@@ -1,4 +1,4 @@
-// Command controlplane starts the AgentBox control plane API server.
+// Command controlplane starts the Superserve Sandbox control plane API server.
 package main
 
 import (
@@ -12,11 +12,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/superserve-ai/sandbox/db"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
@@ -39,6 +41,23 @@ func run() error {
 	}
 	log.Info().Str("port", cfg.Port).Str("vmd_address", cfg.VMDAddress).Msg("configuration loaded")
 
+	// Connect to PostgreSQL.
+	ctx := context.Background()
+	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer dbPool.Close()
+	if err := dbPool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping database: %w", err)
+	}
+	log.Info().Msg("connected to database")
+
+	// Apply migrations.
+	if err := db.MigrateUp(ctx, dbPool); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
+	}
+
 	// Connect to VMD via gRPC.
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -52,14 +71,14 @@ func run() error {
 	// Build handlers and router.
 	vmdClient := newGRPCVMDClient(grpcConn)
 	handlers := api.NewHandlers(vmdClient, cfg)
-	router := api.SetupRouter(handlers)
+	router := api.SetupRouter(handlers, dbPool)
 
 	// Start HTTP server.
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      0,
+		WriteTimeout:      0, // 0 = no timeout; required for streaming exec responses
 		IdleTimeout:       60 * time.Second,
 	}
 
