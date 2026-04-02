@@ -13,7 +13,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -139,7 +138,6 @@ func main() {
 		grpc.MaxRecvMsgSize(64<<20), // 64 MiB
 	)
 	vmdpb.RegisterVMDaemonServer(grpcServer, vm.NewGRPCAdapter(mgr))
-	reflection.Register(grpcServer)
 
 	// Serve in a goroutine so we can handle shutdown signals.
 	go func() {

@@ -2,14 +2,16 @@ package api
 
 import (
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // SetupRouter creates and configures the Gin router with all route groups.
-func SetupRouter(h *Handlers) *gin.Engine {
+func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
 	r.Use(RequestLogger(), ErrorHandler())
 
 	api := r.Group("/")
+	api.Use(APIKeyAuth(pool))
 	{
 		api.POST("/instances", h.CreateInstance)
 		api.GET("/instances", h.ListInstances)
