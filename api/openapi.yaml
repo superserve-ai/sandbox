@@ -1,0 +1,387 @@
+openapi: 3.1.0
+info:
+  title: Superserve API
+  version: 0.1.0
+  description: |
+    Superserve is a Firecracker-based sandbox platform. Spin up lightweight
+    micro-VM instances, execute commands, transfer files, and pause/resume
+    them — all through a simple REST API.
+
+    ## Instance lifecycle
+
+    ```
+    Create --> RUNNING <--> PAUSED --> DEAD (Delete)
+    ```
+
+    | Endpoint | What it does |
+    |----------|-------------|
+    | `POST /instances` | Create a new instance |
+    | `POST /instances/:id/pause` | Snapshot full state, terminate process |
+    | `POST /instances/:id/resume` | Restore from snapshot, continue where it left off |
+    | `DELETE /instances/:id` | Destroy instance and all resources |
+
+    ## Sandbox Environment
+
+    Each instance runs Ubuntu 24.04 with 1 vCPU, 1 GB RAM, 4 GB disk.
+    Pre-installed: Python 3.12, Node.js 22, npm, git, curl, build-essential.
+  contact:
+    name: Superserve Team
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api-staging.superserve.ai
+    description: Staging
+  - url: https://api.superserve.ai
+    description: Production
+  - url: http://localhost:8080
+    description: Local development
+
+paths:
+  /health:
+    get:
+      operationId: health
+      tags: [System]
+      summary: Health check
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: "0.1.0"
+
+  /instances:
+    post:
+      operationId: createInstance
+      tags: [Instances]
+      summary: Create a new instance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInstanceRequest"
+      responses:
+        "201":
+          description: Instance created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateInstanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /instances/{instance_id}:
+    parameters:
+      - $ref: "#/components/parameters/InstanceId"
+
+    delete:
+      operationId: deleteInstance
+      tags: [Instances]
+      summary: Destroy an instance
+      responses:
+        "204":
+          description: Instance destroyed
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /instances/{instance_id}/pause:
+    parameters:
+      - $ref: "#/components/parameters/InstanceId"
+
+    post:
+      operationId: pauseInstance
+      tags: [Instances]
+      summary: Pause a running instance
+      description: |
+        Snapshots the instance's full state (memory + disk), terminates the
+        process, and transitions to PAUSED. Resume it later to continue
+        exactly where it left off.
+      responses:
+        "200":
+          description: Instance is now paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /instances/{instance_id}/resume:
+    parameters:
+      - $ref: "#/components/parameters/InstanceId"
+
+    post:
+      operationId: resumeInstance
+      tags: [Instances]
+      summary: Resume a paused instance
+      description: |
+        Restores the instance from its paused snapshot. The instance transitions
+        back to RUNNING with all state intact — same memory, same processes,
+        same files.
+      responses:
+        "200":
+          description: Instance is now running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /instances/{instance_id}/exec:
+    parameters:
+      - $ref: "#/components/parameters/InstanceId"
+
+    post:
+      operationId: execCommand
+      tags: [Exec]
+      summary: Execute a command inside an instance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+      responses:
+        "200":
+          description: Command executed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /instances/{instance_id}/exec/stream:
+    parameters:
+      - $ref: "#/components/parameters/InstanceId"
+
+    post:
+      operationId: execCommandStream
+      tags: [Exec]
+      summary: Execute a command and stream output via SSE
+      description: |
+        Runs a command and streams stdout/stderr chunks as Server-Sent Events.
+        Each event is a JSON payload. The final event includes `exit_code` and
+        `finished: true`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+      responses:
+        "200":
+          description: SSE stream of exec output
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /instances/{instance_id}/files/{path}:
+    parameters:
+      - $ref: "#/components/parameters/InstanceId"
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: File path inside the instance (without leading slash).
+
+    put:
+      operationId: uploadFile
+      tags: [Files]
+      summary: Upload a file into an instance
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: File uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                  size:
+                    type: integer
+                    format: int64
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    get:
+      operationId: downloadFile
+      tags: [Files]
+      summary: Download a file from an instance
+      responses:
+        "200":
+          description: File content
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  parameters:
+    InstanceId:
+      name: instance_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of the instance.
+
+  schemas:
+    CreateInstanceRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Human-readable name for the instance.
+
+    CreateInstanceResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        status:
+          type: string
+          example: RUNNING
+
+    InstanceStatus:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [RUNNING, PAUSED]
+
+    ExecRequest:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: string
+          minLength: 1
+          description: Command to execute. Wrapped in `/bin/sh -c` unless `args` is provided.
+        args:
+          type: array
+          items:
+            type: string
+          description: If provided, `command` is used as the binary and `args` as arguments (no shell wrapping).
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: Environment variables for the command.
+        working_dir:
+          type: string
+          description: Working directory (default /home/user).
+        timeout_s:
+          type: integer
+          default: 30
+          description: Timeout in seconds.
+
+    ExecResult:
+      type: object
+      properties:
+        stdout:
+          type: string
+        stderr:
+          type: string
+        exit_code:
+          type: integer
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Instance is not in a valid state for this operation
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

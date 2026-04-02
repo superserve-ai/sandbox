@@ -1,0 +1,260 @@
+syntax = "proto3";
+
+package superserve.vmd.v1;
+
+option go_package = "github.com/superserve-ai/sandbox/proto/vmdpb";
+
+// VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
+service VMDaemon {
+  // CreateVM provisions a new microVM with the specified configuration.
+  rpc CreateVM(CreateVMRequest) returns (CreateVMResponse);
+
+  // DestroyVM terminates a running microVM and cleans up all associated resources.
+  rpc DestroyVM(DestroyVMRequest) returns (DestroyVMResponse);
+
+  // PauseVM snapshots a running VM's state and suspends it (sleep).
+  rpc PauseVM(PauseVMRequest) returns (PauseVMResponse);
+
+  // ResumeVM restores a paused VM from its snapshot, optionally into a pre-warmed slot.
+  rpc ResumeVM(ResumeVMRequest) returns (ResumeVMResponse);
+
+  // CreateSnapshot captures a point-in-time snapshot of a running VM.
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+
+  // RestoreSnapshot boots a VM from a previously captured snapshot.
+  rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
+
+  // ExecCommand runs a command inside a VM and streams stdout/stderr back.
+  rpc ExecCommand(ExecCommandRequest) returns (stream ExecCommandResponse);
+
+  // GetVMInfo returns the current status and metadata of a VM.
+  rpc GetVMInfo(GetVMInfoRequest) returns (GetVMInfoResponse);
+
+  // SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
+  rpc SetupNetwork(SetupNetworkRequest) returns (SetupNetworkResponse);
+
+  // UploadFile streams file content into a VM.
+  rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
+
+  // DownloadFile streams file content out of a VM.
+  rpc DownloadFile(DownloadFileRequest) returns (stream DownloadFileChunk);
+}
+
+// ---------------------------------------------------------------------------
+// Resource limits
+// ---------------------------------------------------------------------------
+
+message ResourceLimits {
+  uint32 vcpu_count = 1;
+  uint32 memory_mib = 2;
+  uint32 disk_size_mib = 3;
+  uint32 network_bandwidth_mbps = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Network configuration
+// ---------------------------------------------------------------------------
+
+message NetworkConfig {
+  string host_interface = 1;   // e.g. "eth0"
+  string subnet_cidr = 2;     // e.g. "10.0.0.0/24"
+  string gateway_ip = 3;
+  bool enable_nat = 4;
+}
+
+// ---------------------------------------------------------------------------
+// CreateVM
+// ---------------------------------------------------------------------------
+
+message CreateVMRequest {
+  string vm_id = 1;
+  string base_rootfs_path = 2;   // Path to the base rootfs image.
+  string kernel_path = 3;        // Path to the kernel image.
+  string kernel_args = 4;        // Boot arguments for the kernel.
+  ResourceLimits resource_limits = 5;
+  NetworkConfig network_config = 6;
+  map<string, string> metadata = 7;   // Arbitrary key-value pairs.
+}
+
+message CreateVMResponse {
+  string vm_id = 1;
+  string socket_path = 2;
+  string ip_address = 3;
+  string tap_device = 4;
+  uint32 pid = 5;
+}
+
+// ---------------------------------------------------------------------------
+// DestroyVM
+// ---------------------------------------------------------------------------
+
+message DestroyVMRequest {
+  string vm_id = 1;
+  bool force = 2;   // If true, SIGKILL immediately; otherwise SIGTERM first.
+}
+
+message DestroyVMResponse {
+  string vm_id = 1;
+  bool cleaned_up = 2;
+}
+
+// ---------------------------------------------------------------------------
+// PauseVM (sleep — snapshot then stop)
+// ---------------------------------------------------------------------------
+
+message PauseVMRequest {
+  string vm_id = 1;
+  string snapshot_dir = 2;   // Directory to store the snapshot artifacts.
+}
+
+message PauseVMResponse {
+  string vm_id = 1;
+  string snapshot_path = 2;
+  string mem_file_path = 3;
+}
+
+// ---------------------------------------------------------------------------
+// ResumeVM (wake from snapshot)
+// ---------------------------------------------------------------------------
+
+message ResumeVMRequest {
+  string vm_id = 1;
+  string snapshot_path = 2;
+  string mem_file_path = 3;
+}
+
+message ResumeVMResponse {
+  string vm_id = 1;
+  string socket_path = 2;
+  string ip_address = 3;
+  uint32 pid = 4;
+}
+
+// ---------------------------------------------------------------------------
+// CreateSnapshot
+// ---------------------------------------------------------------------------
+
+message CreateSnapshotRequest {
+  string vm_id = 1;
+  string snapshot_dir = 2;
+}
+
+message CreateSnapshotResponse {
+  string vm_id = 1;
+  string snapshot_path = 2;
+  string mem_file_path = 3;
+  int64 created_at_unix = 4;
+}
+
+// ---------------------------------------------------------------------------
+// RestoreSnapshot
+// ---------------------------------------------------------------------------
+
+message RestoreSnapshotRequest {
+  string vm_id = 1;
+  string snapshot_path = 2;
+  string mem_file_path = 3;
+  string overlay_path = 4;         // COW overlay for the restored rootfs.
+  ResourceLimits resource_limits = 5;
+  NetworkConfig network_config = 6;
+}
+
+message RestoreSnapshotResponse {
+  string vm_id = 1;
+  string socket_path = 2;
+  string ip_address = 3;
+  uint32 pid = 4;
+}
+
+// ---------------------------------------------------------------------------
+// ExecCommand
+// ---------------------------------------------------------------------------
+
+message ExecCommandRequest {
+  string vm_id = 1;
+  string command = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  string working_dir = 5;
+  uint32 timeout_seconds = 6;
+}
+
+message ExecCommandResponse {
+  bytes stdout = 1;
+  bytes stderr = 2;
+  int32 exit_code = 3;
+  bool finished = 4;
+}
+
+// ---------------------------------------------------------------------------
+// GetVMInfo
+// ---------------------------------------------------------------------------
+
+enum VMStatus {
+  VM_STATUS_UNSPECIFIED = 0;
+  VM_STATUS_CREATING = 1;
+  VM_STATUS_RUNNING = 2;
+  VM_STATUS_PAUSED = 3;
+  VM_STATUS_STOPPED = 4;
+  VM_STATUS_ERROR = 5;
+}
+
+message GetVMInfoRequest {
+  string vm_id = 1;
+}
+
+message GetVMInfoResponse {
+  string vm_id = 1;
+  VMStatus status = 2;
+  string socket_path = 3;
+  string ip_address = 4;
+  uint32 pid = 5;
+  ResourceLimits resource_limits = 6;
+  map<string, string> metadata = 7;
+  int64 created_at_unix = 8;
+  int64 uptime_seconds = 9;
+}
+
+// ---------------------------------------------------------------------------
+// SetupNetwork
+// ---------------------------------------------------------------------------
+
+message SetupNetworkRequest {
+  string vm_id = 1;
+  NetworkConfig network_config = 2;
+}
+
+message SetupNetworkResponse {
+  string vm_id = 1;
+  string tap_device = 2;
+  string vm_ip = 3;
+  string gateway_ip = 4;
+  string mac_address = 5;
+}
+
+// ---------------------------------------------------------------------------
+// UploadFile
+// ---------------------------------------------------------------------------
+
+message UploadFileRequest {
+  string vm_id = 1;   // Set in the first message of the stream.
+  string path = 2;    // Set in the first message of the stream.
+  bytes data = 3;     // File content chunks (all messages).
+}
+
+message UploadFileResponse {
+  int64 bytes_written = 1;
+}
+
+// ---------------------------------------------------------------------------
+// DownloadFile
+// ---------------------------------------------------------------------------
+
+message DownloadFileRequest {
+  string vm_id = 1;
+  string path = 2;
+}
+
+message DownloadFileChunk {
+  bytes data = 1;
+}

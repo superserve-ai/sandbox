@@ -1,0 +1,51 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build
+dist/
+*.o
+*.a
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# VM images
+images/base/output/
+*.ext4
+*.img
+vmlinux
+
+# Snapshots (local dev)
+snapshots/
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated
+internal/db/generated/
+.beads/
+.claude/
+.runtime/

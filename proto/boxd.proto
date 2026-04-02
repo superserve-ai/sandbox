@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package superserve.boxd.v1;
+
+option go_package = "github.com/superserve-ai/sandbox/proto/boxdpb";
+
+// ---------------------------------------------------------------------------
+// Process service — exec and PTY
+// ---------------------------------------------------------------------------
+
+service ProcessService {
+  // Start runs a command and streams output events (stdout/stderr/exit).
+  // For PTY mode, set the pty field in StartRequest.
+  rpc Start(StartRequest) returns (stream ProcessEvent);
+
+  // SendInput sends input to a running process (stdin or PTY input).
+  rpc SendInput(SendInputRequest) returns (SendInputResponse);
+
+  // Resize resizes the PTY window of a running process.
+  rpc Resize(ResizeRequest) returns (ResizeResponse);
+
+  // Signal sends a signal to a running process.
+  rpc Signal(SignalRequest) returns (SignalResponse);
+}
+
+message StartRequest {
+  string cmd = 1;
+  repeated string args = 2;
+  map<string, string> envs = 3;
+  string cwd = 4;
+  PtyConfig pty = 5;     // If set, run in PTY mode.
+  uint32 timeout_ms = 6; // 0 = no timeout.
+}
+
+message PtyConfig {
+  TerminalSize size = 1;
+}
+
+message TerminalSize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message ProcessEvent {
+  oneof event {
+    StartEvent start = 1;
+    DataEvent data = 2;
+    EndEvent end = 3;
+    KeepAlive keepalive = 4;
+  }
+}
+
+message StartEvent {
+  uint32 pid = 1;
+}
+
+message DataEvent {
+  oneof output {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    bytes pty_data = 3;
+  }
+}
+
+message EndEvent {
+  int32 exit_code = 1;
+  bool exited = 2;
+  string status = 3;
+  string error = 4;
+}
+
+message KeepAlive {}
+
+message SendInputRequest {
+  uint32 pid = 1;
+  bytes data = 2;
+}
+
+message SendInputResponse {}
+
+message ResizeRequest {
+  uint32 pid = 1;
+  TerminalSize size = 2;
+}
+
+message ResizeResponse {}
+
+message SignalRequest {
+  uint32 pid = 1;
+  int32 signal = 2;
+}
+
+message SignalResponse {}
+
+// ---------------------------------------------------------------------------
+// Filesystem service — file operations
+// ---------------------------------------------------------------------------
+
+service FilesystemService {
+  // Stat returns file info.
+  rpc Stat(StatRequest) returns (StatResponse);
+
+  // ListDir lists directory contents.
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+
+  // MakeDir creates a directory.
+  rpc MakeDir(MakeDirRequest) returns (MakeDirResponse);
+
+  // Remove removes a file or directory.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Move renames/moves a file.
+  rpc Move(MoveRequest) returns (MoveResponse);
+}
+
+message StatRequest {
+  string path = 1;
+}
+
+message StatResponse {
+  string name = 1;
+  int64 size = 2;
+  bool is_dir = 3;
+  string mode = 4;
+  int64 modified_unix = 5;
+}
+
+message ListDirRequest {
+  string path = 1;
+}
+
+message ListDirResponse {
+  repeated FileEntry entries = 1;
+}
+
+message FileEntry {
+  string name = 1;
+  bool is_dir = 2;
+  int64 size = 3;
+}
+
+message MakeDirRequest {
+  string path = 1;
+}
+
+message MakeDirResponse {}
+
+message RemoveRequest {
+  string path = 1;
+}
+
+message RemoveResponse {}
+
+message MoveRequest {
+  string source = 1;
+  string destination = 2;
+}
+
+message MoveResponse {}
