@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,25 +28,38 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubVMD struct {
-	destroyFn func(ctx context.Context, id string, force bool) error
-	resumeFn  func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
+	createFn   func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
+	destroyFn  func(ctx context.Context, id string, force bool) error
+	pauseFn    func(ctx context.Context, id, snapshotDir string) (string, string, error)
+	resumeFn   func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	execFn     func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
+	uploadFn   func(ctx context.Context, id, path string, content io.Reader) (int64, error)
+	downloadFn func(ctx context.Context, id, path string) (io.ReadCloser, error)
 }
 
-func (s *stubVMD) CreateInstance(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
-	return "", nil
+func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error) {
+	if s.createFn != nil {
+		return s.createFn(ctx, id, vcpu, memMiB, diskMiB, metadata)
+	}
+	return "10.0.0.1", nil
 }
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
-	return s.destroyFn(ctx, id, force)
+	if s.destroyFn != nil {
+		return s.destroyFn(ctx, id, force)
+	}
+	return nil
 }
-func (s *stubVMD) PauseInstance(context.Context, string, string) (string, string, error) {
-	return "", "", nil
+func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (string, string, error) {
+	if s.pauseFn != nil {
+		return s.pauseFn(ctx, id, snapshotDir)
+	}
+	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
 }
 func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string) (string, error) {
 	if s.resumeFn != nil {
 		return s.resumeFn(ctx, id, snapshotPath, memPath)
 	}
-	return "", nil
+	return "10.0.0.1", nil
 }
 func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	if s.execFn != nil {
@@ -55,11 +70,17 @@ func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []st
 func (s *stubVMD) ExecCommandStream(context.Context, string, string, []string, map[string]string, string, uint32, func([]byte, []byte, int32, bool)) error {
 	return nil
 }
-func (s *stubVMD) UploadFile(context.Context, string, string, io.Reader) (int64, error) {
+func (s *stubVMD) UploadFile(ctx context.Context, id, path string, content io.Reader) (int64, error) {
+	if s.uploadFn != nil {
+		return s.uploadFn(ctx, id, path, content)
+	}
 	return 0, nil
 }
-func (s *stubVMD) DownloadFile(context.Context, string, string) (io.ReadCloser, error) {
-	return nil, nil
+func (s *stubVMD) DownloadFile(ctx context.Context, id, path string) (io.ReadCloser, error) {
+	if s.downloadFn != nil {
+		return s.downloadFn(ctx, id, path)
+	}
+	return io.NopCloser(strings.NewReader("file-content")), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -155,15 +176,19 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 		}
 		c.Next()
 	})
+	r.POST("/sandboxes", h.CreateSandbox)
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
+	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 
-	// Exec routes go through auto-wake middleware.
-	exec := r.Group("/sandboxes/:sandbox_id")
-	exec.Use(h.AutoWake())
+	// Routes with auto-wake middleware.
+	ops := r.Group("/sandboxes/:sandbox_id")
+	ops.Use(h.AutoWake())
 	{
-		exec.POST("/exec", h.ExecSandbox)
-		exec.POST("/exec/stream", h.ExecSandboxStream)
+		ops.POST("/exec", h.ExecSandbox)
+		ops.POST("/exec/stream", h.ExecSandboxStream)
+		ops.PUT("/files/*path", h.UploadSandboxFile)
+		ops.GET("/files/*path", h.DownloadSandboxFile)
 	}
 	return r
 }
@@ -884,5 +909,1008 @@ func TestExecSandbox_MissingTeamID(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CreateSandbox tests
+// ---------------------------------------------------------------------------
+
+func createSandboxReq(body string) *http.Request {
+	return httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+}
+
+func TestCreateSandbox_Success(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	// Use a channel to synchronize with the background goroutine — avoids the
+	// data race that occurs when testing a plain bool across goroutines.
+	createDone := make(chan struct{})
+	vmd := &stubVMD{
+		createFn: func(_ context.Context, id string, vcpu, memMiB, _ uint32, _ map[string]string) (string, error) {
+			defer close(createDone)
+			if vcpu != 2 {
+				t.Errorf("vcpu = %d, want 2", vcpu)
+			}
+			if memMiB != 512 {
+				t.Errorf("memMiB = %d, want 512", memMiB)
+			}
+			return "10.0.0.42", nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "my-sandbox",
+					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
+					CreatedAt: time.Now(),
+				})
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox","vcpu_count":2,"memory_mib":512}`))
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	// Response is immediate — sandbox is starting, not yet active.
+	body := parseJSON(t, w)
+	if body["name"] != "my-sandbox" {
+		t.Errorf("name = %q, want %q", body["name"], "my-sandbox")
+	}
+	if body["status"] != "starting" {
+		t.Errorf("status = %q, want starting", body["status"])
+	}
+	if _, hasIP := body["ip_address"]; hasIP {
+		t.Error("ip_address should not be present in create response")
+	}
+
+	// Wait for the background goroutine to finish (proves CreateInstance was called).
+	select {
+	case <-createDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("VMD.CreateInstance was not called within 500ms")
+	}
+}
+
+func TestCreateSandbox_InvalidBody(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, createSandboxReq(`{}`))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateSandbox_MissingTeamID(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, "").ServeHTTP(w, createSandboxReq(`{"name":"test","vcpu_count":1,"memory_mib":256}`))
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestCreateSandbox_VMDError(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	// VMD failure is async — the HTTP response is still 201 (starting), and the
+	// background goroutine calls DestroySandbox to clean up.
+	destroyCalled := make(chan struct{})
+	vmd := &stubVMD{
+		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
+			return "", fmt.Errorf("vmd unreachable")
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+				})
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			// DestroySandbox issues an UPDATE with destroyed_at.
+			if strings.Contains(sql, "destroyed_at") {
+				select {
+				case <-destroyCalled:
+				default:
+					close(destroyCalled)
+				}
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb","vcpu_count":1,"memory_mib":256}`))
+
+	// HTTP response is 201 — the error is handled asynchronously.
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201", w.Code)
+	}
+	if parseJSON(t, w)["status"] != "starting" {
+		t.Errorf("status should be starting on create, got %v", parseJSON(t, w)["status"])
+	}
+
+	// Background goroutine must call DestroySandbox after the VMD error.
+	select {
+	case <-destroyCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("DestroySandbox was not called after VMD error within 500ms")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PauseSandbox tests
+// ---------------------------------------------------------------------------
+
+func pauseRequest(sandboxID string) *http.Request {
+	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/pause", nil)
+}
+
+func TestPauseSandbox_Success(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+
+	var pauseCalled bool
+	vmd := &stubVMD{
+		pauseFn: func(_ context.Context, id, _ string) (string, string, error) {
+			pauseCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("PauseInstance id = %q, want %q", id, sandboxID)
+			}
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		},
+	}
+
+	snapshotID := uuid.New()
+	queryRowCall := 0
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			queryRowCall++
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			if strings.Contains(sql, "INSERT INTO snapshot") {
+				return snapshotRow(db.Snapshot{
+					ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+					Path: "/snapshots/vmstate.snap", Trigger: "pause",
+				})
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !pauseCalled {
+		t.Error("VMD.PauseInstance was not called")
+	}
+
+	body := parseJSON(t, w)
+	if body["status"] != "idle" {
+		t.Errorf("status = %q, want %q", body["status"], "idle")
+	}
+	if body["snapshot_id"] != snapshotID.String() {
+		t.Errorf("snapshot_id = %q, want %q", body["snapshot_id"], snapshotID)
+	}
+}
+
+func TestPauseSandbox_NotActive(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusIdle}
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+	vmd := &stubVMD{}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+}
+
+func TestPauseSandbox_NotFound(t *testing.T) {
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+	vmd := &stubVMD{}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, pauseRequest(uuid.New().String()))
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestPauseSandbox_VMDError(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "", "", fmt.Errorf("vmd unreachable")
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestPauseSandbox_MissingTeamID(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, "").ServeHTTP(w, pauseRequest(uuid.New().String()))
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox file operation tests
+// ---------------------------------------------------------------------------
+
+func uploadFileReq(sandboxID, filePath string) *http.Request {
+	return httptest.NewRequest(http.MethodPut, "/sandboxes/"+sandboxID+"/files/"+filePath, strings.NewReader("file-content"))
+}
+
+func downloadFileReq(sandboxID, filePath string) *http.Request {
+	return httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandboxID+"/files/"+filePath, nil)
+}
+
+func TestUploadSandboxFile_Success(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	var uploadCalled bool
+	vmd := &stubVMD{
+		uploadFn: func(_ context.Context, id, path string, content io.Reader) (int64, error) {
+			uploadCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("UploadFile id = %q, want %q", id, sandboxID)
+			}
+			if path != "/app/main.go" {
+				t.Errorf("UploadFile path = %q, want %q", path, "/app/main.go")
+			}
+			data, _ := io.ReadAll(content)
+			return int64(len(data)), nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, uploadFileReq(sandboxID.String(), "app/main.go"))
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !uploadCalled {
+		t.Error("VMD.UploadFile was not called")
+	}
+}
+
+func TestDownloadSandboxFile_Success(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	var downloadCalled bool
+	vmd := &stubVMD{
+		downloadFn: func(_ context.Context, id, path string) (io.ReadCloser, error) {
+			downloadCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("DownloadFile id = %q, want %q", id, sandboxID)
+			}
+			return io.NopCloser(strings.NewReader("hello world")), nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, downloadFileReq(sandboxID.String(), "app/main.go"))
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !downloadCalled {
+		t.Error("VMD.DownloadFile was not called")
+	}
+	if w.Body.String() != "hello world" {
+		t.Errorf("body = %q, want %q", w.Body.String(), "hello world")
+	}
+}
+
+func TestUploadSandboxFile_PathTraversal(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, uploadFileReq(sandboxID.String(), "../etc/passwd"))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
+
+func TestDownloadSandboxFile_NotFound(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{
+		downloadFn: func(context.Context, string, string) (io.ReadCloser, error) {
+			return nil, fmt.Errorf("404 not found")
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, downloadFileReq(sandboxID.String(), "missing.txt"))
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Instance handler mock (separate from sandbox stubVMD above)
+// ---------------------------------------------------------------------------
+
+type mockVMD struct {
+	createInstanceFn    func(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
+	destroyInstanceFn   func(ctx context.Context, instanceID string, force bool) error
+	pauseInstanceFn     func(ctx context.Context, instanceID, snapshotDir string) (string, string, error)
+	resumeInstanceFn    func(ctx context.Context, instanceID, snapshotPath, memPath string) (string, error)
+	execCommandFn       func(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
+	execCommandStreamFn func(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func([]byte, []byte, int32, bool)) error
+	uploadFileFn        func(ctx context.Context, instanceID, path string, content io.Reader) (int64, error)
+	downloadFileFn      func(ctx context.Context, instanceID, path string) (io.ReadCloser, error)
+}
+
+func (m *mockVMD) CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error) {
+	if m.createInstanceFn != nil {
+		return m.createInstanceFn(ctx, instanceID, vcpu, memMiB, diskMiB, metadata)
+	}
+	return "10.0.0.1", nil
+}
+func (m *mockVMD) DestroyInstance(ctx context.Context, instanceID string, force bool) error {
+	if m.destroyInstanceFn != nil {
+		return m.destroyInstanceFn(ctx, instanceID, force)
+	}
+	return nil
+}
+func (m *mockVMD) PauseInstance(ctx context.Context, instanceID, snapshotDir string) (string, string, error) {
+	if m.pauseInstanceFn != nil {
+		return m.pauseInstanceFn(ctx, instanceID, snapshotDir)
+	}
+	return "/snap/path", "/mem/path", nil
+}
+func (m *mockVMD) ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (string, error) {
+	if m.resumeInstanceFn != nil {
+		return m.resumeInstanceFn(ctx, instanceID, snapshotPath, memPath)
+	}
+	return "10.0.0.1", nil
+}
+func (m *mockVMD) ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
+	if m.execCommandFn != nil {
+		return m.execCommandFn(ctx, instanceID, command, args, env, workingDir, timeoutS)
+	}
+	return "hello\n", "", 0, nil
+}
+func (m *mockVMD) ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func([]byte, []byte, int32, bool)) error {
+	if m.execCommandStreamFn != nil {
+		return m.execCommandStreamFn(ctx, instanceID, command, args, env, workingDir, timeoutS, onChunk)
+	}
+	onChunk([]byte("hello\n"), nil, 0, true)
+	return nil
+}
+func (m *mockVMD) UploadFile(ctx context.Context, instanceID, path string, content io.Reader) (int64, error) {
+	if m.uploadFileFn != nil {
+		return m.uploadFileFn(ctx, instanceID, path, content)
+	}
+	return 42, nil
+}
+func (m *mockVMD) DownloadFile(ctx context.Context, instanceID, path string) (io.ReadCloser, error) {
+	if m.downloadFileFn != nil {
+		return m.downloadFileFn(ctx, instanceID, path)
+	}
+	return io.NopCloser(strings.NewReader("file-content")), nil
+}
+
+func newTestHandlers(vmd VMDClient) *Handlers { return &Handlers{VMD: vmd} }
+
+func jsonBody(v interface{}) *bytes.Buffer { b, _ := json.Marshal(v); return bytes.NewBuffer(b) }
+
+func setupInstanceTestRouter(h *Handlers, teamID string) *gin.Engine {
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		if teamID != "" {
+			c.Set("team_id", teamID)
+		}
+		c.Next()
+	})
+	r.GET("/health", h.Health)
+	r.POST("/instances", h.CreateInstance)
+	r.GET("/instances/:instance_id", h.GetInstance)
+	r.GET("/instances", h.ListInstances)
+	r.DELETE("/instances/:instance_id", h.DeleteInstance)
+	r.POST("/instances/:instance_id/pause", h.PauseInstance)
+	r.POST("/instances/:instance_id/resume", h.ResumeInstance)
+	r.POST("/instances/:instance_id/exec", h.ExecCommand)
+	r.POST("/instances/:instance_id/exec/stream", h.ExecCommandStream)
+	r.PUT("/instances/:instance_id/files/*path", h.UploadFile)
+	r.GET("/instances/:instance_id/files/*path", h.DownloadFile)
+	return r
+}
+
+func TestHealth(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), "")
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/health", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := parseJSON(t, w)
+	if body["status"] != "ok" {
+		t.Errorf("status=%v want ok", body["status"])
+	}
+}
+
+func TestCreateInstance_Success(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances", jsonBody(map[string]string{"name": "test-box"}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateInstance_BadRequest_MissingName(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances", jsonBody(map[string]string{}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestCreateInstance_BadRequest_EmptyBody(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances", nil)
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestCreateInstance_VMDFailure(t *testing.T) {
+	vmd := &mockVMD{createInstanceFn: func(_ context.Context, _ string, _, _, _ uint32, _ map[string]string) (string, error) {
+		return "", errors.New("vmd unavailable")
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances", jsonBody(map[string]string{"name": "fail-box"}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestDeleteInstance_Success(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/instances/"+uuid.New().String(), nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteInstance_InvalidUUID(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/instances/not-a-uuid", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestDeleteInstance_VMDFailure(t *testing.T) {
+	vmd := &mockVMD{destroyInstanceFn: func(_ context.Context, _ string, _ bool) error { return errors.New("destroy failed") }}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/instances/"+uuid.New().String(), nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestPauseInstance_Success(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/pause", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if parseJSON(t, w)["status"] != "PAUSED" {
+		t.Errorf("expected status=PAUSED")
+	}
+}
+
+func TestPauseInstance_InvalidUUID(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/bad/pause", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestPauseInstance_VMDFailure(t *testing.T) {
+	vmd := &mockVMD{pauseInstanceFn: func(_ context.Context, _, _ string) (string, string, error) { return "", "", errors.New("pause failed") }}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/pause", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestResumeInstance_Success(t *testing.T) {
+	vmd := &mockVMD{resumeInstanceFn: func(_ context.Context, _, _, _ string) (string, error) { return "10.0.0.42", nil }}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/resume", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if parseJSON(t, w)["ip_address"] != "10.0.0.42" {
+		t.Errorf("expected ip_address=10.0.0.42")
+	}
+}
+
+func TestResumeInstance_VMDFailure(t *testing.T) {
+	vmd := &mockVMD{resumeInstanceFn: func(_ context.Context, _, _, _ string) (string, error) { return "", errors.New("resume failed") }}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/resume", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestExecCommand_Success(t *testing.T) {
+	vmd := &mockVMD{execCommandFn: func(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
+		return "hello world\n", "", 0, nil
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/exec",
+		jsonBody(map[string]interface{}{"command": "echo"}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if parseJSON(t, w)["stdout"] != "hello world\n" {
+		t.Errorf("unexpected stdout")
+	}
+}
+
+func TestExecCommand_BadRequest_MissingCommand(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/exec", jsonBody(map[string]interface{}{}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestExecCommand_DefaultTimeout(t *testing.T) {
+	var capturedTimeout uint32
+	vmd := &mockVMD{execCommandFn: func(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, timeoutS uint32) (string, string, int32, error) {
+		capturedTimeout = timeoutS
+		return "", "", 0, nil
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/exec", jsonBody(map[string]interface{}{"command": "ls"}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if capturedTimeout != 30 {
+		t.Errorf("expected default timeout=30, got %d", capturedTimeout)
+	}
+}
+
+func TestExecCommand_VMDFailure(t *testing.T) {
+	vmd := &mockVMD{execCommandFn: func(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
+		return "", "", 0, errors.New("exec failed")
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/exec", jsonBody(map[string]interface{}{"command": "fail"}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestExecCommand_NonZeroExit(t *testing.T) {
+	vmd := &mockVMD{execCommandFn: func(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
+		return "", "not found\n", 127, nil
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/exec", jsonBody(map[string]interface{}{"command": "missing"}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if parseJSON(t, w)["exit_code"] != float64(127) {
+		t.Errorf("expected exit_code=127")
+	}
+}
+
+func TestUploadFile_Success(t *testing.T) {
+	vmd := &mockVMD{uploadFileFn: func(_ context.Context, _, _ string, content io.Reader) (int64, error) {
+		data, _ := io.ReadAll(content)
+		return int64(len(data)), nil
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/instances/"+uuid.New().String()+"/files/home/user/test.txt", strings.NewReader("file content here"))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if parseJSON(t, w)["path"] != "/home/user/test.txt" {
+		t.Errorf("unexpected path")
+	}
+}
+
+func TestUploadFile_PathTraversal(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/instances/"+uuid.New().String()+"/files/../etc/passwd", strings.NewReader("bad"))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUploadFile_VMDFailure(t *testing.T) {
+	vmd := &mockVMD{uploadFileFn: func(_ context.Context, _, _ string, _ io.Reader) (int64, error) { return 0, errors.New("upload failed") }}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/instances/"+uuid.New().String()+"/files/test.txt", strings.NewReader("data"))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestDownloadFile_Success(t *testing.T) {
+	vmd := &mockVMD{downloadFileFn: func(_ context.Context, _, _ string) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("downloaded-content")), nil
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/instances/"+uuid.New().String()+"/files/data.txt", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if w.Body.String() != "downloaded-content" {
+		t.Errorf("unexpected body: %s", w.Body.String())
+	}
+}
+
+func TestDownloadFile_NotFound(t *testing.T) {
+	vmd := &mockVMD{downloadFileFn: func(_ context.Context, _, _ string) (io.ReadCloser, error) { return nil, errors.New("404 not found") }}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/instances/"+uuid.New().String()+"/files/missing.txt", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestDownloadFile_PathTraversal(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/instances/"+uuid.New().String()+"/files/../../../etc/shadow", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestExecCommandStream_Success(t *testing.T) {
+	vmd := &mockVMD{execCommandStreamFn: func(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32, onChunk func([]byte, []byte, int32, bool)) error {
+		onChunk([]byte("line1\n"), nil, 0, false)
+		onChunk(nil, nil, 0, true)
+		return nil
+	}}
+	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/exec/stream", jsonBody(map[string]interface{}{"command": "echo"}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if w.Header().Get("Content-Type") != "text/event-stream" {
+		t.Errorf("expected text/event-stream")
+	}
+	if !strings.Contains(w.Body.String(), "line1") {
+		t.Errorf("expected stdout in SSE stream")
+	}
+}
+
+func TestExecCommandStream_BadRequest(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/instances/"+uuid.New().String()+"/exec/stream", jsonBody(map[string]interface{}{}))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestGetInstance_NotImplemented(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/instances/"+uuid.New().String(), nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d", w.Code)
+	}
+}
+
+func TestListInstances_NotImplemented(t *testing.T) {
+	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/instances", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d", w.Code)
+	}
+}
+
+func TestCleanFilePath(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"simple file", "/test.txt", "/test.txt", false},
+		{"nested path", "/home/user/data.csv", "/home/user/data.csv", false},
+		{"strips leading slash", "test.txt", "/test.txt", false},
+		{"empty path", "/", "", true},
+		{"traversal blocked", "/../etc/passwd", "", true},
+		{"double dot in middle", "/foo/../bar", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := cleanFilePath(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("cleanFilePath(%q): err=%v, wantErr=%v", tt.input, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("cleanFilePath(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseInstanceID_Valid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "instance_id", Value: uuid.New().String()}}
+	if _, err := parseInstanceID(c); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestParseInstanceID_Invalid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "instance_id", Value: "bad"}}
+	if _, err := parseInstanceID(c); err == nil {
+		t.Fatal("expected error for invalid UUID")
+	}
+}
+
+func TestParseSandboxID_Valid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "sandbox_id", Value: uuid.New().String()}}
+	if _, err := parseSandboxID(c); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestParseSandboxID_Invalid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "sandbox_id", Value: "bad"}}
+	if _, err := parseSandboxID(c); err == nil {
+		t.Fatal("expected error for invalid UUID")
+	}
+}
+
+func TestTeamIDFromContext_Valid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	teamID := uuid.New().String()
+	c.Set("team_id", teamID)
+	got, err := teamIDFromContext(c)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if got.String() != teamID {
+		t.Errorf("expected %s, got %s", teamID, got.String())
+	}
+}
+
+func TestTeamIDFromContext_Missing(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	if _, err := teamIDFromContext(c); err == nil {
+		t.Fatal("expected error for missing team_id")
+	}
+}
+
+func TestTeamIDFromContext_InvalidUUID(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("team_id", "not-a-uuid")
+	if _, err := teamIDFromContext(c); err == nil {
+		t.Fatal("expected error for invalid team_id UUID")
 	}
 }
