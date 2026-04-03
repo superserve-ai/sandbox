@@ -14,49 +14,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type CheckpointType string
-
-const (
-	CheckpointTypeAuto   CheckpointType = "auto"
-	CheckpointTypeManual CheckpointType = "manual"
-	CheckpointTypeNamed  CheckpointType = "named"
-)
-
-func (e *CheckpointType) Scan(src interface{}) error {
-	switch s := src.(type) {
-	case []byte:
-		*e = CheckpointType(s)
-	case string:
-		*e = CheckpointType(s)
-	default:
-		return fmt.Errorf("unsupported scan type for CheckpointType: %T", src)
-	}
-	return nil
-}
-
-type NullCheckpointType struct {
-	CheckpointType CheckpointType `json:"checkpoint_type"`
-	Valid          bool           `json:"valid"` // Valid is true if CheckpointType is not NULL
-}
-
-// Scan implements the Scanner interface.
-func (ns *NullCheckpointType) Scan(value interface{}) error {
-	if value == nil {
-		ns.CheckpointType, ns.Valid = "", false
-		return nil
-	}
-	ns.Valid = true
-	return ns.CheckpointType.Scan(value)
-}
-
-// Value implements the driver Valuer interface.
-func (ns NullCheckpointType) Value() (driver.Value, error) {
-	if !ns.Valid {
-		return nil, nil
-	}
-	return string(ns.CheckpointType), nil
-}
-
 type SandboxStatus string
 
 const (
@@ -102,74 +59,19 @@ func (ns NullSandboxStatus) Value() (driver.Value, error) {
 	return string(ns.SandboxStatus), nil
 }
 
-type VmStatus string
-
-const (
-	VmStatusCreating VmStatus = "creating"
-	VmStatusRunning  VmStatus = "running"
-	VmStatusPaused   VmStatus = "paused"
-	VmStatusSleeping VmStatus = "sleeping"
-	VmStatusStopped  VmStatus = "stopped"
-	VmStatusDead     VmStatus = "dead"
-)
-
-func (e *VmStatus) Scan(src interface{}) error {
-	switch s := src.(type) {
-	case []byte:
-		*e = VmStatus(s)
-	case string:
-		*e = VmStatus(s)
-	default:
-		return fmt.Errorf("unsupported scan type for VmStatus: %T", src)
-	}
-	return nil
-}
-
-type NullVmStatus struct {
-	VmStatus VmStatus `json:"vm_status"`
-	Valid    bool     `json:"valid"` // Valid is true if VmStatus is not NULL
-}
-
-// Scan implements the Scanner interface.
-func (ns *NullVmStatus) Scan(value interface{}) error {
-	if value == nil {
-		ns.VmStatus, ns.Valid = "", false
-		return nil
-	}
-	ns.Valid = true
-	return ns.VmStatus.Scan(value)
-}
-
-// Value implements the driver Valuer interface.
-func (ns NullVmStatus) Value() (driver.Value, error) {
-	if !ns.Valid {
-		return nil, nil
-	}
-	return string(ns.VmStatus), nil
-}
-
 type Activity struct {
-	ID          uuid.UUID `json:"id"`
-	SandboxID   uuid.UUID `json:"sandbox_id"`
-	TeamID      uuid.UUID `json:"team_id"`
-	ActorID     *string   `json:"actor_id"`
-	Category    string    `json:"category"`
-	Action      string    `json:"action"`
-	Status      string    `json:"status"`
-	SandboxName *string   `json:"sandbox_name"`
-	DurationMs  *int32    `json:"duration_ms"`
-	Error       *string   `json:"error"`
-	Metadata    []byte    `json:"metadata"`
-	CreatedAt   time.Time `json:"created_at"`
-}
-
-type ApiKey struct {
-	ID        uuid.UUID          `json:"id"`
-	KeyHash   string             `json:"key_hash"`
-	Name      string             `json:"name"`
-	CreatedAt time.Time          `json:"created_at"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-	Revoked   bool               `json:"revoked"`
+	ID          uuid.UUID   `json:"id"`
+	SandboxID   uuid.UUID   `json:"sandbox_id"`
+	TeamID      uuid.UUID   `json:"team_id"`
+	ActorID     pgtype.UUID `json:"actor_id"`
+	Category    string      `json:"category"`
+	Action      string      `json:"action"`
+	Status      *string     `json:"status"`
+	SandboxName *string     `json:"sandbox_name"`
+	DurationMs  *int32      `json:"duration_ms"`
+	Error       *string     `json:"error"`
+	Metadata    []byte      `json:"metadata"`
+	CreatedAt   time.Time   `json:"created_at"`
 }
 
 type ApiKey struct {
@@ -178,51 +80,43 @@ type ApiKey struct {
 	KeyHash    string             `json:"key_hash"`
 	Name       string             `json:"name"`
 	Scopes     []string           `json:"scopes"`
-	CreatedBy  *string            `json:"created_by"`
+	CreatedBy  pgtype.UUID        `json:"created_by"`
 	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	CreatedAt  time.Time          `json:"created_at"`
 }
 
-type Checkpoint struct {
-	ID             uuid.UUID          `json:"id"`
-	VmID           uuid.UUID          `json:"vm_id"`
-	Name           *string            `json:"name"`
-	Type           CheckpointType     `json:"type"`
-	SizeBytes      int64              `json:"size_bytes"`
-	DeltaSizeBytes int64              `json:"delta_size_bytes"`
-	StoragePath    string             `json:"storage_path"`
-	Pinned         bool               `json:"pinned"`
-	CreatedAt      time.Time          `json:"created_at"`
-	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+type DeviceCode struct {
+	ID         uuid.UUID   `json:"id"`
+	DeviceCode string      `json:"device_code"`
+	UserCode   string      `json:"user_code"`
+	UserID     pgtype.UUID `json:"user_id"`
+	Status     string      `json:"status"`
+	ExpiresAt  time.Time   `json:"expires_at"`
+	CreatedAt  time.Time   `json:"created_at"`
 }
 
-type ExecLog struct {
-	ID          uuid.UUID          `json:"id"`
-	VmID        uuid.UUID          `json:"vm_id"`
-	Command     string             `json:"command"`
-	ExitCode    *int32             `json:"exit_code"`
-	StartedAt   time.Time          `json:"started_at"`
-	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+type EarlyAccessRequest struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Email     string    `json:"email"`
+	Company   *string   `json:"company"`
+	Message   *string   `json:"message"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-type Fork struct {
-	ID                 uuid.UUID `json:"id"`
-	SourceVmID         uuid.UUID `json:"source_vm_id"`
-	TargetVmID         uuid.UUID `json:"target_vm_id"`
-	SourceCheckpointID uuid.UUID `json:"source_checkpoint_id"`
-	CreatedAt          time.Time `json:"created_at"`
-}
-
-type RollbackLog struct {
-	ID                      uuid.UUID `json:"id"`
-	VmID                    uuid.UUID `json:"vm_id"`
-	FromCheckpointID        uuid.UUID `json:"from_checkpoint_id"`
-	ToCheckpointID          uuid.UUID `json:"to_checkpoint_id"`
-	PreRollbackCheckpointID uuid.UUID `json:"pre_rollback_checkpoint_id"`
-	TriggeredBy             *string   `json:"triggered_by"`
-	CreatedAt               time.Time `json:"created_at"`
+type Profile struct {
+	ID                uuid.UUID `json:"id"`
+	Email             string    `json:"email"`
+	FullName          *string   `json:"full_name"`
+	AvatarUrl         *string   `json:"avatar_url"`
+	Provider          *string   `json:"provider"`
+	ProviderID        *string   `json:"provider_id"`
+	StorageQuotaBytes int64     `json:"storage_quota_bytes"`
+	StorageUsedBytes  int64     `json:"storage_used_bytes"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type Sandbox struct {
@@ -236,7 +130,7 @@ type Sandbox struct {
 	IpAddress      *netip.Addr        `json:"ip_address"`
 	Pid            *int32             `json:"pid"`
 	SnapshotID     pgtype.UUID        `json:"snapshot_id"`
-	LastActivityAt pgtype.Timestamptz `json:"last_activity_at"`
+	LastActivityAt time.Time          `json:"last_activity_at"`
 	CreatedAt      time.Time          `json:"created_at"`
 	UpdatedAt      time.Time          `json:"updated_at"`
 	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
@@ -250,7 +144,7 @@ type Snapshot struct {
 	SizeBytes int64     `json:"size_bytes"`
 	Saved     bool      `json:"saved"`
 	Name      *string   `json:"name"`
-	Trigger   *string   `json:"trigger"`
+	Trigger   string    `json:"trigger"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -261,21 +155,9 @@ type Team struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type Vm struct {
-	ID                     uuid.UUID          `json:"id"`
-	Name                   string             `json:"name"`
-	Status                 VmStatus           `json:"status"`
-	VcpuCount              int32              `json:"vcpu_count"`
-	MemSizeMib             int32              `json:"mem_size_mib"`
-	IpAddress              *netip.Addr        `json:"ip_address"`
-	HostID                 *string            `json:"host_id"`
-	ParentVmID             pgtype.UUID        `json:"parent_vm_id"`
-	ForkedFromCheckpointID pgtype.UUID        `json:"forked_from_checkpoint_id"`
-	CreatedAt              time.Time          `json:"created_at"`
-	UpdatedAt              time.Time          `json:"updated_at"`
-	DeletedAt              pgtype.Timestamptz `json:"deleted_at"`
-	Metadata               []byte             `json:"metadata"`
-	SnapshotPath           *string            `json:"snapshot_path"`
-	MemFilePath            *string            `json:"mem_file_path"`
-	DiskSizeMib            int32              `json:"disk_size_mib"`
+type TeamMember struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	ProfileID uuid.UUID `json:"profile_id"`
+	Role      string    `json:"role"`
+	JoinedAt  time.Time `json:"joined_at"`
 }

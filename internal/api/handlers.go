@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,9 +12,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // VMDClient defines the subset of the VM daemon gRPC interface used by the
@@ -32,13 +36,15 @@ type VMDClient interface {
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
 	VMD    VMDClient
+	DB     *db.Queries
 	Config *config.Config
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(vmd VMDClient, cfg *config.Config) *Handlers {
+func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handlers {
 	return &Handlers{
 		VMD:    vmd,
+		DB:     queries,
 		Config: cfg,
 	}
 }
