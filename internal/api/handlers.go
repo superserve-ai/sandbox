@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"time"
@@ -330,6 +331,124 @@ func teamIDFromContext(c *gin.Context) (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 	return id, nil
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox lifecycle
+// ---------------------------------------------------------------------------
+
+func (h *Handlers) ResumeSandbox(c *gin.Context) {
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return
+	}
+
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+
+	// Verify sandbox exists and belongs to this team.
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			respondError(c, ErrSandboxNotFound)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Only idle sandboxes can be resumed.
+	if sandbox.Status != db.SandboxStatusIdle {
+		respondError(c, ErrInvalidState)
+		return
+	}
+
+	// Read the snapshot to get paths for VMD.
+	if !sandbox.SnapshotID.Valid {
+		log.Error().Str("sandbox_id", sandboxID.String()).Msg("idle sandbox has no snapshot_id")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), sandbox.SnapshotID.Bytes)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	snapshotPath := snapshot.Path
+	memPath := filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
+
+	// Resume the VM.
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+	defer vmdCancel()
+	ipAddress, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Update sandbox status to active.
+	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+		ID:     sandboxID,
+		Status: db.SandboxStatusActive,
+		TeamID: teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Update host runtime info.
+	ipAddr, _ := netip.ParseAddr(ipAddress)
+	if err := h.DB.UpdateSandboxHost(c.Request.Context(), db.UpdateSandboxHostParams{
+		ID:        sandboxID,
+		HostID:    sandbox.HostID,
+		IpAddress: &ipAddr,
+		TeamID:    teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxHost failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Update last activity.
+	if err := h.DB.UpdateSandboxLastActivity(c.Request.Context(), db.UpdateSandboxLastActivityParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxLastActivity failed")
+		// Non-fatal: continue.
+	}
+
+	// Log activity.
+	actStatus := "success"
+	_, err = h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
+		SandboxID:   sandboxID,
+		TeamID:      teamID,
+		Category:    "sandbox",
+		Action:      "resumed",
+		Status:      &actStatus,
+		SandboxName: &sandbox.Name,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("failed to log resume activity")
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":         sandboxID.String(),
+		"name":       sandbox.Name,
+		"status":     "active",
+		"ip_address": ipAddress,
+	})
 }
 
 // ---------------------------------------------------------------------------
