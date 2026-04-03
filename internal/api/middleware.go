@@ -13,12 +13,13 @@ import (
 )
 
 // APIKeyAuth returns a Gin middleware that validates the X-API-Key header
-// by hashing the provided key and comparing it against the api_keys table.
+// by hashing the provided key and looking it up in the api_key table.
+// On success, sets "team_id" and "api_key_id" in the Gin context.
 func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
-			respondErrorMsg(c, "unauthorized", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
 			c.Abort()
 			return
 		}
@@ -26,18 +27,25 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		hash := sha256.Sum256([]byte(apiKey))
 		keyHash := hex.EncodeToString(hash[:])
 
-		var id string
+		var id, teamID string
 		err := pool.QueryRow(c.Request.Context(),
-			"SELECT id FROM api_keys WHERE key_hash = $1 AND revoked = false AND (expires_at IS NULL OR expires_at > now())",
+			"SELECT id, team_id FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
 			keyHash,
-		).Scan(&id)
+		).Scan(&id, &teamID)
 		if err != nil {
-			respondErrorMsg(c, "unauthorized", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
 			c.Abort()
 			return
 		}
 
+		// Update last_used_at (fire and forget)
+		go func() {
+			_, _ = pool.Exec(c.Request.Context(),
+				"UPDATE api_key SET last_used_at = now() WHERE id = $1", id)
+		}()
+
 		c.Set("api_key_id", id)
+		c.Set("team_id", teamID)
 		c.Next()
 	}
 }
