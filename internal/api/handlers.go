@@ -695,16 +695,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Async: update status to active and log activity.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
-		defer cancel()
-		_ = h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
-			ID:     sandbox.ID,
-			Status: db.SandboxStatusActive,
-			TeamID: teamID,
-		})
-	}()
+	// Update status to active synchronously — callers may immediately pause/exec
+	// after create, so the DB must be consistent before we return.
+	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+		ID:     sandbox.ID,
+		Status: db.SandboxStatusActive,
+		TeamID: teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
+		respondError(c, ErrInternal)
+		return
+	}
 	h.logActivityAsync(sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
 	c.JSON(http.StatusCreated, sandboxResponse{
