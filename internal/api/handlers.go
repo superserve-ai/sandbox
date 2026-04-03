@@ -771,15 +771,30 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	snapshotPath, memPath, err := h.VMD.PauseInstance(vmdCtx, sandboxID.String(), "")
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance failed")
-		// Revert to active on failure.
-		_ = h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
-			ID:     sandboxID,
-			Status: db.SandboxStatusActive,
-			TeamID: teamID,
-		})
+		// Revert status to active asynchronously — we're already on the error path.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
+			defer cancel()
+			if revertErr := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+				ID:     sandboxID,
+				Status: db.SandboxStatusActive,
+				TeamID: teamID,
+			}); revertErr != nil {
+				log.Error().Err(revertErr).Str("sandbox_id", sandboxID.String()).Msg("async revert to active failed")
+			}
+		}()
 		respondError(c, ErrInternal)
 		return
 	}
+
+	// TODO: store memPath in snapshot table (requires adding a mem_path column to the
+	// snapshot schema). For now, ResumeSandbox derives it via
+	// filepath.Join(filepath.Dir(snapshotPath), "mem.snap") by convention.
+	log.Debug().
+		Str("sandbox_id", sandboxID.String()).
+		Str("snapshot_path", snapshotPath).
+		Str("mem_path", memPath).
+		Msg("VMD pause complete")
 
 	// Create snapshot record in DB.
 	triggerName := "pause"
@@ -798,7 +813,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Link snapshot to sandbox and update status to idle.
+	// Link snapshot to sandbox and mark as idle.
 	if err := h.DB.SetSandboxSnapshot(c.Request.Context(), db.SetSandboxSnapshotParams{
 		ID:         sandboxID,
 		SnapshotID: pgtype.UUID{Bytes: snapshot.ID, Valid: true},
@@ -821,8 +836,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 
 	// Async observability.
 	h.logActivityAsync(sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-
-	_ = memPath // memPath stored alongside snapshotPath by convention
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":          sandboxID.String(),
