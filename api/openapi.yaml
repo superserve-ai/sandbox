@@ -222,11 +222,13 @@ paths:
               $ref: "#/components/schemas/ExecRequest"
       responses:
         "200":
-          description: SSE stream of exec output
+          description: >
+            SSE stream. Each line starting with `data: ` contains a JSON
+            `ExecStreamEvent`. The final event has `finished: true`.
           content:
             text/event-stream:
               schema:
-                type: string
+                $ref: "#/components/schemas/ExecStreamEvent"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -326,15 +328,27 @@ components:
   schemas:
     CreateSandboxRequest:
       type: object
+      required: [name, vcpu_count, memory_mib]
       properties:
-        vcpu:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Human-readable name for the sandbox.
+        vcpu_count:
           type: integer
-          default: 1
+          minimum: 1
           description: Number of vCPUs to allocate.
-        mem_mib:
+        memory_mib:
           type: integer
-          default: 1024
+          minimum: 1
           description: Memory in MiB to allocate.
+        from_snapshot:
+          type: string
+          format: uuid
+          description: >
+            If provided, boot the sandbox from this snapshot instead of
+            creating a fresh VM. The snapshot must belong to the same team.
 
     SandboxResponse:
       type: object
@@ -342,12 +356,48 @@ components:
         id:
           type: string
           format: uuid
+        name:
+          type: string
         status:
           type: string
           enum: [starting, active, idle, deleted]
+        vcpu_count:
+          type: integer
+        memory_mib:
+          type: integer
+        ip_address:
+          type: string
+          description: IP address of the running VM (present when status is active).
+        snapshot_id:
+          type: string
+          format: uuid
+          description: ID of the latest snapshot (present after a pause).
         created_at:
           type: string
           format: date-time
+
+    ExecStreamEvent:
+      type: object
+      description: A single SSE event payload emitted by the exec/stream endpoint.
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        stdout:
+          type: string
+          description: Stdout chunk (present when the process wrote to stdout).
+        stderr:
+          type: string
+          description: Stderr chunk (present when the process wrote to stderr).
+        exit_code:
+          type: integer
+          description: Process exit code (present on the final event).
+        finished:
+          type: boolean
+          description: True on the final event.
+        error:
+          type: string
+          description: Error message if the exec itself failed (present on the final event on error).
 
     ExecRequest:
       type: object
