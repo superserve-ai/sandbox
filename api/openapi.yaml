@@ -57,10 +57,34 @@ paths:
                     example: "0.1.0"
 
   /sandboxes:
+    get:
+      operationId: listSandboxes
+      tags: [Sandboxes]
+      summary: List all sandboxes
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: List of sandboxes belonging to the authenticated team
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
     post:
       operationId: createSandbox
       tags: [Sandboxes]
       summary: Create a new sandbox
+      description: |
+        Creates a sandbox and returns immediately with `status: starting`.
+        The VM boots asynchronously. Poll `GET /sandboxes/{id}` until
+        `status` is `active` before running commands.
       security:
         - apiKey: []
       requestBody:
@@ -86,6 +110,26 @@ paths:
   /sandboxes/{sandbox_id}:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
+
+    get:
+      operationId: getSandbox
+      tags: [Sandboxes]
+      summary: Get a sandbox by ID
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Sandbox details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
 
     delete:
       operationId: deleteSandbox
@@ -358,7 +402,7 @@ components:
           type: string
         status:
           type: string
-          enum: [starting, active, idle, deleted]
+          enum: [starting, active, pausing, idle, deleted]
         vcpu_count:
           type: integer
         memory_mib:

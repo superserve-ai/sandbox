@@ -28,6 +28,8 @@ func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 
 		// Sandbox lifecycle (no auto-wake).
 		api.POST("/sandboxes", h.CreateSandbox)
+		api.GET("/sandboxes", h.ListSandboxes)
+		api.GET("/sandboxes/:sandbox_id", h.GetSandboxByID)
 		api.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)

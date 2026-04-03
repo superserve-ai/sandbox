@@ -611,13 +611,85 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID        uuid.UUID `json:"id"`
-	Name      string    `json:"name"`
-	Status    string    `json:"status"`
-	VcpuCount int32     `json:"vcpu_count"`
-	MemoryMib int32     `json:"memory_mib"`
-	IPAddress string    `json:"ip_address,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         uuid.UUID  `json:"id"`
+	Name       string     `json:"name"`
+	Status     string     `json:"status"`
+	VcpuCount  int32      `json:"vcpu_count"`
+	MemoryMib  int32      `json:"memory_mib"`
+	IPAddress  string     `json:"ip_address,omitempty"`
+	SnapshotID *uuid.UUID `json:"snapshot_id,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+func sandboxToResponse(s db.Sandbox) sandboxResponse {
+	resp := sandboxResponse{
+		ID:        s.ID,
+		Name:      s.Name,
+		Status:    string(s.Status),
+		VcpuCount: s.VcpuCount,
+		MemoryMib: s.MemoryMib,
+		CreatedAt: s.CreatedAt,
+	}
+	if s.IpAddress != nil {
+		resp.IPAddress = s.IpAddress.String()
+	}
+	if s.SnapshotID.Valid {
+		id := uuid.UUID(s.SnapshotID.Bytes)
+		resp.SnapshotID = &id
+	}
+	return resp
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox List + Get
+// ---------------------------------------------------------------------------
+
+func (h *Handlers) ListSandboxes(c *gin.Context) {
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+
+	sandboxes, err := h.DB.ListSandboxesByTeam(c.Request.Context(), teamID)
+	if err != nil {
+		log.Error().Err(err).Msg("DB ListSandboxesByTeam failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	out := make([]sandboxResponse, len(sandboxes))
+	for i, s := range sandboxes {
+		out[i] = sandboxToResponse(s)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func (h *Handlers) GetSandboxByID(c *gin.Context) {
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return
+	}
+
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			respondError(c, ErrSandboxNotFound)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	c.JSON(http.StatusOK, sandboxToResponse(sandbox))
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
@@ -672,51 +744,50 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Call VMD to create or resume the VM.
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-
-	var ipAddress string
-	if req.FromSnapshot != nil {
-		ipAddress, err = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
-	} else {
-		ipAddress, err = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
-			uint32(req.VcpuCount), uint32(req.MemoryMib), 0, nil)
-	}
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-		// Mark sandbox as deleted since VM creation failed.
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
-			defer cancel()
-			_ = h.DB.DestroySandbox(ctx, db.DestroySandboxParams{ID: sandbox.ID, TeamID: teamID})
-		}()
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Update status to active synchronously — callers may immediately pause/exec
-	// after create, so the DB must be consistent before we return.
-	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
-		ID:     sandbox.ID,
-		Status: db.SandboxStatusActive,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	h.logActivityAsync(sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
-
+	// Return starting immediately. VMD boot runs in the background; status
+	// transitions to active once the VM confirms it is up.
 	c.JSON(http.StatusCreated, sandboxResponse{
 		ID:        sandbox.ID,
 		Name:      sandbox.Name,
-		Status:    string(db.SandboxStatusActive),
+		Status:    string(db.SandboxStatusStarting),
 		VcpuCount: sandbox.VcpuCount,
 		MemoryMib: sandbox.MemoryMib,
-		IPAddress: ipAddress,
 		CreatedAt: sandbox.CreatedAt,
 	})
+
+	// Launch VM asynchronously.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), vmdTimeout)
+		defer cancel()
+
+		var ipAddress string
+		var vmdErr error
+		if req.FromSnapshot != nil {
+			ipAddress, vmdErr = h.VMD.ResumeInstance(ctx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
+		} else {
+			ipAddress, vmdErr = h.VMD.CreateInstance(ctx, sandbox.ID.String(),
+				uint32(req.VcpuCount), uint32(req.MemoryMib), 0, nil)
+		}
+		if vmdErr != nil {
+			log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
+			_ = h.DB.DestroySandbox(ctx, db.DestroySandboxParams{ID: sandbox.ID, TeamID: teamID})
+			return
+		}
+
+		dbCtx, dbCancel := context.WithTimeout(context.Background(), asyncTimeout)
+		defer dbCancel()
+		if err := h.DB.UpdateSandboxStatus(dbCtx, db.UpdateSandboxStatusParams{
+			ID:     sandbox.ID,
+			Status: db.SandboxStatusActive,
+			TeamID: teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
+			return
+		}
+
+		_ = ipAddress // stored via UpdateSandboxHost when host info is tracked
+		h.logActivityAsync(sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
+	}()
 }
 
 // ---------------------------------------------------------------------------
