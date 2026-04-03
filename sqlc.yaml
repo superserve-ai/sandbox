@@ -16,6 +16,3 @@ sql:
             go_type: "github.com/google/uuid.UUID"
           - db_type: "timestamptz"
             go_type: "time.Time"
-        rename:
-          api_keys: LegacyApiKey
-          api_key: ApiKey

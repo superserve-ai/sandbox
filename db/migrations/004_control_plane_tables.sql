@@ -1,6 +1,5 @@
 -- 004_control_plane_tables.sql
--- Control plane v1 schema: team, api_key (v2), sandbox, snapshot, activity.
--- Replaces the flat api_keys table with a team-scoped model.
+-- Control plane v1 schema: team, api_key, sandbox, snapshot, activity.
 
 CREATE TYPE sandbox_status AS ENUM ('starting', 'active', 'pausing', 'idle', 'deleted');
 
@@ -16,7 +15,7 @@ CREATE TABLE team (
 );
 
 -- =============================================================================
--- API Keys (v2 — team-scoped, with scopes and audit fields)
+-- API Keys
 -- =============================================================================
 
 CREATE TABLE api_key (
