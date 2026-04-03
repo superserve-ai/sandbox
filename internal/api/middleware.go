@@ -1,15 +1,21 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // APIKeyAuth returns a Gin middleware that validates the X-API-Key header
@@ -76,6 +82,102 @@ func RequestLogger() gin.HandlerFunc {
 			Str("client_ip", clientIP).
 			Int("body_size", c.Writer.Size()).
 			Msg("request")
+	}
+}
+
+// AutoWake returns a Gin middleware that transparently resumes paused VMs before
+// forwarding the request. Applied to exec and file endpoints so that callers
+// don't need to explicitly resume idle sandboxes.
+func AutoWake(pool *pgxpool.Pool, vmd VMDClient) gin.HandlerFunc {
+	queries := db.New(pool)
+
+	return func(c *gin.Context) {
+		raw := c.Param("instance_id")
+		instanceID, err := uuid.Parse(raw)
+		if err != nil {
+			// Let the handler deal with the bad ID.
+			c.Next()
+			return
+		}
+
+		ctx := c.Request.Context()
+
+		status, err := queries.GetVMStatus(ctx, instanceID)
+		if err != nil {
+			// VM may not exist; let the handler return the proper error.
+			c.Next()
+			return
+		}
+
+		if status != db.VmStatusPaused {
+			c.Next()
+			return
+		}
+
+		// VM is paused — resume it before the handler runs.
+		pauseState, err := queries.GetVMPauseState(ctx, instanceID)
+		if err != nil {
+			log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("auto-wake: failed to read pause state")
+			respondError(c, ErrInternal)
+			c.Abort()
+			return
+		}
+
+		snapshotPath := ""
+		if pauseState.SnapshotPath != nil {
+			snapshotPath = *pauseState.SnapshotPath
+		}
+		memPath := ""
+		if pauseState.MemFilePath != nil {
+			memPath = *pauseState.MemFilePath
+		}
+
+		vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
+		defer vmdCancel()
+
+		ipAddress, err := vmd.ResumeInstance(vmdCtx, instanceID.String(), snapshotPath, memPath)
+		if err != nil {
+			log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("auto-wake: VMD ResumeInstance failed")
+			respondError(c, ErrInternal)
+			c.Abort()
+			return
+		}
+
+		// Update DB: mark running, clear snapshot paths.
+		var ip *netip.Addr
+		if ipAddress != "" {
+			parsed, err := netip.ParseAddr(ipAddress)
+			if err == nil {
+				ip = &parsed
+			}
+		}
+		if err := queries.ResumeVM(ctx, db.ResumeVMParams{
+			ID:        instanceID,
+			IpAddress: ip,
+		}); err != nil {
+			log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("auto-wake: DB ResumeVM failed")
+			// VM is already resumed in VMD; proceed despite DB error.
+		}
+
+		// Log activity asynchronously to minimize latency.
+		go func() {
+			meta, _ := json.Marshal(map[string]string{"trigger": "auto_wake"})
+			if err := queries.CreateActivity(context.Background(), db.CreateActivityParams{
+				VmID:     instanceID,
+				Category: "sandbox",
+				Action:   "resumed",
+				Metadata: meta,
+			}); err != nil {
+				log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("auto-wake: activity log failed")
+			}
+		}()
+
+		log.Info().
+			Str("instance_id", instanceID.String()).
+			Str("ip_address", ipAddress).
+			Msg("auto-wake: resumed paused instance")
+
+		c.Next()
 	}
 }
 

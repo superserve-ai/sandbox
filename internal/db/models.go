@@ -103,6 +103,15 @@ func (ns NullVmStatus) Value() (driver.Value, error) {
 	return string(ns.VmStatus), nil
 }
 
+type Activity struct {
+	ID        uuid.UUID `json:"id"`
+	VmID      uuid.UUID `json:"vm_id"`
+	Category  string    `json:"category"`
+	Action    string    `json:"action"`
+	Metadata  []byte    `json:"metadata"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type ApiKey struct {
 	ID        uuid.UUID          `json:"id"`
 	KeyHash   string             `json:"key_hash"`

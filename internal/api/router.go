@@ -20,11 +20,12 @@ func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 		api.POST("/instances/:instance_id/pause", h.PauseInstance)
 		api.POST("/instances/:instance_id/resume", h.ResumeInstance)
 
-		api.POST("/instances/:instance_id/exec", h.ExecCommand)
-		api.POST("/instances/:instance_id/exec/stream", h.ExecCommandStream)
-
-		api.PUT("/instances/:instance_id/files/*path", h.UploadFile)
-		api.GET("/instances/:instance_id/files/*path", h.DownloadFile)
+		// Exec and file endpoints auto-wake paused instances.
+		wake := AutoWake(pool, h.VMD)
+		api.POST("/instances/:instance_id/exec", wake, h.ExecCommand)
+		api.POST("/instances/:instance_id/exec/stream", wake, h.ExecCommandStream)
+		api.PUT("/instances/:instance_id/files/*path", wake, h.UploadFile)
+		api.GET("/instances/:instance_id/files/*path", wake, h.DownloadFile)
 	}
 
 	r.GET("/health", h.Health)
