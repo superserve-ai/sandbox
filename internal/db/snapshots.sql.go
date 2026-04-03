@@ -24,7 +24,7 @@ type CreateSnapshotParams struct {
 	SizeBytes int64     `json:"size_bytes"`
 	Saved     bool      `json:"saved"`
 	Name      *string   `json:"name"`
-	Trigger   *string   `json:"trigger"`
+	Trigger   string    `json:"trigger"`
 }
 
 func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) (Snapshot, error) {
