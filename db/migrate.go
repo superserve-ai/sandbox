@@ -70,6 +70,12 @@ func MigrateUp(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
 
+		// Strip goose-style Down section so only the Up SQL is executed.
+		sql := string(data)
+		if idx := strings.Index(sql, "-- +goose Down"); idx >= 0 {
+			sql = sql[:idx]
+		}
+
 		log.Info().Str("migration", name).Msg("applying migration")
 
 		tx, err := pool.Begin(ctx)
@@ -77,7 +83,7 @@ func MigrateUp(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("begin tx for %s: %w", name, err)
 		}
 
-		if _, err := tx.Exec(ctx, string(data)); err != nil {
+		if _, err := tx.Exec(ctx, sql); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("exec migration %s: %w", name, err)
 		}

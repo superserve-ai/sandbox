@@ -1635,7 +1635,7 @@ var File_proto_vmd_proto protoreflect.FileDescriptor
 
 const file_proto_vmd_proto_rawDesc = "" +
 	"\n" +
-	"\x0fproto/vmd.proto\x12\x0fsuperserve.vmd.v1\"\xa8\x01\n" +
+	"\x0fproto/vmd.proto\x12\x11superserve.vmd.v1\"\xa8\x01\n" +
 	"\x0eResourceLimits\x12\x1d\n" +
 	"\n" +
 	"vcpu_count\x18\x01 \x01(\rR\tvcpuCount\x12\x1d\n" +
@@ -1650,17 +1650,17 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\n" +
 	"gateway_ip\x18\x03 \x01(\tR\tgatewayIp\x12\x1d\n" +
 	"\n" +
-	"enable_nat\x18\x04 \x01(\bR\tenableNat\"\xac\x03\n" +
+	"enable_nat\x18\x04 \x01(\bR\tenableNat\"\xb2\x03\n" +
 	"\x0fCreateVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12(\n" +
 	"\x10base_rootfs_path\x18\x02 \x01(\tR\x0ebaseRootfsPath\x12\x1f\n" +
 	"\vkernel_path\x18\x03 \x01(\tR\n" +
 	"kernelPath\x12\x1f\n" +
 	"\vkernel_args\x18\x04 \x01(\tR\n" +
-	"kernelArgs\x12H\n" +
-	"\x0fresource_limits\x18\x05 \x01(\v2\x1f.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12E\n" +
-	"\x0enetwork_config\x18\x06 \x01(\v2\x1e.superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12J\n" +
-	"\bmetadata\x18\a \x03(\v2..superserve.vmd.v1.CreateVMRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"kernelArgs\x12J\n" +
+	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12G\n" +
+	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12L\n" +
+	"\bmetadata\x18\a \x03(\v20.superserve.vmd.v1.CreateVMRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x98\x01\n" +
@@ -1705,26 +1705,26 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xaa\x02\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xae\x02\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12!\n" +
-	"\foverlay_path\x18\x04 \x01(\tR\voverlayPath\x12H\n" +
-	"\x0fresource_limits\x18\x05 \x01(\v2\x1f.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12E\n" +
-	"\x0enetwork_config\x18\x06 \x01(\v2\x1e.superserve.vmd.v1.NetworkConfigR\rnetworkConfig\"\x80\x01\n" +
+	"\foverlay_path\x18\x04 \x01(\tR\voverlayPath\x12J\n" +
+	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12G\n" +
+	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\"\x80\x01\n" +
 	"\x17RestoreSnapshotResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +
 	"socketPath\x12\x1d\n" +
 	"\n" +
 	"ip_address\x18\x03 \x01(\tR\tipAddress\x12\x10\n" +
-	"\x03pid\x18\x04 \x01(\rR\x03pid\"\x99\x02\n" +
+	"\x03pid\x18\x04 \x01(\rR\x03pid\"\x9b\x02\n" +
 	"\x12ExecCommandRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x12\n" +
-	"\x04args\x18\x03 \x03(\tR\x04args\x12>\n" +
-	"\x03env\x18\x04 \x03(\v2,.superserve.vmd.v1.ExecCommandRequest.EnvEntryR\x03env\x12\x1f\n" +
+	"\x04args\x18\x03 \x03(\tR\x04args\x12@\n" +
+	"\x03env\x18\x04 \x03(\v2..superserve.vmd.v1.ExecCommandRequest.EnvEntryR\x03env\x12\x1f\n" +
 	"\vworking_dir\x18\x05 \x01(\tR\n" +
 	"workingDir\x12'\n" +
 	"\x0ftimeout_seconds\x18\x06 \x01(\rR\x0etimeoutSeconds\x1a6\n" +
@@ -1737,25 +1737,25 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\texit_code\x18\x03 \x01(\x05R\bexitCode\x12\x1a\n" +
 	"\bfinished\x18\x04 \x01(\bR\bfinished\"'\n" +
 	"\x10GetVMInfoRequest\x12\x13\n" +
-	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"\xd1\x03\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"\xd7\x03\n" +
 	"\x11GetVMInfoResponse\x12\x13\n" +
-	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x121\n" +
-	"\x06status\x18\x02 \x01(\x0e2\x19.superserve.vmd.v1.VMStatusR\x06status\x12\x1f\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x123\n" +
+	"\x06status\x18\x02 \x01(\x0e2\x1b.superserve.vmd.v1.VMStatusR\x06status\x12\x1f\n" +
 	"\vsocket_path\x18\x03 \x01(\tR\n" +
 	"socketPath\x12\x1d\n" +
 	"\n" +
 	"ip_address\x18\x04 \x01(\tR\tipAddress\x12\x10\n" +
-	"\x03pid\x18\x05 \x01(\rR\x03pid\x12H\n" +
-	"\x0fresource_limits\x18\x06 \x01(\v2\x1f.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12L\n" +
-	"\bmetadata\x18\a \x03(\v20.superserve.vmd.v1.GetVMInfoResponse.MetadataEntryR\bmetadata\x12&\n" +
+	"\x03pid\x18\x05 \x01(\rR\x03pid\x12J\n" +
+	"\x0fresource_limits\x18\x06 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12N\n" +
+	"\bmetadata\x18\a \x03(\v22.superserve.vmd.v1.GetVMInfoResponse.MetadataEntryR\bmetadata\x12&\n" +
 	"\x0fcreated_at_unix\x18\b \x01(\x03R\rcreatedAtUnix\x12%\n" +
 	"\x0euptime_seconds\x18\t \x01(\x03R\ruptimeSeconds\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"q\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"s\n" +
 	"\x13SetupNetworkRequest\x12\x13\n" +
-	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12E\n" +
-	"\x0enetwork_config\x18\x02 \x01(\v2\x1e.superserve.vmd.v1.NetworkConfigR\rnetworkConfig\"\x9f\x01\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12G\n" +
+	"\x0enetwork_config\x18\x02 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\"\x9f\x01\n" +
 	"\x14SetupNetworkResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1d\n" +
 	"\n" +
@@ -1782,20 +1782,20 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x11VM_STATUS_RUNNING\x10\x02\x12\x14\n" +
 	"\x10VM_STATUS_PAUSED\x10\x03\x12\x15\n" +
 	"\x11VM_STATUS_STOPPED\x10\x04\x12\x13\n" +
-	"\x0fVM_STATUS_ERROR\x10\x052\xd9\a\n" +
-	"\bVMDaemon\x12O\n" +
-	"\bCreateVM\x12 .superserve.vmd.v1.CreateVMRequest\x1a!.superserve.vmd.v1.CreateVMResponse\x12R\n" +
-	"\tDestroyVM\x12!.superserve.vmd.v1.DestroyVMRequest\x1a\".superserve.vmd.v1.DestroyVMResponse\x12L\n" +
-	"\aPauseVM\x12\x1f.superserve.vmd.v1.PauseVMRequest\x1a .superserve.vmd.v1.PauseVMResponse\x12O\n" +
-	"\bResumeVM\x12 .superserve.vmd.v1.ResumeVMRequest\x1a!.superserve.vmd.v1.ResumeVMResponse\x12a\n" +
-	"\x0eCreateSnapshot\x12&.superserve.vmd.v1.CreateSnapshotRequest\x1a'.superserve.vmd.v1.CreateSnapshotResponse\x12d\n" +
-	"\x0fRestoreSnapshot\x12'.superserve.vmd.v1.RestoreSnapshotRequest\x1a(.superserve.vmd.v1.RestoreSnapshotResponse\x12Z\n" +
-	"\vExecCommand\x12#.superserve.vmd.v1.ExecCommandRequest\x1a$.superserve.vmd.v1.ExecCommandResponse0\x01\x12R\n" +
-	"\tGetVMInfo\x12!.superserve.vmd.v1.GetVMInfoRequest\x1a\".superserve.vmd.v1.GetVMInfoResponse\x12[\n" +
-	"\fSetupNetwork\x12$.superserve.vmd.v1.SetupNetworkRequest\x1a%.superserve.vmd.v1.SetupNetworkResponse\x12W\n" +
+	"\x0fVM_STATUS_ERROR\x10\x052\x85\b\n" +
+	"\bVMDaemon\x12S\n" +
+	"\bCreateVM\x12\".superserve.vmd.v1.CreateVMRequest\x1a#.superserve.vmd.v1.CreateVMResponse\x12V\n" +
+	"\tDestroyVM\x12#.superserve.vmd.v1.DestroyVMRequest\x1a$.superserve.vmd.v1.DestroyVMResponse\x12P\n" +
+	"\aPauseVM\x12!.superserve.vmd.v1.PauseVMRequest\x1a\".superserve.vmd.v1.PauseVMResponse\x12S\n" +
+	"\bResumeVM\x12\".superserve.vmd.v1.ResumeVMRequest\x1a#.superserve.vmd.v1.ResumeVMResponse\x12e\n" +
+	"\x0eCreateSnapshot\x12(.superserve.vmd.v1.CreateSnapshotRequest\x1a).superserve.vmd.v1.CreateSnapshotResponse\x12h\n" +
+	"\x0fRestoreSnapshot\x12).superserve.vmd.v1.RestoreSnapshotRequest\x1a*.superserve.vmd.v1.RestoreSnapshotResponse\x12^\n" +
+	"\vExecCommand\x12%.superserve.vmd.v1.ExecCommandRequest\x1a&.superserve.vmd.v1.ExecCommandResponse0\x01\x12V\n" +
+	"\tGetVMInfo\x12#.superserve.vmd.v1.GetVMInfoRequest\x1a$.superserve.vmd.v1.GetVMInfoResponse\x12_\n" +
+	"\fSetupNetwork\x12&.superserve.vmd.v1.SetupNetworkRequest\x1a'.superserve.vmd.v1.SetupNetworkResponse\x12[\n" +
 	"\n" +
-	"UploadFile\x12\".superserve.vmd.v1.UploadFileRequest\x1a#.superserve.vmd.v1.UploadFileResponse(\x01\x12Z\n" +
-	"\fDownloadFile\x12$.superserve.vmd.v1.DownloadFileRequest\x1a\".superserve.vmd.v1.DownloadFileChunk0\x01B/Z-github.com/superserve-ai/sandbox/proto/vmdpbb\x06proto3"
+	"UploadFile\x12$.superserve.vmd.v1.UploadFileRequest\x1a%.superserve.vmd.v1.UploadFileResponse(\x01\x12^\n" +
+	"\fDownloadFile\x12&.superserve.vmd.v1.DownloadFileRequest\x1a$.superserve.vmd.v1.DownloadFileChunk0\x01B.Z,github.com/superserve-ai/sandbox/proto/vmdpbb\x06proto3"
 
 var (
 	file_proto_vmd_proto_rawDescOnce sync.Once
