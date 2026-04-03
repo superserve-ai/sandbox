@@ -11,11 +11,6 @@ on:
         options:
           - rayai-dev
           - rayai-prod
-      deploy:
-        description: 'Roll out new image after build'
-        required: false
-        default: 'true'
-        type: boolean
 
   push:
     branches: [main]
@@ -24,17 +19,18 @@ on:
       - 'cmd/boxd/**'
       - 'internal/vm/**'
       - 'internal/network/**'
-      - 'images/base/**'
-      - 'infra/packer/**'
+
+# VMD instances are discovered at deploy time via the GCP label component=vmd.
+# To add a new host to the deploy fleet, label it:
+#   gcloud compute instances add-labels <name> --labels=component=vmd --zone=<zone>
+# No instance names, zones, or IPs are hardcoded here.
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
-    env:
-      REGION: us-central1
 
     steps:
       - uses: actions/checkout@v4
@@ -61,65 +57,105 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Install Packer
-        run: |
-          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-          sudo apt-get update -qq && sudo apt-get install -y packer
-
-      - name: Init Packer
-        working-directory: infra/packer
-        run: packer init agentbox-vmd.pkr.hcl
-
-      - name: Build GCE Image
-        id: packer
-        working-directory: infra/packer
+      - name: Discover VMD instances
+        id: discover
         run: |
           PROJECT="${{ github.event.inputs.project_id || 'rayai-dev' }}"
-          packer build \
-            -var "project_id=${PROJECT}" \
-            agentbox-vmd.pkr.hcl
-          # Retrieve the newly built image name for the rollout step
-          IMAGE=$(gcloud compute images list \
+
+          # Find all RUNNING instances labelled component=vmd.
+          INSTANCES=$(gcloud compute instances list \
             --project="${PROJECT}" \
-            --filter="family=superserve-vmd" \
-            --sort-by=~creationTimestamp \
-            --limit=1 \
-            --format='value(name)')
-          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+            --filter="labels.component=vmd AND status=RUNNING" \
+            --format="csv[no-heading](name,zone)")
+
+          if [[ -z "${INSTANCES}" ]]; then
+            echo "No instances with label component=vmd found in ${PROJECT}" >&2
+            exit 1
+          fi
+
+          echo "Deploying to:"
+          echo "${INSTANCES}"
+
+          # Encode as JSON array [{name, zone}, ...] for the next step.
+          MATRIX=$(echo "${INSTANCES}" | python3 -c "
+          import sys, json
+          rows = [line.strip().split(',') for line in sys.stdin if line.strip()]
+          print(json.dumps([{'name': r[0], 'zone': r[1]} for r in rows]))
+          ")
+
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
           echo "project=${PROJECT}" >> "$GITHUB_OUTPUT"
-          echo "Built image: ${IMAGE}"
 
-      - name: Roll out new image to instance group
-        if: github.event.inputs.deploy != 'false'
+      - name: Deploy to all VMD instances in parallel
+        env:
+          PROJECT: ${{ steps.discover.outputs.project }}
+          MATRIX: ${{ steps.discover.outputs.matrix }}
+          SHA: ${{ github.sha }}
         run: |
-          PROJECT="${{ steps.packer.outputs.project }}"
-          IMAGE="${{ steps.packer.outputs.image }}"
+          python3 - <<'PYEOF'
+          import os, sys, json, subprocess
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
-          # Create a new instance template pointing at the freshly built image
-          TEMPLATE="superserve-vmd-${GITHUB_SHA::8}"
-          gcloud compute instance-templates create "${TEMPLATE}" \
-            --project="${PROJECT}" \
-            --region="${{ env.REGION }}" \
-            --source-instance-template="$(gcloud compute instance-templates list \
-                --project="${PROJECT}" \
-                --filter="name~superserve-vmd" \
-                --sort-by=~creationTimestamp \
-                --limit=1 \
-                --format='value(name)')" \
-            --image="${IMAGE}" \
-            --image-project="${PROJECT}"
+          project   = os.environ['PROJECT']
+          sha       = os.environ['SHA'][:8]
+          instances = json.loads(os.environ['MATRIX'])
 
-          # Rolling replace — one instance at a time, 90s health window
-          gcloud compute instance-groups managed rolling-action start-update superserve-vmd \
-            --project="${PROJECT}" \
-            --region="${{ env.REGION }}" \
-            --version="template=${TEMPLATE}" \
-            --max-unavailable=1 \
-            --max-surge=0
+          def deploy(inst):
+              name = inst['name']
+              zone = inst['zone']
+              tag  = f'{name}/{zone}'
 
-          gcloud compute instance-groups managed wait-until superserve-vmd \
-            --project="${PROJECT}" \
-            --region="${{ env.REGION }}" \
-            --stable \
-            --timeout=600
+              # Upload binaries to a temp path to avoid replacing the running
+              # binary while it is in use.
+              for binary in ('vmd', 'boxd'):
+                  subprocess.run([
+                      'gcloud', 'compute', 'scp',
+                      f'bin/{binary}',
+                      f'{name}:/tmp/{binary}-{sha}',
+                      f'--zone={zone}',
+                      f'--project={project}',
+                      '--quiet',
+                  ], check=True, capture_output=True)
+              print(f'[{tag}] binaries uploaded')
+
+              # Atomically replace and restart.
+              remote_cmd = '; '.join([
+                  f'sudo mv /tmp/vmd-{sha}  /usr/local/bin/vmd',
+                  f'sudo mv /tmp/boxd-{sha} /usr/local/bin/boxd',
+                  'sudo chmod +x /usr/local/bin/vmd /usr/local/bin/boxd',
+                  'sudo systemctl restart superserve-vmd',
+                  'sleep 2',
+                  'sudo systemctl is-active --quiet superserve-vmd',
+              ])
+              result = subprocess.run([
+                  'gcloud', 'compute', 'ssh', name,
+                  f'--zone={zone}',
+                  f'--project={project}',
+                  '--quiet',
+                  '--command', remote_cmd,
+              ], capture_output=True, text=True)
+              if result.returncode != 0:
+                  raise RuntimeError(
+                      f'service not healthy after restart:\n'
+                      f'stdout: {result.stdout}\nstderr: {result.stderr}'
+                  )
+              print(f'[{tag}] superserve-vmd active ✓')
+
+          failed = []
+          with ThreadPoolExecutor(max_workers=len(instances)) as ex:
+              futures = {ex.submit(deploy, inst): inst for inst in instances}
+              for f in as_completed(futures):
+                  inst = futures[f]
+                  tag  = f"{inst['name']}/{inst['zone']}"
+                  try:
+                      f.result()
+                  except Exception as e:
+                      print(f'[{tag}] FAILED: {e}', file=sys.stderr)
+                      failed.append(tag)
+
+          if failed:
+              print(f'\nDeploy failed on: {", ".join(failed)}', file=sys.stderr)
+              sys.exit(1)
+
+          print(f'\nDeployed to {len(instances)} instance(s). sha={sha}')
+          PYEOF
