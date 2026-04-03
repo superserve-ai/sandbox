@@ -8,8 +8,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog/log"
-
-	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // ---------------------------------------------------------------------------
@@ -91,10 +89,11 @@ func (h *Handlers) ExecCommandStream(c *gin.Context) {
 }
 
 // ExecSandboxStream runs a command inside a sandbox and streams output via SSE.
-// It verifies team ownership, auto-wakes idle sandboxes, then streams.
+// The sandbox is loaded and auto-woken by the AutoWake middleware.
 func (h *Handlers) ExecSandboxStream(c *gin.Context) {
-	sandbox := h.getSandboxForExec(c)
+	sandbox := sandboxFromContext(c)
 	if sandbox == nil {
+		respondError(c, ErrInternal)
 		return
 	}
 
@@ -162,15 +161,8 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 
 	durationMs := int32(time.Since(start).Milliseconds())
 
-	// Update last_activity_at (non-fatal).
-	if updateErr := h.DB.UpdateSandboxLastActivity(c.Request.Context(), db.UpdateSandboxLastActivityParams{
-		ID:     sandbox.ID,
-		TeamID: sandbox.TeamID,
-	}); updateErr != nil {
-		log.Error().Err(updateErr).Str("sandbox_id", sandbox.ID.String()).Msg("failed to update last_activity_at")
-	}
-
-	// Log activity (non-fatal).
+	// Async observability writes.
+	h.updateLastActivityAsync(sandbox.ID, sandbox.TeamID)
 	actStatus := "success"
 	if err != nil {
 		actStatus = "error"
@@ -180,17 +172,5 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		"exit_code":   lastExitCode,
 		"duration_ms": durationMs,
 	})
-	_, actErr := h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
-		SandboxID:   sandbox.ID,
-		TeamID:      sandbox.TeamID,
-		Category:    "exec",
-		Action:      "executed",
-		Status:      &actStatus,
-		SandboxName: &sandbox.Name,
-		DurationMs:  &durationMs,
-		Metadata:    metadata,
-	})
-	if actErr != nil {
-		log.Error().Err(actErr).Str("sandbox_id", sandbox.ID.String()).Msg("failed to log exec stream activity")
-	}
+	h.logActivityAsync(sandbox.ID, sandbox.TeamID, "exec", "executed", actStatus, &sandbox.Name, &durationMs, metadata)
 }

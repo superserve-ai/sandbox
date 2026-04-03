@@ -157,8 +157,14 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	})
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
-	r.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
-	r.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
+
+	// Exec routes go through auto-wake middleware.
+	exec := r.Group("/sandboxes/:sandbox_id")
+	exec.Use(h.AutoWake())
+	{
+		exec.POST("/exec", h.ExecSandbox)
+		exec.POST("/exec/stream", h.ExecSandboxStream)
+	}
 	return r
 }
 
