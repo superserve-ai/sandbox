@@ -1345,28 +1345,28 @@ var File_proto_boxd_proto protoreflect.FileDescriptor
 
 const file_proto_boxd_proto_rawDesc = "" +
 	"\n" +
-	"\x10proto/boxd.proto\x12\x10superserve.boxd.v1\"\x8b\x02\n" +
+	"\x10proto/boxd.proto\x12\x12superserve.boxd.v1\"\x8f\x02\n" +
 	"\fStartRequest\x12\x10\n" +
 	"\x03cmd\x18\x01 \x01(\tR\x03cmd\x12\x12\n" +
-	"\x04args\x18\x02 \x03(\tR\x04args\x12<\n" +
-	"\x04envs\x18\x03 \x03(\v2(.superserve.boxd.v1.StartRequest.EnvsEntryR\x04envs\x12\x10\n" +
-	"\x03cwd\x18\x04 \x01(\tR\x03cwd\x12-\n" +
-	"\x03pty\x18\x05 \x01(\v2\x1b.superserve.boxd.v1.PtyConfigR\x03pty\x12\x1d\n" +
+	"\x04args\x18\x02 \x03(\tR\x04args\x12>\n" +
+	"\x04envs\x18\x03 \x03(\v2*.superserve.boxd.v1.StartRequest.EnvsEntryR\x04envs\x12\x10\n" +
+	"\x03cwd\x18\x04 \x01(\tR\x03cwd\x12/\n" +
+	"\x03pty\x18\x05 \x01(\v2\x1d.superserve.boxd.v1.PtyConfigR\x03pty\x12\x1d\n" +
 	"\n" +
 	"timeout_ms\x18\x06 \x01(\rR\ttimeoutMs\x1a7\n" +
 	"\tEnvsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"?\n" +
-	"\tPtyConfig\x122\n" +
-	"\x04size\x18\x01 \x01(\v2\x1e.superserve.boxd.v1.TerminalSizeR\x04size\"6\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"A\n" +
+	"\tPtyConfig\x124\n" +
+	"\x04size\x18\x01 \x01(\v2 .superserve.boxd.v1.TerminalSizeR\x04size\"6\n" +
 	"\fTerminalSize\x12\x12\n" +
 	"\x04cols\x18\x01 \x01(\rR\x04cols\x12\x12\n" +
-	"\x04rows\x18\x02 \x01(\rR\x04rows\"\xed\x01\n" +
-	"\fProcessEvent\x124\n" +
-	"\x05start\x18\x01 \x01(\v2\x1c.superserve.boxd.v1.StartEventH\x00R\x05start\x121\n" +
-	"\x04data\x18\x02 \x01(\v2\x1b.superserve.boxd.v1.DataEventH\x00R\x04data\x12.\n" +
-	"\x03end\x18\x03 \x01(\v2\x1a.superserve.boxd.v1.EndEventH\x00R\x03end\x12;\n" +
-	"\tkeepalive\x18\x04 \x01(\v2\x1b.superserve.boxd.v1.KeepAliveH\x00R\tkeepaliveB\a\n" +
+	"\x04rows\x18\x02 \x01(\rR\x04rows\"\xf5\x01\n" +
+	"\fProcessEvent\x126\n" +
+	"\x05start\x18\x01 \x01(\v2\x1e.superserve.boxd.v1.StartEventH\x00R\x05start\x123\n" +
+	"\x04data\x18\x02 \x01(\v2\x1d.superserve.boxd.v1.DataEventH\x00R\x04data\x120\n" +
+	"\x03end\x18\x03 \x01(\v2\x1c.superserve.boxd.v1.EndEventH\x00R\x03end\x12=\n" +
+	"\tkeepalive\x18\x04 \x01(\v2\x1d.superserve.boxd.v1.KeepAliveH\x00R\tkeepaliveB\a\n" +
 	"\x05event\"\x1e\n" +
 	"\n" +
 	"StartEvent\x12\x10\n" +
@@ -1385,10 +1385,10 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\x10SendInputRequest\x12\x10\n" +
 	"\x03pid\x18\x01 \x01(\rR\x03pid\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\"\x13\n" +
-	"\x11SendInputResponse\"U\n" +
+	"\x11SendInputResponse\"W\n" +
 	"\rResizeRequest\x12\x10\n" +
-	"\x03pid\x18\x01 \x01(\rR\x03pid\x122\n" +
-	"\x04size\x18\x02 \x01(\v2\x1e.superserve.boxd.v1.TerminalSizeR\x04size\"\x10\n" +
+	"\x03pid\x18\x01 \x01(\rR\x03pid\x124\n" +
+	"\x04size\x18\x02 \x01(\v2 .superserve.boxd.v1.TerminalSizeR\x04size\"\x10\n" +
 	"\x0eResizeResponse\"9\n" +
 	"\rSignalRequest\x12\x10\n" +
 	"\x03pid\x18\x01 \x01(\rR\x03pid\x12\x16\n" +
@@ -1403,9 +1403,9 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\x04mode\x18\x04 \x01(\tR\x04mode\x12#\n" +
 	"\rmodified_unix\x18\x05 \x01(\x03R\fmodifiedUnix\"$\n" +
 	"\x0eListDirRequest\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\"H\n" +
-	"\x0fListDirResponse\x125\n" +
-	"\aentries\x18\x01 \x03(\v2\x1b.superserve.boxd.v1.FileEntryR\aentries\"J\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\"J\n" +
+	"\x0fListDirResponse\x127\n" +
+	"\aentries\x18\x01 \x03(\v2\x1d.superserve.boxd.v1.FileEntryR\aentries\"J\n" +
 	"\tFileEntry\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x15\n" +
 	"\x06is_dir\x18\x02 \x01(\bR\x05isDir\x12\x12\n" +
@@ -1419,18 +1419,18 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\vMoveRequest\x12\x16\n" +
 	"\x06source\x18\x01 \x01(\tR\x06source\x12 \n" +
 	"\vdestination\x18\x02 \x01(\tR\vdestination\"\x0e\n" +
-	"\fMoveResponse2\xcb\x02\n" +
-	"\x0eProcessService\x12I\n" +
-	"\x05Start\x12\x1e.superserve.boxd.v1.StartRequest\x1a\x1e.superserve.boxd.v1.ProcessEvent0\x01\x12T\n" +
-	"\tSendInput\x12\".superserve.boxd.v1.SendInputRequest\x1a#.superserve.boxd.v1.SendInputResponse\x12K\n" +
-	"\x06Resize\x12\x1f.superserve.boxd.v1.ResizeRequest\x1a .superserve.boxd.v1.ResizeResponse\x12K\n" +
-	"\x06Signal\x12\x1f.superserve.boxd.v1.SignalRequest\x1a .superserve.boxd.v1.SignalResponse2\x8e\x03\n" +
-	"\x11FilesystemService\x12E\n" +
-	"\x04Stat\x12\x1d.superserve.boxd.v1.StatRequest\x1a\x1e.superserve.boxd.v1.StatResponse\x12N\n" +
-	"\aListDir\x12 .superserve.boxd.v1.ListDirRequest\x1a!.superserve.boxd.v1.ListDirResponse\x12N\n" +
-	"\aMakeDir\x12 .superserve.boxd.v1.MakeDirRequest\x1a!.superserve.boxd.v1.MakeDirResponse\x12K\n" +
-	"\x06Remove\x12\x1f.superserve.boxd.v1.RemoveRequest\x1a .superserve.boxd.v1.RemoveResponse\x12E\n" +
-	"\x04Move\x12\x1d.superserve.boxd.v1.MoveRequest\x1a\x1e.superserve.boxd.v1.MoveResponseB0Z.github.com/superserve-ai/sandbox/proto/boxdpbb\x06proto3"
+	"\fMoveResponse2\xdb\x02\n" +
+	"\x0eProcessService\x12M\n" +
+	"\x05Start\x12 .superserve.boxd.v1.StartRequest\x1a .superserve.boxd.v1.ProcessEvent0\x01\x12X\n" +
+	"\tSendInput\x12$.superserve.boxd.v1.SendInputRequest\x1a%.superserve.boxd.v1.SendInputResponse\x12O\n" +
+	"\x06Resize\x12!.superserve.boxd.v1.ResizeRequest\x1a\".superserve.boxd.v1.ResizeResponse\x12O\n" +
+	"\x06Signal\x12!.superserve.boxd.v1.SignalRequest\x1a\".superserve.boxd.v1.SignalResponse2\xa2\x03\n" +
+	"\x11FilesystemService\x12I\n" +
+	"\x04Stat\x12\x1f.superserve.boxd.v1.StatRequest\x1a .superserve.boxd.v1.StatResponse\x12R\n" +
+	"\aListDir\x12\".superserve.boxd.v1.ListDirRequest\x1a#.superserve.boxd.v1.ListDirResponse\x12R\n" +
+	"\aMakeDir\x12\".superserve.boxd.v1.MakeDirRequest\x1a#.superserve.boxd.v1.MakeDirResponse\x12O\n" +
+	"\x06Remove\x12!.superserve.boxd.v1.RemoveRequest\x1a\".superserve.boxd.v1.RemoveResponse\x12I\n" +
+	"\x04Move\x12\x1f.superserve.boxd.v1.MoveRequest\x1a .superserve.boxd.v1.MoveResponseB/Z-github.com/superserve-ai/sandbox/proto/boxdpbb\x06proto3"
 
 var (
 	file_proto_boxd_proto_rawDescOnce sync.Once
