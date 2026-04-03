@@ -11,9 +11,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // VMDClient defines the subset of the VM daemon gRPC interface used by the
@@ -32,13 +35,15 @@ type VMDClient interface {
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
 	VMD    VMDClient
+	DB     *pgxpool.Pool
 	Config *config.Config
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(vmd VMDClient, cfg *config.Config) *Handlers {
+func NewHandlers(vmd VMDClient, pool *pgxpool.Pool, cfg *config.Config) *Handlers {
 	return &Handlers{
 		VMD:    vmd,
+		DB:     pool,
 		Config: cfg,
 	}
 }
@@ -87,6 +92,133 @@ func (h *Handlers) CreateInstance(c *gin.Context) {
 		"id":     instanceID,
 		"name":   req.Name,
 		"status": "RUNNING",
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox CRUD
+// ---------------------------------------------------------------------------
+
+type createSandboxRequest struct {
+	Name         string  `json:"name" binding:"required,min=1,max=64"`
+	VcpuCount    int32   `json:"vcpu_count" binding:"required,min=1"`
+	MemoryMib    int32   `json:"memory_mib" binding:"required,min=1"`
+	FromSnapshot *string `json:"from_snapshot,omitempty"`
+}
+
+type sandboxResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	VcpuCount int32     `json:"vcpu_count"`
+	MemoryMib int32     `json:"memory_mib"`
+	IPAddress string    `json:"ip_address,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (h *Handlers) CreateSandbox(c *gin.Context) {
+	var req createSandboxRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	teamIDStr, _ := c.Get("team_id")
+	teamID, err := uuid.Parse(teamIDStr.(string))
+	if err != nil {
+		respondError(c, ErrUnauthorized)
+		return
+	}
+
+	queries := db.New(h.DB)
+
+	// If from_snapshot is provided, look up the snapshot.
+	var snapshotID pgtype.UUID
+	var snapshotPath, snapshotMemPath string
+	if req.FromSnapshot != nil {
+		snapUUID, err := uuid.Parse(*req.FromSnapshot)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "Invalid from_snapshot: not a valid UUID", http.StatusBadRequest)
+			return
+		}
+
+		snapshot, err := queries.GetSnapshot(c.Request.Context(), snapUUID)
+		if err != nil {
+			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
+			return
+		}
+
+		// Verify snapshot belongs to the same team.
+		if snapshot.TeamID != teamID {
+			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
+			return
+		}
+
+		snapshotID = pgtype.UUID{Bytes: snapUUID, Valid: true}
+		snapshotPath = snapshot.Path
+		// Derive mem path from snapshot path (convention: same dir, mem file).
+		snapshotMemPath = strings.TrimSuffix(snapshotPath, filepath.Ext(snapshotPath)) + ".mem"
+	}
+
+	// Insert sandbox with status=starting.
+	sandbox, err := queries.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
+		TeamID:     teamID,
+		Name:       req.Name,
+		Status:     db.SandboxStatusStarting,
+		VcpuCount:  req.VcpuCount,
+		MemoryMib:  req.MemoryMib,
+		SnapshotID: snapshotID,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("failed to create sandbox record")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Call VMD to create or resume the VM.
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+	defer vmdCancel()
+
+	var ipAddress string
+	if req.FromSnapshot != nil {
+		ipAddress, err = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
+	} else {
+		ipAddress, err = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
+			uint32(req.VcpuCount), uint32(req.MemoryMib), 0, nil)
+	}
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
+		// Mark sandbox as deleted since VM creation failed.
+		_ = queries.DestroySandbox(c.Request.Context(), sandbox.ID)
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Update status to active.
+	_ = queries.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+		ID:     sandbox.ID,
+		Status: db.SandboxStatusActive,
+	})
+
+	// Log activity.
+	sandboxName := sandbox.Name
+	_, _ = queries.CreateActivity(c.Request.Context(), db.CreateActivityParams{
+		SandboxID:   sandbox.ID,
+		TeamID:      teamID,
+		Category:    "sandbox",
+		Action:      "started",
+		Status:      "success",
+		SandboxName: &sandboxName,
+	})
+
+	c.JSON(http.StatusCreated, sandboxResponse{
+		ID:        sandbox.ID,
+		Name:      sandbox.Name,
+		Status:    string(db.SandboxStatusActive),
+		VcpuCount: sandbox.VcpuCount,
+		MemoryMib: sandbox.MemoryMib,
+		IPAddress: ipAddress,
+		CreatedAt: sandbox.CreatedAt,
 	})
 }
 

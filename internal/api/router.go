@@ -13,6 +13,8 @@ func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 	api := r.Group("/")
 	api.Use(APIKeyAuth(pool))
 	{
+		api.POST("/sandboxes", h.CreateSandbox)
+
 		api.POST("/instances", h.CreateInstance)
 		api.GET("/instances", h.ListInstances)
 		api.GET("/instances/:instance_id", h.GetInstance)

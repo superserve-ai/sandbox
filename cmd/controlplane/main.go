@@ -70,7 +70,7 @@ func run() error {
 
 	// Build handlers and router.
 	vmdClient := newGRPCVMDClient(grpcConn)
-	handlers := api.NewHandlers(vmdClient, cfg)
+	handlers := api.NewHandlers(vmdClient, dbPool, cfg)
 	router := api.SetupRouter(handlers, dbPool)
 
 	// Start HTTP server.

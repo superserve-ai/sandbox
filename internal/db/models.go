@@ -164,15 +164,6 @@ type Activity struct {
 }
 
 type ApiKey struct {
-	ID        uuid.UUID          `json:"id"`
-	KeyHash   string             `json:"key_hash"`
-	Name      string             `json:"name"`
-	CreatedAt time.Time          `json:"created_at"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-	Revoked   bool               `json:"revoked"`
-}
-
-type ApiKey struct {
 	ID         uuid.UUID          `json:"id"`
 	TeamID     uuid.UUID          `json:"team_id"`
 	KeyHash    string             `json:"key_hash"`
