@@ -52,6 +52,116 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
+// asyncTimeout is the deadline for fire-and-forget DB writes.
+const asyncTimeout = 5 * time.Second
+
+// logActivityAsync writes an activity record in a background goroutine.
+func (h *Handlers) logActivityAsync(sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
+		defer cancel()
+		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+			SandboxID:   sandboxID,
+			TeamID:      teamID,
+			Category:    category,
+			Action:      action,
+			Status:      &status,
+			SandboxName: sandboxName,
+			DurationMs:  durationMs,
+			Metadata:    metadata,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msgf("async %s/%s activity log failed", category, action)
+		}
+	}()
+}
+
+// updateLastActivityAsync bumps last_activity_at in a background goroutine.
+func (h *Handlers) updateLastActivityAsync(sandboxID, teamID uuid.UUID) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
+		defer cancel()
+		if err := h.DB.UpdateSandboxLastActivity(ctx, db.UpdateSandboxLastActivityParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async last_activity_at update failed")
+		}
+	}()
+}
+
+// AutoWake returns middleware that loads a sandbox, verifies team ownership, and
+// transparently resumes idle sandboxes. On success it stores *db.Sandbox under
+// the "sandbox" context key for downstream handlers.
+func (h *Handlers) AutoWake() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		sandboxID, err := parseSandboxID(c)
+		if err != nil {
+			c.Abort()
+			return
+		}
+
+		teamID, err := teamIDFromContext(c)
+		if err != nil {
+			c.Abort()
+			return
+		}
+
+		sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				respondError(c, ErrSandboxNotFound)
+			} else {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+				respondError(c, ErrInternal)
+			}
+			c.Abort()
+			return
+		}
+
+		switch sandbox.Status {
+		case db.SandboxStatusActive:
+			// Ready.
+		case db.SandboxStatusIdle:
+			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+			defer vmdCancel()
+			if _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
+				respondError(c, ErrInternal)
+				c.Abort()
+				return
+			}
+			if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+				ID:     sandboxID,
+				Status: db.SandboxStatusActive,
+				TeamID: teamID,
+			}); err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake UpdateSandboxStatus failed")
+				respondError(c, ErrInternal)
+				c.Abort()
+				return
+			}
+		default:
+			respondError(c, ErrInvalidState)
+			c.Abort()
+			return
+		}
+
+		c.Set("sandbox", &sandbox)
+		c.Next()
+	}
+}
+
+// sandboxFromContext retrieves the *db.Sandbox stored by the AutoWake middleware.
+func sandboxFromContext(c *gin.Context) *db.Sandbox {
+	val, _ := c.Get("sandbox")
+	sb, _ := val.(*db.Sandbox)
+	return sb
+}
+
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
@@ -421,28 +531,9 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	// Update last activity.
-	if err := h.DB.UpdateSandboxLastActivity(c.Request.Context(), db.UpdateSandboxLastActivityParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxLastActivity failed")
-		// Non-fatal: continue.
-	}
-
-	// Log activity.
-	actStatus := "success"
-	_, err = h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
-		SandboxID:   sandboxID,
-		TeamID:      teamID,
-		Category:    "sandbox",
-		Action:      "resumed",
-		Status:      &actStatus,
-		SandboxName: &sandbox.Name,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("failed to log resume activity")
-	}
+	// Async observability writes.
+	h.updateLastActivityAsync(sandboxID, teamID)
+	h.logActivityAsync(sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":         sandboxID.String(),
@@ -501,19 +592,8 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	// Log activity.
-	status := "success"
-	_, err = h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
-		SandboxID:   sandboxID,
-		TeamID:      teamID,
-		Category:    "sandbox",
-		Action:      "deleted",
-		Status:      &status,
-		SandboxName: &sandbox.Name,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("failed to log delete activity")
-	}
+	// Async activity log.
+	h.logActivityAsync(sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -530,67 +610,12 @@ type sandboxExecRequest struct {
 	TimeoutS   int               `json:"timeout_s"`
 }
 
-// getSandboxForExec loads a sandbox, verifies ownership & status, and auto-wakes
-// idle sandboxes. Returns the sandbox or writes an error response and returns nil.
-func (h *Handlers) getSandboxForExec(c *gin.Context) *db.Sandbox {
-	sandboxID, err := parseSandboxID(c)
-	if err != nil {
-		return nil
-	}
-
-	teamID, err := teamIDFromContext(c)
-	if err != nil {
-		return nil
-	}
-
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
-			return nil
-		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return nil
-	}
-
-	switch sandbox.Status {
-	case db.SandboxStatusActive:
-		// Ready to exec.
-	case db.SandboxStatusIdle:
-		// Auto-wake: resume the VM.
-		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-		defer vmdCancel()
-		if _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance (auto-wake) failed")
-			respondError(c, ErrInternal)
-			return nil
-		}
-		// Transition status to active.
-		if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
-			ID:     sandboxID,
-			Status: db.SandboxStatusActive,
-			TeamID: teamID,
-		}); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus failed")
-			respondError(c, ErrInternal)
-			return nil
-		}
-	default:
-		respondError(c, ErrInvalidState)
-		return nil
-	}
-
-	return &sandbox
-}
-
 // ExecSandbox runs a command inside a sandbox and returns the result.
+// The sandbox is loaded and auto-woken by the AutoWake middleware.
 func (h *Handlers) ExecSandbox(c *gin.Context) {
-	sandbox := h.getSandboxForExec(c)
+	sandbox := sandboxFromContext(c)
 	if sandbox == nil {
+		respondError(c, ErrInternal)
 		return
 	}
 
@@ -614,34 +639,14 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		return
 	}
 
-	// Update last_activity_at (non-fatal).
-	if err := h.DB.UpdateSandboxLastActivity(c.Request.Context(), db.UpdateSandboxLastActivityParams{
-		ID:     sandbox.ID,
-		TeamID: sandbox.TeamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to update last_activity_at")
-	}
-
-	// Log activity (non-fatal).
-	actStatus := "success"
+	// Async observability writes.
+	h.updateLastActivityAsync(sandbox.ID, sandbox.TeamID)
 	metadata, _ := json.Marshal(map[string]any{
 		"command":     req.Command,
 		"exit_code":   exitCode,
 		"duration_ms": durationMs,
 	})
-	_, err = h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
-		SandboxID:   sandbox.ID,
-		TeamID:      sandbox.TeamID,
-		Category:    "exec",
-		Action:      "executed",
-		Status:      &actStatus,
-		SandboxName: &sandbox.Name,
-		DurationMs:  &durationMs,
-		Metadata:    metadata,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to log exec activity")
-	}
+	h.logActivityAsync(sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
 
 	c.JSON(http.StatusOK, gin.H{
 		"stdout":    stdout,

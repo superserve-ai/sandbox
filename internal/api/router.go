@@ -26,10 +26,17 @@ func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 		api.PUT("/instances/:instance_id/files/*path", h.UploadFile)
 		api.GET("/instances/:instance_id/files/*path", h.DownloadFile)
 
+		// Sandbox lifecycle (no auto-wake).
 		api.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
-		api.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
-		api.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
+
+		// Sandbox exec with auto-wake middleware.
+		sandboxExec := api.Group("/sandboxes/:sandbox_id")
+		sandboxExec.Use(h.AutoWake())
+		{
+			sandboxExec.POST("/exec", h.ExecSandbox)
+			sandboxExec.POST("/exec/stream", h.ExecSandboxStream)
+		}
 	}
 
 	r.GET("/health", h.Health)
