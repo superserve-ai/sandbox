@@ -1,4 +1,4 @@
-.PHONY: build run test test-integration lint clean generate migrate image validate-boot deploy smoke-test seed-apikey up down
+.PHONY: build run test test-integration lint clean generate migrate image validate-boot deploy smoke-test seed-apikey up down ci
 
 # Binary names
 CONTROLPLANE_BIN := bin/controlplane
@@ -95,6 +95,10 @@ deploy:
 
 smoke-test:
 	bash deploy/smoke-test.sh
+
+## CI (runs all checks locally)
+
+ci: lint test build
 
 ## Clean
 
