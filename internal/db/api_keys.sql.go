@@ -13,19 +13,27 @@ import (
 )
 
 const createAPIKey = `-- name: CreateAPIKey :one
-INSERT INTO api_keys (key_hash, name, expires_at)
-VALUES ($1, $2, $3)
-RETURNING id, key_hash, name, created_at, expires_at, revoked
+INSERT INTO api_keys (key_hash, name, expires_at, team_id, scopes)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, key_hash, name, created_at, expires_at, revoked, team_id, scopes, last_used_at
 `
 
 type CreateAPIKeyParams struct {
 	KeyHash   string             `json:"key_hash"`
 	Name      string             `json:"name"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	Scopes    []string           `json:"scopes"`
 }
 
 func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (ApiKey, error) {
-	row := q.db.QueryRow(ctx, createAPIKey, arg.KeyHash, arg.Name, arg.ExpiresAt)
+	row := q.db.QueryRow(ctx, createAPIKey,
+		arg.KeyHash,
+		arg.Name,
+		arg.ExpiresAt,
+		arg.TeamID,
+		arg.Scopes,
+	)
 	var i ApiKey
 	err := row.Scan(
 		&i.ID,
@@ -34,13 +42,18 @@ func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (Api
 		&i.CreatedAt,
 		&i.ExpiresAt,
 		&i.Revoked,
+		&i.TeamID,
+		&i.Scopes,
+		&i.LastUsedAt,
 	)
 	return i, err
 }
 
 const getAPIKeyByHash = `-- name: GetAPIKeyByHash :one
-SELECT id, key_hash, name, created_at, expires_at, revoked FROM api_keys
-WHERE key_hash = $1 AND revoked = false
+SELECT id, key_hash, name, created_at, expires_at, revoked, team_id, scopes, last_used_at FROM api_keys
+WHERE key_hash = $1
+  AND revoked = false
+  AND (expires_at IS NULL OR expires_at > now())
 `
 
 func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (ApiKey, error) {
@@ -53,6 +66,9 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (ApiKey, 
 		&i.CreatedAt,
 		&i.ExpiresAt,
 		&i.Revoked,
+		&i.TeamID,
+		&i.Scopes,
+		&i.LastUsedAt,
 	)
 	return i, err
 }
@@ -65,5 +81,16 @@ WHERE id = $1
 
 func (q *Queries) RevokeAPIKey(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, revokeAPIKey, id)
+	return err
+}
+
+const updateAPIKeyLastUsed = `-- name: UpdateAPIKeyLastUsed :exec
+UPDATE api_keys
+SET last_used_at = now()
+WHERE id = $1
+`
+
+func (q *Queries) UpdateAPIKeyLastUsed(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, updateAPIKeyLastUsed, id)
 	return err
 }

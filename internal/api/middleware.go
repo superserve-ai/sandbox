@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -10,15 +11,21 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // APIKeyAuth returns a Gin middleware that validates the X-API-Key header
-// by hashing the provided key and comparing it against the api_keys table.
+// by hashing the provided key and looking it up in the api_keys table.
+// It checks that the key is not revoked or expired, validates scopes,
+// sets team_id in context, and updates last_used_at.
 func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
+	queries := db.New(pool)
+
 	return func(c *gin.Context) {
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
-			respondErrorMsg(c, "unauthorized", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+			respondError(c, ErrUnauthorized)
 			c.Abort()
 			return
 		}
@@ -26,18 +33,24 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		hash := sha256.Sum256([]byte(apiKey))
 		keyHash := hex.EncodeToString(hash[:])
 
-		var id string
-		err := pool.QueryRow(c.Request.Context(),
-			"SELECT id FROM api_keys WHERE key_hash = $1 AND revoked = false AND (expires_at IS NULL OR expires_at > now())",
-			keyHash,
-		).Scan(&id)
+		key, err := queries.GetAPIKeyByHash(c.Request.Context(), keyHash)
 		if err != nil {
-			respondErrorMsg(c, "unauthorized", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+			respondError(c, ErrUnauthorized)
 			c.Abort()
 			return
 		}
 
-		c.Set("api_key_id", id)
+		c.Set("api_key_id", key.ID.String())
+		c.Set("team_id", key.TeamID.String())
+		c.Set("scopes", key.Scopes)
+
+		// Update last_used_at in the background so it doesn't add latency.
+		// Use context.WithoutCancel so the update isn't cancelled when the
+		// request finishes.
+		go func() {
+			_ = queries.UpdateAPIKeyLastUsed(context.WithoutCancel(c.Request.Context()), key.ID)
+		}()
+
 		c.Next()
 	}
 }
