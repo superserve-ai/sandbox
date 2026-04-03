@@ -57,6 +57,51 @@ func (ns NullCheckpointType) Value() (driver.Value, error) {
 	return string(ns.CheckpointType), nil
 }
 
+type SandboxStatus string
+
+const (
+	SandboxStatusStarting SandboxStatus = "starting"
+	SandboxStatusActive   SandboxStatus = "active"
+	SandboxStatusPausing  SandboxStatus = "pausing"
+	SandboxStatusIdle     SandboxStatus = "idle"
+	SandboxStatusDeleted  SandboxStatus = "deleted"
+)
+
+func (e *SandboxStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = SandboxStatus(s)
+	case string:
+		*e = SandboxStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for SandboxStatus: %T", src)
+	}
+	return nil
+}
+
+type NullSandboxStatus struct {
+	SandboxStatus SandboxStatus `json:"sandbox_status"`
+	Valid         bool          `json:"valid"` // Valid is true if SandboxStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullSandboxStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.SandboxStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.SandboxStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullSandboxStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.SandboxStatus), nil
+}
+
 type VmStatus string
 
 const (
@@ -103,6 +148,21 @@ func (ns NullVmStatus) Value() (driver.Value, error) {
 	return string(ns.VmStatus), nil
 }
 
+type Activity struct {
+	ID          uuid.UUID `json:"id"`
+	SandboxID   uuid.UUID `json:"sandbox_id"`
+	TeamID      uuid.UUID `json:"team_id"`
+	ActorID     *string   `json:"actor_id"`
+	Category    string    `json:"category"`
+	Action      string    `json:"action"`
+	Status      string    `json:"status"`
+	SandboxName *string   `json:"sandbox_name"`
+	DurationMs  *int32    `json:"duration_ms"`
+	Error       *string   `json:"error"`
+	Metadata    []byte    `json:"metadata"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type ApiKey struct {
 	ID        uuid.UUID          `json:"id"`
 	KeyHash   string             `json:"key_hash"`
@@ -110,6 +170,19 @@ type ApiKey struct {
 	CreatedAt time.Time          `json:"created_at"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	Revoked   bool               `json:"revoked"`
+}
+
+type ApiKey struct {
+	ID         uuid.UUID          `json:"id"`
+	TeamID     uuid.UUID          `json:"team_id"`
+	KeyHash    string             `json:"key_hash"`
+	Name       string             `json:"name"`
+	Scopes     []string           `json:"scopes"`
+	CreatedBy  *string            `json:"created_by"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt  time.Time          `json:"created_at"`
 }
 
 type Checkpoint struct {
@@ -150,6 +223,42 @@ type RollbackLog struct {
 	PreRollbackCheckpointID uuid.UUID `json:"pre_rollback_checkpoint_id"`
 	TriggeredBy             *string   `json:"triggered_by"`
 	CreatedAt               time.Time `json:"created_at"`
+}
+
+type Sandbox struct {
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Name           string             `json:"name"`
+	Status         SandboxStatus      `json:"status"`
+	VcpuCount      int32              `json:"vcpu_count"`
+	MemoryMib      int32              `json:"memory_mib"`
+	HostID         *string            `json:"host_id"`
+	IpAddress      *netip.Addr        `json:"ip_address"`
+	Pid            *int32             `json:"pid"`
+	SnapshotID     pgtype.UUID        `json:"snapshot_id"`
+	LastActivityAt pgtype.Timestamptz `json:"last_activity_at"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
+}
+
+type Snapshot struct {
+	ID        uuid.UUID `json:"id"`
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	Path      string    `json:"path"`
+	SizeBytes int64     `json:"size_bytes"`
+	Saved     bool      `json:"saved"`
+	Name      *string   `json:"name"`
+	Trigger   *string   `json:"trigger"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type Team struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Vm struct {
