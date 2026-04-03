@@ -634,7 +634,7 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIntegration_FileUploadDownload(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
+	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"file-box","vcpu_count":1,"memory_mib":512}`)
@@ -642,6 +642,8 @@ func TestIntegration_FileUploadDownload(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
+	sandboxUUID, _ := uuid.Parse(sid)
+	waitForActive(t, sandboxUUID, teamID)
 
 	// Upload.
 	uw := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/home/user/test.txt", apiKey, []byte("hello sandbox file"))
@@ -664,7 +666,7 @@ func TestIntegration_FileUploadDownload(t *testing.T) {
 }
 
 func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
+	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pt-box","vcpu_count":1,"memory_mib":512}`)
@@ -672,6 +674,8 @@ func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
 		t.Fatalf("create: %d", cw.Code)
 	}
 	sid := mustJSON(t, cw)["id"].(string)
+	sandboxUUID, _ := uuid.Parse(sid)
+	waitForActive(t, sandboxUUID, teamID)
 
 	w := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/../../../etc/passwd", apiKey, []byte("x"))
 	if w.Code != http.StatusBadRequest {
