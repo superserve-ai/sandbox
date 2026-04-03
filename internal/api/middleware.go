@@ -4,17 +4,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// APIKeyAuth returns a Gin middleware that validates the X-API-Key header
-// by hashing the provided key and comparing it against the api_keys table.
-func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
+// APIKeyAuth returns a Gin middleware that validates the X-API-Key header.
+// It hashes the key with SHA-256, looks it up in the api_keys table (checking
+// revoked/expired), stores the team_id in the Gin context, and updates
+// last_used_at asynchronously.
+func APIKeyAuth(queries *db.Queries) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
@@ -26,18 +30,44 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		hash := sha256.Sum256([]byte(apiKey))
 		keyHash := hex.EncodeToString(hash[:])
 
-		var id string
-		err := pool.QueryRow(c.Request.Context(),
-			"SELECT id FROM api_keys WHERE key_hash = $1 AND revoked = false AND (expires_at IS NULL OR expires_at > now())",
-			keyHash,
-		).Scan(&id)
+		key, err := queries.GetAPIKeyByHash(c.Request.Context(), keyHash)
 		if err != nil {
 			respondErrorMsg(c, "unauthorized", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
 			c.Abort()
 			return
 		}
 
-		c.Set("api_key_id", id)
+		c.Set("api_key_id", key.ID.String())
+		c.Set("team_id", key.TeamID.String())
+		c.Set("scopes", key.Scopes)
+
+		// Update last_used_at in a background goroutine to avoid adding latency.
+		go func() {
+			_ = queries.TouchAPIKeyLastUsed(c.Request.Context(), key.ID)
+		}()
+
+		c.Next()
+	}
+}
+
+// RequireScope returns a Gin middleware that checks whether the authenticated
+// API key has the required scope. Must be used after APIKeyAuth.
+func RequireScope(scope string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		scopes, exists := c.Get("scopes")
+		if !exists {
+			respondErrorMsg(c, "unauthorized", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+			c.Abort()
+			return
+		}
+
+		scopeList, ok := scopes.([]string)
+		if !ok || (len(scopeList) > 0 && !slices.Contains(scopeList, "*") && !slices.Contains(scopeList, scope)) {
+			respondErrorMsg(c, "forbidden", "API key does not have the required scope.", http.StatusForbidden)
+			c.Abort()
+			return
+		}
+
 		c.Next()
 	}
 }

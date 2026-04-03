@@ -104,12 +104,15 @@ func (ns NullVmStatus) Value() (driver.Value, error) {
 }
 
 type ApiKey struct {
-	ID        uuid.UUID          `json:"id"`
-	KeyHash   string             `json:"key_hash"`
-	Name      string             `json:"name"`
-	CreatedAt time.Time          `json:"created_at"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-	Revoked   bool               `json:"revoked"`
+	ID         uuid.UUID          `json:"id"`
+	KeyHash    string             `json:"key_hash"`
+	Name       string             `json:"name"`
+	CreatedAt  time.Time          `json:"created_at"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	Revoked    bool               `json:"revoked"`
+	TeamID     uuid.UUID          `json:"team_id"`
+	Scopes     []string           `json:"scopes"`
+	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 }
 
 type Checkpoint struct {

@@ -21,6 +21,7 @@ import (
 	"github.com/superserve-ai/sandbox/db"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
+	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -71,7 +72,8 @@ func run() error {
 	// Build handlers and router.
 	vmdClient := newGRPCVMDClient(grpcConn)
 	handlers := api.NewHandlers(vmdClient, cfg)
-	router := api.SetupRouter(handlers, dbPool)
+	queries := dbq.New(dbPool)
+	router := api.SetupRouter(handlers, queries)
 
 	// Start HTTP server.
 	srv := &http.Server{
