@@ -1,0 +1,125 @@
+name: Deploy VMD
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'GCP Project ID'
+        required: true
+        default: 'rayai-dev'
+        type: choice
+        options:
+          - rayai-dev
+          - rayai-prod
+      deploy:
+        description: 'Roll out new image after build'
+        required: false
+        default: 'true'
+        type: boolean
+
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/vmd/**'
+      - 'cmd/boxd/**'
+      - 'internal/vm/**'
+      - 'internal/network/**'
+      - 'images/base/**'
+      - 'infra/packer/**'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REGION: us-central1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build VMD and boxd binaries
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/vmd ./cmd/vmd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/boxd ./cmd/boxd
+          ls -lh bin/
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install Packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -qq && sudo apt-get install -y packer
+
+      - name: Init Packer
+        working-directory: infra/packer
+        run: packer init agentbox-vmd.pkr.hcl
+
+      - name: Build GCE Image
+        id: packer
+        working-directory: infra/packer
+        run: |
+          PROJECT="${{ github.event.inputs.project_id || 'rayai-dev' }}"
+          packer build \
+            -var "project_id=${PROJECT}" \
+            agentbox-vmd.pkr.hcl
+          # Retrieve the newly built image name for the rollout step
+          IMAGE=$(gcloud compute images list \
+            --project="${PROJECT}" \
+            --filter="family=superserve-vmd" \
+            --sort-by=~creationTimestamp \
+            --limit=1 \
+            --format='value(name)')
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "project=${PROJECT}" >> "$GITHUB_OUTPUT"
+          echo "Built image: ${IMAGE}"
+
+      - name: Roll out new image to instance group
+        if: github.event.inputs.deploy != 'false'
+        run: |
+          PROJECT="${{ steps.packer.outputs.project }}"
+          IMAGE="${{ steps.packer.outputs.image }}"
+
+          # Create a new instance template pointing at the freshly built image
+          TEMPLATE="superserve-vmd-${GITHUB_SHA::8}"
+          gcloud compute instance-templates create "${TEMPLATE}" \
+            --project="${PROJECT}" \
+            --region="${{ env.REGION }}" \
+            --source-instance-template="$(gcloud compute instance-templates list \
+                --project="${PROJECT}" \
+                --filter="name~superserve-vmd" \
+                --sort-by=~creationTimestamp \
+                --limit=1 \
+                --format='value(name)')" \
+            --image="${IMAGE}" \
+            --image-project="${PROJECT}"
+
+          # Rolling replace — one instance at a time, 90s health window
+          gcloud compute instance-groups managed rolling-action start-update superserve-vmd \
+            --project="${PROJECT}" \
+            --region="${{ env.REGION }}" \
+            --version="template=${TEMPLATE}" \
+            --max-unavailable=1 \
+            --max-surge=0
+
+          gcloud compute instance-groups managed wait-until superserve-vmd \
+            --project="${PROJECT}" \
+            --region="${{ env.REGION }}" \
+            --stable \
+            --timeout=600
