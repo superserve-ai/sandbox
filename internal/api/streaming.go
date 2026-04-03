@@ -8,6 +8,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // ---------------------------------------------------------------------------
@@ -85,5 +87,110 @@ func (h *Handlers) ExecCommandStream(c *gin.Context) {
 		})
 		fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
 		flusher.Flush()
+	}
+}
+
+// ExecSandboxStream runs a command inside a sandbox and streams output via SSE.
+// It verifies team ownership, auto-wakes idle sandboxes, then streams.
+func (h *Handlers) ExecSandboxStream(c *gin.Context) {
+	sandbox := h.getSandboxForExec(c)
+	if sandbox == nil {
+		return
+	}
+
+	var req streamExecRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.TimeoutS <= 0 {
+		req.TimeoutS = 30
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		respondError(c, ErrInternal)
+		return
+	}
+
+	start := time.Now()
+	var lastExitCode int32
+
+	err := h.VMD.ExecCommandStream(c.Request.Context(), sandbox.ID.String(),
+		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS),
+		func(stdout, stderr []byte, exitCode int32, finished bool) {
+			event := gin.H{
+				"timestamp": time.Now().Format(time.RFC3339Nano),
+			}
+			if len(stdout) > 0 {
+				event["stdout"] = string(stdout)
+			}
+			if len(stderr) > 0 {
+				event["stderr"] = string(stderr)
+			}
+			if finished {
+				event["exit_code"] = exitCode
+				event["finished"] = true
+				lastExitCode = exitCode
+			}
+
+			data, marshalErr := json.Marshal(event)
+			if marshalErr != nil {
+				return
+			}
+
+			fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+			flusher.Flush()
+		})
+
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("streaming sandbox exec failed")
+		errEvent, _ := json.Marshal(gin.H{
+			"error":    err.Error(),
+			"finished": true,
+		})
+		fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
+		flusher.Flush()
+	}
+
+	durationMs := int32(time.Since(start).Milliseconds())
+
+	// Update last_activity_at (non-fatal).
+	if updateErr := h.DB.UpdateSandboxLastActivity(c.Request.Context(), db.UpdateSandboxLastActivityParams{
+		ID:     sandbox.ID,
+		TeamID: sandbox.TeamID,
+	}); updateErr != nil {
+		log.Error().Err(updateErr).Str("sandbox_id", sandbox.ID.String()).Msg("failed to update last_activity_at")
+	}
+
+	// Log activity (non-fatal).
+	actStatus := "success"
+	if err != nil {
+		actStatus = "error"
+	}
+	metadata, _ := json.Marshal(map[string]any{
+		"command":     req.Command,
+		"exit_code":   lastExitCode,
+		"duration_ms": durationMs,
+	})
+	_, actErr := h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
+		SandboxID:   sandbox.ID,
+		TeamID:      sandbox.TeamID,
+		Category:    "exec",
+		Action:      "executed",
+		Status:      &actStatus,
+		SandboxName: &sandbox.Name,
+		DurationMs:  &durationMs,
+		Metadata:    metadata,
+	})
+	if actErr != nil {
+		log.Error().Err(actErr).Str("sandbox_id", sandbox.ID.String()).Msg("failed to log exec stream activity")
 	}
 }

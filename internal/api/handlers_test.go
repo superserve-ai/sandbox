@@ -28,6 +28,7 @@ import (
 type stubVMD struct {
 	destroyFn func(ctx context.Context, id string, force bool) error
 	resumeFn  func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 }
 
 func (s *stubVMD) CreateInstance(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
@@ -45,7 +46,10 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "", nil
 }
-func (s *stubVMD) ExecCommand(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
+func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
+	if s.execFn != nil {
+		return s.execFn(ctx, id, command, args, env, workingDir, timeoutS)
+	}
 	return "", "", 0, nil
 }
 func (s *stubVMD) ExecCommandStream(context.Context, string, string, []string, map[string]string, string, uint32, func([]byte, []byte, int32, bool)) error {
@@ -153,11 +157,17 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	})
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
+	r.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
+	r.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
 	return r
 }
 
 func deleteRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodDelete, "/sandboxes/"+sandboxID, nil)
+}
+
+func sandboxExecReq(sandboxID, body string) *http.Request {
+	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/exec", strings.NewReader(body))
 }
 
 func parseJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
@@ -653,5 +663,220 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ExecSandbox tests
+// ---------------------------------------------------------------------------
+
+func TestExecSandbox_Success(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+
+	var execCalled bool
+	vmd := &stubVMD{
+		execFn: func(_ context.Context, id, command string, args []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
+			execCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("ExecCommand id = %q, want %q", id, sandboxID)
+			}
+			if command != "ls" {
+				t.Errorf("ExecCommand command = %q, want %q", command, "ls")
+			}
+			return "file1\nfile2\n", "", 0, nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"ls","args":["-la"]}`))
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !execCalled {
+		t.Error("VMD.ExecCommand was not called")
+	}
+
+	body := parseJSON(t, w)
+	if body["stdout"] != "file1\nfile2\n" {
+		t.Errorf("stdout = %q, want %q", body["stdout"], "file1\nfile2\n")
+	}
+	if body["exit_code"] != float64(0) {
+		t.Errorf("exit_code = %v, want 0", body["exit_code"])
+	}
+}
+
+func TestExecSandbox_InvalidUUID(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, sandboxExecReq("not-a-uuid", `{"command":"ls"}`))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestExecSandbox_NotFound(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, sandboxExecReq(uuid.New().String(), `{"command":"ls"}`))
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestExecSandbox_MissingCommand(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{}`))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
+
+func TestExecSandbox_InvalidState(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusStarting}
+
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"ls"}`))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusConflict, w.Body.String())
+	}
+}
+
+func TestExecSandbox_AutoWakeIdle(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "idle-sb", Status: db.SandboxStatusIdle}
+
+	var resumeCalled, execCalled bool
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, id, _, _ string) (string, error) {
+			resumeCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("ResumeInstance id = %q, want %q", id, sandboxID)
+			}
+			return "10.0.0.1", nil
+		},
+		execFn: func(_ context.Context, id, command string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
+			execCalled = true
+			return "ok\n", "", 0, nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo","args":["hello"]}`))
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !resumeCalled {
+		t.Error("VMD.ResumeInstance was not called for auto-wake")
+	}
+	if !execCalled {
+		t.Error("VMD.ExecCommand was not called after auto-wake")
+	}
+}
+
+func TestExecSandbox_VMDExecError(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{
+		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
+			return "", "", -1, fmt.Errorf("vmd unreachable")
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"ls"}`))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestExecSandbox_MissingTeamID(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, "").ServeHTTP(w, sandboxExecReq(uuid.New().String(), `{"command":"ls"}`))
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusUnauthorized, w.Body.String())
 	}
 }

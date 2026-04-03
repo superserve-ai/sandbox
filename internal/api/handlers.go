@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -515,4 +516,136 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	c.Status(http.StatusNoContent)
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox Exec
+// ---------------------------------------------------------------------------
+
+type sandboxExecRequest struct {
+	Command    string            `json:"command" binding:"required,min=1"`
+	Args       []string          `json:"args"`
+	Env        map[string]string `json:"env"`
+	WorkingDir string            `json:"working_dir"`
+	TimeoutS   int               `json:"timeout_s"`
+}
+
+// getSandboxForExec loads a sandbox, verifies ownership & status, and auto-wakes
+// idle sandboxes. Returns the sandbox or writes an error response and returns nil.
+func (h *Handlers) getSandboxForExec(c *gin.Context) *db.Sandbox {
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return nil
+	}
+
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return nil
+	}
+
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			respondError(c, ErrSandboxNotFound)
+			return nil
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+		respondError(c, ErrInternal)
+		return nil
+	}
+
+	switch sandbox.Status {
+	case db.SandboxStatusActive:
+		// Ready to exec.
+	case db.SandboxStatusIdle:
+		// Auto-wake: resume the VM.
+		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+		defer vmdCancel()
+		if _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance (auto-wake) failed")
+			respondError(c, ErrInternal)
+			return nil
+		}
+		// Transition status to active.
+		if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+			ID:     sandboxID,
+			Status: db.SandboxStatusActive,
+			TeamID: teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus failed")
+			respondError(c, ErrInternal)
+			return nil
+		}
+	default:
+		respondError(c, ErrInvalidState)
+		return nil
+	}
+
+	return &sandbox
+}
+
+// ExecSandbox runs a command inside a sandbox and returns the result.
+func (h *Handlers) ExecSandbox(c *gin.Context) {
+	sandbox := h.getSandboxForExec(c)
+	if sandbox == nil {
+		return
+	}
+
+	var req sandboxExecRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.TimeoutS <= 0 {
+		req.TimeoutS = 30
+	}
+
+	start := time.Now()
+	stdout, stderr, exitCode, err := h.VMD.ExecCommand(c.Request.Context(), sandbox.ID.String(),
+		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS))
+	durationMs := int32(time.Since(start).Milliseconds())
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Update last_activity_at (non-fatal).
+	if err := h.DB.UpdateSandboxLastActivity(c.Request.Context(), db.UpdateSandboxLastActivityParams{
+		ID:     sandbox.ID,
+		TeamID: sandbox.TeamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to update last_activity_at")
+	}
+
+	// Log activity (non-fatal).
+	actStatus := "success"
+	metadata, _ := json.Marshal(map[string]any{
+		"command":     req.Command,
+		"exit_code":   exitCode,
+		"duration_ms": durationMs,
+	})
+	_, err = h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
+		SandboxID:   sandbox.ID,
+		TeamID:      sandbox.TeamID,
+		Category:    "exec",
+		Action:      "executed",
+		Status:      &actStatus,
+		SandboxName: &sandbox.Name,
+		DurationMs:  &durationMs,
+		Metadata:    metadata,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to log exec activity")
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"stdout":    stdout,
+		"stderr":    stderr,
+		"exit_code": exitCode,
+	})
 }
