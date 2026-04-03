@@ -28,6 +28,8 @@ func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 
 		api.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
+		api.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
+		api.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
 	}
 
 	r.GET("/health", h.Health)
