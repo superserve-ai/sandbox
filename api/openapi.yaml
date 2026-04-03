@@ -3,14 +3,12 @@ info:
   title: Superserve API
   version: 0.1.0
   description: |
-    Superserve is a Firecracker-based sandbox platform. Spin up lightweight
-    micro-VM sandboxes, execute commands, transfer files, and pause/resume
-    them — all through a simple REST API.
+    Superserve provides sandbox infrastructure to run AI Agents in the cloud. Powered by Firecracker MicroVMs.
 
     ## Sandbox lifecycle
 
     ```
-    Create --> active <--> idle (paused) --> deleted
+    starting --> active <--> idle --> deleted
     ```
 
     | Endpoint | What it does |
@@ -18,7 +16,7 @@ info:
     | `POST /sandboxes` | Create a new sandbox |
     | `POST /sandboxes/:id/pause` | Snapshot full state, suspend the VM |
     | `POST /sandboxes/:id/resume` | Restore from snapshot, continue where it left off |
-    | `DELETE /sandboxes/:id` | Destroy sandbox and all resources |
+    | `DELETE /sandboxes/:id` | Delete sandbox and all resources |
 
     ## Sandbox environment
 
@@ -92,12 +90,12 @@ paths:
     delete:
       operationId: deleteSandbox
       tags: [Sandboxes]
-      summary: Destroy a sandbox
+      summary: Delete a sandbox
       security:
         - apiKey: []
       responses:
         "204":
-          description: Sandbox destroyed
+          description: Sandbox deleted
         "404":
           $ref: "#/components/responses/NotFound"
         "401":
@@ -121,7 +119,7 @@ paths:
         - apiKey: []
       responses:
         "200":
-          description: Sandbox is now idle (paused)
+          description: Sandbox is now idle
           content:
             application/json:
               schema:
