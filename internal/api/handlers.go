@@ -11,9 +11,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // VMDClient defines the subset of the VM daemon gRPC interface used by the
@@ -32,13 +34,15 @@ type VMDClient interface {
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
 	VMD    VMDClient
+	DB     *db.Queries
 	Config *config.Config
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(vmd VMDClient, cfg *config.Config) *Handlers {
+func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handlers {
 	return &Handlers{
 		VMD:    vmd,
+		DB:     queries,
 		Config: cfg,
 	}
 }
@@ -299,4 +303,97 @@ func parseInstanceID(c *gin.Context) (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 	return id, nil
+}
+
+func parseSandboxID(c *gin.Context) (uuid.UUID, error) {
+	raw := c.Param("sandbox_id")
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		respondErrorMsg(c, "bad_request",
+			fmt.Sprintf("Invalid sandbox_id: %q is not a valid UUID", raw),
+			http.StatusBadRequest)
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+func teamIDFromContext(c *gin.Context) (uuid.UUID, error) {
+	raw, _ := c.Get("team_id")
+	s, ok := raw.(string)
+	if !ok || s == "" {
+		respondError(c, ErrUnauthorized)
+		return uuid.Nil, fmt.Errorf("missing team_id")
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		respondError(c, ErrUnauthorized)
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox CRUD
+// ---------------------------------------------------------------------------
+
+func (h *Handlers) DeleteSandbox(c *gin.Context) {
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return
+	}
+
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+
+	// Verify sandbox exists and belongs to this team.
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			respondError(c, ErrSandboxNotFound)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Destroy the VM.
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+	defer vmdCancel()
+	if err := h.VMD.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Soft-delete in DB.
+	if err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB DestroySandbox failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Log activity.
+	status := "success"
+	_, err = h.DB.CreateActivity(c.Request.Context(), db.CreateActivityParams{
+		SandboxID:   sandboxID,
+		TeamID:      teamID,
+		Category:    "sandbox",
+		Action:      "deleted",
+		Status:      &status,
+		SandboxName: &sandbox.Name,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("failed to log delete activity")
+	}
+
+	c.Status(http.StatusNoContent)
 }

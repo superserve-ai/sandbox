@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createActivity = `-- name: CreateActivity :one
@@ -18,16 +19,16 @@ RETURNING id, sandbox_id, team_id, actor_id, category, action, status, sandbox_n
 `
 
 type CreateActivityParams struct {
-	SandboxID   uuid.UUID `json:"sandbox_id"`
-	TeamID      uuid.UUID `json:"team_id"`
-	ActorID     *string   `json:"actor_id"`
-	Category    string    `json:"category"`
-	Action      string    `json:"action"`
-	Status      string    `json:"status"`
-	SandboxName *string   `json:"sandbox_name"`
-	DurationMs  *int32    `json:"duration_ms"`
-	Error       *string   `json:"error"`
-	Metadata    []byte    `json:"metadata"`
+	SandboxID   uuid.UUID   `json:"sandbox_id"`
+	TeamID      uuid.UUID   `json:"team_id"`
+	ActorID     pgtype.UUID `json:"actor_id"`
+	Category    string      `json:"category"`
+	Action      string      `json:"action"`
+	Status      *string     `json:"status"`
+	SandboxName *string     `json:"sandbox_name"`
+	DurationMs  *int32      `json:"duration_ms"`
+	Error       *string     `json:"error"`
+	Metadata    []byte      `json:"metadata"`
 }
 
 func (q *Queries) CreateActivity(ctx context.Context, arg CreateActivityParams) (Activity, error) {
