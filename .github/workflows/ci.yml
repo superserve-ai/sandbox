@@ -18,7 +18,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test -short -count=1 -race ./...
+        run: go test -v -short -count=1 -race ./...
 
   integration-tests:
     name: Integration Tests
@@ -48,7 +48,7 @@ jobs:
       - name: Run integration tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
-        run: go test -tags integration -count=1 -race -timeout 10m ./internal/integration/
+        run: go test -v -tags integration -count=1 -race -timeout 10m ./internal/integration/
 
   build:
     name: Build
