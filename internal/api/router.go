@@ -25,6 +25,8 @@ func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 
 		api.PUT("/instances/:instance_id/files/*path", h.UploadFile)
 		api.GET("/instances/:instance_id/files/*path", h.DownloadFile)
+
+		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 	}
 
 	r.GET("/health", h.Health)

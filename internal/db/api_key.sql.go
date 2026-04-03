@@ -23,7 +23,7 @@ type CreateAPIKeyV2Params struct {
 	KeyHash   string             `json:"key_hash"`
 	Name      string             `json:"name"`
 	Scopes    []string           `json:"scopes"`
-	CreatedBy *string            `json:"created_by"`
+	CreatedBy pgtype.UUID        `json:"created_by"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 

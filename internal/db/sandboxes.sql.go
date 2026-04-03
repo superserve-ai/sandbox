@@ -8,6 +8,7 @@ package db
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -66,21 +67,31 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 const destroySandbox = `-- name: DestroySandbox :exec
 UPDATE sandbox
 SET destroyed_at = now(), status = 'deleted', updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
-func (q *Queries) DestroySandbox(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, destroySandbox, id)
+type DestroySandboxParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) error {
+	_, err := q.db.Exec(ctx, destroySandbox, arg.ID, arg.TeamID)
 	return err
 }
 
 const getSandbox = `-- name: GetSandbox :one
 SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at FROM sandbox
-WHERE id = $1 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
-func (q *Queries) GetSandbox(ctx context.Context, id uuid.UUID) (Sandbox, error) {
-	row := q.db.QueryRow(ctx, getSandbox, id)
+type GetSandboxParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, getSandbox, arg.ID, arg.TeamID)
 	var i Sandbox
 	err := row.Scan(
 		&i.ID,
@@ -109,49 +120,8 @@ WHERE status = 'idle'
 ORDER BY last_activity_at ASC
 `
 
-func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt pgtype.Timestamptz) ([]Sandbox, error) {
+func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Time) ([]Sandbox, error) {
 	rows, err := q.db.Query(ctx, listIdleSandboxes, lastActivityAt)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Sandbox{}
-	for rows.Next() {
-		var i Sandbox
-		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.LastActivityAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listSandboxesByStatus = `-- name: ListSandboxesByStatus :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at FROM sandbox
-WHERE status = $1 AND destroyed_at IS NULL
-ORDER BY created_at DESC
-`
-
-func (q *Queries) ListSandboxesByStatus(ctx context.Context, status SandboxStatus) ([]Sandbox, error) {
-	rows, err := q.db.Query(ctx, listSandboxesByStatus, status)
 	if err != nil {
 		return nil, err
 	}
@@ -227,11 +197,16 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 }
 
 const sandboxExists = `-- name: SandboxExists :one
-SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND destroyed_at IS NULL)
+SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL)
 `
 
-func (q *Queries) SandboxExists(ctx context.Context, id uuid.UUID) (bool, error) {
-	row := q.db.QueryRow(ctx, sandboxExists, id)
+type SandboxExistsParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) SandboxExists(ctx context.Context, arg SandboxExistsParams) (bool, error) {
+	row := q.db.QueryRow(ctx, sandboxExists, arg.ID, arg.TeamID)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -240,23 +215,24 @@ func (q *Queries) SandboxExists(ctx context.Context, id uuid.UUID) (bool, error)
 const setSandboxSnapshot = `-- name: SetSandboxSnapshot :exec
 UPDATE sandbox
 SET snapshot_id = $2, updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
 `
 
 type SetSandboxSnapshotParams struct {
 	ID         uuid.UUID   `json:"id"`
 	SnapshotID pgtype.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID   `json:"team_id"`
 }
 
 func (q *Queries) SetSandboxSnapshot(ctx context.Context, arg SetSandboxSnapshotParams) error {
-	_, err := q.db.Exec(ctx, setSandboxSnapshot, arg.ID, arg.SnapshotID)
+	_, err := q.db.Exec(ctx, setSandboxSnapshot, arg.ID, arg.SnapshotID, arg.TeamID)
 	return err
 }
 
 const updateSandboxHost = `-- name: UpdateSandboxHost :exec
 UPDATE sandbox
 SET host_id = $2, ip_address = $3, pid = $4, updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
 `
 
 type UpdateSandboxHostParams struct {
@@ -264,6 +240,7 @@ type UpdateSandboxHostParams struct {
 	HostID    *string     `json:"host_id"`
 	IpAddress *netip.Addr `json:"ip_address"`
 	Pid       *int32      `json:"pid"`
+	TeamID    uuid.UUID   `json:"team_id"`
 }
 
 func (q *Queries) UpdateSandboxHost(ctx context.Context, arg UpdateSandboxHostParams) error {
@@ -272,6 +249,7 @@ func (q *Queries) UpdateSandboxHost(ctx context.Context, arg UpdateSandboxHostPa
 		arg.HostID,
 		arg.IpAddress,
 		arg.Pid,
+		arg.TeamID,
 	)
 	return err
 }
@@ -279,26 +257,32 @@ func (q *Queries) UpdateSandboxHost(ctx context.Context, arg UpdateSandboxHostPa
 const updateSandboxLastActivity = `-- name: UpdateSandboxLastActivity :exec
 UPDATE sandbox
 SET last_activity_at = now(), updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
-func (q *Queries) UpdateSandboxLastActivity(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, updateSandboxLastActivity, id)
+type UpdateSandboxLastActivityParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) UpdateSandboxLastActivity(ctx context.Context, arg UpdateSandboxLastActivityParams) error {
+	_, err := q.db.Exec(ctx, updateSandboxLastActivity, arg.ID, arg.TeamID)
 	return err
 }
 
 const updateSandboxStatus = `-- name: UpdateSandboxStatus :exec
 UPDATE sandbox
 SET status = $2, updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
 `
 
 type UpdateSandboxStatusParams struct {
 	ID     uuid.UUID     `json:"id"`
 	Status SandboxStatus `json:"status"`
+	TeamID uuid.UUID     `json:"team_id"`
 }
 
 func (q *Queries) UpdateSandboxStatus(ctx context.Context, arg UpdateSandboxStatusParams) error {
-	_, err := q.db.Exec(ctx, updateSandboxStatus, arg.ID, arg.Status)
+	_, err := q.db.Exec(ctx, updateSandboxStatus, arg.ID, arg.Status, arg.TeamID)
 	return err
 }
