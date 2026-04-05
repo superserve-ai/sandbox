@@ -1,0 +1,51 @@
+name: CD — Migrate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'db/migrations/**'
+      - 'db/migrate.go'
+      - 'cmd/migrate/**'
+
+jobs:
+  migrate-staging:
+    name: Migrate Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build migrate binary
+        run: go build -o migrate ./cmd/migrate
+
+      - name: Run migrations (staging)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+        run: ./migrate
+
+  migrate-prod:
+    name: Migrate Production
+    runs-on: ubuntu-latest
+    environment: production
+    needs: migrate-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build migrate binary
+        run: go build -o migrate ./cmd/migrate
+
+      - name: Run migrations (production)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+        run: ./migrate
