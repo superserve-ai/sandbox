@@ -1,0 +1,116 @@
+name: Deploy API
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy to a specific environment only'
+        required: false
+        type: choice
+        options:
+          - both
+          - staging
+          - production
+
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/controlplane/**'
+      - 'internal/api/**'
+      - 'internal/config/**'
+      - 'proto/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+
+jobs:
+  deploy-staging:
+    if: github.event.inputs.environment != 'production'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REGION: us-central1
+      PROJECT: rayai-dev
+      SERVICE: superserve-api
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane"
+          docker build --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
+          docker push ${IMAGE}:latest
+          docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run services update ${{ env.SERVICE }} \
+            --image ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --region ${{ env.REGION }} \
+            --project ${{ env.PROJECT }}
+
+      - name: Verify
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE }} --region ${{ env.REGION }} --project ${{ env.PROJECT }} --format 'value(status.url)')
+          echo "Staging: $URL"
+          curl -sf "$URL/health"
+
+  deploy-production:
+    if: github.event.inputs.environment != 'staging'
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REGION: us-central1
+      PROJECT: rayai-prod
+      SERVICE: superserve-api
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane"
+          docker build --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
+          docker push ${IMAGE}:latest
+          docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run services update ${{ env.SERVICE }} \
+            --image ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --region ${{ env.REGION }} \
+            --project ${{ env.PROJECT }}
+
+      - name: Verify
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE }} --region ${{ env.REGION }} --project ${{ env.PROJECT }} --format 'value(status.url)')
+          echo "Production: $URL"
+          curl -sf "$URL/health"
