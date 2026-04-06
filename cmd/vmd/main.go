@@ -122,8 +122,29 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
 
+	// Initialize the TCP egress proxy for domain-based filtering.
+	// The nftables firewall in each sandbox namespace REDIRECTs TCP traffic
+	// to these ports for inspection (HTTP Host header, TLS SNI).
+	const maxConnsPerSandbox = 256
+	egressProxy := network.NewEgressProxy(
+		network.DefaultHTTPProxyPort,
+		network.DefaultTLSProxyPort,
+		network.DefaultOtherProxyPort,
+		maxConnsPerSandbox,
+		log,
+	)
+	mgr.SetEgressProxy(egressProxy)
+	netMgr.SetEgressProxy(egressProxy)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Run the egress proxy in the background. It shuts down when ctx is cancelled.
+	go func() {
+		if err := egressProxy.Start(ctx); err != nil {
+			log.Error().Err(err).Msg("egress proxy exited")
+		}
+	}()
 
 	// Boot a throwaway VM from the base image, snapshot it, and keep the
 	// snapshot on disk. Every subsequent CreateVM restores from this template

@@ -80,10 +80,19 @@ type Manager struct {
 	// Host-level nftables firewall (FORWARD + MASQUERADE + MSS clamping).
 	hostFW *HostFirewall
 
+	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
+	egressProxy *EgressProxy
+
 	// Proxy ports for the TCP egress proxy.
 	httpProxyPort  uint16
 	tlsProxyPort   uint16
 	otherProxyPort uint16
+}
+
+// SetEgressProxy attaches the TCP egress proxy so the manager can remove
+// per-sandbox rules on cleanup. Must be called before any VMs are created.
+func (m *Manager) SetEgressProxy(p *EgressProxy) {
+	m.egressProxy = p
 }
 
 func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger) (*Manager, error) {
@@ -339,6 +348,11 @@ func (m *Manager) CleanupVM(vmID string) {
 	// Remove host-level nftables rules for this VM.
 	if err := m.hostFW.RemoveVM(vmID); err != nil {
 		log.Warn().Err(err).Msg("error removing host firewall rules")
+	}
+
+	// Remove per-sandbox rules and connection limiter entries from the egress proxy.
+	if m.egressProxy != nil {
+		m.egressProxy.RemoveRules(info.HostIP)
 	}
 
 	vethName := fmt.Sprintf("veth-%d", idx)
