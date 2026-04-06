@@ -25,8 +25,8 @@ type RateLimitConfig struct {
 // DefaultRateLimitConfig returns sensible defaults for API rate limiting.
 func DefaultRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
-		Rate:            10,
-		Burst:           20,
+		Rate:            20,
+		Burst:           40,
 		CleanupInterval: 5 * time.Minute,
 		MaxAge:          10 * time.Minute,
 	}
