@@ -101,6 +101,17 @@ jobs:
                   f'sudo mv /tmp/vmd-{sha}  {install_dir}/vmd',
                   f'sudo mv /tmp/boxd-{sha} {install_dir}/boxd',
                   f'sudo chmod +x {install_dir}/vmd {install_dir}/boxd',
+                  # Inject updated boxd into the base rootfs so new VMs get the latest version.
+                  'ROOTFS=$(grep -s "^BASE_ROOTFS_PATH=" /etc/superserve/vmd.env /etc/agentbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2)',
+                  'if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then'
+                  '  MNT=$(mktemp -d) &&'
+                  '  sudo mount -o loop "$ROOTFS" "$MNT" &&'
+                  f'  sudo cp {install_dir}/boxd "$MNT/usr/local/bin/boxd" &&'
+                  '  sudo chmod +x "$MNT/usr/local/bin/boxd" &&'
+                  '  sudo umount "$MNT" &&'
+                  '  rmdir "$MNT" &&'
+                  '  echo "boxd injected into rootfs";'
+                  'fi',
                   f'sudo systemctl restart {service}',
                   'sleep 2',
                   f'sudo systemctl is-active --quiet {service}',
