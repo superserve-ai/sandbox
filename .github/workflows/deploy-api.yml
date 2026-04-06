@@ -27,13 +27,10 @@ jobs:
   deploy-staging:
     if: github.event.inputs.environment != 'production'
     runs-on: ubuntu-latest
+    environment: staging
     permissions:
       contents: read
       id-token: write
-    env:
-      REGION: us-central1
-      PROJECT: rayai-dev
-      SERVICE: superserve-api
     steps:
       - uses: actions/checkout@v4
 
@@ -47,39 +44,35 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
 
       - name: Build and push
         run: |
-          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane"
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane"
           docker build --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
 
       - name: Deploy to Cloud Run
         run: |
-          gcloud run services update ${{ env.SERVICE }} \
-            --image ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --region ${{ env.REGION }} \
-            --project ${{ env.PROJECT }}
+          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
+            --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --region ${{ vars.GCP_REGION }} \
+            --project ${{ vars.GCP_PROJECT }}
 
       - name: Verify
         run: |
-          URL=$(gcloud run services describe ${{ env.SERVICE }} --region ${{ env.REGION }} --project ${{ env.PROJECT }} --format 'value(status.url)')
-          echo "Staging: $URL"
+          URL=$(gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE }} --region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }} --format 'value(status.url)')
           curl -sf "$URL/health"
 
   deploy-production:
     if: github.event.inputs.environment != 'staging'
     needs: [deploy-staging]
     runs-on: ubuntu-latest
+    environment: production
     permissions:
       contents: read
       id-token: write
-    env:
-      REGION: us-central1
-      PROJECT: rayai-prod
-      SERVICE: superserve-api
     steps:
       - uses: actions/checkout@v4
 
@@ -93,24 +86,23 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
 
       - name: Build and push
         run: |
-          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane"
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane"
           docker build --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
 
       - name: Deploy to Cloud Run
         run: |
-          gcloud run services update ${{ env.SERVICE }} \
-            --image ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --region ${{ env.REGION }} \
-            --project ${{ env.PROJECT }}
+          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
+            --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --region ${{ vars.GCP_REGION }} \
+            --project ${{ vars.GCP_PROJECT }}
 
       - name: Verify
         run: |
-          URL=$(gcloud run services describe ${{ env.SERVICE }} --region ${{ env.REGION }} --project ${{ env.PROJECT }} --format 'value(status.url)')
-          echo "Production: $URL"
+          URL=$(gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE }} --region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }} --format 'value(status.url)')
           curl -sf "$URL/health"
