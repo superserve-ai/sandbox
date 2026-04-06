@@ -18,11 +18,6 @@ jobs:
         with:
           version: latest
 
-      - name: Link Supabase project
-        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
-        env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-
       - name: Push migrations to staging
         run: supabase db push --db-url "$DATABASE_URL"
         env:
@@ -39,11 +34,6 @@ jobs:
       - uses: supabase/setup-cli@v1
         with:
           version: latest
-
-      - name: Link Supabase project
-        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
-        env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
       - name: Push migrations to production
         run: supabase db push --db-url "$DATABASE_URL"
