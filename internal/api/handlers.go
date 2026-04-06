@@ -146,6 +146,13 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 				c.Abort()
 				return
 			}
+			// Reapply persisted egress rules — nftables + proxy state are fresh after restore.
+			if err := h.reapplyNetworkConfig(vmdCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake reapply network config failed")
+				respondError(c, ErrInternal)
+				c.Abort()
+				return
+			}
 		default:
 			respondError(c, ErrInvalidState)
 			c.Abort()
@@ -162,6 +169,45 @@ func sandboxFromContext(c *gin.Context) *db.Sandbox {
 	val, _ := c.Get("sandbox")
 	sb, _ := val.(*db.Sandbox)
 	return sb
+}
+
+// persistedEgressConfig mirrors the jsonb shape stored in sandbox.network_config.
+type persistedEgressConfig struct {
+	Egress struct {
+		AllowedCIDRs   []string `json:"allowed_cidrs"`
+		DeniedCIDRs    []string `json:"denied_cidrs"`
+		AllowedDomains []string `json:"allowed_domains"`
+	} `json:"egress"`
+}
+
+// reapplyNetworkConfig reads the sandbox's persisted egress config from the DB
+// record and pushes it back to VMD. Called after every resume path (explicit
+// /resume, AutoWake, post-restore in CreateSandbox) because the nftables rules
+// and proxy state are fresh after a snapshot restore.
+//
+// Uses a caller-supplied context so the caller controls timeout/cancellation.
+// Silently returns nil if there is no persisted config (default allow-all).
+func (h *Handlers) reapplyNetworkConfig(ctx context.Context, sandboxID string, raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var cfg persistedEgressConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return fmt.Errorf("parse persisted network_config: %w", err)
+	}
+
+	if len(cfg.Egress.AllowedCIDRs) == 0 &&
+		len(cfg.Egress.DeniedCIDRs) == 0 &&
+		len(cfg.Egress.AllowedDomains) == 0 {
+		return nil
+	}
+
+	return h.VMD.UpdateSandboxNetwork(ctx, sandboxID,
+		cfg.Egress.AllowedCIDRs,
+		cfg.Egress.DeniedCIDRs,
+		cfg.Egress.AllowedDomains,
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +575,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		TeamID:    teamID,
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxHost failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Reapply persisted egress rules — the nftables rules and proxy state
+	// are fresh after a snapshot restore, so user rules must be re-pushed.
+	if err := h.reapplyNetworkConfig(vmdCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
 		respondError(c, ErrInternal)
 		return
 	}
