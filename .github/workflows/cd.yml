@@ -4,11 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Deploy to a specific environment only'
+        description: 'Target environment'
         required: false
         type: choice
         options:
-          - both
           - staging
           - production
   push:
@@ -19,7 +18,6 @@ on:
 jobs:
   migrate-staging:
     name: Migrate Staging
-    if: github.event.inputs.environment != 'production'
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -36,10 +34,10 @@ jobs:
 
   migrate-prod:
     name: Migrate Production
-    if: github.event.inputs.environment != 'staging'
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
     runs-on: ubuntu-latest
     environment: production
-    needs: migrate-staging
+    needs: [migrate-staging]
     steps:
       - uses: actions/checkout@v4
 
