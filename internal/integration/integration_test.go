@@ -594,7 +594,7 @@ func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 
 func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	ctx := context.Background()
-	_, apiKey := seedTeamAndKey(t)
+	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"exec-box","vcpu_count":1,"memory_mib":512}`)
@@ -602,6 +602,8 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
+	sandboxUUID, _ := uuid.Parse(sid)
+	waitForActive(t, sandboxUUID, teamID)
 
 	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello","timeout_s":5}`)
 	if ew.Code != http.StatusOK {
@@ -902,5 +904,150 @@ func TestIntegration_ConcurrentCreate(t *testing.T) {
 			}
 			seen[res.id] = true
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PUT /sandboxes/:id/network
+// ---------------------------------------------------------------------------
+
+func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter()
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-box","vcpu_count":1,"memory_mib":512}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxUUID, _ := uuid.Parse(sid)
+	waitForActive(t, sandboxUUID, teamID)
+
+	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
+		`{"allow_out":["api.openai.com","8.8.8.8/32"],"deny_out":["0.0.0.0/0"]}`)
+	if nw.Code != http.StatusNoContent {
+		t.Fatalf("update network: expected 204, got %d: %s", nw.Code, nw.Body.String())
+	}
+
+	// Verify config persisted in DB.
+	row, err := testQueries.GetSandboxNetworkConfig(context.Background(), db.GetSandboxNetworkConfigParams{
+		ID:     sandboxUUID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		t.Fatalf("get network config: %v", err)
+	}
+	if row == nil {
+		t.Fatal("network_config is nil after update")
+	}
+}
+
+func TestIntegration_UpdateSandboxNetwork_NotActive(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter()
+
+	// Create sandbox (status = starting, async boot not yet complete).
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-starting","vcpu_count":1,"memory_mib":512}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+
+	// Immediately try to update network — sandbox is still starting.
+	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
+		`{"deny_out":["0.0.0.0/0"]}`)
+	if nw.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for non-active sandbox, got %d: %s", nw.Code, nw.Body.String())
+	}
+}
+
+func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter()
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-invalid","vcpu_count":1,"memory_mib":512}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxUUID, _ := uuid.Parse(sid)
+	waitForActive(t, sandboxUUID, teamID)
+
+	// deny_out with a domain (not a CIDR) should fail validation.
+	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
+		`{"deny_out":["evil.com"]}`)
+	if nw.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for domain in deny_out, got %d: %s", nw.Code, nw.Body.String())
+	}
+}
+
+func TestIntegration_UpdateSandboxNetwork_NotFound(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter()
+
+	nw := do(r, "PUT", "/sandboxes/00000000-0000-0000-0000-000000000000/network", apiKey,
+		`{"deny_out":["0.0.0.0/0"]}`)
+	if nw.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", nw.Code, nw.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /sandboxes with network config
+// ---------------------------------------------------------------------------
+
+func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter()
+
+	cw := do(r, "POST", "/sandboxes", apiKey,
+		`{"name":"net-create","vcpu_count":1,"memory_mib":512,"network":{"allow_out":["api.openai.com"],"deny_out":["0.0.0.0/0"]}}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create with network: %d %s", cw.Code, cw.Body.String())
+	}
+	body := mustJSON(t, cw)
+	if body["status"] != "starting" {
+		t.Errorf("expected status=starting, got %v", body["status"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Security headers
+// ---------------------------------------------------------------------------
+
+func TestIntegration_SecurityHeaders(t *testing.T) {
+	r := newRouter()
+
+	w := do(r, "GET", "/health", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("health: %d", w.Code)
+	}
+	if w.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("missing X-Content-Type-Options: nosniff")
+	}
+	if w.Header().Get("X-Frame-Options") != "DENY" {
+		t.Error("missing X-Frame-Options: DENY")
+	}
+	if w.Header().Get("Strict-Transport-Security") == "" {
+		t.Error("missing Strict-Transport-Security")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+func TestIntegration_RateLimit_Headers(t *testing.T) {
+	r := newRouter()
+
+	w := do(r, "GET", "/health", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("health: %d", w.Code)
+	}
+	if w.Header().Get("RateLimit-Limit") == "" {
+		t.Error("missing RateLimit-Limit header")
+	}
+	if w.Header().Get("RateLimit-Remaining") == "" {
+		t.Error("missing RateLimit-Remaining header")
 	}
 }
