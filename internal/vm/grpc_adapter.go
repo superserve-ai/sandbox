@@ -304,6 +304,37 @@ func (a *GRPCAdapter) DownloadFile(req *vmdpb.DownloadFileRequest, stream grpc.S
 	}
 }
 
+func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.UpdateSandboxNetworkRequest) (*vmdpb.UpdateSandboxNetworkResponse, error) {
+	vmID := req.GetVmId()
+	if vmID == "" {
+		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+
+	egress := req.GetEgress()
+	if egress == nil {
+		return nil, status.Error(codes.InvalidArgument, "egress config is required")
+	}
+
+	// Update nftables rules (non-TCP traffic).
+	if err := a.mgr.netMgr.UpdateFirewallRules(vmID, egress.GetAllowedCidrs(), egress.GetDeniedCidrs()); err != nil {
+		return nil, status.Errorf(codes.Internal, "update firewall rules: %v", err)
+	}
+
+	// Update egress proxy rules (TCP traffic — domain + CIDR filtering).
+	if a.mgr.egressProxy != nil {
+		netInfo := a.mgr.netMgr.GetVMNetInfo(vmID)
+		if netInfo != nil {
+			a.mgr.egressProxy.SetRules(netInfo.HostIP, &network.EgressRules{
+				AllowedCIDRs:   egress.GetAllowedCidrs(),
+				DeniedCIDRs:    egress.GetDeniedCidrs(),
+				AllowedDomains: egress.GetAllowedDomains(),
+			})
+		}
+	}
+
+	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
+}
+
 func vmStatusToProto(s VMStatus) vmdpb.VMStatus {
 	switch s {
 	case StatusCreating:
