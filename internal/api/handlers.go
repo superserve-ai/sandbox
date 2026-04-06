@@ -574,13 +574,15 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	// Destroy the VM.
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	if err := h.VMD.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
-		respondError(c, ErrInternal)
-		return
+	// Destroy the VM (skip if sandbox never booted).
+	if sandbox.Status != db.SandboxStatusFailed {
+		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+		defer vmdCancel()
+		if err := h.VMD.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
+			respondError(c, ErrInternal)
+			return
+		}
 	}
 
 	// Soft-delete in DB.
