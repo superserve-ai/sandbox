@@ -8,7 +8,7 @@ import (
 // SetupRouter creates and configures the Gin router with all route groups.
 func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
-	r.Use(RequestLogger(), ErrorHandler())
+	r.Use(SecurityHeaders(), RateLimit(DefaultRateLimitConfig()), RequestLogger(), ErrorHandler())
 
 	api := r.Group("/")
 	api.Use(APIKeyAuth(pool))
