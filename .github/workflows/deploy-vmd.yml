@@ -93,6 +93,7 @@ jobs:
                       f'--zone={zone}',
                       f'--project={project}',
                       '--quiet',
+                      '--tunnel-through-iap',
                   ], check=True, capture_output=True)
               print(f'[{tag}] binaries uploaded')
 
@@ -107,7 +108,8 @@ jobs:
               r = subprocess.run([
                   'gcloud', 'compute', 'ssh', name,
                   f'--zone={zone}', f'--project={project}',
-                  '--quiet', '--command', remote_cmd,
+                  '--quiet', '--tunnel-through-iap',
+                  '--command', remote_cmd,
               ], capture_output=True, text=True)
               if r.returncode != 0:
                   raise RuntimeError(f'service not healthy: {r.stderr}')
