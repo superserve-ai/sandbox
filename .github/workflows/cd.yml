@@ -2,6 +2,15 @@ name: CD — Migrate
 
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy to a specific environment only'
+        required: false
+        type: choice
+        options:
+          - both
+          - staging
+          - production
   push:
     branches: [main]
     paths:
@@ -10,6 +19,7 @@ on:
 jobs:
   migrate-staging:
     name: Migrate Staging
+    if: github.event.inputs.environment != 'production'
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -26,6 +36,7 @@ jobs:
 
   migrate-prod:
     name: Migrate Production
+    if: github.event.inputs.environment != 'staging'
     runs-on: ubuntu-latest
     environment: production
     needs: migrate-staging
