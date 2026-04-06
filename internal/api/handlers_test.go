@@ -82,6 +82,9 @@ func (s *stubVMD) DownloadFile(ctx context.Context, id, path string) (io.ReadClo
 	}
 	return io.NopCloser(strings.NewReader("file-content")), nil
 }
+func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // Mock DBTX — drives db.Queries without a real database
@@ -1437,6 +1440,9 @@ func (m *mockVMD) DownloadFile(ctx context.Context, instanceID, path string) (io
 		return m.downloadFileFn(ctx, instanceID, path)
 	}
 	return io.NopCloser(strings.NewReader("file-content")), nil
+}
+func (m *mockVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
 }
 
 func newTestHandlers(vmd VMDClient) *Handlers { return &Handlers{VMD: vmd} }

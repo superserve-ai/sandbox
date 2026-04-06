@@ -139,6 +139,9 @@ func (s *stubVMD) UploadFile(_ context.Context, _, _ string, r io.Reader) (int64
 func (s *stubVMD) DownloadFile(_ context.Context, _, _ string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("file-content")), nil
 }
+func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
+}
 
 // seedTeamAndKey inserts a team + API key and returns (teamID, rawKey).
 func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
