@@ -4,11 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Deploy to a specific environment only'
+        description: 'Target environment'
         required: false
         type: choice
         options:
-          - both
           - staging
           - production
 
@@ -25,7 +24,6 @@ on:
 
 jobs:
   deploy-staging:
-    if: github.event.inputs.environment != 'production'
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -66,7 +64,7 @@ jobs:
           curl -sf "$URL/health"
 
   deploy-production:
-    if: github.event.inputs.environment != 'staging'
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
     needs: [deploy-staging]
     runs-on: ubuntu-latest
     environment: production
