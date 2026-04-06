@@ -613,8 +613,6 @@ type networkConfigRequest struct {
 
 type createSandboxRequest struct {
 	Name         string                `json:"name" binding:"required,min=1,max=64"`
-	VcpuCount    int32                 `json:"vcpu_count" binding:"required,min=1"`
-	MemoryMib    int32                 `json:"memory_mib" binding:"required,min=1"`
 	FromSnapshot *string               `json:"from_snapshot,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
 }
@@ -738,13 +736,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		snapshotMemPath = filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
 	}
 
+	// Default template resources (1 vCPU, 512 MiB).
+	const defaultVcpu int32 = 1
+	const defaultMemoryMib int32 = 512
+
 	// Insert sandbox with status=starting.
 	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
 		TeamID:     teamID,
 		Name:       req.Name,
 		Status:     db.SandboxStatusStarting,
-		VcpuCount:  req.VcpuCount,
-		MemoryMib:  req.MemoryMib,
+		VcpuCount:  defaultVcpu,
+		MemoryMib:  defaultMemoryMib,
 		SnapshotID: snapshotID,
 	})
 	if err != nil {
@@ -764,7 +766,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		ipAddress, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
 	} else {
 		ipAddress, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
-			uint32(req.VcpuCount), uint32(req.MemoryMib), 0, nil)
+			uint32(defaultVcpu), uint32(defaultMemoryMib), 0, nil)
 	}
 	if vmdErr != nil {
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")

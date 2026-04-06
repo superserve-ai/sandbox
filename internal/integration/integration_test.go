@@ -224,14 +224,14 @@ func TestIntegration_Auth_HealthNoKeyRequired(t *testing.T) {
 }
 
 func TestIntegration_Auth_MissingKey(t *testing.T) {
-	w := do(newRouter(), "POST", "/sandboxes", "", `{"name":"x","vcpu_count":1,"memory_mib":512}`)
+	w := do(newRouter(), "POST", "/sandboxes", "", `{"name":"x"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
 }
 
 func TestIntegration_Auth_InvalidKey(t *testing.T) {
-	w := do(newRouter(), "POST", "/sandboxes", "sk-does-not-exist", `{"name":"x","vcpu_count":1,"memory_mib":512}`)
+	w := do(newRouter(), "POST", "/sandboxes", "sk-does-not-exist", `{"name":"x"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
@@ -251,7 +251,7 @@ func TestIntegration_Auth_RevokedKey(t *testing.T) {
 		t.Fatalf("revoke key: %v", err)
 	}
 
-	w := do(newRouter(), "POST", "/sandboxes", rawKey, `{"name":"x","vcpu_count":1,"memory_mib":512}`)
+	w := do(newRouter(), "POST", "/sandboxes", rawKey, `{"name":"x"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
@@ -266,7 +266,7 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	w := do(r, "POST", "/sandboxes", apiKey, `{"name":"my-box","vcpu_count":2,"memory_mib":1024}`)
+	w := do(r, "POST", "/sandboxes", apiKey, `{"name":"my-box"}`)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -288,11 +288,11 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sandbox not found in DB: %v", err)
 	}
-	if sb.VcpuCount != 2 {
-		t.Errorf("vcpu_count = %d, want 2", sb.VcpuCount)
+	if sb.VcpuCount != 1 {
+		t.Errorf("vcpu_count = %d, want 1", sb.VcpuCount)
 	}
-	if sb.MemoryMib != 1024 {
-		t.Errorf("memory_mib = %d, want 1024", sb.MemoryMib)
+	if sb.MemoryMib != 512 {
+		t.Errorf("memory_mib = %d, want 512", sb.MemoryMib)
 	}
 }
 
@@ -306,7 +306,7 @@ func TestIntegration_ListSandboxes(t *testing.T) {
 
 	// Create two sandboxes.
 	for i, name := range []string{"list-box-1", "list-box-2"} {
-		cw := do(r, "POST", "/sandboxes", apiKey, fmt.Sprintf(`{"name":%q,"vcpu_count":1,"memory_mib":256}`, name))
+		cw := do(r, "POST", "/sandboxes", apiKey, fmt.Sprintf(`{"name":%q}`, name))
 		if cw.Code != http.StatusCreated {
 			t.Fatalf("create[%d]: %d %s", i, cw.Code, cw.Body.String())
 		}
@@ -339,7 +339,7 @@ func TestIntegration_GetSandbox(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"get-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"get-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -372,7 +372,7 @@ func TestIntegration_ListSandboxes_TeamIsolation(t *testing.T) {
 	r := newRouter()
 
 	// Team A creates a sandbox.
-	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-list-box","vcpu_count":1,"memory_mib":256}`)
+	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-list-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -410,7 +410,7 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pause-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pause-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -459,7 +459,7 @@ func TestIntegration_PauseSandbox_AlreadyIdle(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"idle-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"idle-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -482,7 +482,7 @@ func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"resume-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"resume-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -516,7 +516,7 @@ func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"active-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"active-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -537,7 +537,7 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"del-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"del-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -572,7 +572,7 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"exec-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"exec-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -615,7 +615,7 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"wake-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"wake-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -652,7 +652,7 @@ func TestIntegration_FileUploadDownload(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"file-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"file-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -681,7 +681,7 @@ func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pt-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pt-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -702,7 +702,7 @@ func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 	r := newRouter()
 
 	// Team A creates a sandbox.
-	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"teamA-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"teamA-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -726,7 +726,7 @@ func TestIntegration_TeamIsolation_Exec(t *testing.T) {
 	_, apiKeyB := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-exec","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-exec"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -747,7 +747,7 @@ func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"actlog-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"actlog-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -790,7 +790,7 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pause-log-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pause-log-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -842,7 +842,7 @@ func TestIntegration_ConcurrentCreate(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			w := do(r, "POST", "/sandboxes", apiKey, fmt.Sprintf(`{"name":"concurrent-%d","vcpu_count":1,"memory_mib":256}`, i))
+			w := do(r, "POST", "/sandboxes", apiKey, fmt.Sprintf(`{"name":"concurrent-%d"}`, i))
 			res := result{code: w.Code}
 			if w.Code == http.StatusCreated {
 				var b map[string]interface{}
@@ -878,7 +878,7 @@ func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-box","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -908,7 +908,7 @@ func TestIntegration_UpdateSandboxNetwork_NotActive(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-idle","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-idle"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -931,7 +931,7 @@ func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-invalid","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-invalid"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
@@ -964,7 +964,7 @@ func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey,
-		`{"name":"net-create","vcpu_count":1,"memory_mib":512,"network":{"allow_out":["api.openai.com"],"deny_out":["0.0.0.0/0"]}}`)
+		`{"name":"net-create","network":{"allow_out":["api.openai.com"],"deny_out":["0.0.0.0/0"]}}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create with network: %d %s", cw.Code, cw.Body.String())
 	}

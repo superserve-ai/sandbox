@@ -366,7 +366,7 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		RunDirID:  vmID,
 		Config: VMConfig{
 			VCPU:       1,
-			MemoryMiB:  1024,
+			MemoryMiB:  512,
 			KernelPath: m.cfg.KernelPath,
 			RootfsPath: m.cfg.BaseRootfsPath,
 		},

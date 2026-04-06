@@ -929,8 +929,8 @@ func TestCreateSandbox_Success(t *testing.T) {
 
 	vmd := &stubVMD{
 		createFn: func(_ context.Context, id string, vcpu, memMiB, _ uint32, _ map[string]string) (string, error) {
-			if vcpu != 2 {
-				t.Errorf("vcpu = %d, want 2", vcpu)
+			if vcpu != 1 {
+				t.Errorf("vcpu = %d, want 1", vcpu)
 			}
 			if memMiB != 512 {
 				t.Errorf("memMiB = %d, want 512", memMiB)
@@ -957,7 +957,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox","vcpu_count":2,"memory_mib":512}`))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox"}`))
 
 	if w.Code != http.StatusCreated {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
@@ -998,7 +998,7 @@ func TestCreateSandbox_MissingTeamID(t *testing.T) {
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, "").ServeHTTP(w, createSandboxReq(`{"name":"test","vcpu_count":1,"memory_mib":256}`))
+	setupTestRouter(h, "").ServeHTTP(w, createSandboxReq(`{"name":"test"}`))
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
@@ -1032,7 +1032,7 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb","vcpu_count":1,"memory_mib":256}`))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
 
 	// Creation is synchronous — VMD error returns 500.
 	if w.Code != http.StatusInternalServerError {

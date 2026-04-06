@@ -405,21 +405,13 @@ components:
   schemas:
     CreateSandboxRequest:
       type: object
-      required: [name, vcpu_count, memory_mib]
+      required: [name]
       properties:
         name:
           type: string
           minLength: 1
           maxLength: 64
           description: Human-readable name for the sandbox.
-        vcpu_count:
-          type: integer
-          minimum: 1
-          description: Number of vCPUs to allocate.
-        memory_mib:
-          type: integer
-          minimum: 1
-          description: Memory in MiB to allocate.
         from_snapshot:
           type: string
           format: uuid
