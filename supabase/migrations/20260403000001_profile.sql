@@ -1,4 +1,3 @@
--- +goose Up
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 CREATE TABLE profile (
@@ -14,5 +13,3 @@ CREATE TABLE profile (
     updated_at          timestamptz NOT NULL DEFAULT now()
 );
 
--- +goose Down
-DROP TABLE IF EXISTS profile;

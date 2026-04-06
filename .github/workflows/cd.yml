@@ -4,9 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'db/migrations/**'
-      - 'db/migrate.go'
-      - 'cmd/migrate/**'
+      - 'supabase/migrations/**'
 
 jobs:
   migrate-staging:
@@ -16,18 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: supabase/setup-cli@v1
         with:
-          go-version-file: go.mod
-          cache: true
+          version: latest
 
-      - name: Build migrate binary
-        run: go build -o migrate ./cmd/migrate
+      - name: Link Supabase project
+        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
-      - name: Run migrations (staging)
+      - name: Push migrations to staging
+        run: supabase db push --db-url "$DATABASE_URL"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
-        run: ./migrate
 
   migrate-prod:
     name: Migrate Production
@@ -37,15 +36,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: supabase/setup-cli@v1
         with:
-          go-version-file: go.mod
-          cache: true
+          version: latest
 
-      - name: Build migrate binary
-        run: go build -o migrate ./cmd/migrate
+      - name: Link Supabase project
+        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
-      - name: Run migrations (production)
+      - name: Push migrations to production
+        run: supabase db push --db-url "$DATABASE_URL"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
-        run: ./migrate

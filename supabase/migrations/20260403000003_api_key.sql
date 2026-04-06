@@ -1,4 +1,3 @@
--- +goose Up
 CREATE TABLE api_key (
     id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id      uuid NOT NULL REFERENCES team(id),
@@ -15,5 +14,3 @@ CREATE TABLE api_key (
 CREATE INDEX idx_api_key_team ON api_key(team_id);
 CREATE INDEX idx_api_key_hash_active ON api_key(key_hash) WHERE revoked_at IS NULL;
 
--- +goose Down
-DROP TABLE IF EXISTS api_key;

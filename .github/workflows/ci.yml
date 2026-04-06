@@ -78,3 +78,22 @@ jobs:
 
       - name: Go vet
         run: go vet ./...
+
+  sqlc-check:
+    name: sqlc Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: sqlc-dev/setup-sqlc@v4
+        with:
+          sqlc-version: '1.30.0'
+
+      - name: Verify sqlc generated code is up to date
+        run: |
+          sqlc generate
+          if ! git diff --quiet --exit-code; then
+            echo "::error::sqlc generated code is out of date. Run 'sqlc generate' and commit the result."
+            git diff
+            exit 1
+          fi

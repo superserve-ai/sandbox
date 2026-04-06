@@ -1,4 +1,3 @@
--- +goose Up
 CREATE TABLE team (
     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name       text NOT NULL UNIQUE,
@@ -16,6 +15,3 @@ CREATE TABLE team_member (
 
 CREATE INDEX idx_team_member_profile ON team_member(profile_id);
 
--- +goose Down
-DROP TABLE IF EXISTS team_member;
-DROP TABLE IF EXISTS team;

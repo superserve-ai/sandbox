@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -22,7 +24,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	dbmigrate "github.com/superserve-ai/sandbox/db"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -61,13 +62,52 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	if err := dbmigrate.MigrateUp(ctx, testPool); err != nil {
+	if err := applyMigrations(ctx, testPool); err != nil {
 		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	testQueries = db.New(testPool)
 	os.Exit(m.Run())
+}
+
+// applyMigrations reads SQL files from supabase/migrations/ and executes them
+// in order against the test database. Uses IF NOT EXISTS / OR REPLACE so it is
+// safe to run repeatedly against the same database.
+func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+	// Walk up from the test file to the repo root (contains supabase/).
+	dir, _ := os.Getwd()
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "supabase", "migrations")); err == nil {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return fmt.Errorf("could not find supabase/migrations from %s", dir)
+		}
+		dir = parent
+	}
+
+	entries, err := os.ReadDir(filepath.Join(dir, "supabase", "migrations"))
+	if err != nil {
+		return fmt.Errorf("read migrations dir: %w", err)
+	}
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "supabase", "migrations", e.Name()))
+		if err != nil {
+			return fmt.Errorf("read %s: %w", e.Name(), err)
+		}
+		if _, err := pool.Exec(ctx, string(data)); err != nil {
+			return fmt.Errorf("exec %s: %w", e.Name(), err)
+		}
+	}
+	return nil
 }
 
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible

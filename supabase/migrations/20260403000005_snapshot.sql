@@ -1,4 +1,3 @@
--- +goose Up
 CREATE TABLE snapshot (
     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     sandbox_id uuid NOT NULL REFERENCES sandbox(id),
@@ -20,6 +19,3 @@ ALTER TABLE sandbox
 CREATE INDEX idx_snapshot_sandbox ON snapshot(sandbox_id, created_at DESC);
 CREATE INDEX idx_snapshot_team_saved ON snapshot(team_id, created_at DESC) WHERE saved = true;
 
--- +goose Down
-ALTER TABLE sandbox DROP CONSTRAINT IF EXISTS fk_sandbox_snapshot;
-DROP TABLE IF EXISTS snapshot;

@@ -1,4 +1,3 @@
--- +goose Up
 CREATE TABLE device_code (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     device_code text NOT NULL UNIQUE,
@@ -11,5 +10,3 @@ CREATE TABLE device_code (
     CONSTRAINT device_code_status_check CHECK (status IN ('pending', 'approved', 'denied', 'expired'))
 );
 
--- +goose Down
-DROP TABLE IF EXISTS device_code;

@@ -1,4 +1,3 @@
--- +goose Up
 CREATE TYPE sandbox_status AS ENUM (
     'starting', 'active', 'pausing', 'idle', 'deleted'
 );
@@ -28,6 +27,3 @@ CREATE INDEX idx_sandbox_status ON sandbox(status) WHERE destroyed_at IS NULL;
 CREATE INDEX idx_sandbox_team_status ON sandbox(team_id, status) WHERE destroyed_at IS NULL;
 CREATE INDEX idx_sandbox_last_activity ON sandbox(last_activity_at) WHERE status = 'active';
 
--- +goose Down
-DROP TABLE IF EXISTS sandbox;
-DROP TYPE IF EXISTS sandbox_status;

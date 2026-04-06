@@ -18,7 +18,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/superserve-ai/sandbox/db"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
@@ -53,11 +52,6 @@ func run() error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 	log.Info().Msg("connected to database")
-
-	// Apply migrations.
-	if err := db.MigrateUp(ctx, dbPool); err != nil {
-		return fmt.Errorf("run migrations: %w", err)
-	}
 
 	// Connect to VMD via gRPC.
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
