@@ -770,7 +770,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if vmdErr != nil {
 			log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-			_ = h.DB.DestroySandbox(ctx, db.DestroySandboxParams{ID: sandbox.ID, TeamID: teamID})
+			_ = h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+				ID:     sandbox.ID,
+				Status: db.SandboxStatusFailed,
+				TeamID: teamID,
+			})
 			return
 		}
 
