@@ -89,7 +89,7 @@ func main() {
 		Msg("starting VM daemon")
 
 	// Validate required system tools are available.
-	for _, tool := range []string{"ip", "unshare", "sh", "mount", "cp", "iptables"} {
+	for _, tool := range []string{"ip", "unshare", "sh", "mount", "cp", "sysctl"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			log.Fatal().Str("tool", tool).Msg("required system tool not found in PATH")
 		}
@@ -103,7 +103,11 @@ func main() {
 	}
 
 	// Initialize the network manager.
-	netMgr := network.NewManager(cfg.HostInterface, log)
+	netMgr, err := network.NewManager(context.Background(), cfg.HostInterface, log)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize network manager")
+	}
+	defer netMgr.Close()
 
 	// Initialize the VM manager.
 	mgr, err := vm.NewManager(vm.ManagerConfig{
