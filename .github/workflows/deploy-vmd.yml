@@ -1,0 +1,133 @@
+name: Deploy VMD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/vmd/**'
+      - 'cmd/boxd/**'
+      - 'internal/vm/**'
+      - 'internal/network/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build VMD and boxd binaries
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/vmd ./cmd/vmd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/boxd ./cmd/boxd
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Discover and deploy to VMD instances
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_SERVICE: ${{ vars.VMD_SERVICE }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys, json, subprocess
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          project     = os.environ['GCP_PROJECT']
+          label       = os.environ.get('VMD_LABEL', 'component=vmd')
+          service     = os.environ.get('VMD_SERVICE', 'vmd')
+          install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
+          sha         = os.environ['SHA'][:8]
+
+          # Discover instances by label.
+          result = subprocess.run([
+              'gcloud', 'compute', 'instances', 'list',
+              f'--project={project}',
+              f'--filter=labels.{label} AND status=RUNNING',
+              '--format=csv[no-heading](name,zone)',
+          ], capture_output=True, text=True, check=True)
+
+          instances = [
+              {'name': r[0], 'zone': r[1]}
+              for line in result.stdout.strip().splitlines()
+              if line.strip()
+              for r in [line.strip().split(',')]
+          ]
+
+          if not instances:
+              print(f'No instances with label {label} found in {project}', file=sys.stderr)
+              sys.exit(1)
+
+          print(f'Deploying to {len(instances)} instance(s)')
+
+          def deploy(inst):
+              name, zone = inst['name'], inst['zone']
+              tag = f'{name}/{zone}'
+
+              for binary in ('vmd', 'boxd'):
+                  subprocess.run([
+                      'gcloud', 'compute', 'scp',
+                      f'bin/{binary}',
+                      f'{name}:/tmp/{binary}-{sha}',
+                      f'--zone={zone}',
+                      f'--project={project}',
+                      '--quiet',
+                  ], check=True, capture_output=True)
+              print(f'[{tag}] binaries uploaded')
+
+              remote_cmd = '; '.join([
+                  f'sudo mv /tmp/vmd-{sha}  {install_dir}/vmd',
+                  f'sudo mv /tmp/boxd-{sha} {install_dir}/boxd',
+                  f'sudo chmod +x {install_dir}/vmd {install_dir}/boxd',
+                  f'sudo systemctl restart {service}',
+                  'sleep 2',
+                  f'sudo systemctl is-active --quiet {service}',
+              ])
+              r = subprocess.run([
+                  'gcloud', 'compute', 'ssh', name,
+                  f'--zone={zone}', f'--project={project}',
+                  '--quiet', '--command', remote_cmd,
+              ], capture_output=True, text=True)
+              if r.returncode != 0:
+                  raise RuntimeError(f'service not healthy: {r.stderr}')
+              print(f'[{tag}] active')
+
+          failed = []
+          with ThreadPoolExecutor(max_workers=len(instances)) as ex:
+              futures = {ex.submit(deploy, inst): inst for inst in instances}
+              for f in as_completed(futures):
+                  inst = futures[f]
+                  try:
+                      f.result()
+                  except Exception as e:
+                      tag = f"{inst['name']}/{inst['zone']}"
+                      print(f'[{tag}] FAILED: {e}', file=sys.stderr)
+                      failed.append(tag)
+
+          if failed:
+              print(f'Deploy failed on: {", ".join(failed)}', file=sys.stderr)
+              sys.exit(1)
+
+          print(f'Deployed to {len(instances)} instance(s). sha={sha}')
+          PYEOF
