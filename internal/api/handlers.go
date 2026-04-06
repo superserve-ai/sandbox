@@ -753,87 +753,80 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Return starting immediately. VMD boot runs in the background; status
-	// transitions to active once the VM confirms it is up.
+	// Boot the VM synchronously — the client gets a response only after
+	// the sandbox is fully running and ready to use.
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+	defer vmdCancel()
+
+	var ipAddress string
+	var vmdErr error
+	if req.FromSnapshot != nil {
+		ipAddress, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
+	} else {
+		ipAddress, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
+			uint32(req.VcpuCount), uint32(req.MemoryMib), 0, nil)
+	}
+	if vmdErr != nil {
+		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
+		_ = h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+			ID:     sandbox.ID,
+			Status: db.SandboxStatusFailed,
+			TeamID: teamID,
+		})
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Mark active in DB.
+	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+		ID:     sandbox.ID,
+		Status: db.SandboxStatusActive,
+		TeamID: teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
+	}
+
+	_ = ipAddress // stored via UpdateSandboxHost when host info is tracked
+
+	// Apply network rules if provided at creation.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		var allowedCIDRs, allowedDomains []string
+		for _, entry := range req.Network.AllowOut {
+			if isIPOrCIDR(entry) {
+				allowedCIDRs = append(allowedCIDRs, entry)
+			} else {
+				allowedDomains = append(allowedDomains, entry)
+			}
+		}
+
+		if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
+		} else {
+			networkConfig, _ := json.Marshal(map[string]any{
+				"egress": map[string]any{
+					"allowed_cidrs":   allowedCIDRs,
+					"denied_cidrs":    req.Network.DenyOut,
+					"allowed_domains": allowedDomains,
+				},
+			})
+			_ = h.DB.UpdateSandboxNetworkConfig(c.Request.Context(), db.UpdateSandboxNetworkConfigParams{
+				ID:            sandbox.ID,
+				NetworkConfig: networkConfig,
+				TeamID:        teamID,
+			})
+		}
+	}
+
+	h.logActivityAsync(sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
+
 	c.JSON(http.StatusCreated, sandboxResponse{
 		ID:        sandbox.ID,
 		Name:      sandbox.Name,
-		Status:    string(db.SandboxStatusStarting),
+		Status:    string(db.SandboxStatusActive),
 		VcpuCount: sandbox.VcpuCount,
 		MemoryMib: sandbox.MemoryMib,
 		CreatedAt: sandbox.CreatedAt,
 	})
-
-	// Launch VM asynchronously.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), vmdTimeout)
-		defer cancel()
-
-		var ipAddress string
-		var vmdErr error
-		if req.FromSnapshot != nil {
-			ipAddress, vmdErr = h.VMD.ResumeInstance(ctx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
-		} else {
-			ipAddress, vmdErr = h.VMD.CreateInstance(ctx, sandbox.ID.String(),
-				uint32(req.VcpuCount), uint32(req.MemoryMib), 0, nil)
-		}
-		if vmdErr != nil {
-			log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-			_ = h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
-				ID:     sandbox.ID,
-				Status: db.SandboxStatusFailed,
-				TeamID: teamID,
-			})
-			return
-		}
-
-		dbCtx, dbCancel := context.WithTimeout(context.Background(), asyncTimeout)
-		defer dbCancel()
-		if err := h.DB.UpdateSandboxStatus(dbCtx, db.UpdateSandboxStatusParams{
-			ID:     sandbox.ID,
-			Status: db.SandboxStatusActive,
-			TeamID: teamID,
-		}); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
-			return
-		}
-
-		_ = ipAddress // stored via UpdateSandboxHost when host info is tracked
-
-		// Apply network rules if provided at creation.
-		if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-			var allowedCIDRs, allowedDomains []string
-			for _, entry := range req.Network.AllowOut {
-				if isIPOrCIDR(entry) {
-					allowedCIDRs = append(allowedCIDRs, entry)
-				} else {
-					allowedDomains = append(allowedDomains, entry)
-				}
-			}
-
-			netCtx, netCancel := context.WithTimeout(context.Background(), vmdTimeout)
-			defer netCancel()
-			if err := h.VMD.UpdateSandboxNetwork(netCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
-			} else {
-				// Persist to DB.
-				networkConfig, _ := json.Marshal(map[string]any{
-					"egress": map[string]any{
-						"allowed_cidrs":   allowedCIDRs,
-						"denied_cidrs":    req.Network.DenyOut,
-						"allowed_domains": allowedDomains,
-					},
-				})
-				_ = h.DB.UpdateSandboxNetworkConfig(netCtx, db.UpdateSandboxNetworkConfigParams{
-					ID:            sandbox.ID,
-					NetworkConfig: networkConfig,
-					TeamID:        teamID,
-				})
-			}
-		}
-
-		h.logActivityAsync(sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
-	}()
 }
 
 // ---------------------------------------------------------------------------

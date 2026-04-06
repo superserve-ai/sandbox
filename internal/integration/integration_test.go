@@ -176,20 +176,6 @@ func newRouter() *gin.Engine {
 	return api.SetupRouter(h, testPool)
 }
 
-// waitForActive polls the DB until the sandbox is active or the deadline passes.
-// Tests that call pause/exec after create must use this because CreateSandbox is async.
-func waitForActive(t *testing.T, sandboxID uuid.UUID, teamID uuid.UUID) {
-	t.Helper()
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		sb, err := testQueries.GetSandbox(context.Background(), db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
-		if err == nil && sb.Status == db.SandboxStatusActive {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("sandbox did not become active within 500ms")
-}
 
 func do(r *gin.Engine, method, path, apiKey, body string) *httptest.ResponseRecorder {
 	var bodyReader io.Reader
@@ -293,15 +279,11 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	if body["name"] != "my-box" {
 		t.Errorf("name = %q, want my-box", body["name"])
 	}
-	if body["status"] != "starting" {
-		t.Errorf("status = %q, want starting", body["status"])
-	}
-	if _, hasIP := body["ip_address"]; hasIP {
-		t.Error("create response should not include ip_address (VM not yet booted)")
+	if body["status"] != "active" {
+		t.Errorf("status = %q, want active", body["status"])
 	}
 
-	// DB record transitions to active once the background goroutine completes.
-	waitForActive(t, sandboxID, teamID)
+	// DB record is active immediately since creation is synchronous.
 	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
 	if err != nil {
 		t.Fatalf("sandbox not found in DB: %v", err)
@@ -433,8 +415,6 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
 	if pw.Code != http.StatusOK {
@@ -476,7 +456,7 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 }
 
 func TestIntegration_PauseSandbox_AlreadyIdle(t *testing.T) {
-	teamID, apiKey := seedTeamAndKey(t)
+	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"idle-box","vcpu_count":1,"memory_mib":512}`)
@@ -484,8 +464,6 @@ func TestIntegration_PauseSandbox_AlreadyIdle(t *testing.T) {
 		t.Fatalf("create: %d", cw.Code)
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
 
 	do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "") // first pause
 
@@ -509,9 +487,6 @@ func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
-
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
 	if pw.Code != http.StatusOK {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
@@ -594,7 +569,7 @@ func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 
 func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
+	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"exec-box","vcpu_count":1,"memory_mib":512}`)
@@ -602,9 +577,6 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
-
 	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello","timeout_s":5}`)
 	if ew.Code != http.StatusOK {
 		t.Fatalf("exec: expected 200, got %d: %s", ew.Code, ew.Body.String())
@@ -648,8 +620,6 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 		t.Fatalf("create: %d", cw.Code)
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
 	if pw.Code != http.StatusOK {
@@ -679,7 +649,7 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIntegration_FileUploadDownload(t *testing.T) {
-	teamID, apiKey := seedTeamAndKey(t)
+	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"file-box","vcpu_count":1,"memory_mib":512}`)
@@ -687,9 +657,6 @@ func TestIntegration_FileUploadDownload(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
-
 	// Upload.
 	uw := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/home/user/test.txt", apiKey, []byte("hello sandbox file"))
 	if uw.Code != http.StatusOK {
@@ -711,7 +678,7 @@ func TestIntegration_FileUploadDownload(t *testing.T) {
 }
 
 func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
-	teamID, apiKey := seedTeamAndKey(t)
+	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pt-box","vcpu_count":1,"memory_mib":512}`)
@@ -719,9 +686,6 @@ func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
 		t.Fatalf("create: %d", cw.Code)
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
-
 	w := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/../../../etc/passwd", apiKey, []byte("x"))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for path traversal, got %d", w.Code)
@@ -823,7 +787,7 @@ func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 
 func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
+	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pause-log-box","vcpu_count":1,"memory_mib":512}`)
@@ -832,7 +796,6 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 	}
 	sid := mustJSON(t, cw)["id"].(string)
 	sandboxID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxID, teamID)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
 	if pw.Code != http.StatusOK {
@@ -921,7 +884,6 @@ func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
 	}
 	sid := mustJSON(t, cw)["id"].(string)
 	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
 
 	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
 		`{"allow_out":["api.openai.com","8.8.8.8/32"],"deny_out":["0.0.0.0/0"]}`)
@@ -946,23 +908,27 @@ func TestIntegration_UpdateSandboxNetwork_NotActive(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
-	// Create sandbox (status = starting, async boot not yet complete).
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-starting","vcpu_count":1,"memory_mib":512}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-idle","vcpu_count":1,"memory_mib":512}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
+	// Pause it so it's in idle state.
+	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
+	if pw.Code != http.StatusOK {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
 
-	// Immediately try to update network — sandbox is still starting.
+	// Try to update network on idle sandbox — should fail.
 	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
 		`{"deny_out":["0.0.0.0/0"]}`)
 	if nw.Code != http.StatusConflict {
-		t.Fatalf("expected 409 for non-active sandbox, got %d: %s", nw.Code, nw.Body.String())
+		t.Fatalf("expected 409 for idle sandbox, got %d: %s", nw.Code, nw.Body.String())
 	}
 }
 
 func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
-	teamID, apiKey := seedTeamAndKey(t)
+	_, apiKey := seedTeamAndKey(t)
 	r := newRouter()
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-invalid","vcpu_count":1,"memory_mib":512}`)
@@ -970,9 +936,6 @@ func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	sandboxUUID, _ := uuid.Parse(sid)
-	waitForActive(t, sandboxUUID, teamID)
-
 	// deny_out with a domain (not a CIDR) should fail validation.
 	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
 		`{"deny_out":["evil.com"]}`)
@@ -1006,8 +969,8 @@ func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 		t.Fatalf("create with network: %d %s", cw.Code, cw.Body.String())
 	}
 	body := mustJSON(t, cw)
-	if body["status"] != "starting" {
-		t.Errorf("expected status=starting, got %v", body["status"])
+	if body["status"] != "active" {
+		t.Errorf("expected status=active, got %v", body["status"])
 	}
 }
 
