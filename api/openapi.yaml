@@ -206,6 +206,41 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/{sandbox_id}/network:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    put:
+      operationId: updateSandboxNetwork
+      tags: [Sandboxes]
+      summary: Update sandbox network egress rules
+      description: |
+        Atomically replaces the egress allow/deny rules for a running sandbox.
+        Rules take effect immediately. Supports CIDRs and domain names in
+        `allow_out`, CIDRs only in `deny_out`. Rules are persisted and
+        reapplied on resume after a pause.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkConfig"
+      responses:
+        "204":
+          description: Network rules updated
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}/exec:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
@@ -391,6 +426,8 @@ components:
           description: >
             If provided, boot the sandbox from this snapshot instead of
             creating a fresh VM. The snapshot must belong to the same team.
+        network:
+          $ref: "#/components/schemas/NetworkConfig"
 
     SandboxResponse:
       type: object
@@ -476,6 +513,28 @@ components:
           type: string
         exit_code:
           type: integer
+
+    NetworkConfig:
+      type: object
+      description: >
+        Egress network rules for a sandbox. `allow_out` accepts CIDRs
+        (e.g. `8.8.8.8/32`) and domain names (e.g. `api.openai.com`,
+        `*.github.com`). `deny_out` accepts CIDRs only.
+        Private ranges (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16)
+        are always blocked regardless of rules.
+      properties:
+        allow_out:
+          type: array
+          items:
+            type: string
+          description: CIDRs or domains to allow.
+          example: ["api.openai.com", "*.github.com", "8.8.8.8/32"]
+        deny_out:
+          type: array
+          items:
+            type: string
+          description: CIDRs to deny. Use `0.0.0.0/0` to block all traffic not in `allow_out`.
+          example: ["0.0.0.0/0"]
 
     Error:
       type: object

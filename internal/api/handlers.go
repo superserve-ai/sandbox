@@ -606,11 +606,17 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 // Sandbox Create
 // ---------------------------------------------------------------------------
 
+type networkConfigRequest struct {
+	AllowOut []string `json:"allow_out,omitempty"` // Allowed CIDRs or domains.
+	DenyOut  []string `json:"deny_out,omitempty"`  // Denied CIDRs.
+}
+
 type createSandboxRequest struct {
-	Name         string  `json:"name" binding:"required,min=1,max=64"`
-	VcpuCount    int32   `json:"vcpu_count" binding:"required,min=1"`
-	MemoryMib    int32   `json:"memory_mib" binding:"required,min=1"`
-	FromSnapshot *string `json:"from_snapshot,omitempty"`
+	Name         string                `json:"name" binding:"required,min=1,max=64"`
+	VcpuCount    int32                 `json:"vcpu_count" binding:"required,min=1"`
+	MemoryMib    int32                 `json:"memory_mib" binding:"required,min=1"`
+	FromSnapshot *string               `json:"from_snapshot,omitempty"`
+	Network      *networkConfigRequest `json:"network,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -793,6 +799,39 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 
 		_ = ipAddress // stored via UpdateSandboxHost when host info is tracked
+
+		// Apply network rules if provided at creation.
+		if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+			var allowedCIDRs, allowedDomains []string
+			for _, entry := range req.Network.AllowOut {
+				if isIPOrCIDR(entry) {
+					allowedCIDRs = append(allowedCIDRs, entry)
+				} else {
+					allowedDomains = append(allowedDomains, entry)
+				}
+			}
+
+			netCtx, netCancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer netCancel()
+			if err := h.VMD.UpdateSandboxNetwork(netCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
+			} else {
+				// Persist to DB.
+				networkConfig, _ := json.Marshal(map[string]any{
+					"egress": map[string]any{
+						"allowed_cidrs":   allowedCIDRs,
+						"denied_cidrs":    req.Network.DenyOut,
+						"allowed_domains": allowedDomains,
+					},
+				})
+				_ = h.DB.UpdateSandboxNetworkConfig(netCtx, db.UpdateSandboxNetworkConfigParams{
+					ID:            sandbox.ID,
+					NetworkConfig: networkConfig,
+					TeamID:        teamID,
+				})
+			}
+		}
+
 		h.logActivityAsync(sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 	}()
 }
