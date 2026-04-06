@@ -33,6 +33,7 @@ func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 		api.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
+		api.PUT("/sandboxes/:sandbox_id/network", h.UpdateSandboxNetwork)
 
 		// Sandbox operations with auto-wake middleware.
 		sandboxOps := api.Group("/sandboxes/:sandbox_id")

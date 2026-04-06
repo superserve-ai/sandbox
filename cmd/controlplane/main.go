@@ -323,3 +323,18 @@ func (c *grpcVMDClient) DownloadFile(ctx context.Context, vmID, path string) (io
 
 	return pr, nil
 }
+
+func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
+	_, err := c.client.UpdateSandboxNetwork(ctx, &vmdpb.UpdateSandboxNetworkRequest{
+		VmId: vmID,
+		Egress: &vmdpb.SandboxNetworkEgressConfig{
+			AllowedCidrs:   allowedCIDRs,
+			DeniedCidrs:    deniedCIDRs,
+			AllowedDomains: allowedDomains,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
+	}
+	return nil
+}

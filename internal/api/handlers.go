@@ -32,6 +32,7 @@ type VMDClient interface {
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UploadFile(ctx context.Context, instanceID, path string, content io.Reader) (int64, error)
 	DownloadFile(ctx context.Context, instanceID, path string) (io.ReadCloser, error)
+	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
 // Handlers holds shared dependencies for all route handlers.
@@ -1046,4 +1047,108 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		"stderr":    stderr,
 		"exit_code": exitCode,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox Network Config
+// ---------------------------------------------------------------------------
+
+type updateNetworkRequest struct {
+	AllowOut []string `json:"allow_out"` // Allowed CIDRs or domains.
+	DenyOut  []string `json:"deny_out"`  // Denied CIDRs.
+}
+
+func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return
+	}
+
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+
+	var body updateNetworkRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		respondErrorMsg(c, "bad_request", "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate: deny_out only supports CIDRs, allow_out supports CIDRs and domains.
+	for _, cidr := range body.DenyOut {
+		if !isIPOrCIDR(cidr) {
+			respondErrorMsg(c, "bad_request", fmt.Sprintf("deny_out only supports CIDRs, got %q", cidr), http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Verify sandbox exists, belongs to this team, and is active.
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			respondError(c, ErrSandboxNotFound)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	if sandbox.Status != db.SandboxStatusActive {
+		respondErrorMsg(c, "conflict", "Sandbox must be active to update network config", http.StatusConflict)
+		return
+	}
+
+	// Separate CIDRs and domains from allow_out.
+	var allowedCIDRs, allowedDomains []string
+	for _, entry := range body.AllowOut {
+		if isIPOrCIDR(entry) {
+			allowedCIDRs = append(allowedCIDRs, entry)
+		} else {
+			allowedDomains = append(allowedDomains, entry)
+		}
+	}
+
+	// Apply rules to the running VM via VMD.
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+	defer vmdCancel()
+	if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.DenyOut, allowedDomains); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Persist config to DB so it survives pause/resume.
+	networkConfig, _ := json.Marshal(map[string]any{
+		"egress": map[string]any{
+			"allowed_cidrs":   allowedCIDRs,
+			"denied_cidrs":    body.DenyOut,
+			"allowed_domains": allowedDomains,
+		},
+	})
+	if err := h.DB.UpdateSandboxNetworkConfig(c.Request.Context(), db.UpdateSandboxNetworkConfigParams{
+		ID:            sandboxID,
+		NetworkConfig: networkConfig,
+		TeamID:        teamID,
+	}); err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
+	}
+
+	h.logActivityAsync(sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
+
+	c.Status(http.StatusNoContent)
+}
+
+func isIPOrCIDR(s string) bool {
+	if _, err := netip.ParseAddr(s); err == nil {
+		return true
+	}
+	if _, err := netip.ParsePrefix(s); err == nil {
+		return true
+	}
+	return false
 }
