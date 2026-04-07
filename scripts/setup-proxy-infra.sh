@@ -13,19 +13,26 @@
 # Certificate provisioning takes ~10-15 minutes after DNS propagates.
 #
 # Usage:
-#   GCP_PROJECT=rayai-dev ZONE=us-central1-a ./scripts/setup-proxy-infra.sh
+#   GCP_PROJECT=my-project \
+#   ZONE=us-central1-a \
+#   INSTANCE=my-vmd-instance \
+#   NETWORK=my-vpc-network \
+#   DOMAIN=sandbox.example.com \
+#   ./scripts/setup-proxy-infra.sh
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Config — override via env vars
+# Config — all required via env vars, no hardcoded defaults
 # ---------------------------------------------------------------------------
-PROJECT="${GCP_PROJECT:-rayai-dev}"
-ZONE="${ZONE:-us-central1-a}"
+: "${GCP_PROJECT:?GCP_PROJECT is required}"
+: "${ZONE:?ZONE is required (e.g. us-central1-a)}"
+: "${INSTANCE:?INSTANCE is required (bare metal GCP instance name)}"
+: "${NETWORK:?NETWORK is required (VPC network name)}"
+: "${DOMAIN:?DOMAIN is required (e.g. sandbox.example.com)}"
+
+PROJECT="${GCP_PROJECT}"
 REGION="${ZONE%-*}"  # strips zone suffix, e.g. us-central1-a → us-central1
-INSTANCE="superserve-vmd-staging"
-NETWORK="${NETWORK:-superserve-network-3cb2c3b}"
-DOMAIN="sandbox.superserve.ai"
 WILDCARD_DOMAIN="*.${DOMAIN}"
 PROXY_PORT=5007
 
