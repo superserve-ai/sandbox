@@ -7,8 +7,11 @@ on:
     paths:
       - 'cmd/vmd/**'
       - 'cmd/boxd/**'
+      - 'cmd/proxy/**'
       - 'internal/vm/**'
       - 'internal/network/**'
+      - 'internal/proxy/**'
+      - 'deploy/proxy.service'
 
 jobs:
   deploy:
@@ -27,11 +30,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build VMD and boxd binaries
+      - name: Build binaries
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/vmd ./cmd/vmd
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -85,7 +89,7 @@ jobs:
               name, zone = inst['name'], inst['zone']
               tag = f'{name}/{zone}'
 
-              for binary in ('vmd', 'boxd'):
+              for binary in ('vmd', 'boxd', 'proxy'):
                   subprocess.run([
                       'gcloud', 'compute', 'scp',
                       f'bin/{binary}',
@@ -95,6 +99,15 @@ jobs:
                       '--quiet',
                       '--tunnel-through-iap',
                   ], check=True, capture_output=True)
+              subprocess.run([
+                  'gcloud', 'compute', 'scp',
+                  'deploy/proxy.service',
+                  f'{name}:/tmp/proxy.service',
+                  f'--zone={zone}',
+                  f'--project={project}',
+                  '--quiet',
+                  '--tunnel-through-iap',
+              ], check=True, capture_output=True)
               print(f'[{tag}] binaries uploaded')
 
               # Inject updated boxd into the base rootfs atomically:
@@ -167,6 +180,24 @@ jobs:
                       echo "ERROR: {service} failed to become active after restart" >&2
                       sudo systemctl status --no-pager {service} >&2 || true
                       sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                      exit 1
+                  )
+
+                  # Deploy proxy binary and service
+                  sudo mv /tmp/proxy-{sha} {install_dir}/proxy
+                  sudo chmod +x {install_dir}/proxy
+
+                  # Install or update the systemd service file
+                  sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
+                  sudo systemctl daemon-reload
+                  sudo systemctl enable proxy
+
+                  sudo systemctl restart proxy
+                  sleep 2
+                  sudo systemctl is-active --quiet proxy || (
+                      echo "ERROR: proxy failed to become active after restart" >&2
+                      sudo systemctl status --no-pager proxy >&2 || true
+                      sudo journalctl -u proxy --no-pager -n 40 >&2 || true
                       exit 1
                   )
               ''')
