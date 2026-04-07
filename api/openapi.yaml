@@ -427,6 +427,15 @@ components:
           description: >
             If provided, boot the sandbox from this snapshot instead of
             creating a fresh VM. The snapshot must belong to the same team.
+        allow_internet_access:
+          type: boolean
+          default: true
+          description: >
+            Convenience toggle for outbound internet access. When false and
+            no `network.deny_out` is provided, the sandbox is created with
+            `deny_out: ["0.0.0.0/0"]` and cannot reach any public IP. An
+            explicit `network` field always wins over this flag, so use
+            `network` for fine-grained allow/deny lists.
         network:
           $ref: "#/components/schemas/NetworkConfig"
 

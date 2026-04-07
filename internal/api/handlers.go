@@ -691,6 +691,17 @@ type createSandboxRequest struct {
 	Name         string                `json:"name" binding:"required,min=1,max=64"`
 	FromSnapshot *string               `json:"from_snapshot,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
+
+	// AllowInternetAccess is syntactic sugar for a network config. If set
+	// to false and Network is not provided (or Network.DenyOut is empty),
+	// we inject "0.0.0.0/0" into deny_out so the sandbox cannot reach any
+	// public IP. An explicit Network config takes precedence — we only
+	// apply this shortcut when the user has not already expressed deny
+	// intent.
+	//
+	// Pointer so we can distinguish unset (nil → default allow) from
+	// explicitly false.
+	AllowInternetAccess *bool `json:"allow_internet_access,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -786,6 +797,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if req.Name == "" || len(req.Name) > 64 {
 		respondErrorMsg(c, "bad_request", "name is required and must be 1-64 characters", http.StatusBadRequest)
 		return
+	}
+
+	// Translate allow_internet_access: false into an equivalent deny rule
+	// so the rest of the flow treats it like any other egress config.
+	// An explicit Network config wins — we only inject a deny when the
+	// user has not already expressed intent for deny_out. This makes the
+	// boolean a pure convenience sugar over the granular network field.
+	if req.AllowInternetAccess != nil && !*req.AllowInternetAccess {
+		if req.Network == nil {
+			req.Network = &networkConfigRequest{DenyOut: []string{"0.0.0.0/0"}}
+		} else if len(req.Network.DenyOut) == 0 {
+			req.Network.DenyOut = []string{"0.0.0.0/0"}
+		}
 	}
 
 	// Validate network rules up front so we fail before doing any DB or VMD work.
