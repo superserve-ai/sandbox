@@ -185,6 +185,11 @@ func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 }
 
 // RemoveVM removes all host-level rules for a VM using stored handles.
+//
+// If any step fails, the handles are kept in vmRuleHandles so a caller can
+// retry. Silently dropping errors here used to leak rules into the kernel
+// permanently — both a resource leak and a security issue (stale FORWARD
+// ACCEPT and MASQUERADE for a VM that no longer exists).
 func (hfw *HostFirewall) RemoveVM(vmID string) error {
 	hfw.mu.Lock()
 	defer hfw.mu.Unlock()
@@ -193,32 +198,52 @@ func (hfw *HostFirewall) RemoveVM(vmID string) error {
 	if !ok {
 		return nil
 	}
-	delete(hfw.vmRuleHandles, vmID)
 
-	// Delete rules from both chains by handle.
-	// We need to find which chain each handle belongs to, so query both.
-	fwdRules, _ := hfw.conn.GetRules(hfw.table, hfw.fwdChain)
-	natRules, _ := hfw.conn.GetRules(hfw.table, hfw.natChain)
-
+	// Build a lookup once.
 	handleSet := make(map[uint64]bool, len(handles))
 	for _, h := range handles {
 		handleSet[h] = true
 	}
 
+	// Query both chains. If GetRules fails, surface the error — we cannot
+	// safely delete by handle without knowing which chain each handle
+	// belongs to, and we must NOT drop the handles from vmRuleHandles or
+	// a retry will have nothing to work with.
+	fwdRules, err := hfw.conn.GetRules(hfw.table, hfw.fwdChain)
+	if err != nil {
+		return fmt.Errorf("get forward rules for cleanup: %w", err)
+	}
+	natRules, err := hfw.conn.GetRules(hfw.table, hfw.natChain)
+	if err != nil {
+		return fmt.Errorf("get nat rules for cleanup: %w", err)
+	}
+
+	// Enqueue deletes for every matching rule.
+	matched := 0
 	for _, r := range fwdRules {
 		if handleSet[r.Handle] {
-			_ = hfw.conn.DelRule(r)
+			if err := hfw.conn.DelRule(r); err != nil {
+				return fmt.Errorf("delete forward rule handle %d: %w", r.Handle, err)
+			}
+			matched++
 		}
 	}
 	for _, r := range natRules {
 		if handleSet[r.Handle] {
-			_ = hfw.conn.DelRule(r)
+			if err := hfw.conn.DelRule(r); err != nil {
+				return fmt.Errorf("delete nat rule handle %d: %w", r.Handle, err)
+			}
+			matched++
 		}
 	}
 
+	// Flush to the kernel. Only remove the VM from the tracking map on
+	// success — if flush fails, a retry can try again.
 	if err := hfw.conn.Flush(); err != nil {
-		return fmt.Errorf("flush rule deletion: %w", err)
+		return fmt.Errorf("flush rule deletion for vm %s: %w", vmID, err)
 	}
+
+	delete(hfw.vmRuleHandles, vmID)
 	return nil
 }
 
