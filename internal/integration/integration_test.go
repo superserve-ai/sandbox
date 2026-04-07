@@ -170,10 +170,14 @@ func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
 	return team.ID, rawKey
 }
 
-func newRouter() *gin.Engine {
+// newRouter builds a router scoped to the current test. Using t.Context()
+// ensures the rate limiter's cleanup goroutine exits when the test ends,
+// preventing goroutine leaks across hundreds of test invocations.
+func newRouter(t *testing.T) *gin.Engine {
+	t.Helper()
 	cfg := &config.Config{Port: "0", VMDAddress: "localhost:0"}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
-	return api.SetupRouter(h, testPool)
+	return api.SetupRouter(t.Context(), h, testPool)
 }
 
 
@@ -217,21 +221,21 @@ func mustJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{}
 // ---------------------------------------------------------------------------
 
 func TestIntegration_Auth_HealthNoKeyRequired(t *testing.T) {
-	w := do(newRouter(), "GET", "/health", "", "")
+	w := do(newRouter(t), "GET", "/health", "", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("health: expected 200, got %d", w.Code)
 	}
 }
 
 func TestIntegration_Auth_MissingKey(t *testing.T) {
-	w := do(newRouter(), "POST", "/sandboxes", "", `{"name":"x"}`)
+	w := do(newRouter(t), "POST", "/sandboxes", "", `{"name":"x"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
 }
 
 func TestIntegration_Auth_InvalidKey(t *testing.T) {
-	w := do(newRouter(), "POST", "/sandboxes", "sk-does-not-exist", `{"name":"x"}`)
+	w := do(newRouter(t), "POST", "/sandboxes", "sk-does-not-exist", `{"name":"x"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
@@ -251,7 +255,7 @@ func TestIntegration_Auth_RevokedKey(t *testing.T) {
 		t.Fatalf("revoke key: %v", err)
 	}
 
-	w := do(newRouter(), "POST", "/sandboxes", rawKey, `{"name":"x"}`)
+	w := do(newRouter(t), "POST", "/sandboxes", rawKey, `{"name":"x"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
@@ -264,7 +268,7 @@ func TestIntegration_Auth_RevokedKey(t *testing.T) {
 func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	w := do(r, "POST", "/sandboxes", apiKey, `{"name":"my-box"}`)
 	if w.Code != http.StatusCreated {
@@ -302,7 +306,7 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 
 func TestIntegration_ListSandboxes(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	// Create two sandboxes.
 	for i, name := range []string{"list-box-1", "list-box-2"} {
@@ -337,7 +341,7 @@ func TestIntegration_ListSandboxes(t *testing.T) {
 
 func TestIntegration_GetSandbox(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"get-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -360,7 +364,7 @@ func TestIntegration_GetSandbox(t *testing.T) {
 
 func TestIntegration_GetSandbox_NotFound(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	w := do(newRouter(), "GET", "/sandboxes/"+uuid.New().String(), apiKey, "")
+	w := do(newRouter(t), "GET", "/sandboxes/"+uuid.New().String(), apiKey, "")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
@@ -369,7 +373,7 @@ func TestIntegration_GetSandbox_NotFound(t *testing.T) {
 func TestIntegration_ListSandboxes_TeamIsolation(t *testing.T) {
 	_, apiKeyA := seedTeamAndKey(t)
 	_, apiKeyB := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	// Team A creates a sandbox.
 	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-list-box"}`)
@@ -395,7 +399,7 @@ func TestIntegration_ListSandboxes_TeamIsolation(t *testing.T) {
 func TestIntegration_CreateSandbox_ValidationError(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	// Missing required fields.
-	w := do(newRouter(), "POST", "/sandboxes", apiKey, `{}`)
+	w := do(newRouter(t), "POST", "/sandboxes", apiKey, `{}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
@@ -408,7 +412,7 @@ func TestIntegration_CreateSandbox_ValidationError(t *testing.T) {
 func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pause-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -457,7 +461,7 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 
 func TestIntegration_PauseSandbox_AlreadyIdle(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"idle-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -480,7 +484,7 @@ func TestIntegration_PauseSandbox_AlreadyIdle(t *testing.T) {
 func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"resume-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -514,7 +518,7 @@ func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 
 func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"active-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -535,7 +539,7 @@ func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"del-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -557,7 +561,7 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 
 func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	w := do(newRouter(), "DELETE", "/sandboxes/"+uuid.New().String(), apiKey, "")
+	w := do(newRouter(t), "DELETE", "/sandboxes/"+uuid.New().String(), apiKey, "")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
@@ -570,7 +574,7 @@ func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"exec-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -613,7 +617,7 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"wake-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -650,7 +654,7 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 
 func TestIntegration_FileUploadDownload(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"file-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -679,7 +683,7 @@ func TestIntegration_FileUploadDownload(t *testing.T) {
 
 func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pt-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -699,7 +703,7 @@ func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
 func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 	_, apiKeyA := seedTeamAndKey(t)
 	_, apiKeyB := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	// Team A creates a sandbox.
 	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"teamA-box"}`)
@@ -724,7 +728,7 @@ func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 func TestIntegration_TeamIsolation_Exec(t *testing.T) {
 	_, apiKeyA := seedTeamAndKey(t)
 	_, apiKeyB := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-exec"}`)
 	if cw.Code != http.StatusCreated {
@@ -745,7 +749,7 @@ func TestIntegration_TeamIsolation_Exec(t *testing.T) {
 func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 	ctx := context.Background()
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"actlog-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -788,7 +792,7 @@ func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 	ctx := context.Background()
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pause-log-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -828,7 +832,7 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 
 func TestIntegration_ConcurrentCreate(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	const n = 5
 	type result struct {
@@ -876,7 +880,7 @@ func TestIntegration_ConcurrentCreate(t *testing.T) {
 
 func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -906,7 +910,7 @@ func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
 
 func TestIntegration_UpdateSandboxNetwork_NotActive(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-idle"}`)
 	if cw.Code != http.StatusCreated {
@@ -929,7 +933,7 @@ func TestIntegration_UpdateSandboxNetwork_NotActive(t *testing.T) {
 
 func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-invalid"}`)
 	if cw.Code != http.StatusCreated {
@@ -946,7 +950,7 @@ func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
 
 func TestIntegration_UpdateSandboxNetwork_NotFound(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	nw := do(r, "PUT", "/sandboxes/00000000-0000-0000-0000-000000000000/network", apiKey,
 		`{"deny_out":["0.0.0.0/0"]}`)
@@ -961,7 +965,7 @@ func TestIntegration_UpdateSandboxNetwork_NotFound(t *testing.T) {
 
 func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
-	r := newRouter()
+	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey,
 		`{"name":"net-create","network":{"allow_out":["api.openai.com"],"deny_out":["0.0.0.0/0"]}}`)
@@ -979,7 +983,7 @@ func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIntegration_SecurityHeaders(t *testing.T) {
-	r := newRouter()
+	r := newRouter(t)
 
 	w := do(r, "GET", "/health", "", "")
 	if w.Code != http.StatusOK {
@@ -1001,7 +1005,7 @@ func TestIntegration_SecurityHeaders(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIntegration_RateLimit_Headers(t *testing.T) {
-	r := newRouter()
+	r := newRouter(t)
 
 	w := do(r, "GET", "/health", "", "")
 	if w.Code != http.StatusOK {

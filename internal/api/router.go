@@ -1,14 +1,20 @@
 package api
 
 import (
+	"context"
+
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // SetupRouter creates and configures the Gin router with all route groups.
-func SetupRouter(h *Handlers, pool *pgxpool.Pool) *gin.Engine {
+// The supplied context scopes background goroutines (rate limiter cleanup)
+// so they exit when the context is cancelled. In production this is the
+// process lifetime context; in tests it's the per-test context so each
+// router instance doesn't leak a cleanup goroutine.
+func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
-	r.Use(SecurityHeaders(), RateLimit(DefaultRateLimitConfig()), RequestLogger(), ErrorHandler())
+	r.Use(SecurityHeaders(), RateLimit(ctx, DefaultRateLimitConfig()), RequestLogger(), ErrorHandler())
 
 	api := r.Group("/")
 	api.Use(APIKeyAuth(pool))

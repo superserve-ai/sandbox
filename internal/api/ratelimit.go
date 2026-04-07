@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"sync"
@@ -81,15 +82,25 @@ func (l *ipRateLimiter) cleanup(maxAge time.Duration) {
 // RateLimit returns a Gin middleware that enforces per-IP rate limiting
 // using a token bucket algorithm. Returns standard rate limit headers
 // and 429 Too Many Requests when the limit is exceeded.
-func RateLimit(cfg RateLimitConfig) gin.HandlerFunc {
+//
+// The supplied context controls the background cleanup goroutine: when ctx
+// is cancelled, the cleanup loop exits so the limiter does not leak. Tests
+// that build many routers should pass a per-test context so goroutines
+// don't accumulate across runs.
+func RateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 	limiter := newIPRateLimiter(cfg.Rate, cfg.Burst)
 
-	// Background cleanup of stale entries.
+	// Background cleanup of stale entries — exits cleanly on ctx.Done.
 	go func() {
 		ticker := time.NewTicker(cfg.CleanupInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			limiter.cleanup(cfg.MaxAge)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				limiter.cleanup(cfg.MaxAge)
+			}
 		}
 	}()
 
