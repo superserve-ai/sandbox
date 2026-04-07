@@ -520,9 +520,6 @@ components:
           type: integer
         memory_mib:
           type: integer
-        ip_address:
-          type: string
-          description: IP address of the running VM (present when status is active).
         snapshot_id:
           type: string
           format: uuid

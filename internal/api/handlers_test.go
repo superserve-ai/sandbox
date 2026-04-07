@@ -519,9 +519,6 @@ func TestResumeSandbox_Success(t *testing.T) {
 	if body["status"] != "active" {
 		t.Errorf("status = %q, want %q", body["status"], "active")
 	}
-	if body["ip_address"] != "10.0.0.5" {
-		t.Errorf("ip_address = %q, want %q", body["ip_address"], "10.0.0.5")
-	}
 }
 
 func TestResumeSandbox_InvalidUUID(t *testing.T) {
@@ -1576,9 +1573,6 @@ func TestResumeInstance_Success(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if parseJSON(t, w)["ip_address"] != "10.0.0.42" {
-		t.Errorf("expected ip_address=10.0.0.42")
 	}
 }
 

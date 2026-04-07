@@ -739,7 +739,6 @@ type sandboxResponse struct {
 	Status         string              `json:"status"`
 	VcpuCount      int32               `json:"vcpu_count"`
 	MemoryMib      int32               `json:"memory_mib"`
-	IPAddress      string              `json:"ip_address,omitempty"`
 	SnapshotID     *uuid.UUID          `json:"snapshot_id,omitempty"`
 	CreatedAt      time.Time           `json:"created_at"`
 	TimeoutSeconds *int32              `json:"timeout_seconds,omitempty"`
@@ -756,9 +755,6 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 		MemoryMib: s.MemoryMib,
 		CreatedAt: s.CreatedAt,
 		Metadata:  decodeMetadata(s.Metadata),
-	}
-	if s.IpAddress != nil {
-		resp.IPAddress = s.IpAddress.String()
 	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
@@ -1140,9 +1136,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// the INSERT — overwrite it with "active" since we just transitioned.
 	resp := sandboxToResponse(sandbox)
 	resp.Status = string(db.SandboxStatusActive)
-	if ipAddress != "" {
-		resp.IPAddress = ipAddress
-	}
 	// req.Network may have been populated by the allow_internet_access=false
 	// path, so include it in the response if rules were set.
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
