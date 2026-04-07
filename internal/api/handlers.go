@@ -768,9 +768,22 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 		resp.TimeoutSeconds = s.TimeoutSeconds
 	}
 	if len(s.NetworkConfig) > 0 {
-		var nc networkConfigRequest
-		if err := json.Unmarshal(s.NetworkConfig, &nc); err == nil && (len(nc.AllowOut) > 0 || len(nc.DenyOut) > 0) {
-			resp.Network = &nc
+		var stored struct {
+			Egress struct {
+				AllowedCIDRs   []string `json:"allowed_cidrs"`
+				DeniedCIDRs    []string `json:"denied_cidrs"`
+				AllowedDomains []string `json:"allowed_domains"`
+			} `json:"egress"`
+		}
+		if err := json.Unmarshal(s.NetworkConfig, &stored); err == nil {
+			e := stored.Egress
+			allowOut := append(e.AllowedCIDRs, e.AllowedDomains...)
+			if len(allowOut) > 0 || len(e.DeniedCIDRs) > 0 {
+				resp.Network = &networkConfigRequest{
+					AllowOut: allowOut,
+					DenyOut:  e.DeniedCIDRs,
+				}
+			}
 		}
 	}
 	return resp
