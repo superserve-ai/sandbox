@@ -3,7 +3,6 @@ package network
 import (
 	"fmt"
 	"net/netip"
-	"slices"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
@@ -474,20 +473,12 @@ func (fw *Firewall) ReplaceUserRules(allowedCIDRs, deniedCIDRs []string) error {
 }
 
 func (fw *Firewall) addCIDRsToSet(s *nftables.Set, cidrs []string) error {
-	// Handle special 0.0.0.0/0 case — nftables rejects 0.0.0.0 as unspecified.
-	if slices.Contains(cidrs, AllTrafficCIDR) {
-		start := netip.MustParseAddr("0.0.0.0").As4()
-		end := netip.MustParseAddr("255.255.255.255").As4()
-		elems := []nftables.SetElement{
-			{Key: start[:]},
-			{Key: end[:], IntervalEnd: true},
-		}
-		return fw.conn.SetAddElements(s, elems)
-	}
-
 	elems, err := cidrsToElements(cidrs)
 	if err != nil {
 		return err
+	}
+	if len(elems) == 0 {
+		return nil
 	}
 	return fw.conn.SetAddElements(s, elems)
 }
@@ -691,6 +682,17 @@ func mssClampToPMTU() []expr.Any {
 }
 
 // cidrsToElements converts CIDR strings to nftables interval set elements.
+//
+// Each CIDR becomes a (start, end) pair where `end` is the first address
+// past the prefix range. IPv6 entries are silently skipped — they are not
+// supported in these sets (a separate nftables rule drops all IPv6 egress
+// wholesale, and the API layer rejects v6 entries).
+//
+// Edge cases handled:
+//   - 0.0.0.0/0: nftables rejects the literal 0.0.0.0 as "unspecified", so
+//     we emit the full-range interval [0.0.0.0, 255.255.255.255]+ directly
+//     without round-tripping through prefix arithmetic.
+//   - /32: the end calculation must not overflow uint32. We use uint64 math.
 func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 	var elems []nftables.SetElement
 	for _, cidr := range cidrs {
@@ -699,10 +701,23 @@ func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
 		}
 		if !prefix.Addr().Is4() {
-			continue // skip IPv6 for now, nftables TypeIPAddr is IPv4
+			continue
 		}
+
+		// 0.0.0.0/0 — nftables rejects 0.0.0.0 as an interval start.
+		// Emit the canonical full-range pair directly.
+		if cidr == AllTrafficCIDR {
+			start := netip.MustParseAddr("0.0.0.0").As4()
+			end := netip.MustParseAddr("255.255.255.255").As4()
+			elems = append(elems,
+				nftables.SetElement{Key: start[:]},
+				nftables.SetElement{Key: end[:], IntervalEnd: true},
+			)
+			continue
+		}
+
 		s4 := prefix.Masked().Addr().As4()
-		e4 := prefixEnd(prefix).As4()
+		e4 := prefixEnd(prefix)
 		elems = append(elems,
 			nftables.SetElement{Key: s4[:]},
 			nftables.SetElement{Key: e4[:], IntervalEnd: true},
@@ -711,19 +726,27 @@ func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 	return elems, nil
 }
 
-// prefixEnd returns the first address after the prefix range.
-func prefixEnd(p netip.Prefix) netip.Addr {
-	addr := p.Masked().Addr()
+// prefixEnd returns the first address past the prefix range as a 4-byte IPv4.
+//
+// Implementation uses uint64 to avoid the overflow that bit uint32 math
+// would hit for prefixes covering 255.255.255.255/32 (where
+// (0xFFFFFFFF | 0) + 1 would wrap to 0 and produce 0.0.0.0 — a
+// nonsensical "end" that would create a malformed interval set element).
+func prefixEnd(p netip.Prefix) [4]byte {
+	addr := p.Masked().Addr().As4()
 	bits := p.Bits()
-	a4 := addr.As4()
-	// Set all host bits to 1, then add 1 to get the first address past the range.
-	hostBits := 32 - bits
-	mask := uint32(0xFFFFFFFF) << hostBits
-	ip := uint32(a4[0])<<24 | uint32(a4[1])<<16 | uint32(a4[2])<<8 | uint32(a4[3])
-	end := (ip | ^mask) + 1
-	return netip.AddrFrom4([4]byte{
-		byte(end >> 24), byte(end >> 16), byte(end >> 8), byte(end),
-	})
+	start := uint64(addr[0])<<24 | uint64(addr[1])<<16 | uint64(addr[2])<<8 | uint64(addr[3])
+	size := uint64(1) << uint(32-bits)
+	end := start + size
+	if end > 0xFFFFFFFF {
+		end = 0xFFFFFFFF
+	}
+	return [4]byte{
+		byte(end >> 24),
+		byte(end >> 16),
+		byte(end >> 8),
+		byte(end),
+	}
 }
 
 func mustParseAddr(s string) netip.Addr {
