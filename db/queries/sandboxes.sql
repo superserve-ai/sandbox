@@ -1,6 +1,6 @@
 -- name: CreateSandbox :one
-INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING *;
 
 -- name: GetSandbox :one
@@ -55,3 +55,16 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 -- name: GetSandboxNetworkConfig :one
 SELECT network_config FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
+
+-- name: ListExpiredSandboxes :many
+-- Sandboxes whose hard lifetime cap has elapsed. Includes all live states
+-- (active, pausing, idle, starting) because `timeout_seconds` is a hard
+-- cap measured from created_at — paused / idle sandboxes are not exempt.
+-- Returns up to $1 rows per reaper cycle to bound work.
+SELECT id, team_id, name, status, snapshot_id, host_id FROM sandbox
+WHERE destroyed_at IS NULL
+  AND timeout_seconds IS NOT NULL
+  AND status != 'deleted'
+  AND created_at + (timeout_seconds || ' seconds')::interval < now()
+ORDER BY created_at ASC
+LIMIT $1;

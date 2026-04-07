@@ -15,21 +15,22 @@ import (
 )
 
 const createSandbox = `-- name: CreateSandbox :one
-INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config
+INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds
 `
 
 type CreateSandboxParams struct {
-	TeamID     uuid.UUID     `json:"team_id"`
-	Name       string        `json:"name"`
-	Status     SandboxStatus `json:"status"`
-	VcpuCount  int32         `json:"vcpu_count"`
-	MemoryMib  int32         `json:"memory_mib"`
-	HostID     *string       `json:"host_id"`
-	IpAddress  *netip.Addr   `json:"ip_address"`
-	Pid        *int32        `json:"pid"`
-	SnapshotID pgtype.UUID   `json:"snapshot_id"`
+	TeamID         uuid.UUID     `json:"team_id"`
+	Name           string        `json:"name"`
+	Status         SandboxStatus `json:"status"`
+	VcpuCount      int32         `json:"vcpu_count"`
+	MemoryMib      int32         `json:"memory_mib"`
+	HostID         *string       `json:"host_id"`
+	IpAddress      *netip.Addr   `json:"ip_address"`
+	Pid            *int32        `json:"pid"`
+	SnapshotID     pgtype.UUID   `json:"snapshot_id"`
+	TimeoutSeconds *int32        `json:"timeout_seconds"`
 }
 
 func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (Sandbox, error) {
@@ -43,6 +44,7 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		arg.IpAddress,
 		arg.Pid,
 		arg.SnapshotID,
+		arg.TimeoutSeconds,
 	)
 	var i Sandbox
 	err := row.Scan(
@@ -61,6 +63,7 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		&i.UpdatedAt,
 		&i.DestroyedAt,
 		&i.NetworkConfig,
+		&i.TimeoutSeconds,
 	)
 	return i, err
 }
@@ -82,7 +85,7 @@ func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) 
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -110,6 +113,7 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.UpdatedAt,
 		&i.DestroyedAt,
 		&i.NetworkConfig,
+		&i.TimeoutSeconds,
 	)
 	return i, err
 }
@@ -131,8 +135,58 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	return network_config, err
 }
 
+const listExpiredSandboxes = `-- name: ListExpiredSandboxes :many
+SELECT id, team_id, name, status, snapshot_id, host_id FROM sandbox
+WHERE destroyed_at IS NULL
+  AND timeout_seconds IS NOT NULL
+  AND status != 'deleted'
+  AND created_at + (timeout_seconds || ' seconds')::interval < now()
+ORDER BY created_at ASC
+LIMIT $1
+`
+
+type ListExpiredSandboxesRow struct {
+	ID         uuid.UUID     `json:"id"`
+	TeamID     uuid.UUID     `json:"team_id"`
+	Name       string        `json:"name"`
+	Status     SandboxStatus `json:"status"`
+	SnapshotID pgtype.UUID   `json:"snapshot_id"`
+	HostID     *string       `json:"host_id"`
+}
+
+// Sandboxes whose hard lifetime cap has elapsed. Includes all live states
+// (active, pausing, idle, starting) because `timeout_seconds` is a hard
+// cap measured from created_at — paused / idle sandboxes are not exempt.
+// Returns up to $1 rows per reaper cycle to bound work.
+func (q *Queries) ListExpiredSandboxes(ctx context.Context, limit int32) ([]ListExpiredSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, listExpiredSandboxes, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListExpiredSandboxesRow{}
+	for rows.Next() {
+		var i ListExpiredSandboxesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.Status,
+			&i.SnapshotID,
+			&i.HostID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listIdleSandboxes = `-- name: ListIdleSandboxes :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds FROM sandbox
 WHERE status = 'idle'
   AND destroyed_at IS NULL
   AND last_activity_at < $1
@@ -164,6 +218,7 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 			&i.UpdatedAt,
 			&i.DestroyedAt,
 			&i.NetworkConfig,
+			&i.TimeoutSeconds,
 		); err != nil {
 			return nil, err
 		}
@@ -176,7 +231,7 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 }
 
 const listSandboxesByTeam = `-- name: ListSandboxesByTeam :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
 ORDER BY created_at DESC
 `
@@ -206,6 +261,7 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.UpdatedAt,
 			&i.DestroyedAt,
 			&i.NetworkConfig,
+			&i.TimeoutSeconds,
 		); err != nil {
 			return nil, err
 		}

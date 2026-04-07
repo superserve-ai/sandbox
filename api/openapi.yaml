@@ -436,6 +436,18 @@ components:
             `deny_out: ["0.0.0.0/0"]` and cannot reach any public IP. An
             explicit `network` field always wins over this flag, so use
             `network` for fine-grained allow/deny lists.
+        timeout_seconds:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 604800
+          description: >
+            Optional hard lifetime cap in seconds, measured from sandbox
+            creation. When set, the sandbox is destroyed this many seconds
+            after creation regardless of state (active, paused, idle) or
+            activity — the user asked for a hard deadline.
+            When unset, the sandbox lives until explicitly paused or
+            deleted. Maximum 604800 (7 days).
         network:
           $ref: "#/components/schemas/NetworkConfig"
 

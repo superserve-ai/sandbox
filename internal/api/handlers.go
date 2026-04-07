@@ -702,6 +702,20 @@ type createSandboxRequest struct {
 	// Pointer so we can distinguish unset (nil → default allow) from
 	// explicitly false.
 	AllowInternetAccess *bool `json:"allow_internet_access,omitempty"`
+
+	// TimeoutSeconds is a hard lifetime cap in seconds, measured from
+	// created_at. When set, the reaper destroys the sandbox that many
+	// seconds after creation — regardless of state (active, paused, idle)
+	// and regardless of activity. Matches the user intent "delete this
+	// sandbox in N seconds no matter what I do with it."
+	//
+	// The field name includes "_seconds" so the unit is obvious at every
+	// call site without having to read the docs.
+	//
+	// Nil means no cap — the sandbox lives until explicitly paused or
+	// deleted (this is the default philosophy of the platform: sandboxes
+	// don't die on their own).
+	TimeoutSeconds *int32 `json:"timeout_seconds,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -799,6 +813,21 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	// timeout_seconds validation — 1 second to 7 days. Must be positive
+	// (zero would mean "destroy immediately" which makes no sense). The
+	// 7-day cap is a safety ceiling so runaway "I set timeout=huge and
+	// forgot" sandboxes cannot live forever, while still supporting
+	// genuinely long-running workloads. Per-team overrides can come later.
+	const maxTimeoutSeconds int32 = 7 * 24 * 3600 // 7 days
+	if req.TimeoutSeconds != nil {
+		if *req.TimeoutSeconds < 1 || *req.TimeoutSeconds > maxTimeoutSeconds {
+			respondErrorMsg(c, "bad_request",
+				fmt.Sprintf("timeout_seconds must be between 1 and %d (7 days)", maxTimeoutSeconds),
+				http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Translate allow_internet_access: false into an equivalent deny rule
 	// so the rest of the flow treats it like any other egress config.
 	// An explicit Network config wins — we only inject a deny when the
@@ -854,14 +883,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	const defaultVcpu int32 = 1
 	const defaultMemoryMib int32 = 512
 
-	// Insert sandbox with status=starting.
+	// Insert sandbox with status=starting. timeout_seconds is optional —
+	// NULL means the sandbox lives until explicitly paused or deleted.
 	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
-		TeamID:     teamID,
-		Name:       req.Name,
-		Status:     db.SandboxStatusStarting,
-		VcpuCount:  defaultVcpu,
-		MemoryMib:  defaultMemoryMib,
-		SnapshotID: snapshotID,
+		TeamID:         teamID,
+		Name:           req.Name,
+		Status:         db.SandboxStatusStarting,
+		VcpuCount:      defaultVcpu,
+		MemoryMib:      defaultMemoryMib,
+		SnapshotID:     snapshotID,
+		TimeoutSeconds: req.TimeoutSeconds,
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create sandbox record")
