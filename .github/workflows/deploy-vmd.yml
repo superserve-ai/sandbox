@@ -122,11 +122,27 @@ jobs:
               # standalone curly-brace pairs from a bash function body.
               inject_script = textwrap.dedent(f'''
                   set -euo pipefail
+
                   sudo mv /tmp/vmd-{sha}  {install_dir}/vmd
                   sudo mv /tmp/boxd-{sha} {install_dir}/boxd
                   sudo chmod +x {install_dir}/vmd {install_dir}/boxd
 
-                  ROOTFS=$(grep -s "^BASE_ROOTFS_PATH=" /etc/superserve/vmd.env /etc/agentbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2)
+                  # Resolve the base rootfs path from whichever env file is
+                  # present. We cannot use `grep -s ... file1 file2` because
+                  # grep exits with 2 when ANY listed file is missing (even
+                  # with -s), and `set -euo pipefail` treats that as a fatal
+                  # error via the pipeline. Enumerate candidate files safely.
+                  ROOTFS=""
+                  for env_file in /etc/superserve/vmd.env /etc/agentbox/vmd.env; do
+                      if [ -f "$env_file" ]; then
+                          candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
+                          if [ -n "$candidate" ]; then
+                              ROOTFS="$candidate"
+                              break
+                          fi
+                      fi
+                  done
+
                   if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then
                       STAGING="$ROOTFS.new.$$"
                       MNT=$(mktemp -d)
@@ -141,11 +157,18 @@ jobs:
                       sudo mv "$STAGING" "$ROOTFS"
                       trap - EXIT
                       echo "boxd injected into rootfs atomically"
+                  else
+                      echo "WARNING: BASE_ROOTFS_PATH not found or not readable; skipping rootfs inject"
                   fi
 
                   sudo systemctl restart {service}
-                  sleep 2
-                  sudo systemctl is-active --quiet {service}
+                  sleep 3
+                  sudo systemctl is-active --quiet {service} || (
+                      echo "ERROR: {service} failed to become active after restart" >&2
+                      sudo systemctl status --no-pager {service} >&2 || true
+                      sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                      exit 1
+                  )
               ''')
               r = subprocess.run([
                   'gcloud', 'compute', 'ssh', name,
@@ -154,8 +177,19 @@ jobs:
                   '--command', inject_script,
               ], capture_output=True, text=True)
               if r.returncode != 0:
-                  raise RuntimeError(f'service not healthy: {r.stderr}')
+                  # Surface both stdout and stderr so deploy failures are
+                  # actually debuggable from the GitHub Actions log. The
+                  # inject script prints journalctl output to stderr on
+                  # service failure; silently swallowing it was a source of
+                  # long debug sessions.
+                  raise RuntimeError(
+                      f'service not healthy\n'
+                      f'--- stdout ---\n{r.stdout}\n'
+                      f'--- stderr ---\n{r.stderr}'
+                  )
               print(f'[{tag}] active')
+              if r.stdout.strip():
+                  print(f'[{tag}] {r.stdout.strip()}')
 
           failed = []
           with ThreadPoolExecutor(max_workers=len(instances)) as ex:
