@@ -1280,10 +1280,14 @@ func isIPOrCIDR(s string) bool {
 // validateEgressRules enforces the rules shared between CreateSandbox and
 // UpdateSandboxNetwork:
 //
-//   - deny_out entries MUST be valid CIDRs or IP addresses (domains are
-//     not supported in deny lists — there's no way to enforce a domain
+//   - deny_out entries MUST be valid IPv4 CIDRs or IP addresses (domains
+//     are not supported in deny lists — there's no way to enforce a domain
 //     deny at the IP layer, and mixing silently fails).
-//   - allow_out entries can be either CIDRs/IPs or domain names.
+//   - allow_out entries can be either IPv4 CIDRs/IPs or domain names.
+//   - IPv6 entries are rejected everywhere. Sandboxes are IPv4-only and
+//     all IPv6 egress is dropped wholesale by the nftables firewall; we
+//     reject v6 in the API instead of silently ignoring it so users get
+//     a clear error.
 //
 // Returns nil on success or a 400-appropriate error message.
 func validateEgressRules(allowOut, denyOut []string) error {
@@ -1291,7 +1295,26 @@ func validateEgressRules(allowOut, denyOut []string) error {
 		if !isIPOrCIDR(entry) {
 			return fmt.Errorf("deny_out only supports CIDRs, got %q", entry)
 		}
+		if isIPv6(entry) {
+			return fmt.Errorf("IPv6 is not supported, got %q in deny_out", entry)
+		}
 	}
-	// allow_out accepts both CIDRs and domains — no validation beyond existence.
+	for _, entry := range allowOut {
+		if isIPOrCIDR(entry) && isIPv6(entry) {
+			return fmt.Errorf("IPv6 is not supported, got %q in allow_out", entry)
+		}
+	}
 	return nil
+}
+
+// isIPv6 returns true if s is a valid IPv6 address or IPv6 CIDR.
+// Assumes the caller has already confirmed via isIPOrCIDR that s parses.
+func isIPv6(s string) bool {
+	if addr, err := netip.ParseAddr(s); err == nil {
+		return addr.Is6() && !addr.Is4In6()
+	}
+	if prefix, err := netip.ParsePrefix(s); err == nil {
+		return prefix.Addr().Is6() && !prefix.Addr().Is4In6()
+	}
+	return false
 }

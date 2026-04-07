@@ -233,6 +233,7 @@ func (fw *Firewall) installRules() error {
 // ---------------------------------------------------------------------------
 //
 // Order:
+//   0. Any IPv6 from TAP → drop (fail-closed; sandboxes are IPv4-only)
 //   1. ESTABLISHED/RELATED → accept
 //   2. predefinedAllowSet → accept (all protocols)
 //   3. predefinedDenySet  → drop   (all protocols)
@@ -241,6 +242,25 @@ func (fw *Firewall) installRules() error {
 //   6. Default: accept (TCP goes to proxy via REDIRECT)
 
 func (fw *Firewall) installFilterRules() {
+	// Rule 0: drop all IPv6 traffic from the TAP interface.
+	//
+	// The namespace is IPv4-only (no IPv6 address on TAP, no IPv6 default
+	// route) so global IPv6 egress already cannot leave the sandbox. This
+	// rule is defense in depth: if IPv6 routing is ever accidentally
+	// enabled, or a user assumes v6 rules in their allow/deny lists are
+	// enforced, we fail closed at the firewall layer instead of silently
+	// leaking. The API layer rejects v6 entries outright so users get a
+	// clear error instead of surprised-by-enforcement-gap behavior.
+	fw.conn.AddRule(&nftables.Rule{
+		Table: fw.table,
+		Chain: fw.filterChain,
+		Exprs: flatten(
+			fw.tapIfaceMatch(),
+			protoIPv6(),
+			verdictDrop(),
+		),
+	})
+
 	// Rule 1: ESTABLISHED/RELATED → accept.
 	fw.conn.AddRule(&nftables.Rule{
 		Table: fw.table,
@@ -554,6 +574,15 @@ func protoNotTCP() []expr.Any {
 	return []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 		&expr.Cmp{Register: 1, Op: expr.CmpOpNeq, Data: []byte{unix.IPPROTO_TCP}},
+	}
+}
+
+// protoIPv6 matches packets where the network-layer protocol is IPv6.
+// Used to drop all IPv6 egress from sandbox namespaces (which are IPv4-only).
+func protoIPv6() []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: []byte{unix.NFPROTO_IPV6}},
 	}
 }
 
