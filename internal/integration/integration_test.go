@@ -1118,6 +1118,246 @@ func TestIntegration_SecurityHeaders(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox metadata
+// ---------------------------------------------------------------------------
+
+func TestIntegration_CreateSandbox_WithMetadata(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	w := do(r, "POST", "/sandboxes", apiKey,
+		`{"name":"tagged","metadata":{"env":"prod","owner":"agent-7"}}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	body := mustJSON(t, w)
+	md, ok := body["metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("response metadata not an object: %v", body["metadata"])
+	}
+	if md["env"] != "prod" || md["owner"] != "agent-7" {
+		t.Fatalf("response metadata = %v", md)
+	}
+
+	// DB row carries the same jsonb.
+	sandboxID, _ := uuid.Parse(body["id"].(string))
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	var roundTrip map[string]string
+	if err := json.Unmarshal(sb.Metadata, &roundTrip); err != nil {
+		t.Fatalf("decode persisted metadata: %v", err)
+	}
+	if roundTrip["env"] != "prod" || roundTrip["owner"] != "agent-7" {
+		t.Fatalf("persisted metadata = %v", roundTrip)
+	}
+}
+
+func TestIntegration_CreateSandbox_NoMetadataDefaultsEmptyObject(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	w := do(r, "POST", "/sandboxes", apiKey, `{"name":"plain"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+
+	// Response must include metadata as an empty object, not null/missing.
+	if !strings.Contains(w.Body.String(), `"metadata":{}`) {
+		t.Errorf("response should include \"metadata\":{}, got %s", w.Body.String())
+	}
+
+	// DB row must be the empty jsonb object (NOT NULL constraint enforces this).
+	sandboxID, _ := uuid.Parse(mustJSON(t, w)["id"].(string))
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if string(sb.Metadata) != "{}" {
+		t.Errorf("persisted metadata = %q, want %q", string(sb.Metadata), "{}")
+	}
+}
+
+func TestIntegration_CreateSandbox_MetadataAdversarial(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// Build adversarial payloads that should each return 400.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "reserved prefix",
+			body: `{"name":"x","metadata":{"superserve.tier":"gold"}}`,
+		},
+		{
+			name: "reserved underscore prefix",
+			body: `{"name":"x","metadata":{"_superserve_internal":"x"}}`,
+		},
+		{
+			name: "key too long",
+			body: fmt.Sprintf(`{"name":"x","metadata":{%q:"v"}}`, strings.Repeat("k", 257)),
+		},
+		{
+			name: "value too long",
+			body: fmt.Sprintf(`{"name":"x","metadata":{"k":%q}}`, strings.Repeat("v", 2049)),
+		},
+		{
+			name: "empty key",
+			body: `{"name":"x","metadata":{"":"v"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(r, "POST", "/sandboxes", apiKey, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestIntegration_CreateSandbox_MetadataTooManyKeys(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// 65 keys exceeds the cap of 64.
+	pairs := make([]string, 0, 65)
+	for i := 0; i < 65; i++ {
+		pairs = append(pairs, fmt.Sprintf("%q:%q", fmt.Sprintf("k%d", i), "v"))
+	}
+	body := fmt.Sprintf(`{"name":"x","metadata":{%s}}`, strings.Join(pairs, ","))
+
+	w := do(r, "POST", "/sandboxes", apiKey, body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_CreateSandbox_MetadataTotalSizeExceeded(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// 9 values × ~2 KB each = ~18 KB > 16 KB cap.
+	bigVal := strings.Repeat("v", 2048)
+	pairs := make([]string, 0, 9)
+	for i := 0; i < 9; i++ {
+		pairs = append(pairs, fmt.Sprintf("%q:%q", fmt.Sprintf("k%d", i), bigVal))
+	}
+	body := fmt.Sprintf(`{"name":"x","metadata":{%s}}`, strings.Join(pairs, ","))
+
+	w := do(r, "POST", "/sandboxes", apiKey, body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_ListSandboxes_FilterByMetadata(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// Create three sandboxes with overlapping but distinct tag sets.
+	bodies := []string{
+		`{"name":"a","metadata":{"env":"prod","owner":"alice"}}`,
+		`{"name":"b","metadata":{"env":"prod","owner":"bob"}}`,
+		`{"name":"c","metadata":{"env":"staging","owner":"alice"}}`,
+	}
+	for i, body := range bodies {
+		cw := do(r, "POST", "/sandboxes", apiKey, body)
+		if cw.Code != http.StatusCreated {
+			t.Fatalf("create[%d]: %d %s", i, cw.Code, cw.Body.String())
+		}
+	}
+
+	// Filter by env=prod → expect a, b.
+	w := do(r, "GET", "/sandboxes?metadata.env=prod", apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", w.Code, w.Body.String())
+	}
+	var got []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	names := map[string]bool{}
+	for _, item := range got {
+		names[item["name"].(string)] = true
+	}
+	if !names["a"] || !names["b"] || names["c"] {
+		t.Errorf("env=prod filter returned wrong set: %v", names)
+	}
+
+	// AND filter env=prod & owner=alice → expect only a.
+	w = do(r, "GET", "/sandboxes?metadata.env=prod&metadata.owner=alice", apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 1 || got[0]["name"] != "a" {
+		t.Errorf("env=prod&owner=alice should return only [a], got %v", got)
+	}
+
+	// Non-matching value → empty list.
+	w = do(r, "GET", "/sandboxes?metadata.env=nope", apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("env=nope should return empty list, got %v", got)
+	}
+}
+
+func TestIntegration_ListSandboxes_FilterIsolatedPerTeam(t *testing.T) {
+	_, apiKeyA := seedTeamAndKey(t)
+	_, apiKeyB := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// Team A creates a sandbox tagged env=prod.
+	if cw := do(r, "POST", "/sandboxes", apiKeyA,
+		`{"name":"a","metadata":{"env":"prod"}}`); cw.Code != http.StatusCreated {
+		t.Fatalf("team A create: %d %s", cw.Code, cw.Body.String())
+	}
+
+	// Team B filters env=prod and must not see team A's sandbox.
+	w := do(r, "GET", "/sandboxes?metadata.env=prod", apiKeyB, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("team B list: %d %s", w.Code, w.Body.String())
+	}
+	var got []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("team B should see 0 sandboxes, got %d", len(got))
+	}
+}
+
+func TestIntegration_ListSandboxes_FilterRejectsAdversarial(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// Reserved prefix in filter is also rejected (uses same validateMetadata).
+	w := do(r, "GET", "/sandboxes?metadata.superserve.tier=gold", apiKey, "")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("reserved prefix in filter: status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+
+	// Empty filter key is rejected.
+	w = do(r, "GET", "/sandboxes?metadata.=v", apiKey, "")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("empty filter key: status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Rate limiting
 // ---------------------------------------------------------------------------
 

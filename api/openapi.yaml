@@ -62,8 +62,29 @@ paths:
       operationId: listSandboxes
       tags: [Sandboxes]
       summary: List all sandboxes
+      description: |
+        Returns sandboxes belonging to the authenticated team, optionally
+        filtered by metadata tags.
+
+        ## Filtering by metadata
+
+        Any query parameter prefixed `metadata.` is treated as a filter
+        clause: `?metadata.env=prod&metadata.owner=agent-7`. Multiple
+        filters AND together — a sandbox matches only if every key/value
+        pair is present in its metadata. Values are compared as exact
+        strings; there is no type coercion or substring matching.
       security:
         - apiKey: []
+      parameters:
+        - name: metadata.{key}
+          in: query
+          required: false
+          description: |
+            Filter sandboxes whose metadata contains an exact `{key}: <value>`
+            pair. Repeat with different keys to AND multiple filters. Values
+            are always strings. Example: `?metadata.env=prod`.
+          schema:
+            type: string
       responses:
         "200":
           description: List of sandboxes belonging to the authenticated team
@@ -73,6 +94,8 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/SandboxResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -448,6 +471,37 @@ components:
             activity — the user asked for a hard deadline.
             When unset, the sandbox lives until explicitly paused or
             deleted. Maximum 604800 (7 days).
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Flat string-to-string tags attached to the sandbox at creation.
+            Useful for grouping, owner labels, environment, run IDs, etc.
+
+            ## Constraints
+              - **Strings only.** Values must be strings. There is no type
+                coercion: `metadata.count=42` filters for the *string* "42".
+              - **At most 64 keys.**
+              - Each key may be at most **256 bytes**.
+              - Each value may be at most **2048 bytes** (2 KB).
+              - The serialized object may be at most **16384 bytes** (16 KB)
+                in total.
+              - Keys starting with `superserve.` or `_superserve` (case-
+                insensitive) are reserved for platform use and rejected.
+
+            ## Lifecycle
+            Metadata is **immutable** after creation. There is no
+            `PATCH /sandboxes/:id/metadata` endpoint by design — if you
+            need mutability, delete and recreate the sandbox, or open an
+            issue with your use case.
+
+            Filter sandboxes by metadata via the `metadata.{key}` query
+            parameter on `GET /sandboxes`.
+          example:
+            env: prod
+            owner: agent-7
+            run_id: 7f3c-21
         network:
           $ref: "#/components/schemas/NetworkConfig"
 
@@ -476,6 +530,17 @@ components:
         created_at:
           type: string
           format: date-time
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: >
+            User-supplied tags attached at creation. Always present —
+            sandboxes created without metadata return `{}` rather than
+            being absent.
+          example:
+            env: prod
+            owner: agent-7
 
     ExecStreamEvent:
       type: object

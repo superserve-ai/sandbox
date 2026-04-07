@@ -1,6 +1,6 @@
 -- name: CreateSandbox :one
-INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 RETURNING *;
 
 -- name: GetSandbox :one
@@ -10,6 +10,17 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 -- name: ListSandboxesByTeam :many
 SELECT * FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
+ORDER BY created_at DESC;
+
+-- name: ListSandboxesByTeamWithFilter :many
+-- Same as ListSandboxesByTeam but additionally filters rows whose metadata
+-- contains every key/value pair in $2 (jsonb @> containment). Pass an empty
+-- object '{}'::jsonb to match everything — but prefer ListSandboxesByTeam
+-- in that case so we don't pay the (still tiny) cost of the @> evaluation.
+SELECT * FROM sandbox
+WHERE team_id = $1
+  AND destroyed_at IS NULL
+  AND metadata @> $2
 ORDER BY created_at DESC;
 
 -- name: UpdateSandboxStatus :exec

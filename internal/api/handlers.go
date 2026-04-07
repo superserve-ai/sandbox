@@ -716,17 +716,33 @@ type createSandboxRequest struct {
 	// deleted (this is the default philosophy of the platform: sandboxes
 	// don't die on their own).
 	TimeoutSeconds *int32 `json:"timeout_seconds,omitempty"`
+
+	// Metadata is a flat string→string map of user-supplied tags that get
+	// attached to the sandbox at creation. The tags are immutable after
+	// creation and filterable on GET /sandboxes via metadata.<key>=<value>
+	// query params (jsonb @> containment, so all conditions must match).
+	//
+	// Strings only — no nested objects, numbers, or arrays. This is
+	// deliberate: it keeps URL filters unambiguous (no "is 42 the number
+	// or the string?" questions) and matches what every other tagging
+	// system in this space does (E2B, AWS tags, GCE labels, k8s labels).
+	//
+	// Limits are enforced by validateMetadata: 64 keys, 256-byte keys,
+	// 2 KB values, 16 KB total. Keys starting with `superserve.` or
+	// `_superserve` are reserved for platform use and rejected.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type sandboxResponse struct {
-	ID         uuid.UUID  `json:"id"`
-	Name       string     `json:"name"`
-	Status     string     `json:"status"`
-	VcpuCount  int32      `json:"vcpu_count"`
-	MemoryMib  int32      `json:"memory_mib"`
-	IPAddress  string     `json:"ip_address,omitempty"`
-	SnapshotID *uuid.UUID `json:"snapshot_id,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID         uuid.UUID         `json:"id"`
+	Name       string            `json:"name"`
+	Status     string            `json:"status"`
+	VcpuCount  int32             `json:"vcpu_count"`
+	MemoryMib  int32             `json:"memory_mib"`
+	IPAddress  string            `json:"ip_address,omitempty"`
+	SnapshotID *uuid.UUID        `json:"snapshot_id,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Metadata   map[string]string `json:"metadata"`
 }
 
 func sandboxToResponse(s db.Sandbox) sandboxResponse {
@@ -737,6 +753,7 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 		VcpuCount: s.VcpuCount,
 		MemoryMib: s.MemoryMib,
 		CreatedAt: s.CreatedAt,
+		Metadata:  decodeMetadata(s.Metadata),
 	}
 	if s.IpAddress != nil {
 		resp.IPAddress = s.IpAddress.String()
@@ -746,6 +763,25 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 		resp.SnapshotID = &id
 	}
 	return resp
+}
+
+// decodeMetadata unmarshals the jsonb bytes column into a string→string map.
+// On any decode error (which should be impossible because the column is
+// constrained to objects we wrote ourselves) we return an empty map rather
+// than panicking — losing the tags is bad, but failing the whole list/get
+// response would be worse. Callers always get a non-nil map so the JSON
+// response renders `"metadata": {}` instead of `null` for sandboxes that
+// were created without any tags.
+func decodeMetadata(raw []byte) map[string]string {
+	out := map[string]string{}
+	if len(raw) == 0 {
+		return out
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		log.Error().Err(err).Msg("decode sandbox metadata jsonb")
+		return map[string]string{}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +794,33 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		return
 	}
 
-	sandboxes, err := h.DB.ListSandboxesByTeam(c.Request.Context(), teamID)
+	// Parse metadata filters from the query string. Any query param that
+	// starts with `metadata.` is treated as a filter clause:
+	//
+	//   GET /sandboxes?metadata.env=prod&metadata.owner=agent-7
+	//
+	// Multiple filters AND together (jsonb @> containment semantics): a
+	// sandbox matches only if all key/value pairs are present in its
+	// metadata. Values are always strings — there's no type coercion,
+	// because the storage shape is flat string→string and we want url
+	// filters to be unambiguous (`metadata.count=42` matches the string
+	// "42", not the number 42).
+	filter, err := parseMetadataFilter(c.Request.URL.Query())
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var sandboxes []db.Sandbox
+	if len(filter) == 0 {
+		sandboxes, err = h.DB.ListSandboxesByTeam(c.Request.Context(), teamID)
+	} else {
+		filterJSON, _ := json.Marshal(filter) // map[string]string never fails
+		sandboxes, err = h.DB.ListSandboxesByTeamWithFilter(c.Request.Context(), db.ListSandboxesByTeamWithFilterParams{
+			TeamID:   teamID,
+			Metadata: filterJSON,
+		})
+	}
 	if err != nil {
 		log.Error().Err(err).Msg("DB ListSandboxesByTeam failed")
 		respondError(c, ErrInternal)
@@ -770,6 +832,39 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		out[i] = sandboxToResponse(s)
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// parseMetadataFilter walks query params and extracts the metadata.* filter
+// pairs into a flat string→string map. Returns an empty map (not nil) when
+// the user didn't supply any metadata filters.
+//
+// The validation cap on the *filter* is the same as on stored metadata
+// (validateMetadata), because we marshal the filter to jsonb and pass it
+// through @> — a 16 KB filter would be a denial-of-service vector if
+// allowed. We reuse validateMetadata so the rules can never drift apart.
+func parseMetadataFilter(query map[string][]string) (map[string]string, error) {
+	const prefix = "metadata."
+	out := map[string]string{}
+	for key, values := range query {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		mdKey := strings.TrimPrefix(key, prefix)
+		if mdKey == "" {
+			return nil, fmt.Errorf("metadata filter key cannot be empty")
+		}
+		// Repeated `?metadata.k=a&metadata.k=b` is meaningless under
+		// containment semantics (a sandbox can have only one value per
+		// key), so we reject it loudly instead of picking last-wins.
+		if len(values) > 1 {
+			return nil, fmt.Errorf("metadata filter %q has multiple values; only one allowed", mdKey)
+		}
+		out[mdKey] = values[0]
+	}
+	if err := validateMetadata(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (h *Handlers) GetSandboxByID(c *gin.Context) {
@@ -849,6 +944,27 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 	}
 
+	// Validate metadata before any DB or VMD work for the same reason —
+	// reject oversized / reserved-prefix tags with a 400 instead of writing
+	// a row we'd need to roll back.
+	if err := validateMetadata(req.Metadata); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Marshal once into the canonical jsonb shape. Empty / nil maps are
+	// stored as the empty object so the column is never NULL.
+	metadataJSON, err := json.Marshal(req.Metadata)
+	if err != nil {
+		// json.Marshal of map[string]string cannot actually fail, but the
+		// linter doesn't know that and the cost of the check is zero.
+		log.Error().Err(err).Msg("marshal sandbox metadata")
+		respondError(c, ErrInternal)
+		return
+	}
+	if len(req.Metadata) == 0 {
+		metadataJSON = []byte(`{}`)
+	}
+
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
 		return
@@ -885,6 +1001,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Insert sandbox with status=starting. timeout_seconds is optional —
 	// NULL means the sandbox lives until explicitly paused or deleted.
+	// metadata is always non-NULL (empty object when the user provided none)
+	// to match the DB column constraint and keep read paths nil-free.
 	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
 		TeamID:         teamID,
 		Name:           req.Name,
@@ -893,6 +1011,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		MemoryMib:      defaultMemoryMib,
 		SnapshotID:     snapshotID,
 		TimeoutSeconds: req.TimeoutSeconds,
+		Metadata:       metadataJSON,
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create sandbox record")
@@ -991,14 +1110,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
-	c.JSON(http.StatusCreated, sandboxResponse{
-		ID:        sandbox.ID,
-		Name:      sandbox.Name,
-		Status:    string(db.SandboxStatusActive),
-		VcpuCount: sandbox.VcpuCount,
-		MemoryMib: sandbox.MemoryMib,
-		CreatedAt: sandbox.CreatedAt,
-	})
+	// Build the response from the freshly-inserted row so metadata, IP, and
+	// any other server-populated fields make it back to the client without
+	// having to re-read the row. The row's status is still "starting" from
+	// the INSERT — overwrite it with "active" since we just transitioned.
+	resp := sandboxToResponse(sandbox)
+	resp.Status = string(db.SandboxStatusActive)
+	if ipAddress != "" {
+		resp.IPAddress = ipAddress
+	}
+	c.JSON(http.StatusCreated, resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,6 +1555,71 @@ func isIPOrCIDR(s string) bool {
 //     reject v6 in the API instead of silently ignoring it so users get
 //     a clear error.
 //
+// Limits on user-supplied metadata. These are deliberately conservative —
+// metadata is meant for tags ("env=prod", "owner=agent-7"), not for shipping
+// arbitrary blobs through the sandbox API. Tighter limits also keep the
+// jsonb @> filter cheap and bound the cost of the GIN index.
+const (
+	metadataMaxKeys       = 64    // distinct key/value pairs per sandbox
+	metadataMaxKeyLen     = 256   // bytes per key
+	metadataMaxValueLen   = 2048  // bytes per value (2 KB)
+	metadataMaxTotalBytes = 16384 // total serialized jsonb size (16 KB)
+)
+
+// metadataReservedPrefixes are key prefixes the platform reserves for its
+// own use. Today nothing actually emits these, but reserving them now means
+// we can introduce internal tags later (e.g., `superserve.billing.tier`)
+// without having to migrate user data out of the way. The check is
+// case-insensitive so users can't sneak through with `Superserve.foo`.
+var metadataReservedPrefixes = []string{"superserve.", "_superserve"}
+
+// validateMetadata enforces all the size and naming rules on a user-supplied
+// metadata map. Returns nil on success or a 400-appropriate error.
+//
+// nil and empty maps are both fine — they yield an empty jsonb object in
+// the database. The caller is responsible for marshalling.
+//
+// Important: this validation is the *only* place where reserved prefixes
+// are enforced, so any new code that writes to sandbox.metadata must route
+// through here (or add its own check). Today the only writer is
+// CreateSandbox.
+func validateMetadata(md map[string]string) error {
+	if len(md) == 0 {
+		return nil
+	}
+	if len(md) > metadataMaxKeys {
+		return fmt.Errorf("metadata has %d keys, max is %d", len(md), metadataMaxKeys)
+	}
+
+	// Track total size as we iterate so we can fail fast on the offending
+	// key rather than re-marshalling at the end. The size is approximate
+	// (it doesn't include json punctuation) but the cap is conservative
+	// enough that the difference doesn't matter.
+	totalBytes := 0
+	for k, v := range md {
+		if k == "" {
+			return fmt.Errorf("metadata keys cannot be empty")
+		}
+		if len(k) > metadataMaxKeyLen {
+			return fmt.Errorf("metadata key %q is %d bytes, max is %d", k, len(k), metadataMaxKeyLen)
+		}
+		if len(v) > metadataMaxValueLen {
+			return fmt.Errorf("metadata value for key %q is %d bytes, max is %d", k, len(v), metadataMaxValueLen)
+		}
+		lower := strings.ToLower(k)
+		for _, prefix := range metadataReservedPrefixes {
+			if strings.HasPrefix(lower, prefix) {
+				return fmt.Errorf("metadata key %q uses reserved prefix %q", k, prefix)
+			}
+		}
+		totalBytes += len(k) + len(v)
+		if totalBytes > metadataMaxTotalBytes {
+			return fmt.Errorf("metadata exceeds %d bytes total", metadataMaxTotalBytes)
+		}
+	}
+	return nil
+}
+
 // Returns nil on success or a 400-appropriate error message.
 func validateEgressRules(allowOut, denyOut []string) error {
 	for _, entry := range denyOut {

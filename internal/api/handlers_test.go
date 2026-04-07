@@ -118,7 +118,10 @@ func (m *mockDBTX) Query(context.Context, string, ...any) (pgx.Rows, error) {
 // ---------------------------------------------------------------------------
 
 // sandboxRow returns a mockRow that populates a Sandbox from GetSandbox's Scan
-// call (14 destination pointers matching the column order).
+// call (17 destination pointers matching the column order in sqlc-generated
+// queries: ID, TeamID, Name, Status, VcpuCount, MemoryMib, HostID, IpAddress,
+// Pid, SnapshotID, LastActivityAt, CreatedAt, UpdatedAt, DestroyedAt,
+// NetworkConfig, TimeoutSeconds, Metadata).
 func sandboxRow(s db.Sandbox) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = s.ID
@@ -135,6 +138,9 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[11].(*time.Time) = s.CreatedAt
 		*dest[12].(*time.Time) = s.UpdatedAt
 		*dest[13].(*pgtype.Timestamptz) = s.DestroyedAt
+		*dest[14].(*[]byte) = s.NetworkConfig
+		*dest[15].(**int32) = s.TimeoutSeconds
+		*dest[16].(*[]byte) = s.Metadata
 		return nil
 	}}
 }
@@ -1883,5 +1889,292 @@ func TestTeamIDFromContext_InvalidUUID(t *testing.T) {
 	c.Set("team_id", "not-a-uuid")
 	if _, err := teamIDFromContext(c); err == nil {
 		t.Fatal("expected error for invalid team_id UUID")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// validateMetadata tests
+// ---------------------------------------------------------------------------
+
+func TestValidateMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		md      map[string]string
+		wantErr bool
+		errSub  string // substring expected in the error message
+	}{
+		{name: "nil ok", md: nil},
+		{name: "empty ok", md: map[string]string{}},
+		{name: "happy path", md: map[string]string{"env": "prod", "owner": "agent-7"}},
+		{
+			name:    "too many keys",
+			md:      makeMetadata(metadataMaxKeys+1, "k", "v"),
+			wantErr: true,
+			errSub:  "max is 64",
+		},
+		{
+			name:    "key too long",
+			md:      map[string]string{strings.Repeat("k", metadataMaxKeyLen+1): "v"},
+			wantErr: true,
+			errSub:  "max is 256",
+		},
+		{
+			name:    "value too long",
+			md:      map[string]string{"k": strings.Repeat("v", metadataMaxValueLen+1)},
+			wantErr: true,
+			errSub:  "max is 2048",
+		},
+		{
+			name:    "empty key",
+			md:      map[string]string{"": "v"},
+			wantErr: true,
+			errSub:  "cannot be empty",
+		},
+		{
+			name:    "reserved prefix lower",
+			md:      map[string]string{"superserve.tier": "gold"},
+			wantErr: true,
+			errSub:  "reserved prefix",
+		},
+		{
+			name:    "reserved prefix upper",
+			md:      map[string]string{"SUPERSERVE.tier": "gold"},
+			wantErr: true,
+			errSub:  "reserved prefix",
+		},
+		{
+			name:    "reserved underscore",
+			md:      map[string]string{"_superserve_internal": "x"},
+			wantErr: true,
+			errSub:  "reserved prefix",
+		},
+		{
+			name:    "total bytes exceeded",
+			md:      map[string]string{"a": strings.Repeat("v", metadataMaxValueLen), "b": strings.Repeat("v", metadataMaxValueLen), "c": strings.Repeat("v", metadataMaxValueLen), "d": strings.Repeat("v", metadataMaxValueLen), "e": strings.Repeat("v", metadataMaxValueLen), "f": strings.Repeat("v", metadataMaxValueLen), "g": strings.Repeat("v", metadataMaxValueLen), "h": strings.Repeat("v", metadataMaxValueLen), "i": strings.Repeat("v", metadataMaxValueLen)},
+			wantErr: true,
+			errSub:  "16384 bytes total",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMetadata(tc.md)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.errSub)
+				}
+				if tc.errSub != "" && !strings.Contains(err.Error(), tc.errSub) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tc.errSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// makeMetadata builds a metadata map with n entries — used to exercise the
+// max-keys check without typing out 65 literals.
+func makeMetadata(n int, keyPrefix, val string) map[string]string {
+	out := make(map[string]string, n)
+	for i := 0; i < n; i++ {
+		out[fmt.Sprintf("%s%d", keyPrefix, i)] = val
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// parseMetadataFilter tests
+// ---------------------------------------------------------------------------
+
+func TestParseMetadataFilter(t *testing.T) {
+	t.Run("no filters", func(t *testing.T) {
+		got, err := parseMetadataFilter(map[string][]string{"page": {"1"}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("expected empty filter, got %v", got)
+		}
+	})
+
+	t.Run("multiple filters", func(t *testing.T) {
+		got, err := parseMetadataFilter(map[string][]string{
+			"metadata.env":   {"prod"},
+			"metadata.owner": {"agent-7"},
+			"page":           {"1"},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got["env"] != "prod" || got["owner"] != "agent-7" {
+			t.Fatalf("got %v, want env=prod owner=agent-7", got)
+		}
+	})
+
+	t.Run("empty key after prefix rejected", func(t *testing.T) {
+		_, err := parseMetadataFilter(map[string][]string{"metadata.": {"x"}})
+		if err == nil {
+			t.Fatal("expected error for empty filter key")
+		}
+	})
+
+	t.Run("repeated value rejected", func(t *testing.T) {
+		_, err := parseMetadataFilter(map[string][]string{"metadata.k": {"a", "b"}})
+		if err == nil {
+			t.Fatal("expected error for repeated filter value")
+		}
+	})
+
+	t.Run("filter values inherit metadata limits", func(t *testing.T) {
+		_, err := parseMetadataFilter(map[string][]string{
+			"metadata.k": {strings.Repeat("v", metadataMaxValueLen+1)},
+		})
+		if err == nil {
+			t.Fatal("expected error for oversized filter value")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// CreateSandbox metadata tests
+// ---------------------------------------------------------------------------
+
+func TestCreateSandbox_WithMetadata(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	var capturedMetadata []byte
+	vmd := &stubVMD{
+		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
+			return "10.0.0.42", nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				// args[10] is the metadata jsonb (11th positional, 0-indexed).
+				if b, ok := args[10].([]byte); ok {
+					capturedMetadata = b
+				}
+				// Echo metadata back through the row so the response carries it.
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "tagged",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 512,
+					CreatedAt: time.Now(),
+					Metadata:  capturedMetadata,
+				})
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	body := `{"name":"tagged","metadata":{"env":"prod","owner":"agent-7"}}`
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(body))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if string(capturedMetadata) == "" {
+		t.Fatal("metadata was not passed to CreateSandbox params")
+	}
+	// Verify the captured jsonb decodes back to our map.
+	var roundTrip map[string]string
+	if err := json.Unmarshal(capturedMetadata, &roundTrip); err != nil {
+		t.Fatalf("decode captured metadata: %v", err)
+	}
+	if roundTrip["env"] != "prod" || roundTrip["owner"] != "agent-7" {
+		t.Fatalf("round-trip metadata = %v, want env=prod owner=agent-7", roundTrip)
+	}
+
+	// Response should echo metadata.
+	resp := parseJSON(t, w)
+	mdResp, _ := resp["metadata"].(map[string]any)
+	if mdResp["env"] != "prod" || mdResp["owner"] != "agent-7" {
+		t.Fatalf("response metadata = %v, want env=prod owner=agent-7", mdResp)
+	}
+}
+
+func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	var capturedMetadata []byte
+	vmd := &stubVMD{
+		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
+			return "10.0.0.42", nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				if b, ok := args[10].([]byte); ok {
+					capturedMetadata = b
+				}
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "no-md",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 512,
+					CreatedAt: time.Now(),
+				})
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"no-md"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if string(capturedMetadata) != "{}" {
+		t.Fatalf("metadata sent to DB = %q, want %q", string(capturedMetadata), "{}")
+	}
+
+	// Response should serialize metadata as `{}`, not `null`.
+	if !strings.Contains(w.Body.String(), `"metadata":{}`) {
+		t.Fatalf("response body should contain \"metadata\":{}, got %s", w.Body.String())
+	}
+}
+
+func TestCreateSandbox_MetadataValidationRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "reserved prefix", body: `{"name":"x","metadata":{"superserve.tier":"gold"}}`},
+		{name: "key too long", body: fmt.Sprintf(`{"name":"x","metadata":{%q:"v"}}`, strings.Repeat("k", metadataMaxKeyLen+1))},
+		{name: "value too long", body: fmt.Sprintf(`{"name":"x","metadata":{"k":%q}}`, strings.Repeat("v", metadataMaxValueLen+1))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vmd := &stubVMD{}
+			mock := &mockDBTX{
+				queryRowFn: func(context.Context, string, ...any) pgx.Row {
+					t.Fatal("DB should not be called when validation fails")
+					return notFoundRow()
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					t.Fatal("DB should not be called when validation fails")
+					return pgconn.NewCommandTag(""), nil
+				},
+			}
+			h := &Handlers{VMD: vmd, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, uuid.New().String()).ServeHTTP(w, createSandboxReq(tc.body))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }
