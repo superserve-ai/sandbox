@@ -215,6 +215,112 @@ func (x *NetworkConfig) GetEnableNat() bool {
 	return false
 }
 
+// SandboxNetworkConfig holds per-sandbox network rules.
+type SandboxNetworkConfig struct {
+	state         protoimpl.MessageState      `protogen:"open.v1"`
+	Egress        *SandboxNetworkEgressConfig `protobuf:"bytes,1,opt,name=egress,proto3" json:"egress,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SandboxNetworkConfig) Reset() {
+	*x = SandboxNetworkConfig{}
+	mi := &file_proto_vmd_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxNetworkConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxNetworkConfig) ProtoMessage() {}
+
+func (x *SandboxNetworkConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vmd_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxNetworkConfig.ProtoReflect.Descriptor instead.
+func (*SandboxNetworkConfig) Descriptor() ([]byte, []int) {
+	return file_proto_vmd_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *SandboxNetworkConfig) GetEgress() *SandboxNetworkEgressConfig {
+	if x != nil {
+		return x.Egress
+	}
+	return nil
+}
+
+// SandboxNetworkEgressConfig controls outbound traffic from a sandbox.
+type SandboxNetworkEgressConfig struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	AllowedCidrs   []string               `protobuf:"bytes,1,rep,name=allowed_cidrs,json=allowedCidrs,proto3" json:"allowed_cidrs,omitempty"`       // CIDRs explicitly allowed (e.g. "8.8.8.8/32").
+	DeniedCidrs    []string               `protobuf:"bytes,2,rep,name=denied_cidrs,json=deniedCidrs,proto3" json:"denied_cidrs,omitempty"`          // CIDRs explicitly denied (e.g. "0.0.0.0/0" to block all).
+	AllowedDomains []string               `protobuf:"bytes,3,rep,name=allowed_domains,json=allowedDomains,proto3" json:"allowed_domains,omitempty"` // Domains allowed via TCP proxy (e.g. "api.openai.com", "*.github.com").
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *SandboxNetworkEgressConfig) Reset() {
+	*x = SandboxNetworkEgressConfig{}
+	mi := &file_proto_vmd_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxNetworkEgressConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxNetworkEgressConfig) ProtoMessage() {}
+
+func (x *SandboxNetworkEgressConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vmd_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxNetworkEgressConfig.ProtoReflect.Descriptor instead.
+func (*SandboxNetworkEgressConfig) Descriptor() ([]byte, []int) {
+	return file_proto_vmd_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *SandboxNetworkEgressConfig) GetAllowedCidrs() []string {
+	if x != nil {
+		return x.AllowedCidrs
+	}
+	return nil
+}
+
+func (x *SandboxNetworkEgressConfig) GetDeniedCidrs() []string {
+	if x != nil {
+		return x.DeniedCidrs
+	}
+	return nil
+}
+
+func (x *SandboxNetworkEgressConfig) GetAllowedDomains() []string {
+	if x != nil {
+		return x.AllowedDomains
+	}
+	return nil
+}
+
 type CreateVMRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
@@ -224,13 +330,14 @@ type CreateVMRequest struct {
 	ResourceLimits *ResourceLimits        `protobuf:"bytes,5,opt,name=resource_limits,json=resourceLimits,proto3" json:"resource_limits,omitempty"`
 	NetworkConfig  *NetworkConfig         `protobuf:"bytes,6,opt,name=network_config,json=networkConfig,proto3" json:"network_config,omitempty"`
 	Metadata       map[string]string      `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Arbitrary key-value pairs.
+	SandboxNetwork *SandboxNetworkConfig  `protobuf:"bytes,8,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"`                                         // Per-sandbox egress rules (optional).
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateVMRequest) Reset() {
 	*x = CreateVMRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[2]
+	mi := &file_proto_vmd_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -242,7 +349,7 @@ func (x *CreateVMRequest) String() string {
 func (*CreateVMRequest) ProtoMessage() {}
 
 func (x *CreateVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[2]
+	mi := &file_proto_vmd_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -255,7 +362,7 @@ func (x *CreateVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateVMRequest.ProtoReflect.Descriptor instead.
 func (*CreateVMRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{2}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *CreateVMRequest) GetVmId() string {
@@ -307,6 +414,13 @@ func (x *CreateVMRequest) GetMetadata() map[string]string {
 	return nil
 }
 
+func (x *CreateVMRequest) GetSandboxNetwork() *SandboxNetworkConfig {
+	if x != nil {
+		return x.SandboxNetwork
+	}
+	return nil
+}
+
 type CreateVMResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
@@ -320,7 +434,7 @@ type CreateVMResponse struct {
 
 func (x *CreateVMResponse) Reset() {
 	*x = CreateVMResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[3]
+	mi := &file_proto_vmd_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -332,7 +446,7 @@ func (x *CreateVMResponse) String() string {
 func (*CreateVMResponse) ProtoMessage() {}
 
 func (x *CreateVMResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[3]
+	mi := &file_proto_vmd_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -345,7 +459,7 @@ func (x *CreateVMResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateVMResponse.ProtoReflect.Descriptor instead.
 func (*CreateVMResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{3}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CreateVMResponse) GetVmId() string {
@@ -393,7 +507,7 @@ type DestroyVMRequest struct {
 
 func (x *DestroyVMRequest) Reset() {
 	*x = DestroyVMRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[4]
+	mi := &file_proto_vmd_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -405,7 +519,7 @@ func (x *DestroyVMRequest) String() string {
 func (*DestroyVMRequest) ProtoMessage() {}
 
 func (x *DestroyVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[4]
+	mi := &file_proto_vmd_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -418,7 +532,7 @@ func (x *DestroyVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DestroyVMRequest.ProtoReflect.Descriptor instead.
 func (*DestroyVMRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{4}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *DestroyVMRequest) GetVmId() string {
@@ -445,7 +559,7 @@ type DestroyVMResponse struct {
 
 func (x *DestroyVMResponse) Reset() {
 	*x = DestroyVMResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[5]
+	mi := &file_proto_vmd_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -457,7 +571,7 @@ func (x *DestroyVMResponse) String() string {
 func (*DestroyVMResponse) ProtoMessage() {}
 
 func (x *DestroyVMResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[5]
+	mi := &file_proto_vmd_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -470,7 +584,7 @@ func (x *DestroyVMResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DestroyVMResponse.ProtoReflect.Descriptor instead.
 func (*DestroyVMResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{5}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *DestroyVMResponse) GetVmId() string {
@@ -497,7 +611,7 @@ type PauseVMRequest struct {
 
 func (x *PauseVMRequest) Reset() {
 	*x = PauseVMRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[6]
+	mi := &file_proto_vmd_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -509,7 +623,7 @@ func (x *PauseVMRequest) String() string {
 func (*PauseVMRequest) ProtoMessage() {}
 
 func (x *PauseVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[6]
+	mi := &file_proto_vmd_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -522,7 +636,7 @@ func (x *PauseVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseVMRequest.ProtoReflect.Descriptor instead.
 func (*PauseVMRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{6}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PauseVMRequest) GetVmId() string {
@@ -550,7 +664,7 @@ type PauseVMResponse struct {
 
 func (x *PauseVMResponse) Reset() {
 	*x = PauseVMResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[7]
+	mi := &file_proto_vmd_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -562,7 +676,7 @@ func (x *PauseVMResponse) String() string {
 func (*PauseVMResponse) ProtoMessage() {}
 
 func (x *PauseVMResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[7]
+	mi := &file_proto_vmd_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -575,7 +689,7 @@ func (x *PauseVMResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseVMResponse.ProtoReflect.Descriptor instead.
 func (*PauseVMResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{7}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PauseVMResponse) GetVmId() string {
@@ -600,17 +714,18 @@ func (x *PauseVMResponse) GetMemFilePath() string {
 }
 
 type ResumeVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
-	SnapshotPath  string                 `protobuf:"bytes,2,opt,name=snapshot_path,json=snapshotPath,proto3" json:"snapshot_path,omitempty"`
-	MemFilePath   string                 `protobuf:"bytes,3,opt,name=mem_file_path,json=memFilePath,proto3" json:"mem_file_path,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	SnapshotPath   string                 `protobuf:"bytes,2,opt,name=snapshot_path,json=snapshotPath,proto3" json:"snapshot_path,omitempty"`
+	MemFilePath    string                 `protobuf:"bytes,3,opt,name=mem_file_path,json=memFilePath,proto3" json:"mem_file_path,omitempty"`
+	SandboxNetwork *SandboxNetworkConfig  `protobuf:"bytes,4,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"` // Reapply egress rules after resume.
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ResumeVMRequest) Reset() {
 	*x = ResumeVMRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[8]
+	mi := &file_proto_vmd_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -622,7 +737,7 @@ func (x *ResumeVMRequest) String() string {
 func (*ResumeVMRequest) ProtoMessage() {}
 
 func (x *ResumeVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[8]
+	mi := &file_proto_vmd_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -635,7 +750,7 @@ func (x *ResumeVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeVMRequest.ProtoReflect.Descriptor instead.
 func (*ResumeVMRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{8}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ResumeVMRequest) GetVmId() string {
@@ -659,6 +774,13 @@ func (x *ResumeVMRequest) GetMemFilePath() string {
 	return ""
 }
 
+func (x *ResumeVMRequest) GetSandboxNetwork() *SandboxNetworkConfig {
+	if x != nil {
+		return x.SandboxNetwork
+	}
+	return nil
+}
+
 type ResumeVMResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
@@ -671,7 +793,7 @@ type ResumeVMResponse struct {
 
 func (x *ResumeVMResponse) Reset() {
 	*x = ResumeVMResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[9]
+	mi := &file_proto_vmd_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -683,7 +805,7 @@ func (x *ResumeVMResponse) String() string {
 func (*ResumeVMResponse) ProtoMessage() {}
 
 func (x *ResumeVMResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[9]
+	mi := &file_proto_vmd_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -696,7 +818,7 @@ func (x *ResumeVMResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeVMResponse.ProtoReflect.Descriptor instead.
 func (*ResumeVMResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{9}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ResumeVMResponse) GetVmId() string {
@@ -737,7 +859,7 @@ type CreateSnapshotRequest struct {
 
 func (x *CreateSnapshotRequest) Reset() {
 	*x = CreateSnapshotRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[10]
+	mi := &file_proto_vmd_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -749,7 +871,7 @@ func (x *CreateSnapshotRequest) String() string {
 func (*CreateSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[10]
+	mi := &file_proto_vmd_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -762,7 +884,7 @@ func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{10}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *CreateSnapshotRequest) GetVmId() string {
@@ -791,7 +913,7 @@ type CreateSnapshotResponse struct {
 
 func (x *CreateSnapshotResponse) Reset() {
 	*x = CreateSnapshotResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[11]
+	mi := &file_proto_vmd_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -803,7 +925,7 @@ func (x *CreateSnapshotResponse) String() string {
 func (*CreateSnapshotResponse) ProtoMessage() {}
 
 func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[11]
+	mi := &file_proto_vmd_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -816,7 +938,7 @@ func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{11}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *CreateSnapshotResponse) GetVmId() string {
@@ -861,7 +983,7 @@ type RestoreSnapshotRequest struct {
 
 func (x *RestoreSnapshotRequest) Reset() {
 	*x = RestoreSnapshotRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[12]
+	mi := &file_proto_vmd_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -873,7 +995,7 @@ func (x *RestoreSnapshotRequest) String() string {
 func (*RestoreSnapshotRequest) ProtoMessage() {}
 
 func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[12]
+	mi := &file_proto_vmd_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -886,7 +1008,7 @@ func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*RestoreSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{12}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *RestoreSnapshotRequest) GetVmId() string {
@@ -943,7 +1065,7 @@ type RestoreSnapshotResponse struct {
 
 func (x *RestoreSnapshotResponse) Reset() {
 	*x = RestoreSnapshotResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[13]
+	mi := &file_proto_vmd_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -955,7 +1077,7 @@ func (x *RestoreSnapshotResponse) String() string {
 func (*RestoreSnapshotResponse) ProtoMessage() {}
 
 func (x *RestoreSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[13]
+	mi := &file_proto_vmd_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -968,7 +1090,7 @@ func (x *RestoreSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*RestoreSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{13}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *RestoreSnapshotResponse) GetVmId() string {
@@ -1013,7 +1135,7 @@ type ExecCommandRequest struct {
 
 func (x *ExecCommandRequest) Reset() {
 	*x = ExecCommandRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[14]
+	mi := &file_proto_vmd_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1025,7 +1147,7 @@ func (x *ExecCommandRequest) String() string {
 func (*ExecCommandRequest) ProtoMessage() {}
 
 func (x *ExecCommandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[14]
+	mi := &file_proto_vmd_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1038,7 +1160,7 @@ func (x *ExecCommandRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecCommandRequest.ProtoReflect.Descriptor instead.
 func (*ExecCommandRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{14}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ExecCommandRequest) GetVmId() string {
@@ -1095,7 +1217,7 @@ type ExecCommandResponse struct {
 
 func (x *ExecCommandResponse) Reset() {
 	*x = ExecCommandResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[15]
+	mi := &file_proto_vmd_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1107,7 +1229,7 @@ func (x *ExecCommandResponse) String() string {
 func (*ExecCommandResponse) ProtoMessage() {}
 
 func (x *ExecCommandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[15]
+	mi := &file_proto_vmd_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1120,7 +1242,7 @@ func (x *ExecCommandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecCommandResponse.ProtoReflect.Descriptor instead.
 func (*ExecCommandResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{15}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ExecCommandResponse) GetStdout() []byte {
@@ -1160,7 +1282,7 @@ type GetVMInfoRequest struct {
 
 func (x *GetVMInfoRequest) Reset() {
 	*x = GetVMInfoRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[16]
+	mi := &file_proto_vmd_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1172,7 +1294,7 @@ func (x *GetVMInfoRequest) String() string {
 func (*GetVMInfoRequest) ProtoMessage() {}
 
 func (x *GetVMInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[16]
+	mi := &file_proto_vmd_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1185,7 +1307,7 @@ func (x *GetVMInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetVMInfoRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{16}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GetVMInfoRequest) GetVmId() string {
@@ -1212,7 +1334,7 @@ type GetVMInfoResponse struct {
 
 func (x *GetVMInfoResponse) Reset() {
 	*x = GetVMInfoResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[17]
+	mi := &file_proto_vmd_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1224,7 +1346,7 @@ func (x *GetVMInfoResponse) String() string {
 func (*GetVMInfoResponse) ProtoMessage() {}
 
 func (x *GetVMInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[17]
+	mi := &file_proto_vmd_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1237,7 +1359,7 @@ func (x *GetVMInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetVMInfoResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{17}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *GetVMInfoResponse) GetVmId() string {
@@ -1313,7 +1435,7 @@ type SetupNetworkRequest struct {
 
 func (x *SetupNetworkRequest) Reset() {
 	*x = SetupNetworkRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[18]
+	mi := &file_proto_vmd_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1325,7 +1447,7 @@ func (x *SetupNetworkRequest) String() string {
 func (*SetupNetworkRequest) ProtoMessage() {}
 
 func (x *SetupNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[18]
+	mi := &file_proto_vmd_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1338,7 +1460,7 @@ func (x *SetupNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetupNetworkRequest.ProtoReflect.Descriptor instead.
 func (*SetupNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{18}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SetupNetworkRequest) GetVmId() string {
@@ -1368,7 +1490,7 @@ type SetupNetworkResponse struct {
 
 func (x *SetupNetworkResponse) Reset() {
 	*x = SetupNetworkResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[19]
+	mi := &file_proto_vmd_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1380,7 +1502,7 @@ func (x *SetupNetworkResponse) String() string {
 func (*SetupNetworkResponse) ProtoMessage() {}
 
 func (x *SetupNetworkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[19]
+	mi := &file_proto_vmd_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1393,7 +1515,7 @@ func (x *SetupNetworkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetupNetworkResponse.ProtoReflect.Descriptor instead.
 func (*SetupNetworkResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{19}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SetupNetworkResponse) GetVmId() string {
@@ -1442,7 +1564,7 @@ type UploadFileRequest struct {
 
 func (x *UploadFileRequest) Reset() {
 	*x = UploadFileRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[20]
+	mi := &file_proto_vmd_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1454,7 +1576,7 @@ func (x *UploadFileRequest) String() string {
 func (*UploadFileRequest) ProtoMessage() {}
 
 func (x *UploadFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[20]
+	mi := &file_proto_vmd_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1467,7 +1589,7 @@ func (x *UploadFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadFileRequest.ProtoReflect.Descriptor instead.
 func (*UploadFileRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{20}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *UploadFileRequest) GetVmId() string {
@@ -1500,7 +1622,7 @@ type UploadFileResponse struct {
 
 func (x *UploadFileResponse) Reset() {
 	*x = UploadFileResponse{}
-	mi := &file_proto_vmd_proto_msgTypes[21]
+	mi := &file_proto_vmd_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1512,7 +1634,7 @@ func (x *UploadFileResponse) String() string {
 func (*UploadFileResponse) ProtoMessage() {}
 
 func (x *UploadFileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[21]
+	mi := &file_proto_vmd_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1525,7 +1647,7 @@ func (x *UploadFileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadFileResponse.ProtoReflect.Descriptor instead.
 func (*UploadFileResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{21}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *UploadFileResponse) GetBytesWritten() int64 {
@@ -1545,7 +1667,7 @@ type DownloadFileRequest struct {
 
 func (x *DownloadFileRequest) Reset() {
 	*x = DownloadFileRequest{}
-	mi := &file_proto_vmd_proto_msgTypes[22]
+	mi := &file_proto_vmd_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1557,7 +1679,7 @@ func (x *DownloadFileRequest) String() string {
 func (*DownloadFileRequest) ProtoMessage() {}
 
 func (x *DownloadFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[22]
+	mi := &file_proto_vmd_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1570,7 +1692,7 @@ func (x *DownloadFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DownloadFileRequest.ProtoReflect.Descriptor instead.
 func (*DownloadFileRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{22}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *DownloadFileRequest) GetVmId() string {
@@ -1596,7 +1718,7 @@ type DownloadFileChunk struct {
 
 func (x *DownloadFileChunk) Reset() {
 	*x = DownloadFileChunk{}
-	mi := &file_proto_vmd_proto_msgTypes[23]
+	mi := &file_proto_vmd_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1608,7 +1730,7 @@ func (x *DownloadFileChunk) String() string {
 func (*DownloadFileChunk) ProtoMessage() {}
 
 func (x *DownloadFileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vmd_proto_msgTypes[23]
+	mi := &file_proto_vmd_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1621,7 +1743,7 @@ func (x *DownloadFileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DownloadFileChunk.ProtoReflect.Descriptor instead.
 func (*DownloadFileChunk) Descriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{23}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *DownloadFileChunk) GetData() []byte {
@@ -1629,6 +1751,102 @@ func (x *DownloadFileChunk) GetData() []byte {
 		return x.Data
 	}
 	return nil
+}
+
+type UpdateSandboxNetworkRequest struct {
+	state         protoimpl.MessageState      `protogen:"open.v1"`
+	VmId          string                      `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	Egress        *SandboxNetworkEgressConfig `protobuf:"bytes,2,opt,name=egress,proto3" json:"egress,omitempty"` // New egress rules (replaces existing).
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateSandboxNetworkRequest) Reset() {
+	*x = UpdateSandboxNetworkRequest{}
+	mi := &file_proto_vmd_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateSandboxNetworkRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateSandboxNetworkRequest) ProtoMessage() {}
+
+func (x *UpdateSandboxNetworkRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vmd_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateSandboxNetworkRequest.ProtoReflect.Descriptor instead.
+func (*UpdateSandboxNetworkRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vmd_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *UpdateSandboxNetworkRequest) GetVmId() string {
+	if x != nil {
+		return x.VmId
+	}
+	return ""
+}
+
+func (x *UpdateSandboxNetworkRequest) GetEgress() *SandboxNetworkEgressConfig {
+	if x != nil {
+		return x.Egress
+	}
+	return nil
+}
+
+type UpdateSandboxNetworkResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateSandboxNetworkResponse) Reset() {
+	*x = UpdateSandboxNetworkResponse{}
+	mi := &file_proto_vmd_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateSandboxNetworkResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateSandboxNetworkResponse) ProtoMessage() {}
+
+func (x *UpdateSandboxNetworkResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vmd_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateSandboxNetworkResponse.ProtoReflect.Descriptor instead.
+func (*UpdateSandboxNetworkResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vmd_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *UpdateSandboxNetworkResponse) GetVmId() string {
+	if x != nil {
+		return x.VmId
+	}
+	return ""
 }
 
 var File_proto_vmd_proto protoreflect.FileDescriptor
@@ -1650,7 +1868,13 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\n" +
 	"gateway_ip\x18\x03 \x01(\tR\tgatewayIp\x12\x1d\n" +
 	"\n" +
-	"enable_nat\x18\x04 \x01(\bR\tenableNat\"\xb2\x03\n" +
+	"enable_nat\x18\x04 \x01(\bR\tenableNat\"]\n" +
+	"\x14SandboxNetworkConfig\x12E\n" +
+	"\x06egress\x18\x01 \x01(\v2-.superserve.vmd.v1.SandboxNetworkEgressConfigR\x06egress\"\x8d\x01\n" +
+	"\x1aSandboxNetworkEgressConfig\x12#\n" +
+	"\rallowed_cidrs\x18\x01 \x03(\tR\fallowedCidrs\x12!\n" +
+	"\fdenied_cidrs\x18\x02 \x03(\tR\vdeniedCidrs\x12'\n" +
+	"\x0fallowed_domains\x18\x03 \x03(\tR\x0eallowedDomains\"\x84\x04\n" +
 	"\x0fCreateVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12(\n" +
 	"\x10base_rootfs_path\x18\x02 \x01(\tR\x0ebaseRootfsPath\x12\x1f\n" +
@@ -1660,7 +1884,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"kernelArgs\x12J\n" +
 	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12G\n" +
 	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12L\n" +
-	"\bmetadata\x18\a \x03(\v20.superserve.vmd.v1.CreateVMRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\a \x03(\v20.superserve.vmd.v1.CreateVMRequest.MetadataEntryR\bmetadata\x12P\n" +
+	"\x0fsandbox_network\x18\b \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x98\x01\n" +
@@ -1686,11 +1911,12 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0fPauseVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
-	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\"o\n" +
+	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\"\xc1\x01\n" +
 	"\x0fResumeVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
-	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\"y\n" +
+	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12P\n" +
+	"\x0fsandbox_network\x18\x04 \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\"y\n" +
 	"\x10ResumeVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +
@@ -1775,14 +2001,19 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\"'\n" +
 	"\x11DownloadFileChunk\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\fR\x04data*\x96\x01\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"y\n" +
+	"\x1bUpdateSandboxNetworkRequest\x12\x13\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12E\n" +
+	"\x06egress\x18\x02 \x01(\v2-.superserve.vmd.v1.SandboxNetworkEgressConfigR\x06egress\"3\n" +
+	"\x1cUpdateSandboxNetworkResponse\x12\x13\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId*\x96\x01\n" +
 	"\bVMStatus\x12\x19\n" +
 	"\x15VM_STATUS_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12VM_STATUS_CREATING\x10\x01\x12\x15\n" +
 	"\x11VM_STATUS_RUNNING\x10\x02\x12\x14\n" +
 	"\x10VM_STATUS_PAUSED\x10\x03\x12\x15\n" +
 	"\x11VM_STATUS_STOPPED\x10\x04\x12\x13\n" +
-	"\x0fVM_STATUS_ERROR\x10\x052\x85\b\n" +
+	"\x0fVM_STATUS_ERROR\x10\x052\xfe\b\n" +
 	"\bVMDaemon\x12S\n" +
 	"\bCreateVM\x12\".superserve.vmd.v1.CreateVMRequest\x1a#.superserve.vmd.v1.CreateVMResponse\x12V\n" +
 	"\tDestroyVM\x12#.superserve.vmd.v1.DestroyVMRequest\x1a$.superserve.vmd.v1.DestroyVMResponse\x12P\n" +
@@ -1795,7 +2026,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\fSetupNetwork\x12&.superserve.vmd.v1.SetupNetworkRequest\x1a'.superserve.vmd.v1.SetupNetworkResponse\x12[\n" +
 	"\n" +
 	"UploadFile\x12$.superserve.vmd.v1.UploadFileRequest\x1a%.superserve.vmd.v1.UploadFileResponse(\x01\x12^\n" +
-	"\fDownloadFile\x12&.superserve.vmd.v1.DownloadFileRequest\x1a$.superserve.vmd.v1.DownloadFileChunk0\x01B.Z,github.com/superserve-ai/sandbox/proto/vmdpbb\x06proto3"
+	"\fDownloadFile\x12&.superserve.vmd.v1.DownloadFileRequest\x1a$.superserve.vmd.v1.DownloadFileChunk0\x01\x12w\n" +
+	"\x14UpdateSandboxNetwork\x12..superserve.vmd.v1.UpdateSandboxNetworkRequest\x1a/.superserve.vmd.v1.UpdateSandboxNetworkResponseB.Z,github.com/superserve-ai/sandbox/proto/vmdpbb\x06proto3"
 
 var (
 	file_proto_vmd_proto_rawDescOnce sync.Once
@@ -1810,75 +2042,85 @@ func file_proto_vmd_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_vmd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_vmd_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
+var file_proto_vmd_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_proto_vmd_proto_goTypes = []any{
-	(VMStatus)(0),                   // 0: superserve.vmd.v1.VMStatus
-	(*ResourceLimits)(nil),          // 1: superserve.vmd.v1.ResourceLimits
-	(*NetworkConfig)(nil),           // 2: superserve.vmd.v1.NetworkConfig
-	(*CreateVMRequest)(nil),         // 3: superserve.vmd.v1.CreateVMRequest
-	(*CreateVMResponse)(nil),        // 4: superserve.vmd.v1.CreateVMResponse
-	(*DestroyVMRequest)(nil),        // 5: superserve.vmd.v1.DestroyVMRequest
-	(*DestroyVMResponse)(nil),       // 6: superserve.vmd.v1.DestroyVMResponse
-	(*PauseVMRequest)(nil),          // 7: superserve.vmd.v1.PauseVMRequest
-	(*PauseVMResponse)(nil),         // 8: superserve.vmd.v1.PauseVMResponse
-	(*ResumeVMRequest)(nil),         // 9: superserve.vmd.v1.ResumeVMRequest
-	(*ResumeVMResponse)(nil),        // 10: superserve.vmd.v1.ResumeVMResponse
-	(*CreateSnapshotRequest)(nil),   // 11: superserve.vmd.v1.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil),  // 12: superserve.vmd.v1.CreateSnapshotResponse
-	(*RestoreSnapshotRequest)(nil),  // 13: superserve.vmd.v1.RestoreSnapshotRequest
-	(*RestoreSnapshotResponse)(nil), // 14: superserve.vmd.v1.RestoreSnapshotResponse
-	(*ExecCommandRequest)(nil),      // 15: superserve.vmd.v1.ExecCommandRequest
-	(*ExecCommandResponse)(nil),     // 16: superserve.vmd.v1.ExecCommandResponse
-	(*GetVMInfoRequest)(nil),        // 17: superserve.vmd.v1.GetVMInfoRequest
-	(*GetVMInfoResponse)(nil),       // 18: superserve.vmd.v1.GetVMInfoResponse
-	(*SetupNetworkRequest)(nil),     // 19: superserve.vmd.v1.SetupNetworkRequest
-	(*SetupNetworkResponse)(nil),    // 20: superserve.vmd.v1.SetupNetworkResponse
-	(*UploadFileRequest)(nil),       // 21: superserve.vmd.v1.UploadFileRequest
-	(*UploadFileResponse)(nil),      // 22: superserve.vmd.v1.UploadFileResponse
-	(*DownloadFileRequest)(nil),     // 23: superserve.vmd.v1.DownloadFileRequest
-	(*DownloadFileChunk)(nil),       // 24: superserve.vmd.v1.DownloadFileChunk
-	nil,                             // 25: superserve.vmd.v1.CreateVMRequest.MetadataEntry
-	nil,                             // 26: superserve.vmd.v1.ExecCommandRequest.EnvEntry
-	nil,                             // 27: superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
+	(VMStatus)(0),                        // 0: superserve.vmd.v1.VMStatus
+	(*ResourceLimits)(nil),               // 1: superserve.vmd.v1.ResourceLimits
+	(*NetworkConfig)(nil),                // 2: superserve.vmd.v1.NetworkConfig
+	(*SandboxNetworkConfig)(nil),         // 3: superserve.vmd.v1.SandboxNetworkConfig
+	(*SandboxNetworkEgressConfig)(nil),   // 4: superserve.vmd.v1.SandboxNetworkEgressConfig
+	(*CreateVMRequest)(nil),              // 5: superserve.vmd.v1.CreateVMRequest
+	(*CreateVMResponse)(nil),             // 6: superserve.vmd.v1.CreateVMResponse
+	(*DestroyVMRequest)(nil),             // 7: superserve.vmd.v1.DestroyVMRequest
+	(*DestroyVMResponse)(nil),            // 8: superserve.vmd.v1.DestroyVMResponse
+	(*PauseVMRequest)(nil),               // 9: superserve.vmd.v1.PauseVMRequest
+	(*PauseVMResponse)(nil),              // 10: superserve.vmd.v1.PauseVMResponse
+	(*ResumeVMRequest)(nil),              // 11: superserve.vmd.v1.ResumeVMRequest
+	(*ResumeVMResponse)(nil),             // 12: superserve.vmd.v1.ResumeVMResponse
+	(*CreateSnapshotRequest)(nil),        // 13: superserve.vmd.v1.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil),       // 14: superserve.vmd.v1.CreateSnapshotResponse
+	(*RestoreSnapshotRequest)(nil),       // 15: superserve.vmd.v1.RestoreSnapshotRequest
+	(*RestoreSnapshotResponse)(nil),      // 16: superserve.vmd.v1.RestoreSnapshotResponse
+	(*ExecCommandRequest)(nil),           // 17: superserve.vmd.v1.ExecCommandRequest
+	(*ExecCommandResponse)(nil),          // 18: superserve.vmd.v1.ExecCommandResponse
+	(*GetVMInfoRequest)(nil),             // 19: superserve.vmd.v1.GetVMInfoRequest
+	(*GetVMInfoResponse)(nil),            // 20: superserve.vmd.v1.GetVMInfoResponse
+	(*SetupNetworkRequest)(nil),          // 21: superserve.vmd.v1.SetupNetworkRequest
+	(*SetupNetworkResponse)(nil),         // 22: superserve.vmd.v1.SetupNetworkResponse
+	(*UploadFileRequest)(nil),            // 23: superserve.vmd.v1.UploadFileRequest
+	(*UploadFileResponse)(nil),           // 24: superserve.vmd.v1.UploadFileResponse
+	(*DownloadFileRequest)(nil),          // 25: superserve.vmd.v1.DownloadFileRequest
+	(*DownloadFileChunk)(nil),            // 26: superserve.vmd.v1.DownloadFileChunk
+	(*UpdateSandboxNetworkRequest)(nil),  // 27: superserve.vmd.v1.UpdateSandboxNetworkRequest
+	(*UpdateSandboxNetworkResponse)(nil), // 28: superserve.vmd.v1.UpdateSandboxNetworkResponse
+	nil,                                  // 29: superserve.vmd.v1.CreateVMRequest.MetadataEntry
+	nil,                                  // 30: superserve.vmd.v1.ExecCommandRequest.EnvEntry
+	nil,                                  // 31: superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
 }
 var file_proto_vmd_proto_depIdxs = []int32{
-	1,  // 0: superserve.vmd.v1.CreateVMRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	2,  // 1: superserve.vmd.v1.CreateVMRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	25, // 2: superserve.vmd.v1.CreateVMRequest.metadata:type_name -> superserve.vmd.v1.CreateVMRequest.MetadataEntry
-	1,  // 3: superserve.vmd.v1.RestoreSnapshotRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	2,  // 4: superserve.vmd.v1.RestoreSnapshotRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	26, // 5: superserve.vmd.v1.ExecCommandRequest.env:type_name -> superserve.vmd.v1.ExecCommandRequest.EnvEntry
-	0,  // 6: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
-	1,  // 7: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	27, // 8: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
-	2,  // 9: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	3,  // 10: superserve.vmd.v1.VMDaemon.CreateVM:input_type -> superserve.vmd.v1.CreateVMRequest
-	5,  // 11: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
-	7,  // 12: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
-	9,  // 13: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
-	11, // 14: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
-	13, // 15: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
-	15, // 16: superserve.vmd.v1.VMDaemon.ExecCommand:input_type -> superserve.vmd.v1.ExecCommandRequest
-	17, // 17: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
-	19, // 18: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
-	21, // 19: superserve.vmd.v1.VMDaemon.UploadFile:input_type -> superserve.vmd.v1.UploadFileRequest
-	23, // 20: superserve.vmd.v1.VMDaemon.DownloadFile:input_type -> superserve.vmd.v1.DownloadFileRequest
-	4,  // 21: superserve.vmd.v1.VMDaemon.CreateVM:output_type -> superserve.vmd.v1.CreateVMResponse
-	6,  // 22: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
-	8,  // 23: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
-	10, // 24: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
-	12, // 25: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
-	14, // 26: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
-	16, // 27: superserve.vmd.v1.VMDaemon.ExecCommand:output_type -> superserve.vmd.v1.ExecCommandResponse
-	18, // 28: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
-	20, // 29: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
-	22, // 30: superserve.vmd.v1.VMDaemon.UploadFile:output_type -> superserve.vmd.v1.UploadFileResponse
-	24, // 31: superserve.vmd.v1.VMDaemon.DownloadFile:output_type -> superserve.vmd.v1.DownloadFileChunk
-	21, // [21:32] is the sub-list for method output_type
-	10, // [10:21] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	4,  // 0: superserve.vmd.v1.SandboxNetworkConfig.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
+	1,  // 1: superserve.vmd.v1.CreateVMRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	2,  // 2: superserve.vmd.v1.CreateVMRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	29, // 3: superserve.vmd.v1.CreateVMRequest.metadata:type_name -> superserve.vmd.v1.CreateVMRequest.MetadataEntry
+	3,  // 4: superserve.vmd.v1.CreateVMRequest.sandbox_network:type_name -> superserve.vmd.v1.SandboxNetworkConfig
+	3,  // 5: superserve.vmd.v1.ResumeVMRequest.sandbox_network:type_name -> superserve.vmd.v1.SandboxNetworkConfig
+	1,  // 6: superserve.vmd.v1.RestoreSnapshotRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	2,  // 7: superserve.vmd.v1.RestoreSnapshotRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	30, // 8: superserve.vmd.v1.ExecCommandRequest.env:type_name -> superserve.vmd.v1.ExecCommandRequest.EnvEntry
+	0,  // 9: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
+	1,  // 10: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	31, // 11: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
+	2,  // 12: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	4,  // 13: superserve.vmd.v1.UpdateSandboxNetworkRequest.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
+	5,  // 14: superserve.vmd.v1.VMDaemon.CreateVM:input_type -> superserve.vmd.v1.CreateVMRequest
+	7,  // 15: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
+	9,  // 16: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
+	11, // 17: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
+	13, // 18: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
+	15, // 19: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
+	17, // 20: superserve.vmd.v1.VMDaemon.ExecCommand:input_type -> superserve.vmd.v1.ExecCommandRequest
+	19, // 21: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
+	21, // 22: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
+	23, // 23: superserve.vmd.v1.VMDaemon.UploadFile:input_type -> superserve.vmd.v1.UploadFileRequest
+	25, // 24: superserve.vmd.v1.VMDaemon.DownloadFile:input_type -> superserve.vmd.v1.DownloadFileRequest
+	27, // 25: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:input_type -> superserve.vmd.v1.UpdateSandboxNetworkRequest
+	6,  // 26: superserve.vmd.v1.VMDaemon.CreateVM:output_type -> superserve.vmd.v1.CreateVMResponse
+	8,  // 27: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
+	10, // 28: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
+	12, // 29: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
+	14, // 30: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
+	16, // 31: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
+	18, // 32: superserve.vmd.v1.VMDaemon.ExecCommand:output_type -> superserve.vmd.v1.ExecCommandResponse
+	20, // 33: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
+	22, // 34: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
+	24, // 35: superserve.vmd.v1.VMDaemon.UploadFile:output_type -> superserve.vmd.v1.UploadFileResponse
+	26, // 36: superserve.vmd.v1.VMDaemon.DownloadFile:output_type -> superserve.vmd.v1.DownloadFileChunk
+	28, // 37: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:output_type -> superserve.vmd.v1.UpdateSandboxNetworkResponse
+	26, // [26:38] is the sub-list for method output_type
+	14, // [14:26] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_proto_vmd_proto_init() }
@@ -1892,7 +2134,7 @@ func file_proto_vmd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vmd_proto_rawDesc), len(file_proto_vmd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   27,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

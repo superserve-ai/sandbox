@@ -19,17 +19,18 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	VMDaemon_CreateVM_FullMethodName        = "/superserve.vmd.v1.VMDaemon/CreateVM"
-	VMDaemon_DestroyVM_FullMethodName       = "/superserve.vmd.v1.VMDaemon/DestroyVM"
-	VMDaemon_PauseVM_FullMethodName         = "/superserve.vmd.v1.VMDaemon/PauseVM"
-	VMDaemon_ResumeVM_FullMethodName        = "/superserve.vmd.v1.VMDaemon/ResumeVM"
-	VMDaemon_CreateSnapshot_FullMethodName  = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
-	VMDaemon_RestoreSnapshot_FullMethodName = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
-	VMDaemon_ExecCommand_FullMethodName     = "/superserve.vmd.v1.VMDaemon/ExecCommand"
-	VMDaemon_GetVMInfo_FullMethodName       = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
-	VMDaemon_SetupNetwork_FullMethodName    = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
-	VMDaemon_UploadFile_FullMethodName      = "/superserve.vmd.v1.VMDaemon/UploadFile"
-	VMDaemon_DownloadFile_FullMethodName    = "/superserve.vmd.v1.VMDaemon/DownloadFile"
+	VMDaemon_CreateVM_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CreateVM"
+	VMDaemon_DestroyVM_FullMethodName            = "/superserve.vmd.v1.VMDaemon/DestroyVM"
+	VMDaemon_PauseVM_FullMethodName              = "/superserve.vmd.v1.VMDaemon/PauseVM"
+	VMDaemon_ResumeVM_FullMethodName             = "/superserve.vmd.v1.VMDaemon/ResumeVM"
+	VMDaemon_CreateSnapshot_FullMethodName       = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
+	VMDaemon_RestoreSnapshot_FullMethodName      = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
+	VMDaemon_ExecCommand_FullMethodName          = "/superserve.vmd.v1.VMDaemon/ExecCommand"
+	VMDaemon_GetVMInfo_FullMethodName            = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
+	VMDaemon_SetupNetwork_FullMethodName         = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
+	VMDaemon_UploadFile_FullMethodName           = "/superserve.vmd.v1.VMDaemon/UploadFile"
+	VMDaemon_DownloadFile_FullMethodName         = "/superserve.vmd.v1.VMDaemon/DownloadFile"
+	VMDaemon_UpdateSandboxNetwork_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -60,6 +61,8 @@ type VMDaemonClient interface {
 	UploadFile(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadFileRequest, UploadFileResponse], error)
 	// DownloadFile streams file content out of a VM.
 	DownloadFile(ctx context.Context, in *DownloadFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DownloadFileChunk], error)
+	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
+	UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error)
 }
 
 type vMDaemonClient struct {
@@ -201,6 +204,16 @@ func (c *vMDaemonClient) DownloadFile(ctx context.Context, in *DownloadFileReque
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VMDaemon_DownloadFileClient = grpc.ServerStreamingClient[DownloadFileChunk]
 
+func (c *vMDaemonClient) UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateSandboxNetworkResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_UpdateSandboxNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VMDaemonServer is the server API for VMDaemon service.
 // All implementations must embed UnimplementedVMDaemonServer
 // for forward compatibility.
@@ -229,6 +242,8 @@ type VMDaemonServer interface {
 	UploadFile(grpc.ClientStreamingServer[UploadFileRequest, UploadFileResponse]) error
 	// DownloadFile streams file content out of a VM.
 	DownloadFile(*DownloadFileRequest, grpc.ServerStreamingServer[DownloadFileChunk]) error
+	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
+	UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error)
 	mustEmbedUnimplementedVMDaemonServer()
 }
 
@@ -271,6 +286,9 @@ func (UnimplementedVMDaemonServer) UploadFile(grpc.ClientStreamingServer[UploadF
 }
 func (UnimplementedVMDaemonServer) DownloadFile(*DownloadFileRequest, grpc.ServerStreamingServer[DownloadFileChunk]) error {
 	return status.Error(codes.Unimplemented, "method DownloadFile not implemented")
+}
+func (UnimplementedVMDaemonServer) UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateSandboxNetwork not implemented")
 }
 func (UnimplementedVMDaemonServer) mustEmbedUnimplementedVMDaemonServer() {}
 func (UnimplementedVMDaemonServer) testEmbeddedByValue()                  {}
@@ -466,6 +484,24 @@ func _VMDaemon_DownloadFile_Handler(srv interface{}, stream grpc.ServerStream) e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VMDaemon_DownloadFileServer = grpc.ServerStreamingServer[DownloadFileChunk]
 
+func _VMDaemon_UpdateSandboxNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateSandboxNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).UpdateSandboxNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_UpdateSandboxNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).UpdateSandboxNetwork(ctx, req.(*UpdateSandboxNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VMDaemon_ServiceDesc is the grpc.ServiceDesc for VMDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -504,6 +540,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetupNetwork",
 			Handler:    _VMDaemon_SetupNetwork_Handler,
+		},
+		{
+			MethodName: "UpdateSandboxNetwork",
+			Handler:    _VMDaemon_UpdateSandboxNetwork_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

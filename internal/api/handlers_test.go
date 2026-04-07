@@ -82,6 +82,9 @@ func (s *stubVMD) DownloadFile(ctx context.Context, id, path string) (io.ReadClo
 	}
 	return io.NopCloser(strings.NewReader("file-content")), nil
 }
+func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // Mock DBTX — drives db.Queries without a real database
@@ -924,14 +927,10 @@ func TestCreateSandbox_Success(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
-	// Use a channel to synchronize with the background goroutine — avoids the
-	// data race that occurs when testing a plain bool across goroutines.
-	createDone := make(chan struct{})
 	vmd := &stubVMD{
 		createFn: func(_ context.Context, id string, vcpu, memMiB, _ uint32, _ map[string]string) (string, error) {
-			defer close(createDone)
-			if vcpu != 2 {
-				t.Errorf("vcpu = %d, want 2", vcpu)
+			if vcpu != 1 {
+				t.Errorf("vcpu = %d, want 1", vcpu)
 			}
 			if memMiB != 512 {
 				t.Errorf("memMiB = %d, want 512", memMiB)
@@ -958,29 +957,19 @@ func TestCreateSandbox_Success(t *testing.T) {
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox","vcpu_count":2,"memory_mib":512}`))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox"}`))
 
 	if w.Code != http.StatusCreated {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
 	}
 
-	// Response is immediate — sandbox is starting, not yet active.
+	// Creation is synchronous — sandbox is active on return.
 	body := parseJSON(t, w)
 	if body["name"] != "my-sandbox" {
 		t.Errorf("name = %q, want %q", body["name"], "my-sandbox")
 	}
-	if body["status"] != "starting" {
-		t.Errorf("status = %q, want starting", body["status"])
-	}
-	if _, hasIP := body["ip_address"]; hasIP {
-		t.Error("ip_address should not be present in create response")
-	}
-
-	// Wait for the background goroutine to finish (proves CreateInstance was called).
-	select {
-	case <-createDone:
-	case <-time.After(500 * time.Millisecond):
-		t.Error("VMD.CreateInstance was not called within 500ms")
+	if body["status"] != "active" {
+		t.Errorf("status = %q, want active", body["status"])
 	}
 }
 
@@ -1009,7 +998,7 @@ func TestCreateSandbox_MissingTeamID(t *testing.T) {
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, "").ServeHTTP(w, createSandboxReq(`{"name":"test","vcpu_count":1,"memory_mib":256}`))
+	setupTestRouter(h, "").ServeHTTP(w, createSandboxReq(`{"name":"test"}`))
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
@@ -1020,9 +1009,6 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
-	// VMD failure is async — the HTTP response is still 201 (starting), and the
-	// background goroutine calls DestroySandbox to clean up.
-	destroyCalled := make(chan struct{})
 	vmd := &stubVMD{
 		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
 			return "", fmt.Errorf("vmd unreachable")
@@ -1039,36 +1025,18 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 			}
 			return activityRow()
 		},
-		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-			// DestroySandbox issues an UPDATE with destroyed_at.
-			if strings.Contains(sql, "destroyed_at") {
-				select {
-				case <-destroyCalled:
-				default:
-					close(destroyCalled)
-				}
-			}
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb","vcpu_count":1,"memory_mib":256}`))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
 
-	// HTTP response is 201 — the error is handled asynchronously.
-	if w.Code != http.StatusCreated {
-		t.Errorf("status = %d, want 201", w.Code)
-	}
-	if parseJSON(t, w)["status"] != "starting" {
-		t.Errorf("status should be starting on create, got %v", parseJSON(t, w)["status"])
-	}
-
-	// Background goroutine must call DestroySandbox after the VMD error.
-	select {
-	case <-destroyCalled:
-	case <-time.After(500 * time.Millisecond):
-		t.Error("DestroySandbox was not called after VMD error within 500ms")
+	// Creation is synchronous — VMD error returns 500.
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
 	}
 }
 
@@ -1437,6 +1405,9 @@ func (m *mockVMD) DownloadFile(ctx context.Context, instanceID, path string) (io
 		return m.downloadFileFn(ctx, instanceID, path)
 	}
 	return io.NopCloser(strings.NewReader("file-content")), nil
+}
+func (m *mockVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
 }
 
 func newTestHandlers(vmd VMDClient) *Handlers { return &Handlers{VMD: vmd} }

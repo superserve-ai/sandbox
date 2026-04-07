@@ -38,6 +38,9 @@ service VMDaemon {
 
   // DownloadFile streams file content out of a VM.
   rpc DownloadFile(DownloadFileRequest) returns (stream DownloadFileChunk);
+
+  // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
+  rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +65,18 @@ message NetworkConfig {
   bool enable_nat = 4;
 }
 
+// SandboxNetworkConfig holds per-sandbox network rules.
+message SandboxNetworkConfig {
+  SandboxNetworkEgressConfig egress = 1;
+}
+
+// SandboxNetworkEgressConfig controls outbound traffic from a sandbox.
+message SandboxNetworkEgressConfig {
+  repeated string allowed_cidrs = 1;    // CIDRs explicitly allowed (e.g. "8.8.8.8/32").
+  repeated string denied_cidrs = 2;     // CIDRs explicitly denied (e.g. "0.0.0.0/0" to block all).
+  repeated string allowed_domains = 3;  // Domains allowed via TCP proxy (e.g. "api.openai.com", "*.github.com").
+}
+
 // ---------------------------------------------------------------------------
 // CreateVM
 // ---------------------------------------------------------------------------
@@ -74,6 +89,7 @@ message CreateVMRequest {
   ResourceLimits resource_limits = 5;
   NetworkConfig network_config = 6;
   map<string, string> metadata = 7;   // Arbitrary key-value pairs.
+  SandboxNetworkConfig sandbox_network = 8;  // Per-sandbox egress rules (optional).
 }
 
 message CreateVMResponse {
@@ -121,6 +137,7 @@ message ResumeVMRequest {
   string vm_id = 1;
   string snapshot_path = 2;
   string mem_file_path = 3;
+  SandboxNetworkConfig sandbox_network = 4;  // Reapply egress rules after resume.
 }
 
 message ResumeVMResponse {
@@ -257,4 +274,17 @@ message DownloadFileRequest {
 
 message DownloadFileChunk {
   bytes data = 1;
+}
+
+// ---------------------------------------------------------------------------
+// UpdateSandboxNetwork
+// ---------------------------------------------------------------------------
+
+message UpdateSandboxNetworkRequest {
+  string vm_id = 1;
+  SandboxNetworkEgressConfig egress = 2;  // New egress rules (replaces existing).
+}
+
+message UpdateSandboxNetworkResponse {
+  string vm_id = 1;
 }

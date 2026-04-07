@@ -46,3 +46,12 @@ WHERE status = 'idle'
   AND destroyed_at IS NULL
   AND last_activity_at < $1
 ORDER BY last_activity_at ASC;
+
+-- name: UpdateSandboxNetworkConfig :exec
+UPDATE sandbox
+SET network_config = $2, updated_at = now()
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
+
+-- name: GetSandboxNetworkConfig :one
+SELECT network_config FROM sandbox
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;

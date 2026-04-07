@@ -121,9 +121,10 @@ type TemplateSnapshot struct {
 
 // Manager orchestrates the lifecycle of Firecracker microVMs.
 type Manager struct {
-	cfg    ManagerConfig
-	netMgr *network.Manager
-	log    zerolog.Logger
+	cfg         ManagerConfig
+	netMgr      *network.Manager
+	egressProxy *network.EgressProxy
+	log         zerolog.Logger
 
 	mu              sync.RWMutex
 	vms             map[string]*VMInstance
@@ -144,6 +145,12 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		vms:       make(map[string]*VMInstance),
 		createSem: make(chan struct{}, maxConcurrent),
 	}, nil
+}
+
+// SetEgressProxy sets the TCP egress proxy for domain-based filtering.
+// Must be called before any VMs are created.
+func (m *Manager) SetEgressProxy(proxy *network.EgressProxy) {
+	m.egressProxy = proxy
 }
 
 // templateRunDir returns the fixed path where the template VM's files live.
@@ -359,7 +366,7 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		RunDirID:  vmID,
 		Config: VMConfig{
 			VCPU:       1,
-			MemoryMiB:  1024,
+			MemoryMiB:  512,
 			KernelPath: m.cfg.KernelPath,
 			RootfsPath: m.cfg.BaseRootfsPath,
 		},

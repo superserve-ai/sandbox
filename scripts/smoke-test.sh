@@ -69,7 +69,7 @@ fi
 RESP=$(curl -s -w "\n%{http_code}" -X POST \
   -H "X-API-Key: ${API_KEY}" \
   -H "Content-Type: application/json" \
-  -d '{"name":"smoke-test","vcpu_count":1,"memory_mib":128}' \
+  -d '{"name":"smoke-test"}' \
   "${API_URL}/sandboxes")
 STATUS=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')

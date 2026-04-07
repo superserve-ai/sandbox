@@ -1,0 +1,13 @@
+-- Add network_config column to sandbox table.
+-- Stores per-sandbox egress rules (allowed/denied CIDRs and domains)
+-- so they survive pause/resume cycles.
+--
+-- Schema:
+--   {
+--     "egress": {
+--       "allowed_cidrs": ["8.8.8.8/32"],
+--       "denied_cidrs": ["0.0.0.0/0"],
+--       "allowed_domains": ["api.openai.com", "*.github.com"]
+--     }
+--   }
+ALTER TABLE sandbox ADD COLUMN network_config jsonb;
