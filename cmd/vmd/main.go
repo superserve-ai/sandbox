@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,7 +28,7 @@ type Config struct {
 	KernelPath     string
 	BaseRootfsPath string
 	SnapshotDir    string
-	RunDir     string
+	RunDir         string
 	GRPCPort       int
 	HostInterface  string
 }
@@ -43,7 +45,7 @@ func loadConfig() (Config, error) {
 		KernelPath:     requireEnv("KERNEL_PATH"),
 		BaseRootfsPath: requireEnv("BASE_ROOTFS_PATH"),
 		SnapshotDir:    envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
-		RunDir:     envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
+		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:       port,
 		HostInterface:  envOrDefault("HOST_INTERFACE", "eth0"),
 	}
@@ -68,6 +70,110 @@ func envOrDefault(key, fallback string) string {
 func requireEnv(key string) string {
 	return os.Getenv(key)
 }
+
+// ---------------------------------------------------------------------------
+// Service lifecycle
+// ---------------------------------------------------------------------------
+//
+// A tiny orchestration helper that manages long-running background services
+// with named startup and LIFO shutdown. Every service has a name so shutdown
+// logs are clear, and closers run in reverse registration order so that
+// dependent services are shut down before the services they depend on.
+//
+// Keeps the main() flow flat: register a service, push its closer, done.
+// If any service exits (successfully or with an error), shutdown is signaled
+// to the rest via the shared root context.
+
+type serviceCloser struct {
+	name  string
+	close func(ctx context.Context) error
+}
+
+type lifecycle struct {
+	log zerolog.Logger
+
+	mu       sync.Mutex
+	closers  []serviceCloser
+	firstErr error
+	errName  string
+
+	done   chan struct{}
+	doneCh sync.Once
+}
+
+func newLifecycle(log zerolog.Logger) *lifecycle {
+	return &lifecycle{
+		log:  log,
+		done: make(chan struct{}),
+	}
+}
+
+// start launches fn in a background goroutine under the service name.
+// If fn returns (for any reason) the lifecycle's shutdown signal is raised.
+// The first non-nil error is recorded and surfaced on shutdown.
+func (lc *lifecycle) start(name string, fn func() error) {
+	lc.log.Info().Str("service", name).Msg("service starting")
+	go func() {
+		err := fn()
+		lc.mu.Lock()
+		if err != nil && lc.firstErr == nil {
+			lc.firstErr = err
+			lc.errName = name
+		}
+		lc.mu.Unlock()
+		if err != nil {
+			lc.log.Error().Err(err).Str("service", name).Msg("service exited with error")
+		} else {
+			lc.log.Info().Str("service", name).Msg("service exited")
+		}
+		lc.signalShutdown()
+	}()
+}
+
+// addCloser registers a cleanup callback. Closers run on shutdown in
+// reverse order of registration (LIFO) so later-started services tear
+// down before earlier ones.
+func (lc *lifecycle) addCloser(name string, close func(ctx context.Context) error) {
+	lc.mu.Lock()
+	lc.closers = append(lc.closers, serviceCloser{name: name, close: close})
+	lc.mu.Unlock()
+}
+
+// signalShutdown is idempotent — closing an already-closed channel panics.
+func (lc *lifecycle) signalShutdown() {
+	lc.doneCh.Do(func() { close(lc.done) })
+}
+
+// wait blocks until shutdown is signaled (by a service exit, context
+// cancellation, or an external caller).
+func (lc *lifecycle) wait(ctx context.Context) {
+	select {
+	case <-lc.done:
+	case <-ctx.Done():
+		lc.signalShutdown()
+	}
+}
+
+// shutdown runs every registered closer in reverse order, collecting
+// errors but never stopping on the first failure — we want every
+// resource to get a chance to clean up.
+func (lc *lifecycle) shutdown(ctx context.Context) {
+	lc.mu.Lock()
+	closers := slices.Clone(lc.closers)
+	lc.mu.Unlock()
+	slices.Reverse(closers)
+
+	for _, c := range closers {
+		lc.log.Info().Str("service", c.name).Msg("closing")
+		if err := c.close(ctx); err != nil {
+			lc.log.Error().Err(err).Str("service", c.name).Msg("close returned error")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 func main() {
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
@@ -102,29 +208,43 @@ func main() {
 		}
 	}
 
-	// Initialize the network manager.
-	netMgr, err := network.NewManager(context.Background(), cfg.HostInterface, log)
+	// Root context — cancelled on signal or on the first service exit.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	lc := newLifecycle(log)
+
+	// ---- Network manager + host firewall ----
+	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
 	}
-	defer netMgr.Close()
+	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
-	// Initialize the VM manager.
+	// ---- VM manager ----
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin: cfg.FirecrackerBin,
 		JailerBin:      cfg.JailerBin,
 		KernelPath:     cfg.KernelPath,
 		BaseRootfsPath: cfg.BaseRootfsPath,
 		SnapshotDir:    cfg.SnapshotDir,
-		RunDir:     cfg.RunDir,
+		RunDir:         cfg.RunDir,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
+	lc.addCloser("vm manager: active sandboxes", func(_ context.Context) error {
+		mgr.ShutdownAll()
+		return nil
+	})
+	lc.addCloser("vm manager: template", func(_ context.Context) error {
+		mgr.CleanupTemplate()
+		return nil
+	})
 
-	// Initialize the TCP egress proxy for domain-based filtering.
+	// ---- TCP egress proxy ----
 	// The nftables firewall in each sandbox namespace REDIRECTs TCP traffic
-	// to these ports for inspection (HTTP Host header, TLS SNI).
+	// to these ports for HTTP Host header / TLS SNI inspection.
 	const maxConnsPerSandbox = 256
 	egressProxy := network.NewEgressProxy(
 		network.DefaultHTTPProxyPort,
@@ -135,71 +255,72 @@ func main() {
 	)
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
+	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Run the egress proxy in the background. It shuts down when ctx is cancelled.
-	go func() {
-		if err := egressProxy.Start(ctx); err != nil {
-			log.Error().Err(err).Msg("egress proxy exited")
-		}
-	}()
-
-	// Boot a throwaway VM from the base image, snapshot it, and keep the
-	// snapshot on disk. Every subsequent CreateVM restores from this template
-	// snapshot instead of cold-booting (~90-200ms vs ~933ms).
+	// ---- Default template ----
+	// Boot a throwaway VM from the base image, snapshot it, keep the
+	// snapshot on disk. Every subsequent CreateVM restores from this
+	// template snapshot instead of cold-booting (~90-200ms vs ~933ms).
 	if err := mgr.InitDefaultTemplate(ctx); err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize default template")
 	}
 
-	// Start the gRPC server.
+	// ---- gRPC server ----
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
 		log.Fatal().Err(err).Int("port", cfg.GRPCPort).Msg("failed to listen")
 	}
-
 	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(64<<20), // 64 MiB
+		grpc.MaxRecvMsgSize(64 << 20), // 64 MiB
 	)
 	vmdpb.RegisterVMDaemonServer(grpcServer, vm.NewGRPCAdapter(mgr))
-
-	// Serve in a goroutine so we can handle shutdown signals.
-	go func() {
+	lc.start("grpc server", func() error {
 		log.Info().Int("port", cfg.GRPCPort).Msg("gRPC server listening")
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatal().Err(err).Msg("gRPC server failed")
+		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+			return fmt.Errorf("grpc serve: %w", err)
+		}
+		return nil
+	})
+	lc.addCloser("grpc server", func(shutdownCtx context.Context) error {
+		done := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(done)
+		}()
+		select {
+		case <-done:
+			log.Info().Msg("gRPC server stopped gracefully")
+		case <-shutdownCtx.Done():
+			log.Warn().Msg("graceful shutdown timed out, forcing stop")
+			grpcServer.Stop()
+		}
+		return nil
+	})
+
+	// ---- Wait for signal or service failure ----
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		select {
+		case sig := <-sigCh:
+			log.Info().Str("signal", sig.String()).Msg("received shutdown signal")
+			lc.signalShutdown()
+		case <-ctx.Done():
 		}
 	}()
 
-	// Wait for termination signal.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigCh
-	log.Info().Str("signal", sig.String()).Msg("received shutdown signal")
+	lc.wait(ctx)
+	cancel() // propagate cancellation to any service still blocked on ctx
 
-	// Graceful shutdown: stop accepting new RPCs, drain in-flight requests.
+	// ---- Run closers in LIFO order with a hard deadline ----
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
+	lc.shutdown(shutdownCtx)
 
-	done := make(chan struct{})
-	go func() {
-		grpcServer.GracefulStop()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Info().Msg("gRPC server stopped gracefully")
-	case <-shutdownCtx.Done():
-		log.Warn().Msg("graceful shutdown timed out, forcing stop")
-		grpcServer.Stop()
+	if lc.firstErr != nil {
+		log.Error().Err(lc.firstErr).Str("service", lc.errName).Msg("VM daemon shutdown after service error")
+		os.Exit(1)
 	}
-
-	// Cancel background tasks, cleanup all active VMs, and remove template files.
-	cancel()
-	mgr.ShutdownAll()
-	mgr.CleanupTemplate()
-
 	log.Info().Msg("VM daemon shutdown complete")
 }
