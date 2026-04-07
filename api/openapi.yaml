@@ -530,6 +530,17 @@ components:
         created_at:
           type: string
           format: date-time
+        timeout_seconds:
+          type: integer
+          format: int32
+          description: >
+            Hard lifetime cap in seconds from creation, if set at creation
+            time. Absent when no cap was configured.
+        network:
+          $ref: "#/components/schemas/NetworkConfig"
+          description: >
+            Current egress allow/deny rules, if any have been configured.
+            Absent when the sandbox uses default network settings.
         metadata:
           type: object
           additionalProperties:

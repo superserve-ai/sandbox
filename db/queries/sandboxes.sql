@@ -67,15 +67,33 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 SELECT network_config FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
--- name: ListExpiredSandboxes :many
--- Sandboxes whose hard lifetime cap has elapsed. Includes all live states
--- (active, pausing, idle, starting) because `timeout_seconds` is a hard
--- cap measured from created_at — paused / idle sandboxes are not exempt.
--- Returns up to $1 rows per reaper cycle to bound work.
-SELECT id, team_id, name, status, snapshot_id, host_id FROM sandbox
-WHERE destroyed_at IS NULL
-  AND timeout_seconds IS NOT NULL
-  AND status != 'deleted'
-  AND created_at + (timeout_seconds || ' seconds')::interval < now()
-ORDER BY created_at ASC
-LIMIT $1;
+-- name: ClaimExpiredSandboxes :many
+-- Atomically claims and soft-deletes sandboxes whose hard timeout has elapsed.
+-- FOR UPDATE SKIP LOCKED lets concurrent reaper replicas skip rows already
+-- being processed by another replica, so multi-replica Cloud Run deployments
+-- do not double-destroy the same sandbox.
+--
+-- Transient states (starting, pausing) are excluded: destroying a sandbox
+-- mid-operation can leave VMD in an inconsistent state. The reaper will pick
+-- them up on the next tick once they have settled. `failed` sandboxes are
+-- excluded because they are already dead but user-visible — auto-reaping them
+-- would silently remove evidence. The 60-second grace window prevents reaping a
+-- sandbox that was just created with a very short timeout before it finishes
+-- starting up.
+WITH expired AS (
+  SELECT id, team_id, name, snapshot_id, host_id
+  FROM sandbox
+  WHERE destroyed_at IS NULL
+    AND timeout_seconds IS NOT NULL
+    AND status NOT IN ('starting', 'pausing', 'failed', 'deleted')
+    AND created_at + (timeout_seconds || ' seconds')::interval < now()
+    AND created_at < now() - interval '60 seconds'
+  ORDER BY created_at ASC
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE sandbox
+SET destroyed_at = now(), status = 'deleted', updated_at = now()
+FROM expired
+WHERE sandbox.id = expired.id
+RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id;

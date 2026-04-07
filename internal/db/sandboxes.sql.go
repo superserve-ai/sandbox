@@ -14,6 +14,72 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
+WITH expired AS (
+  SELECT id, team_id, name, snapshot_id, host_id
+  FROM sandbox
+  WHERE destroyed_at IS NULL
+    AND timeout_seconds IS NOT NULL
+    AND status NOT IN ('starting', 'pausing', 'failed', 'deleted')
+    AND created_at + (timeout_seconds || ' seconds')::interval < now()
+    AND created_at < now() - interval '60 seconds'
+  ORDER BY created_at ASC
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE sandbox
+SET destroyed_at = now(), status = 'deleted', updated_at = now()
+FROM expired
+WHERE sandbox.id = expired.id
+RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+`
+
+type ClaimExpiredSandboxesRow struct {
+	ID         uuid.UUID   `json:"id"`
+	TeamID     uuid.UUID   `json:"team_id"`
+	Name       string      `json:"name"`
+	SnapshotID pgtype.UUID `json:"snapshot_id"`
+	HostID     *string     `json:"host_id"`
+}
+
+// Atomically claims and soft-deletes sandboxes whose hard timeout has elapsed.
+// FOR UPDATE SKIP LOCKED lets concurrent reaper replicas skip rows already
+// being processed by another replica, so multi-replica Cloud Run deployments
+// do not double-destroy the same sandbox.
+//
+// Transient states (starting, pausing) are excluded: destroying a sandbox
+// mid-operation can leave VMD in an inconsistent state. The reaper will pick
+// them up on the next tick once they have settled. `failed` sandboxes are
+// excluded because they are already dead but user-visible — auto-reaping them
+// would silently remove evidence. The 60-second grace window prevents reaping a
+// sandbox that was just created with a very short timeout before it finishes
+// starting up.
+func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]ClaimExpiredSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, claimExpiredSandboxes, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimExpiredSandboxesRow{}
+	for rows.Next() {
+		var i ClaimExpiredSandboxesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.SnapshotID,
+			&i.HostID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createSandbox = `-- name: CreateSandbox :one
 INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -137,56 +203,6 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	var network_config []byte
 	err := row.Scan(&network_config)
 	return network_config, err
-}
-
-const listExpiredSandboxes = `-- name: ListExpiredSandboxes :many
-SELECT id, team_id, name, status, snapshot_id, host_id FROM sandbox
-WHERE destroyed_at IS NULL
-  AND timeout_seconds IS NOT NULL
-  AND status != 'deleted'
-  AND created_at + (timeout_seconds || ' seconds')::interval < now()
-ORDER BY created_at ASC
-LIMIT $1
-`
-
-type ListExpiredSandboxesRow struct {
-	ID         uuid.UUID     `json:"id"`
-	TeamID     uuid.UUID     `json:"team_id"`
-	Name       string        `json:"name"`
-	Status     SandboxStatus `json:"status"`
-	SnapshotID pgtype.UUID   `json:"snapshot_id"`
-	HostID     *string       `json:"host_id"`
-}
-
-// Sandboxes whose hard lifetime cap has elapsed. Includes all live states
-// (active, pausing, idle, starting) because `timeout_seconds` is a hard
-// cap measured from created_at — paused / idle sandboxes are not exempt.
-// Returns up to $1 rows per reaper cycle to bound work.
-func (q *Queries) ListExpiredSandboxes(ctx context.Context, limit int32) ([]ListExpiredSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, listExpiredSandboxes, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListExpiredSandboxesRow{}
-	for rows.Next() {
-		var i ListExpiredSandboxesRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.SnapshotID,
-			&i.HostID,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const listIdleSandboxes = `-- name: ListIdleSandboxes :many

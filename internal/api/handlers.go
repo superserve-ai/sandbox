@@ -734,15 +734,17 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID         uuid.UUID         `json:"id"`
-	Name       string            `json:"name"`
-	Status     string            `json:"status"`
-	VcpuCount  int32             `json:"vcpu_count"`
-	MemoryMib  int32             `json:"memory_mib"`
-	IPAddress  string            `json:"ip_address,omitempty"`
-	SnapshotID *uuid.UUID        `json:"snapshot_id,omitempty"`
-	CreatedAt  time.Time         `json:"created_at"`
-	Metadata   map[string]string `json:"metadata"`
+	ID             uuid.UUID           `json:"id"`
+	Name           string              `json:"name"`
+	Status         string              `json:"status"`
+	VcpuCount      int32               `json:"vcpu_count"`
+	MemoryMib      int32               `json:"memory_mib"`
+	IPAddress      string              `json:"ip_address,omitempty"`
+	SnapshotID     *uuid.UUID          `json:"snapshot_id,omitempty"`
+	CreatedAt      time.Time           `json:"created_at"`
+	TimeoutSeconds *int32              `json:"timeout_seconds,omitempty"`
+	Network        *networkConfigRequest `json:"network,omitempty"`
+	Metadata       map[string]string   `json:"metadata"`
 }
 
 func sandboxToResponse(s db.Sandbox) sandboxResponse {
@@ -761,6 +763,15 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
 		resp.SnapshotID = &id
+	}
+	if s.TimeoutSeconds != nil {
+		resp.TimeoutSeconds = s.TimeoutSeconds
+	}
+	if len(s.NetworkConfig) > 0 {
+		var nc networkConfigRequest
+		if err := json.Unmarshal(s.NetworkConfig, &nc); err == nil && (len(nc.AllowOut) > 0 || len(nc.DenyOut) > 0) {
+			resp.Network = &nc
+		}
 	}
 	return resp
 }
