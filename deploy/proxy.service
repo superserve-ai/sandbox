@@ -1,0 +1,25 @@
+[Unit]
+Description=Superserve Edge Proxy
+After=network.target vmd.service
+Requires=vmd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/proxy
+Restart=always
+RestartSec=2
+
+# Proxy address — listens on all interfaces on port 5007 (HTTP, no TLS for now)
+Environment=PROXY_ADDR=:5007
+# VMD local HTTP resolver
+Environment=VMD_ADDR=http://localhost:9090
+
+# Allow binding to privileged ports if we ever move to :443
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=proxy
+
+[Install]
+WantedBy=multi-user.target
