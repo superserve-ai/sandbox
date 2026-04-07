@@ -1209,15 +1209,35 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 }
 
 // ---------------------------------------------------------------------------
-// Sandbox Network Config
+// Sandbox Patch
 // ---------------------------------------------------------------------------
 
-type updateNetworkRequest struct {
-	AllowOut []string `json:"allow_out"` // Allowed CIDRs or domains.
-	DenyOut  []string `json:"deny_out"`  // Denied CIDRs.
+// patchSandboxRequest is the body for PATCH /sandboxes/:id. Each top-level
+// field is optional; only fields that are present in the request body are
+// applied. Nested objects (like Network) are full replacements when present —
+// to clear deny_out, send {"network": {"allow_out": [...], "deny_out": []}},
+// not {"network": {"allow_out": [...]}} (which would replace deny_out with
+// nil and effectively clear it anyway, but be explicit).
+//
+// At least one top-level field must be set, otherwise the request is rejected
+// with 400. This guards against clients sending empty bodies by mistake and
+// silently no-opping.
+//
+// Today the only patchable field is `network`. Adding more in the future is
+// additive — declare a new pointer field and dispatch on its non-nil-ness.
+type patchSandboxRequest struct {
+	Network *networkConfigRequest `json:"network,omitempty"`
 }
 
-func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
+// PatchSandbox applies a partial update to a running sandbox. Currently the
+// only patchable field is `network`, which replaces the egress rules for the
+// sandbox. The sandbox must be in the active state — patching a paused or
+// idle sandbox returns 409.
+//
+// Replaces the previous PUT /sandboxes/:id/network endpoint. The wrapping
+// under a top-level field name leaves room to patch additional fields later
+// without breaking the route shape.
+func (h *Handlers) PatchSandbox(c *gin.Context) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -1228,13 +1248,25 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 		return
 	}
 
-	var body updateNetworkRequest
-	if err := c.ShouldBindJSON(&body); err != nil {
+	var body patchSandboxRequest
+	if err := bindJSONStrict(c, &body); err != nil {
 		respondErrorMsg(c, "bad_request", "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if err := validateEgressRules(body.AllowOut, body.DenyOut); err != nil {
+	// Reject empty patches. We use a strict decoder so unknown fields are
+	// already a 400; this catches the legitimate-shape-but-empty case
+	// (e.g. `{}` or `{"network": null}`) which would otherwise silently
+	// succeed as a no-op.
+	if body.Network == nil {
+		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network)", http.StatusBadRequest)
+		return
+	}
+
+	// Validate the egress rules before doing any DB or VMD work so we can
+	// fail fast with a clean 400 instead of writing a row we'd need to
+	// roll back.
+	if err := validateEgressRules(body.Network.AllowOut, body.Network.DenyOut); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1261,7 +1293,7 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 
 	// Separate CIDRs and domains from allow_out.
 	var allowedCIDRs, allowedDomains []string
-	for _, entry := range body.AllowOut {
+	for _, entry := range body.Network.AllowOut {
 		if isIPOrCIDR(entry) {
 			allowedCIDRs = append(allowedCIDRs, entry)
 		} else {
@@ -1272,7 +1304,7 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 	// Apply rules to the running VM via VMD.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.DenyOut, allowedDomains); err != nil {
+	if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
 		respondError(c, ErrInternal)
 		return
@@ -1282,7 +1314,7 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 	networkConfig, _ := json.Marshal(map[string]any{
 		"egress": map[string]any{
 			"allowed_cidrs":   allowedCIDRs,
-			"denied_cidrs":    body.DenyOut,
+			"denied_cidrs":    body.Network.DenyOut,
 			"allowed_domains": allowedDomains,
 		},
 	})
@@ -1336,7 +1368,7 @@ func isIPOrCIDR(s string) bool {
 }
 
 // validateEgressRules enforces the rules shared between CreateSandbox and
-// UpdateSandboxNetwork:
+// PatchSandbox:
 //
 //   - deny_out entries MUST be valid IPv4 CIDRs or IP addresses (domains
 //     are not supported in deny lists — there's no way to enforce a domain

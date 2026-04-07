@@ -875,10 +875,10 @@ func TestIntegration_ConcurrentCreate(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PUT /sandboxes/:id/network
+// PATCH /sandboxes/:id
 // ---------------------------------------------------------------------------
 
-func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
+func TestIntegration_PatchSandbox_Network_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
@@ -889,10 +889,10 @@ func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
 	sid := mustJSON(t, cw)["id"].(string)
 	sandboxUUID, _ := uuid.Parse(sid)
 
-	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
-		`{"allow_out":["api.openai.com","8.8.8.8/32"],"deny_out":["0.0.0.0/0"]}`)
+	nw := do(r, "PATCH", "/sandboxes/"+sid, apiKey,
+		`{"network":{"allow_out":["api.openai.com","8.8.8.8/32"],"deny_out":["0.0.0.0/0"]}}`)
 	if nw.Code != http.StatusNoContent {
-		t.Fatalf("update network: expected 204, got %d: %s", nw.Code, nw.Body.String())
+		t.Fatalf("patch network: expected 204, got %d: %s", nw.Code, nw.Body.String())
 	}
 
 	// Verify config persisted in DB.
@@ -904,11 +904,11 @@ func TestIntegration_UpdateSandboxNetwork_Success(t *testing.T) {
 		t.Fatalf("get network config: %v", err)
 	}
 	if row == nil {
-		t.Fatal("network_config is nil after update")
+		t.Fatal("network_config is nil after patch")
 	}
 }
 
-func TestIntegration_UpdateSandboxNetwork_NotActive(t *testing.T) {
+func TestIntegration_PatchSandbox_Network_NotActive(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
@@ -923,15 +923,15 @@ func TestIntegration_UpdateSandboxNetwork_NotActive(t *testing.T) {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
-	// Try to update network on idle sandbox — should fail.
-	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
-		`{"deny_out":["0.0.0.0/0"]}`)
+	// Try to patch network on idle sandbox — should fail.
+	nw := do(r, "PATCH", "/sandboxes/"+sid, apiKey,
+		`{"network":{"deny_out":["0.0.0.0/0"]}}`)
 	if nw.Code != http.StatusConflict {
 		t.Fatalf("expected 409 for idle sandbox, got %d: %s", nw.Code, nw.Body.String())
 	}
 }
 
-func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
+func TestIntegration_PatchSandbox_Network_InvalidDenyCIDR(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
@@ -941,21 +941,56 @@ func TestIntegration_UpdateSandboxNetwork_InvalidDenyCIDR(t *testing.T) {
 	}
 	sid := mustJSON(t, cw)["id"].(string)
 	// deny_out with a domain (not a CIDR) should fail validation.
-	nw := do(r, "PUT", "/sandboxes/"+sid+"/network", apiKey,
-		`{"deny_out":["evil.com"]}`)
+	nw := do(r, "PATCH", "/sandboxes/"+sid, apiKey,
+		`{"network":{"deny_out":["evil.com"]}}`)
 	if nw.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for domain in deny_out, got %d: %s", nw.Code, nw.Body.String())
 	}
 }
 
-func TestIntegration_UpdateSandboxNetwork_NotFound(t *testing.T) {
+func TestIntegration_PatchSandbox_NotFound(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
-	nw := do(r, "PUT", "/sandboxes/00000000-0000-0000-0000-000000000000/network", apiKey,
-		`{"deny_out":["0.0.0.0/0"]}`)
+	nw := do(r, "PATCH", "/sandboxes/00000000-0000-0000-0000-000000000000", apiKey,
+		`{"network":{"deny_out":["0.0.0.0/0"]}}`)
 	if nw.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", nw.Code, nw.Body.String())
+	}
+}
+
+// Empty patch body — at least one top-level field must be present.
+func TestIntegration_PatchSandbox_EmptyBody(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-empty"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+
+	nw := do(r, "PATCH", "/sandboxes/"+sid, apiKey, `{}`)
+	if nw.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty patch body, got %d: %s", nw.Code, nw.Body.String())
+	}
+}
+
+// Unknown top-level fields are rejected by the strict JSON decoder so typos
+// surface as 400s instead of silent no-ops.
+func TestIntegration_PatchSandbox_UnknownField(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-unknown"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+
+	nw := do(r, "PATCH", "/sandboxes/"+sid, apiKey, `{"netwrk":{"deny_out":["0.0.0.0/0"]}}`)
+	if nw.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown field, got %d: %s", nw.Code, nw.Body.String())
 	}
 }
 

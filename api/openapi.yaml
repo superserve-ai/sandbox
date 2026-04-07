@@ -14,6 +14,7 @@ info:
     | Endpoint | What it does |
     |----------|-------------|
     | `POST /sandboxes` | Create a new sandbox |
+    | `PATCH /sandboxes/:id` | Partially update a running sandbox (e.g. network rules) |
     | `POST /sandboxes/:id/pause` | Snapshot full state, suspend the VM |
     | `POST /sandboxes/:id/resume` | Restore from snapshot, continue where it left off |
     | `DELETE /sandboxes/:id` | Delete sandbox and all resources |
@@ -147,6 +148,49 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+    patch:
+      operationId: patchSandbox
+      tags: [Sandboxes]
+      summary: Partially update a running sandbox
+      description: |
+        Applies a partial update to a running sandbox. Each top-level field
+        in the request body is optional; only fields that are present are
+        applied. Omitted top-level fields are left unchanged. Nested objects
+        are full replacements when present — to clear a list, send it as an
+        empty array.
+
+        At least one top-level field must be present, otherwise the request
+        is rejected with `400`. Unknown top-level fields are also rejected
+        with `400` so typos surface as errors instead of silent no-ops.
+
+        ## Currently patchable fields
+
+        - `network` — replaces the egress allow/deny rules. The sandbox
+          must be in the `active` state; patching a paused or idle sandbox
+          returns `409`. Rules take effect immediately and are persisted so
+          they survive a future pause/resume cycle.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxPatch"
+      responses:
+        "204":
+          description: Patch applied
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}/pause:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
@@ -197,41 +241,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SandboxResponse"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-  /sandboxes/{sandbox_id}/network:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-
-    put:
-      operationId: updateSandboxNetwork
-      tags: [Sandboxes]
-      summary: Update sandbox network egress rules
-      description: |
-        Atomically replaces the egress allow/deny rules for a running sandbox.
-        Rules take effect immediately. Supports CIDRs and domain names in
-        `allow_out`, CIDRs only in `deny_out`. Rules are persisted and
-        reapplied on resume after a pause.
-      security:
-        - apiKey: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/NetworkConfig"
-      responses:
-        "204":
-          description: Network rules updated
-        "400":
-          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -527,6 +536,31 @@ components:
             type: string
           description: CIDRs to deny. Use `0.0.0.0/0` to block all traffic not in `allow_out`.
           example: ["0.0.0.0/0"]
+
+    SandboxPatch:
+      type: object
+      description: |
+        Partial update body for `PATCH /sandboxes/{sandbox_id}`. Each
+        top-level field is optional; only fields that are present are
+        applied. Omitted fields are left unchanged. Nested objects are
+        full replacements when present — to clear a list, send it as an
+        empty array.
+
+        At least one top-level field must be set, otherwise the request
+        is rejected with `400`. Unknown fields are also rejected with
+        `400`.
+      properties:
+        network:
+          allOf:
+            - $ref: "#/components/schemas/NetworkConfig"
+          description: |
+            Replace the sandbox's egress rules. The sandbox must be in
+            the `active` state. The provided `allow_out` and `deny_out`
+            lists fully replace whatever was previously configured.
+      example:
+        network:
+          allow_out: ["api.openai.com", "*.github.com"]
+          deny_out: ["0.0.0.0/0"]
 
     Error:
       type: object
