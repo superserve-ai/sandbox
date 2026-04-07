@@ -1143,6 +1143,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if ipAddress != "" {
 		resp.IPAddress = ipAddress
 	}
+	// req.Network may have been populated by the allow_internet_access=false
+	// path, so include it in the response if rules were set.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		resp.Network = req.Network
+	}
 	c.JSON(http.StatusCreated, resp)
 }
 
