@@ -279,32 +279,24 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 
 // isAllowed checks if egress is allowed based on domain and CIDR rules.
 // Returns (allowed, matchType).
+//
+// Priority order is fail-safe: deny is always checked BEFORE allow, so a
+// user who writes {"allow_out": ["*.example.com"], "deny_out": ["0.0.0.0/0"]}
+// cannot accidentally bypass the deny rule via a matching allowlist entry.
+//
+//  1. No rules configured → allow (default)
+//  2. Destination matches any deny CIDR → deny
+//  3. Destination matches any allow domain → allow
+//  4. Destination matches any allow CIDR → allow
+//  5. Allow list is non-empty but nothing matched → deny (implicit deny)
+//  6. Allow list is empty → allow (deny list only)
 func (p *EgressProxy) isAllowed(rules *EgressRules, hostname string, dstIP net.IP) (bool, string) {
 	if rules == nil {
 		return true, "default"
 	}
 
-	// Priority 1: Check allowed domains.
-	if hostname != "" {
-		for _, domain := range rules.AllowedDomains {
-			if matchDomain(hostname, domain) {
-				return true, "domain"
-			}
-		}
-	}
-
-	// Priority 1: Check allowed CIDRs.
-	for _, cidr := range rules.AllowedCIDRs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		if ipNet.Contains(dstIP) {
-			return true, "cidr"
-		}
-	}
-
-	// Priority 2: Check denied CIDRs.
+	// Priority 1: deny CIDRs — evaluated first so they cannot be bypassed
+	// by a matching allow entry.
 	for _, cidr := range rules.DeniedCIDRs {
 		_, ipNet, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -315,20 +307,49 @@ func (p *EgressProxy) isAllowed(rules *EgressRules, hostname string, dstIP net.I
 		}
 	}
 
-	// Default: allow.
+	// Priority 2: allow domains.
+	if hostname != "" {
+		for _, domain := range rules.AllowedDomains {
+			if matchDomain(hostname, domain) {
+				return true, "domain"
+			}
+		}
+	}
+
+	// Priority 2: allow CIDRs.
+	for _, cidr := range rules.AllowedCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if ipNet.Contains(dstIP) {
+			return true, "cidr"
+		}
+	}
+
+	// Allow list was non-empty but nothing matched → implicit deny.
+	// This makes {"allow_out": ["api.openai.com"]} work as users expect
+	// (only the listed domain is allowed, everything else blocked).
+	if len(rules.AllowedDomains) > 0 || len(rules.AllowedCIDRs) > 0 {
+		return false, "implicit-deny"
+	}
+
+	// Only a deny list was configured and nothing matched → allow.
 	return true, "default"
 }
 
 // matchDomain checks if a hostname matches a domain pattern.
-// Supports exact match, wildcard (*), and suffix wildcard (*.example.com).
+// Supports exact match and suffix wildcard (*.example.com).
+// A bare "*" is NOT supported — it's too easy to misuse and would silently
+// bypass all deny rules. Use explicit CIDR allow rules for "match all".
 func matchDomain(hostname, pattern string) bool {
 	if pattern == "" {
 		return false
 	}
-	if strings.EqualFold(pattern, hostname) {
-		return true
+	if pattern == "*" {
+		return false // bare wildcard is intentionally rejected
 	}
-	if strings.EqualFold(pattern, "*") {
+	if strings.EqualFold(pattern, hostname) {
 		return true
 	}
 	if strings.HasPrefix(pattern, "*.") {
