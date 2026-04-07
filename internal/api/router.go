@@ -14,10 +14,21 @@ import (
 // router instance doesn't leak a cleanup goroutine.
 func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
-	r.Use(SecurityHeaders(), RateLimit(ctx, DefaultRateLimitConfig()), RequestLogger(), ErrorHandler())
+	// Global middleware: security headers, coarse per-IP rate limit
+	// (unauthenticated flood protection), logging, panic recovery.
+	r.Use(
+		SecurityHeaders(),
+		RateLimit(ctx, DefaultIPRateLimitConfig()),
+		RequestLogger(),
+		ErrorHandler(),
+	)
 
 	api := r.Group("/")
-	api.Use(APIKeyAuth(pool))
+	// Authenticate first, then apply per-team rate limit — so each
+	// customer gets a dedicated bucket regardless of source IP. Behind a
+	// load balancer the per-IP limit collapses tenants onto one bucket
+	// and becomes meaningless for fairness.
+	api.Use(APIKeyAuth(pool), TeamRateLimit(ctx, DefaultTeamRateLimitConfig()))
 	{
 		api.POST("/instances", h.CreateInstance)
 		api.GET("/instances", h.ListInstances)
