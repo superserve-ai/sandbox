@@ -760,6 +760,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	// Validate network rules up front so we fail before doing any DB or VMD work.
+	if req.Network != nil {
+		if err := validateEgressRules(req.Network.AllowOut, req.Network.DenyOut); err != nil {
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
 		return
@@ -1163,12 +1171,9 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 		return
 	}
 
-	// Validate: deny_out only supports CIDRs, allow_out supports CIDRs and domains.
-	for _, cidr := range body.DenyOut {
-		if !isIPOrCIDR(cidr) {
-			respondErrorMsg(c, "bad_request", fmt.Sprintf("deny_out only supports CIDRs, got %q", cidr), http.StatusBadRequest)
-			return
-		}
+	if err := validateEgressRules(body.AllowOut, body.DenyOut); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// Verify sandbox exists, belongs to this team, and is active.
@@ -1231,6 +1236,8 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// isIPOrCIDR returns true if s is a valid IP address or CIDR prefix.
+// Used to distinguish CIDR entries from domain names in allow/deny lists.
 func isIPOrCIDR(s string) bool {
 	if _, err := netip.ParseAddr(s); err == nil {
 		return true
@@ -1239,4 +1246,23 @@ func isIPOrCIDR(s string) bool {
 		return true
 	}
 	return false
+}
+
+// validateEgressRules enforces the rules shared between CreateSandbox and
+// UpdateSandboxNetwork:
+//
+//   - deny_out entries MUST be valid CIDRs or IP addresses (domains are
+//     not supported in deny lists — there's no way to enforce a domain
+//     deny at the IP layer, and mixing silently fails).
+//   - allow_out entries can be either CIDRs/IPs or domain names.
+//
+// Returns nil on success or a 400-appropriate error message.
+func validateEgressRules(allowOut, denyOut []string) error {
+	for _, entry := range denyOut {
+		if !isIPOrCIDR(entry) {
+			return fmt.Errorf("deny_out only supports CIDRs, got %q", entry)
+		}
+	}
+	// allow_out accepts both CIDRs and domains — no validation beyond existence.
+	return nil
 }
