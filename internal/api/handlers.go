@@ -766,8 +766,14 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var req createSandboxRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSONStrict(c, &req); err != nil {
 		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		return
+	}
+	// Manual field validation — bindJSONStrict uses encoding/json which does
+	// not honor gin's `binding:"required,..."` struct tags.
+	if req.Name == "" || len(req.Name) > 64 {
+		respondErrorMsg(c, "bad_request", "name is required and must be 1-64 characters", http.StatusBadRequest)
 		return
 	}
 
@@ -1263,6 +1269,30 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 	h.logActivityAsync(sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 
 	c.Status(http.StatusNoContent)
+}
+
+// bindJSONStrict decodes the request body into v and rejects unknown fields.
+//
+// This is stricter than gin's c.ShouldBindJSON which silently ignores fields
+// not present in the target struct. Strict binding is important for fields
+// we intentionally removed (e.g. vcpu_count, memory_mib) so old clients get
+// a clear 400 error instead of silently losing their request data.
+//
+// Returns nil on success, or an error suitable for a 400 Bad Request.
+func bindJSONStrict(c *gin.Context, v any) error {
+	if c.Request.Body == nil {
+		return fmt.Errorf("request body is empty")
+	}
+	dec := json.NewDecoder(c.Request.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	// Reject trailing garbage / multiple JSON objects.
+	if dec.More() {
+		return fmt.Errorf("unexpected trailing data after JSON object")
+	}
+	return nil
 }
 
 // isIPOrCIDR returns true if s is a valid IP address or CIDR prefix.
