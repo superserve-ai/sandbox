@@ -6,39 +6,56 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"sync"
 	"time"
 )
 
-const (
-	defaultVMDAddr  = "http://localhost:9090"
-	defaultCacheTTL = 5 * time.Second
-)
-
-// ErrInstanceNotFound is returned when VMD has no record of the instance.
+// ErrInstanceNotFound is returned when the resolver has no record of the instance.
 var ErrInstanceNotFound = errors.New("proxy: instance not found")
 
-// InstanceInfo is what the resolver returns for a given instance.
+// InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
 	VMIP      string
 	Status    string
-	StartedAt int64 // Unix nanoseconds; changes when the sandbox restarts — used as a lifecycle key
+	StartedAt int64 // Unix nanoseconds; changes on restart — used as transport lifecycle key
 }
 
-// lifecycleKey returns a string that is stable for the lifetime of one VM boot.
-// The proxy uses it to detect when a sandbox was replaced and old transports must be closed.
+// lifecycleKey returns a string stable for the lifetime of one VM boot.
 func (i InstanceInfo) lifecycleKey() string {
-	return fmt.Sprintf("%d", i.StartedAt)
+	return strconv.FormatInt(i.StartedAt, 10)
 }
+
+// Resolver is the interface the proxy uses to look up sandbox instances.
+// The current implementation queries VMD's local HTTP server.
+// When Redis is added, swap in a RedisResolver without touching the proxy.
+type Resolver interface {
+	Lookup(ctx context.Context, instanceID string) (InstanceInfo, error)
+	Invalidate(instanceID string)
+}
+
+// ---------------------------------------------------------------------------
+// VMDResolver — queries VMD's local HTTP server (current implementation)
+// ---------------------------------------------------------------------------
+
+const (
+	defaultVMDAddr   = "http://127.0.0.1:9090"
+	defaultCacheTTL  = 500 * time.Millisecond // VMD is on localhost, latency is negligible
+	negativeCacheTTL = 1 * time.Second        // cache "not found" slightly longer to absorb spam
+	maxCacheSize     = 10_000                  // cap against random instance ID amplification
+)
 
 type cacheEntry struct {
 	info      InstanceInfo
+	err       error // non-nil for negative cache entries
 	expiresAt time.Time
 }
 
-// Resolver looks up instanceID → vmIP by querying VMD's local HTTP server.
-// Results are cached with a short TTL to avoid a VMD call on every request.
-type Resolver struct {
+// VMDResolver looks up instanceID → vmIP by querying VMD's local HTTP server.
+// Results are cached briefly to absorb request bursts to the same sandbox.
+// Negative results are also cached to prevent VMD amplification from unknown IDs.
+type VMDResolver struct {
 	vmdAddr string
 	ttl     time.Duration
 	client  *http.Client
@@ -47,13 +64,13 @@ type Resolver struct {
 	cache map[string]cacheEntry
 }
 
-// NewResolver creates a Resolver that queries VMD at vmdAddr.
-// Pass "" to use the default (localhost:9090).
-func NewResolver(vmdAddr string) *Resolver {
+// NewVMDResolver creates a Resolver that queries VMD at vmdAddr.
+// Pass "" to use the default (127.0.0.1:9090).
+func NewVMDResolver(vmdAddr string) *VMDResolver {
 	if vmdAddr == "" {
 		vmdAddr = defaultVMDAddr
 	}
-	return &Resolver{
+	return &VMDResolver{
 		vmdAddr: vmdAddr,
 		ttl:     defaultCacheTTL,
 		client:  &http.Client{Timeout: 2 * time.Second},
@@ -62,12 +79,11 @@ func NewResolver(vmdAddr string) *Resolver {
 }
 
 // Lookup returns InstanceInfo for the given instanceID.
-// Hits cache first; falls through to VMD if stale or missing.
-func (r *Resolver) Lookup(ctx context.Context, instanceID string) (InstanceInfo, error) {
+func (r *VMDResolver) Lookup(ctx context.Context, instanceID string) (InstanceInfo, error) {
 	r.mu.Lock()
 	if e, ok := r.cache[instanceID]; ok && time.Now().Before(e.expiresAt) {
 		r.mu.Unlock()
-		return e.info, nil
+		return e.info, e.err
 	}
 	r.mu.Unlock()
 
@@ -75,8 +91,7 @@ func (r *Resolver) Lookup(ctx context.Context, instanceID string) (InstanceInfo,
 }
 
 // Invalidate removes an instance from the cache so the next Lookup goes to VMD.
-// Called when an upstream request fails, in case the sandbox has moved.
-func (r *Resolver) Invalidate(instanceID string) {
+func (r *VMDResolver) Invalidate(instanceID string) {
 	r.mu.Lock()
 	delete(r.cache, instanceID)
 	r.mu.Unlock()
@@ -89,9 +104,9 @@ type vmdResponse struct {
 	StartedAt int64  `json:"started_at"`
 }
 
-func (r *Resolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, error) {
-	url := fmt.Sprintf("%s/instances/%s", r.vmdAddr, instanceID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, error) {
+	u := fmt.Sprintf("%s/instances/%s", r.vmdAddr, url.PathEscape(instanceID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return InstanceInfo{}, fmt.Errorf("resolver: build request: %w", err)
 	}
@@ -103,6 +118,7 @@ func (r *Resolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
+		r.store(instanceID, InstanceInfo{}, ErrInstanceNotFound, negativeCacheTTL)
 		return InstanceInfo{}, ErrInstanceNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -114,15 +130,16 @@ func (r *Resolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, 
 		return InstanceInfo{}, fmt.Errorf("resolver: decode response: %w", err)
 	}
 
-	info := InstanceInfo{
-		VMIP:      raw.VMIP,
-		Status:    raw.Status,
-		StartedAt: raw.StartedAt,
-	}
-
-	r.mu.Lock()
-	r.cache[instanceID] = cacheEntry{info: info, expiresAt: time.Now().Add(r.ttl)}
-	r.mu.Unlock()
-
+	info := InstanceInfo{VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt}
+	r.store(instanceID, info, nil, r.ttl)
 	return info, nil
+}
+
+func (r *VMDResolver) store(instanceID string, info InstanceInfo, err error, ttl time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.cache) >= maxCacheSize {
+		r.cache = make(map[string]cacheEntry)
+	}
+	r.cache[instanceID] = cacheEntry{info: info, err: err, expiresAt: time.Now().Add(ttl)}
 }

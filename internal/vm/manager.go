@@ -476,10 +476,7 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		rundirKey = inst.RunDirID
 	}
 	m.cleanupRunDir(rundirKey)
-
-	m.mu.Lock()
-	delete(m.vms, vmID)
-	m.mu.Unlock()
+	m.removeVM(vmID)
 
 	log.Info().Msg("VM destroyed")
 	return nil

@@ -3,35 +3,48 @@ package proxy
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
+// validInstanceID restricts instance IDs to alphanumeric + hyphen, max 64 chars.
+// Prevents path traversal (%2f, ..) from reaching the VMD resolver URL.
+var validInstanceID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$`)
+
 // ParseHost extracts port and instanceID from a Host header of the form
-// {port}-{instanceID}.sandbox.superserve.ai (or any subdomain suffix).
-// Returns an error if the format doesn't match.
-func ParseHost(host string) (port int, instanceID string, err error) {
-	// Strip port from host if present (e.g. "49983-abc123.sandbox.superserve.ai:443")
+// {port}-{instanceID}.{domain} and validates both fields.
+//
+// Returns ErrInvalidHost if the host doesn't end with the expected domain suffix,
+// so the proxy rejects forged Host headers pointing at arbitrary backends.
+func ParseHost(host, domain string) (port int, instanceID string, err error) {
+	// Strip TCP port from Host if present (e.g. "49983-abc.sandbox.superserve.ai:443")
 	hostname, _, splitErr := net.SplitHostPort(host)
 	if splitErr != nil {
-		// No port in host, use as-is
 		hostname = host
 	}
 
-	// Take the leftmost label: "49983-abc123"
-	label := strings.SplitN(hostname, ".", 2)[0]
+	// Validate domain suffix — prevents accepting any Host: port-id.attacker.com
+	if !strings.HasSuffix(hostname, "."+domain) {
+		return 0, "", fmt.Errorf("proxy: host %q does not end in .%s", hostname, domain)
+	}
 
-	// Split on first "-" to get port and instanceID
-	idx := strings.Index(label, "-")
-	if idx < 0 {
+	// Take the leftmost label only: "49983-abc123"
+	label, _, _ := strings.Cut(hostname, ".")
+
+	// Split on the first "-" to separate port from instance ID
+	portStr, instanceID, ok := strings.Cut(label, "-")
+	if !ok {
 		return 0, "", fmt.Errorf("proxy: host label %q has no '-' separator", label)
 	}
 
-	portStr := label[:idx]
-	instanceID = label[idx+1:]
-
 	if instanceID == "" {
 		return 0, "", fmt.Errorf("proxy: empty instance ID in host %q", host)
+	}
+
+	// Validate charset — blocks path traversal and injection into VMD URL
+	if !validInstanceID.MatchString(instanceID) {
+		return 0, "", fmt.Errorf("proxy: instance ID %q contains invalid characters", instanceID)
 	}
 
 	port, err = strconv.Atoi(portStr)

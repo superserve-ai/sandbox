@@ -9,6 +9,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -18,7 +19,7 @@ import (
 //
 // The client-facing idle timeout must be longer than the upstream idle timeout
 // so we don't race the upstream close. GCP LB has a 600s upstream idle timeout,
-// so the VM-facing transport idle is set to 610s and the server idle to 620s.
+// so the VM-facing transport idle is 610s and the server idle is 620s.
 const (
 	serverIdleTimeout    = 620 * time.Second
 	transportIdleTimeout = 610 * time.Second
@@ -27,30 +28,69 @@ const (
 	// maxDialAttempts handles the window where boxd is starting up inside the VM.
 	// We retry with linear backoff: 100ms, 200ms, 300ms before giving up.
 	maxDialAttempts = 3
+
+	// minProxiedPort blocks privileged ports (< 1024) which could expose system
+	// services (SSH, etc.) running inside the VM. User app ports and boxd (49983)
+	// are all above this threshold.
+	minProxiedPort = 1024
+
+	// transportSweepInterval controls how often the transport cache is swept
+	// to close transports for sandboxes that are no longer alive.
+	transportSweepInterval = 5 * time.Minute
+	transportMaxAge        = 10 * time.Minute
 )
 
 // Handler is the core reverse proxy handler.
 type Handler struct {
-	resolver  *Resolver
+	domain     string // expected hostname suffix, e.g. "sandbox.superserve.ai"
+	resolver   Resolver
 	transports *transportCache
-	log       zerolog.Logger
+	log        zerolog.Logger
 }
 
-// NewHandler creates a proxy Handler.
-func NewHandler(resolver *Resolver, log zerolog.Logger) *Handler {
-	return &Handler{
-		resolver:  resolver,
+// NewHandler creates a proxy Handler that only accepts requests whose Host
+// header ends in ".{domain}".
+func NewHandler(domain string, resolver Resolver, log zerolog.Logger) *Handler {
+	h := &Handler{
+		domain:     domain,
+		resolver:   resolver,
 		transports: newTransportCache(),
-		log:       log,
+		log:        log,
 	}
+	return h
+}
+
+// StartSweeper launches a background goroutine that periodically closes
+// transports for sandboxes that haven't been seen in transportMaxAge.
+// It stops when ctx is cancelled.
+func (h *Handler) StartSweeper(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(transportSweepInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				h.transports.sweep()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	port, instanceID, err := ParseHost(r.Host)
+	port, instanceID, err := ParseHost(r.Host, h.domain)
 	if err != nil {
 		h.log.Warn().Err(err).Str("host", r.Host).Msg("bad host")
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)
+		return
+	}
+
+	// Block privileged ports — prevents accessing SSH or other system services
+	// that may be bound on the VM's network interface.
+	if port < minProxiedPort {
+		http.Error(w, "port not allowed", http.StatusForbidden)
 		return
 	}
 
@@ -83,10 +123,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
-			req.Host = target.Host
-			req.Header.Del("X-Forwarded-For")
+			// Preserve the original Host so boxd sees the sandbox URL, not the VM IP.
+			// This prevents the VM IP from leaking in redirects or cookies that echo Host.
+			req.Host = r.Host
+			// Strip all forwarding headers — a client could inject these to
+			// spoof origin info that boxd or user apps might trust.
+			for _, h := range []string{
+				"X-Forwarded-For",
+				"X-Forwarded-Host",
+				"X-Forwarded-Proto",
+				"X-Real-Ip",
+				"Forwarded",
+			} {
+				req.Header.Del(h)
+			}
 		},
 		Transport: transport,
+		// FlushInterval: -1 enables immediate flushing for streaming responses
+		// (PTY output, SSE). Without this Go buffers until the copy buffer fills.
+		FlushInterval: -1,
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
 			h.log.Error().Err(proxyErr).
 				Str("instance", instanceID).
@@ -103,8 +158,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rp.ServeHTTP(w, r)
 }
 
-// CloseTransport closes the transport for an instance (e.g. when VMD destroys it).
-// This terminates any idle connections to that VM immediately.
+// CloseTransport closes and removes the transport for an instance.
+// Call this when VMD destroys a sandbox to terminate idle connections immediately.
 func (h *Handler) CloseTransport(instanceID string) {
 	h.transports.close(instanceID)
 }
@@ -114,7 +169,7 @@ func (h *Handler) CloseTransport(instanceID string) {
 // ---------------------------------------------------------------------------
 
 // transportCache maintains one *http.Transport per sandbox lifecycle.
-// When a sandbox restarts, its lifecycleKey changes (new CreatedAt), so the old
+// When a sandbox restarts, its lifecycleKey changes (new StartedAt), so the old
 // transport is closed and a fresh one is created, preventing stale TCP connections.
 type transportCache struct {
 	mu    sync.Mutex
@@ -124,6 +179,7 @@ type transportCache struct {
 type transportEntry struct {
 	lifecycleKey string
 	transport    *http.Transport
+	lastUsed     time.Time
 }
 
 func newTransportCache() *transportCache {
@@ -140,14 +196,19 @@ func (c *transportCache) get(instanceID string, info InstanceInfo) *http.Transpo
 
 	if e, ok := c.items[instanceID]; ok {
 		if e.lifecycleKey == key {
+			e.lastUsed = time.Now()
 			return e.transport
 		}
-		// Sandbox was replaced — close idle conns on old transport before discarding.
+		// Sandbox was replaced — close idle connections on old transport.
 		e.transport.CloseIdleConnections()
 	}
 
 	t := newTransport()
-	c.items[instanceID] = &transportEntry{lifecycleKey: key, transport: t}
+	c.items[instanceID] = &transportEntry{
+		lifecycleKey: key,
+		transport:    t,
+		lastUsed:     time.Now(),
+	}
 	return t
 }
 
@@ -165,6 +226,26 @@ func (c *transportCache) close(instanceID string) {
 	}
 }
 
+// sweep closes and removes transports that haven't been used recently.
+// This handles the case where a sandbox was destroyed without an explicit
+// CloseTransport call (e.g. VMD restart).
+func (c *transportCache) sweep() {
+	cutoff := time.Now().Add(-transportMaxAge)
+
+	c.mu.Lock()
+	var stale []string
+	for id, e := range c.items {
+		if e.lastUsed.Before(cutoff) {
+			stale = append(stale, id)
+		}
+	}
+	for _, id := range stale {
+		c.items[id].transport.CloseIdleConnections()
+		delete(c.items, id)
+	}
+	c.mu.Unlock()
+}
+
 // ---------------------------------------------------------------------------
 // Transport factory
 // ---------------------------------------------------------------------------
@@ -173,25 +254,26 @@ func (c *transportCache) close(instanceID string) {
 //
 // Key decisions:
 //   - DisableKeepAlives: sandboxes are ephemeral and can restart; never reuse TCP.
-//   - DisableCompression: we're a transparent proxy — the client and server negotiate compression.
-//   - Retry dial: boxd may not be ready the instant the sandbox reaches "running".
-//     We retry up to maxDialAttempts times with linear backoff so the SDK doesn't
-//     need to handle this transient window.
+//   - DisableCompression: we're a transparent proxy — client and server negotiate it.
+//   - Retry dial on ECONNREFUSED only: boxd may not be ready immediately after the
+//     sandbox reaches "running". We retry up to maxDialAttempts with linear backoff.
+//     Other errors (DNS failure, host unreachable, cancelled ctx) are not retried.
 //   - No ResponseHeaderTimeout: PTY and streaming responses can take arbitrarily long.
 func newTransport() *http.Transport {
 	return &http.Transport{
 		DisableKeepAlives:   true,
 		DisableCompression:  true,
 		IdleConnTimeout:     transportIdleTimeout,
-		TLSHandshakeTimeout: 0, // no TLS to VMs
+		TLSHandshakeTimeout: 0,
 		ForceAttemptHTTP2:   false,
 		DialContext:         retryDial(maxDialAttempts, dialTimeout),
 	}
 }
 
-// retryDial returns a DialContext func that retries on connection refused with
-// linear backoff. This handles the window between a sandbox reaching "running"
-// status and boxd finishing its startup inside the VM.
+// retryDial returns a DialContext func that retries on ECONNREFUSED with linear
+// backoff. Only ECONNREFUSED is retried — this is the specific error that occurs
+// when boxd hasn't finished binding its port yet after VM start.
+// Other errors (host unreachable, context cancelled, DNS failure) fail immediately.
 func retryDial(maxAttempts int, timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		d := &net.Dialer{Timeout: timeout}
@@ -203,6 +285,11 @@ func retryDial(maxAttempts int, timeout time.Duration) func(ctx context.Context,
 			conn, err = d.DialContext(ctx, network, addr)
 			if err == nil {
 				return conn, nil
+			}
+			// Only retry connection refused — boxd startup window.
+			// All other errors (unreachable, cancelled, etc.) are non-retriable.
+			if !errors.Is(err, syscall.ECONNREFUSED) {
+				return nil, err
 			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -228,12 +315,14 @@ func retryDial(maxAttempts int, timeout time.Duration) func(ctx context.Context,
 // NewServer builds an http.Server for the proxy.
 // No ReadTimeout/WriteTimeout — PTY and streaming need long-lived connections.
 // ReadHeaderTimeout guards against slow-loris without breaking streams.
+// MaxHeaderBytes limits header size to 1 MiB.
 func NewServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		IdleTimeout:       serverIdleTimeout,
 		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
 }
 
@@ -247,6 +336,7 @@ func ListenAndServe(ctx context.Context, addr string, handler http.Handler, log 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
+		close(errCh)
 	}()
 
 	select {
@@ -256,6 +346,9 @@ func ListenAndServe(ctx context.Context, addr string, handler http.Handler, log 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		log.Info().Msg("proxy shutting down")
-		return srv.Shutdown(shutdownCtx)
+		err := srv.Shutdown(shutdownCtx)
+		// Drain in case Shutdown races with a serve error.
+		<-errCh
+		return err
 	}
 }
