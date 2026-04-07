@@ -1,14 +1,26 @@
+# Deploy API — control plane (Cloud Run).
+#
+# Triggers:
+#   - push to main on API-relevant paths: runs staging, then production
+#   - workflow_dispatch with environment=staging: staging only
+#   - workflow_dispatch with environment=production: staging FIRST, then production
+#
+# Production NEVER deploys without staging first — whether the trigger is a
+# push, a dispatch, or a forced production run. Selecting "production" does
+# not skip staging; it just promises to run production afterward. This is
+# intentional: keeping staging in sync with production avoids a drift hazard
+# where a hotfix to production leaves staging on an older revision.
+
 name: Deploy API
 
 on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Deploy to a specific environment only'
+        description: 'Target environment (staging always runs first)'
         required: false
         type: choice
         options:
-          - both
           - staging
           - production
 
@@ -25,7 +37,6 @@ on:
 
 jobs:
   deploy-staging:
-    if: github.event.inputs.environment != 'production'
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -66,7 +77,7 @@ jobs:
           curl -sf "$URL/health"
 
   deploy-production:
-    if: github.event.inputs.environment != 'staging'
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
     needs: [deploy-staging]
     runs-on: ubuntu-latest
     environment: production

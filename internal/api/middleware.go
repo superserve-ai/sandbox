@@ -87,6 +87,17 @@ func RequestLogger() gin.HandlerFunc {
 	}
 }
 
+// SecurityHeaders returns a Gin middleware that sets standard security headers
+// on all responses.
+func SecurityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		c.Next()
+	}
+}
+
 // ErrorHandler returns a Gin middleware that recovers from panics and returns
 // a structured JSON error response.
 func ErrorHandler() gin.HandlerFunc {

@@ -162,7 +162,7 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 	durationMs := int32(time.Since(start).Milliseconds())
 
 	// Async observability writes.
-	h.updateLastActivityAsync(sandbox.ID, sandbox.TeamID)
+	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 	actStatus := "success"
 	if err != nil {
 		actStatus = "error"
@@ -172,5 +172,5 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		"exit_code":   lastExitCode,
 		"duration_ms": durationMs,
 	})
-	h.logActivityAsync(sandbox.ID, sandbox.TeamID, "exec", "executed", actStatus, &sandbox.Name, &durationMs, metadata)
+	h.logActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", actStatus, &sandbox.Name, &durationMs, metadata)
 }

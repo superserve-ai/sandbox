@@ -17,7 +17,7 @@ import (
 const createSandbox = `-- name: CreateSandbox :one
 INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config
 `
 
 type CreateSandboxParams struct {
@@ -60,6 +60,7 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DestroyedAt,
+		&i.NetworkConfig,
 	)
 	return i, err
 }
@@ -81,7 +82,7 @@ func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) 
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -108,12 +109,30 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DestroyedAt,
+		&i.NetworkConfig,
 	)
 	return i, err
 }
 
+const getSandboxNetworkConfig = `-- name: GetSandboxNetworkConfig :one
+SELECT network_config FROM sandbox
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+`
+
+type GetSandboxNetworkConfigParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNetworkConfigParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getSandboxNetworkConfig, arg.ID, arg.TeamID)
+	var network_config []byte
+	err := row.Scan(&network_config)
+	return network_config, err
+}
+
 const listIdleSandboxes = `-- name: ListIdleSandboxes :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
 WHERE status = 'idle'
   AND destroyed_at IS NULL
   AND last_activity_at < $1
@@ -144,6 +163,7 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DestroyedAt,
+			&i.NetworkConfig,
 		); err != nil {
 			return nil, err
 		}
@@ -156,7 +176,7 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 }
 
 const listSandboxesByTeam = `-- name: ListSandboxesByTeam :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
 ORDER BY created_at DESC
 `
@@ -185,6 +205,7 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DestroyedAt,
+			&i.NetworkConfig,
 		); err != nil {
 			return nil, err
 		}
@@ -267,6 +288,23 @@ type UpdateSandboxLastActivityParams struct {
 
 func (q *Queries) UpdateSandboxLastActivity(ctx context.Context, arg UpdateSandboxLastActivityParams) error {
 	_, err := q.db.Exec(ctx, updateSandboxLastActivity, arg.ID, arg.TeamID)
+	return err
+}
+
+const updateSandboxNetworkConfig = `-- name: UpdateSandboxNetworkConfig :exec
+UPDATE sandbox
+SET network_config = $2, updated_at = now()
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+`
+
+type UpdateSandboxNetworkConfigParams struct {
+	ID            uuid.UUID `json:"id"`
+	NetworkConfig []byte    `json:"network_config"`
+	TeamID        uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) UpdateSandboxNetworkConfig(ctx context.Context, arg UpdateSandboxNetworkConfigParams) error {
+	_, err := q.db.Exec(ctx, updateSandboxNetworkConfig, arg.ID, arg.NetworkConfig, arg.TeamID)
 	return err
 }
 

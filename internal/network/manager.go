@@ -30,6 +30,11 @@ const (
 	// match to avoid silent packet drops during TLS handshakes. See:
 	// https://cloud.google.com/vpc/docs/mtu
 	ifaceMTU = "1460"
+
+	// Default TCP proxy ports for the egress proxy.
+	DefaultHTTPProxyPort  = 19080
+	DefaultTLSProxyPort   = 19443
+	DefaultOtherProxyPort = 19090
 )
 
 // ---------------------------------------------------------------------------
@@ -45,12 +50,13 @@ type Config struct {
 
 // VMNetInfo holds the network resources for a single VM.
 type VMNetInfo struct {
-	Namespace  string // Network namespace name.
-	TAPDevice  string // TAP device inside namespace (always "tap0").
-	VMIP       string // VM's internal IP (always VMInternalIP).
-	GatewayIP  string // Gateway inside namespace (always VMGatewayIP).
-	HostIP     string // Host-side IP to reach this VM.
+	Namespace  string    // Network namespace name.
+	TAPDevice  string    // TAP device inside namespace (always "tap0").
+	VMIP       string    // VM's internal IP (always VMInternalIP).
+	GatewayIP  string    // Gateway inside namespace (always VMGatewayIP).
+	HostIP     string    // Host-side IP to reach this VM.
 	MACAddress string
+	Firewall   *Firewall // nftables firewall for this VM (inside namespace).
 }
 
 // ---------------------------------------------------------------------------
@@ -70,15 +76,60 @@ type Manager struct {
 	devices   map[string]*VMNetInfo
 	freeSlots []int // recycled slot indices
 	nextSlot  int   // next new slot (used when freeSlots is empty)
+
+	// Host-level nftables firewall (FORWARD + MASQUERADE + MSS clamping).
+	hostFW *HostFirewall
+
+	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
+	egressProxy *EgressProxy
+
+	// Proxy ports for the TCP egress proxy.
+	httpProxyPort  uint16
+	tlsProxyPort   uint16
+	otherProxyPort uint16
 }
 
-func NewManager(hostInterface string, log zerolog.Logger) *Manager {
-	return &Manager{
-		hostInterface: hostInterface,
-		log:           log.With().Str("component", "network").Logger(),
-		devices:       make(map[string]*VMNetInfo),
-		nextSlot:      1,
+// SetEgressProxy attaches the TCP egress proxy so the manager can remove
+// per-sandbox rules on cleanup. Must be called before any VMs are created.
+func (m *Manager) SetEgressProxy(p *EgressProxy) {
+	m.egressProxy = p
+}
+
+func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger) (*Manager, error) {
+	if err := enableIPForward(ctx); err != nil {
+		return nil, err
 	}
+
+	hostFW, err := NewHostFirewall(hostInterface)
+	if err != nil {
+		return nil, fmt.Errorf("init host firewall: %w", err)
+	}
+
+	return &Manager{
+		hostInterface:  hostInterface,
+		log:            log.With().Str("component", "network").Logger(),
+		devices:        make(map[string]*VMNetInfo),
+		nextSlot:       1,
+		hostFW:         hostFW,
+		httpProxyPort:  DefaultHTTPProxyPort,
+		tlsProxyPort:   DefaultTLSProxyPort,
+		otherProxyPort: DefaultOtherProxyPort,
+	}, nil
+}
+
+// Close tears down the host firewall. Should be called on VMD shutdown.
+func (m *Manager) Close() error {
+	if m.hostFW != nil {
+		return m.hostFW.Close()
+	}
+	return nil
+}
+
+// SetProxyPorts overrides the default TCP proxy ports. Must be called before any VMs are created.
+func (m *Manager) SetProxyPorts(http, tls, other uint16) {
+	m.httpProxyPort = http
+	m.tlsProxyPort = tls
+	m.otherProxyPort = other
 }
 
 // SetupVM creates an isolated network namespace for a VM.
@@ -88,8 +139,8 @@ func NewManager(hostInterface string, log zerolog.Logger) *Manager {
 //	Host:      veth-<idx> (10.12.x.y/31)  ←→  eth0 (10.12.x.y/31) :Namespace
 //	Host:      route hostIP/32 via vpeerIP
 //	Namespace: tap0 (169.254.0.22/30)  ←→  VM eth0 (169.254.0.21)
-//	Namespace: SNAT 169.254.0.21 → hostIP (outbound)
-//	Namespace: DNAT hostIP → 169.254.0.21 (inbound)
+//	Namespace: nftables SNAT 169.254.0.21 → hostIP (outbound)
+//	Namespace: nftables DNAT hostIP → 169.254.0.21 (inbound)
 //
 // IP addressing uses /16 subnets to support thousands of concurrent VMs:
 //   - hostIP:  10.11.<idx/256>.<idx%256>  (one per VM)
@@ -124,11 +175,6 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	vethName := fmt.Sprintf("veth-%d", idx)
 	vpeerName := "eth0"
 	hostCIDR := fmt.Sprintf("%s/32", hostIP)
-
-	hostIface := m.hostInterface
-	if cfg != nil && cfg.HostInterface != "" {
-		hostIface = cfg.HostInterface
-	}
 
 	// 1. Create network namespace.
 	if err := run(ctx, "ip", "netns", "add", nsName); err != nil {
@@ -202,16 +248,24 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		return nil, fmt.Errorf("add default route in ns: %w", err)
 	}
 
-	// 9. NAT inside namespace: SNAT outbound, DNAT inbound.
-	if err := nsRun(ctx, nsName, "iptables", "--wait", "10", "-t", "nat", "-A", "POSTROUTING",
-		"-o", vpeerName, "-s", VMInternalIP, "-j", "SNAT", "--to", hostIP); err != nil {
+	// 9. Initialize nftables firewall inside namespace (NAT + filtering + MSS clamping + TCP redirect).
+	var fw *Firewall
+	if err := nsExecGo(nsName, func() error {
+		var fwErr error
+		fw, fwErr = NewFirewall(FirewallConfig{
+			TAPInterface:   TAPName,
+			VethPeer:       vpeerName,
+			VMIP:           VMInternalIP,
+			HostIP:         hostIP,
+			GatewayIP:      VMGatewayIP,
+			HTTPProxyPort:  m.httpProxyPort,
+			TLSProxyPort:   m.tlsProxyPort,
+			OtherProxyPort: m.otherProxyPort,
+		})
+		return fwErr
+	}); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("SNAT rule: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "iptables", "--wait", "10", "-t", "nat", "-A", "PREROUTING",
-		"-i", vpeerName, "-d", hostIP, "-j", "DNAT", "--to", VMInternalIP); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("DNAT rule: %w", err)
+		return nil, fmt.Errorf("init firewall: %w", err)
 	}
 
 	// 10. Host routing: traffic to hostIP goes via vpeer through the veth.
@@ -219,27 +273,11 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		log.Debug().Err(err).Msg("host route (may already exist)")
 	}
 
-	// 10a. TCP MSS clamping inside namespace — prevents TLS handshake hangs
-	// caused by MTU mismatch (GCP VPC MTU 1460 vs default 1500). Clamps the
-	// MSS in SYN packets so the remote server never sends packets larger than
-	// the path MTU. See: https://cloud.google.com/vpc/docs/mtu
-	_ = nsRun(ctx, nsName, "iptables", "--wait", "10", "-t", "mangle", "-A", "FORWARD",
-		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS", "--clamp-mss-to-pmtu")
-	_ = nsRun(ctx, nsName, "iptables", "--wait", "10", "-t", "mangle", "-A", "POSTROUTING",
-		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS", "--clamp-mss-to-pmtu")
-
-	// 11. Host forwarding + NAT for outbound internet.
-	_ = run(ctx, "sysctl", "-w", "net.ipv4.ip_forward=1")
-	_ = run(ctx, "iptables", "--wait", "10", "-A", "FORWARD", "-i", vethName, "-o", hostIface, "-j", "ACCEPT")
-	_ = run(ctx, "iptables", "--wait", "10", "-A", "FORWARD", "-i", hostIface, "-o", vethName, "-j", "ACCEPT")
-	_ = run(ctx, "iptables", "--wait", "10", "-t", "nat", "-A", "POSTROUTING", "-s", hostCIDR, "-o", hostIface, "-j", "MASQUERADE")
-
-	// 11a. Host-level MSS clamping for traffic forwarded to/from VMs.
-	_ = run(ctx, "iptables", "--wait", "10", "-t", "mangle", "-A", "FORWARD",
-		"-o", hostIface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS", "--clamp-mss-to-pmtu")
+	// 11. Host-level nftables: FORWARD + MASQUERADE + MSS clamping for this VM.
+	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
+		m.cleanupFull(nsName, vethName)
+		return nil, fmt.Errorf("add host firewall rules: %w", err)
+	}
 
 	mac := fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256)
 
@@ -250,6 +288,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		GatewayIP:  VMGatewayIP,
 		HostIP:     hostIP,
 		MACAddress: mac,
+		Firewall:   fw,
 	}
 
 	m.mu.Lock()
@@ -284,36 +323,46 @@ func (m *Manager) CleanupVM(vmID string) {
 	}
 	m.mu.Unlock()
 
-	// Recycle the slot index for reuse.
-	if ok {
-		var idx int
-		fmt.Sscanf(info.Namespace, "ns-%d", &idx)
-		m.mu.Lock()
-		m.freeSlots = append(m.freeSlots, idx)
-		m.mu.Unlock()
-	}
-
 	if !ok {
 		return
 	}
 
-	log := m.log.With().Str("vm_id", vmID).Logger()
-
-	// Find the slot index from the namespace name.
+	// Parse slot index once.
 	var idx int
 	fmt.Sscanf(info.Namespace, "ns-%d", &idx)
-	vethName := fmt.Sprintf("veth-%d", idx)
 
-	// Clean up host iptables rules.
+	// Recycle the slot index for reuse.
+	m.mu.Lock()
+	m.freeSlots = append(m.freeSlots, idx)
+	m.mu.Unlock()
+
+	log := m.log.With().Str("vm_id", vmID).Logger()
+
+	// Close nftables firewall inside namespace (kernel removes table + all rules).
+	if info.Firewall != nil {
+		if err := info.Firewall.Close(); err != nil {
+			log.Warn().Err(err).Msg("error closing namespace firewall")
+		}
+	}
+
+	// Remove host-level nftables rules for this VM.
+	if err := m.hostFW.RemoveVM(vmID); err != nil {
+		log.Warn().Err(err).Msg("error removing host firewall rules")
+	}
+
+	// Remove per-sandbox rules and connection limiter entries from the egress proxy.
+	if m.egressProxy != nil {
+		m.egressProxy.RemoveRules(info.HostIP)
+	}
+
+	vethName := fmt.Sprintf("veth-%d", idx)
+	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
+	hostCIDR := fmt.Sprintf("%s/32", info.HostIP)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	hostCIDR := fmt.Sprintf("%s/32", info.HostIP)
-	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
-
-	_ = run(ctx, "iptables", "--wait", "10", "-D", "FORWARD", "-i", vethName, "-o", m.hostInterface, "-j", "ACCEPT")
-	_ = run(ctx, "iptables", "--wait", "10", "-D", "FORWARD", "-i", m.hostInterface, "-o", vethName, "-j", "ACCEPT")
-	_ = run(ctx, "iptables", "--wait", "10", "-t", "nat", "-D", "POSTROUTING", "-s", hostCIDR, "-o", m.hostInterface, "-j", "MASQUERADE")
+	// Remove host route.
 	_ = run(ctx, "ip", "route", "del", hostCIDR, "via", vpeerIP, "dev", vethName)
 
 	// Delete veth (also removes peer in namespace).
@@ -323,6 +372,20 @@ func (m *Manager) CleanupVM(vmID string) {
 	_ = run(ctx, "ip", "netns", "del", info.Namespace)
 
 	log.Info().Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+}
+
+// UpdateFirewallRules atomically replaces the user allow/deny sets for a VM's firewall.
+func (m *Manager) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []string) error {
+	m.mu.Lock()
+	info, ok := m.devices[vmID]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("VM %q not found", vmID)
+	}
+	if info.Firewall == nil {
+		return fmt.Errorf("VM %q has no firewall", vmID)
+	}
+	return info.Firewall.ReplaceUserRules(allowedCIDRs, deniedCIDRs)
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +406,9 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 }
 
 func run(ctx context.Context, name string, args ...string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s %v: %s: %w", name, args, string(out), err)

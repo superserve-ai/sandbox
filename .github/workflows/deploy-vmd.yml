@@ -51,7 +51,7 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           python3 - <<'PYEOF'
-          import os, sys, json, subprocess
+          import os, sys, json, subprocess, textwrap
           from concurrent.futures import ThreadPoolExecutor, as_completed
 
           project     = os.environ['GCP_PROJECT']
@@ -97,23 +97,99 @@ jobs:
                   ], check=True, capture_output=True)
               print(f'[{tag}] binaries uploaded')
 
-              remote_cmd = '; '.join([
-                  f'sudo mv /tmp/vmd-{sha}  {install_dir}/vmd',
-                  f'sudo mv /tmp/boxd-{sha} {install_dir}/boxd',
-                  f'sudo chmod +x {install_dir}/vmd {install_dir}/boxd',
-                  f'sudo systemctl restart {service}',
-                  'sleep 2',
-                  f'sudo systemctl is-active --quiet {service}',
-              ])
+              # Inject updated boxd into the base rootfs atomically:
+              #   1. copy ROOTFS -> ROOTFS.new on the same filesystem
+              #   2. mount the copy, cp boxd into it, umount
+              #   3. mv ROOTFS.new -> ROOTFS (rename is atomic on POSIX)
+              # The original rootfs is untouched until the final rename, so a
+              # failure at any earlier step leaves the system in its
+              # previous working state. The trap ensures we clean up any
+              # staging file/mount on failure.
+              #
+              # textwrap.dedent is used so we can keep the script indented
+              # consistently with the enclosing Python code (which YAML
+              # requires) without leaking that indentation into the shell.
+              # NOTE on braces: GitHub Actions scans the YAML for its own
+              # expression syntax (dollar-double-brace) EVERYWHERE in the
+              # file, including inside Python heredocs and string literals.
+              # We cannot use doubled curly braces in f-strings here because
+              # the raw YAML characters would get parsed as a GitHub
+              # expression and fail with "Unrecognized named-value: ROOTFS".
+              # Workaround: use $ROOTFS / $STAGING without curly braces.
+              # Bash terminates variable names at non-identifier chars
+              # (dot, space, slash), so $ROOTFS.new.$$ works identically.
+              # The cleanup callback is inlined into trap so we avoid any
+              # standalone curly-brace pairs from a bash function body.
+              inject_script = textwrap.dedent(f'''
+                  set -euo pipefail
+
+                  sudo mv /tmp/vmd-{sha}  {install_dir}/vmd
+                  sudo mv /tmp/boxd-{sha} {install_dir}/boxd
+                  sudo chmod +x {install_dir}/vmd {install_dir}/boxd
+
+                  # Resolve the base rootfs path from whichever env file is
+                  # present. We cannot use `grep -s ... file1 file2` because
+                  # grep exits with 2 when ANY listed file is missing (even
+                  # with -s), and `set -euo pipefail` treats that as a fatal
+                  # error via the pipeline. Enumerate candidate files safely.
+                  ROOTFS=""
+                  for env_file in /etc/superserve/vmd.env /etc/agentbox/vmd.env; do
+                      if [ -f "$env_file" ]; then
+                          candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
+                          if [ -n "$candidate" ]; then
+                              ROOTFS="$candidate"
+                              break
+                          fi
+                      fi
+                  done
+
+                  if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then
+                      STAGING="$ROOTFS.new.$$"
+                      MNT=$(mktemp -d)
+                      trap '\''if mountpoint -q "$MNT" 2>/dev/null; then sudo umount "$MNT" || true; fi; rmdir "$MNT" 2>/dev/null || true; sudo rm -f "$STAGING" 2>/dev/null || true'\'' EXIT
+
+                      sudo cp --reflink=auto "$ROOTFS" "$STAGING"
+                      sudo mount -o loop "$STAGING" "$MNT"
+                      sudo cp {install_dir}/boxd "$MNT/usr/local/bin/boxd"
+                      sudo chmod +x "$MNT/usr/local/bin/boxd"
+                      sudo umount "$MNT"
+                      rmdir "$MNT"
+                      sudo mv "$STAGING" "$ROOTFS"
+                      trap - EXIT
+                      echo "boxd injected into rootfs atomically"
+                  else
+                      echo "WARNING: BASE_ROOTFS_PATH not found or not readable; skipping rootfs inject"
+                  fi
+
+                  sudo systemctl restart {service}
+                  sleep 3
+                  sudo systemctl is-active --quiet {service} || (
+                      echo "ERROR: {service} failed to become active after restart" >&2
+                      sudo systemctl status --no-pager {service} >&2 || true
+                      sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                      exit 1
+                  )
+              ''')
               r = subprocess.run([
                   'gcloud', 'compute', 'ssh', name,
                   f'--zone={zone}', f'--project={project}',
                   '--quiet', '--tunnel-through-iap',
-                  '--command', remote_cmd,
+                  '--command', inject_script,
               ], capture_output=True, text=True)
               if r.returncode != 0:
-                  raise RuntimeError(f'service not healthy: {r.stderr}')
+                  # Surface both stdout and stderr so deploy failures are
+                  # actually debuggable from the GitHub Actions log. The
+                  # inject script prints journalctl output to stderr on
+                  # service failure; silently swallowing it was a source of
+                  # long debug sessions.
+                  raise RuntimeError(
+                      f'service not healthy\n'
+                      f'--- stdout ---\n{r.stdout}\n'
+                      f'--- stderr ---\n{r.stderr}'
+                  )
               print(f'[{tag}] active')
+              if r.stdout.strip():
+                  print(f'[{tag}] {r.stdout.strip()}')
 
           failed = []
           with ThreadPoolExecutor(max_workers=len(instances)) as ex:

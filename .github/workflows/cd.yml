@@ -1,7 +1,25 @@
+# CD — Migrate — Supabase schema migrations.
+#
+# Triggers:
+#   - push to main on supabase/migrations/**: runs staging, then production
+#   - workflow_dispatch with environment=staging: staging only
+#   - workflow_dispatch with environment=production: staging FIRST, then production
+#
+# Production NEVER migrates without staging first. Running prod migrations
+# while staging is behind is a recipe for schema drift and rollback pain.
+
 name: CD — Migrate
 
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging always runs first)'
+        required: false
+        type: choice
+        options:
+          - staging
+          - production
   push:
     branches: [main]
     paths:
@@ -26,9 +44,10 @@ jobs:
 
   migrate-prod:
     name: Migrate Production
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
     runs-on: ubuntu-latest
     environment: production
-    needs: migrate-staging
+    needs: [migrate-staging]
     steps:
       - uses: actions/checkout@v4
 

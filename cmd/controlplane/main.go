@@ -41,8 +41,12 @@ func run() error {
 	}
 	log.Info().Str("port", cfg.Port).Str("vmd_address", cfg.VMDAddress).Msg("configuration loaded")
 
+	// Root context — cancelled on shutdown so background goroutines
+	// (rate limiter cleanup, etc.) exit cleanly.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Connect to PostgreSQL.
-	ctx := context.Background()
 	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
@@ -67,7 +71,7 @@ func run() error {
 	vmdClient := newGRPCVMDClient(grpcConn)
 	queries := dbq.New(dbPool)
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
-	router := api.SetupRouter(handlers, dbPool)
+	router := api.SetupRouter(ctx, handlers, dbPool)
 
 	// Start HTTP server.
 	srv := &http.Server{
@@ -322,4 +326,19 @@ func (c *grpcVMDClient) DownloadFile(ctx context.Context, vmID, path string) (io
 	}()
 
 	return pr, nil
+}
+
+func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
+	_, err := c.client.UpdateSandboxNetwork(ctx, &vmdpb.UpdateSandboxNetworkRequest{
+		VmId: vmID,
+		Egress: &vmdpb.SandboxNetworkEgressConfig{
+			AllowedCidrs:   allowedCIDRs,
+			DeniedCidrs:    deniedCIDRs,
+			AllowedDomains: allowedDomains,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
+	}
+	return nil
 }

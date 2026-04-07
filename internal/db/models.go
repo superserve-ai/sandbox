@@ -135,6 +135,7 @@ type Sandbox struct {
 	CreatedAt      time.Time          `json:"created_at"`
 	UpdatedAt      time.Time          `json:"updated_at"`
 	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig  []byte             `json:"network_config"`
 }
 
 type Snapshot struct {
