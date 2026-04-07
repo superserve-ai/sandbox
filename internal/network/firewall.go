@@ -689,11 +689,36 @@ func mssClampToPMTU() []expr.Any {
 // wholesale, and the API layer rejects v6 entries).
 //
 // Edge cases handled:
+//
 //   - 0.0.0.0/0: nftables rejects the literal 0.0.0.0 as "unspecified", so
-//     we emit the full-range interval [0.0.0.0, 255.255.255.255]+ directly
-//     without round-tripping through prefix arithmetic.
-//   - /32: the end calculation must not overflow uint32. We use uint64 math.
+//     we emit the full-range pair [0.0.0.0, 255.255.255.255] directly
+//     without round-tripping through prefix arithmetic. If 0.0.0.0/0 is
+//     present alongside other CIDRs, the other CIDRs are redundant
+//     (already covered by the full range) AND nftables interval sets
+//     reject overlapping intervals with EEXIST. We therefore emit ONLY
+//     the full-range pair and skip all other entries. The API layer does
+//     not validate this because it is semantically equivalent — a user
+//     passing ["0.0.0.0/0", "8.8.8.8/32"] clearly means "block everything
+//     including 8.8.8.8," and one full-range rule accomplishes exactly
+//     that.
+//
+//   - /32: the end calculation must not overflow uint32. prefixEnd uses
+//     uint64 math and clamps at 0xFFFFFFFF.
 func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
+	// If 0.0.0.0/0 is in the list, collapse everything to a single
+	// full-range pair. Including any other entries would create
+	// overlapping intervals in the nftables set and cause EEXIST.
+	for _, cidr := range cidrs {
+		if cidr == AllTrafficCIDR {
+			start := netip.MustParseAddr("0.0.0.0").As4()
+			end := netip.MustParseAddr("255.255.255.255").As4()
+			return []nftables.SetElement{
+				{Key: start[:]},
+				{Key: end[:], IntervalEnd: true},
+			}, nil
+		}
+	}
+
 	var elems []nftables.SetElement
 	for _, cidr := range cidrs {
 		prefix, err := netip.ParsePrefix(cidr)
@@ -703,19 +728,6 @@ func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 		if !prefix.Addr().Is4() {
 			continue
 		}
-
-		// 0.0.0.0/0 — nftables rejects 0.0.0.0 as an interval start.
-		// Emit the canonical full-range pair directly.
-		if cidr == AllTrafficCIDR {
-			start := netip.MustParseAddr("0.0.0.0").As4()
-			end := netip.MustParseAddr("255.255.255.255").As4()
-			elems = append(elems,
-				nftables.SetElement{Key: start[:]},
-				nftables.SetElement{Key: end[:], IntervalEnd: true},
-			)
-			continue
-		}
-
 		s4 := prefix.Masked().Addr().As4()
 		e4 := prefixEnd(prefix)
 		elems = append(elems,
