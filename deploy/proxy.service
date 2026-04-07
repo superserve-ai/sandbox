@@ -1,7 +1,6 @@
 [Unit]
 Description=Superserve Edge Proxy
-After=network.target vmd.service
-Requires=vmd.service
+After=network.target
 
 [Service]
 Type=simple
