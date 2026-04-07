@@ -13,16 +13,11 @@ import (
 	"unsafe"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/sys/unix"
 )
 
-const (
-	// upstreamDialTimeout is the maximum time to wait for upstream connections.
-	upstreamDialTimeout = 30 * time.Second
-
-	// soOriginalDst is the socket option for retrieving the original
-	// destination before iptables/nftables REDIRECT.
-	soOriginalDst = 80
-)
+// upstreamDialTimeout is the maximum time to wait for upstream connections.
+const upstreamDialTimeout = 30 * time.Second
 
 // EgressProxy is a per-sandbox TCP proxy that intercepts egress traffic
 // for domain-based filtering. It listens on three ports:
@@ -467,7 +462,7 @@ func getOriginalDst(conn net.Conn) (net.IP, int, error) {
 
 		_, _, errno := syscall.Syscall6(
 			syscall.SYS_GETSOCKOPT, fd,
-			syscall.SOL_IP, soOriginalDst,
+			syscall.SOL_IP, unix.SO_ORIGINAL_DST,
 			uintptr(unsafe.Pointer(&addr)), uintptr(unsafe.Pointer(&addrLen)), 0,
 		)
 		if errno != 0 {

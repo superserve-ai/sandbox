@@ -879,7 +879,18 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
 	}
 
-	_ = ipAddress // stored via UpdateSandboxHost when host info is tracked
+	// Persist the VM's assigned IP. host_id and pid are not tracked yet.
+	if ipAddress != "" {
+		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
+			if err := h.DB.UpdateSandboxHost(postCtx, db.UpdateSandboxHostParams{
+				ID:        sandbox.ID,
+				IpAddress: &addr,
+				TeamID:    teamID,
+			}); err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxHost failed")
+			}
+		}
+	}
 
 	// Apply network rules if provided at creation.
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
