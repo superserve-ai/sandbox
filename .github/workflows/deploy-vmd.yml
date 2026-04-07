@@ -109,6 +109,17 @@ jobs:
               # textwrap.dedent is used so we can keep the script indented
               # consistently with the enclosing Python code (which YAML
               # requires) without leaking that indentation into the shell.
+              # NOTE on braces: GitHub Actions scans the YAML for its own
+              # expression syntax (dollar-double-brace) EVERYWHERE in the
+              # file, including inside Python heredocs and string literals.
+              # We cannot use doubled curly braces in f-strings here because
+              # the raw YAML characters would get parsed as a GitHub
+              # expression and fail with "Unrecognized named-value: ROOTFS".
+              # Workaround: use $ROOTFS / $STAGING without curly braces.
+              # Bash terminates variable names at non-identifier chars
+              # (dot, space, slash), so $ROOTFS.new.$$ works identically.
+              # The cleanup callback is inlined into trap so we avoid any
+              # standalone curly-brace pairs from a bash function body.
               inject_script = textwrap.dedent(f'''
                   set -euo pipefail
                   sudo mv /tmp/vmd-{sha}  {install_dir}/vmd
@@ -117,14 +128,9 @@ jobs:
 
                   ROOTFS=$(grep -s "^BASE_ROOTFS_PATH=" /etc/superserve/vmd.env /etc/agentbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2)
                   if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then
-                      STAGING="${{ROOTFS}}.new.$$"
+                      STAGING="$ROOTFS.new.$$"
                       MNT=$(mktemp -d)
-                      cleanup() {{
-                          if mountpoint -q "$MNT" 2>/dev/null; then sudo umount "$MNT" || true; fi
-                          rmdir "$MNT" 2>/dev/null || true
-                          sudo rm -f "$STAGING" 2>/dev/null || true
-                      }}
-                      trap cleanup EXIT
+                      trap '\''if mountpoint -q "$MNT" 2>/dev/null; then sudo umount "$MNT" || true; fi; rmdir "$MNT" 2>/dev/null || true; sudo rm -f "$STAGING" 2>/dev/null || true'\'' EXIT
 
                       sudo cp --reflink=auto "$ROOTFS" "$STAGING"
                       sudo mount -o loop "$STAGING" "$MNT"
