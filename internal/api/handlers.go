@@ -136,7 +136,11 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 				c.Abort()
 				return
 			}
-			if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+			// VM is running — use a detached context so a client
+			// disconnect cannot leave the row stuck in "idle".
+			postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer postCancel()
+			if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
 				ID:     sandboxID,
 				Status: db.SandboxStatusActive,
 				TeamID: teamID,
@@ -147,7 +151,7 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 				return
 			}
 			// Reapply persisted egress rules — nftables + proxy state are fresh after restore.
-			if err := h.reapplyNetworkConfig(vmdCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+			if err := h.reapplyNetworkConfig(postCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake reapply network config failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -545,7 +549,8 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	snapshotPath := snapshot.Path
 	memPath := filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
 
-	// Resume the VM.
+	// Resume the VM. Cancellation of this call still follows the request
+	// context — if the client hangs up mid-resume, abort the VMD call.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 	ipAddress, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
@@ -555,8 +560,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
+	// Past this point the VM is running. Post-resume state transitions
+	// must use a detached context so client disconnect cannot leave the
+	// sandbox stuck in "idle" while the VM is actually up.
+	postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+	defer postCancel()
+
 	// Update sandbox status to active.
-	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
 		ID:     sandboxID,
 		Status: db.SandboxStatusActive,
 		TeamID: teamID,
@@ -568,7 +579,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 
 	// Update host runtime info.
 	ipAddr, _ := netip.ParseAddr(ipAddress)
-	if err := h.DB.UpdateSandboxHost(c.Request.Context(), db.UpdateSandboxHostParams{
+	if err := h.DB.UpdateSandboxHost(postCtx, db.UpdateSandboxHostParams{
 		ID:        sandboxID,
 		HostID:    sandbox.HostID,
 		IpAddress: &ipAddr,
@@ -581,7 +592,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 
 	// Reapply persisted egress rules — the nftables rules and proxy state
 	// are fresh after a snapshot restore, so user rules must be re-pushed.
-	if err := h.reapplyNetworkConfig(vmdCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+	if err := h.reapplyNetworkConfig(postCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
 		respondError(c, ErrInternal)
 		return
@@ -818,7 +829,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 
 	// Boot the VM synchronously — the client gets a response only after
-	// the sandbox is fully running and ready to use.
+	// the sandbox is fully running and ready to use. This call is still
+	// scoped to the request context so that if the client hangs up, the
+	// boot is cancelled and VMD cleans up.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
@@ -832,7 +845,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	if vmdErr != nil {
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-		_ = h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+		// Mark the row failed using a detached context so a disconnected
+		// client does not leave the sandbox stuck in "starting" forever.
+		failCtx, failCancel := context.WithTimeout(context.Background(), asyncTimeout)
+		defer failCancel()
+		_ = h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
 			ID:     sandbox.ID,
 			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
@@ -841,8 +858,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	// Past this point the VM is running. All post-VMD DB writes and the
+	// follow-up network update must use a detached context so the state
+	// transition cannot be lost by a client disconnect.
+	postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+	defer postCancel()
+
 	// Mark active in DB.
-	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
 		ID:     sandbox.ID,
 		Status: db.SandboxStatusActive,
 		TeamID: teamID,
@@ -863,7 +886,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			}
 		}
 
-		if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+		if err := h.VMD.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
 		} else {
 			networkConfig, _ := json.Marshal(map[string]any{
@@ -873,7 +896,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 					"allowed_domains": allowedDomains,
 				},
 			})
-			_ = h.DB.UpdateSandboxNetworkConfig(c.Request.Context(), db.UpdateSandboxNetworkConfigParams{
+			_ = h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
 				ID:            sandbox.ID,
 				NetworkConfig: networkConfig,
 				TeamID:        teamID,
@@ -971,9 +994,15 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		Str("mem_path", memPath).
 		Msg("VMD pause complete")
 
+	// Past this point the snapshot already exists on disk. All remaining
+	// DB writes must use a detached context or a client disconnect will
+	// orphan the snapshot files without a DB row pointing to them.
+	postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+	defer postCancel()
+
 	// Create snapshot record in DB.
 	triggerName := "pause"
-	snapshot, err := h.DB.CreateSnapshot(c.Request.Context(), db.CreateSnapshotParams{
+	snapshot, err := h.DB.CreateSnapshot(postCtx, db.CreateSnapshotParams{
 		SandboxID: sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
@@ -989,7 +1018,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	}
 
 	// Link snapshot to sandbox and mark as idle.
-	if err := h.DB.SetSandboxSnapshot(c.Request.Context(), db.SetSandboxSnapshotParams{
+	if err := h.DB.SetSandboxSnapshot(postCtx, db.SetSandboxSnapshotParams{
 		ID:         sandboxID,
 		SnapshotID: pgtype.UUID{Bytes: snapshot.ID, Valid: true},
 		TeamID:     teamID,
@@ -999,7 +1028,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
+	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
 		ID:     sandboxID,
 		Status: db.SandboxStatusIdle,
 		TeamID: teamID,
