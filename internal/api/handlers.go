@@ -58,9 +58,15 @@ const vmdTimeout = 30 * time.Second
 const asyncTimeout = 5 * time.Second
 
 // logActivityAsync writes an activity record in a background goroutine.
-func (h *Handlers) logActivityAsync(sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
+//
+// The caller passes the request context. We strip cancellation via
+// context.WithoutCancel so the goroutine is not killed when the HTTP
+// response completes, but we KEEP the trace/span context so the async
+// write appears in the same request trace as the synchronous work.
+func (h *Handlers) logActivityAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
+	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
+		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
 			SandboxID:   sandboxID,
@@ -79,9 +85,11 @@ func (h *Handlers) logActivityAsync(sandboxID, teamID uuid.UUID, category, actio
 }
 
 // updateLastActivityAsync bumps last_activity_at in a background goroutine.
-func (h *Handlers) updateLastActivityAsync(sandboxID, teamID uuid.UUID) {
+// Same detached-but-traced context pattern as logActivityAsync.
+func (h *Handlers) updateLastActivityAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
+	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
+		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		if err := h.DB.UpdateSandboxLastActivity(ctx, db.UpdateSandboxLastActivityParams{
 			ID:     sandboxID,
@@ -136,9 +144,11 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 				c.Abort()
 				return
 			}
-			// VM is running — use a detached context so a client
-			// disconnect cannot leave the row stuck in "idle".
-			postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+			// VM is running — detach from cancellation so a client
+			// disconnect cannot leave the row stuck in "idle", but
+			// keep the trace/span context so post-VMD writes show
+			// up in the same request trace.
+			postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 			defer postCancel()
 			if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
 				ID:     sandboxID,
@@ -560,10 +570,11 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	// Past this point the VM is running. Post-resume state transitions
-	// must use a detached context so client disconnect cannot leave the
-	// sandbox stuck in "idle" while the VM is actually up.
-	postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+	// Past this point the VM is running. Detach from cancellation so a
+	// client disconnect cannot leave the sandbox stuck in "idle" while
+	// the VM is actually up, but preserve the trace/span context so
+	// these DB writes still appear in the request trace.
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
 	// Update sandbox status to active.
@@ -599,8 +610,8 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	}
 
 	// Async observability writes.
-	h.updateLastActivityAsync(sandboxID, teamID)
-	h.logActivityAsync(sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
+	h.updateLastActivityAsync(c.Request.Context(), sandboxID, teamID)
+	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":         sandboxID.String(),
@@ -662,7 +673,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	// Async activity log.
-	h.logActivityAsync(sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
+	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -851,9 +862,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	if vmdErr != nil {
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-		// Mark the row failed using a detached context so a disconnected
-		// client does not leave the sandbox stuck in "starting" forever.
-		failCtx, failCancel := context.WithTimeout(context.Background(), asyncTimeout)
+		// Mark the row failed using a cancellation-detached context so a
+		// disconnected client does not leave the sandbox stuck in
+		// "starting", but keep trace context so the failure write shows
+		// up in the same request span.
+		failCtx, failCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
 		defer failCancel()
 		_ = h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
 			ID:     sandbox.ID,
@@ -864,10 +877,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Past this point the VM is running. All post-VMD DB writes and the
-	// follow-up network update must use a detached context so the state
-	// transition cannot be lost by a client disconnect.
-	postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+	// Past this point the VM is running. Detach from cancellation so a
+	// client disconnect cannot lose the state transition, but preserve
+	// the trace/span context so post-VMD writes stay in the request trace.
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
 	// Mark active in DB.
@@ -921,7 +934,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 	}
 
-	h.logActivityAsync(sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
+	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
 	c.JSON(http.StatusCreated, sandboxResponse{
 		ID:        sandbox.ID,
@@ -986,9 +999,12 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	snapshotPath, memPath, err := h.VMD.PauseInstance(vmdCtx, sandboxID.String(), "")
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance failed")
-		// Revert status to active asynchronously — we're already on the error path.
+		// Revert status to active asynchronously. Detach cancellation so
+		// the revert survives client disconnect, but keep trace context
+		// so the revert is linked to the original pause request.
+		revertCtx := context.WithoutCancel(c.Request.Context())
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
+			ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
 			defer cancel()
 			if revertErr := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
 				ID:     sandboxID,
@@ -1011,10 +1027,11 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		Str("mem_path", memPath).
 		Msg("VMD pause complete")
 
-	// Past this point the snapshot already exists on disk. All remaining
-	// DB writes must use a detached context or a client disconnect will
-	// orphan the snapshot files without a DB row pointing to them.
-	postCtx, postCancel := context.WithTimeout(context.Background(), vmdTimeout)
+	// Past this point the snapshot already exists on disk. Detach from
+	// cancellation so a client disconnect cannot orphan the snapshot
+	// files, but preserve the trace/span context so the snapshot row
+	// creation stays linked to the original pause request trace.
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
 	// Create snapshot record in DB.
@@ -1056,7 +1073,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	}
 
 	// Async observability.
-	h.logActivityAsync(sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
+	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":          sandboxID.String(),
@@ -1092,7 +1109,7 @@ func (h *Handlers) UploadSandboxFile(c *gin.Context) {
 		return
 	}
 
-	h.updateLastActivityAsync(sandbox.ID, sandbox.TeamID)
+	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 
 	c.JSON(http.StatusOK, gin.H{"path": filePath, "size": bytesWritten})
 }
@@ -1127,7 +1144,7 @@ func (h *Handlers) DownloadSandboxFile(c *gin.Context) {
 	}
 	defer reader.Close()
 
-	h.updateLastActivityAsync(sandbox.ID, sandbox.TeamID)
+	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 
 	c.Header("Content-Type", "application/octet-stream")
 	c.Status(http.StatusOK)
@@ -1176,13 +1193,13 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 	}
 
 	// Async observability writes.
-	h.updateLastActivityAsync(sandbox.ID, sandbox.TeamID)
+	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 	metadata, _ := json.Marshal(map[string]any{
 		"command":     req.Command,
 		"exit_code":   exitCode,
 		"duration_ms": durationMs,
 	})
-	h.logActivityAsync(sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
+	h.logActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
 
 	c.JSON(http.StatusOK, gin.H{
 		"stdout":    stdout,
@@ -1277,7 +1294,7 @@ func (h *Handlers) UpdateSandboxNetwork(c *gin.Context) {
 		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
 	}
 
-	h.logActivityAsync(sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
+	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 
 	c.Status(http.StatusNoContent)
 }
