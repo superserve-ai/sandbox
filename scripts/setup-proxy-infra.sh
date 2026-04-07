@@ -106,6 +106,7 @@ if ! gcloud compute firewall-rules describe "${FW_HC_NAME}" --project="${PROJECT
     --network="${NETWORK}" \
     --allow="tcp:${PROXY_PORT}" \
     --source-ranges="35.191.0.0/16,130.211.0.0/22" \
+    --target-tags="${INSTANCE_TAG:-vmd}" \
     --description="Allow GCP LB health check probes to edge proxy" \
     --project="${PROJECT}"
 fi
@@ -115,6 +116,7 @@ if ! gcloud compute firewall-rules describe "${FW_LB_NAME}" --project="${PROJECT
     --network="${NETWORK}" \
     --allow="tcp:${PROXY_PORT}" \
     --source-ranges="130.211.0.0/22,35.191.0.0/16" \
+    --target-tags="${INSTANCE_TAG:-vmd}" \
     --description="Allow GCP LB backend traffic to edge proxy" \
     --project="${PROJECT}"
 fi

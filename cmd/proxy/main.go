@@ -20,15 +20,21 @@ func main() {
 		Logger()
 
 	addr := envOrDefault("PROXY_ADDR", ":5007")
-	vmdAddr := envOrDefault("VMD_ADDR", "http://localhost:9090")
+	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
+	domain := envOrDefault("PROXY_DOMAIN", "sandbox.superserve.ai")
 
 	log.Info().
 		Str("addr", addr).
 		Str("vmd_addr", vmdAddr).
+		Str("domain", domain).
 		Msg("starting edge proxy")
 
-	resolver := proxy.NewResolver(vmdAddr)
-	proxyHandler := proxy.NewHandler(resolver, log)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	resolver := proxy.NewVMDResolver(vmdAddr)
+	proxyHandler := proxy.NewHandler(domain, resolver, log)
+	proxyHandler.StartSweeper(ctx)
 
 	// Wrap with a health check endpoint for the GCP LB health probe.
 	// The LB hits /health directly on the instance IP (not a sandbox URL),
@@ -38,17 +44,6 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.Handle("/", proxyHandler)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		log.Info().Str("signal", sig.String()).Msg("shutting down")
-		cancel()
-	}()
 
 	if err := proxy.ListenAndServe(ctx, addr, mux, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
@@ -62,4 +57,3 @@ func envOrDefault(key, fallback string) string {
 	}
 	return fallback
 }
-

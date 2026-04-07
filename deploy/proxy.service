@@ -1,6 +1,7 @@
 [Unit]
 Description=Superserve Edge Proxy
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -8,13 +9,25 @@ ExecStart=/usr/local/bin/proxy
 Restart=always
 RestartSec=2
 
-# Proxy address — listens on all interfaces on port 5007 (HTTP, no TLS for now)
 Environment=PROXY_ADDR=:5007
-# VMD local HTTP resolver
-Environment=VMD_ADDR=http://localhost:9090
+Environment=VMD_ADDR=http://127.0.0.1:9090
+Environment=PROXY_DOMAIN=sandbox.superserve.ai
 
-# Allow binding to privileged ports if we ever move to :443
-# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Run as a dedicated unprivileged user
+DynamicUser=yes
+NoNewPrivileges=true
+
+# Filesystem hardening
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+
+# Network restrictions
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# File descriptor limit for concurrent connections
+LimitNOFILE=65536
 
 StandardOutput=journal
 StandardError=journal
