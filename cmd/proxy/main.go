@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,7 +28,16 @@ func main() {
 		Msg("starting edge proxy")
 
 	resolver := proxy.NewResolver(vmdAddr)
-	handler := proxy.NewHandler(resolver, log)
+	proxyHandler := proxy.NewHandler(resolver, log)
+
+	// Wrap with a health check endpoint for the GCP LB health probe.
+	// The LB hits /health directly on the instance IP (not a sandbox URL),
+	// so the proxy handler would reject it — intercept it first.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.Handle("/", proxyHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -40,7 +50,7 @@ func main() {
 		cancel()
 	}()
 
-	if err := proxy.ListenAndServe(ctx, addr, handler, log); err != nil {
+	if err := proxy.ListenAndServe(ctx, addr, mux, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
 	}
 	log.Info().Msg("proxy stopped")
