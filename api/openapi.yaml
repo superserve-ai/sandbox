@@ -684,7 +684,7 @@ components:
             query parameters and no token material — putting the token
             in the URL would leak it to access logs, browser history,
             and Referer headers.
-          example: "wss://b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/terminal"
+          example: "wss://boxd-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/terminal"
         subprotocol:
           type: string
           description: |
@@ -718,7 +718,7 @@ components:
             proxy. The client appends `?path=<absolute-path>` to select
             a file and attaches the token as a header or query
             parameter. Does not contain the token or any path.
-          example: "https://49983-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/files"
+          example: "https://boxd-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/files"
         expires_at:
           type: string
           format: date-time

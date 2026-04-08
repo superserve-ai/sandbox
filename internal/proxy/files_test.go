@@ -211,7 +211,7 @@ func (e *filesTestEnv) buildRequest(method, filePath, token string, carrier toke
 		target += "?" + q.Encode()
 	}
 	req := httptest.NewRequest(method, target, body)
-	req.Host = "49983-" + e.sandboxID + "." + e.domain
+	req.Host = "boxd-" + e.sandboxID + "." + e.domain
 	if token != "" && carrier == carrierHeader {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -268,7 +268,7 @@ func TestFiles_UploadHeaderCarrier_ForwardsToUpstream(t *testing.T) {
 		t.Errorf("X-Forwarded-For leaked: %q", env.lastReq.fwdFor)
 	}
 	// Host header preserved so boxd logs the public name, not the VM IP.
-	if !strings.HasPrefix(env.lastReq.host, "49983-") {
+	if !strings.HasPrefix(env.lastReq.host, "boxd-") {
 		t.Errorf("Host = %q, want public sandbox label", env.lastReq.host)
 	}
 }
@@ -405,7 +405,7 @@ func TestFiles_NonFilesPathBlocked(t *testing.T) {
 	for _, p := range paths {
 		t.Run(p, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "http://unused"+p, nil)
-			req.Host = "49983-" + env.sandboxID + "." + env.domain
+			req.Host = "boxd-" + env.sandboxID + "." + env.domain
 			req.Header.Set("Authorization", "Bearer "+tok)
 
 			w := httptest.NewRecorder()

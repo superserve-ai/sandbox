@@ -19,9 +19,15 @@ import (
 // through, everything else is 404'd so the in-VM connect-rpc services
 // stay strictly internal.
 const (
-	// filesPath is the single path we forward to boxd on boxdPort.
-	// Anything else lands on an explicit 404.
+	// filesPath is the HTTP path the edge proxy forwards to boxd's
+	// raw /files handler after verifying a ScopeFiles token.
 	filesPath = "/files"
+
+	// terminalPath is the HTTP path the edge proxy upgrades to a
+	// WebSocket and bridges to boxd's connect-rpc ProcessService.
+	// The bridge itself is implemented in terminal.go; this constant
+	// just names the route serveBoxdPort dispatches to it on.
+	terminalPath = "/terminal"
 
 	// bearerPrefix matches the standard Authorization header format.
 	bearerPrefix = "Bearer "
@@ -34,30 +40,45 @@ const (
 	tokenQueryParam = "token"
 )
 
-// serveBoxdPort is the entry point for any request addressed at
-// `{boxdPort}-{instanceID}.{domain}`. It is reachable from ServeHTTP
-// after ParseHost has validated the host label.
+// serveBoxdPort is the entry point for any request addressed at the
+// reserved `boxd-{instanceID}.{domain}` host label. It dispatches by
+// path to the concrete handler for each boxd-fronted feature.
 //
-// The boxd port is a special case: it exposes both the raw file HTTP
-// endpoint and internal connect-rpc services. We only ever expose /files
-// through the edge, and only with a valid signed ScopeFiles token. Every
-// other path and every other method returns an opaque 404 so a caller
-// probing the in-VM surface learns nothing about what exists behind the
-// proxy.
+// boxd is a special case: inside the VM a single HTTP listener serves
+// both the raw /files endpoint and the full connect-rpc service
+// surface (ProcessService, FilesystemService). We only ever expose the
+// narrow set of paths we explicitly handle below; any other path
+// returns an opaque 404 so a caller probing the in-VM surface cannot
+// enumerate what exists behind the proxy. That includes `/health`,
+// connect-rpc routes, and anything future boxd grows internally
+// without our knowledge.
 func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instanceID string) {
+	switch r.URL.Path {
+	case filesPath:
+		h.serveFiles(w, r, instanceID)
+	case terminalPath:
+		if h.terminal == nil {
+			// Proxy started without WithTerminal — don't leak that
+			// the feature exists but is off.
+			http.NotFound(w, r)
+			return
+		}
+		h.serveTerminal(w, r, instanceID)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// serveFiles handles POST/GET /files on the boxd host label. It
+// verifies the signed ScopeFiles token, scrubs the token and caller-
+// controlled headers, and reverse-proxies the request to boxd's
+// internal /files handler.
+func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID string) {
 	if !h.filesEnabled {
 		// The proxy was started without WithFiles — either this is a
 		// legacy deployment that doesn't have the feature on yet or a
 		// misconfigured one. Don't leak which: return the same 404 a
 		// caller would see probing any other internal path.
-		http.NotFound(w, r)
-		return
-	}
-
-	if r.URL.Path != filesPath {
-		// Block connect-rpc endpoints (e.g. /superserve.boxd.v1.ProcessService/Start)
-		// and any future unlisted paths. NotFound rather than Forbidden
-		// so scanners cannot enumerate which services exist.
 		http.NotFound(w, r)
 		return
 	}

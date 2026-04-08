@@ -170,20 +170,23 @@ type wsControlMessage struct {
 	Name string `json:"name,omitempty"`
 }
 
-// serveTerminal is the entry point for /terminal requests. It:
-//  1. Extracts and verifies the token (signature, expiry, scope)
-//  2. Single-use nonce check (replay protection)
-//  3. Parses the host to extract sandbox ID and matches it against the
-//     token's sandbox ID
-//  4. Resolves the VM IP via the normal resolver
-//  5. Upgrades the HTTP connection to WebSocket
-//  6. Opens a connect-rpc stream to boxd ProcessService.Start
-//  7. Bridges bytes until either side closes
+// serveTerminal handles /terminal requests for a sandbox addressed by
+// the `boxd-{id}.{domain}` host label. The caller (serveBoxdPort) has
+// already parsed the instance ID and confirmed the terminal feature is
+// enabled; this function is responsible for:
+//
+//  1. Extracting and verifying the token (signature, expiry, scope).
+//  2. Single-use nonce check (replay protection).
+//  3. Binding the token to the requested instance ID.
+//  4. Resolving the VM IP via the resolver.
+//  5. Upgrading the HTTP connection to a WebSocket.
+//  6. Opening a connect-rpc stream to boxd ProcessService.Start.
+//  7. Bridging bytes until either side closes.
 //
 // Errors before the upgrade are returned as standard HTTP error responses.
 // Errors after the upgrade are sent as WebSocket close frames with codes
 // from the coder/websocket library.
-func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instanceID string) {
 	// The token is carried in the Sec-WebSocket-Protocol header, NOT the
 	// URL. This keeps the token out of GCP LB access logs, browser history,
 	// Referer headers on sub-resources, and any middleware request logger.
@@ -202,17 +205,6 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
 	token := extractTerminalToken(r)
 	if token == "" {
 		http.Error(w, "missing token (pass as Sec-WebSocket-Protocol: token.<value>)", http.StatusUnauthorized)
-		return
-	}
-
-	// ParseTerminalHost extracts the instance ID from a bare
-	// `{id}.{domain}` host (no port label) — the terminal URL shape is
-	// distinct from the `{port}-{id}.{domain}` shape used for /files and
-	// user application ports, so we cannot reuse ParseHost here.
-	instanceID, err := ParseTerminalHost(r.Host, h.domain)
-	if err != nil {
-		h.log.Warn().Err(err).Str("host", r.Host).Msg("terminal: bad host")
-		http.Error(w, "invalid terminal URL", http.StatusBadRequest)
 		return
 	}
 

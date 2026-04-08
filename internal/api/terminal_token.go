@@ -85,7 +85,7 @@ func (h *Handlers) IssueTerminalToken(c *gin.Context) {
 	// Putting the token in the URL would leak it to LB access logs,
 	// browser history, any Referer header on sub-resources, and any
 	// request-logging middleware. Subprotocol headers are not logged.
-	url := fmt.Sprintf("wss://%s.%s/terminal", sandbox.ID.String(), h.Config.EdgeProxyDomain)
+	url := fmt.Sprintf("wss://boxd-%s.%s/terminal", sandbox.ID.String(), h.Config.EdgeProxyDomain)
 
 	c.JSON(http.StatusOK, terminalTokenResponse{
 		Token:       token,
