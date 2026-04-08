@@ -55,6 +55,16 @@ type Scope string
 const (
 	// ScopeTerminal grants WebSocket upgrade access to a sandbox's PTY.
 	ScopeTerminal Scope = "terminal"
+
+	// ScopeFiles grants HTTP upload (POST) and download (GET) access to a
+	// sandbox's /files endpoint on the edge proxy. A single scope covers
+	// both directions because the capability to read and the capability
+	// to write are already both implied by having raw filesystem access
+	// to the sandbox — splitting them would create a false sense of
+	// least-privilege without actually reducing blast radius. If a future
+	// use case genuinely needs read-only handoff to an untrusted viewer,
+	// add ScopeFilesRead as a separate capability then.
+	ScopeFiles Scope = "files"
 )
 
 // Payload is the body of a signed token. Every field is required and
