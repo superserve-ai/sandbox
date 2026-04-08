@@ -10,6 +10,7 @@ Restart=always
 RestartSec=2
 
 Environment=PROXY_ADDR=:5007
+Environment=PROXY_REDIRECT_ADDR=:5008
 Environment=VMD_ADDR=http://127.0.0.1:9090
 Environment=PROXY_DOMAIN=sandbox.superserve.ai
 

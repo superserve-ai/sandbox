@@ -34,21 +34,22 @@ set -euo pipefail
 PROJECT="${GCP_PROJECT}"
 REGION="${ZONE%-*}"  # strips zone suffix, e.g. us-central1-a → us-central1
 WILDCARD_DOMAIN="*.${DOMAIN}"
-PROXY_PORT=5007
+PROXY_PORT=5007            # Main listener: HTTPS-after-LB-termination, HTTP/1.1, WebSocket
+PROXY_REDIRECT_PORT=5008   # Tiny listener: HTTP→HTTPS 301 redirect
 
 # Resource names
 IP_NAME="sandbox-proxy-ip"
 IG_NAME="sandbox-proxy-ig"          # unmanaged instance group
-HC_NAME="sandbox-proxy-hc"          # health check
-BACKEND_NAME="sandbox-proxy-backend"
+HC_NAME="sandbox-proxy-hc"          # HTTP health check on PROXY_PORT
+HC_REDIRECT_NAME="sandbox-proxy-redirect-hc"  # TCP health check on PROXY_REDIRECT_PORT
+BACKEND_NAME="sandbox-proxy-backend"          # main TCP backend → proxy:5007
+BACKEND_REDIRECT_NAME="sandbox-proxy-redirect-backend"  # TCP backend → proxy:5008
 CERT_MAP_NAME="sandbox-proxy-cert-map"
 CERT_MAP_ENTRY="sandbox-proxy-cert-entry"
 CERT_NAME="sandbox-proxy-cert"
 DNS_AUTH_NAME="sandbox-proxy-dns-auth"
-URL_MAP_NAME="sandbox-proxy-url-map"
-URL_MAP_HTTP_NAME="sandbox-proxy-url-map-http"  # for HTTP→HTTPS redirect
-HTTPS_PROXY_NAME="sandbox-proxy-https"
-HTTP_PROXY_NAME="sandbox-proxy-http"
+SSL_PROXY_NAME="sandbox-proxy-ssl"   # target SSL proxy (terminates TLS at LB)
+TCP_PROXY_NAME="sandbox-proxy-tcp"   # target TCP proxy (port 80 → redirect listener)
 FWD_RULE_HTTPS="sandbox-proxy-https-fwd"
 FWD_RULE_HTTP="sandbox-proxy-http-fwd"
 
@@ -86,9 +87,11 @@ else
     --project="${PROJECT}"
 fi
 
-# Define the named port so the backend service knows which port to target.
+# Define the named ports so backend services know which ports to target.
+# - "proxy" → main HTTP listener (TLS terminates at the LB, plain HTTP here)
+# - "proxy-redirect" → tiny HTTP listener that 301-redirects to https://
 gcloud compute instance-groups unmanaged set-named-ports "${IG_NAME}" \
-  --named-ports="proxy:${PROXY_PORT}" \
+  --named-ports="proxy:${PROXY_PORT},proxy-redirect:${PROXY_REDIRECT_PORT}" \
   --zone="${ZONE}" \
   --project="${PROJECT}"
 
@@ -104,30 +107,33 @@ FW_LB_NAME="allow-sandbox-proxy-lb"
 if ! gcloud compute firewall-rules describe "${FW_HC_NAME}" --project="${PROJECT}" &>/dev/null; then
   gcloud compute firewall-rules create "${FW_HC_NAME}" \
     --network="${NETWORK}" \
-    --allow="tcp:${PROXY_PORT}" \
+    --allow="tcp:${PROXY_PORT},tcp:${PROXY_REDIRECT_PORT}" \
     --source-ranges="35.191.0.0/16,130.211.0.0/22" \
     --target-tags="${INSTANCE_TAG:-vmd}" \
-    --description="Allow GCP LB health check probes to edge proxy" \
+    --description="Allow GCP LB health check probes to edge proxy (main + redirect ports)" \
     --project="${PROJECT}"
 fi
 
 if ! gcloud compute firewall-rules describe "${FW_LB_NAME}" --project="${PROJECT}" &>/dev/null; then
   gcloud compute firewall-rules create "${FW_LB_NAME}" \
     --network="${NETWORK}" \
-    --allow="tcp:${PROXY_PORT}" \
+    --allow="tcp:${PROXY_PORT},tcp:${PROXY_REDIRECT_PORT}" \
     --source-ranges="130.211.0.0/22,35.191.0.0/16" \
     --target-tags="${INSTANCE_TAG:-vmd}" \
-    --description="Allow GCP LB backend traffic to edge proxy" \
+    --description="Allow GCP LB backend traffic to edge proxy (main + redirect ports)" \
     --project="${PROJECT}"
 fi
 
 # ---------------------------------------------------------------------------
-# 4. HTTP health check on /health
+# 4. Health checks
+#    - Main backend uses an HTTP health check on /health
+#    - Redirect backend uses a TCP health check (the redirect listener has
+#      no /health endpoint, only a 301 handler)
 # ---------------------------------------------------------------------------
 echo ""
-echo "==> [4/9] Creating health check..."
+echo "==> [4/9] Creating health checks..."
 if gcloud compute health-checks describe "${HC_NAME}" --global --project="${PROJECT}" &>/dev/null; then
-  echo "    already exists, skipping"
+  echo "    ${HC_NAME} already exists, skipping"
 else
   gcloud compute health-checks create http "${HC_NAME}" \
     --global \
@@ -140,23 +146,85 @@ else
     --project="${PROJECT}"
 fi
 
+if gcloud compute health-checks describe "${HC_REDIRECT_NAME}" --global --project="${PROJECT}" &>/dev/null; then
+  echo "    ${HC_REDIRECT_NAME} already exists, skipping"
+else
+  gcloud compute health-checks create tcp "${HC_REDIRECT_NAME}" \
+    --global \
+    --port-name=proxy-redirect \
+    --check-interval=10 \
+    --timeout=5 \
+    --healthy-threshold=2 \
+    --unhealthy-threshold=3 \
+    --project="${PROJECT}"
+fi
+
 # ---------------------------------------------------------------------------
-# 5. Backend service
-#    Timeout 630s > proxy server idle (620s) > proxy transport idle (610s) > GCP LB upstream (600s)
+# 5. Backend services
+#
+# We use TWO backend services and TWO load balancers in front of the proxy:
+#
+# (a) Main backend (TCP protocol, port-name=proxy) — fronted by an SSL
+#     Proxy Network LB on port 443. The LB terminates TLS using the
+#     Certificate Manager wildcard cert and forwards plain TCP to the
+#     proxy on port 5007. The proxy serves plain HTTP — TLS termination
+#     is at the LB.
+#
+#     Critically, SSL Proxy LB does NOT advertise HTTP/2 in TLS ALPN, so
+#     browsers fall back to HTTP/1.1. This is the *whole reason* we use
+#     SSL Proxy LB instead of the Application LB: GCP's Application LB
+#     advertises h2 in ALPN and then strips the WebSocket Upgrade headers
+#     during HTTP/2→HTTP/1.1 translation, breaking every browser-based
+#     WebSocket upgrade. Confirmed empirically; do not switch back.
+#
+# (b) Redirect backend (TCP protocol, port-name=proxy-redirect) — fronted
+#     by a TCP Proxy LB on port 80. Plain TCP forwarding to the proxy's
+#     tiny HTTP-only redirect listener on port 5008, which serves a 301
+#     to the same URL on https://. Lives on the same instance group, just
+#     a different named port.
+#
+# Long timeouts on the main backend so streaming WebSocket connections
+# (terminal sessions, exec streams) survive idle periods. The 86400s
+# (24h) value matches the maximum the proxy itself will allow before
+# its idle timer kicks in.
 # ---------------------------------------------------------------------------
 echo ""
-echo "==> [5/9] Creating backend service..."
+echo "==> [5/9] Creating backend services..."
 if gcloud compute backend-services describe "${BACKEND_NAME}" --global --project="${PROJECT}" &>/dev/null; then
-  echo "    already exists, skipping"
+  echo "    ${BACKEND_NAME} already exists, skipping"
 else
   gcloud compute backend-services create "${BACKEND_NAME}" \
     --global \
-    --protocol=HTTP \
+    --load-balancing-scheme=EXTERNAL_MANAGED \
+    --protocol=TCP \
     --port-name=proxy \
     --health-checks="${HC_NAME}" \
-    --timeout=630 \
+    --timeout=86400 \
+    --connection-draining-timeout=300 \
+    --enable-logging \
+    --logging-sample-rate=1.0 \
     --project="${PROJECT}"
   gcloud compute backend-services add-backend "${BACKEND_NAME}" \
+    --global \
+    --instance-group="${IG_NAME}" \
+    --instance-group-zone="${ZONE}" \
+    --balancing-mode=UTILIZATION \
+    --max-utilization=0.8 \
+    --project="${PROJECT}"
+fi
+
+if gcloud compute backend-services describe "${BACKEND_REDIRECT_NAME}" --global --project="${PROJECT}" &>/dev/null; then
+  echo "    ${BACKEND_REDIRECT_NAME} already exists, skipping"
+else
+  gcloud compute backend-services create "${BACKEND_REDIRECT_NAME}" \
+    --global \
+    --load-balancing-scheme=EXTERNAL_MANAGED \
+    --protocol=TCP \
+    --port-name=proxy-redirect \
+    --health-checks="${HC_REDIRECT_NAME}" \
+    --timeout=30 \
+    --project="${PROJECT}"
+  gcloud compute backend-services add-backend "${BACKEND_REDIRECT_NAME}" \
     --global \
     --instance-group="${IG_NAME}" \
     --instance-group-zone="${ZONE}" \
@@ -204,70 +272,58 @@ if ! gcloud certificate-manager maps entries describe "${CERT_MAP_ENTRY}" \
 fi
 
 # ---------------------------------------------------------------------------
-# 7. URL maps
+# 7. Target proxies
+#
+# - target-ssl-proxy → SSL Proxy LB on port 443. Terminates TLS at the LB
+#   using the Certificate Manager wildcard cert. Forwards plain TCP to the
+#   main backend. Does NOT speak HTTP, does NOT advertise h2 in ALPN.
+# - target-tcp-proxy → TCP Proxy LB on port 80. Plain TCP forwarding to
+#   the redirect backend (which serves a 301).
+#
+# We deliberately do NOT use target-https-proxy / Application LB here
+# because GCP's Application LB strips the WebSocket Upgrade headers when
+# translating HTTP/2 client connections to HTTP/1.1 backend connections,
+# breaking every browser-based WebSocket upgrade. Both classic and
+# modern (EXTERNAL_MANAGED) Application LBs have this bug. Confirmed
+# empirically. Do not switch back without re-verifying.
 # ---------------------------------------------------------------------------
 echo ""
-echo "==> [7/9] Creating URL maps..."
+echo "==> [7/9] Creating target proxies..."
 
-# HTTPS: route everything to the backend
-if ! gcloud compute url-maps describe "${URL_MAP_NAME}" --global --project="${PROJECT}" &>/dev/null; then
-  gcloud compute url-maps create "${URL_MAP_NAME}" \
-    --default-service="${BACKEND_NAME}" \
-    --global \
-    --project="${PROJECT}"
-fi
-
-# HTTP: redirect all traffic to HTTPS
-if ! gcloud compute url-maps describe "${URL_MAP_HTTP_NAME}" --global --project="${PROJECT}" &>/dev/null; then
-  gcloud compute url-maps import "${URL_MAP_HTTP_NAME}" \
-    --global \
-    --project="${PROJECT}" \
-    --source=/dev/stdin <<'YAML'
-name: sandbox-proxy-url-map-http
-defaultUrlRedirect:
-  redirectResponseCode: MOVED_PERMANENTLY_DEFAULT
-  httpsRedirect: true
-YAML
-fi
-
-# ---------------------------------------------------------------------------
-# 8. Target proxies and forwarding rules
-# ---------------------------------------------------------------------------
-echo ""
-echo "==> [8/9] Creating target proxies and forwarding rules..."
-
-# HTTPS target proxy — references the certificate map
-if ! gcloud compute target-https-proxies describe "${HTTPS_PROXY_NAME}" --global --project="${PROJECT}" &>/dev/null; then
-  gcloud compute target-https-proxies create "${HTTPS_PROXY_NAME}" \
-    --url-map="${URL_MAP_NAME}" \
+if ! gcloud compute target-ssl-proxies describe "${SSL_PROXY_NAME}" --project="${PROJECT}" &>/dev/null; then
+  gcloud compute target-ssl-proxies create "${SSL_PROXY_NAME}" \
+    --backend-service="${BACKEND_NAME}" \
     --certificate-map="${CERT_MAP_NAME}" \
-    --global \
     --project="${PROJECT}"
 fi
 
-# HTTP target proxy (for redirect)
-if ! gcloud compute target-http-proxies describe "${HTTP_PROXY_NAME}" --global --project="${PROJECT}" &>/dev/null; then
-  gcloud compute target-http-proxies create "${HTTP_PROXY_NAME}" \
-    --url-map="${URL_MAP_HTTP_NAME}" \
-    --global \
+if ! gcloud compute target-tcp-proxies describe "${TCP_PROXY_NAME}" --project="${PROJECT}" &>/dev/null; then
+  gcloud compute target-tcp-proxies create "${TCP_PROXY_NAME}" \
+    --backend-service="${BACKEND_REDIRECT_NAME}" \
     --project="${PROJECT}"
 fi
 
-# HTTPS forwarding rule
+# ---------------------------------------------------------------------------
+# 8. Forwarding rules (both on the same global static IP)
+# ---------------------------------------------------------------------------
+echo ""
+echo "==> [8/9] Creating forwarding rules..."
+
 if ! gcloud compute forwarding-rules describe "${FWD_RULE_HTTPS}" --global --project="${PROJECT}" &>/dev/null; then
   gcloud compute forwarding-rules create "${FWD_RULE_HTTPS}" \
     --global \
-    --target-https-proxy="${HTTPS_PROXY_NAME}" \
+    --load-balancing-scheme=EXTERNAL_MANAGED \
+    --target-ssl-proxy="${SSL_PROXY_NAME}" \
     --address="${IP_NAME}" \
     --ports=443 \
     --project="${PROJECT}"
 fi
 
-# HTTP forwarding rule (redirect to HTTPS)
 if ! gcloud compute forwarding-rules describe "${FWD_RULE_HTTP}" --global --project="${PROJECT}" &>/dev/null; then
   gcloud compute forwarding-rules create "${FWD_RULE_HTTP}" \
     --global \
-    --target-http-proxy="${HTTP_PROXY_NAME}" \
+    --load-balancing-scheme=EXTERNAL_MANAGED \
+    --target-tcp-proxy="${TCP_PROXY_NAME}" \
     --address="${IP_NAME}" \
     --ports=80 \
     --project="${PROJECT}"
