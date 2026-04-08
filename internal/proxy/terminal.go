@@ -192,10 +192,18 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build the connect-rpc client to boxd. We use the transport cache so
+	// the bridge benefits from the same lifecycle keying and connection
+	// pooling as the generic proxy path.
+	transport := h.transports.get(instanceID, info)
+	httpClient := &http.Client{Transport: transport}
+	baseURL := fmt.Sprintf("http://%s:%d", info.VMIP, boxdPort)
+	procClient := boxdpbconnect.NewProcessServiceClient(httpClient, baseURL)
+
 	// Tie the bridge lifetime to the request context so shutdowns
 	// propagate cleanly. The WS will be closed in bridgeTerminal.
 	ctx := r.Context()
-	h.bridgeTerminal(ctx, ws, instanceID, info, payload)
+	h.bridgeTerminal(ctx, ws, procClient, instanceID, payload.TeamID)
 }
 
 // bridgeTerminal is the long-lived function that pumps bytes between the
@@ -206,23 +214,15 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
 // waits for either to finish. When either direction errors, we cancel the
 // shared context and the other direction sees its read/write return, then
 // exits. This is the simplest correct pattern for bidirectional bridging.
-func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, instanceID string, info InstanceInfo, payload *auth.Payload) {
+func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procClient boxdpbconnect.ProcessServiceClient, instanceID, teamID string) {
 	l := h.log.With().
 		Str("sandbox_id", instanceID).
-		Str("team_id", payload.TeamID).
+		Str("team_id", teamID).
 		Logger()
 
 	// Scoped context so either direction's failure cancels everything.
 	bridgeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	// Build a connect-rpc client to boxd over the VM's private IP.
-	// We use the transport cache so we benefit from the same lifecycle
-	// keying and connection pooling as the generic proxy path.
-	transport := h.transports.get(instanceID, info)
-	httpClient := &http.Client{Transport: transport}
-	baseURL := fmt.Sprintf("http://%s:%d", info.VMIP, boxdPort)
-	procClient := boxdpbconnect.NewProcessServiceClient(httpClient, baseURL)
 
 	// Start a shell in PTY mode. Initial size is a placeholder — the
 	// browser will resize immediately after mount.
