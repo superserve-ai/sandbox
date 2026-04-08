@@ -38,32 +38,49 @@ func main() {
 	proxyHandler := proxy.NewHandler(domain, resolver, log)
 	proxyHandler.StartSweeper(ctx)
 
-	// Terminal bridge — wire in the Ed25519 verifier, nonce cache, and
-	// allowed browser origins.
+	// Data-plane auth — the Ed25519 verifier and the single shared nonce
+	// cache are used by every token-gated endpoint on the edge (terminal
+	// bridge, /files reverse proxy, and any future scoped capability).
+	// Both features share the same Verifier and NonceCache; installing
+	// them through WithTerminal and WithFiles below is idempotent as
+	// long as the same instances are reused.
 	//
 	// REQUIRE_TERMINAL=1 makes missing configuration a hard-fail at boot
 	// rather than a warn-and-continue. Prod should always set this so a
 	// misconfigured deploy breaks the health check instead of silently
-	// shipping a proxy with the endpoint disabled — users would only
-	// notice when they click "open terminal" and get an opaque error.
+	// shipping a proxy with the data-plane endpoints disabled — users
+	// would only notice when they hit an opaque 404 on upload or
+	// "open terminal".
 	verifier, verr := proxy.LoadTerminalVerifierFromEnv()
 	originsEnv := os.Getenv("TERMINAL_ALLOWED_ORIGINS")
 	required := os.Getenv("REQUIRE_TERMINAL") == "1"
 
-	if verr != nil || originsEnv == "" {
+	switch {
+	case verr != nil:
 		if required {
 			log.Fatal().
-				AnErr("verifier_err", verr).
-				Str("origins", originsEnv).
-				Msg("REQUIRE_TERMINAL=1 but terminal config missing")
+				Err(verr).
+				Msg("REQUIRE_TERMINAL=1 but TERMINAL_TOKEN_PUBLIC_KEY missing/invalid")
 		}
 		log.Warn().
-			AnErr("verifier_err", verr).
-			Msg("terminal endpoint disabled (TERMINAL_TOKEN_PUBLIC_KEY or TERMINAL_ALLOWED_ORIGINS not configured)")
-	} else {
+			Err(verr).
+			Msg("data-plane endpoints disabled (TERMINAL_TOKEN_PUBLIC_KEY not configured)")
+	case originsEnv == "":
+		if required {
+			log.Fatal().
+				Msg("REQUIRE_TERMINAL=1 but TERMINAL_ALLOWED_ORIGINS missing")
+		}
+		log.Warn().
+			Msg("data-plane endpoints disabled (TERMINAL_ALLOWED_ORIGINS not configured)")
+	default:
 		origins := splitCSV(originsEnv)
-		proxyHandler.WithTerminal(verifier, proxy.DefaultNonceCache(), origins)
-		log.Info().Strs("allowed_origins", origins).Msg("terminal endpoint enabled")
+		nonces := proxy.DefaultNonceCache()
+		proxyHandler.
+			WithTerminal(verifier, nonces, origins).
+			WithFiles(verifier, nonces)
+		log.Info().
+			Strs("allowed_origins", origins).
+			Msg("data-plane endpoints enabled (terminal, files)")
 	}
 
 	// Wrap with a health check endpoint for the GCP LB health probe.

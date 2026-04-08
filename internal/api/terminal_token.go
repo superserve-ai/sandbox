@@ -6,11 +6,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
-	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // terminalTokenResponse is what the browser receives.
@@ -63,45 +61,15 @@ const TerminalSubprotocol = "superserve.terminal.v1"
 // nonce dedupe), so even if it leaks within the 60s TTL it cannot be
 // replayed once the legitimate browser has consumed it.
 func (h *Handlers) IssueTerminalToken(c *gin.Context) {
-	sandboxID, err := parseSandboxID(c)
-	if err != nil {
-		return
-	}
-
-	teamID, err := teamIDFromContext(c)
-	if err != nil {
-		return
-	}
-
-	// Verify sandbox exists, belongs to this team, and is active. Only
-	// `active` is allowed — the edge proxy bridge does not auto-wake,
-	// so issuing a token to an idle sandbox would mint a capability that
-	// cannot be used. Callers must resume first, then mint.
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
-			return
-		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	if sandbox.Status != db.SandboxStatusActive {
-		respondErrorMsg(c, "conflict",
-			fmt.Sprintf("sandbox is %s, resume it before opening a terminal", sandbox.Status),
-			http.StatusConflict)
+	sandbox, teamID, ok := h.loadActiveSandboxForMint(c)
+	if !ok {
 		return
 	}
 
 	now := time.Now()
-	token, err := h.TerminalSign.Mint(now, sandboxID.String(), teamID.String(), auth.ScopeTerminal)
+	token, err := h.Signer.Mint(now, sandbox.ID.String(), teamID.String(), auth.ScopeTerminal)
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("terminal token mint failed")
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("terminal token mint failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -117,7 +85,7 @@ func (h *Handlers) IssueTerminalToken(c *gin.Context) {
 	// Putting the token in the URL would leak it to LB access logs,
 	// browser history, any Referer header on sub-resources, and any
 	// request-logging middleware. Subprotocol headers are not logged.
-	url := fmt.Sprintf("wss://%s.%s/terminal", sandboxID.String(), h.Config.EdgeProxyDomain)
+	url := fmt.Sprintf("wss://%s.%s/terminal", sandbox.ID.String(), h.Config.EdgeProxyDomain)
 
 	c.JSON(http.StatusOK, terminalTokenResponse{
 		Token:       token,
