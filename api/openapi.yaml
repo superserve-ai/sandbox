@@ -192,6 +192,8 @@ paths:
           must be in the `active` state; patching a paused or idle sandbox
           returns `409`. Rules take effect immediately and are persisted so
           they survive a future pause/resume cycle.
+        - `metadata` — replaces the sandbox's metadata tags. Can be updated
+          regardless of sandbox state (active, paused, idle).
       security:
         - apiKey: []
       requestBody:
@@ -450,15 +452,6 @@ components:
           description: >
             If provided, boot the sandbox from this snapshot instead of
             creating a fresh VM. The snapshot must belong to the same team.
-        allow_internet_access:
-          type: boolean
-          default: true
-          description: >
-            Convenience toggle for outbound internet access. When false and
-            no `network.deny_out` is provided, the sandbox is created with
-            `deny_out: ["0.0.0.0/0"]` and cannot reach any public IP. An
-            explicit `network` field always wins over this flag, so use
-            `network` for fine-grained allow/deny lists.
         timeout_seconds:
           type: integer
           format: int32
@@ -490,12 +483,7 @@ components:
               - Keys starting with `superserve.` or `_superserve` (case-
                 insensitive) are reserved for platform use and rejected.
 
-            ## Lifecycle
-            Metadata is **immutable** after creation. There is no
-            `PATCH /sandboxes/:id/metadata` endpoint by design — if you
-            need mutability, delete and recreate the sandbox, or open an
-            issue with your use case.
-
+            Metadata can be updated after creation via `PATCH /sandboxes/:id`.
             Filter sandboxes by metadata via the `metadata.{key}` query
             parameter on `GET /sandboxes`.
           example:
@@ -651,10 +639,19 @@ components:
             Replace the sandbox's egress rules. The sandbox must be in
             the `active` state. The provided `allow_out` and `deny_out`
             lists fully replace whatever was previously configured.
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Replace the sandbox's metadata tags. Fully replaces the existing
+            metadata — omitted keys are removed. Can be patched regardless of
+            sandbox state. Same validation limits as on create (64 keys,
+            256-byte keys, 2 KB values, 16 KB total).
       example:
-        network:
-          allow_out: ["api.openai.com", "*.github.com"]
-          deny_out: ["0.0.0.0/0"]
+        metadata:
+          env: prod
+          owner: agent-7
 
     Error:
       type: object

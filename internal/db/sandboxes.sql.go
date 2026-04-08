@@ -20,7 +20,7 @@ WITH expired AS (
   FROM sandbox
   WHERE destroyed_at IS NULL
     AND timeout_seconds IS NOT NULL
-    AND status NOT IN ('starting', 'pausing', 'failed', 'deleted')
+    AND status = 'active'
     AND created_at + (timeout_seconds || ' seconds')::interval < now()
     AND created_at < now() - interval '60 seconds'
   ORDER BY created_at ASC
@@ -28,7 +28,7 @@ WITH expired AS (
   FOR UPDATE SKIP LOCKED
 )
 UPDATE sandbox
-SET destroyed_at = now(), status = 'deleted', updated_at = now()
+SET status = 'pausing', updated_at = now()
 FROM expired
 WHERE sandbox.id = expired.id
 RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
@@ -42,18 +42,15 @@ type ClaimExpiredSandboxesRow struct {
 	HostID     *string     `json:"host_id"`
 }
 
-// Atomically claims and soft-deletes sandboxes whose hard timeout has elapsed.
-// FOR UPDATE SKIP LOCKED lets concurrent reaper replicas skip rows already
-// being processed by another replica, so multi-replica Cloud Run deployments
-// do not double-destroy the same sandbox.
+// Atomically claims active sandboxes whose hard timeout has elapsed and marks
+// them as 'pausing'. FOR UPDATE SKIP LOCKED lets concurrent reaper replicas
+// skip rows already being processed, so multi-replica Cloud Run deployments
+// do not double-process the same sandbox.
 //
-// Transient states (starting, pausing) are excluded: destroying a sandbox
-// mid-operation can leave VMD in an inconsistent state. The reaper will pick
-// them up on the next tick once they have settled. `failed` sandboxes are
-// excluded because they are already dead but user-visible — auto-reaping them
-// would silently remove evidence. The 60-second grace window prevents reaping a
-// sandbox that was just created with a very short timeout before it finishes
-// starting up.
+// Only 'active' sandboxes are claimed — idle sandboxes are already stopped,
+// and transient states (starting, pausing) are skipped to avoid racing with
+// in-progress operations. The 60-second grace window prevents reaping a sandbox
+// that was just created with a very short timeout before it finishes starting up.
 func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]ClaimExpiredSandboxesRow, error) {
 	rows, err := q.db.Query(ctx, claimExpiredSandboxes, limit)
 	if err != nil {
@@ -421,6 +418,23 @@ type UpdateSandboxLastActivityParams struct {
 
 func (q *Queries) UpdateSandboxLastActivity(ctx context.Context, arg UpdateSandboxLastActivityParams) error {
 	_, err := q.db.Exec(ctx, updateSandboxLastActivity, arg.ID, arg.TeamID)
+	return err
+}
+
+const updateSandboxMetadata = `-- name: UpdateSandboxMetadata :exec
+UPDATE sandbox
+SET metadata = $2, updated_at = now()
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+`
+
+type UpdateSandboxMetadataParams struct {
+	ID       uuid.UUID `json:"id"`
+	Metadata []byte    `json:"metadata"`
+	TeamID   uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) UpdateSandboxMetadata(ctx context.Context, arg UpdateSandboxMetadataParams) error {
+	_, err := q.db.Exec(ctx, updateSandboxMetadata, arg.ID, arg.Metadata, arg.TeamID)
 	return err
 }
 

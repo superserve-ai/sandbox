@@ -692,22 +692,11 @@ type createSandboxRequest struct {
 	FromSnapshot *string               `json:"from_snapshot,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
 
-	// AllowInternetAccess is syntactic sugar for a network config. If set
-	// to false and Network is not provided (or Network.DenyOut is empty),
-	// we inject "0.0.0.0/0" into deny_out so the sandbox cannot reach any
-	// public IP. An explicit Network config takes precedence — we only
-	// apply this shortcut when the user has not already expressed deny
-	// intent.
-	//
-	// Pointer so we can distinguish unset (nil → default allow) from
-	// explicitly false.
-	AllowInternetAccess *bool `json:"allow_internet_access,omitempty"`
-
 	// TimeoutSeconds is a hard lifetime cap in seconds, measured from
-	// created_at. When set, the reaper destroys the sandbox that many
-	// seconds after creation — regardless of state (active, paused, idle)
-	// and regardless of activity. Matches the user intent "delete this
-	// sandbox in N seconds no matter what I do with it."
+	// created_at. When set, the reaper pauses the sandbox that many seconds
+	// after creation if it is still active. Already-idle sandboxes are left
+	// alone. Matches the user intent "stop this sandbox in N seconds so it
+	// cannot burn resources indefinitely."
 	//
 	// The field name includes "_seconds" so the unit is obvious at every
 	// call site without having to read the docs.
@@ -718,8 +707,8 @@ type createSandboxRequest struct {
 	TimeoutSeconds *int32 `json:"timeout_seconds,omitempty"`
 
 	// Metadata is a flat string→string map of user-supplied tags that get
-	// attached to the sandbox at creation. The tags are immutable after
-	// creation and filterable on GET /sandboxes via metadata.<key>=<value>
+	// attached to the sandbox at creation. Updatable after creation via
+	// PATCH /sandboxes/:id. Filterable on GET /sandboxes via metadata.<key>=<value>
 	// query params (jsonb @> containment, so all conditions must match).
 	//
 	// Strings only — no nested objects, numbers, or arrays. This is
@@ -943,19 +932,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 	}
 
-	// Translate allow_internet_access: false into an equivalent deny rule
-	// so the rest of the flow treats it like any other egress config.
-	// An explicit Network config wins — we only inject a deny when the
-	// user has not already expressed intent for deny_out. This makes the
-	// boolean a pure convenience sugar over the granular network field.
-	if req.AllowInternetAccess != nil && !*req.AllowInternetAccess {
-		if req.Network == nil {
-			req.Network = &networkConfigRequest{DenyOut: []string{"0.0.0.0/0"}}
-		} else if len(req.Network.DenyOut) == 0 {
-			req.Network.DenyOut = []string{"0.0.0.0/0"}
-		}
-	}
-
 	// Validate network rules up front so we fail before doing any DB or VMD work.
 	if req.Network != nil {
 		if err := validateEgressRules(req.Network.AllowOut, req.Network.DenyOut); err != nil {
@@ -1136,8 +1112,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// the INSERT — overwrite it with "active" since we just transitioned.
 	resp := sandboxToResponse(sandbox)
 	resp.Status = string(db.SandboxStatusActive)
-	// req.Network may have been populated by the allow_internet_access=false
-	// path, so include it in the response if rules were set.
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
@@ -1421,20 +1395,16 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 // with 400. This guards against clients sending empty bodies by mistake and
 // silently no-opping.
 //
-// Today the only patchable field is `network`. Adding more in the future is
+// Patchable fields: `network` and `metadata`. Adding more in the future is
 // additive — declare a new pointer field and dispatch on its non-nil-ness.
 type patchSandboxRequest struct {
-	Network *networkConfigRequest `json:"network,omitempty"`
+	Network  *networkConfigRequest `json:"network,omitempty"`
+	Metadata map[string]string     `json:"metadata,omitempty"`
 }
 
-// PatchSandbox applies a partial update to a running sandbox. Currently the
-// only patchable field is `network`, which replaces the egress rules for the
-// sandbox. The sandbox must be in the active state — patching a paused or
-// idle sandbox returns 409.
-//
-// Replaces the previous PUT /sandboxes/:id/network endpoint. The wrapping
-// under a top-level field name leaves room to patch additional fields later
-// without breaking the route shape.
+// PatchSandbox applies a partial update to a sandbox.
+// - network: replaces egress rules; sandbox must be active.
+// - metadata: replaces metadata tags; can be patched in any non-deleted state.
 func (h *Handlers) PatchSandbox(c *gin.Context) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -1452,21 +1422,24 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		return
 	}
 
-	// Reject empty patches. We use a strict decoder so unknown fields are
-	// already a 400; this catches the legitimate-shape-but-empty case
-	// (e.g. `{}` or `{"network": null}`) which would otherwise silently
-	// succeed as a no-op.
-	if body.Network == nil {
-		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network)", http.StatusBadRequest)
+	// Reject empty patches.
+	if body.Network == nil && body.Metadata == nil {
+		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata)", http.StatusBadRequest)
 		return
 	}
 
-	// Validate the egress rules before doing any DB or VMD work so we can
-	// fail fast with a clean 400 instead of writing a row we'd need to
-	// roll back.
-	if err := validateEgressRules(body.Network.AllowOut, body.Network.DenyOut); err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
+	if body.Network != nil {
+		if err := validateEgressRules(body.Network.AllowOut, body.Network.DenyOut); err != nil {
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if body.Metadata != nil {
+		if err := validateMetadata(body.Metadata); err != nil {
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Verify sandbox exists, belongs to this team, and is active.
@@ -1484,47 +1457,70 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		return
 	}
 
-	if sandbox.Status != db.SandboxStatusActive {
+	// Network updates require an active sandbox (rules are applied live to the VM).
+	if body.Network != nil && sandbox.Status != db.SandboxStatusActive {
 		respondErrorMsg(c, "conflict", "Sandbox must be active to update network config", http.StatusConflict)
 		return
 	}
 
-	// Separate CIDRs and domains from allow_out.
-	var allowedCIDRs, allowedDomains []string
-	for _, entry := range body.Network.AllowOut {
-		if isIPOrCIDR(entry) {
-			allowedCIDRs = append(allowedCIDRs, entry)
-		} else {
-			allowedDomains = append(allowedDomains, entry)
+	if body.Network != nil {
+		// Separate CIDRs and domains from allow_out.
+		var allowedCIDRs, allowedDomains []string
+		for _, entry := range body.Network.AllowOut {
+			if isIPOrCIDR(entry) {
+				allowedCIDRs = append(allowedCIDRs, entry)
+			} else {
+				allowedDomains = append(allowedDomains, entry)
+			}
 		}
+
+		// Apply rules to the running VM via VMD.
+		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+		defer vmdCancel()
+		if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
+			respondError(c, ErrInternal)
+			return
+		}
+
+		// Persist config to DB so it survives pause/resume.
+		networkConfig, _ := json.Marshal(map[string]any{
+			"egress": map[string]any{
+				"allowed_cidrs":   allowedCIDRs,
+				"denied_cidrs":    body.Network.DenyOut,
+				"allowed_domains": allowedDomains,
+			},
+		})
+		if err := h.DB.UpdateSandboxNetworkConfig(c.Request.Context(), db.UpdateSandboxNetworkConfigParams{
+			ID:            sandboxID,
+			NetworkConfig: networkConfig,
+			TeamID:        teamID,
+		}); err != nil {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
+		}
+
+		h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 	}
 
-	// Apply rules to the running VM via VMD.
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
-		respondError(c, ErrInternal)
-		return
-	}
+	if body.Metadata != nil {
+		metadataJSON, err := json.Marshal(body.Metadata)
+		if err != nil {
+			log.Error().Err(err).Msg("marshal patch metadata")
+			respondError(c, ErrInternal)
+			return
+		}
+		if err := h.DB.UpdateSandboxMetadata(c.Request.Context(), db.UpdateSandboxMetadataParams{
+			ID:       sandboxID,
+			Metadata: metadataJSON,
+			TeamID:   teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxMetadata failed")
+			respondError(c, ErrInternal)
+			return
+		}
 
-	// Persist config to DB so it survives pause/resume.
-	networkConfig, _ := json.Marshal(map[string]any{
-		"egress": map[string]any{
-			"allowed_cidrs":   allowedCIDRs,
-			"denied_cidrs":    body.Network.DenyOut,
-			"allowed_domains": allowedDomains,
-		},
-	})
-	if err := h.DB.UpdateSandboxNetworkConfig(c.Request.Context(), db.UpdateSandboxNetworkConfigParams{
-		ID:            sandboxID,
-		NetworkConfig: networkConfig,
-		TeamID:        teamID,
-	}); err != nil {
-		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
+		h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
 	}
-
-	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 
 	c.Status(http.StatusNoContent)
 }
