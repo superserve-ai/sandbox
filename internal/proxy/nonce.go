@@ -4,6 +4,8 @@ import (
 	"container/list"
 	"sync"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
 // NonceCache is a bounded in-memory store of seen token nonces. It enforces
@@ -74,12 +76,14 @@ func NewNonceCache(maxEntries int, ttl time.Duration) *NonceCache {
 
 // DefaultNonceCache returns a cache with reasonable production defaults:
 //
-//   - 100,000 entries — at ~64 bytes each that's ~6 MB, well under any
-//     practical limit on a bare metal box
-//   - 2 minute TTL — comfortably above the 60s token TTL plus clock skew
-//     so a token that's accepted by the verifier is also tracked here
+//   - 100,000 entries — at ~200 bytes each (map entry + list element +
+//     payload) that's ~20 MB, comfortable on a bare metal box
+//   - TTL = DefaultTTL + MaxClockSkew (65 s) — exactly the window in
+//     which a token can verify successfully. Holding nonces longer
+//     wastes cache slots and gives a noisy tenant a wider eviction
+//     window against honest neighbours.
 func DefaultNonceCache() *NonceCache {
-	return NewNonceCache(100_000, 2*time.Minute)
+	return NewNonceCache(100_000, auth.DefaultTTL+auth.MaxClockSkew)
 }
 
 // CheckAndStore is the only operation callers need. It atomically checks

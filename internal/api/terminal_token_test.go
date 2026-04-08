@@ -74,8 +74,15 @@ func TestIssueTerminalToken_Success(t *testing.T) {
 	if !strings.HasPrefix(url, "wss://") {
 		t.Errorf("url should be wss://: %s", url)
 	}
-	if !strings.Contains(url, "/terminal?t=") {
-		t.Errorf("url missing /terminal?t= path: %s", url)
+	if !strings.HasSuffix(url, "/terminal") {
+		t.Errorf("url should end at /terminal (no query params): %s", url)
+	}
+	if strings.Contains(url, "?") {
+		t.Errorf("url must not contain query params (token leak risk): %s", url)
+	}
+	subprotocol, _ := body["subprotocol"].(string)
+	if subprotocol != TerminalSubprotocol {
+		t.Errorf("subprotocol = %q, want %q", subprotocol, TerminalSubprotocol)
 	}
 
 	// Round-trip the token through the verifier to confirm it's well-formed
@@ -92,8 +99,10 @@ func TestIssueTerminalToken_Success(t *testing.T) {
 	}
 }
 
-func TestIssueTerminalToken_IdleSandboxAllowed(t *testing.T) {
-	// Idle sandboxes are allowed because the WS bridge auto-wakes on connect.
+func TestIssueTerminalToken_IdleSandboxRejected(t *testing.T) {
+	// Idle sandboxes must be rejected — the bridge does not auto-wake,
+	// so issuing a token would mint an unusable capability. Caller must
+	// resume the sandbox first.
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 	signer, _ := newTestSigner(t)
@@ -111,8 +120,8 @@ func TestIssueTerminalToken_IdleSandboxAllowed(t *testing.T) {
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, tokenRequest(sandboxID.String()))
 
-	if w.Code != http.StatusOK {
-		t.Errorf("idle sandbox should be allowed, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Errorf("idle sandbox should be rejected with 409, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

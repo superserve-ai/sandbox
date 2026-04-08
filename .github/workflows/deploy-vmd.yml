@@ -67,7 +67,17 @@ jobs:
           # Public key for terminal token verification. Non-sensitive, lives
           # in GitHub Actions variables (not secrets). Empty string means the
           # /terminal endpoint stays disabled on the proxy.
+          #
+          # Validate the shape Python-side BEFORE interpolating into the
+          # remote bash script — a stray newline or shell metacharacter
+          # could otherwise inject extra environment lines into the proxy
+          # process. Ed25519 public keys serialize to exactly 44 chars of
+          # standard base64 (32 bytes -> 43 base64 chars + '=').
+          import re as _re
           terminal_pub = os.environ.get('TERMINAL_TOKEN_PUBLIC_KEY', '')
+          if terminal_pub and not _re.fullmatch(r'[A-Za-z0-9+/]{43}=', terminal_pub):
+              print('ERROR: TERMINAL_TOKEN_PUBLIC_KEY has invalid shape (want 44-char base64)', file=sys.stderr)
+              sys.exit(1)
 
           # Discover instances by label.
           result = subprocess.run([
@@ -198,9 +208,11 @@ jobs:
                   sudo systemctl enable proxy
 
                   # Write the terminal token public key env file. The key
-                  # itself is non-sensitive (designed to be shared), so we
-                  # pipe it through the SSH command line. Empty value means
-                  # the /terminal endpoint stays disabled.
+                  # itself is non-sensitive (designed to be shared); shape
+                  # validation already ran Python-side before this script
+                  # was rendered, so {terminal_pub} is guaranteed to be
+                  # exactly 44 base64 characters with no shell-special
+                  # bytes by the time it reaches bash.
                   sudo mkdir -p /etc/superserve
                   if [ -n "{terminal_pub}" ]; then
                       echo "TERMINAL_TOKEN_PUBLIC_KEY={terminal_pub}" | sudo tee /etc/superserve/proxy.env > /dev/null

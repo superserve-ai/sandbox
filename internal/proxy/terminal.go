@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,25 +25,39 @@ import (
 // be attached to the main Handler via WithTerminal. Kept unexported because
 // callers interact with it only through the Handler methods.
 type terminalBridgeDeps struct {
-	verifier *auth.Verifier
-	nonces   *NonceCache
+	verifier       *auth.Verifier
+	nonces         *NonceCache
+	allowedOrigins []string // Host patterns passed to websocket.Accept.OriginPatterns
 }
 
 // WithTerminal installs the dependencies the /terminal WebSocket bridge
 // needs. Call once at proxy startup with a verifier loaded from
-// TERMINAL_TOKEN_PUBLIC_KEY and a NonceCache (DefaultNonceCache is fine).
+// TERMINAL_TOKEN_PUBLIC_KEY, a NonceCache, and the browser origins allowed
+// to upgrade to a terminal WS.
 //
-// Passing nil for either argument panics — the proxy is about to bind a
-// listener and we want configuration errors to surface immediately, not as
-// nil-pointer crashes on the first real request.
-func (h *Handler) WithTerminal(verifier *auth.Verifier, nonces *NonceCache) *Handler {
+// allowedOrigins must be non-empty — passing an empty list would effectively
+// disable origin validation, defeating the point. If you genuinely need to
+// allow all origins during local dev, pass []string{"*"} explicitly so the
+// intent is visible in configuration.
+//
+// Passing a nil verifier or nonce cache panics; the proxy is about to bind
+// a listener and configuration errors should surface at startup, not on
+// the first real request.
+func (h *Handler) WithTerminal(verifier *auth.Verifier, nonces *NonceCache, allowedOrigins []string) *Handler {
 	if verifier == nil {
 		panic("proxy: WithTerminal requires a non-nil Verifier")
 	}
 	if nonces == nil {
 		panic("proxy: WithTerminal requires a non-nil NonceCache")
 	}
-	h.terminal = &terminalBridgeDeps{verifier: verifier, nonces: nonces}
+	if len(allowedOrigins) == 0 {
+		panic("proxy: WithTerminal requires at least one allowed origin (use \"*\" for dev)")
+	}
+	h.terminal = &terminalBridgeDeps{
+		verifier:       verifier,
+		nonces:         nonces,
+		allowedOrigins: allowedOrigins,
+	}
 	return h
 }
 
@@ -54,6 +69,30 @@ const (
 	// single HTTP endpoint exposed by the VM.
 	boxdPort = 49983
 
+	// terminalProtocol is the identifying WebSocket subprotocol echoed
+	// back on a successful upgrade. Bump the version if the wire format
+	// ever changes so older clients break loudly instead of silently
+	// misinterpreting frames.
+	terminalProtocol = "superserve.terminal.v1"
+
+	// tokenProtocolPrefix is how clients smuggle the auth token through
+	// the WebSocket handshake without putting it in a URL query param.
+	// Browser WebSocket APIs cannot set custom headers on upgrade, but
+	// they CAN set the Sec-WebSocket-Protocol header via the second arg
+	// of `new WebSocket(url, protocols)`. We look for an entry starting
+	// with this prefix and treat the suffix as the signed token. The
+	// server never echoes this value back — only terminalProtocol — so
+	// the token never lands in a response header or access log.
+	tokenProtocolPrefix = "token."
+
+	// maxReadBytes bounds the size of a single WebSocket frame we will
+	// accept from the browser. Terminal input frames are keystrokes,
+	// typically 1-10 bytes. 64 KiB is several orders of magnitude
+	// above legitimate traffic and protects boxd from a malicious
+	// client asking us to forward a huge SendInput payload for every
+	// "keystroke."
+	maxReadBytes = 64 * 1024
+
 	// writeWait is the max duration we wait for a WS write to complete
 	// before closing the connection. If the browser side is slow or
 	// unresponsive we want to free the PTY rather than block forever.
@@ -63,7 +102,15 @@ const (
 	// either direction before we tear it down. Protects against zombie
 	// connections (user closes laptop, leaves tab open, network drops
 	// without FIN). Re-set on every message in either direction.
-	idleCloseAfter = 30 * time.Minute
+	idleCloseAfter = 10 * time.Minute
+
+	// maxSessionDuration is a hard ceiling on a single terminal session
+	// regardless of traffic. Bounds the blast radius of a stolen WS
+	// connection — even if an attacker hijacks an active session and
+	// sends just enough traffic to keep the idle timer alive, the
+	// session still terminates after this duration. Clients should
+	// reconnect (and re-mint a token) for longer-running work.
+	maxSessionDuration = 4 * time.Hour
 
 	// initialTerminalCols / initialTerminalRows are the PTY dimensions
 	// we start the shell with. The browser will almost immediately send
@@ -108,9 +155,24 @@ type wsControlMessage struct {
 // Errors after the upgrade are sent as WebSocket close frames with codes
 // from the coder/websocket library.
 func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("t")
+	// The token is carried in the Sec-WebSocket-Protocol header, NOT the
+	// URL. This keeps the token out of GCP LB access logs, browser history,
+	// Referer headers on sub-resources, and any middleware request logger.
+	// See extractTerminalToken for the parser.
+	//
+	// Defence in depth: unconditionally scrub any ?t= query param before
+	// the request reaches any downstream logger, in case an older client
+	// still sends one.
+	r.URL.RawQuery = ""
+
+	// Discourage browsers from sending Referer on any sub-resource the
+	// handshake might spawn. Terminal upgrades don't produce sub-resources
+	// but the header is cheap and matches the "token is sensitive" posture.
+	w.Header().Set("Referrer-Policy", "no-referrer")
+
+	token := extractTerminalToken(r)
 	if token == "" {
-		http.Error(w, "missing token", http.StatusUnauthorized)
+		http.Error(w, "missing token (pass as Sec-WebSocket-Protocol: token.<value>)", http.StatusUnauthorized)
 		return
 	}
 
@@ -131,7 +193,13 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.terminal.nonces.CheckAndStore(payload.Nonce, time.Now()) {
+	// Namespace the dedupe key with the sandbox ID so a noisy tenant
+	// burning nonces against their own sandbox cannot LRU-evict an
+	// unrelated sandbox's nonces and enable replay against it. The
+	// signature already binds (sandboxID, nonce) so this is a structural
+	// reflection of the token contents, not a new trust assumption.
+	dedupeKey := payload.SandboxID + ":" + payload.Nonce
+	if !h.terminal.nonces.CheckAndStore(dedupeKey, time.Now()) {
 		h.log.Warn().
 			Str("sandbox_id", payload.SandboxID).
 			Str("nonce", payload.Nonce).
@@ -175,22 +243,41 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// From here on, errors go back through the WebSocket (if the upgrade
-	// succeeds) because we've committed to streaming. We use the coder
-	// library's AcceptOptions to lock down the origin check.
-	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// OriginPatterns: the browser sends Origin; we trust any
-		// origin because the token already proves the request is
-		// authorized. Origin is a CSRF defense for cookie-based auth,
-		// which we don't use here.
-		InsecureSkipVerify: true,
-		// CompressionMode: disable because PTY output is already
-		// binary and compression doesn't help terminal traffic.
+	// succeeds) because we've committed to streaming.
+	//
+	// Origin enforcement: Origin is a CSRF-like defense that stops a
+	// malicious page in the user's browser from leveraging a leaked or
+	// coerced token (e.g. via a mint-CSRF path) to open a live terminal.
+	// The set is configured at proxy startup. Passing `"*"` explicitly is
+	// how local dev opts out; the default is deny-unknown.
+	//
+	// Subprotocols: we declare terminalProtocol as the one we'll accept
+	// and echo. Clients must include it in their offered list. The
+	// token-carrier subprotocol (token.<value>) is NOT listed here, so
+	// coder/websocket will never echo it back in the handshake response.
+	acceptOpts := &websocket.AcceptOptions{
+		OriginPatterns:  h.terminal.allowedOrigins,
+		Subprotocols:    []string{terminalProtocol},
 		CompressionMode: websocket.CompressionDisabled,
-	})
+	}
+	// Explicit opt-out: a single "*" entry in allowed origins disables
+	// the check for dev. The config loader is responsible for only
+	// allowing this via an explicit env var.
+	if len(h.terminal.allowedOrigins) == 1 && h.terminal.allowedOrigins[0] == "*" {
+		acceptOpts.OriginPatterns = nil
+		acceptOpts.InsecureSkipVerify = true
+	}
+
+	ws, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("terminal: WS upgrade failed")
 		return
 	}
+
+	// Bound the size of any single input frame. Keystrokes are tiny;
+	// anything approaching 64 KiB is either a paste (legitimate but
+	// still bounded) or an attack trying to amplify into SendInput.
+	ws.SetReadLimit(maxReadBytes)
 
 	// Build the connect-rpc client to boxd. We use the transport cache so
 	// the bridge benefits from the same lifecycle keying and connection
@@ -259,8 +346,8 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 	pid := startEvent.GetPid()
 	l.Info().Uint32("pid", pid).Msg("terminal: bridge established")
 
-	// Idle timer — reset on every message in either direction. If no
-	// activity for idleCloseAfter we cancel the bridge context.
+	// Idle timer — reset on every message in either direction. Tears
+	// down sessions that have gone quiet for idleCloseAfter.
 	var idleMu sync.Mutex
 	lastActivity := time.Now()
 	touchIdle := func() {
@@ -268,12 +355,24 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 		lastActivity = time.Now()
 		idleMu.Unlock()
 	}
+
+	// Hard session deadline — independent of activity. Bounds the
+	// blast radius of a hijacked WS connection regardless of how
+	// chatty the attacker is. Clients should reconnect for sessions
+	// longer than this.
+	sessionDeadline := time.NewTimer(maxSessionDuration)
+	defer sessionDeadline.Stop()
+
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-bridgeCtx.Done():
+				return
+			case <-sessionDeadline.C:
+				l.Info().Dur("max", maxSessionDuration).Msg("terminal: max session reached, closing")
+				cancel()
 				return
 			case <-ticker.C:
 				idleMu.Lock()
@@ -410,6 +509,28 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 	default:
 		l.Debug().Str("type", msg.Type).Msg("terminal: unknown control type")
 	}
+}
+
+// extractTerminalToken pulls the signed token out of the
+// Sec-WebSocket-Protocol header. Clients include one entry of the form
+// `token.<value>` alongside the main terminalProtocol entry. This keeps
+// the token out of URLs, logs, and referrers.
+//
+// Multiple entries per header line are comma-separated per RFC 6455; we
+// also accept multiple header values. Entries are trimmed and compared
+// case-sensitively (the prefix is ASCII, no folding needed).
+//
+// Returns "" if no token entry is found. The caller logs and rejects.
+func extractTerminalToken(r *http.Request) string {
+	for _, hv := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, part := range strings.Split(hv, ",") {
+			p := strings.TrimSpace(part)
+			if strings.HasPrefix(p, tokenProtocolPrefix) {
+				return strings.TrimPrefix(p, tokenProtocolPrefix)
+			}
+		}
+	}
+	return ""
 }
 
 // signalNameToNumber maps POSIX signal names to their numeric values.

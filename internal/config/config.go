@@ -41,7 +41,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 
-	priv, err := loadOrGenerateTerminalKey(os.Getenv("TERMINAL_TOKEN_PRIVATE_KEY"))
+	priv, err := loadTerminalKey(os.Getenv("TERMINAL_TOKEN_PRIVATE_KEY"), os.Getenv("ALLOW_EPHEMERAL_TERMINAL_KEY") == "1")
 	if err != nil {
 		return nil, fmt.Errorf("TERMINAL_TOKEN_PRIVATE_KEY: %w", err)
 	}
@@ -56,23 +56,31 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// loadOrGenerateTerminalKey decodes the env-supplied Ed25519 private key,
-// or generates a fresh ephemeral one with a warning if no key is set. The
-// fallback exists so local `go run` works without ceremony — production
-// must always set the env var explicitly so the matching public key can be
-// distributed to the edge proxy out-of-band.
-func loadOrGenerateTerminalKey(envValue string) (ed25519.PrivateKey, error) {
+// loadTerminalKey decodes the env-supplied Ed25519 private key. Returns an
+// error if the env var is empty UNLESS the caller explicitly opted in to
+// an ephemeral key via ALLOW_EPHEMERAL_TERMINAL_KEY=1.
+//
+// The opt-in exists so `go test`, local `go run`, and CI jobs can work
+// without managing real secrets, but production startups that forget to
+// set TERMINAL_TOKEN_PRIVATE_KEY hard-fail at boot instead of silently
+// generating a per-replica key that will never verify against anything.
+//
+// Multi-replica control planes would generate a DIFFERENT ephemeral key
+// per replica, so every token would fail verification at the edge proxy
+// (which has a single stable public key). That failure mode is the one
+// this guard is designed to prevent from shipping to prod.
+func loadTerminalKey(envValue string, allowEphemeral bool) (ed25519.PrivateKey, error) {
 	if envValue == "" {
+		if !allowEphemeral {
+			return nil, fmt.Errorf("required in production; set ALLOW_EPHEMERAL_TERMINAL_KEY=1 to auto-generate for local dev")
+		}
 		pub, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			return nil, fmt.Errorf("generate ephemeral key: %w", err)
 		}
-		// Log the matching public key so a developer can paste it into
-		// their local edge proxy without restarting the control plane
-		// to find it.
 		log.Warn().
 			Str("public_key", base64.StdEncoding.EncodeToString(pub)).
-			Msg("TERMINAL_TOKEN_PRIVATE_KEY not set — generated ephemeral keypair (DO NOT USE IN PRODUCTION)")
+			Msg("TERMINAL_TOKEN_PRIVATE_KEY unset, ALLOW_EPHEMERAL_TERMINAL_KEY=1 — generated ephemeral keypair (DO NOT USE IN PRODUCTION)")
 		return priv, nil
 	}
 

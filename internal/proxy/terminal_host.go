@@ -3,8 +3,16 @@ package proxy
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 )
+
+// portPrefixLabel matches labels shaped like "1234-..." which belong to
+// the user-app routing format ({port}-{id}.{domain}), NOT the terminal
+// format ({id}.{domain}). We reject any such label in the terminal parser
+// so the two routing tables are cleanly separated and a crafted host can
+// never slip a port-labelled request through the terminal path.
+var portPrefixLabel = regexp.MustCompile(`^[0-9]+-`)
 
 // ParseTerminalHost extracts the instanceID from a Host header of the form
 // {instanceID}.{domain}, used by the terminal endpoint.
@@ -36,10 +44,14 @@ func ParseTerminalHost(host, domain string) (instanceID string, err error) {
 		return "", fmt.Errorf("proxy: terminal host %q has empty subdomain", host)
 	}
 
-	// The instance ID must NOT contain a port-style "n-..." prefix —
-	// that's the user app routing format and we want a clear separation.
-	// Terminal IDs are bare UUIDs (alphanumeric + hyphen, but the first
-	// segment of a UUID is always 8 hex chars so it's never numeric+dash).
+	// Reject port-prefix labels (e.g. "3000-abc") that belong to the
+	// user-app routing table. The regex enforces this structurally rather
+	// than relying on the coincidence that our current instance IDs happen
+	// to start with hex digits.
+	if portPrefixLabel.MatchString(label) {
+		return "", fmt.Errorf("proxy: terminal host label %q has port prefix (user-app format)", label)
+	}
+
 	if !validInstanceID.MatchString(label) {
 		return "", fmt.Errorf("proxy: terminal host instance ID %q contains invalid characters", label)
 	}

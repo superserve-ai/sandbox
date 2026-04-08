@@ -13,21 +13,32 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// terminalTokenResponse is what the browser receives. The fields are kept
-// minimal so the frontend can act without parsing or constructing URLs:
+// terminalTokenResponse is what the browser receives.
 //
-//   - token: opaque, paste straight into the WebSocket URL.
-//   - url:   fully-formed wss:// URL the browser opens directly. Includes
-//     the token as a query param because browser WebSocket APIs cannot set
-//     custom headers on the upgrade request.
-//   - expires_at: ISO-8601 expiry, so the frontend can pre-fetch a fresh
-//     token before the current one expires (mostly defensive — TTL is 60s
-//     and the WS upgrade happens immediately).
+//   - token:      the signed capability. Opaque to the client.
+//   - url:        fully-formed wss:// URL the browser opens. Does NOT
+//     contain the token — see the note in IssueTerminalToken for why.
+//   - subprotocol: the main WebSocket subprotocol the server expects and
+//     will echo back. The client should pass
+//     [subprotocol, "token." + token] as the protocols arg to
+//     `new WebSocket(url, protocols)`. The server parses the token from
+//     the `token.` entry and acknowledges only the subprotocol entry.
+//   - expires_at: ISO-8601 expiry (default TTL 60s). Defensive — the WS
+//     upgrade should happen immediately so the TTL never matters in
+//     practice.
 type terminalTokenResponse struct {
-	Token     string    `json:"token"`
-	URL       string    `json:"url"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Token       string    `json:"token"`
+	URL         string    `json:"url"`
+	Subprotocol string    `json:"subprotocol"`
+	ExpiresAt   time.Time `json:"expires_at"`
 }
+
+// TerminalSubprotocol is the fixed subprotocol identifier browsers must
+// offer as their first WebSocket subprotocol when connecting to
+// /terminal. Kept in sync with internal/proxy.terminalProtocol. Exported
+// as a constant so the OpenAPI response example stays correct and tests
+// can assert on it.
+const TerminalSubprotocol = "superserve.terminal.v1"
 
 // IssueTerminalToken mints a short-lived signed token that grants the caller
 // a WebSocket-upgraded PTY session to the named sandbox via the edge proxy.
@@ -62,13 +73,10 @@ func (h *Handlers) IssueTerminalToken(c *gin.Context) {
 		return
 	}
 
-	// Verify sandbox exists, belongs to this team, and is in a usable
-	// state. We deliberately allow `idle` here because the WS bridge will
-	// wake the sandbox on connect — issuing a token to a paused sandbox
-	// is the natural UX (the user clicked "open terminal" on a paused
-	// box). We do NOT issue tokens for transient states (starting,
-	// pausing) or terminal states (failed, deleted) — those are bugs
-	// waiting to happen at the bridge layer.
+	// Verify sandbox exists, belongs to this team, and is active. Only
+	// `active` is allowed — the edge proxy bridge does not auto-wake,
+	// so issuing a token to an idle sandbox would mint a capability that
+	// cannot be used. Callers must resume first, then mint.
 	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
 		ID:     sandboxID,
 		TeamID: teamID,
@@ -83,13 +91,9 @@ func (h *Handlers) IssueTerminalToken(c *gin.Context) {
 		return
 	}
 
-	switch sandbox.Status {
-	case db.SandboxStatusActive, db.SandboxStatusIdle:
-		// OK — terminal can be opened directly (active) or after the
-		// edge proxy triggers an auto-wake (idle).
-	default:
+	if sandbox.Status != db.SandboxStatusActive {
 		respondErrorMsg(c, "conflict",
-			fmt.Sprintf("sandbox is %s, terminal not available", sandbox.Status),
+			fmt.Sprintf("sandbox is %s, resume it before opening a terminal", sandbox.Status),
 			http.StatusConflict)
 		return
 	}
@@ -102,16 +106,23 @@ func (h *Handlers) IssueTerminalToken(c *gin.Context) {
 		return
 	}
 
-	// Construct the wss URL the browser should connect to. We hand back
-	// a fully-formed URL so the frontend doesn't have to know our host
-	// scheme — that lets us migrate the URL pattern later (e.g. moving
-	// from `{id}.sandbox.superserve.ai` to a regional sub-domain) without
-	// touching the frontend.
-	url := fmt.Sprintf("wss://%s.%s/terminal?t=%s", sandboxID.String(), h.Config.EdgeProxyDomain, token)
+	// Construct the wss URL the browser should connect to. The token is
+	// NOT embedded in the URL — it goes in the Sec-WebSocket-Protocol
+	// header at connect time. Browsers cannot set arbitrary headers on
+	// WebSocket upgrade, but they CAN pass subprotocols via
+	// `new WebSocket(url, protocols)`. The frontend must include
+	// `["superserve.terminal.v1", "token." + token]` in that array; the
+	// proxy picks the first (echoes it back) and validates the second.
+	//
+	// Putting the token in the URL would leak it to LB access logs,
+	// browser history, any Referer header on sub-resources, and any
+	// request-logging middleware. Subprotocol headers are not logged.
+	url := fmt.Sprintf("wss://%s.%s/terminal", sandboxID.String(), h.Config.EdgeProxyDomain)
 
 	c.JSON(http.StatusOK, terminalTokenResponse{
-		Token:     token,
-		URL:       url,
-		ExpiresAt: now.Add(auth.DefaultTTL),
+		Token:       token,
+		URL:         url,
+		Subprotocol: TerminalSubprotocol,
+		ExpiresAt:   now.Add(auth.DefaultTTL),
 	})
 }
