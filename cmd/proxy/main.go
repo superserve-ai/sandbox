@@ -84,10 +84,29 @@ func main() {
 	}
 
 	// Wrap with a health check endpoint for the GCP LB health probe.
-	// The LB hits /health directly on the instance IP (not a sandbox URL),
-	// so the proxy handler would reject it — intercept it first.
+	// The LB hits /health directly on the instance IP (not a sandbox
+	// URL), so the proxy handler would reject it — intercept it first.
+	//
+	// Important: we only answer 200 when the request is NOT addressed
+	// at a sandbox host. If a caller sends /health with a sandbox
+	// Host header (e.g. `boxd-<id>.sandbox.superserve.ai/health`), we
+	// fall through to the proxy handler so the boxd-label lockdown
+	// can 404 it normally. Otherwise the global /health handler would
+	// punch a hole in the documented "every non-allowlisted path
+	// under boxd- returns 404" promise.
+	domainSuffix := "." + domain
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		if strings.HasSuffix(host, domainSuffix) {
+			// Sandbox-addressed /health — defer to the proxy
+			// handler so the boxd-label lockdown applies.
+			proxyHandler.ServeHTTP(w, r)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.Handle("/", proxyHandler)
