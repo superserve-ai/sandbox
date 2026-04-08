@@ -2,11 +2,9 @@ package vm
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"time"
 
 	"connectrpc.com/connect"
@@ -179,61 +177,11 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 }
 
 // boxdFilesystemClient returns a Connect RPC client for the FilesystemService.
+// This is the only surviving boxd file client on the VMD side — raw HTTP
+// content transfer (uploadFile/downloadFile, boxdFileURL) was removed
+// when file bytes moved onto the edge proxy's /files path. Metadata
+// operations (Remove, Move, etc.) still go through this Connect client.
 func boxdFilesystemClient(vmIP string) boxdpbconnect.FilesystemServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
 	return boxdpbconnect.NewFilesystemServiceClient(http.DefaultClient, baseURL)
-}
-
-// boxdFileURL returns the HTTP URL for file operations.
-func boxdFileURL(vmIP, path string) string {
-	return fmt.Sprintf("http://%s:%d/files?path=%s", vmIP, boxdPort, url.QueryEscape(path))
-}
-
-// uploadFile uploads content to a file inside a VM via raw HTTP.
-func uploadFile(ctx context.Context, vmIP, filePath string, content io.Reader) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, boxdFileURL(vmIP, filePath), content)
-	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("upload file: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("upload failed (status %d): %s", resp.StatusCode, body)
-	}
-
-	var result struct {
-		Size int64 `json:"size"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, fmt.Errorf("decode response: %w", err)
-	}
-	return result.Size, nil
-}
-
-// downloadFile downloads a file from a VM via raw HTTP.
-func downloadFile(ctx context.Context, vmIP, filePath string) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, boxdFileURL(vmIP, filePath), nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("download file: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, fmt.Errorf("download failed (status %d): %s", resp.StatusCode, body)
-	}
-
-	return resp.Body, nil
 }

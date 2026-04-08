@@ -2,8 +2,6 @@ package vm
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"time"
 
 	"google.golang.org/grpc"
@@ -219,89 +217,6 @@ func (a *GRPCAdapter) SetupNetwork(ctx context.Context, req *vmdpb.SetupNetworkR
 		GatewayIp:  info.GatewayIP,
 		MacAddress: info.MACAddress,
 	}, nil
-}
-
-func (a *GRPCAdapter) UploadFile(stream grpc.ClientStreamingServer[vmdpb.UploadFileRequest, vmdpb.UploadFileResponse]) error {
-	// First message must contain vm_id and path.
-	first, err := stream.Recv()
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "failed to receive first message: %v", err)
-	}
-	vmID := first.GetVmId()
-	path := first.GetPath()
-	if vmID == "" || path == "" {
-		return status.Error(codes.InvalidArgument, "vm_id and path are required in the first message")
-	}
-
-	// Collect all data chunks into a buffer via io.Pipe so the Manager
-	// streams directly to boxd without buffering the entire file.
-	pr, pw := io.Pipe()
-	var uploadErr error
-	var bytesWritten int64
-
-	go func() {
-		defer pw.Close()
-		// Write first message's data if present.
-		if len(first.GetData()) > 0 {
-			if _, err := pw.Write(first.GetData()); err != nil {
-				return
-			}
-		}
-		for {
-			msg, err := stream.Recv()
-			if err == io.EOF {
-				return
-			}
-			if err != nil {
-				pw.CloseWithError(fmt.Errorf("recv: %w", err))
-				return
-			}
-			if len(msg.GetData()) > 0 {
-				if _, err := pw.Write(msg.GetData()); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	bytesWritten, uploadErr = a.mgr.UploadFile(stream.Context(), vmID, path, pr)
-	if uploadErr != nil {
-		return status.Errorf(codes.Internal, "upload file: %v", uploadErr)
-	}
-
-	return stream.SendAndClose(&vmdpb.UploadFileResponse{
-		BytesWritten: bytesWritten,
-	})
-}
-
-func (a *GRPCAdapter) DownloadFile(req *vmdpb.DownloadFileRequest, stream grpc.ServerStreamingServer[vmdpb.DownloadFileChunk]) error {
-	if req.GetVmId() == "" || req.GetPath() == "" {
-		return status.Error(codes.InvalidArgument, "vm_id and path are required")
-	}
-
-	reader, err := a.mgr.DownloadFile(stream.Context(), req.GetVmId(), req.GetPath())
-	if err != nil {
-		return status.Errorf(codes.Internal, "download file: %v", err)
-	}
-	defer reader.Close()
-
-	buf := make([]byte, 64*1024) // 64KB chunks
-	for {
-		n, readErr := reader.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			if sendErr := stream.Send(&vmdpb.DownloadFileChunk{Data: chunk}); sendErr != nil {
-				return sendErr
-			}
-		}
-		if readErr == io.EOF {
-			return nil
-		}
-		if readErr != nil {
-			return status.Errorf(codes.Internal, "read file: %v", readErr)
-		}
-	}
 }
 
 func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.UpdateSandboxNetworkRequest) (*vmdpb.UpdateSandboxNetworkResponse, error) {

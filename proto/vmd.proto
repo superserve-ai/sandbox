@@ -33,14 +33,15 @@ service VMDaemon {
   // SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
   rpc SetupNetwork(SetupNetworkRequest) returns (SetupNetworkResponse);
 
-  // UploadFile streams file content into a VM.
-  rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
-
-  // DownloadFile streams file content out of a VM.
-  rpc DownloadFile(DownloadFileRequest) returns (stream DownloadFileChunk);
-
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
+
+  // File transfer used to live here as UploadFile / DownloadFile RPCs.
+  // Those have been removed: file bytes now flow directly from clients
+  // to boxd via the edge proxy's /files endpoint, authorized by a
+  // short-lived signed token minted at POST /sandboxes/:id/file-token.
+  // The control plane is no longer in the byte path. See
+  // docs/sdk/file-api.md for the replacement contract.
 }
 
 // ---------------------------------------------------------------------------
@@ -247,33 +248,6 @@ message SetupNetworkResponse {
   string vm_ip = 3;
   string gateway_ip = 4;
   string mac_address = 5;
-}
-
-// ---------------------------------------------------------------------------
-// UploadFile
-// ---------------------------------------------------------------------------
-
-message UploadFileRequest {
-  string vm_id = 1;   // Set in the first message of the stream.
-  string path = 2;    // Set in the first message of the stream.
-  bytes data = 3;     // File content chunks (all messages).
-}
-
-message UploadFileResponse {
-  int64 bytes_written = 1;
-}
-
-// ---------------------------------------------------------------------------
-// DownloadFile
-// ---------------------------------------------------------------------------
-
-message DownloadFileRequest {
-  string vm_id = 1;
-  string path = 2;
-}
-
-message DownloadFileChunk {
-  bytes data = 1;
 }
 
 // ---------------------------------------------------------------------------

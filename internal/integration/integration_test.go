@@ -132,13 +132,6 @@ func (s *stubVMD) ExecCommandStream(_ context.Context, _, _ string, _ []string, 
 	onChunk(nil, nil, 0, true)
 	return nil
 }
-func (s *stubVMD) UploadFile(_ context.Context, _, _ string, r io.Reader) (int64, error) {
-	n, _ := io.Copy(io.Discard, r)
-	return n, nil
-}
-func (s *stubVMD) DownloadFile(_ context.Context, _, _ string) (io.ReadCloser, error) {
-	return io.NopCloser(strings.NewReader("file-content")), nil
-}
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
@@ -648,53 +641,10 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// PUT + GET /sandboxes/:id/files/*path
-// ---------------------------------------------------------------------------
-
-func TestIntegration_FileUploadDownload(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"file-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	// Upload.
-	uw := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/home/user/test.txt", apiKey, []byte("hello sandbox file"))
-	if uw.Code != http.StatusOK {
-		t.Fatalf("upload: expected 200, got %d: %s", uw.Code, uw.Body.String())
-	}
-	ub := mustJSON(t, uw)
-	if ub["path"] != "/home/user/test.txt" {
-		t.Errorf("upload path = %q, want /home/user/test.txt", ub["path"])
-	}
-
-	// Download.
-	dw := do(r, "GET", "/sandboxes/"+sid+"/files/home/user/test.txt", apiKey, "")
-	if dw.Code != http.StatusOK {
-		t.Fatalf("download: expected 200, got %d: %s", dw.Code, dw.Body.String())
-	}
-	if dw.Body.String() != "file-content" { // stubVMD always returns "file-content"
-		t.Errorf("download body = %q, want file-content", dw.Body.String())
-	}
-}
-
-func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pt-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	w := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/../../../etc/passwd", apiKey, []byte("x"))
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for path traversal, got %d", w.Code)
-	}
-}
+// File upload/download used to have a control-plane integration test
+// here (PUT/GET /sandboxes/:id/files/*path). That API was removed when
+// file bytes moved onto the edge proxy's /files endpoint; the direct
+// edge-proxy path is covered by its own tests in internal/proxy.
 
 // ---------------------------------------------------------------------------
 // Team isolation

@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/netip"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,8 +29,6 @@ type VMDClient interface {
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, err error)
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
-	UploadFile(ctx context.Context, instanceID, path string, content io.Reader) (int64, error)
-	DownloadFile(ctx context.Context, instanceID, path string) (io.ReadCloser, error)
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
@@ -409,79 +405,17 @@ func (h *Handlers) ExecCommand(c *gin.Context) {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// Files
-// ---------------------------------------------------------------------------
-
-func (h *Handlers) UploadFile(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	bytesWritten, err := h.VMD.UploadFile(c.Request.Context(), instanceID.String(), filePath, c.Request.Body)
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("file upload failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"path": filePath, "size": bytesWritten})
-}
-
-func (h *Handlers) DownloadFile(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	reader, err := h.VMD.DownloadFile(c.Request.Context(), instanceID.String(), filePath)
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("file download failed")
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "not found") {
-			respondErrorMsg(c, "not_found",
-				fmt.Sprintf("File not found: %s", filePath),
-				http.StatusNotFound)
-		} else {
-			respondError(c, ErrInternal)
-		}
-		return
-	}
-	defer reader.Close()
-
-	c.Header("Content-Type", "application/octet-stream")
-	c.Status(http.StatusOK)
-	io.Copy(c.Writer, reader)
-}
+// File upload and download used to live here as UploadFile/DownloadFile
+// handlers that streamed through the VMD gRPC `UploadFile`/`DownloadFile`
+// RPCs. Both the HTTP endpoints and their gRPC backing have been removed:
+// the data plane for file bytes is now the edge proxy's /files endpoint,
+// reached by minting a short-lived signed token at
+// POST /sandboxes/:id/file-token. See docs/sdk/file-api.md for the
+// contract SDK authors should build against.
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-func cleanFilePath(raw string) (string, error) {
-	raw = strings.TrimPrefix(raw, "/")
-	if raw == "" {
-		return "", fmt.Errorf("file path is required")
-	}
-	if strings.Contains(raw, "..") {
-		return "", fmt.Errorf("path traversal not allowed")
-	}
-	cleaned := filepath.Clean("/" + raw)
-	return cleaned, nil
-}
 
 func parseInstanceID(c *gin.Context) (uuid.UUID, error) {
 	raw := c.Param("instance_id")
@@ -1097,74 +1031,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		"status":      "idle",
 		"snapshot_id": snapshot.ID.String(),
 	})
-}
-
-// ---------------------------------------------------------------------------
-// Sandbox Files
-// ---------------------------------------------------------------------------
-
-// UploadSandboxFile uploads a file to a sandbox. The sandbox is loaded and
-// auto-woken by the AutoWake middleware.
-func (h *Handlers) UploadSandboxFile(c *gin.Context) {
-	sandbox := sandboxFromContext(c)
-	if sandbox == nil {
-		respondError(c, ErrInternal)
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	bytesWritten, err := h.VMD.UploadFile(c.Request.Context(), sandbox.ID.String(), filePath, c.Request.Body)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("sandbox file upload failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
-
-	c.JSON(http.StatusOK, gin.H{"path": filePath, "size": bytesWritten})
-}
-
-// DownloadSandboxFile downloads a file from a sandbox. The sandbox is loaded
-// and auto-woken by the AutoWake middleware.
-func (h *Handlers) DownloadSandboxFile(c *gin.Context) {
-	sandbox := sandboxFromContext(c)
-	if sandbox == nil {
-		respondError(c, ErrInternal)
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	reader, err := h.VMD.DownloadFile(c.Request.Context(), sandbox.ID.String(), filePath)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("sandbox file download failed")
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "not found") {
-			respondErrorMsg(c, "not_found",
-				fmt.Sprintf("File not found: %s", filePath),
-				http.StatusNotFound)
-		} else {
-			respondError(c, ErrInternal)
-		}
-		return
-	}
-	defer reader.Close()
-
-	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
-
-	c.Header("Content-Type", "application/octet-stream")
-	c.Status(http.StatusOK)
-	io.Copy(c.Writer, reader)
 }
 
 // ---------------------------------------------------------------------------

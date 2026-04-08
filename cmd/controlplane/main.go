@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -241,91 +240,6 @@ func (c *grpcVMDClient) ExecCommandStream(ctx context.Context, vmID, command str
 			return nil
 		}
 	}
-}
-
-func (c *grpcVMDClient) UploadFile(ctx context.Context, vmID, path string, content io.Reader) (int64, error) {
-	stream, err := c.client.UploadFile(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("gRPC UploadFile: %w", err)
-	}
-
-	buf := make([]byte, 64*1024)
-	first := true
-	for {
-		n, readErr := content.Read(buf)
-		if n > 0 || first {
-			msg := &vmdpb.UploadFileRequest{Data: buf[:n]}
-			if first {
-				msg.VmId = vmID
-				msg.Path = path
-				first = false
-			}
-			if err := stream.Send(msg); err != nil {
-				return 0, fmt.Errorf("gRPC UploadFile send: %w", err)
-			}
-		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				return 0, fmt.Errorf("gRPC UploadFile read content: %w", readErr)
-			}
-			break
-		}
-	}
-
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return 0, fmt.Errorf("gRPC UploadFile close: %w", err)
-	}
-	return resp.BytesWritten, nil
-}
-
-func (c *grpcVMDClient) DownloadFile(ctx context.Context, vmID, path string) (io.ReadCloser, error) {
-	streamCtx, streamCancel := context.WithCancel(ctx)
-
-	stream, err := c.client.DownloadFile(streamCtx, &vmdpb.DownloadFileRequest{
-		VmId: vmID,
-		Path: path,
-	})
-	if err != nil {
-		streamCancel()
-		return nil, fmt.Errorf("gRPC DownloadFile: %w", err)
-	}
-
-	first, err := stream.Recv()
-	if err != nil {
-		streamCancel()
-		if err == io.EOF {
-			return io.NopCloser(strings.NewReader("")), nil
-		}
-		return nil, fmt.Errorf("gRPC DownloadFile: %w", err)
-	}
-
-	pr, pw := io.Pipe()
-	go func() {
-		defer pw.Close()
-		defer streamCancel()
-		if len(first.Data) > 0 {
-			if _, err := pw.Write(first.Data); err != nil {
-				return
-			}
-		}
-		for {
-			resp, err := stream.Recv()
-			if err != nil {
-				if err != io.EOF {
-					pw.CloseWithError(fmt.Errorf("gRPC DownloadFile recv: %w", err))
-				}
-				return
-			}
-			if len(resp.Data) > 0 {
-				if _, err := pw.Write(resp.Data); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	return pr, nil
 }
 
 func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
