@@ -405,14 +405,6 @@ func (h *Handlers) ExecCommand(c *gin.Context) {
 	})
 }
 
-// File upload and download used to live here as UploadFile/DownloadFile
-// handlers that streamed through the VMD gRPC `UploadFile`/`DownloadFile`
-// RPCs. Both the HTTP endpoints and their gRPC backing have been removed:
-// the data plane for file bytes is now the edge proxy's /files endpoint,
-// reached by minting a short-lived signed token at
-// POST /sandboxes/:id/file-token. See docs/sdk/file-api.md for the
-// contract SDK authors should build against.
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

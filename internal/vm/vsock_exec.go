@@ -176,11 +176,9 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 	return fmt.Errorf("boxd health check not ready after %s", timeout)
 }
 
-// boxdFilesystemClient returns a Connect RPC client for the FilesystemService.
-// This is the only surviving boxd file client on the VMD side — raw HTTP
-// content transfer (uploadFile/downloadFile, boxdFileURL) was removed
-// when file bytes moved onto the edge proxy's /files path. Metadata
-// operations (Remove, Move, etc.) still go through this Connect client.
+// boxdFilesystemClient returns a Connect RPC client for boxd's
+// FilesystemService, used for metadata ops (Remove, Move, etc.) inside
+// a VM. File byte transfer goes through the edge proxy directly.
 func boxdFilesystemClient(vmIP string) boxdpbconnect.FilesystemServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
 	return boxdpbconnect.NewFilesystemServiceClient(http.DefaultClient, baseURL)

@@ -831,9 +831,8 @@ func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, t
 }
 
 // ---------------------------------------------------------------------------
-// File operations (Connect RPC for metadata; byte transfer has moved to
-// the edge proxy — UploadFile/DownloadFile were removed when the data
-// plane was cut over to the direct edge-proxy /files path.)
+// File operations (Connect RPC for metadata only; byte transfer lives
+// on the edge proxy's /files endpoint.)
 // ---------------------------------------------------------------------------
 
 // DeleteFile removes a file or directory inside a running VM via Connect RPC.

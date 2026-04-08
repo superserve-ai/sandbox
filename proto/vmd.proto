@@ -35,13 +35,6 @@ service VMDaemon {
 
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
-
-  // File transfer used to live here as UploadFile / DownloadFile RPCs.
-  // Those have been removed: file bytes now flow directly from clients
-  // to boxd via the edge proxy's /files endpoint, authorized by a
-  // short-lived signed token minted at POST /sandboxes/:id/file-token.
-  // The control plane is no longer in the byte path. See
-  // docs/sdk/file-api.md for the replacement contract.
 }
 
 // ---------------------------------------------------------------------------

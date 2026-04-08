@@ -641,11 +641,6 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 	}
 }
 
-// File upload/download used to have a control-plane integration test
-// here (PUT/GET /sandboxes/:id/files/*path). That API was removed when
-// file bytes moved onto the edge proxy's /files endpoint; the direct
-// edge-proxy path is covered by its own tests in internal/proxy.
-
 // ---------------------------------------------------------------------------
 // Team isolation
 // ---------------------------------------------------------------------------

@@ -201,8 +201,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.Host = r.Host
 			// Strip all forwarding headers — a client could inject these to
 			// spoof origin info that boxd or user apps might trust.
+			// X-Forwarded-For needs an explicit nil assignment because
+			// httputil.ReverseProxy re-appends it after the Director
+			// runs unless the slot is the nil slice.
+			req.Header["X-Forwarded-For"] = nil
 			for _, h := range []string{
-				"X-Forwarded-For",
 				"X-Forwarded-Host",
 				"X-Forwarded-Proto",
 				"X-Real-Ip",
