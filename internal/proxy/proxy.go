@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
 // Timeout constants.
@@ -58,12 +60,26 @@ type Handler struct {
 	ipConns      *connLimiter
 	log          zerolog.Logger
 
-	// terminal holds the dependencies for the /terminal WebSocket bridge.
-	// Set via WithTerminal — nil means the /terminal path falls through to
-	// the generic reverse proxy and likely 404s (there's no boxd endpoint
-	// at /terminal today), which is the safe default if a proxy is
-	// deployed without terminal config.
+	// verifier and nonces are the shared auth dependencies for every
+	// data-plane endpoint gated by a signed token (/terminal, /files).
+	// Installed once via WithTerminal or WithFiles — both call into the
+	// same internal setter. Kept on the Handler (rather than duplicated
+	// per feature-group struct) so the authorizeSandboxRequest helper
+	// can reach them without each caller having to plumb them through.
+	verifier *auth.Verifier
+	nonces   *NonceCache
+
+	// terminal holds the dependencies specific to the /terminal WebSocket
+	// bridge (allowed browser origins for the Origin check). Nil means
+	// the /terminal path is disabled and upgrades will 404 — the safe
+	// default when a proxy is deployed without terminal config.
 	terminal *terminalBridgeDeps
+
+	// filesEnabled controls whether /files on boxdPort is served. When
+	// false, every request addressed at boxdPort returns 404 regardless
+	// of path — boxd's internal connect-rpc services must never be
+	// exposed through the edge proxy without a scoped token gate.
+	filesEnabled bool
 }
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
@@ -121,6 +137,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// that may be bound on the VM's network interface.
 	if port < minProxiedPort {
 		http.Error(w, "port not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Boxd traffic (port 49983) is handled by a dedicated, token-gated
+	// path. Everything on that port — even outside /files — must never
+	// fall through to the generic reverse proxy, because that would
+	// expose the in-VM connect-rpc services (ProcessService,
+	// FilesystemService) directly to any internet caller who can guess
+	// an instance ID. The file bridge allowlists /files only; anything
+	// else on the boxd port is refused.
+	if port == boxdPort {
+		h.serveBoxdPort(w, r, instanceID)
 		return
 	}
 

@@ -21,13 +21,39 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
-// terminalBridgeDeps groups everything the terminal handler needs so it can
-// be attached to the main Handler via WithTerminal. Kept unexported because
-// callers interact with it only through the Handler methods.
+// terminalBridgeDeps holds the dependencies specific to the /terminal
+// WebSocket bridge. The shared verifier and nonce cache live on the
+// Handler itself (see WithAuth / authorizeSandboxRequest), so all that
+// remains here is the list of browser origins allowed to upgrade.
 type terminalBridgeDeps struct {
-	verifier       *auth.Verifier
-	nonces         *NonceCache
 	allowedOrigins []string // Host patterns passed to websocket.Accept.OriginPatterns
+}
+
+// installAuth wires the shared verifier and nonce cache used by every
+// token-gated data-plane endpoint (/terminal, /files). Both WithTerminal
+// and WithFiles funnel through this so callers can install either feature
+// first and still share the same auth state.
+//
+// Called more than once with the same pair is a no-op; called with a
+// different verifier or cache panics — quietly swapping crypto keys at
+// runtime is an invitation to footguns, and an accidental double-install
+// with mismatched objects is a configuration bug we want to surface
+// immediately at startup.
+func (h *Handler) installAuth(verifier *auth.Verifier, nonces *NonceCache) {
+	if verifier == nil {
+		panic("proxy: auth install requires a non-nil Verifier")
+	}
+	if nonces == nil {
+		panic("proxy: auth install requires a non-nil NonceCache")
+	}
+	if h.verifier != nil && h.verifier != verifier {
+		panic("proxy: auth install called with a different Verifier")
+	}
+	if h.nonces != nil && h.nonces != nonces {
+		panic("proxy: auth install called with a different NonceCache")
+	}
+	h.verifier = verifier
+	h.nonces = nonces
 }
 
 // WithTerminal installs the dependencies the /terminal WebSocket bridge
@@ -44,20 +70,23 @@ type terminalBridgeDeps struct {
 // a listener and configuration errors should surface at startup, not on
 // the first real request.
 func (h *Handler) WithTerminal(verifier *auth.Verifier, nonces *NonceCache, allowedOrigins []string) *Handler {
-	if verifier == nil {
-		panic("proxy: WithTerminal requires a non-nil Verifier")
-	}
-	if nonces == nil {
-		panic("proxy: WithTerminal requires a non-nil NonceCache")
-	}
 	if len(allowedOrigins) == 0 {
 		panic("proxy: WithTerminal requires at least one allowed origin (use \"*\" for dev)")
 	}
-	h.terminal = &terminalBridgeDeps{
-		verifier:       verifier,
-		nonces:         nonces,
-		allowedOrigins: allowedOrigins,
-	}
+	h.installAuth(verifier, nonces)
+	h.terminal = &terminalBridgeDeps{allowedOrigins: allowedOrigins}
+	return h
+}
+
+// WithFiles enables the /files HTTP reverse proxy on boxdPort. It shares
+// the same verifier and nonce cache as the terminal bridge (installing
+// both is idempotent as long as the same instances are reused).
+//
+// Must be called at proxy startup — like WithTerminal, misconfiguration
+// panics rather than degrading silently.
+func (h *Handler) WithFiles(verifier *auth.Verifier, nonces *NonceCache) *Handler {
+	h.installAuth(verifier, nonces)
+	h.filesEnabled = true
 	return h
 }
 
@@ -176,38 +205,10 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, err := h.terminal.verifier.Verify(token, time.Now(), auth.ScopeTerminal)
-	if err != nil {
-		h.log.Warn().Err(err).Msg("terminal: token verify failed")
-		// Map fine-grained errors to specific statuses so the frontend
-		// can show useful messages (expired = re-mint, bad sig =
-		// auth failure).
-		switch {
-		case errors.Is(err, auth.ErrExpired), errors.Is(err, auth.ErrNotYetValid):
-			http.Error(w, "token expired", http.StatusUnauthorized)
-		case errors.Is(err, auth.ErrBadSignature), errors.Is(err, auth.ErrScopeMismatch):
-			http.Error(w, "invalid token", http.StatusUnauthorized)
-		default:
-			http.Error(w, "bad token", http.StatusBadRequest)
-		}
-		return
-	}
-
-	// Namespace the dedupe key with the sandbox ID so a noisy tenant
-	// burning nonces against their own sandbox cannot LRU-evict an
-	// unrelated sandbox's nonces and enable replay against it. The
-	// signature already binds (sandboxID, nonce) so this is a structural
-	// reflection of the token contents, not a new trust assumption.
-	dedupeKey := payload.SandboxID + ":" + payload.Nonce
-	if !h.terminal.nonces.CheckAndStore(dedupeKey, time.Now()) {
-		h.log.Warn().
-			Str("sandbox_id", payload.SandboxID).
-			Str("nonce", payload.Nonce).
-			Msg("terminal: token replay rejected")
-		http.Error(w, "token already used", http.StatusUnauthorized)
-		return
-	}
-
+	// ParseTerminalHost extracts the instance ID from a bare
+	// `{id}.{domain}` host (no port label) — the terminal URL shape is
+	// distinct from the `{port}-{id}.{domain}` shape used for /files and
+	// user application ports, so we cannot reuse ParseHost here.
 	instanceID, err := ParseTerminalHost(r.Host, h.domain)
 	if err != nil {
 		h.log.Warn().Err(err).Str("host", r.Host).Msg("terminal: bad host")
@@ -215,30 +216,18 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := auth.SameSandbox(payload, instanceID); err != nil {
-		// Token was minted for a different sandbox than the one being
-		// addressed. Could be a misconfigured frontend or an active
-		// attempt to swap sandboxes with a valid token.
-		h.log.Warn().
-			Str("token_sandbox", payload.SandboxID).
-			Str("host_sandbox", instanceID).
-			Msg("terminal: sandbox mismatch")
-		http.Error(w, "token does not match sandbox", http.StatusForbidden)
-		return
-	}
-
-	info, err := h.resolver.Lookup(r.Context(), instanceID)
-	if err != nil {
-		if errors.Is(err, ErrInstanceNotFound) {
-			http.Error(w, "sandbox not found", http.StatusNotFound)
-			return
+	payload, info, fail := h.authorizeSandboxRequest(
+		r.Context(), token, auth.ScopeTerminal, instanceID, time.Now(),
+	)
+	if fail != nil {
+		if fail.LogMsg != "" {
+			evt := h.log.Warn().Str("sandbox_id", instanceID)
+			if fail.LogKV[0] != "" {
+				evt = evt.Str(fail.LogKV[0], fail.LogKV[1])
+			}
+			evt.Msg("terminal: " + fail.LogMsg)
 		}
-		h.log.Error().Err(err).Str("instance", instanceID).Msg("terminal: resolver error")
-		http.Error(w, "sandbox unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	if info.Status != "running" {
-		http.Error(w, fmt.Sprintf("sandbox is %s", info.Status), http.StatusServiceUnavailable)
+		fail.write(w)
 		return
 	}
 
