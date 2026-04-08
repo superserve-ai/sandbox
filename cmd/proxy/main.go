@@ -21,6 +21,7 @@ func main() {
 		Logger()
 
 	addr := envOrDefault("PROXY_ADDR", ":5007")
+	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
 	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
 	domain := envOrDefault("PROXY_DOMAIN", "sandbox.superserve.ai")
 
@@ -73,6 +74,34 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.Handle("/", proxyHandler)
+
+	// HTTP→HTTPS redirect listener. The SSL Proxy LB on port 443 terminates
+	// TLS and forwards plain HTTP to the main listener. A separate L4
+	// forwarding rule on port 80 lands here, on a dedicated port, with a
+	// single 301 handler. Doing it on a separate port (rather than
+	// path-routing within the main listener) means main-listener traffic
+	// is unambiguously "TLS-terminated and trusted" while redirect-listener
+	// traffic is unambiguously "plain HTTP from a public client" — no
+	// confusion about which path the request came from.
+	redirectMux := http.NewServeMux()
+	redirectMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Strip any TCP port from Host (rare on port 80 but be safe).
+		host := r.Host
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+	})
+	go func() {
+		log.Info().Str("addr", redirectAddr).Msg("starting HTTP→HTTPS redirect listener")
+		srv := &http.Server{
+			Addr:    redirectAddr,
+			Handler: redirectMux,
+		}
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error().Err(err).Msg("redirect listener error")
+		}
+	}()
 
 	if err := proxy.ListenAndServe(ctx, addr, mux, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
