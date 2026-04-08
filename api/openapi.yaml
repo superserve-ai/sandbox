@@ -275,6 +275,41 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/{sandbox_id}/terminal-token:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    post:
+      operationId: issueTerminalToken
+      tags: [Sandboxes]
+      summary: Issue a short-lived token for an interactive terminal session
+      description: |
+        Mints a short-lived Ed25519-signed token that authorizes a single
+        WebSocket connection to the sandbox's PTY via the edge proxy. The
+        browser then opens the returned `url` directly — the control plane
+        is not in the data path for the terminal session itself.
+
+        The token has a 60-second TTL and is single-use at the verifier
+        (replay-protected). The sandbox must be `active` or `idle`; other
+        states return `409`.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TerminalTokenResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}/exec:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
@@ -652,6 +687,22 @@ components:
         metadata:
           env: prod
           owner: agent-7
+
+    TerminalTokenResponse:
+      type: object
+      required: [token, url, expires_at]
+      properties:
+        token:
+          type: string
+          description: The signed token. Opaque — clients should pass it verbatim in the WebSocket URL.
+        url:
+          type: string
+          description: Fully-formed WebSocket URL the browser opens to start the terminal session.
+          example: "wss://b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/terminal?t=v1.eyJzaWQiOi..."
+        expires_at:
+          type: string
+          format: date-time
+          description: ISO-8601 expiry timestamp (default TTL 60 seconds).
 
     Error:
       type: object
