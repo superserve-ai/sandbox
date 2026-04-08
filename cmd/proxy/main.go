@@ -36,6 +36,17 @@ func main() {
 	proxyHandler := proxy.NewHandler(domain, resolver, log)
 	proxyHandler.StartSweeper(ctx)
 
+	// Terminal bridge — wire in the Ed25519 verifier and nonce cache.
+	// If TERMINAL_TOKEN_PUBLIC_KEY is missing we log a warning and
+	// continue without the /terminal endpoint, rather than failing the
+	// whole proxy. Individual deployments can opt in by setting the var.
+	if verifier, err := proxy.LoadTerminalVerifierFromEnv(); err != nil {
+		log.Warn().Err(err).Msg("terminal endpoint disabled (TERMINAL_TOKEN_PUBLIC_KEY not configured)")
+	} else {
+		proxyHandler.WithTerminal(verifier, proxy.DefaultNonceCache())
+		log.Info().Msg("terminal endpoint enabled")
+	}
+
 	// Wrap with a health check endpoint for the GCP LB health probe.
 	// The LB hits /health directly on the instance IP (not a sandbox URL),
 	// so the proxy handler would reject it — intercept it first.
