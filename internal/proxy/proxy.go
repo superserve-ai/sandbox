@@ -46,6 +46,13 @@ type Handler struct {
 	resolver   Resolver
 	transports *transportCache
 	log        zerolog.Logger
+
+	// terminal holds the dependencies for the /terminal WebSocket bridge.
+	// Set via WithTerminal — nil means the /terminal path falls through to
+	// the generic reverse proxy and likely 404s (there's no boxd endpoint
+	// at /terminal today), which is the safe default if a proxy is
+	// deployed without terminal config.
+	terminal *terminalBridgeDeps
 }
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
@@ -80,6 +87,16 @@ func (h *Handler) StartSweeper(ctx context.Context) {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The /terminal path uses a different host format ({id}.{domain},
+	// no port label) and is handled by a dedicated WS→connect-rpc
+	// bridge instead of the generic reverse proxy. We check the path
+	// before calling ParseHost because the bare-id host won't parse as
+	// {port}-{id}.
+	if r.URL.Path == "/terminal" && h.terminal != nil {
+		h.serveTerminal(w, r)
+		return
+	}
+
 	port, instanceID, err := ParseHost(r.Host, h.domain)
 	if err != nil {
 		h.log.Warn().Err(err).Str("host", r.Host).Msg("bad host")
