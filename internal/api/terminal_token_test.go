@@ -68,11 +68,8 @@ func TestIssueTerminalToken_Success(t *testing.T) {
 	if tok == "" || url == "" {
 		t.Fatalf("missing token/url in response: %v", body)
 	}
-	if !strings.Contains(url, sandboxID.String()) {
-		t.Errorf("url does not contain sandbox id: %s", url)
-	}
-	if !strings.HasPrefix(url, "wss://") {
-		t.Errorf("url should be wss://: %s", url)
+	if !strings.HasPrefix(url, "wss://boxd-"+sandboxID.String()+".") {
+		t.Errorf("url must start with wss://boxd-<sandboxID>., got %q", url)
 	}
 	if !strings.HasSuffix(url, "/terminal") {
 		t.Errorf("url should end at /terminal (no query params): %s", url)

@@ -103,16 +103,6 @@ func (h *Handler) StartSweeper(ctx context.Context) {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// The /terminal path uses a different host format ({id}.{domain},
-	// no port label) and is handled by a dedicated WS→connect-rpc
-	// bridge instead of the generic reverse proxy. We check the path
-	// before calling ParseHost because the bare-id host won't parse as
-	// {port}-{id}.
-	if r.URL.Path == "/terminal" && h.terminal != nil {
-		h.serveTerminal(w, r)
-		return
-	}
-
 	port, instanceID, err := ParseHost(r.Host, h.domain)
 	if err != nil {
 		h.log.Warn().Err(err).Str("host", r.Host).Msg("bad host")

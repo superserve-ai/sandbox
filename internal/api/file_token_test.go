@@ -60,8 +60,8 @@ func TestIssueFileToken_Success(t *testing.T) {
 	// https over the boxd port, the sandbox ID as the host label prefix,
 	// no query string. Callers append ?path=... and attach the token
 	// themselves.
-	if !strings.HasPrefix(url, "https://49983-"+sandboxID.String()+".") {
-		t.Errorf("url must start with https://49983-<sandboxID>., got %q", url)
+	if !strings.HasPrefix(url, "https://boxd-"+sandboxID.String()+".") {
+		t.Errorf("url must start with https://boxd-<sandboxID>., got %q", url)
 	}
 	if !strings.HasSuffix(url, "/files") {
 		t.Errorf("url must end at /files (no query string), got %q", url)

@@ -74,10 +74,14 @@ func (h *Handlers) IssueFileToken(c *gin.Context) {
 	// Callers append `?path=/abs/file.txt` to address a specific file
 	// and attach the token as either an Authorization header or a
 	// `&token=…` query parameter (the latter unlocks <a href> downloads
-	// that can't set headers). The boxd port is the fixed constant
-	// 49983 — hardcoding it here rather than plumbing it through config
-	// keeps the mint endpoint contract stable for SDK authors.
-	url := fmt.Sprintf("https://49983-%s.%s/files",
+	// that can't set headers).
+	//
+	// The reserved `boxd-` host label routes everything under the
+	// sandbox's in-VM agent (files, terminal, future endpoints). The
+	// numeric boxd port number is intentionally kept out of public URLs
+	// — the edge proxy handles the label specially and never exposes
+	// the port directly.
+	url := fmt.Sprintf("https://boxd-%s.%s/files",
 		sandbox.ID.String(), h.Config.EdgeProxyDomain)
 
 	c.JSON(http.StatusOK, fileTokenResponse{
