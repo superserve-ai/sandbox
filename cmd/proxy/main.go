@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/rs/zerolog"
@@ -36,15 +37,32 @@ func main() {
 	proxyHandler := proxy.NewHandler(domain, resolver, log)
 	proxyHandler.StartSweeper(ctx)
 
-	// Terminal bridge — wire in the Ed25519 verifier and nonce cache.
-	// If TERMINAL_TOKEN_PUBLIC_KEY is missing we log a warning and
-	// continue without the /terminal endpoint, rather than failing the
-	// whole proxy. Individual deployments can opt in by setting the var.
-	if verifier, err := proxy.LoadTerminalVerifierFromEnv(); err != nil {
-		log.Warn().Err(err).Msg("terminal endpoint disabled (TERMINAL_TOKEN_PUBLIC_KEY not configured)")
+	// Terminal bridge — wire in the Ed25519 verifier, nonce cache, and
+	// allowed browser origins.
+	//
+	// REQUIRE_TERMINAL=1 makes missing configuration a hard-fail at boot
+	// rather than a warn-and-continue. Prod should always set this so a
+	// misconfigured deploy breaks the health check instead of silently
+	// shipping a proxy with the endpoint disabled — users would only
+	// notice when they click "open terminal" and get an opaque error.
+	verifier, verr := proxy.LoadTerminalVerifierFromEnv()
+	originsEnv := os.Getenv("TERMINAL_ALLOWED_ORIGINS")
+	required := os.Getenv("REQUIRE_TERMINAL") == "1"
+
+	if verr != nil || originsEnv == "" {
+		if required {
+			log.Fatal().
+				AnErr("verifier_err", verr).
+				Str("origins", originsEnv).
+				Msg("REQUIRE_TERMINAL=1 but terminal config missing")
+		}
+		log.Warn().
+			AnErr("verifier_err", verr).
+			Msg("terminal endpoint disabled (TERMINAL_TOKEN_PUBLIC_KEY or TERMINAL_ALLOWED_ORIGINS not configured)")
 	} else {
-		proxyHandler.WithTerminal(verifier, proxy.DefaultNonceCache())
-		log.Info().Msg("terminal endpoint enabled")
+		origins := splitCSV(originsEnv)
+		proxyHandler.WithTerminal(verifier, proxy.DefaultNonceCache(), origins)
+		log.Info().Strs("allowed_origins", origins).Msg("terminal endpoint enabled")
 	}
 
 	// Wrap with a health check endpoint for the GCP LB health probe.
@@ -67,4 +85,17 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// splitCSV trims and returns non-empty entries from a comma-separated
+// string. Used for TERMINAL_ALLOWED_ORIGINS where whitespace around
+// commas should not cause silent misconfiguration.
+func splitCSV(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if t := strings.TrimSpace(s); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }

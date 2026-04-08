@@ -599,15 +599,33 @@ components:
 
     TerminalTokenResponse:
       type: object
-      required: [token, url, expires_at]
+      required: [token, url, subprotocol, expires_at]
       properties:
         token:
           type: string
-          description: The signed token. Opaque — clients should pass it verbatim in the WebSocket URL.
+          description: |
+            Signed capability for one terminal session. Opaque to the
+            client. The token is **never** included in the URL. To open
+            the WebSocket the client must offer it as a subprotocol
+            entry of the form `token.<value>` (see `subprotocol`).
         url:
           type: string
-          description: Fully-formed WebSocket URL the browser opens to start the terminal session.
-          example: "wss://b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/terminal?t=v1.eyJzaWQiOi..."
+          description: |
+            Fully-formed WebSocket URL the browser opens. Contains no
+            query parameters and no token material — putting the token
+            in the URL would leak it to access logs, browser history,
+            and Referer headers.
+          example: "wss://b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/terminal"
+        subprotocol:
+          type: string
+          description: |
+            The main WebSocket subprotocol the server will echo back on a
+            successful upgrade. The client must pass
+            `[subprotocol, "token." + token]` as the protocols argument
+            to `new WebSocket(url, protocols)`. The server picks the main
+            entry to acknowledge and parses the token from the
+            `token.` entry — it never echoes the token back.
+          example: "superserve.terminal.v1"
         expires_at:
           type: string
           format: date-time

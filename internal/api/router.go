@@ -51,7 +51,14 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
-		api.POST("/sandboxes/:sandbox_id/terminal-token", h.IssueTerminalToken)
+		// Terminal-token mint gets a dedicated, much tighter per-team
+		// rate limit on top of the general TeamRateLimit. Each minted
+		// token is a stateful capability — it consumes a nonce slot at
+		// the proxy and grants a live PTY — so it deserves a stricter
+		// ceiling than the general read-heavy API surface.
+		api.POST("/sandboxes/:sandbox_id/terminal-token",
+			TeamRateLimit(ctx, DefaultTerminalTokenRateLimitConfig()),
+			h.IssueTerminalToken)
 
 		// Sandbox operations with auto-wake middleware.
 		sandboxOps := api.Group("/sandboxes/:sandbox_id")

@@ -43,6 +43,16 @@ func TestParseTerminalHost(t *testing.T) {
 			host:    "..%2fshutdown.sandbox.superserve.ai",
 			wantErr: true,
 		},
+		// Port-prefix label is the user-app routing format and must be
+		// rejected structurally, not just incidentally.
+		{
+			host:    "3000-abc.sandbox.superserve.ai",
+			wantErr: true,
+		},
+		{
+			host:    "8080-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
