@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -37,17 +38,23 @@ type VMDClient interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	VMD    VMDClient
-	DB     *db.Queries
-	Config *config.Config
+	VMD          VMDClient
+	DB           *db.Queries
+	Config       *config.Config
+	TerminalSign *auth.Signer
 }
 
 // NewHandlers creates a new Handlers instance.
+//
+// The terminal token Signer is constructed from cfg.TerminalTokenPrivateKey
+// here (rather than passed in) so callers don't have to know about the
+// auth package wiring — config.Load already produced the key.
 func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handlers {
 	return &Handlers{
-		VMD:    vmd,
-		DB:     queries,
-		Config: cfg,
+		VMD:          vmd,
+		DB:           queries,
+		Config:       cfg,
+		TerminalSign: auth.NewSigner(cfg.TerminalTokenPrivateKey),
 	}
 }
 
