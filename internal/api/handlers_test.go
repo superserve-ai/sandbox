@@ -169,6 +169,7 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 	r.POST("/sandboxes/:sandbox_id/terminal-token", h.IssueTerminalToken)
+	r.POST("/sandboxes/:sandbox_id/file-token", h.IssueFileToken)
 
 	// Routes with auto-wake middleware.
 	ops := r.Group("/sandboxes/:sandbox_id")

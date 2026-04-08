@@ -133,10 +133,14 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 			// on any downstream middleware that trusts it.
 			req.Host = r.Host
 			// Strip all forwarding / origin headers — a caller could
-			// otherwise inject these to spoof identity in any boxd log
-			// or future handler that trusts them.
+			// otherwise inject these to spoof identity in any boxd
+			// log or future handler that trusts them. Note the
+			// explicit `= nil` for X-Forwarded-For: httputil.ReverseProxy
+			// re-appends that header after the Director runs unless
+			// its value is the nil slice. A plain Del leaves it
+			// missing, which httputil then "helpfully" refills.
+			req.Header["X-Forwarded-For"] = nil
 			for _, hdr := range []string{
-				"X-Forwarded-For",
 				"X-Forwarded-Host",
 				"X-Forwarded-Proto",
 				"X-Real-Ip",
