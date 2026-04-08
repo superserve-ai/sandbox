@@ -51,7 +51,7 @@ func TestIssueTerminalToken_Success(t *testing.T) {
 
 	h := &Handlers{
 		DB:           db.New(mock),
-		TerminalSign: signer,
+		Signer:       signer,
 		Config:       &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"},
 	}
 
@@ -115,7 +115,7 @@ func TestIssueTerminalToken_IdleSandboxRejected(t *testing.T) {
 			})
 		},
 	}
-	h := &Handlers{DB: db.New(mock), TerminalSign: signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
+	h := &Handlers{DB: db.New(mock), Signer:       signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
 
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, tokenRequest(sandboxID.String()))
@@ -148,7 +148,7 @@ func TestIssueTerminalToken_TransientStateRejected(t *testing.T) {
 					})
 				},
 			}
-			h := &Handlers{DB: db.New(mock), TerminalSign: signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
+			h := &Handlers{DB: db.New(mock), Signer:       signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
 
 			w := httptest.NewRecorder()
 			setupTestRouter(h, teamID.String()).ServeHTTP(w, tokenRequest(sandboxID.String()))
@@ -165,7 +165,7 @@ func TestIssueTerminalToken_NotFound(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
 	}
-	h := &Handlers{DB: db.New(mock), TerminalSign: signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
+	h := &Handlers{DB: db.New(mock), Signer:       signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
 
 	w := httptest.NewRecorder()
 	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, tokenRequest(uuid.New().String()))
@@ -177,7 +177,7 @@ func TestIssueTerminalToken_NotFound(t *testing.T) {
 
 func TestIssueTerminalToken_NoTeam(t *testing.T) {
 	signer, _ := newTestSigner(t)
-	h := &Handlers{DB: db.New(&mockDBTX{}), TerminalSign: signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
+	h := &Handlers{DB: db.New(&mockDBTX{}), Signer:       signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
 
 	w := httptest.NewRecorder()
 	setupTestRouter(h, "").ServeHTTP(w, tokenRequest(uuid.New().String()))
@@ -189,7 +189,7 @@ func TestIssueTerminalToken_NoTeam(t *testing.T) {
 
 func TestIssueTerminalToken_BadSandboxID(t *testing.T) {
 	signer, _ := newTestSigner(t)
-	h := &Handlers{DB: db.New(&mockDBTX{}), TerminalSign: signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
+	h := &Handlers{DB: db.New(&mockDBTX{}), Signer:       signer, Config: &config.Config{EdgeProxyDomain: "sandbox.superserve.ai"}}
 
 	w := httptest.NewRecorder()
 	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, tokenRequest("not-a-uuid"))

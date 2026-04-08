@@ -38,23 +38,32 @@ type VMDClient interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	VMD          VMDClient
-	DB           *db.Queries
-	Config       *config.Config
-	TerminalSign *auth.Signer
+	VMD    VMDClient
+	DB     *db.Queries
+	Config *config.Config
+
+	// Signer mints every signed data-plane token the control plane
+	// issues — terminal sessions, file uploads/downloads, and any
+	// future scoped capability. A single Ed25519 key pair is reused
+	// across scopes because the Scope field inside the token payload
+	// is what distinguishes them; splitting into per-scope keys would
+	// multiply the rotation surface with no security benefit.
+	Signer *auth.Signer
 }
 
 // NewHandlers creates a new Handlers instance.
 //
-// The terminal token Signer is constructed from cfg.TerminalTokenPrivateKey
-// here (rather than passed in) so callers don't have to know about the
-// auth package wiring — config.Load already produced the key.
+// The Signer is constructed from cfg.TerminalTokenPrivateKey here (rather
+// than passed in) so callers don't have to know about the auth package
+// wiring — config.Load already produced the key. The config field is
+// still named TerminalTokenPrivateKey for historical reasons; it signs
+// all data-plane tokens, not just terminal ones.
 func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handlers {
 	return &Handlers{
-		VMD:          vmd,
-		DB:           queries,
-		Config:       cfg,
-		TerminalSign: auth.NewSigner(cfg.TerminalTokenPrivateKey),
+		VMD:    vmd,
+		DB:     queries,
+		Config: cfg,
+		Signer: auth.NewSigner(cfg.TerminalTokenPrivateKey),
 	}
 }
 
