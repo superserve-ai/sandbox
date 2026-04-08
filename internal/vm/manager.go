@@ -3,7 +3,6 @@ package vm
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -832,26 +831,10 @@ func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, t
 }
 
 // ---------------------------------------------------------------------------
-// File operations (raw HTTP to boxd for content, Connect RPC for metadata)
+// File operations (Connect RPC for metadata; byte transfer has moved to
+// the edge proxy — UploadFile/DownloadFile were removed when the data
+// plane was cut over to the direct edge-proxy /files path.)
 // ---------------------------------------------------------------------------
-
-// UploadFile writes content to a file inside a running VM.
-func (m *Manager) UploadFile(ctx context.Context, vmID, filePath string, content io.Reader) (int64, error) {
-	vmIP, err := m.getRunningVMIP(vmID)
-	if err != nil {
-		return 0, err
-	}
-	return uploadFile(ctx, vmIP, filePath, content)
-}
-
-// DownloadFile reads a file from inside a running VM.
-func (m *Manager) DownloadFile(ctx context.Context, vmID, filePath string) (io.ReadCloser, error) {
-	vmIP, err := m.getRunningVMIP(vmID)
-	if err != nil {
-		return nil, err
-	}
-	return downloadFile(ctx, vmIP, filePath)
-}
 
 // DeleteFile removes a file or directory inside a running VM via Connect RPC.
 func (m *Manager) DeleteFile(ctx context.Context, vmID, filePath string) error {

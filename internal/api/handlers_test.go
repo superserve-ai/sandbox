@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -28,13 +27,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubVMD struct {
-	createFn   func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
-	destroyFn  func(ctx context.Context, id string, force bool) error
-	pauseFn    func(ctx context.Context, id, snapshotDir string) (string, string, error)
-	resumeFn   func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	execFn     func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
-	uploadFn   func(ctx context.Context, id, path string, content io.Reader) (int64, error)
-	downloadFn func(ctx context.Context, id, path string) (io.ReadCloser, error)
+	createFn  func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
+	destroyFn func(ctx context.Context, id string, force bool) error
+	pauseFn   func(ctx context.Context, id, snapshotDir string) (string, string, error)
+	resumeFn  func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 }
 
 func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error) {
@@ -69,18 +66,6 @@ func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []st
 }
 func (s *stubVMD) ExecCommandStream(context.Context, string, string, []string, map[string]string, string, uint32, func([]byte, []byte, int32, bool)) error {
 	return nil
-}
-func (s *stubVMD) UploadFile(ctx context.Context, id, path string, content io.Reader) (int64, error) {
-	if s.uploadFn != nil {
-		return s.uploadFn(ctx, id, path, content)
-	}
-	return 0, nil
-}
-func (s *stubVMD) DownloadFile(ctx context.Context, id, path string) (io.ReadCloser, error) {
-	if s.downloadFn != nil {
-		return s.downloadFn(ctx, id, path)
-	}
-	return io.NopCloser(strings.NewReader("file-content")), nil
 }
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
@@ -197,8 +182,6 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	{
 		ops.POST("/exec", h.ExecSandbox)
 		ops.POST("/exec/stream", h.ExecSandboxStream)
-		ops.PUT("/files/*path", h.UploadSandboxFile)
-		ops.GET("/files/*path", h.DownloadSandboxFile)
 	}
 	return r
 }
@@ -1192,160 +1175,6 @@ func TestPauseSandbox_MissingTeamID(t *testing.T) {
 // Sandbox file operation tests
 // ---------------------------------------------------------------------------
 
-func uploadFileReq(sandboxID, filePath string) *http.Request {
-	return httptest.NewRequest(http.MethodPut, "/sandboxes/"+sandboxID+"/files/"+filePath, strings.NewReader("file-content"))
-}
-
-func downloadFileReq(sandboxID, filePath string) *http.Request {
-	return httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandboxID+"/files/"+filePath, nil)
-}
-
-func TestUploadSandboxFile_Success(t *testing.T) {
-	sandboxID := uuid.New()
-	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
-
-	var uploadCalled bool
-	vmd := &stubVMD{
-		uploadFn: func(_ context.Context, id, path string, content io.Reader) (int64, error) {
-			uploadCalled = true
-			if id != sandboxID.String() {
-				t.Errorf("UploadFile id = %q, want %q", id, sandboxID)
-			}
-			if path != "/app/main.go" {
-				t.Errorf("UploadFile path = %q, want %q", path, "/app/main.go")
-			}
-			data, _ := io.ReadAll(content)
-			return int64(len(data)), nil
-		},
-	}
-
-	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "FROM sandbox") {
-				return sandboxRow(sb)
-			}
-			return activityRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
-	}
-
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, uploadFileReq(sandboxID.String(), "app/main.go"))
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
-	}
-	if !uploadCalled {
-		t.Error("VMD.UploadFile was not called")
-	}
-}
-
-func TestDownloadSandboxFile_Success(t *testing.T) {
-	sandboxID := uuid.New()
-	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
-
-	var downloadCalled bool
-	vmd := &stubVMD{
-		downloadFn: func(_ context.Context, id, path string) (io.ReadCloser, error) {
-			downloadCalled = true
-			if id != sandboxID.String() {
-				t.Errorf("DownloadFile id = %q, want %q", id, sandboxID)
-			}
-			return io.NopCloser(strings.NewReader("hello world")), nil
-		},
-	}
-
-	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "FROM sandbox") {
-				return sandboxRow(sb)
-			}
-			return activityRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
-	}
-
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, downloadFileReq(sandboxID.String(), "app/main.go"))
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
-	}
-	if !downloadCalled {
-		t.Error("VMD.DownloadFile was not called")
-	}
-	if w.Body.String() != "hello world" {
-		t.Errorf("body = %q, want %q", w.Body.String(), "hello world")
-	}
-}
-
-func TestUploadSandboxFile_PathTraversal(t *testing.T) {
-	sandboxID := uuid.New()
-	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
-
-	vmd := &stubVMD{}
-	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "FROM sandbox") {
-				return sandboxRow(sb)
-			}
-			return activityRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
-	}
-
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, uploadFileReq(sandboxID.String(), "../etc/passwd"))
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
-	}
-}
-
-func TestDownloadSandboxFile_NotFound(t *testing.T) {
-	sandboxID := uuid.New()
-	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
-
-	vmd := &stubVMD{
-		downloadFn: func(context.Context, string, string) (io.ReadCloser, error) {
-			return nil, fmt.Errorf("404 not found")
-		},
-	}
-
-	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "FROM sandbox") {
-				return sandboxRow(sb)
-			}
-			return activityRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
-	}
-
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, downloadFileReq(sandboxID.String(), "missing.txt"))
-
-	if w.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Instance handler mock (separate from sandbox stubVMD above)
 // ---------------------------------------------------------------------------
@@ -1357,8 +1186,6 @@ type mockVMD struct {
 	resumeInstanceFn    func(ctx context.Context, instanceID, snapshotPath, memPath string) (string, error)
 	execCommandFn       func(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 	execCommandStreamFn func(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func([]byte, []byte, int32, bool)) error
-	uploadFileFn        func(ctx context.Context, instanceID, path string, content io.Reader) (int64, error)
-	downloadFileFn      func(ctx context.Context, instanceID, path string) (io.ReadCloser, error)
 }
 
 func (m *mockVMD) CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error) {
@@ -1398,18 +1225,6 @@ func (m *mockVMD) ExecCommandStream(ctx context.Context, instanceID, command str
 	onChunk([]byte("hello\n"), nil, 0, true)
 	return nil
 }
-func (m *mockVMD) UploadFile(ctx context.Context, instanceID, path string, content io.Reader) (int64, error) {
-	if m.uploadFileFn != nil {
-		return m.uploadFileFn(ctx, instanceID, path, content)
-	}
-	return 42, nil
-}
-func (m *mockVMD) DownloadFile(ctx context.Context, instanceID, path string) (io.ReadCloser, error) {
-	if m.downloadFileFn != nil {
-		return m.downloadFileFn(ctx, instanceID, path)
-	}
-	return io.NopCloser(strings.NewReader("file-content")), nil
-}
 func (m *mockVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
@@ -1435,8 +1250,6 @@ func setupInstanceTestRouter(h *Handlers, teamID string) *gin.Engine {
 	r.POST("/instances/:instance_id/resume", h.ResumeInstance)
 	r.POST("/instances/:instance_id/exec", h.ExecCommand)
 	r.POST("/instances/:instance_id/exec/stream", h.ExecCommandStream)
-	r.PUT("/instances/:instance_id/files/*path", h.UploadFile)
-	r.GET("/instances/:instance_id/files/*path", h.DownloadFile)
 	return r
 }
 
@@ -1664,81 +1477,6 @@ func TestExecCommand_NonZeroExit(t *testing.T) {
 	}
 }
 
-func TestUploadFile_Success(t *testing.T) {
-	vmd := &mockVMD{uploadFileFn: func(_ context.Context, _, _ string, content io.Reader) (int64, error) {
-		data, _ := io.ReadAll(content)
-		return int64(len(data)), nil
-	}}
-	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("PUT", "/instances/"+uuid.New().String()+"/files/home/user/test.txt", strings.NewReader("file content here"))
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if parseJSON(t, w)["path"] != "/home/user/test.txt" {
-		t.Errorf("unexpected path")
-	}
-}
-
-func TestUploadFile_PathTraversal(t *testing.T) {
-	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("PUT", "/instances/"+uuid.New().String()+"/files/../etc/passwd", strings.NewReader("bad"))
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestUploadFile_VMDFailure(t *testing.T) {
-	vmd := &mockVMD{uploadFileFn: func(_ context.Context, _, _ string, _ io.Reader) (int64, error) { return 0, errors.New("upload failed") }}
-	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("PUT", "/instances/"+uuid.New().String()+"/files/test.txt", strings.NewReader("data"))
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d", w.Code)
-	}
-}
-
-func TestDownloadFile_Success(t *testing.T) {
-	vmd := &mockVMD{downloadFileFn: func(_ context.Context, _, _ string) (io.ReadCloser, error) {
-		return io.NopCloser(strings.NewReader("downloaded-content")), nil
-	}}
-	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/instances/"+uuid.New().String()+"/files/data.txt", nil)
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-	if w.Body.String() != "downloaded-content" {
-		t.Errorf("unexpected body: %s", w.Body.String())
-	}
-}
-
-func TestDownloadFile_NotFound(t *testing.T) {
-	vmd := &mockVMD{downloadFileFn: func(_ context.Context, _, _ string) (io.ReadCloser, error) { return nil, errors.New("404 not found") }}
-	r := setupInstanceTestRouter(newTestHandlers(vmd), uuid.New().String())
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/instances/"+uuid.New().String()+"/files/missing.txt", nil)
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", w.Code)
-	}
-}
-
-func TestDownloadFile_PathTraversal(t *testing.T) {
-	r := setupInstanceTestRouter(newTestHandlers(&mockVMD{}), uuid.New().String())
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/instances/"+uuid.New().String()+"/files/../../../etc/shadow", nil)
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
 func TestExecCommandStream_Success(t *testing.T) {
 	vmd := &mockVMD{execCommandStreamFn: func(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32, onChunk func([]byte, []byte, int32, bool)) error {
 		onChunk([]byte("line1\n"), nil, 0, false)
@@ -1789,34 +1527,6 @@ func TestListInstances_NotImplemented(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotImplemented {
 		t.Fatalf("expected 501, got %d", w.Code)
-	}
-}
-
-func TestCleanFilePath(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		want    string
-		wantErr bool
-	}{
-		{"simple file", "/test.txt", "/test.txt", false},
-		{"nested path", "/home/user/data.csv", "/home/user/data.csv", false},
-		{"strips leading slash", "test.txt", "/test.txt", false},
-		{"empty path", "/", "", true},
-		{"traversal blocked", "/../etc/passwd", "", true},
-		{"double dot in middle", "/foo/../bar", "", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := cleanFilePath(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("cleanFilePath(%q): err=%v, wantErr=%v", tt.input, err, tt.wantErr)
-				return
-			}
-			if !tt.wantErr && got != tt.want {
-				t.Errorf("cleanFilePath(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
 	}
 }
 
