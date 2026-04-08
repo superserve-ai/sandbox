@@ -420,6 +420,51 @@ func TestFiles_NonFilesPathBlocked(t *testing.T) {
 	}
 }
 
+// TestFiles_PathTraversalRejected asserts that a literal `..` segment
+// in the path query param is refused with 400, matching the documented
+// "path traversal rejected" contract. This short-circuits before the
+// auth pipeline so nonces are not burned on malformed requests.
+func TestFiles_PathTraversalRejected(t *testing.T) {
+	env := newFilesTestEnv(t)
+	tok := env.mintToken(auth.ScopeFiles, "")
+
+	cases := []string{
+		"/home/user/../../../etc/bad.txt",
+		"/home/user/x/../y",
+		"../x",
+		"..",
+	}
+	for _, p := range cases {
+		t.Run(p, func(t *testing.T) {
+			req := env.buildRequest(http.MethodPost, p, tok, carrierHeader,
+				strings.NewReader("content"))
+			w := httptest.NewRecorder()
+			env.handler.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", w.Code)
+			}
+			if env.lastReq.received {
+				t.Error("upstream was called despite traversal")
+			}
+		})
+	}
+}
+
+// TestFiles_MissingPathParam checks that a POST without ?path= is
+// refused with 400 before reaching boxd.
+func TestFiles_MissingPathParam(t *testing.T) {
+	env := newFilesTestEnv(t)
+	tok := env.mintToken(auth.ScopeFiles, "")
+
+	req := env.buildRequest(http.MethodPost, "", tok, carrierHeader,
+		strings.NewReader("content"))
+	w := httptest.NewRecorder()
+	env.handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
 func TestFiles_MethodNotAllowed(t *testing.T) {
 	env := newFilesTestEnv(t)
 	tok := env.mintToken(auth.ScopeFiles, "")

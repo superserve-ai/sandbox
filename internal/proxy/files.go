@@ -91,6 +91,27 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		return
 	}
 
+	// Path traversal rejection. boxd's own safePath runs filepath.Clean,
+	// which silently resolves `..` segments instead of refusing them —
+	// `/home/user/../../../etc/x` quietly becomes `/etc/x` and gets
+	// written as root. That's technically no worse than what a caller
+	// could do via the exec endpoint, but it contradicts the documented
+	// "path traversal rejected" contract and turns a typo in a relative
+	// path into a silent write to an unintended location. Reject any
+	// request whose ?path= contains a literal `..` segment, before we
+	// burn a nonce on auth.
+	requestedPath := r.URL.Query().Get("path")
+	if requestedPath == "" {
+		http.Error(w, "missing path query parameter", http.StatusBadRequest)
+		return
+	}
+	for _, seg := range strings.Split(requestedPath, "/") {
+		if seg == ".." {
+			http.Error(w, "path traversal not allowed", http.StatusBadRequest)
+			return
+		}
+	}
+
 	token, fromQuery := extractFileToken(r)
 	if token == "" {
 		http.Error(w,
