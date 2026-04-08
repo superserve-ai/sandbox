@@ -290,7 +290,7 @@ paths:
         is not in the data path for the terminal session itself.
 
         The token has a 60-second TTL and is single-use at the verifier
-        (replay-protected). The sandbox must be `active` or `idle`; other
+        (replay-protected). The sandbox must be `active`; other
         states return `409`.
       security:
         - apiKey: []
@@ -301,6 +301,54 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TerminalTokenResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/file-token:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    post:
+      operationId: issueFileToken
+      tags: [Sandboxes, Files]
+      summary: Issue a short-lived token for uploading or downloading files
+      description: |
+        Mints a short-lived Ed25519-signed token that authorizes a single
+        file upload (`POST /files`) or download (`GET /files`) against the
+        sandbox's edge-proxy endpoint. The control plane is never in the
+        byte path — file content flows directly from the client to the
+        sandbox via the URL returned here.
+
+        The token has a 60-second TTL and is single-use at the verifier
+        (replay-protected). The sandbox must be `active`; other states
+        return `409`.
+
+        **Using the token.** The caller appends `?path=<absolute-path>`
+        to the returned `url` and attaches the token as either:
+
+          - `Authorization: Bearer <token>` header (preferred for
+            programmatic uploads — keeps the token out of access logs), or
+          - `?token=<token>` query parameter (use for `<a href>`
+            downloads or any context that can't set a header).
+
+        One token corresponds to one file transfer. For multi-file
+        operations, mint one token per file — minting is cheap
+        (Ed25519 signature, single DB lookup).
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileTokenResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -375,76 +423,6 @@ paths:
             text/event-stream:
               schema:
                 $ref: "#/components/schemas/ExecStreamEvent"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-  /sandboxes/{sandbox_id}/files/{path}:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-      - name: path
-        in: path
-        required: true
-        schema:
-          type: string
-        description: File path inside the sandbox (without leading slash).
-
-    put:
-      operationId: uploadFile
-      tags: [Files]
-      summary: Upload a file into a sandbox
-      description: Idle sandboxes are automatically resumed before the upload.
-      security:
-        - apiKey: []
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-      responses:
-        "200":
-          description: File uploaded
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  path:
-                    type: string
-                  size:
-                    type: integer
-                    format: int64
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-    get:
-      operationId: downloadFile
-      tags: [Files]
-      summary: Download a file from a sandbox
-      description: Idle sandboxes are automatically resumed before the download.
-      security:
-        - apiKey: []
-      responses:
-        "200":
-          description: File content
-          content:
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -717,6 +695,30 @@ components:
             entry to acknowledge and parses the token from the
             `token.` entry — it never echoes the token back.
           example: "superserve.terminal.v1"
+        expires_at:
+          type: string
+          format: date-time
+          description: ISO-8601 expiry timestamp (default TTL 60 seconds).
+
+    FileTokenResponse:
+      type: object
+      required: [token, url, expires_at]
+      properties:
+        token:
+          type: string
+          description: |
+            Signed capability for one file transfer (upload or
+            download). Opaque to the client. Attach it to the request
+            to `url` as either `Authorization: Bearer <token>` or
+            `?token=<token>`.
+        url:
+          type: string
+          description: |
+            Base URL of the sandbox's `/files` endpoint on the edge
+            proxy. The client appends `?path=<absolute-path>` to select
+            a file and attaches the token as a header or query
+            parameter. Does not contain the token or any path.
+          example: "https://49983-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/files"
         expires_at:
           type: string
           format: date-time
