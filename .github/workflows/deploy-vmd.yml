@@ -53,6 +53,7 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          TERMINAL_TOKEN_PUBLIC_KEY: ${{ vars.TERMINAL_TOKEN_PUBLIC_KEY_STAGING }}
         run: |
           python3 - <<'PYEOF'
           import os, sys, json, subprocess, textwrap
@@ -63,6 +64,10 @@ jobs:
           service     = os.environ.get('VMD_SERVICE', 'vmd')
           install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
           sha         = os.environ['SHA'][:8]
+          # Public key for terminal token verification. Non-sensitive, lives
+          # in GitHub Actions variables (not secrets). Empty string means the
+          # /terminal endpoint stays disabled on the proxy.
+          terminal_pub = os.environ.get('TERMINAL_TOKEN_PUBLIC_KEY', '')
 
           # Discover instances by label.
           result = subprocess.run([
@@ -191,6 +196,16 @@ jobs:
                   sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
                   sudo systemctl daemon-reload
                   sudo systemctl enable proxy
+
+                  # Write the terminal token public key env file. The key
+                  # itself is non-sensitive (designed to be shared), so we
+                  # pipe it through the SSH command line. Empty value means
+                  # the /terminal endpoint stays disabled.
+                  sudo mkdir -p /etc/superserve
+                  if [ -n "{terminal_pub}" ]; then
+                      echo "TERMINAL_TOKEN_PUBLIC_KEY={terminal_pub}" | sudo tee /etc/superserve/proxy.env > /dev/null
+                      sudo chmod 0644 /etc/superserve/proxy.env
+                  fi
 
                   sudo systemctl restart proxy
                   sleep 2
