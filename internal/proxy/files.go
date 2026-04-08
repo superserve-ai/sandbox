@@ -178,8 +178,7 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 // terminal bridge doesn't: plain HTML downloads via <a href> cannot set
 // custom headers, but they can embed the token in the URL; programmatic
 // uploads from an SDK can (and should) use the header carrier to keep
-// the token out of server access logs. Supporting both mirrors the E2B
-// precedent and avoids pushing SDK authors into a worse default.
+// the token out of server access logs.
 func extractFileToken(r *http.Request) (token string, fromQuery bool) {
 	if h := r.Header.Get("Authorization"); h != "" {
 		if strings.HasPrefix(h, bearerPrefix) {
