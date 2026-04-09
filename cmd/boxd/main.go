@@ -26,10 +26,9 @@ import (
 )
 
 const (
-	httpPort       = 49983
-	defaultShell   = "/bin/bash"
-	defaultHome    = "/home/user"
-	maxUploadBytes = 512 * 1024 * 1024 // 512 MB upload limit
+	httpPort     = 49983
+	defaultShell = "/bin/bash"
+	defaultHome  = "/home/user"
 )
 
 // dangerousPaths are paths that must never be modified via the filesystem API.
@@ -529,8 +528,42 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
 }
 
+// storageFullResponse is the canonical 507 body we return whenever a
+// write fails because the sandbox has run out of disk space. It's a
+// stable shape (code + message) so SDKs and the eventual web UI can
+// branch on `error.code == "sandbox_storage_full"` rather than parsing
+// free-form text.
+const storageFullResponse = `{"error":{"code":"sandbox_storage_full","message":"Sandbox storage limit reached."}}`
+
+// writeStorageFull sends the canonical 507 + cleans up any partial
+// file that may have been left behind by a failed write. Extracted
+// because we handle ENOSPC at two distinct syscall boundaries (open
+// and write) and both need the same response.
+func writeStorageFull(w http.ResponseWriter, partialPath string) {
+	if partialPath != "" {
+		// Best-effort: reclaim the bytes that did land before the
+		// kernel returned ENOSPC. If the remove itself fails (disk
+		// problem, race with a concurrent process), we swallow it —
+		// leaving an empty/partial file on a full disk is strictly
+		// better than failing the request a second time.
+		_ = os.Remove(partialPath)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInsufficientStorage) // 507
+	_, _ = w.Write([]byte(storageFullResponse))
+}
+
 func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		// mkdir itself can hit ENOSPC if the sandbox is already
+		// brimming — inodes exhausted, no room for a new directory
+		// entry. Surface it as the same storage-full error so users
+		// get one consistent code for "you're out of disk" regardless
+		// of which syscall tripped it.
+		if errors.Is(err, syscall.ENOSPC) {
+			writeStorageFull(w, "")
+			return
+		}
 		errJSON, _ := json.Marshal(map[string]string{"error": "mkdir: " + err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
@@ -538,24 +571,32 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			writeStorageFull(w, "")
+			return
+		}
 		errJSON, _ := json.Marshal(map[string]string{"error": "create file: " + err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
 
-	written, err := io.Copy(f, io.LimitReader(r.Body, maxUploadBytes+1))
+	// Stream the request body straight to disk with no artificial
+	// size cap — the sandbox's own rootfs is the only ceiling. When
+	// the kernel runs out of blocks, the next write(2) returns ENOSPC
+	// and we surface it as a clean 507. Anything else is a real
+	// internal failure and comes back as 500.
+	written, err := io.Copy(f, r.Body)
 	if err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			writeStorageFull(w, path)
+			return
+		}
 		errJSON, _ := json.Marshal(map[string]string{"error": "write: " + err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
-	if written > maxUploadBytes {
-		os.Remove(path)
-		http.Error(w, `{"error":"file too large","max_bytes":536870912}`, http.StatusRequestEntityTooLarge)
-		return
-	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"path": path, "size": written})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"path": path, "size": written})
 }
