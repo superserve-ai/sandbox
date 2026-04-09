@@ -53,9 +53,9 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
-          TERMINAL_TOKEN_PUBLIC_KEY: ${{ vars.TERMINAL_TOKEN_PUBLIC_KEY_STAGING }}
+          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
           TERMINAL_ALLOWED_ORIGINS: ${{ vars.TERMINAL_ALLOWED_ORIGINS_STAGING }}
-          REQUIRE_TERMINAL: ${{ vars.REQUIRE_TERMINAL_STAGING }}
+          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
         run: |
           python3 - <<'PYEOF'
           import os, sys, json, subprocess, textwrap
@@ -66,31 +66,21 @@ jobs:
           service     = os.environ.get('VMD_SERVICE', 'vmd')
           install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
           sha         = os.environ['SHA'][:8]
-          # Public key for terminal token verification. Non-sensitive, lives
-          # in GitHub Actions variables (not secrets). Empty string means the
-          # /terminal endpoint stays disabled on the proxy.
-          #
-          # Validate the shape Python-side BEFORE interpolating into the
-          # remote bash script — a stray newline or shell metacharacter
-          # could otherwise inject extra environment lines into the proxy
-          # process. Ed25519 public keys serialize to exactly 44 chars of
-          # standard base64 (32 bytes -> 43 base64 chars + '=').
           import re as _re
-          terminal_pub = os.environ.get('TERMINAL_TOKEN_PUBLIC_KEY', '')
-          if terminal_pub and not _re.fullmatch(r'[A-Za-z0-9+/]{43}=', terminal_pub):
-              print('ERROR: TERMINAL_TOKEN_PUBLIC_KEY has invalid shape (want 44-char base64)', file=sys.stderr)
+          # HMAC seed for per-sandbox access tokens. Hex-encoded, >= 32 bytes.
+          # Shared with the control plane. Lives in GitHub secrets (sensitive).
+          access_seed = os.environ.get('SANDBOX_ACCESS_TOKEN_SEED', '')
+          if access_seed and not _re.fullmatch(r'[0-9a-fA-F]{64,}', access_seed):
+              print('ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)', file=sys.stderr)
               sys.exit(1)
-          # Allowed browser origins for the WS upgrade. Plain text, but
-          # validate to avoid injecting newlines into the systemd env file.
-          # Allow alphanumerics, dots, dashes, colons (for ports), slashes,
-          # commas (separator), and the explicit "*" wildcard.
+          # Allowed browser origins for the WS terminal upgrade.
           terminal_origins = os.environ.get('TERMINAL_ALLOWED_ORIGINS', '')
           if terminal_origins and not _re.fullmatch(r'[A-Za-z0-9.,:/*\-]+', terminal_origins):
               print('ERROR: TERMINAL_ALLOWED_ORIGINS contains disallowed characters', file=sys.stderr)
               sys.exit(1)
-          require_terminal = os.environ.get('REQUIRE_TERMINAL', '')
-          if require_terminal not in ('', '0', '1'):
-              print('ERROR: REQUIRE_TERMINAL must be empty, "0", or "1"', file=sys.stderr)
+          require_data_plane = os.environ.get('REQUIRE_DATA_PLANE', '')
+          if require_data_plane not in ('', '0', '1'):
+              print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
               sys.exit(1)
 
           # Discover instances by label.
@@ -221,18 +211,15 @@ jobs:
                   sudo systemctl daemon-reload
                   sudo systemctl enable proxy
 
-                  # Write the terminal env file. All values were
-                  # validated Python-side so they are guaranteed safe to
-                  # interpolate here. The proxy reads this via
-                  # EnvironmentFile=-/etc/superserve/proxy.env.
+                  # Write the proxy env file. Values were validated Python-side.
                   sudo mkdir -p /etc/superserve
-                  if [ -n "{terminal_pub}" ]; then
-                      sudo tee /etc/superserve/proxy.env > /dev/null <<TERMENV
-                  TERMINAL_TOKEN_PUBLIC_KEY={terminal_pub}
+                  if [ -n "{access_seed}" ]; then
+                      sudo tee /etc/superserve/proxy.env > /dev/null <<PROXYENV
+                  SANDBOX_ACCESS_TOKEN_SEED={access_seed}
                   TERMINAL_ALLOWED_ORIGINS={terminal_origins}
-                  REQUIRE_TERMINAL={require_terminal}
-                  TERMENV
-                      sudo chmod 0644 /etc/superserve/proxy.env
+                  REQUIRE_DATA_PLANE={require_data_plane}
+                  PROXYENV
+                      sudo chmod 0600 /etc/superserve/proxy.env
                   fi
 
                   sudo systemctl restart proxy

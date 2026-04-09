@@ -48,20 +48,6 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
-		// Terminal-token mint gets a dedicated, much tighter per-team
-		// rate limit on top of the general TeamRateLimit. Each minted
-		// token is a stateful capability — it consumes a nonce slot at
-		// the proxy and grants a live PTY — so it deserves a stricter
-		// ceiling than the general read-heavy API surface.
-		api.POST("/sandboxes/:sandbox_id/terminal-token",
-			TeamRateLimit(ctx, DefaultTerminalTokenRateLimitConfig()),
-			h.IssueTerminalToken)
-		// File-token mint rides the general per-team rate limit rather
-		// than a tighter dedicated one: bulk uploads legitimately need
-		// one token per file and the general bucket (20/s burst 40)
-		// covers that case comfortably. If future abuse patterns emerge
-		// we can layer a scoped limiter here without touching callers.
-		api.POST("/sandboxes/:sandbox_id/file-token", h.IssueFileToken)
 
 		// Sandbox operations with auto-wake middleware.
 		sandboxOps := api.Group("/sandboxes/:sandbox_id")

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -37,29 +38,14 @@ type Handlers struct {
 	VMD    VMDClient
 	DB     *db.Queries
 	Config *config.Config
-
-	// Signer mints every signed data-plane token the control plane
-	// issues — terminal sessions, file uploads/downloads, and any
-	// future scoped capability. A single Ed25519 key pair is reused
-	// across scopes because the Scope field inside the token payload
-	// is what distinguishes them; splitting into per-scope keys would
-	// multiply the rotation surface with no security benefit.
-	Signer *auth.Signer
 }
 
 // NewHandlers creates a new Handlers instance.
-//
-// The Signer is constructed from cfg.TerminalTokenPrivateKey here (rather
-// than passed in) so callers don't have to know about the auth package
-// wiring — config.Load already produced the key. The config field is
-// still named TerminalTokenPrivateKey for historical reasons; it signs
-// all data-plane tokens, not just terminal ones.
 func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handlers {
 	return &Handlers{
 		VMD:    vmd,
 		DB:     queries,
 		Config: cfg,
-		Signer: auth.NewSigner(cfg.TerminalTokenPrivateKey),
 	}
 }
 
@@ -665,19 +651,20 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID           `json:"id"`
-	Name           string              `json:"name"`
-	Status         string              `json:"status"`
-	VcpuCount      int32               `json:"vcpu_count"`
-	MemoryMib      int32               `json:"memory_mib"`
-	SnapshotID     *uuid.UUID          `json:"snapshot_id,omitempty"`
-	CreatedAt      time.Time           `json:"created_at"`
-	TimeoutSeconds *int32              `json:"timeout_seconds,omitempty"`
+	ID             uuid.UUID             `json:"id"`
+	Name           string                `json:"name"`
+	Status         string                `json:"status"`
+	VcpuCount      int32                 `json:"vcpu_count"`
+	MemoryMib      int32                 `json:"memory_mib"`
+	AccessToken    string                `json:"access_token,omitempty"`
+	SnapshotID     *uuid.UUID            `json:"snapshot_id,omitempty"`
+	CreatedAt      time.Time             `json:"created_at"`
+	TimeoutSeconds *int32                `json:"timeout_seconds,omitempty"`
 	Network        *networkConfigRequest `json:"network,omitempty"`
-	Metadata       map[string]string   `json:"metadata"`
+	Metadata       map[string]string     `json:"metadata"`
 }
 
-func sandboxToResponse(s db.Sandbox) sandboxResponse {
+func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
 		ID:        s.ID,
 		Name:      s.Name,
@@ -686,6 +673,9 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 		MemoryMib: s.MemoryMib,
 		CreatedAt: s.CreatedAt,
 		Metadata:  decodeMetadata(s.Metadata),
+	}
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
 	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
@@ -780,7 +770,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
-		out[i] = sandboxToResponse(s)
+		out[i] = h.sandboxToResponse(s)
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -843,7 +833,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, sandboxToResponse(sandbox))
+	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
@@ -1048,12 +1038,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
-	// Build the response from the freshly-inserted row so metadata, IP, and
-	// any other server-populated fields make it back to the client without
-	// having to re-read the row. The row's status is still "starting" from
-	// the INSERT — overwrite it with "active" since we just transitioned.
-	resp := sandboxToResponse(sandbox)
-	resp.Status = string(db.SandboxStatusActive)
+	sandbox.Status = db.SandboxStatusActive
+	resp := h.sandboxToResponse(sandbox)
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}

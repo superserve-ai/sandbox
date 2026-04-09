@@ -275,88 +275,6 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /sandboxes/{sandbox_id}/terminal-token:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-
-    post:
-      operationId: issueTerminalToken
-      tags: [Sandboxes]
-      summary: Issue a short-lived token for an interactive terminal session
-      description: |
-        Mints a short-lived Ed25519-signed token that authorizes a single
-        WebSocket connection to the sandbox's PTY via the edge proxy. The
-        browser then opens the returned `url` directly — the control plane
-        is not in the data path for the terminal session itself.
-
-        The token has a 60-second TTL and is single-use at the verifier
-        (replay-protected). The sandbox must be `active`; other
-        states return `409`.
-      security:
-        - apiKey: []
-      responses:
-        "200":
-          description: Token issued
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TerminalTokenResponse"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-  /sandboxes/{sandbox_id}/file-token:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-
-    post:
-      operationId: issueFileToken
-      tags: [Sandboxes, Files]
-      summary: Issue a short-lived token for uploading or downloading files
-      description: |
-        Mints a short-lived Ed25519-signed token that authorizes a single
-        file upload (`POST /files`) or download (`GET /files`) against the
-        sandbox's edge-proxy endpoint. The control plane is never in the
-        byte path — file content flows directly from the client to the
-        sandbox via the URL returned here.
-
-        The token has a 60-second TTL and is single-use at the verifier
-        (replay-protected). The sandbox must be `active`; other states
-        return `409`.
-
-        **Using the token.** The caller appends `?path=<absolute-path>`
-        to the returned `url` and attaches the token as either:
-
-          - `Authorization: Bearer <token>` header (preferred for
-            programmatic uploads — keeps the token out of access logs), or
-          - `?token=<token>` query parameter (use for `<a href>`
-            downloads or any context that can't set a header).
-
-        One token corresponds to one file transfer. For multi-file
-        operations, mint one token per file — minting is cheap
-        (Ed25519 signature, single DB lookup).
-      security:
-        - apiKey: []
-      responses:
-        "200":
-          description: Token issued
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/FileTokenResponse"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
 
   /sandboxes/{sandbox_id}/exec:
     parameters:
@@ -521,6 +439,14 @@ components:
           type: integer
         memory_mib:
           type: integer
+        access_token:
+          type: string
+          description: |
+            Per-sandbox HMAC access token for data-plane operations
+            (file upload/download, terminal). Pass as `X-Access-Token`
+            header when hitting the edge proxy at
+            `boxd-{id}.sandbox.superserve.ai`. Reusable for the
+            lifetime of the sandbox.
         snapshot_id:
           type: string
           format: uuid
@@ -665,64 +591,6 @@ components:
         metadata:
           env: prod
           owner: agent-7
-
-    TerminalTokenResponse:
-      type: object
-      required: [token, url, subprotocol, expires_at]
-      properties:
-        token:
-          type: string
-          description: |
-            Signed capability for one terminal session. Opaque to the
-            client. The token is **never** included in the URL. To open
-            the WebSocket the client must offer it as a subprotocol
-            entry of the form `token.<value>` (see `subprotocol`).
-        url:
-          type: string
-          description: |
-            Fully-formed WebSocket URL the browser opens. Contains no
-            query parameters and no token material — putting the token
-            in the URL would leak it to access logs, browser history,
-            and Referer headers.
-          example: "wss://boxd-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/terminal"
-        subprotocol:
-          type: string
-          description: |
-            The main WebSocket subprotocol the server will echo back on a
-            successful upgrade. The client must pass
-            `[subprotocol, "token." + token]` as the protocols argument
-            to `new WebSocket(url, protocols)`. The server picks the main
-            entry to acknowledge and parses the token from the
-            `token.` entry — it never echoes the token back.
-          example: "superserve.terminal.v1"
-        expires_at:
-          type: string
-          format: date-time
-          description: ISO-8601 expiry timestamp (default TTL 60 seconds).
-
-    FileTokenResponse:
-      type: object
-      required: [token, url, expires_at]
-      properties:
-        token:
-          type: string
-          description: |
-            Signed capability for one file transfer (upload or
-            download). Opaque to the client. Attach it to the request
-            to `url` as either `Authorization: Bearer <token>` or
-            `?token=<token>`.
-        url:
-          type: string
-          description: |
-            Base URL of the sandbox's `/files` endpoint on the edge
-            proxy. The client appends `?path=<absolute-path>` to select
-            a file and attaches the token as a header or query
-            parameter. Does not contain the token or any path.
-          example: "https://boxd-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai/files"
-        expires_at:
-          type: string
-          format: date-time
-          description: ISO-8601 expiry timestamp (default TTL 60 seconds).
 
     Error:
       type: object

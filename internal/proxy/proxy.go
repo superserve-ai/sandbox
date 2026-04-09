@@ -14,8 +14,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-
-	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
 // Timeout constants.
@@ -60,25 +58,17 @@ type Handler struct {
 	ipConns      *connLimiter
 	log          zerolog.Logger
 
-	// verifier and nonces are the shared auth dependencies for every
-	// data-plane endpoint gated by a signed token (/terminal, /files).
-	// Installed once via WithTerminal or WithFiles — both call into the
-	// same internal setter. Kept on the Handler (rather than duplicated
-	// per feature-group struct) so the authorizeSandboxRequest helper
-	// can reach them without each caller having to plumb them through.
-	verifier *auth.Verifier
-	nonces   *NonceCache
+	// seedKey is the HMAC seed shared with the control plane. Both
+	// sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
+	// Set via WithAuth; nil means data-plane endpoints are disabled.
+	seedKey []byte
 
 	// terminal holds the dependencies specific to the /terminal WebSocket
 	// bridge (allowed browser origins for the Origin check). Nil means
-	// the /terminal path is disabled and upgrades will 404 — the safe
-	// default when a proxy is deployed without terminal config.
+	// the /terminal path is disabled.
 	terminal *terminalBridgeDeps
 
-	// filesEnabled controls whether /files on boxdPort is served. When
-	// false, every request addressed at boxdPort returns 404 regardless
-	// of path — boxd's internal connect-rpc services must never be
-	// exposed through the edge proxy without a scoped token gate.
+	// filesEnabled controls whether /files on boxdPort is served.
 	filesEnabled bool
 }
 

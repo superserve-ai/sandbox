@@ -48,22 +48,6 @@ func DefaultTeamRateLimitConfig() RateLimitConfig {
 	}
 }
 
-// DefaultTerminalTokenRateLimitConfig is a tighter per-team limit applied
-// only to POST /sandboxes/:id/terminal-token. The mint endpoint mints
-// stateful capabilities (each one consumes a nonce slot at the proxy and
-// gives the holder a live PTY) so it deserves a stricter ceiling than the
-// general read-heavy API. 10/min/team with a burst of 5 covers normal
-// "open a few terminals in quick succession" usage and rejects automated
-// abuse well below the noisy-tenant threshold for the general bucket.
-func DefaultTerminalTokenRateLimitConfig() RateLimitConfig {
-	return RateLimitConfig{
-		Rate:            10.0 / 60.0, // 10 per minute
-		Burst:           5,
-		CleanupInterval: 5 * time.Minute,
-		MaxAge:          10 * time.Minute,
-	}
-}
-
 type limiterEntry struct {
 	limiter  *rate.Limiter
 	lastSeen time.Time
