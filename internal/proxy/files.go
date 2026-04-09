@@ -6,9 +6,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"time"
-
-	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
 // File bridge constants. The /files path lives on the same boxd port that
@@ -20,7 +17,7 @@ import (
 // stay strictly internal.
 const (
 	// filesPath is the HTTP path the edge proxy forwards to boxd's
-	// raw /files handler after verifying a ScopeFiles token.
+	// raw /files handler after verifying the access token.
 	filesPath = "/files"
 
 	// terminalPath is the HTTP path the edge proxy upgrades to a
@@ -29,14 +26,13 @@ const (
 	// just names the route serveBoxdPort dispatches to it on.
 	terminalPath = "/terminal"
 
-	// bearerPrefix matches the standard Authorization header format.
-	bearerPrefix = "Bearer "
+	// accessTokenHeader is the primary carrier for the per-sandbox
+	// HMAC access token on HTTP requests.
+	accessTokenHeader = "X-Access-Token"
 
 	// tokenQueryParam is the query-string fallback for contexts that
 	// cannot set headers — notably <a href> downloads, <img src>
-	// embeds, and any `window.open()` style flows. The mint endpoint
-	// returns the token separately so callers can choose whichever
-	// carrier fits their environment.
+	// embeds, and `window.open()` style flows.
 	tokenQueryParam = "token"
 )
 
@@ -70,7 +66,7 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 }
 
 // serveFiles handles POST/GET /files on the boxd host label. It
-// verifies the signed ScopeFiles token, scrubs the token and caller-
+// verifies the sandbox access token, scrubs the token and caller-
 // controlled headers, and reverse-proxies the request to boxd's
 // internal /files handler.
 func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID string) {
@@ -115,43 +111,24 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	token, fromQuery := extractFileToken(r)
 	if token == "" {
 		http.Error(w,
-			"missing token (pass Authorization: Bearer <token> or ?token=<token>)",
+			"missing access token (pass X-Access-Token header or ?token= query param)",
 			http.StatusUnauthorized)
 		return
 	}
 
-	// Scrub the token before we touch the upstream request. Two reasons:
-	//
-	//  1. boxd has no business seeing our bearer token — it trusts the
-	//     edge proxy implicitly because it's bound to the VM's private
-	//     IP and is not reachable from outside the host.
-	//  2. If a caller used ?token= we want to strip it from the forwarded
-	//     URL so it cannot land in any intermediate access log between
-	//     here and the disk, however unlikely that is (there is none
-	//     today, but keeping the token's blast radius minimal is cheap).
-	r.Header.Del("Authorization")
+	// Scrub the token before forwarding to boxd.
+	r.Header.Del(accessTokenHeader)
 	if fromQuery {
 		q := r.URL.Query()
 		q.Del(tokenQueryParam)
 		r.URL.RawQuery = q.Encode()
 	}
 
-	// Don't emit a Referrer on anything this proxy might spawn. The
-	// token-carrier is the sensitive piece; this matches the "token as a
-	// secret" posture from the terminal bridge.
 	w.Header().Set("Referrer-Policy", "no-referrer")
 
-	_, info, fail := h.authorizeSandboxRequest(
-		r.Context(), token, auth.ScopeFiles, instanceID, time.Now(),
-	)
+	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	if fail != nil {
-		if fail.LogMsg != "" {
-			evt := h.log.Warn().Str("sandbox_id", instanceID)
-			if fail.LogKV[0] != "" {
-				evt = evt.Str(fail.LogKV[0], fail.LogKV[1])
-			}
-			evt.Msg("files: " + fail.LogMsg)
-		}
+		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("files: auth failed")
 		fail.write(w)
 		return
 	}
@@ -222,10 +199,8 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 // uploads from an SDK can (and should) use the header carrier to keep
 // the token out of server access logs.
 func extractFileToken(r *http.Request) (token string, fromQuery bool) {
-	if h := r.Header.Get("Authorization"); h != "" {
-		if strings.HasPrefix(h, bearerPrefix) {
-			return strings.TrimSpace(h[len(bearerPrefix):]), false
-		}
+	if h := r.Header.Get(accessTokenHeader); h != "" {
+		return h, false
 	}
 	if q := r.URL.Query().Get(tokenQueryParam); q != "" {
 		return q, true

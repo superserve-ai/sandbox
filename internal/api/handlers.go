@@ -37,29 +37,14 @@ type Handlers struct {
 	VMD    VMDClient
 	DB     *db.Queries
 	Config *config.Config
-
-	// Signer mints every signed data-plane token the control plane
-	// issues — terminal sessions, file uploads/downloads, and any
-	// future scoped capability. A single Ed25519 key pair is reused
-	// across scopes because the Scope field inside the token payload
-	// is what distinguishes them; splitting into per-scope keys would
-	// multiply the rotation surface with no security benefit.
-	Signer *auth.Signer
 }
 
 // NewHandlers creates a new Handlers instance.
-//
-// The Signer is constructed from cfg.TerminalTokenPrivateKey here (rather
-// than passed in) so callers don't have to know about the auth package
-// wiring — config.Load already produced the key. The config field is
-// still named TerminalTokenPrivateKey for historical reasons; it signs
-// all data-plane tokens, not just terminal ones.
 func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handlers {
 	return &Handlers{
 		VMD:    vmd,
 		DB:     queries,
 		Config: cfg,
-		Signer: auth.NewSigner(cfg.TerminalTokenPrivateKey),
 	}
 }
 
@@ -636,17 +621,18 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID         uuid.UUID  `json:"id"`
-	Name       string     `json:"name"`
-	Status     string     `json:"status"`
-	VcpuCount  int32      `json:"vcpu_count"`
-	MemoryMib  int32      `json:"memory_mib"`
-	IPAddress  string     `json:"ip_address,omitempty"`
-	SnapshotID *uuid.UUID `json:"snapshot_id,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID          uuid.UUID  `json:"id"`
+	Name        string     `json:"name"`
+	Status      string     `json:"status"`
+	VcpuCount   int32      `json:"vcpu_count"`
+	MemoryMib   int32      `json:"memory_mib"`
+	AccessToken string     `json:"access_token,omitempty"`
+	IPAddress   string     `json:"ip_address,omitempty"`
+	SnapshotID  *uuid.UUID `json:"snapshot_id,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
-func sandboxToResponse(s db.Sandbox) sandboxResponse {
+func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
 		ID:        s.ID,
 		Name:      s.Name,
@@ -654,6 +640,9 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 		VcpuCount: s.VcpuCount,
 		MemoryMib: s.MemoryMib,
 		CreatedAt: s.CreatedAt,
+	}
+	if h.Config.SandboxAccessTokenSeed != nil {
+		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
 	}
 	if s.IpAddress != nil {
 		resp.IPAddress = s.IpAddress.String()
@@ -684,7 +673,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
-		out[i] = sandboxToResponse(s)
+		out[i] = h.sandboxToResponse(s)
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -714,7 +703,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, sandboxToResponse(sandbox))
+	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {

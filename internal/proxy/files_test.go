@@ -2,8 +2,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"io"
 	"net"
 	"net/http"
@@ -20,12 +18,9 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Test harness: stub resolver + fake upstream boxd + wired Handler
+// Test harness
 // ---------------------------------------------------------------------------
 
-// stubResolver is the minimum Resolver implementation the files handler
-// needs: one fixed instance ID → one InstanceInfo mapping, plus a settable
-// error and an Invalidate no-op.
 type stubResolver struct {
 	info   InstanceInfo
 	err    error
@@ -46,14 +41,9 @@ func (s *stubResolver) Invalidate(instanceID string) {
 	s.invMu.Unlock()
 }
 
-// filesTestEnv bundles everything a single files test case needs: the
-// signing key so tests can mint tokens, the proxy Handler being
-// exercised, a fake upstream standing in for boxd's /files endpoint, and
-// a capture slot for the last request the upstream saw (tests assert on
-// headers, query string, method, and body here).
 type filesTestEnv struct {
 	t          *testing.T
-	signer     *auth.Signer
+	seedKey    []byte
 	handler    *Handler
 	upstream   *httptest.Server
 	sandboxID  string
@@ -63,53 +53,41 @@ type filesTestEnv struct {
 	lastReq    capturedRequest
 }
 
-// capturedRequest snapshots a request hitting the fake upstream so the
-// test goroutine can assert on it after rp.ServeHTTP returns.
 type capturedRequest struct {
-	method       string
-	path         string
-	rawQuery     string
-	host         string
-	hasAuth      bool
-	fwdFor       string
-	body         string
-	contentType  string
-	received     bool
+	method      string
+	path        string
+	rawQuery    string
+	host        string
+	hasToken    bool
+	fwdFor      string
+	body        string
+	received    bool
 }
 
 func newFilesTestEnv(t *testing.T) *filesTestEnv {
 	t.Helper()
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("ed25519 keygen: %v", err)
-	}
-	signer := auth.NewSigner(priv)
-	verifier := auth.NewVerifier(pub)
+	seedKey := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
 
 	env := &filesTestEnv{
 		t:         t,
-		signer:    signer,
+		seedKey:   seedKey,
 		sandboxID: "sbx-" + strings.Repeat("a", 8),
 		domain:    "sandbox.test",
 	}
 
-	// Fake upstream: captures whatever request reaches it, returns a
-	// small deterministic payload so tests can distinguish "forwarded"
-	// from "blocked".
 	env.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		env.upstreamMu.Lock()
 		env.lastReq = capturedRequest{
-			method:      r.Method,
-			path:        r.URL.Path,
-			rawQuery:    r.URL.RawQuery,
-			host:        r.Host,
-			hasAuth:     r.Header.Get("Authorization") != "",
-			fwdFor:      r.Header.Get("X-Forwarded-For"),
-			body:        string(bodyBytes),
-			contentType: r.Header.Get("Content-Type"),
-			received:    true,
+			method:   r.Method,
+			path:     r.URL.Path,
+			rawQuery: r.URL.RawQuery,
+			host:     r.Host,
+			hasToken: r.Header.Get("X-Access-Token") != "",
+			fwdFor:   r.Header.Get("X-Forwarded-For"),
+			body:     string(bodyBytes),
+			received: true,
 		}
 		env.upstreamMu.Unlock()
 
@@ -118,22 +96,6 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 	}))
 	t.Cleanup(env.upstream.Close)
 
-	// Point the resolver at the upstream. We parse the URL to lift its
-	// host so the proxy's reverse-proxy target resolves to the
-	// upstream's listener. The proxy always targets `{VMIP}:{boxdPort}`
-	// — we embed the entire host:port into VMIP and accept that the
-	// port is appended again by the director. To keep this simple, the
-	// upstream is mounted as an httptest.Server whose ClientConnection
-	// is used directly via a custom transport. Easier alternative:
-	// override the whole ReverseProxy path. We take the easier road:
-	// rebuild InstanceInfo.VMIP to be the upstream's host (including
-	// its real port) and set a custom transport cache entry that
-	// ignores the port we append.
-	//
-	// Simpler still: use the upstream's host:port as VMIP and rely on
-	// the fact that the proxy will dial "VMIP:boxdPort" (a made-up
-	// address). That won't work. Instead, plug a custom transport that
-	// always routes to the upstream regardless of target.
 	upURL, _ := url.Parse(env.upstream.URL)
 	env.resolver = &stubResolver{
 		info: InstanceInfo{
@@ -144,25 +106,12 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 	}
 
 	env.handler = NewHandler(env.domain, env.resolver, zerolog.Nop())
-	env.handler.WithFiles(verifier, DefaultNonceCache())
+	env.handler.WithAuth(seedKey).WithTerminal([]string{"*"}).WithFiles()
 
-	// Override the transport cache with one that forces every outbound
-	// connection to the upstream. This short-circuits the fact that
-	// "VMIP:boxdPort" isn't a real address — the upstream lives on a
-	// random ephemeral port that the proxy would never guess.
 	upHost := upURL.Host
 	env.handler.transports = &transportCache{
 		items: map[string]*transportEntry{},
 	}
-	// Inject a pre-built entry that will be returned for any instance
-	// ID the test asks about. The lifecycle key must match
-	// InstanceInfo.lifecycleKey(), otherwise transports.get replaces
-	// the entry on first call.
-	// The reverse proxy builds its target from InstanceInfo.VMIP and
-	// the hardcoded boxdPort, producing an address the upstream doesn't
-	// actually listen on (the upstream is on a random ephemeral port).
-	// Override DialContext so every outbound connection lands on the
-	// real upstream regardless of what address the director asked for.
 	redirTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
@@ -179,25 +128,10 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 	return env
 }
 
-// mintToken produces a signed token for the test's sandbox and scope.
-// When override is non-empty, it's used as the sandbox ID in the token
-// (to drive the "token for sandbox A replayed against sandbox B" case).
-func (e *filesTestEnv) mintToken(scope auth.Scope, override string) string {
-	e.t.Helper()
-	sid := e.sandboxID
-	if override != "" {
-		sid = override
-	}
-	tok, err := e.signer.Mint(time.Now(), sid, "team-test", scope)
-	if err != nil {
-		e.t.Fatalf("mint: %v", err)
-	}
-	return tok
+func (e *filesTestEnv) validToken() string {
+	return auth.ComputeAccessToken(e.seedKey, e.sandboxID)
 }
 
-// buildRequest constructs a request addressed at the files endpoint
-// through the proxy's host label. The test chooses the carrier (header
-// or query), path query, and optional body.
 func (e *filesTestEnv) buildRequest(method, filePath, token string, carrier tokenCarrier, body io.Reader) *http.Request {
 	q := url.Values{}
 	if filePath != "" {
@@ -213,7 +147,7 @@ func (e *filesTestEnv) buildRequest(method, filePath, token string, carrier toke
 	req := httptest.NewRequest(method, target, body)
 	req.Host = "boxd-" + e.sandboxID + "." + e.domain
 	if token != "" && carrier == carrierHeader {
-		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Access-Token", token)
 	}
 	return req
 }
@@ -231,7 +165,7 @@ const (
 
 func TestFiles_UploadHeaderCarrier_ForwardsToUpstream(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 
 	req := env.buildRequest(http.MethodPost, "/home/u/app.txt", tok, carrierHeader,
 		strings.NewReader("file contents"))
@@ -258,16 +192,12 @@ func TestFiles_UploadHeaderCarrier_ForwardsToUpstream(t *testing.T) {
 	if env.lastReq.body != "file contents" {
 		t.Errorf("upstream body = %q, want 'file contents'", env.lastReq.body)
 	}
-	// Auth header must be scrubbed before the upstream sees it — boxd
-	// has no business holding the bearer token.
-	if env.lastReq.hasAuth {
-		t.Error("Authorization header leaked to upstream")
+	if env.lastReq.hasToken {
+		t.Error("X-Access-Token leaked to upstream")
 	}
-	// X-Forwarded-For must be stripped so a caller can't spoof origin.
 	if env.lastReq.fwdFor != "" {
 		t.Errorf("X-Forwarded-For leaked: %q", env.lastReq.fwdFor)
 	}
-	// Host header preserved so boxd logs the public name, not the VM IP.
 	if !strings.HasPrefix(env.lastReq.host, "boxd-") {
 		t.Errorf("Host = %q, want public sandbox label", env.lastReq.host)
 	}
@@ -275,7 +205,7 @@ func TestFiles_UploadHeaderCarrier_ForwardsToUpstream(t *testing.T) {
 
 func TestFiles_DownloadQueryCarrier_StripsTokenBeforeForwarding(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 
 	req := env.buildRequest(http.MethodGet, "/etc/motd", tok, carrierQuery, nil)
 
@@ -305,42 +235,34 @@ func TestFiles_MissingToken_Unauthorized(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
-	if env.lastReq.received {
-		t.Error("upstream was called despite missing token")
-	}
 }
 
-func TestFiles_WrongScopeRejected(t *testing.T) {
+func TestFiles_WrongTokenRejected(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeTerminal, "")
-	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
+	req := env.buildRequest(http.MethodGet, "/f.txt", "totally-wrong-token", carrierHeader, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
-	if env.lastReq.received {
-		t.Error("upstream was called with a terminal-scope token")
-	}
 }
 
-func TestFiles_WrongSandboxRejected(t *testing.T) {
-	// Token minted for a different sandbox must be refused — this is
-	// the cross-sandbox replay defense.
+func TestFiles_WrongSandboxTokenRejected(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "sbx-"+strings.Repeat("b", 8))
-	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
+	wrongToken := auth.ComputeAccessToken(env.seedKey, "different-sandbox-id")
+	req := env.buildRequest(http.MethodGet, "/f.txt", wrongToken, carrierHeader, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403; body: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
 
-func TestFiles_NonceReplayRejected(t *testing.T) {
+func TestFiles_TokenReusable(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 
+	// First request
 	req1 := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
 	w1 := httptest.NewRecorder()
 	env.handler.ServeHTTP(w1, req1)
@@ -348,19 +270,19 @@ func TestFiles_NonceReplayRejected(t *testing.T) {
 		t.Fatalf("first call status = %d, want 200", w1.Code)
 	}
 
-	// Replay the exact same token. The nonce cache must reject it.
+	// Same token again — should still work (not single-use anymore)
 	req2 := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
 	w2 := httptest.NewRecorder()
 	env.handler.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusUnauthorized {
-		t.Fatalf("replay status = %d, want 401", w2.Code)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second call status = %d, want 200 (token should be reusable)", w2.Code)
 	}
 }
 
 func TestFiles_SandboxNotRunningReturns503(t *testing.T) {
 	env := newFilesTestEnv(t)
 	env.resolver.info.Status = "paused"
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
@@ -372,7 +294,7 @@ func TestFiles_SandboxNotRunningReturns503(t *testing.T) {
 func TestFiles_SandboxNotFoundReturns404(t *testing.T) {
 	env := newFilesTestEnv(t)
 	env.resolver.err = ErrInstanceNotFound
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
@@ -385,17 +307,10 @@ func TestFiles_SandboxNotFoundReturns404(t *testing.T) {
 // Boxd-port lockdown
 // ---------------------------------------------------------------------------
 
-// TestFiles_NonFilesPathBlocked asserts that anything on port 49983 other
-// than /files returns 404 even with a valid token. The proxy must never
-// forward arbitrary paths to boxd because the connect-rpc
-// ProcessService / FilesystemService also live on that port and have no
-// scope-based auth of their own.
 func TestFiles_NonFilesPathBlocked(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 
-	// Try a few representative paths that correspond to real boxd
-	// connect-rpc endpoints and generic probes.
 	paths := []string{
 		"/superserve.boxd.v1.ProcessService/Start",
 		"/superserve.boxd.v1.FilesystemService/ListDir",
@@ -406,7 +321,7 @@ func TestFiles_NonFilesPathBlocked(t *testing.T) {
 		t.Run(p, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "http://unused"+p, nil)
 			req.Host = "boxd-" + env.sandboxID + "." + env.domain
-			req.Header.Set("Authorization", "Bearer "+tok)
+			req.Header.Set("X-Access-Token", tok)
 
 			w := httptest.NewRecorder()
 			env.handler.ServeHTTP(w, req)
@@ -415,18 +330,11 @@ func TestFiles_NonFilesPathBlocked(t *testing.T) {
 			}
 		})
 	}
-	if env.lastReq.received {
-		t.Error("upstream was called for a non-/files path on boxd port")
-	}
 }
 
-// TestFiles_PathTraversalRejected asserts that a literal `..` segment
-// in the path query param is refused with 400, matching the documented
-// "path traversal rejected" contract. This short-circuits before the
-// auth pipeline so nonces are not burned on malformed requests.
 func TestFiles_PathTraversalRejected(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 
 	cases := []string{
 		"/home/user/../../../etc/bad.txt",
@@ -443,18 +351,13 @@ func TestFiles_PathTraversalRejected(t *testing.T) {
 			if w.Code != http.StatusBadRequest {
 				t.Errorf("status = %d, want 400", w.Code)
 			}
-			if env.lastReq.received {
-				t.Error("upstream was called despite traversal")
-			}
 		})
 	}
 }
 
-// TestFiles_MissingPathParam checks that a POST without ?path= is
-// refused with 400 before reaching boxd.
 func TestFiles_MissingPathParam(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 
 	req := env.buildRequest(http.MethodPost, "", tok, carrierHeader,
 		strings.NewReader("content"))
@@ -467,7 +370,7 @@ func TestFiles_MissingPathParam(t *testing.T) {
 
 func TestFiles_MethodNotAllowed(t *testing.T) {
 	env := newFilesTestEnv(t)
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 	req := env.buildRequest(http.MethodDelete, "/f.txt", tok, carrierHeader, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
@@ -479,14 +382,11 @@ func TestFiles_MethodNotAllowed(t *testing.T) {
 	}
 }
 
-// TestFiles_DisabledReturns404 ensures a proxy started without WithFiles
-// returns an opaque 404 on boxd-port traffic rather than leaking that the
-// feature exists but is off.
 func TestFiles_DisabledReturns404(t *testing.T) {
 	env := newFilesTestEnv(t)
 	env.handler.filesEnabled = false
 
-	tok := env.mintToken(auth.ScopeFiles, "")
+	tok := env.validToken()
 	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)

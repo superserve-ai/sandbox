@@ -22,70 +22,41 @@ import (
 )
 
 // terminalBridgeDeps holds the dependencies specific to the /terminal
-// WebSocket bridge. The shared verifier and nonce cache live on the
-// Handler itself (see WithAuth / authorizeSandboxRequest), so all that
-// remains here is the list of browser origins allowed to upgrade.
+// WebSocket bridge. Auth is handled by the shared HMAC seed on the
+// Handler; all that remains here is the browser origin allowlist.
 type terminalBridgeDeps struct {
-	allowedOrigins []string // Host patterns passed to websocket.Accept.OriginPatterns
+	allowedOrigins []string
 }
 
-// installAuth wires the shared verifier and nonce cache used by every
-// token-gated data-plane endpoint (/terminal, /files). Both WithTerminal
-// and WithFiles funnel through this so callers can install either feature
-// first and still share the same auth state.
-//
-// Called more than once with the same pair is a no-op; called with a
-// different verifier or cache panics — quietly swapping crypto keys at
-// runtime is an invitation to footguns, and an accidental double-install
-// with mismatched objects is a configuration bug we want to surface
-// immediately at startup.
-func (h *Handler) installAuth(verifier *auth.Verifier, nonces *NonceCache) {
-	if verifier == nil {
-		panic("proxy: auth install requires a non-nil Verifier")
+// WithAuth sets the HMAC seed used by every data-plane endpoint on the
+// boxd host label (/terminal, /files). Call once at proxy startup.
+func (h *Handler) WithAuth(seedKey []byte) *Handler {
+	if err := auth.ValidateSeed(seedKey); err != nil {
+		panic("proxy: " + err.Error())
 	}
-	if nonces == nil {
-		panic("proxy: auth install requires a non-nil NonceCache")
-	}
-	if h.verifier != nil && h.verifier != verifier {
-		panic("proxy: auth install called with a different Verifier")
-	}
-	if h.nonces != nil && h.nonces != nonces {
-		panic("proxy: auth install called with a different NonceCache")
-	}
-	h.verifier = verifier
-	h.nonces = nonces
+	h.seedKey = seedKey
+	return h
 }
 
-// WithTerminal installs the dependencies the /terminal WebSocket bridge
-// needs. Call once at proxy startup with a verifier loaded from
-// TERMINAL_TOKEN_PUBLIC_KEY, a NonceCache, and the browser origins allowed
-// to upgrade to a terminal WS.
-//
-// allowedOrigins must be non-empty — passing an empty list would effectively
-// disable origin validation, defeating the point. If you genuinely need to
-// allow all origins during local dev, pass []string{"*"} explicitly so the
-// intent is visible in configuration.
-//
-// Passing a nil verifier or nonce cache panics; the proxy is about to bind
-// a listener and configuration errors should surface at startup, not on
-// the first real request.
-func (h *Handler) WithTerminal(verifier *auth.Verifier, nonces *NonceCache, allowedOrigins []string) *Handler {
+// WithTerminal enables the /terminal WebSocket bridge. Requires
+// WithAuth to have been called first.
+func (h *Handler) WithTerminal(allowedOrigins []string) *Handler {
 	if len(allowedOrigins) == 0 {
 		panic("proxy: WithTerminal requires at least one allowed origin (use \"*\" for dev)")
 	}
-	h.installAuth(verifier, nonces)
+	if h.seedKey == nil {
+		panic("proxy: WithTerminal requires WithAuth to be called first")
+	}
 	h.terminal = &terminalBridgeDeps{allowedOrigins: allowedOrigins}
 	return h
 }
 
-// WithFiles enables the /files HTTP reverse proxy on boxdPort. It shares
-// the same verifier and nonce cache as the terminal bridge (installing
-// both is idempotent as long as the same instances are reused).
-//
-// Must be called at proxy startup — like WithTerminal, misconfiguration
-// panics rather than degrading silently.
-func (h *Handler) WithFiles(verifier *auth.Verifier, nonces *NonceCache) *Handler {
-	h.installAuth(verifier, nonces)
+// WithFiles enables the /files HTTP reverse proxy on boxdPort. Requires
+// WithAuth to have been called first.
+func (h *Handler) WithFiles() *Handler {
+	if h.seedKey == nil {
+		panic("proxy: WithFiles requires WithAuth to be called first")
+	}
 	h.filesEnabled = true
 	return h
 }
@@ -208,17 +179,9 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 		return
 	}
 
-	payload, info, fail := h.authorizeSandboxRequest(
-		r.Context(), token, auth.ScopeTerminal, instanceID, time.Now(),
-	)
+	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	if fail != nil {
-		if fail.LogMsg != "" {
-			evt := h.log.Warn().Str("sandbox_id", instanceID)
-			if fail.LogKV[0] != "" {
-				evt = evt.Str(fail.LogKV[0], fail.LogKV[1])
-			}
-			evt.Msg("terminal: " + fail.LogMsg)
-		}
+		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("terminal: auth failed")
 		fail.write(w)
 		return
 	}
@@ -271,7 +234,7 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 	// Tie the bridge lifetime to the request context so shutdowns
 	// propagate cleanly. The WS will be closed in bridgeTerminal.
 	ctx := r.Context()
-	h.bridgeTerminal(ctx, ws, procClient, instanceID, payload.TeamID)
+	h.bridgeTerminal(ctx, ws, procClient, instanceID)
 }
 
 // bridgeTerminal is the long-lived function that pumps bytes between the
@@ -282,10 +245,9 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 // waits for either to finish. When either direction errors, we cancel the
 // shared context and the other direction sees its read/write return, then
 // exits. This is the simplest correct pattern for bidirectional bridging.
-func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procClient boxdpbconnect.ProcessServiceClient, instanceID, teamID string) {
+func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procClient boxdpbconnect.ProcessServiceClient, instanceID string) {
 	l := h.log.With().
 		Str("sandbox_id", instanceID).
-		Str("team_id", teamID).
 		Logger()
 
 	// Scoped context so either direction's failure cancels everything.

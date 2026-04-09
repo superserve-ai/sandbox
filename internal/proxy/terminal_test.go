@@ -176,7 +176,7 @@ func newBridgeTestEnv(t *testing.T) *bridgeTestEnv {
 			t.Errorf("ws accept: %v", err)
 			return
 		}
-		h.bridgeTerminal(r.Context(), ws, procClient, "sbx-test", "team-test")
+		h.bridgeTerminal(r.Context(), ws, procClient, "sbx-test")
 	}))
 
 	// Dial the proxy.
@@ -400,7 +400,7 @@ func TestBridge_StartErrorClosesWSImmediately(t *testing.T) {
 		if err != nil {
 			return
 		}
-		h.bridgeTerminal(r.Context(), ws, procClient, "sbx", "team")
+		h.bridgeTerminal(r.Context(), ws, procClient, "sbx")
 	}))
 	defer proxySrv.Close()
 

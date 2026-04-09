@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"net/http"
 	"os"
 	"os/signal"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/proxy"
 )
 
@@ -38,62 +40,42 @@ func main() {
 	proxyHandler := proxy.NewHandler(domain, resolver, log)
 	proxyHandler.StartSweeper(ctx)
 
-	// Data-plane auth — the Ed25519 verifier and the single shared nonce
-	// cache are used by every token-gated endpoint on the edge (terminal
-	// bridge, /files reverse proxy, and any future scoped capability).
-	// Both features share the same Verifier and NonceCache; installing
-	// them through WithTerminal and WithFiles below is idempotent as
-	// long as the same instances are reused.
-	//
-	// REQUIRE_TERMINAL=1 makes missing configuration a hard-fail at boot
-	// rather than a warn-and-continue. Prod should always set this so a
-	// misconfigured deploy breaks the health check instead of silently
-	// shipping a proxy with the data-plane endpoints disabled — users
-	// would only notice when they hit an opaque 404 on upload or
-	// "open terminal".
-	verifier, verr := proxy.LoadTerminalVerifierFromEnv()
+	// Data-plane auth — the HMAC seed is shared with the control plane.
+	// Both sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
+	seedHex := os.Getenv("SANDBOX_ACCESS_TOKEN_SEED")
 	originsEnv := os.Getenv("TERMINAL_ALLOWED_ORIGINS")
-	required := os.Getenv("REQUIRE_TERMINAL") == "1"
+	required := os.Getenv("REQUIRE_DATA_PLANE") == "1"
 
-	switch {
-	case verr != nil:
+	if seedHex == "" {
 		if required {
-			log.Fatal().
-				Err(verr).
-				Msg("REQUIRE_TERMINAL=1 but TERMINAL_TOKEN_PUBLIC_KEY missing/invalid")
+			log.Fatal().Msg("REQUIRE_DATA_PLANE=1 but SANDBOX_ACCESS_TOKEN_SEED missing")
 		}
-		log.Warn().
-			Err(verr).
-			Msg("data-plane endpoints disabled (TERMINAL_TOKEN_PUBLIC_KEY not configured)")
-	case originsEnv == "":
-		if required {
-			log.Fatal().
-				Msg("REQUIRE_TERMINAL=1 but TERMINAL_ALLOWED_ORIGINS missing")
+		log.Warn().Msg("data-plane endpoints disabled (SANDBOX_ACCESS_TOKEN_SEED not configured)")
+	} else {
+		seed, err := hex.DecodeString(seedHex)
+		if err != nil {
+			log.Fatal().Err(err).Msg("SANDBOX_ACCESS_TOKEN_SEED is not valid hex")
 		}
-		log.Warn().
-			Msg("data-plane endpoints disabled (TERMINAL_ALLOWED_ORIGINS not configured)")
-	default:
-		origins := splitCSV(originsEnv)
-		nonces := proxy.DefaultNonceCache()
-		proxyHandler.
-			WithTerminal(verifier, nonces, origins).
-			WithFiles(verifier, nonces)
-		log.Info().
-			Strs("allowed_origins", origins).
-			Msg("data-plane endpoints enabled (terminal, files)")
+		if err := auth.ValidateSeed(seed); err != nil {
+			log.Fatal().Err(err).Msg("SANDBOX_ACCESS_TOKEN_SEED invalid")
+		}
+
+		proxyHandler.WithAuth(seed)
+
+		if originsEnv != "" {
+			origins := splitCSV(originsEnv)
+			proxyHandler.WithTerminal(origins)
+			log.Info().Strs("allowed_origins", origins).Msg("terminal endpoint enabled")
+		} else if required {
+			log.Fatal().Msg("REQUIRE_DATA_PLANE=1 but TERMINAL_ALLOWED_ORIGINS missing")
+		}
+
+		proxyHandler.WithFiles()
+		log.Info().Msg("data-plane endpoints enabled (files)")
 	}
 
-	// Wrap with a health check endpoint for the GCP LB health probe.
-	// The LB hits /health directly on the instance IP (not a sandbox
-	// URL), so the proxy handler would reject it — intercept it first.
-	//
-	// Important: we only answer 200 when the request is NOT addressed
-	// at a sandbox host. If a caller sends /health with a sandbox
-	// Host header (e.g. `boxd-<id>.sandbox.superserve.ai/health`), we
-	// fall through to the proxy handler so the boxd-label lockdown
-	// can 404 it normally. Otherwise the global /health handler would
-	// punch a hole in the documented "every non-allowlisted path
-	// under boxd- returns 404" promise.
+	// Health check for the GCP LB. Only responds on non-sandbox hosts
+	// so the boxd-label lockdown isn't bypassed.
 	domainSuffix := "." + domain
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -102,8 +84,6 @@ func main() {
 			host = host[:i]
 		}
 		if strings.HasSuffix(host, domainSuffix) {
-			// Sandbox-addressed /health — defer to the proxy
-			// handler so the boxd-label lockdown applies.
 			proxyHandler.ServeHTTP(w, r)
 			return
 		}
@@ -111,17 +91,9 @@ func main() {
 	})
 	mux.Handle("/", proxyHandler)
 
-	// HTTP→HTTPS redirect listener. The SSL Proxy LB on port 443 terminates
-	// TLS and forwards plain HTTP to the main listener. A separate L4
-	// forwarding rule on port 80 lands here, on a dedicated port, with a
-	// single 301 handler. Doing it on a separate port (rather than
-	// path-routing within the main listener) means main-listener traffic
-	// is unambiguously "TLS-terminated and trusted" while redirect-listener
-	// traffic is unambiguously "plain HTTP from a public client" — no
-	// confusion about which path the request came from.
+	// HTTP→HTTPS redirect listener.
 	redirectMux := http.NewServeMux()
 	redirectMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Strip any TCP port from Host (rare on port 80 but be safe).
 		host := r.Host
 		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
@@ -152,9 +124,6 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-// splitCSV trims and returns non-empty entries from a comma-separated
-// string. Used for TERMINAL_ALLOWED_ORIGINS where whitespace around
-// commas should not cause silent misconfiguration.
 func splitCSV(v string) []string {
 	var out []string
 	for _, s := range strings.Split(v, ",") {
