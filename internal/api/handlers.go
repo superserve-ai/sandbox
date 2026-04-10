@@ -541,12 +541,11 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	h.updateLastActivityAsync(c.Request.Context(), sandboxID, teamID)
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
-	c.JSON(http.StatusOK, gin.H{
-		"id":         sandboxID.String(),
-		"name":       sandbox.Name,
-		"status":     "active",
-		"ip_address": ipAddress,
-	})
+	sandbox.Status = db.SandboxStatusActive
+	resumeIP, _ := netip.ParseAddr(ipAddress)
+	sandbox.IpAddress = &resumeIP
+
+	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
 }
 
 // ---------------------------------------------------------------------------
