@@ -34,6 +34,14 @@ const (
 	// are all above this threshold.
 	minProxiedPort = 1024
 
+	// maxConnsPerSandbox limits concurrent connections to a single sandbox.
+	// Prevents one sandbox from exhausting host file descriptors.
+	maxConnsPerSandbox = 200
+
+	// maxConnsPerIP limits concurrent connections from a single client IP.
+	// Mitigates abuse from a single source.
+	maxConnsPerIP = 100
+
 	// transportSweepInterval controls how often the transport cache is swept
 	// to close transports for sandboxes that are no longer alive.
 	transportSweepInterval = 5 * time.Minute
@@ -42,20 +50,24 @@ const (
 
 // Handler is the core reverse proxy handler.
 type Handler struct {
-	domain     string // expected hostname suffix, e.g. "sandbox.superserve.ai"
-	resolver   Resolver
-	transports *transportCache
-	log        zerolog.Logger
+	domain       string // expected hostname suffix, e.g. "sandbox.superserve.ai"
+	resolver     Resolver
+	transports   *transportCache
+	sandboxConns *connLimiter
+	ipConns      *connLimiter
+	log          zerolog.Logger
 }
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
 // header ends in ".{domain}".
 func NewHandler(domain string, resolver Resolver, log zerolog.Logger) *Handler {
 	h := &Handler{
-		domain:     domain,
-		resolver:   resolver,
-		transports: newTransportCache(),
-		log:        log,
+		domain:       domain,
+		resolver:     resolver,
+		transports:   newTransportCache(),
+		sandboxConns: newConnLimiter(maxConnsPerSandbox),
+		ipConns:      newConnLimiter(maxConnsPerIP),
+		log:          log,
 	}
 	return h
 }
@@ -111,6 +123,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("sandbox is %s", info.Status), http.StatusServiceUnavailable)
 		return
 	}
+
+	// Enforce per-sandbox connection limit.
+	if !h.sandboxConns.acquire(instanceID) {
+		http.Error(w, "too many connections to sandbox", http.StatusTooManyRequests)
+		return
+	}
+	defer h.sandboxConns.release(instanceID)
+
+	// Enforce per-IP connection limit.
+	clientIP := clientAddr(r)
+	if !h.ipConns.acquire(clientIP) {
+		http.Error(w, "too many connections from this IP", http.StatusTooManyRequests)
+		return
+	}
+	defer h.ipConns.release(clientIP)
 
 	transport := h.transports.get(instanceID, info)
 
@@ -229,21 +256,26 @@ func (c *transportCache) close(instanceID string) {
 // sweep closes and removes transports that haven't been used recently.
 // This handles the case where a sandbox was destroyed without an explicit
 // CloseTransport call (e.g. VMD restart).
+//
+// The lock is held only while collecting stale keys and deleting them from the
+// map. Transport teardown (CloseIdleConnections) happens outside the lock so
+// concurrent requests are not blocked during cleanup.
 func (c *transportCache) sweep() {
 	cutoff := time.Now().Add(-transportMaxAge)
 
 	c.mu.Lock()
-	var stale []string
+	stale := make([]*http.Transport, 0)
 	for id, e := range c.items {
 		if e.lastUsed.Before(cutoff) {
-			stale = append(stale, id)
+			stale = append(stale, e.transport)
+			delete(c.items, id)
 		}
 	}
-	for _, id := range stale {
-		c.items[id].transport.CloseIdleConnections()
-		delete(c.items, id)
-	}
 	c.mu.Unlock()
+
+	for _, t := range stale {
+		t.CloseIdleConnections()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +285,9 @@ func (c *transportCache) sweep() {
 // newTransport builds an http.Transport for VM-facing connections.
 //
 // Key decisions:
-//   - DisableKeepAlives: sandboxes are ephemeral and can restart; never reuse TCP.
+//   - Keep-alives enabled: the lifecycle-keyed transport cache already handles stale
+//     connections on VM restart (StartedAt changes → new transport, old one swept).
+//     Reusing TCP connections avoids a handshake per request for high-frequency HTTP.
 //   - DisableCompression: we're a transparent proxy — client and server negotiate it.
 //   - Retry dial on ECONNREFUSED only: boxd may not be ready immediately after the
 //     sandbox reaches "running". We retry up to maxDialAttempts with linear backoff.
@@ -261,7 +295,6 @@ func (c *transportCache) sweep() {
 //   - No ResponseHeaderTimeout: PTY and streaming responses can take arbitrarily long.
 func newTransport() *http.Transport {
 	return &http.Transport{
-		DisableKeepAlives:   true,
 		DisableCompression:  true,
 		IdleConnTimeout:     transportIdleTimeout,
 		TLSHandshakeTimeout: 0,
@@ -306,6 +339,18 @@ func retryDial(maxAttempts int, timeout time.Duration) func(ctx context.Context,
 		}
 		return nil, err
 	}
+}
+
+// clientAddr extracts the client IP from the request. It uses RemoteAddr
+// (which is set by the Go HTTP server from the TCP connection) and strips
+// the port. We intentionally ignore X-Forwarded-For since we strip it
+// before forwarding — the GCP LB sets RemoteAddr to the true client IP.
+func clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // ---------------------------------------------------------------------------
