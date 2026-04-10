@@ -749,16 +749,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		snapshotMemPath = filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
 	}
 
-	// Insert sandbox with status=starting. VcpuCount and MemoryMib are
-	// set to 0 here as placeholders — the real values come from VMD's
-	// CreateVMResponse after the VM boots from the template snapshot.
-	// We update them below once VMD reports back.
+	// Insert sandbox with status=starting. VcpuCount and MemoryMib use
+	// minimal placeholders (1) to satisfy the DB CHECK constraint. The
+	// real values come from VMD's CreateVMResponse and are written by
+	// ActivateSandbox once the VM boots.
 	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
 		TeamID:         teamID,
 		Name:           req.Name,
 		Status:         db.SandboxStatusStarting,
-		VcpuCount:      0,
-		MemoryMib:      0,
+		VcpuCount:      1,
+		MemoryMib:      1,
 		SnapshotID:     snapshotID,
 		TimeoutSeconds: req.TimeoutSeconds,
 		Metadata:       metadataJSON,
