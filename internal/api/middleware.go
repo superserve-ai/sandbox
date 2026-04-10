@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -38,9 +39,13 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			return
 		}
 
-		// Update last_used_at (fire and forget)
+		// Update last_used_at (fire and forget). Extract the context
+		// before spawning so the goroutine does not capture c — gin
+		// recycles *Context back to the pool after ServeHTTP returns,
+		// causing a data race if the goroutine reads c.Request later.
+		lastUsedCtx := context.WithoutCancel(c.Request.Context())
 		go func() {
-			_, _ = pool.Exec(c.Request.Context(),
+			_, _ = pool.Exec(lastUsedCtx,
 				"UPDATE api_key SET last_used_at = now() WHERE id = $1", id)
 		}()
 
