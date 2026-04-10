@@ -50,3 +50,6 @@ internal/db/generated/
 .claude/
 .runtime/
 migrate
+
+# Docs
+docs/
