@@ -68,7 +68,7 @@ type ClaimExpiredSandboxesRow struct {
 	TeamID     uuid.UUID   `json:"team_id"`
 	Name       string      `json:"name"`
 	SnapshotID pgtype.UUID `json:"snapshot_id"`
-	HostID     *string     `json:"host_id"`
+	HostID     string      `json:"host_id"`
 }
 
 // Atomically claims active sandboxes whose hard timeout has elapsed and marks
@@ -118,7 +118,7 @@ type CreateSandboxParams struct {
 	Status         SandboxStatus `json:"status"`
 	VcpuCount      int32         `json:"vcpu_count"`
 	MemoryMib      int32         `json:"memory_mib"`
-	HostID         *string       `json:"host_id"`
+	HostID         string        `json:"host_id"`
 	IpAddress      *netip.Addr   `json:"ip_address"`
 	Pid            *int32        `json:"pid"`
 	SnapshotID     pgtype.UUID   `json:"snapshot_id"`
@@ -417,7 +417,7 @@ WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
 
 type UpdateSandboxHostParams struct {
 	ID        uuid.UUID   `json:"id"`
-	HostID    *string     `json:"host_id"`
+	HostID    string      `json:"host_id"`
 	IpAddress *netip.Addr `json:"ip_address"`
 	Pid       *int32      `json:"pid"`
 	TeamID    uuid.UUID   `json:"team_id"`

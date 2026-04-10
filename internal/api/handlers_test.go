@@ -115,7 +115,7 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[3].(*db.SandboxStatus) = s.Status
 		*dest[4].(*int32) = s.VcpuCount
 		*dest[5].(*int32) = s.MemoryMib
-		*dest[6].(**string) = s.HostID
+		*dest[6].(*string) = s.HostID
 		*dest[7].(**netip.Addr) = s.IpAddress
 		*dest[8].(**int32) = s.Pid
 		*dest[9].(*pgtype.UUID) = s.SnapshotID

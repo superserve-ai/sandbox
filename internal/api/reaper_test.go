@@ -42,7 +42,7 @@ func (r *stubRows) Scan(dest ...any) error {
 	*dest[1].(*uuid.UUID) = row.TeamID
 	*dest[2].(*string) = row.Name
 	*dest[3].(*pgtype.UUID) = row.SnapshotID
-	*dest[4].(**string) = row.HostID
+	*dest[4].(*string) = row.HostID
 	return nil
 }
 
