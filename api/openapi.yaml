@@ -420,6 +420,18 @@ components:
           example:
             env: prod
             owner: agent-7
+        env_vars:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Environment variables injected into every process inside the
+            sandbox (terminal sessions, exec calls). Not persisted in the
+            database — they live in the VM agent's memory for the sandbox's
+            lifetime and survive pause/resume via snapshot.
+          example:
+            OPENAI_API_KEY: sk-...
+            DEBUG: "1"
             run_id: 7f3c-21
         network:
           $ref: "#/components/schemas/NetworkConfig"

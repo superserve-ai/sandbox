@@ -48,6 +48,12 @@ func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) 
 		return nil, err
 	}
 
+	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
+		a.mgr.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to post env vars to boxd")
+		// Don't fail the create — the VM is running, env vars just didn't get set.
+		// The caller can still use per-request env vars as a fallback.
+	}
+
 	return &vmdpb.CreateVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
@@ -89,6 +95,11 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	if err != nil {
 		return nil, err
 	}
+
+	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
+		a.mgr.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to post env vars to boxd on resume")
+	}
+
 	return &vmdpb.ResumeVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
