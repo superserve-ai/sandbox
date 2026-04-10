@@ -73,6 +73,11 @@ func run() error {
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
+	// Launch the timeout reaper. This goroutine destroys sandboxes whose
+	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
+	// to ctx so it exits on shutdown.
+	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+
 	// Start HTTP server.
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

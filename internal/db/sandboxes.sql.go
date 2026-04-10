@@ -14,22 +14,87 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
+WITH expired AS (
+  SELECT id, team_id, name, snapshot_id, host_id
+  FROM sandbox
+  WHERE destroyed_at IS NULL
+    AND timeout_seconds IS NOT NULL
+    AND status = 'active'
+    AND created_at + (timeout_seconds || ' seconds')::interval < now()
+    AND created_at < now() - interval '60 seconds'
+  ORDER BY created_at ASC
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE sandbox
+SET status = 'pausing', updated_at = now()
+FROM expired
+WHERE sandbox.id = expired.id
+RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+`
+
+type ClaimExpiredSandboxesRow struct {
+	ID         uuid.UUID   `json:"id"`
+	TeamID     uuid.UUID   `json:"team_id"`
+	Name       string      `json:"name"`
+	SnapshotID pgtype.UUID `json:"snapshot_id"`
+	HostID     *string     `json:"host_id"`
+}
+
+// Atomically claims active sandboxes whose hard timeout has elapsed and marks
+// them as 'pausing'. FOR UPDATE SKIP LOCKED lets concurrent reaper replicas
+// skip rows already being processed, so multi-replica Cloud Run deployments
+// do not double-process the same sandbox.
+//
+// Only 'active' sandboxes are claimed — idle sandboxes are already stopped,
+// and transient states (starting, pausing) are skipped to avoid racing with
+// in-progress operations. The 60-second grace window prevents reaping a sandbox
+// that was just created with a very short timeout before it finishes starting up.
+func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]ClaimExpiredSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, claimExpiredSandboxes, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimExpiredSandboxesRow{}
+	for rows.Next() {
+		var i ClaimExpiredSandboxesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.SnapshotID,
+			&i.HostID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createSandbox = `-- name: CreateSandbox :one
-INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config
+INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
 `
 
 type CreateSandboxParams struct {
-	TeamID     uuid.UUID     `json:"team_id"`
-	Name       string        `json:"name"`
-	Status     SandboxStatus `json:"status"`
-	VcpuCount  int32         `json:"vcpu_count"`
-	MemoryMib  int32         `json:"memory_mib"`
-	HostID     *string       `json:"host_id"`
-	IpAddress  *netip.Addr   `json:"ip_address"`
-	Pid        *int32        `json:"pid"`
-	SnapshotID pgtype.UUID   `json:"snapshot_id"`
+	TeamID         uuid.UUID     `json:"team_id"`
+	Name           string        `json:"name"`
+	Status         SandboxStatus `json:"status"`
+	VcpuCount      int32         `json:"vcpu_count"`
+	MemoryMib      int32         `json:"memory_mib"`
+	HostID         *string       `json:"host_id"`
+	IpAddress      *netip.Addr   `json:"ip_address"`
+	Pid            *int32        `json:"pid"`
+	SnapshotID     pgtype.UUID   `json:"snapshot_id"`
+	TimeoutSeconds *int32        `json:"timeout_seconds"`
+	Metadata       []byte        `json:"metadata"`
 }
 
 func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (Sandbox, error) {
@@ -43,6 +108,8 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		arg.IpAddress,
 		arg.Pid,
 		arg.SnapshotID,
+		arg.TimeoutSeconds,
+		arg.Metadata,
 	)
 	var i Sandbox
 	err := row.Scan(
@@ -61,6 +128,8 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		&i.UpdatedAt,
 		&i.DestroyedAt,
 		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
 	)
 	return i, err
 }
@@ -82,7 +151,7 @@ func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) 
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -110,6 +179,8 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.UpdatedAt,
 		&i.DestroyedAt,
 		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
 	)
 	return i, err
 }
@@ -132,7 +203,7 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 }
 
 const listIdleSandboxes = `-- name: ListIdleSandboxes :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
 WHERE status = 'idle'
   AND destroyed_at IS NULL
   AND last_activity_at < $1
@@ -164,6 +235,8 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 			&i.UpdatedAt,
 			&i.DestroyedAt,
 			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.Metadata,
 		); err != nil {
 			return nil, err
 		}
@@ -176,7 +249,7 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 }
 
 const listSandboxesByTeam = `-- name: ListSandboxesByTeam :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
 ORDER BY created_at DESC
 `
@@ -206,6 +279,63 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.UpdatedAt,
 			&i.DestroyedAt,
 			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.Metadata,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSandboxesByTeamWithFilter = `-- name: ListSandboxesByTeamWithFilter :many
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
+WHERE team_id = $1
+  AND destroyed_at IS NULL
+  AND metadata @> $2
+ORDER BY created_at DESC
+`
+
+type ListSandboxesByTeamWithFilterParams struct {
+	TeamID   uuid.UUID `json:"team_id"`
+	Metadata []byte    `json:"metadata"`
+}
+
+// Same as ListSandboxesByTeam but additionally filters rows whose metadata
+// contains every key/value pair in $2 (jsonb @> containment). Pass an empty
+// object '{}'::jsonb to match everything — but prefer ListSandboxesByTeam
+// in that case so we don't pay the (still tiny) cost of the @> evaluation.
+func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSandboxesByTeamWithFilterParams) ([]Sandbox, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByTeamWithFilter, arg.TeamID, arg.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sandbox{}
+	for rows.Next() {
+		var i Sandbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.Status,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.HostID,
+			&i.IpAddress,
+			&i.Pid,
+			&i.SnapshotID,
+			&i.LastActivityAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DestroyedAt,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.Metadata,
 		); err != nil {
 			return nil, err
 		}
@@ -288,6 +418,23 @@ type UpdateSandboxLastActivityParams struct {
 
 func (q *Queries) UpdateSandboxLastActivity(ctx context.Context, arg UpdateSandboxLastActivityParams) error {
 	_, err := q.db.Exec(ctx, updateSandboxLastActivity, arg.ID, arg.TeamID)
+	return err
+}
+
+const updateSandboxMetadata = `-- name: UpdateSandboxMetadata :exec
+UPDATE sandbox
+SET metadata = $2, updated_at = now()
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+`
+
+type UpdateSandboxMetadataParams struct {
+	ID       uuid.UUID `json:"id"`
+	Metadata []byte    `json:"metadata"`
+	TeamID   uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) UpdateSandboxMetadata(ctx context.Context, arg UpdateSandboxMetadataParams) error {
+	_, err := q.db.Exec(ctx, updateSandboxMetadata, arg.ID, arg.Metadata, arg.TeamID)
 	return err
 }
 

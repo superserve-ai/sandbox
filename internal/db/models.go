@@ -136,6 +136,10 @@ type Sandbox struct {
 	UpdatedAt      time.Time          `json:"updated_at"`
 	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
 	NetworkConfig  []byte             `json:"network_config"`
+	// Hard lifetime cap in seconds from created_at. NULL = no cap. The reaper destroys the sandbox when now() > created_at + (timeout_seconds || ' seconds')::interval, regardless of state (active, paused, idle).
+	TimeoutSeconds *int32 `json:"timeout_seconds"`
+	// User-supplied flat string→string tags attached at creation. Immutable. Filterable on list endpoints via jsonb @> containment. Always non-null; an absent value is the empty object {}, never NULL.
+	Metadata []byte `json:"metadata"`
 }
 
 type Snapshot struct {
