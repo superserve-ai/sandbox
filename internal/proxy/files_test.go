@@ -132,13 +132,10 @@ func (e *filesTestEnv) validToken() string {
 	return auth.ComputeAccessToken(e.seedKey, e.sandboxID)
 }
 
-func (e *filesTestEnv) buildRequest(method, filePath, token string, carrier tokenCarrier, body io.Reader) *http.Request {
+func (e *filesTestEnv) buildRequest(method, filePath, token string, body io.Reader) *http.Request {
 	q := url.Values{}
 	if filePath != "" {
 		q.Set("path", filePath)
-	}
-	if token != "" && carrier == carrierQuery {
-		q.Set("token", token)
 	}
 	target := "http://unused/files"
 	if len(q) > 0 {
@@ -146,18 +143,11 @@ func (e *filesTestEnv) buildRequest(method, filePath, token string, carrier toke
 	}
 	req := httptest.NewRequest(method, target, body)
 	req.Host = "boxd-" + e.sandboxID + "." + e.domain
-	if token != "" && carrier == carrierHeader {
+	if token != "" {
 		req.Header.Set("X-Access-Token", token)
 	}
 	return req
 }
-
-type tokenCarrier int
-
-const (
-	carrierHeader tokenCarrier = iota
-	carrierQuery
-)
 
 // ---------------------------------------------------------------------------
 // Happy paths
@@ -167,7 +157,7 @@ func TestFiles_UploadHeaderCarrier_ForwardsToUpstream(t *testing.T) {
 	env := newFilesTestEnv(t)
 	tok := env.validToken()
 
-	req := env.buildRequest(http.MethodPost, "/home/u/app.txt", tok, carrierHeader,
+	req := env.buildRequest(http.MethodPost, "/home/u/app.txt", tok,
 		strings.NewReader("file contents"))
 	req.Header.Set("Content-Type", "application/octet-stream")
 
@@ -203,33 +193,13 @@ func TestFiles_UploadHeaderCarrier_ForwardsToUpstream(t *testing.T) {
 	}
 }
 
-func TestFiles_DownloadQueryCarrier_StripsTokenBeforeForwarding(t *testing.T) {
-	env := newFilesTestEnv(t)
-	tok := env.validToken()
-
-	req := env.buildRequest(http.MethodGet, "/etc/motd", tok, carrierQuery, nil)
-
-	w := httptest.NewRecorder()
-	env.handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
-	}
-	if strings.Contains(env.lastReq.rawQuery, "token=") {
-		t.Errorf("token leaked to upstream query: %q", env.lastReq.rawQuery)
-	}
-	if !strings.Contains(env.lastReq.rawQuery, "path=%2Fetc%2Fmotd") {
-		t.Errorf("path param lost: %q", env.lastReq.rawQuery)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Auth rejections
 // ---------------------------------------------------------------------------
 
 func TestFiles_MissingToken_Unauthorized(t *testing.T) {
 	env := newFilesTestEnv(t)
-	req := env.buildRequest(http.MethodGet, "/f.txt", "", carrierHeader, nil)
+	req := env.buildRequest(http.MethodGet, "/f.txt", "", nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
@@ -239,7 +209,7 @@ func TestFiles_MissingToken_Unauthorized(t *testing.T) {
 
 func TestFiles_WrongTokenRejected(t *testing.T) {
 	env := newFilesTestEnv(t)
-	req := env.buildRequest(http.MethodGet, "/f.txt", "totally-wrong-token", carrierHeader, nil)
+	req := env.buildRequest(http.MethodGet, "/f.txt", "totally-wrong-token", nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
@@ -250,7 +220,7 @@ func TestFiles_WrongTokenRejected(t *testing.T) {
 func TestFiles_WrongSandboxTokenRejected(t *testing.T) {
 	env := newFilesTestEnv(t)
 	wrongToken := auth.ComputeAccessToken(env.seedKey, "different-sandbox-id")
-	req := env.buildRequest(http.MethodGet, "/f.txt", wrongToken, carrierHeader, nil)
+	req := env.buildRequest(http.MethodGet, "/f.txt", wrongToken, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
@@ -263,7 +233,7 @@ func TestFiles_TokenReusable(t *testing.T) {
 	tok := env.validToken()
 
 	// First request
-	req1 := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
+	req1 := env.buildRequest(http.MethodGet, "/f.txt", tok, nil)
 	w1 := httptest.NewRecorder()
 	env.handler.ServeHTTP(w1, req1)
 	if w1.Code != http.StatusOK {
@@ -271,7 +241,7 @@ func TestFiles_TokenReusable(t *testing.T) {
 	}
 
 	// Same token again — should still work (not single-use anymore)
-	req2 := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
+	req2 := env.buildRequest(http.MethodGet, "/f.txt", tok, nil)
 	w2 := httptest.NewRecorder()
 	env.handler.ServeHTTP(w2, req2)
 	if w2.Code != http.StatusOK {
@@ -283,7 +253,7 @@ func TestFiles_SandboxNotRunningReturns503(t *testing.T) {
 	env := newFilesTestEnv(t)
 	env.resolver.info.Status = "paused"
 	tok := env.validToken()
-	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
+	req := env.buildRequest(http.MethodGet, "/f.txt", tok, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
@@ -295,7 +265,7 @@ func TestFiles_SandboxNotFoundReturns404(t *testing.T) {
 	env := newFilesTestEnv(t)
 	env.resolver.err = ErrInstanceNotFound
 	tok := env.validToken()
-	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
+	req := env.buildRequest(http.MethodGet, "/f.txt", tok, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -344,7 +314,7 @@ func TestFiles_PathTraversalRejected(t *testing.T) {
 	}
 	for _, p := range cases {
 		t.Run(p, func(t *testing.T) {
-			req := env.buildRequest(http.MethodPost, p, tok, carrierHeader,
+			req := env.buildRequest(http.MethodPost, p, tok,
 				strings.NewReader("content"))
 			w := httptest.NewRecorder()
 			env.handler.ServeHTTP(w, req)
@@ -359,7 +329,7 @@ func TestFiles_MissingPathParam(t *testing.T) {
 	env := newFilesTestEnv(t)
 	tok := env.validToken()
 
-	req := env.buildRequest(http.MethodPost, "", tok, carrierHeader,
+	req := env.buildRequest(http.MethodPost, "", tok,
 		strings.NewReader("content"))
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
@@ -371,7 +341,7 @@ func TestFiles_MissingPathParam(t *testing.T) {
 func TestFiles_MethodNotAllowed(t *testing.T) {
 	env := newFilesTestEnv(t)
 	tok := env.validToken()
-	req := env.buildRequest(http.MethodDelete, "/f.txt", tok, carrierHeader, nil)
+	req := env.buildRequest(http.MethodDelete, "/f.txt", tok, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusMethodNotAllowed {
@@ -387,7 +357,7 @@ func TestFiles_DisabledReturns404(t *testing.T) {
 	env.handler.filesEnabled = false
 
 	tok := env.validToken()
-	req := env.buildRequest(http.MethodGet, "/f.txt", tok, carrierHeader, nil)
+	req := env.buildRequest(http.MethodGet, "/f.txt", tok, nil)
 	w := httptest.NewRecorder()
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {

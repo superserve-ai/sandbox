@@ -105,11 +105,10 @@ const (
 	idleCloseAfter = 10 * time.Minute
 
 	// maxSessionDuration is a hard ceiling on a single terminal session
-	// regardless of traffic. Bounds the blast radius of a stolen WS
-	// connection — even if an attacker hijacks an active session and
-	// sends just enough traffic to keep the idle timer alive, the
-	// session still terminates after this duration. Clients should
-	// reconnect (and re-mint a token) for longer-running work.
+	// regardless of traffic. Bounds the blast radius of a hijacked WS
+	// connection — even if an attacker sends just enough traffic to
+	// keep the idle timer alive, the session still terminates after
+	// this duration. Clients should reconnect for longer-running work.
 	maxSessionDuration = 4 * time.Hour
 
 	// initialTerminalCols / initialTerminalRows are the PTY dimensions
@@ -146,13 +145,12 @@ type wsControlMessage struct {
 // already parsed the instance ID and confirmed the terminal feature is
 // enabled; this function is responsible for:
 //
-//  1. Extracting and verifying the token (signature, expiry, scope).
-//  2. Single-use nonce check (replay protection).
-//  3. Binding the token to the requested instance ID.
-//  4. Resolving the VM IP via the resolver.
-//  5. Upgrading the HTTP connection to a WebSocket.
-//  6. Opening a connect-rpc stream to boxd ProcessService.Start.
-//  7. Bridging bytes until either side closes.
+//  1. Extracting the HMAC access token from the WebSocket subprotocol.
+//  2. Verifying the token against the sandbox ID.
+//  3. Resolving the VM IP via the resolver.
+//  4. Upgrading the HTTP connection to a WebSocket.
+//  5. Opening a connect-rpc stream to boxd ProcessService.Start.
+//  6. Bridging bytes until either side closes.
 //
 // Errors before the upgrade are returned as standard HTTP error responses.
 // Errors after the upgrade are sent as WebSocket close frames with codes
