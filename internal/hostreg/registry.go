@@ -6,11 +6,11 @@ import (
 	"sync"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// DialFunc creates a client for the given gRPC address. The returned value
-// must satisfy api.VMDClient — the concrete type is opaque to the registry.
-type DialFunc func(addr string) (any, error)
+// DialFunc creates a VMD client for the given gRPC address.
+type DialFunc func(addr string) (vmdclient.Client, error)
 
 // Registry maps host IDs to VMD clients. Clients are lazily created on
 // first use and cached.
@@ -18,7 +18,7 @@ type Registry struct {
 	db      *db.Queries
 	dial    DialFunc
 	mu      sync.RWMutex
-	clients map[string]any
+	clients map[string]vmdclient.Client
 }
 
 // New creates a Registry backed by the host table.
@@ -26,14 +26,13 @@ func New(queries *db.Queries, dial DialFunc) *Registry {
 	return &Registry{
 		db:      queries,
 		dial:    dial,
-		clients: make(map[string]any),
+		clients: make(map[string]vmdclient.Client),
 	}
 }
 
 // ClientFor returns the VMD client for the given host. It looks up the host
-// in the DB on first access, dials gRPC, and caches the result. The caller
-// must type-assert the result to api.VMDClient.
-func (r *Registry) ClientFor(ctx context.Context, hostID string) (any, error) {
+// in the DB on first access, dials gRPC, and caches the result.
+func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Client, error) {
 	r.mu.RLock()
 	c, ok := r.clients[hostID]
 	r.mu.RUnlock()

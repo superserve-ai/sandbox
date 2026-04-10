@@ -22,6 +22,7 @@ import (
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -75,7 +76,7 @@ func run() error {
 
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
 	// Falls back to the default vmdClient when the registry has no entry.
-	dialVMD := func(addr string) (any, error) {
+	dialVMD := func(addr string) (vmdclient.Client, error) {
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		)

@@ -26,6 +26,10 @@ type Config struct {
 	// EdgeProxyDomain is the public hostname suffix served by the edge
 	// proxy, used to construct URLs in sandbox responses.
 	EdgeProxyDomain string
+
+	// DefaultHostID is the fallback host identifier used when no scheduler
+	// is configured. Set via DEFAULT_HOST_ID; defaults to "default".
+	DefaultHostID string
 }
 
 // Load reads configuration from environment variables.
@@ -49,6 +53,7 @@ func Load() (*Config, error) {
 		DatabaseURL:            dbURL,
 		SandboxAccessTokenSeed: seed,
 		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
+		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
 	}
 	return cfg, nil
 }

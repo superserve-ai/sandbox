@@ -19,39 +19,29 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// VMDClient defines the subset of the VM daemon gRPC interface used by the
-// control plane. This is satisfied by the gRPC adapter in cmd/controlplane.
-type VMDClient interface {
-	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
-	DestroyInstance(ctx context.Context, instanceID string, force bool) error
-	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
-	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
-	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
-	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
-}
+// VMDClient is the interface for talking to a VM daemon.
+type VMDClient = vmdclient.Client
 
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
 	SelectHost(ctx context.Context) (hostID string, err error)
 }
 
-// HostRegistry resolves a host ID to a VMD client. The returned value
-// must satisfy VMDClient; the registry is type-agnostic to avoid
-// circular imports between api and hostreg.
+// HostRegistry resolves a host ID to a VMD client.
 type HostRegistry interface {
-	ClientFor(ctx context.Context, hostID string) (any, error)
+	ClientFor(ctx context.Context, hostID string) (vmdclient.Client, error)
 }
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	VMD       VMDClient     // default/fallback VMD client
+	VMD       VMDClient     // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
 	DB        *db.Queries
 	Config    *config.Config
-	Hosts     HostRegistry  // optional; when set, routes via host_id
-	Scheduler Scheduler     // optional; when set, picks host on create
+	Hosts     HostRegistry  // when set, routes VMD calls via host_id
+	Scheduler Scheduler     // when set, picks host on create
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -63,21 +53,24 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 	}
 }
 
-// vmdForHost returns the VMDClient for the given host. If the registry is
-// configured it does a lookup; otherwise it falls back to the default client.
+// vmdForHost returns the VMDClient for the given host. When a registry is
+// configured, it resolves via DB lookup. If the lookup fails (e.g. legacy
+// sandbox with a backfilled host_id that has no host row), falls back to
+// the default VMD client so existing sandboxes keep working during the
+// migration period.
 func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
-	if h.Hosts != nil {
-		raw, err := h.Hosts.ClientFor(ctx, hostID)
-		if err != nil {
-			return nil, err
-		}
-		c, ok := raw.(VMDClient)
-		if !ok {
-			return nil, fmt.Errorf("host registry returned %T, want VMDClient", raw)
-		}
-		return c, nil
+	if h.Hosts == nil {
+		return h.VMD, nil
 	}
-	return h.VMD, nil
+	c, err := h.Hosts.ClientFor(ctx, hostID)
+	if err != nil {
+		if h.VMD != nil {
+			log.Warn().Err(err).Str("host_id", hostID).Msg("host registry lookup failed, falling back to default VMD client")
+			return h.VMD, nil
+		}
+		return nil, err
+	}
+	return c, nil
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -809,7 +802,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 
 	// Select a host for this sandbox.
-	hostID := ""
+	var hostID string
 	if h.Scheduler != nil {
 		hostID, err = h.Scheduler.SelectHost(c.Request.Context())
 		if err != nil {
@@ -817,6 +810,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
 			return
 		}
+	} else if h.Config != nil && h.Config.DefaultHostID != "" {
+		hostID = h.Config.DefaultHostID
+	} else {
+		hostID = "default"
 	}
 
 	// Insert sandbox with status=starting. VcpuCount and MemoryMib use
