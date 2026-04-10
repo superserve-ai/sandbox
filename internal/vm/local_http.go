@@ -90,7 +90,7 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 	}
 
 	instanceID := strings.TrimPrefix(r.URL.Path, "/instances/")
-	if instanceID == "" {
+	if instanceID == "" || strings.Contains(instanceID, "/") {
 		http.Error(w, "missing instance ID", http.StatusBadRequest)
 		return
 	}

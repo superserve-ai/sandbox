@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // ErrInstanceNotFound is returned when the resolver has no record of the instance.
@@ -62,6 +64,7 @@ type VMDResolver struct {
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+	group singleflight.Group
 }
 
 // NewVMDResolver creates a Resolver that queries VMD at vmdAddr.
@@ -79,6 +82,8 @@ func NewVMDResolver(vmdAddr string) *VMDResolver {
 }
 
 // Lookup returns InstanceInfo for the given instanceID.
+// Concurrent lookups for the same instanceID are collapsed into a single
+// VMD call via singleflight, preventing cache stampedes on miss.
 func (r *VMDResolver) Lookup(ctx context.Context, instanceID string) (InstanceInfo, error) {
 	r.mu.Lock()
 	if e, ok := r.cache[instanceID]; ok && time.Now().Before(e.expiresAt) {
@@ -87,7 +92,13 @@ func (r *VMDResolver) Lookup(ctx context.Context, instanceID string) (InstanceIn
 	}
 	r.mu.Unlock()
 
-	return r.fetch(ctx, instanceID)
+	v, err, _ := r.group.Do(instanceID, func() (any, error) {
+		return r.fetch(ctx, instanceID)
+	})
+	if err != nil {
+		return InstanceInfo{}, err
+	}
+	return v.(InstanceInfo), nil
 }
 
 // Invalidate removes an instance from the cache so the next Lookup goes to VMD.
@@ -139,25 +150,17 @@ func (r *VMDResolver) store(instanceID string, info InstanceInfo, err error, ttl
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.cache) >= maxCacheSize {
-		r.evictOldest()
+		r.evictRandom()
 	}
 	r.cache[instanceID] = cacheEntry{info: info, err: err, expiresAt: time.Now().Add(ttl)}
 }
 
-// evictOldest removes the cache entry with the earliest expiresAt.
+// evictRandom removes a random cache entry. O(1) under lock — Go's map
+// iteration starts at a random bucket, so the first key is effectively random.
 // Must be called with r.mu held.
-func (r *VMDResolver) evictOldest() {
-	var oldestKey string
-	var oldestTime time.Time
-	first := true
-	for k, e := range r.cache {
-		if first || e.expiresAt.Before(oldestTime) {
-			oldestKey = k
-			oldestTime = e.expiresAt
-			first = false
-		}
-	}
-	if !first {
-		delete(r.cache, oldestKey)
+func (r *VMDResolver) evictRandom() {
+	for k := range r.cache {
+		delete(r.cache, k)
+		return
 	}
 }

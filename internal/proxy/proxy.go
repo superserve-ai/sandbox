@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -341,11 +342,19 @@ func retryDial(maxAttempts int, timeout time.Duration) func(ctx context.Context,
 	}
 }
 
-// clientAddr extracts the client IP from the request. It uses RemoteAddr
-// (which is set by the Go HTTP server from the TCP connection) and strips
-// the port. We intentionally ignore X-Forwarded-For since we strip it
-// before forwarding — the GCP LB sets RemoteAddr to the true client IP.
+// clientAddr extracts the client IP from the request.
+// Behind GCP HTTPS LB, RemoteAddr is the LB's egress IP, not the client's.
+// GCP sets X-Forwarded-For to: "<client>, <lb>" — we take the first entry.
+// We read XFF before the director strips it (director runs later in ServeHTTP).
+// Falls back to RemoteAddr if XFF is missing (direct access, tests).
 func clientAddr(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// XFF may contain: "client, proxy1, proxy2" — first is the client.
+		if i := strings.Index(xff, ","); i != -1 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

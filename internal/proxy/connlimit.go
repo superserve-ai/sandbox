@@ -32,8 +32,9 @@ func (cl *connLimiter) acquire(key string) bool {
 func (cl *connLimiter) release(key string) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	cl.counts[key]--
-	if cl.counts[key] <= 0 {
+	if cl.counts[key] <= 1 {
 		delete(cl.counts, key)
+		return
 	}
+	cl.counts[key]--
 }

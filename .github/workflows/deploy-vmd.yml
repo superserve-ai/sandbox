@@ -193,7 +193,7 @@ jobs:
                   sudo systemctl enable proxy
 
                   sudo systemctl restart proxy
-                  sleep 2
+                  sleep 3
                   sudo systemctl is-active --quiet proxy || (
                       echo "ERROR: proxy failed to become active after restart" >&2
                       sudo systemctl status --no-pager proxy >&2 || true
