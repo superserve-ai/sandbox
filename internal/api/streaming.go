@@ -53,10 +53,17 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		return
 	}
 
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for exec stream failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
 	start := time.Now()
 	var lastExitCode int32
 
-	err := h.VMD.ExecCommandStream(c.Request.Context(), sandbox.ID.String(),
+	err := vmd.ExecCommandStream(c.Request.Context(), sandbox.ID.String(),
 		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS),
 		func(stdout, stderr []byte, exitCode int32, finished bool) {
 			event := gin.H{

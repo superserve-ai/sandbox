@@ -20,6 +20,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostreg"
+	"github.com/superserve-ai/sandbox/internal/scheduler"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -70,6 +72,21 @@ func run() error {
 	vmdClient := newGRPCVMDClient(grpcConn)
 	queries := dbq.New(dbPool)
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
+
+	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
+	// Falls back to the default vmdClient when the registry has no entry.
+	dialVMD := func(addr string) (any, error) {
+		conn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return newGRPCVMDClient(conn), nil
+	}
+	handlers.Hosts = hostreg.New(queries, dialVMD)
+	handlers.Scheduler = &scheduler.PickFirst{DB: queries}
+
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose

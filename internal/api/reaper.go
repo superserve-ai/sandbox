@@ -130,8 +130,15 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Str("name", sbx.Name).
 		Logger()
 
+	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
+	if vmdLookupErr != nil {
+		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
+		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
+		return
+	}
+
 	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	snapshotPath, memPath, err := h.VMD.PauseInstance(vmdCtx, sbx.ID.String(), "")
+	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sbx.ID.String(), "")
 	vmdCancel()
 	if err != nil {
 		// VM never stopped — safe to revert DB to active so the reaper
@@ -199,8 +206,15 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		AnErr("cause", cause).
 		Logger()
 
+	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
+	if vmdLookupErr != nil {
+		rl.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD for rollback failed")
+		h.markSandboxFailed(ctx, sbx, "resolve VMD failed during rollback", rl)
+		return
+	}
+
 	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	_, _, _, err := h.VMD.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath, nil)
+	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath, nil)
 	vmdCancel()
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")

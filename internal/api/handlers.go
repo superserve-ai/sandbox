@@ -33,11 +33,25 @@ type VMDClient interface {
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
+// Scheduler selects a host for new sandboxes.
+type Scheduler interface {
+	SelectHost(ctx context.Context) (hostID string, err error)
+}
+
+// HostRegistry resolves a host ID to a VMD client. The returned value
+// must satisfy VMDClient; the registry is type-agnostic to avoid
+// circular imports between api and hostreg.
+type HostRegistry interface {
+	ClientFor(ctx context.Context, hostID string) (any, error)
+}
+
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	VMD    VMDClient
-	DB     *db.Queries
-	Config *config.Config
+	VMD       VMDClient     // default/fallback VMD client
+	DB        *db.Queries
+	Config    *config.Config
+	Hosts     HostRegistry  // optional; when set, routes via host_id
+	Scheduler Scheduler     // optional; when set, picks host on create
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -47,6 +61,23 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 		DB:     queries,
 		Config: cfg,
 	}
+}
+
+// vmdForHost returns the VMDClient for the given host. If the registry is
+// configured it does a lookup; otherwise it falls back to the default client.
+func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
+	if h.Hosts != nil {
+		raw, err := h.Hosts.ClientFor(ctx, hostID)
+		if err != nil {
+			return nil, err
+		}
+		c, ok := raw.(VMDClient)
+		if !ok {
+			return nil, fmt.Errorf("host registry returned %T, want VMDClient", raw)
+		}
+		return c, nil
+	}
+	return h.VMD, nil
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -134,9 +165,16 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 		case db.SandboxStatusActive:
 			// Ready.
 		case db.SandboxStatusIdle:
+			vmd, vmdErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+			if vmdErr != nil {
+				log.Error().Err(vmdErr).Str("sandbox_id", sandboxID.String()).Msg("auto-wake resolve VMD failed")
+				respondError(c, ErrInternal)
+				c.Abort()
+				return
+			}
 			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 			defer vmdCancel()
-			if _, _, _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", "", nil); err != nil {
+			if _, _, _, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), "", "", nil); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -159,7 +197,7 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 				return
 			}
 			// Reapply persisted egress rules — nftables + proxy state are fresh after restore.
-			if err := h.reapplyNetworkConfig(postCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+			if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake reapply network config failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -199,7 +237,7 @@ type persistedEgressConfig struct {
 //
 // Uses a caller-supplied context so the caller controls timeout/cancellation.
 // Silently returns nil if there is no persisted config (default allow-all).
-func (h *Handlers) reapplyNetworkConfig(ctx context.Context, sandboxID string, raw []byte) error {
+func (h *Handlers) reapplyNetworkConfig(ctx context.Context, vmd VMDClient, sandboxID string, raw []byte) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -215,7 +253,7 @@ func (h *Handlers) reapplyNetworkConfig(ctx context.Context, sandboxID string, r
 		return nil
 	}
 
-	return h.VMD.UpdateSandboxNetwork(ctx, sandboxID,
+	return vmd.UpdateSandboxNetwork(ctx, sandboxID,
 		cfg.Egress.AllowedCIDRs,
 		cfg.Egress.DeniedCIDRs,
 		cfg.Egress.AllowedDomains,
@@ -317,11 +355,19 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	snapshotPath := snapshot.Path
 	memPath := filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
 
+	// Resolve the VMD client for this sandbox's host.
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
 	// Resume the VM. Cancellation of this call still follows the request
 	// context — if the client hangs up mid-resume, abort the VMD call.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
 		respondError(c, ErrInternal)
@@ -355,7 +401,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 
 	// Reapply persisted egress rules — the nftables rules and proxy state
 	// are fresh after a snapshot restore, so user rules must be re-pushed.
-	if err := h.reapplyNetworkConfig(postCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
 		respondError(c, ErrInternal)
 		return
@@ -404,9 +450,15 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 
 	// Destroy the VM (skip if sandbox never booted).
 	if sandbox.Status != db.SandboxStatusFailed {
+		vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+		if vmdLookupErr != nil {
+			log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete failed")
+			respondError(c, ErrInternal)
+			return
+		}
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 		defer vmdCancel()
-		if err := h.VMD.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
+		if err := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
 			respondError(c, ErrInternal)
 			return
@@ -756,6 +808,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		snapshotMemPath = filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
 	}
 
+	// Select a host for this sandbox.
+	hostID := ""
+	if h.Scheduler != nil {
+		hostID, err = h.Scheduler.SelectHost(c.Request.Context())
+		if err != nil {
+			log.Error().Err(err).Msg("scheduler SelectHost failed")
+			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	// Insert sandbox with status=starting. VcpuCount and MemoryMib use
 	// minimal placeholders (1) to satisfy the DB CHECK constraint. The
 	// real values come from VMD's CreateVMResponse and are written by
@@ -766,12 +829,21 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Status:         db.SandboxStatusStarting,
 		VcpuCount:      1,
 		MemoryMib:      1,
+		HostID:         hostID,
 		SnapshotID:     snapshotID,
 		TimeoutSeconds: req.TimeoutSeconds,
 		Metadata:       metadataJSON,
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create sandbox record")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// Resolve the VMD client for the selected host.
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for create failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -787,9 +859,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromSnapshot != nil {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
 	} else {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandbox.ID.String(),
 			0, 0, 0, nil, req.EnvVars)
 	}
 	if vmdErr != nil {
@@ -851,7 +923,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			}
 		}
 
-		if err := h.VMD.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+		if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
 		} else {
 			networkConfig, _ := json.Marshal(map[string]any{
@@ -926,10 +998,18 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
+	// Resolve the VMD client for this sandbox's host.
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for pause failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
 	// Call VMD to pause and snapshot the VM.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	snapshotPath, memPath, err := h.VMD.PauseInstance(vmdCtx, sandboxID.String(), "")
+	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sandboxID.String(), "")
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance failed")
 		// Revert status to active asynchronously. Detach cancellation so
@@ -1047,8 +1127,15 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		req.TimeoutS = 30
 	}
 
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for exec failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
 	start := time.Now()
-	stdout, stderr, exitCode, err := h.VMD.ExecCommand(c.Request.Context(), sandbox.ID.String(),
+	stdout, stderr, exitCode, err := vmd.ExecCommand(c.Request.Context(), sandbox.ID.String(),
 		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS))
 	durationMs := int32(time.Since(start).Milliseconds())
 	if err != nil {
@@ -1167,10 +1254,18 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			}
 		}
 
+		// Resolve the VMD client for this sandbox's host.
+		vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+		if vmdLookupErr != nil {
+			log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for patch failed")
+			respondError(c, ErrInternal)
+			return
+		}
+
 		// Apply rules to the running VM via VMD.
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 		defer vmdCancel()
-		if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
+		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
 			respondError(c, ErrInternal)
 			return
