@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -103,7 +104,8 @@ type ManagerConfig struct {
 	BaseRootfsPath string
 	SnapshotDir    string
 	RunDir         string
-	MaxConcurrent  int // Max concurrent CreateVM operations (0 = default 10).
+	MaxConcurrent  int  // Max concurrent CreateVM operations (0 = default 10).
+	UseSystemd     bool // When true, VMs run as standalone systemd units.
 }
 
 // TemplateSnapshot holds paths for a template snapshot created at startup.
@@ -126,11 +128,17 @@ type Manager struct {
 	netMgr      *network.Manager
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
+	state       *StateStore // persistent local state (BoltDB); nil = no persistence
 
 	mu              sync.RWMutex
 	vms             map[string]*VMInstance
 	defaultTemplate *TemplateSnapshot
 	createSem       chan struct{}
+
+	// useSystemd controls whether VMs are started via systemd units
+	// (true) or as direct child processes (false). Defaults to false
+	// for backward compatibility; set to true via ManagerConfig.
+	useSystemd bool
 }
 
 // NewManager creates a new VM manager.
@@ -140,12 +148,19 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		maxConcurrent = 10
 	}
 	return &Manager{
-		cfg:       cfg,
-		netMgr:    netMgr,
-		log:       log.With().Str("component", "vm_manager").Logger(),
-		vms:       make(map[string]*VMInstance),
-		createSem: make(chan struct{}, maxConcurrent),
+		cfg:        cfg,
+		netMgr:     netMgr,
+		log:        log.With().Str("component", "vm_manager").Logger(),
+		vms:        make(map[string]*VMInstance),
+		createSem:  make(chan struct{}, maxConcurrent),
+		useSystemd: cfg.UseSystemd,
 	}, nil
+}
+
+// SetStateStore attaches a BoltDB state store for durable persistence.
+// Must be called before any VM operations.
+func (m *Manager) SetStateStore(s *StateStore) {
+	m.state = s
 }
 
 // SetEgressProxy sets the TCP egress proxy for domain-based filtering.
@@ -312,7 +327,12 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 	inst.SocketPath = socketPath
 
-	pid, err := m.startFirecrackerInNamespace(vmID, socketPath, perVMRootfs, netInfo.Namespace)
+	var pid int
+	if m.useSystemd {
+		pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, netInfo.Namespace)
+	} else {
+		pid, err = m.startFirecrackerInNamespace(vmID, socketPath, perVMRootfs, netInfo.Namespace)
+	}
 	if err != nil {
 		m.netMgr.CleanupVM(vmID)
 		cleanup()
@@ -448,20 +468,29 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
-	if inst.PID > 0 {
-		proc, findErr := os.FindProcess(inst.PID)
-		if findErr == nil {
-			if force {
-				_ = proc.Signal(syscall.SIGKILL)
-			} else {
-				_ = proc.Signal(syscall.SIGTERM)
-				done := make(chan error, 1)
-				go func() { _, e := proc.Wait(); done <- e }()
-				select {
-				case <-done:
-				case <-time.After(5 * time.Second):
-					log.Warn().Msg("SIGTERM timed out, sending SIGKILL")
+	if m.useSystemd {
+		// Stop the systemd unit — this kills Firecracker and runs ExecStopPost cleanup.
+		// The netns unit is also stopped since firecracker@ Requires= it.
+		if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
+			log.Warn().Err(err).Msg("systemctl stop failed (unit may already be stopped)")
+		}
+		removeUnitDropIn(vmID)
+	} else {
+		if inst.PID > 0 {
+			proc, findErr := os.FindProcess(inst.PID)
+			if findErr == nil {
+				if force {
 					_ = proc.Signal(syscall.SIGKILL)
+				} else {
+					_ = proc.Signal(syscall.SIGTERM)
+					done := make(chan error, 1)
+					go func() { _, e := proc.Wait(); done <- e }()
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+						log.Warn().Msg("SIGTERM timed out, sending SIGKILL")
+						_ = proc.Signal(syscall.SIGKILL)
+					}
 				}
 			}
 		}
@@ -471,7 +500,10 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		_ = os.Remove(inst.SocketPath)
 	}
 
-	m.netMgr.CleanupVM(vmID)
+	if !m.useSystemd {
+		// In systemd mode, the netns unit handles network cleanup.
+		m.netMgr.CleanupVM(vmID)
+	}
 
 	rundirKey := vmID
 	if inst.RunDirID != "" {
@@ -758,7 +790,14 @@ func (m *Manager) GetVMInfo(_ context.Context, vmID string) (*VMInstance, error)
 // ShutdownAll
 // ---------------------------------------------------------------------------
 
+// ShutdownAll destroys all VMs. In systemd mode this is a no-op — the VMs
+// are owned by systemd and should outlive VMD.
 func (m *Manager) ShutdownAll() {
+	if m.useSystemd {
+		m.log.Info().Msg("systemd mode: VMs will continue running after VMD shutdown")
+		return
+	}
+
 	m.mu.RLock()
 	ids := make([]string, 0, len(m.vms))
 	for id := range m.vms {
@@ -771,6 +810,69 @@ func (m *Manager) ShutdownAll() {
 			m.log.Error().Err(err).Str("vm_id", id).Msg("failed to destroy VM during shutdown")
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ReattachAll — startup recovery
+// ---------------------------------------------------------------------------
+
+// ReattachAll reconstructs the in-memory VM map from BoltDB + systemd on
+// startup. For each VM that BoltDB knows about AND systemd reports as active,
+// VMD reattaches by connecting to the existing Firecracker API socket.
+// VMs in BoltDB that are no longer running in systemd are marked as stopped.
+func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
+	if m.state == nil {
+		m.log.Warn().Msg("no state store configured — skipping reattach")
+		return 0, 0
+	}
+
+	records, err := m.state.All()
+	if err != nil {
+		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach")
+		return 0, 0
+	}
+	if len(records) == 0 {
+		m.log.Info().Msg("no VMs in BoltDB — nothing to reattach")
+		return 0, 0
+	}
+
+	m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
+
+	for _, rec := range records {
+		log := m.log.With().Str("vm_id", rec.ID).Logger()
+
+		// Check if the systemd unit is still active.
+		alive := isUnitActive(ctx, systemdUnitName(rec.ID))
+		if !alive {
+			// Also check if the socket exists (non-systemd mode compatibility).
+			if rec.SocketPath != "" {
+				if _, err := os.Stat(rec.SocketPath); err == nil {
+					alive = true
+				}
+			}
+		}
+
+		if !alive {
+			log.Warn().Msg("VM in BoltDB but not running — marking stale")
+			m.state.Delete(rec.ID)
+			stale++
+			continue
+		}
+
+		// Reattach: add to in-memory map.
+		inst := toInstance(rec)
+		inst.Status = StatusRunning
+
+		m.mu.Lock()
+		m.vms[rec.ID] = inst
+		m.mu.Unlock()
+
+		m.persistState(inst)
+		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
+		reattached++
+	}
+
+	return reattached, stale
 }
 
 // ---------------------------------------------------------------------------
@@ -920,12 +1022,36 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 	inst.mu.Lock()
 	inst.Status = s
 	inst.mu.Unlock()
+	m.persistState(inst)
+}
+
+// persistState writes the current VM state to BoltDB. No-op if no state
+// store is configured. Errors are logged but not returned — BoltDB is a
+// cache, not a source of truth.
+func (m *Manager) persistState(inst *VMInstance) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.Put(toRecord(inst)); err != nil {
+		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
+	}
+}
+
+// deleteState removes a VM record from BoltDB.
+func (m *Manager) deleteState(vmID string) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.Delete(vmID); err != nil {
+		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
+	}
 }
 
 func (m *Manager) removeVM(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
 	m.mu.Unlock()
+	m.deleteState(vmID)
 }
 
 // copyRootfs creates a per-VM rootfs by copying the source image.
@@ -985,6 +1111,62 @@ func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath
 	}
 
 	go func() { _ = cmd.Wait() }()
+	return pid, nil
+}
+
+// startFirecrackerViaSystemd writes the start script and launches Firecracker
+// as a standalone systemd unit. The VM survives VMD restarts because systemd
+// owns the process, not VMD.
+func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, netNS string) (int, error) {
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
+		return 0, fmt.Errorf("mkdir socket dir: %w", err)
+	}
+	_ = os.Remove(socketPath)
+
+	// Ensure log directory exists.
+	os.MkdirAll("/var/lib/sandbox/logs", 0o755)
+
+	templateDir := m.templateRunDir()
+	rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
+
+	// Write the start script that the systemd unit's ExecStart calls.
+	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
+	scriptContent := fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s unshare -m -- sh -c 'mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && exec %q --api-sock %q --id %q'\n",
+		netNS, templateDir, perVMRootfs, rootfsLink, m.cfg.FirecrackerBin, socketPath, vmID)
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
+		return 0, fmt.Errorf("write start script: %w", err)
+	}
+
+	// Start the systemd unit.
+	if err := startUnit(ctx, systemdUnitName(vmID)); err != nil {
+		return 0, fmt.Errorf("start systemd unit: %w", err)
+	}
+
+	// Wait for the Firecracker API socket.
+	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+		_ = stopUnit(ctx, systemdUnitName(vmID))
+		return 0, fmt.Errorf("wait for socket: %w", err)
+	}
+
+	// Read the PID from systemd.
+	pid, err := m.getUnitMainPID(ctx, vmID)
+	if err != nil {
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("could not read unit PID, using 0")
+	}
+	return pid, nil
+}
+
+// getUnitMainPID queries systemd for the main PID of a firecracker@ unit.
+func (m *Manager) getUnitMainPID(ctx context.Context, vmID string) (int, error) {
+	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID))
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid); err != nil {
+		return 0, err
+	}
 	return pid, nil
 }
 

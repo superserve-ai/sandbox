@@ -222,6 +222,7 @@ func main() {
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
+	useSystemd := os.Getenv("VMD_FC_SYSTEMD_MODE") == "1"
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin: cfg.FirecrackerBin,
 		JailerBin:      cfg.JailerBin,
@@ -229,10 +230,27 @@ func main() {
 		BaseRootfsPath: cfg.BaseRootfsPath,
 		SnapshotDir:    cfg.SnapshotDir,
 		RunDir:         cfg.RunDir,
+		UseSystemd:     useSystemd,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
+
+	// ---- BoltDB state store ----
+	statePath := envOrDefault("VMD_STATE_PATH", "/var/lib/sandbox/vmd.db")
+	stateStore, err := vm.OpenStateStore(statePath)
+	if err != nil {
+		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
+	}
+	mgr.SetStateStore(stateStore)
+	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+
+	// ---- Reattach to running VMs from previous VMD lifetime ----
+	reattached, stale := mgr.ReattachAll(ctx)
+	if reattached > 0 || stale > 0 {
+		log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
+	}
+
 	lc.addCloser("vm manager: active sandboxes", func(_ context.Context) error {
 		mgr.ShutdownAll()
 		return nil
