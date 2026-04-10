@@ -1,18 +1,11 @@
 [Unit]
 Description=Firecracker VM %i
-After=network-online.target firecracker-netns@%i.service
-Requires=firecracker-netns@%i.service
+After=network-online.target
 StopWhenUnneeded=no
 
 [Service]
 Type=simple
 Slice=sandboxes.slice
-
-# VMD writes per-sandbox resource limits and startup args to a drop-in
-# at /etc/systemd/system/firecracker@%i.service.d/vm.conf before starting
-# this unit. The drop-in sets FIRECRACKER_BIN, SOCKET_PATH, VM_ROOTFS,
-# NET_NS, and TEMPLATE_DIR as environment variables consumed by the
-# start script below.
 
 # Start Firecracker in a mount namespace (rootfs isolation) inside the
 # network namespace (network isolation). The start script is written by

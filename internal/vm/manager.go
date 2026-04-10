@@ -356,6 +356,8 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: restore snapshot")
 
 	m.setStatus(vmID, StatusRunning)
+	// Persist again now that PID, IP, and socket are set.
+	m.persistState(inst)
 	log.Info().
 		Int("pid", pid).
 		Str("host_ip", inst.IP).
@@ -500,10 +502,7 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		_ = os.Remove(inst.SocketPath)
 	}
 
-	if !m.useSystemd {
-		// In systemd mode, the netns unit handles network cleanup.
-		m.netMgr.CleanupVM(vmID)
-	}
+	m.netMgr.CleanupVM(vmID)
 
 	rundirKey := vmID
 	if inst.RunDirID != "" {
@@ -544,7 +543,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
 
-	if inst.PID > 0 {
+	// Stop the Firecracker process — snapshot is already on disk.
+	if m.useSystemd {
+		if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
+			log.Warn().Err(err).Msg("systemctl stop failed during pause")
+		}
+	} else if inst.PID > 0 {
 		if proc, e := os.FindProcess(inst.PID); e == nil {
 			_ = proc.Signal(syscall.SIGTERM)
 			done := make(chan struct{})
@@ -564,6 +568,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.MemFilePath = memPath
 	inst.mu.Unlock()
 
+	m.persistState(inst)
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, nil
 }
@@ -607,7 +612,12 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
-	pid, err := m.startFirecrackerInNamespace(vmID, socketPath, rootfsPath, inst.Namespace)
+	var pid int
+	if m.useSystemd {
+		pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Namespace)
+	} else {
+		pid, err = m.startFirecrackerInNamespace(vmID, socketPath, rootfsPath, inst.Namespace)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
@@ -623,6 +633,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.Status = StatusRunning
 	inst.mu.Unlock()
 
+	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
 	return inst, nil
 }
@@ -672,10 +683,11 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.Lock()
 	existingInst, inPlace := m.vms[vmID]
 	if inPlace {
-		if existingInst.PID > 0 {
+		if m.useSystemd {
+			_ = stopUnit(ctx, systemdUnitName(vmID))
+		} else if existingInst.PID > 0 {
 			if proc, e := os.FindProcess(existingInst.PID); e == nil {
 				_ = proc.Signal(syscall.SIGTERM)
-				// Wait for process to exit instead of sleeping.
 				done := make(chan struct{})
 				go func() { proc.Wait(); close(done) }() //nolint:errcheck
 				select {
@@ -745,14 +757,20 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 	inst.SocketPath = socketPath
 
-	pid, err := m.startFirecrackerInNamespace(vmID, socketPath, diskPath, nsName)
-	if err != nil {
+	var pid int
+	var startErr error
+	if m.useSystemd {
+		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, nsName)
+	} else {
+		pid, startErr = m.startFirecrackerInNamespace(vmID, socketPath, diskPath, nsName)
+	}
+	if startErr != nil {
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
-		return nil, fmt.Errorf("start firecracker: %w", err)
+		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
 	inst.PID = pid
 
@@ -774,6 +792,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	m.setStatus(vmID, StatusRunning)
+	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM restored from snapshot")
 	return inst, nil
 }
@@ -816,10 +835,15 @@ func (m *Manager) ShutdownAll() {
 // ReattachAll — startup recovery
 // ---------------------------------------------------------------------------
 
-// ReattachAll reconstructs the in-memory VM map from BoltDB + systemd on
-// startup. For each VM that BoltDB knows about AND systemd reports as active,
-// VMD reattaches by connecting to the existing Firecracker API socket.
-// VMs in BoltDB that are no longer running in systemd are marked as stopped.
+// ReattachAll reconstructs the in-memory VM map on startup from two sources:
+//
+//  1. BoltDB — VMD's own cache from the previous lifetime.
+//  2. Systemd — ground truth for which Firecracker units are actually running.
+//
+// For each VM in BoltDB that systemd confirms is alive AND whose Firecracker
+// API socket is reachable, VMD reattaches. Stale BoltDB entries (dead process)
+// are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
+// so the Phase 3 reconciler can handle them.
 func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if m.state == nil {
 		m.log.Warn().Msg("no state store configured — skipping reattach")
@@ -831,13 +855,20 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach")
 		return 0, 0
 	}
-	if len(records) == 0 {
-		m.log.Info().Msg("no VMs in BoltDB — nothing to reattach")
-		return 0, 0
+
+	// Build a set of BoltDB-known IDs for orphan detection.
+	knownIDs := make(map[string]bool, len(records))
+	for _, rec := range records {
+		knownIDs[rec.ID] = true
 	}
 
-	m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
+	if len(records) == 0 {
+		m.log.Info().Msg("no VMs in BoltDB — checking systemd for orphans")
+	} else {
+		m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
+	}
 
+	// Phase A: reattach from BoltDB.
 	for _, rec := range records {
 		log := m.log.With().Str("vm_id", rec.ID).Logger()
 
@@ -853,10 +884,20 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 
 		if !alive {
-			log.Warn().Msg("VM in BoltDB but not running — marking stale")
+			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
 			m.state.Delete(rec.ID)
 			stale++
 			continue
+		}
+
+		// Verify the Firecracker API socket is actually reachable.
+		if rec.SocketPath != "" {
+			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
+				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — cleaning up")
+				m.state.Delete(rec.ID)
+				stale++
+				continue
+			}
 		}
 
 		// Reattach: add to in-memory map.
@@ -870,6 +911,23 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.persistState(inst)
 		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
 		reattached++
+	}
+
+	// Phase B: detect orphan systemd units not in BoltDB.
+	// These are VMs that survived a VMD crash where BoltDB was lost or
+	// corrupted. We log them here; the Phase 3 reconciler will decide
+	// whether to adopt or clean them up.
+	if m.useSystemd {
+		activeIDs, err := listActiveFirecrackerUnits(ctx)
+		if err != nil {
+			m.log.Warn().Err(err).Msg("failed to list active firecracker units — orphan detection skipped")
+		} else {
+			for _, id := range activeIDs {
+				if !knownIDs[id] {
+					m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
+				}
+			}
+		}
 	}
 
 	return reattached, stale
