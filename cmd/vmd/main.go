@@ -265,6 +265,17 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize default template")
 	}
 
+	// ---- Local HTTP server (proxy resolver) ----
+	// Listens on localhost:9090. The edge proxy queries this to resolve
+	// instanceID → vmIP before forwarding data-plane traffic.
+	localHTTP := vm.NewLocalHTTPServer(mgr, log)
+	lc.start("local http server", func() error {
+		return localHTTP.ListenAndServe(ctx, "localhost:9090")
+	})
+	lc.addCloser("local http server", func(shutdownCtx context.Context) error {
+		return localHTTP.Shutdown(shutdownCtx)
+	})
+
 	// ---- gRPC server ----
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {

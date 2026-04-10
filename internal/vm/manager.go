@@ -476,10 +476,7 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		rundirKey = inst.RunDirID
 	}
 	m.cleanupRunDir(rundirKey)
-
-	m.mu.Lock()
-	delete(m.vms, vmID)
-	m.mu.Unlock()
+	m.removeVM(vmID)
 
 	log.Info().Msg("VM destroyed")
 	return nil
@@ -884,6 +881,34 @@ func (m *Manager) getRunningVMIP(vmID string) (string, error) {
 		return "", status.Errorf(codes.Internal, "vm %s has no IP", vmID)
 	}
 	return vmIP, nil
+}
+
+// InstanceInfo is a snapshot of a VM's address and status for proxy lookups.
+type InstanceInfo struct {
+	VMIP      string
+	Status    VMStatus
+	CreatedAt time.Time
+}
+
+// LookupInstance returns the address, status, and creation time of a VM.
+// CreatedAt acts as a lifecycle key — it changes if the VM is replaced, allowing
+// the proxy to detect stale transports and close them before reuse.
+// Returns false if the instance is not known to this VMD.
+func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if !ok {
+		return InstanceInfo{}, false
+	}
+	inst.mu.RLock()
+	info := InstanceInfo{
+		VMIP:      inst.IP,
+		Status:    inst.Status,
+		CreatedAt: inst.CreatedAt,
+	}
+	inst.mu.RUnlock()
+	return info, true
 }
 
 // ---------------------------------------------------------------------------
