@@ -540,12 +540,11 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	h.updateLastActivityAsync(c.Request.Context(), sandboxID, teamID)
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
-	c.JSON(http.StatusOK, gin.H{
-		"id":         sandboxID.String(),
-		"name":       sandbox.Name,
-		"status":     "active",
-		"ip_address": ipAddress,
-	})
+	sandbox.Status = db.SandboxStatusActive
+	resumeIP, _ := netip.ParseAddr(ipAddress)
+	sandbox.IpAddress = &resumeIP
+
+	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +640,7 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 		MemoryMib: s.MemoryMib,
 		CreatedAt: s.CreatedAt,
 	}
-	if h.Config.SandboxAccessTokenSeed != nil {
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
 		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
 	}
 	if s.IpAddress != nil {
@@ -867,14 +866,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
-	c.JSON(http.StatusCreated, sandboxResponse{
-		ID:        sandbox.ID,
-		Name:      sandbox.Name,
-		Status:    string(db.SandboxStatusActive),
-		VcpuCount: sandbox.VcpuCount,
-		MemoryMib: sandbox.MemoryMib,
-		CreatedAt: sandbox.CreatedAt,
-	})
+	// The sandbox row still has status "starting" and no IP from the
+	// initial insert. Patch the struct with the values we just wrote
+	// so sandboxToResponse returns the correct state.
+	sandbox.Status = db.SandboxStatusActive
+	ipAddr, _ := netip.ParseAddr(ipAddress)
+	sandbox.IpAddress = &ipAddr
+
+	c.JSON(http.StatusCreated, h.sandboxToResponse(sandbox))
 }
 
 // ---------------------------------------------------------------------------
