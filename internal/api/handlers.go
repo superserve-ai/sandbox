@@ -708,6 +708,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateEnvVars(req.EnvVars); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Marshal once into the canonical jsonb shape. Empty / nil maps are
 	// stored as the empty object so the column is never NULL.
 	metadataJSON, err := json.Marshal(req.Metadata)
@@ -1298,10 +1302,6 @@ func validateMetadata(md map[string]string) error {
 		return fmt.Errorf("metadata has %d keys, max is %d", len(md), metadataMaxKeys)
 	}
 
-	// Track total size as we iterate so we can fail fast on the offending
-	// key rather than re-marshalling at the end. The size is approximate
-	// (it doesn't include json punctuation) but the cap is conservative
-	// enough that the difference doesn't matter.
 	totalBytes := 0
 	for k, v := range md {
 		if k == "" {
@@ -1322,6 +1322,41 @@ func validateMetadata(md map[string]string) error {
 		totalBytes += len(k) + len(v)
 		if totalBytes > metadataMaxTotalBytes {
 			return fmt.Errorf("metadata exceeds %d bytes total", metadataMaxTotalBytes)
+		}
+	}
+	return nil
+}
+
+// Env var validation limits. Same key count cap as metadata; values are
+// larger (API keys, connection strings) so 8 KB per value, 64 KB total.
+const (
+	envVarsMaxKeys       = 64
+	envVarsMaxKeyLen     = 256
+	envVarsMaxValueLen   = 8192  // 8 KB — API keys, tokens, DSNs
+	envVarsMaxTotalBytes = 65536 // 64 KB
+)
+
+func validateEnvVars(env map[string]string) error {
+	if len(env) == 0 {
+		return nil
+	}
+	if len(env) > envVarsMaxKeys {
+		return fmt.Errorf("env_vars has %d keys, max is %d", len(env), envVarsMaxKeys)
+	}
+	totalBytes := 0
+	for k, v := range env {
+		if k == "" {
+			return fmt.Errorf("env_vars keys cannot be empty")
+		}
+		if len(k) > envVarsMaxKeyLen {
+			return fmt.Errorf("env_vars key %q is %d bytes, max is %d", k, len(k), envVarsMaxKeyLen)
+		}
+		if len(v) > envVarsMaxValueLen {
+			return fmt.Errorf("env_vars value for key %q is %d bytes, max is %d", k, len(v), envVarsMaxValueLen)
+		}
+		totalBytes += len(k) + len(v)
+		if totalBytes > envVarsMaxTotalBytes {
+			return fmt.Errorf("env_vars exceeds %d bytes total", envVarsMaxTotalBytes)
 		}
 	}
 	return nil
