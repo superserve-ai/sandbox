@@ -1,0 +1,37 @@
+[Unit]
+Description=Superserve Edge Proxy
+After=network-online.target vmd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/proxy
+Restart=always
+RestartSec=2
+
+Environment=PROXY_ADDR=:5007
+Environment=VMD_ADDR=http://127.0.0.1:9090
+Environment=PROXY_DOMAIN=sandbox.superserve.ai
+
+# Run as a dedicated unprivileged user
+DynamicUser=yes
+NoNewPrivileges=true
+
+# Filesystem hardening
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+
+# Network restrictions
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# File descriptor limit for concurrent connections
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=proxy
+
+[Install]
+WantedBy=multi-user.target

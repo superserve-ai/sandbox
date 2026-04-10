@@ -5,13 +5,14 @@ CONTROLPLANE_BIN := bin/controlplane
 VMD_BIN := bin/vmd
 SEED_APIKEY_BIN := bin/seed-apikey
 BOXD_BIN := bin/boxd
+PROXY_BIN := bin/proxy
 
 # Go build flags
 LDFLAGS := -ldflags "-s -w"
 
 ## Build
 
-build: build-controlplane build-vmd build-seed-apikey build-boxd
+build: build-controlplane build-vmd build-seed-apikey build-boxd build-proxy
 
 build-controlplane:
 	go build $(LDFLAGS) -o $(CONTROLPLANE_BIN) ./cmd/controlplane
@@ -24,6 +25,9 @@ build-seed-apikey:
 
 build-boxd:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BOXD_BIN) ./cmd/boxd
+
+build-proxy:
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(PROXY_BIN) ./cmd/proxy
 
 ## Run
 
