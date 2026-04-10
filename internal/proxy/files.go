@@ -26,14 +26,8 @@ const (
 	// just names the route serveBoxdPort dispatches to it on.
 	terminalPath = "/terminal"
 
-	// accessTokenHeader is the primary carrier for the per-sandbox
-	// HMAC access token on HTTP requests.
+	// accessTokenHeader is the carrier for the per-sandbox HMAC access token.
 	accessTokenHeader = "X-Access-Token"
-
-	// tokenQueryParam is the query-string fallback for contexts that
-	// cannot set headers — notably <a href> downloads, <img src>
-	// embeds, and `window.open()` style flows.
-	tokenQueryParam = "token"
 )
 
 // serveBoxdPort is the entry point for any request addressed at the
@@ -95,7 +89,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	// "path traversal rejected" contract and turns a typo in a relative
 	// path into a silent write to an unintended location. Reject any
 	// request whose ?path= contains a literal `..` segment, before we
-	// burn a nonce on auth.
+	// hit the auth check.
 	requestedPath := r.URL.Query().Get("path")
 	if requestedPath == "" {
 		http.Error(w, "missing path query parameter", http.StatusBadRequest)
@@ -108,21 +102,14 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		}
 	}
 
-	token, fromQuery := extractFileToken(r)
+	token := r.Header.Get(accessTokenHeader)
 	if token == "" {
-		http.Error(w,
-			"missing access token (pass X-Access-Token header or ?token= query param)",
-			http.StatusUnauthorized)
+		http.Error(w, "missing X-Access-Token header", http.StatusUnauthorized)
 		return
 	}
 
 	// Scrub the token before forwarding to boxd.
 	r.Header.Del(accessTokenHeader)
-	if fromQuery {
-		q := r.URL.Query()
-		q.Del(tokenQueryParam)
-		r.URL.RawQuery = q.Encode()
-	}
 
 	w.Header().Set("Referrer-Policy", "no-referrer")
 
@@ -188,22 +175,3 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	rp.ServeHTTP(w, r)
 }
 
-// extractFileToken pulls the signed token out of either the Authorization
-// header or the ?token= query parameter, in that order. The second return
-// value reports whether the token came from the query string so the
-// caller can strip it before forwarding upstream.
-//
-// We accept both carriers because file transfers have contexts the
-// terminal bridge doesn't: plain HTML downloads via <a href> cannot set
-// custom headers, but they can embed the token in the URL; programmatic
-// uploads from an SDK can (and should) use the header carrier to keep
-// the token out of server access logs.
-func extractFileToken(r *http.Request) (token string, fromQuery bool) {
-	if h := r.Header.Get(accessTokenHeader); h != "" {
-		return h, false
-	}
-	if q := r.URL.Query().Get(tokenQueryParam); q != "" {
-		return q, true
-	}
-	return "", false
-}
