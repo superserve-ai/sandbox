@@ -139,7 +139,27 @@ func (r *VMDResolver) store(instanceID string, info InstanceInfo, err error, ttl
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.cache) >= maxCacheSize {
-		r.cache = make(map[string]cacheEntry)
+		r.evictOldest()
 	}
 	r.cache[instanceID] = cacheEntry{info: info, err: err, expiresAt: time.Now().Add(ttl)}
+}
+
+// evictOldest removes the cache entry with the earliest expiresAt.
+// Called with r.mu held. This is O(n) but only fires when the cache
+// is full (10k entries), which is rare in practice — most deployments
+// have far fewer concurrent sandboxes than the cache cap.
+func (r *VMDResolver) evictOldest() {
+	var oldestKey string
+	var oldestTime time.Time
+	first := true
+	for k, e := range r.cache {
+		if first || e.expiresAt.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = e.expiresAt
+			first = false
+		}
+	}
+	if !first {
+		delete(r.cache, oldestKey)
+	}
 }
