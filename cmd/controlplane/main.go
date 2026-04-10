@@ -136,7 +136,7 @@ func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
 	}
 }
 
-func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error) {
+func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.CreateVM(ctx, &vmdpb.CreateVMRequest{
 		VmId:     vmID,
 		Metadata: metadata,
@@ -147,9 +147,14 @@ func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, m
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("gRPC CreateVM: %w", err)
+		return "", 0, 0, fmt.Errorf("gRPC CreateVM: %w", err)
 	}
-	return resp.IpAddress, nil
+	var actualVcpu, actualMemMiB uint32
+	if rl := resp.GetResourceLimits(); rl != nil {
+		actualVcpu = rl.GetVcpuCount()
+		actualMemMiB = rl.GetMemoryMib()
+	}
+	return resp.IpAddress, actualVcpu, actualMemMiB, nil
 }
 
 func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force bool) error {

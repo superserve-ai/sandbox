@@ -422,14 +422,15 @@ func (x *CreateVMRequest) GetSandboxNetwork() *SandboxNetworkConfig {
 }
 
 type CreateVMResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
-	SocketPath    string                 `protobuf:"bytes,2,opt,name=socket_path,json=socketPath,proto3" json:"socket_path,omitempty"`
-	IpAddress     string                 `protobuf:"bytes,3,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
-	TapDevice     string                 `protobuf:"bytes,4,opt,name=tap_device,json=tapDevice,proto3" json:"tap_device,omitempty"`
-	Pid           uint32                 `protobuf:"varint,5,opt,name=pid,proto3" json:"pid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	SocketPath     string                 `protobuf:"bytes,2,opt,name=socket_path,json=socketPath,proto3" json:"socket_path,omitempty"`
+	IpAddress      string                 `protobuf:"bytes,3,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
+	TapDevice      string                 `protobuf:"bytes,4,opt,name=tap_device,json=tapDevice,proto3" json:"tap_device,omitempty"`
+	Pid            uint32                 `protobuf:"varint,5,opt,name=pid,proto3" json:"pid,omitempty"`
+	ResourceLimits *ResourceLimits        `protobuf:"bytes,6,opt,name=resource_limits,json=resourceLimits,proto3" json:"resource_limits,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateVMResponse) Reset() {
@@ -495,6 +496,13 @@ func (x *CreateVMResponse) GetPid() uint32 {
 		return x.Pid
 	}
 	return 0
+}
+
+func (x *CreateVMResponse) GetResourceLimits() *ResourceLimits {
+	if x != nil {
+		return x.ResourceLimits
+	}
+	return nil
 }
 
 type DestroyVMRequest struct {
@@ -1688,7 +1696,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0fsandbox_network\x18\b \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x98\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe4\x01\n" +
 	"\x10CreateVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +
@@ -1697,7 +1705,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"ip_address\x18\x03 \x01(\tR\tipAddress\x12\x1d\n" +
 	"\n" +
 	"tap_device\x18\x04 \x01(\tR\ttapDevice\x12\x10\n" +
-	"\x03pid\x18\x05 \x01(\rR\x03pid\"=\n" +
+	"\x03pid\x18\x05 \x01(\rR\x03pid\x12J\n" +
+	"\x0fresource_limits\x18\x06 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\"=\n" +
 	"\x10DestroyVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x14\n" +
 	"\x05force\x18\x02 \x01(\bR\x05force\"G\n" +
@@ -1865,40 +1874,41 @@ var file_proto_vmd_proto_depIdxs = []int32{
 	2,  // 2: superserve.vmd.v1.CreateVMRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
 	25, // 3: superserve.vmd.v1.CreateVMRequest.metadata:type_name -> superserve.vmd.v1.CreateVMRequest.MetadataEntry
 	3,  // 4: superserve.vmd.v1.CreateVMRequest.sandbox_network:type_name -> superserve.vmd.v1.SandboxNetworkConfig
-	3,  // 5: superserve.vmd.v1.ResumeVMRequest.sandbox_network:type_name -> superserve.vmd.v1.SandboxNetworkConfig
-	1,  // 6: superserve.vmd.v1.RestoreSnapshotRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	2,  // 7: superserve.vmd.v1.RestoreSnapshotRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	26, // 8: superserve.vmd.v1.ExecCommandRequest.env:type_name -> superserve.vmd.v1.ExecCommandRequest.EnvEntry
-	0,  // 9: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
-	1,  // 10: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	27, // 11: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
-	2,  // 12: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	4,  // 13: superserve.vmd.v1.UpdateSandboxNetworkRequest.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
-	5,  // 14: superserve.vmd.v1.VMDaemon.CreateVM:input_type -> superserve.vmd.v1.CreateVMRequest
-	7,  // 15: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
-	9,  // 16: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
-	11, // 17: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
-	13, // 18: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
-	15, // 19: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
-	17, // 20: superserve.vmd.v1.VMDaemon.ExecCommand:input_type -> superserve.vmd.v1.ExecCommandRequest
-	19, // 21: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
-	21, // 22: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
-	23, // 23: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:input_type -> superserve.vmd.v1.UpdateSandboxNetworkRequest
-	6,  // 24: superserve.vmd.v1.VMDaemon.CreateVM:output_type -> superserve.vmd.v1.CreateVMResponse
-	8,  // 25: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
-	10, // 26: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
-	12, // 27: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
-	14, // 28: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
-	16, // 29: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
-	18, // 30: superserve.vmd.v1.VMDaemon.ExecCommand:output_type -> superserve.vmd.v1.ExecCommandResponse
-	20, // 31: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
-	22, // 32: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
-	24, // 33: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:output_type -> superserve.vmd.v1.UpdateSandboxNetworkResponse
-	24, // [24:34] is the sub-list for method output_type
-	14, // [14:24] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	1,  // 5: superserve.vmd.v1.CreateVMResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	3,  // 6: superserve.vmd.v1.ResumeVMRequest.sandbox_network:type_name -> superserve.vmd.v1.SandboxNetworkConfig
+	1,  // 7: superserve.vmd.v1.RestoreSnapshotRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	2,  // 8: superserve.vmd.v1.RestoreSnapshotRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	26, // 9: superserve.vmd.v1.ExecCommandRequest.env:type_name -> superserve.vmd.v1.ExecCommandRequest.EnvEntry
+	0,  // 10: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
+	1,  // 11: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	27, // 12: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
+	2,  // 13: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	4,  // 14: superserve.vmd.v1.UpdateSandboxNetworkRequest.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
+	5,  // 15: superserve.vmd.v1.VMDaemon.CreateVM:input_type -> superserve.vmd.v1.CreateVMRequest
+	7,  // 16: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
+	9,  // 17: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
+	11, // 18: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
+	13, // 19: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
+	15, // 20: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
+	17, // 21: superserve.vmd.v1.VMDaemon.ExecCommand:input_type -> superserve.vmd.v1.ExecCommandRequest
+	19, // 22: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
+	21, // 23: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
+	23, // 24: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:input_type -> superserve.vmd.v1.UpdateSandboxNetworkRequest
+	6,  // 25: superserve.vmd.v1.VMDaemon.CreateVM:output_type -> superserve.vmd.v1.CreateVMResponse
+	8,  // 26: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
+	10, // 27: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
+	12, // 28: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
+	14, // 29: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
+	16, // 30: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
+	18, // 31: superserve.vmd.v1.VMDaemon.ExecCommand:output_type -> superserve.vmd.v1.ExecCommandResponse
+	20, // 32: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
+	22, // 33: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
+	24, // 34: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:output_type -> superserve.vmd.v1.UpdateSandboxNetworkResponse
+	25, // [25:35] is the sub-list for method output_type
+	15, // [15:25] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_proto_vmd_proto_init() }

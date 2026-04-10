@@ -32,11 +32,12 @@ type stubVMD struct {
 	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 }
 
-func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error) {
+func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, uint32, uint32, error) {
 	if s.createFn != nil {
-		return s.createFn(ctx, id, vcpu, memMiB, diskMiB, metadata)
+		ip, err := s.createFn(ctx, id, vcpu, memMiB, diskMiB, metadata)
+		return ip, 1, 1024, err
 	}
-	return "10.0.0.1", nil
+	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
@@ -911,13 +912,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 	sandboxID := uuid.New()
 
 	vmd := &stubVMD{
-		createFn: func(_ context.Context, id string, vcpu, memMiB, _ uint32, _ map[string]string) (string, error) {
-			if vcpu != 1 {
-				t.Errorf("vcpu = %d, want 1", vcpu)
-			}
-			if memMiB != 512 {
-				t.Errorf("memMiB = %d, want 512", memMiB)
-			}
+		createFn: func(_ context.Context, id string, _, _, _ uint32, _ map[string]string) (string, error) {
 			return "10.0.0.42", nil
 		},
 	}
@@ -953,6 +948,13 @@ func TestCreateSandbox_Success(t *testing.T) {
 	}
 	if body["status"] != "active" {
 		t.Errorf("status = %q, want active", body["status"])
+	}
+	// Resources should reflect what VMD reported, not the initial INSERT placeholders.
+	if v := body["vcpu_count"].(float64); v == 0 {
+		t.Error("vcpu_count is 0 — VMD's reported value was not propagated to the response")
+	}
+	if v := body["memory_mib"].(float64); v == 0 {
+		t.Error("memory_mib is 0 — VMD's reported value was not propagated to the response")
 	}
 }
 

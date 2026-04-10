@@ -92,6 +92,7 @@ message CreateVMResponse {
   string ip_address = 3;
   string tap_device = 4;
   uint32 pid = 5;
+  ResourceLimits resource_limits = 6;
 }
 
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ import (
 // VMDClient defines the subset of the VM daemon gRPC interface used by the
 // control plane. This is satisfied by the gRPC adapter in cmd/controlplane.
 type VMDClient interface {
-	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (ipAddress string, err error)
+	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, err error)
@@ -749,20 +749,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		snapshotMemPath = filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
 	}
 
-	// Default template resources (1 vCPU, 512 MiB).
-	const defaultVcpu int32 = 1
-	const defaultMemoryMib int32 = 512
-
-	// Insert sandbox with status=starting. timeout_seconds is optional —
-	// NULL means the sandbox lives until explicitly paused or deleted.
-	// metadata is always non-NULL (empty object when the user provided none)
-	// to match the DB column constraint and keep read paths nil-free.
+	// Insert sandbox with status=starting. VcpuCount and MemoryMib are
+	// set to 0 here as placeholders — the real values come from VMD's
+	// CreateVMResponse after the VM boots from the template snapshot.
+	// We update them below once VMD reports back.
 	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
 		TeamID:         teamID,
 		Name:           req.Name,
 		Status:         db.SandboxStatusStarting,
-		VcpuCount:      defaultVcpu,
-		MemoryMib:      defaultMemoryMib,
+		VcpuCount:      0,
+		MemoryMib:      0,
 		SnapshotID:     snapshotID,
 		TimeoutSeconds: req.TimeoutSeconds,
 		Metadata:       metadataJSON,
@@ -781,12 +777,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	defer vmdCancel()
 
 	var ipAddress string
+	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromSnapshot != nil {
 		ipAddress, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
 	} else {
-		ipAddress, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
-			uint32(defaultVcpu), uint32(defaultMemoryMib), 0, nil)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
+			0, 0, 0, nil)
 	}
 	if vmdErr != nil {
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
@@ -811,26 +808,29 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Mark active in DB.
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sandbox.ID,
-		Status: db.SandboxStatusActive,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
-	}
-
-	// Persist the VM's assigned IP. host_id and pid are not tracked yet.
+	// Single atomic transition: starting → active with real resources
+	// and IP. VMD's response is the source of truth for vcpu/memory
+	// (they come from the template snapshot, not from what the control
+	// plane requested).
+	var ipAddr *netip.Addr
 	if ipAddress != "" {
 		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
-			if err := h.DB.UpdateSandboxHost(postCtx, db.UpdateSandboxHostParams{
-				ID:        sandbox.ID,
-				IpAddress: &addr,
-				TeamID:    teamID,
-			}); err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxHost failed")
-			}
+			ipAddr = &addr
 		}
+	}
+	sandbox.Status = db.SandboxStatusActive
+	sandbox.VcpuCount = int32(actualVcpu)
+	sandbox.MemoryMib = int32(actualMemMiB)
+	sandbox.IpAddress = ipAddr
+
+	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
+		ID:        sandbox.ID,
+		VcpuCount: int32(actualVcpu),
+		MemoryMib: int32(actualMemMiB),
+		IpAddress: ipAddr,
+		TeamID:    teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 	}
 
 	// Apply network rules if provided at creation.

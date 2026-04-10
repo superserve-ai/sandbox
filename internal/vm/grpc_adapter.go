@@ -54,6 +54,10 @@ func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) 
 		IpAddress:  inst.IP,
 		TapDevice:  inst.TAPDevice,
 		Pid:        uint32(inst.PID),
+		ResourceLimits: &vmdpb.ResourceLimits{
+			VcpuCount: inst.Config.VCPU,
+			MemoryMib: inst.Config.MemoryMiB,
+		},
 	}, nil
 }
 

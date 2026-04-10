@@ -112,6 +112,8 @@ type TemplateSnapshot struct {
 	MemFilePath  string // e.g., snapshots/template/mem.snap
 	DiskPath     string // e.g., rundir/template/rootfs.ext4
 	RunDir       string // e.g., rundir/template/
+	VCPUCount    uint32 // actual vCPU count baked into the snapshot
+	MemSizeMiB   uint32 // actual RAM in MiB baked into the snapshot
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +208,8 @@ func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
 		MemFilePath:  memPath,
 		DiskPath:     diskPath,
 		RunDir:       m.templateRunDir(),
+		VCPUCount:    inst.Config.VCPU,
+		MemSizeMiB:   inst.Config.MemoryMiB,
 	}
 
 	log.Info().
@@ -266,9 +270,8 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		Metadata:  metadata,
 		RunDirID:  rundirID,
 		Config: VMConfig{
-			VCPU:        vcpu,
-			MemoryMiB:   memMiB,
-			DiskSizeMiB: diskMiB,
+			VCPU:      m.defaultTemplate.VCPUCount,
+			MemoryMiB: m.defaultTemplate.MemSizeMiB,
 		},
 	}
 	m.vms[vmID] = inst
@@ -365,7 +368,7 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		RunDirID:  vmID,
 		Config: VMConfig{
 			VCPU:       1,
-			MemoryMiB:  512,
+			MemoryMiB:  1024,
 			KernelPath: m.cfg.KernelPath,
 			RootfsPath: m.cfg.BaseRootfsPath,
 		},

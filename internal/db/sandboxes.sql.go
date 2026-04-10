@@ -14,6 +14,35 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const activateSandbox = `-- name: ActivateSandbox :exec
+UPDATE sandbox
+SET status = 'active',
+    vcpu_count = $2,
+    memory_mib = $3,
+    ip_address = $4,
+    updated_at = now()
+WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
+`
+
+type ActivateSandboxParams struct {
+	ID        uuid.UUID   `json:"id"`
+	VcpuCount int32       `json:"vcpu_count"`
+	MemoryMib int32       `json:"memory_mib"`
+	IpAddress *netip.Addr `json:"ip_address"`
+	TeamID    uuid.UUID   `json:"team_id"`
+}
+
+func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams) error {
+	_, err := q.db.Exec(ctx, activateSandbox,
+		arg.ID,
+		arg.VcpuCount,
+		arg.MemoryMib,
+		arg.IpAddress,
+		arg.TeamID,
+	)
+	return err
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH expired AS (
   SELECT id, team_id, name, snapshot_id, host_id
