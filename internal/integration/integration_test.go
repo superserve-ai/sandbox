@@ -288,8 +288,8 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	if sb.VcpuCount != 1 {
 		t.Errorf("vcpu_count = %d, want 1", sb.VcpuCount)
 	}
-	if sb.MemoryMib != 512 {
-		t.Errorf("memory_mib = %d, want 512", sb.MemoryMib)
+	if sb.MemoryMib != 1024 {
+		t.Errorf("memory_mib = %d, want 1024", sb.MemoryMib)
 	}
 }
 
