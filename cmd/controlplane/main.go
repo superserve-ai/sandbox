@@ -179,16 +179,21 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 	return resp.SnapshotPath, resp.MemFilePath, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
 	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 	})
 	if err != nil {
-		return "", fmt.Errorf("gRPC ResumeVM: %w", err)
+		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
 	}
-	return resp.IpAddress, nil
+	var actualVcpu, actualMemMiB uint32
+	if rl := resp.GetResourceLimits(); rl != nil {
+		actualVcpu = rl.GetVcpuCount()
+		actualMemMiB = rl.GetMemoryMib()
+	}
+	return resp.IpAddress, actualVcpu, actualMemMiB, nil
 }
 
 func (c *grpcVMDClient) ExecCommand(ctx context.Context, vmID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {

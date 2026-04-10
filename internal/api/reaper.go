@@ -200,7 +200,7 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		Logger()
 
 	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	_, err := h.VMD.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath)
+	_, _, _, err := h.VMD.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath)
 	vmdCancel()
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")

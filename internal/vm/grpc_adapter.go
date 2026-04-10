@@ -94,6 +94,10 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		SocketPath: inst.SocketPath,
 		IpAddress:  inst.IP,
 		Pid:        uint32(inst.PID),
+		ResourceLimits: &vmdpb.ResourceLimits{
+			VcpuCount: inst.Config.VCPU,
+			MemoryMib: inst.Config.MemoryMiB,
+		},
 	}, nil
 }
 

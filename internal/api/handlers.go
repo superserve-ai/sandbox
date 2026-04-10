@@ -27,7 +27,7 @@ type VMDClient interface {
 	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, err error)
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
@@ -136,7 +136,7 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 		case db.SandboxStatusIdle:
 			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 			defer vmdCancel()
-			if _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
+			if _, _, _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -321,7 +321,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	// context — if the client hangs up mid-resume, abort the VMD call.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+	ipAddress, actualVcpu, actualMemMiB, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
 		respondError(c, ErrInternal)
@@ -335,26 +335,20 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Update sandbox status to active.
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sandboxID,
-		Status: db.SandboxStatusActive,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus failed")
-		respondError(c, ErrInternal)
-		return
+	var ipAddr *netip.Addr
+	if ipAddress != "" {
+		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
+			ipAddr = &addr
+		}
 	}
-
-	// Update host runtime info.
-	ipAddr, _ := netip.ParseAddr(ipAddress)
-	if err := h.DB.UpdateSandboxHost(postCtx, db.UpdateSandboxHostParams{
+	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
 		ID:        sandboxID,
-		HostID:    sandbox.HostID,
-		IpAddress: &ipAddr,
+		VcpuCount: int32(actualVcpu),
+		MemoryMib: int32(actualMemMiB),
+		IpAddress: ipAddr,
 		TeamID:    teamID,
 	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxHost failed")
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -372,6 +366,9 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
 	sandbox.Status = db.SandboxStatusActive
+	sandbox.VcpuCount = int32(actualVcpu)
+	sandbox.MemoryMib = int32(actualMemMiB)
+	sandbox.IpAddress = ipAddr
 	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
 }
 
@@ -780,7 +777,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromSnapshot != nil {
-		ipAddress, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
 	} else {
 		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
 			0, 0, 0, nil)

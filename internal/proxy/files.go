@@ -43,6 +43,19 @@ const (
 // connect-rpc routes, and anything future boxd grows internally
 // without our knowledge.
 func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instanceID string) {
+	if !h.sandboxConns.acquire(instanceID) {
+		http.Error(w, "too many connections to sandbox", http.StatusTooManyRequests)
+		return
+	}
+	defer h.sandboxConns.release(instanceID)
+
+	clientIP := clientAddr(r)
+	if !h.ipConns.acquire(clientIP) {
+		http.Error(w, "too many connections from this IP", http.StatusTooManyRequests)
+		return
+	}
+	defer h.ipConns.release(clientIP)
+
 	switch r.URL.Path {
 	case filesPath:
 		h.serveFiles(w, r, instanceID)
