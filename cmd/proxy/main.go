@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -61,17 +62,16 @@ func main() {
 		}
 
 		proxyHandler.WithAuth(seed)
+		proxyHandler.WithFiles()
+		log.Info().Msg("files endpoint enabled")
 
 		if originsEnv != "" {
 			origins := splitCSV(originsEnv)
 			proxyHandler.WithTerminal(origins)
 			log.Info().Strs("allowed_origins", origins).Msg("terminal endpoint enabled")
-		} else if required {
-			log.Fatal().Msg("REQUIRE_DATA_PLANE=1 but TERMINAL_ALLOWED_ORIGINS missing")
+		} else {
+			log.Warn().Msg("terminal endpoint disabled (TERMINAL_ALLOWED_ORIGINS not configured)")
 		}
-
-		proxyHandler.WithFiles()
-		log.Info().Msg("data-plane endpoints enabled (files)")
 	}
 
 	// Health check for the GCP LB. Only responds on non-sandbox hosts
@@ -91,7 +91,7 @@ func main() {
 	})
 	mux.Handle("/", proxyHandler)
 
-	// HTTP→HTTPS redirect listener.
+	// HTTP→HTTPS redirect listener with graceful shutdown.
 	redirectMux := http.NewServeMux()
 	redirectMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
@@ -100,13 +100,13 @@ func main() {
 		}
 		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
 	})
+	redirectSrv := &http.Server{
+		Addr:    redirectAddr,
+		Handler: redirectMux,
+	}
 	go func() {
 		log.Info().Str("addr", redirectAddr).Msg("starting HTTP→HTTPS redirect listener")
-		srv := &http.Server{
-			Addr:    redirectAddr,
-			Handler: redirectMux,
-		}
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := redirectSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("redirect listener error")
 		}
 	}()
@@ -114,6 +114,12 @@ func main() {
 	if err := proxy.ListenAndServe(ctx, addr, mux, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
 	}
+
+	// Shut down the redirect listener cleanly.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	_ = redirectSrv.Shutdown(shutCtx)
+
 	log.Info().Msg("proxy stopped")
 }
 

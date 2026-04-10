@@ -579,17 +579,18 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
-	defer f.Close()
 
-	// Stream the request body straight to disk with no artificial
-	// size cap — the sandbox's own rootfs is the only ceiling. When
-	// the kernel runs out of blocks, the next write(2) returns ENOSPC
-	// and we surface it as a clean 507. Anything else is a real
-	// internal failure and comes back as 500.
 	written, err := io.Copy(f, r.Body)
+	f.Close()
 	if err != nil {
+		// Remove the partial file — a truncated upload is never useful
+		// to the caller. This handles both ENOSPC (disk full) and
+		// client disconnect (network drop, cancel) so interrupted
+		// uploads don't leave orphaned files eating disk space.
+		_ = os.Remove(path)
+
 		if errors.Is(err, syscall.ENOSPC) {
-			writeStorageFull(w, path)
+			writeStorageFull(w, "")
 			return
 		}
 		errJSON, _ := json.Marshal(map[string]string{"error": "write: " + err.Error()})
