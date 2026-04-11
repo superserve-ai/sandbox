@@ -45,13 +45,16 @@ func DefaultReconcilerConfig() ReconcilerConfig {
 
 // Reconciler detects and fixes drift between three sources of truth:
 //
+//   - systemd: which firecracker@ units are actually running
+//     (authoritative for liveness)
+//   - Control plane DB: the sandbox rows scheduled on this host
+//     (authoritative for intent)
 //   - BoltDB: VMD's own fast-path cache (authoritative for nothing)
-//   - systemd: which firecracker@ units are actually running (authoritative
-//     for liveness)
 //
-// It runs as a goroutine under the manager's lifecycle. Destructive actions
-// are rate-limited via MaxAutoFailPerHour and require the drift to persist
-// across at least two consecutive runs (GracePeriod).
+// The DB source is optional — if the reconciler is constructed without a
+// DB, it falls back to a BoltDB ↔ systemd comparison only. Destructive
+// actions are rate-limited via MaxAutoFailPerHour and require the drift
+// to persist across at least two consecutive runs (GracePeriod).
 type Reconciler struct {
 	mgr *Manager
 	cfg ReconcilerConfig
@@ -72,6 +75,10 @@ func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 	}
 }
 
+// runTimeout bounds each reconciliation pass so a slow DB or stuck
+// systemctl call cannot wedge the loop.
+const runTimeout = 25 * time.Second
+
 // Run launches the reconciler loop. Blocks until ctx is cancelled.
 func (r *Reconciler) Run(ctx context.Context) {
 	log := r.mgr.log.With().Str("component", "reconciler").Logger()
@@ -85,7 +92,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 	defer ticker.Stop()
 
 	// Run once immediately so startup is observable.
-	r.runOnce(ctx)
+	r.runWithTimeout(ctx)
 
 	for {
 		select {
@@ -93,9 +100,17 @@ func (r *Reconciler) Run(ctx context.Context) {
 			log.Info().Msg("reconciler exiting")
 			return
 		case <-ticker.C:
-			r.runOnce(ctx)
+			r.runWithTimeout(ctx)
 		}
 	}
+}
+
+// runWithTimeout bounds a single reconciliation pass. Runs deadlines
+// below the tick interval so two consecutive runs cannot overlap.
+func (r *Reconciler) runWithTimeout(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, runTimeout)
+	defer cancel()
+	r.runOnce(ctx)
 }
 
 // runOnce performs a single reconciliation pass. Each pass:
@@ -138,10 +153,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Source C: DB sandbox rows for this host (optional).
+	// Source C: DB sandbox rows for this host (optional). A short
+	// per-query deadline keeps a slow DB from stalling the whole run.
 	var dbSandboxes map[string]db.Sandbox
 	if r.cfg.DB != nil && r.cfg.HostID != "" {
-		rows, dbErr := r.cfg.DB.ListSandboxesByHost(ctx, r.cfg.HostID)
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		rows, dbErr := r.cfg.DB.ListSandboxesByHost(qctx, r.cfg.HostID)
+		cancel()
 		if dbErr != nil {
 			log.Error().Err(dbErr).Msg("failed to list sandboxes from DB")
 		} else {
@@ -161,7 +179,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if sb.Status != db.SandboxStatusActive {
 				continue
 			}
-			if r.isAlive(id, bolted) {
+			if r.isAlive(ctx, id, bolted) {
 				r.clearDrift(id)
 				continue
 			}
@@ -188,7 +206,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if rec.Status != StatusRunning {
 				continue
 			}
-			if r.isAlive(id, bolted) {
+			if r.isAlive(ctx, id, bolted) {
 				r.clearDrift(id)
 				continue
 			}
@@ -244,8 +262,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if sb.Status != db.SandboxStatusIdle || !sb.SnapshotID.Valid {
 				continue
 			}
-			// Look up the snapshot path.
-			snap, snapErr := r.cfg.DB.GetSnapshot(ctx, sb.SnapshotID.Bytes)
+			snap, snapErr := r.getSnapshot(ctx, sb.SnapshotID.Bytes)
 			if snapErr != nil {
 				continue
 			}
@@ -268,13 +285,45 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.clearDrift("idle:" + id)
 		}
 	}
+
+	// Drift 5: BoltDB record exists but DB has no corresponding sandbox
+	// row (either never written or soft-deleted). Clean up the BoltDB
+	// entry. If the VM is still live, we ALSO need to stop it — leaving
+	// a systemd unit running for a sandbox the control plane forgot about
+	// is a resource leak and a security risk.
+	if dbSandboxes != nil {
+		for id, rec := range bolted {
+			if _, ok := dbSandboxes[id]; ok {
+				continue
+			}
+			if !r.gracePeriodElapsed("bolt-orphan:"+id, now) {
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				r.writeAudit(ctx, id, "budget_exhausted", "stale_cleanup suppressed by rate limit", "boltdb_present_db_missing")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
+				Msg("BoltDB entry with no DB row — cleaning up")
+			// Stop the unit if it's still live so we don't leak a VM.
+			if r.mgr.useSystemd && rec.Status == StatusRunning {
+				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB")
+				}
+				removeUnitDropIn(id)
+			}
+			r.markStale(id)
+			r.writeAudit(ctx, id, "stale_cleanup", "BoltDB entry with no DB row", "boltdb_present_db_missing")
+			r.clearDrift("bolt-orphan:" + id)
+		}
+	}
 }
 
 // isAlive returns true when the VM is verifiably running per its runtime
 // channel (systemd unit active, or socket present in non-systemd mode).
-func (r *Reconciler) isAlive(vmID string, bolted map[string]VMRecord) bool {
+func (r *Reconciler) isAlive(ctx context.Context, vmID string, bolted map[string]VMRecord) bool {
 	if r.mgr.useSystemd {
-		return isUnitActive(context.Background(), systemdUnitName(vmID))
+		return isUnitActive(ctx, systemdUnitName(vmID))
 	}
 	rec, ok := bolted[vmID]
 	if !ok || rec.SocketPath == "" {
@@ -306,6 +355,21 @@ func (r *Reconciler) clearDrift(key string) {
 	r.mu.Unlock()
 }
 
+// getSnapshot loads a snapshot row by ID via the internal (unscoped)
+// query. The reconciler is host-scoped, not team-scoped, so it uses
+// GetSnapshotByID which bypasses the tenant filter. Guards the call
+// with dbQueryTimeout so a slow DB can't wedge the loop.
+func (r *Reconciler) getSnapshot(ctx context.Context, id [16]byte) (db.Snapshot, error) {
+	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
+	return r.cfg.DB.GetSnapshotByID(qctx, id)
+}
+
+// dbQueryTimeout is the per-query deadline for short reconciler writes
+// and single-row reads. Kept below runTimeout so a single slow query
+// can't consume the whole run's budget.
+const dbQueryTimeout = 5 * time.Second
+
 // markFailedInDB writes status=failed for the given sandbox ID. No-op if
 // the DB is not configured.
 func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
@@ -317,7 +381,9 @@ func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: invalid vm_id for DB mark-failed")
 		return
 	}
-	if err := r.cfg.DB.MarkSandboxFailed(ctx, id); err != nil {
+	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
+	if err := r.cfg.DB.MarkSandboxFailed(qctx, id); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
 	}
 }
@@ -334,7 +400,9 @@ func (r *Reconciler) writeAudit(ctx context.Context, vmID, action, reason, drift
 		sandboxID = pgtype.UUID{Bytes: id, Valid: true}
 	}
 	kind := driftKind
-	if err := r.cfg.DB.InsertReconcilerLog(ctx, db.InsertReconcilerLogParams{
+	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
+	if err := r.cfg.DB.InsertReconcilerLog(qctx, db.InsertReconcilerLogParams{
 		HostID:    r.cfg.HostID,
 		SandboxID: sandboxID,
 		Action:    action,

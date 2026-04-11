@@ -443,7 +443,7 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	}
 
 	snapID, _ := uuid.Parse(snapshotIDStr)
-	snap, err := testQueries.GetSnapshot(ctx, snapID)
+	snap, err := testQueries.GetSnapshot(ctx, db.GetSnapshotParams{ID: snapID, TeamID: teamID})
 	if err != nil {
 		t.Fatalf("snapshot not found in DB: %v", err)
 	}

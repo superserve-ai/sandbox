@@ -233,7 +233,10 @@ func (h *Handlers) wakeIdleSandbox(ctx context.Context, vmd VMDClient, sandbox *
 		return err
 	}
 
-	snap, snapErr := h.DB.GetSnapshot(ctx, sandbox.SnapshotID.Bytes)
+	snap, snapErr := h.DB.GetSnapshot(ctx, db.GetSnapshotParams{
+		ID:     sandbox.SnapshotID.Bytes,
+		TeamID: sandbox.TeamID,
+	})
 	if snapErr != nil {
 		return err
 	}
@@ -371,7 +374,10 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), sandbox.SnapshotID.Bytes)
+	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
+		ID:     sandbox.SnapshotID.Bytes,
+		TeamID: teamID,
+	})
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
 		respondError(c, ErrInternal)
@@ -848,12 +854,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return
 		}
 
-		snapshot, err := h.DB.GetSnapshot(c.Request.Context(), snapUUID)
+		snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
+			ID:     snapUUID,
+			TeamID: teamID,
+		})
 		if err != nil {
-			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
-			return
-		}
-		if snapshot.TeamID != teamID {
 			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 			return
 		}

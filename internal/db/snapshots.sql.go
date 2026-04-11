@@ -64,11 +64,44 @@ func (q *Queries) DeleteSnapshot(ctx context.Context, id uuid.UUID) error {
 
 const getSnapshot = `-- name: GetSnapshot :one
 SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at FROM snapshot
+WHERE id = $1 AND team_id = $2
+`
+
+type GetSnapshotParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Team-scoped snapshot lookup for user-facing handlers. The join on
+// team_id enforces tenant isolation at the SQL layer so callers cannot
+// accidentally leak another team's snapshot metadata by forgetting the
+// in-Go team check.
+func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSnapshot, arg.ID, arg.TeamID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Saved,
+		&i.Name,
+		&i.Trigger,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getSnapshotByID = `-- name: GetSnapshotByID :one
+SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at FROM snapshot
 WHERE id = $1
 `
 
-func (q *Queries) GetSnapshot(ctx context.Context, id uuid.UUID) (Snapshot, error) {
-	row := q.db.QueryRow(ctx, getSnapshot, id)
+// Unscoped snapshot lookup for internal (host-scoped) code paths such as
+// the VMD reconciler. DO NOT call from user-facing handlers.
+func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSnapshotByID, id)
 	var i Snapshot
 	err := row.Scan(
 		&i.ID,
