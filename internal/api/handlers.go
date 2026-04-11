@@ -883,34 +883,42 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		hostID = "default"
 	}
 
-	// Insert sandbox with status=starting. VcpuCount and MemoryMib use
-	// minimal placeholders (1) to satisfy the DB CHECK constraint. The
-	// real values come from VMD's CreateVMResponse and are written by
-	// ActivateSandbox once the VM boots.
-	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
-		TeamID:         teamID,
-		Name:           req.Name,
-		Status:         db.SandboxStatusStarting,
-		VcpuCount:      1,
-		MemoryMib:      1,
-		HostID:         hostID,
-		SnapshotID:     snapshotID,
-		TimeoutSeconds: req.TimeoutSeconds,
-		Metadata:       metadataJSON,
-	})
-	if err != nil {
-		log.Error().Err(err).Msg("failed to create sandbox record")
+	// Resolve the VMD client up front so we don't waste a DB INSERT on
+	// a host we can't reach.
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), hostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Msg("resolve VMD for create failed")
 		respondError(c, ErrInternal)
 		return
 	}
 
-	// Resolve the VMD client for the selected host.
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if vmdLookupErr != nil {
-		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for create failed")
-		respondError(c, ErrInternal)
-		return
+	// Generate the sandbox ID in Go so the DB INSERT and the VMD call
+	// can run in parallel — both need the same ID and neither needs to
+	// wait on the other. This hides the ~10-20ms INSERT roundtrip behind
+	// VMD's ~100-200ms create latency, shaving that much off the p50.
+	sandboxID := uuid.New()
+
+	insertCtx := c.Request.Context()
+	type insertResult struct {
+		sandbox db.Sandbox
+		err     error
 	}
+	insertCh := make(chan insertResult, 1)
+	go func() {
+		sb, insertErr := h.DB.CreateSandbox(insertCtx, db.CreateSandboxParams{
+			ID:             sandboxID,
+			TeamID:         teamID,
+			Name:           req.Name,
+			Status:         db.SandboxStatusStarting,
+			VcpuCount:      1, // placeholders; real values land via ActivateSandbox
+			MemoryMib:      1,
+			HostID:         hostID,
+			SnapshotID:     snapshotID,
+			TimeoutSeconds: req.TimeoutSeconds,
+			Metadata:       metadataJSON,
+		})
+		insertCh <- insertResult{sandbox: sb, err: insertErr}
+	}()
 
 	// Boot the VM synchronously — the client gets a response only after
 	// the sandbox is fully running and ready to use. This call is still
@@ -923,17 +931,38 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromSnapshot != nil {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
 	} else {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandbox.ID.String(),
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),
 			0, 0, 0, nil, req.EnvVars)
 	}
-	if vmdErr != nil {
+
+	// Wait for the parallel INSERT to complete — its result determines
+	// how we handle a VMD failure (mark row failed vs. nothing to mark).
+	insertRes := <-insertCh
+	sandbox := insertRes.sandbox
+	dbErr := insertRes.err
+
+	switch {
+	case dbErr != nil && vmdErr != nil:
+		// Both failed — nothing persisted, nothing to clean up.
+		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
+		respondError(c, ErrInternal)
+		return
+	case dbErr != nil:
+		// DB insert failed but VMD succeeded — destroy the orphan VM so
+		// it doesn't linger on the host. Use a detached context so client
+		// disconnect doesn't leak the VM.
+		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed, destroying orphan VM")
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+		cleanupCancel()
+		respondError(c, ErrInternal)
+		return
+	case vmdErr != nil:
+		// VMD failed but DB row exists — mark it failed so the reaper
+		// doesn't leave it stuck in "starting".
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-		// Mark the row failed using a cancellation-detached context so a
-		// disconnected client does not leave the sandbox stuck in
-		// "starting", but keep trace context so the failure write shows
-		// up in the same request span.
 		failCtx, failCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
 		defer failCancel()
 		_ = h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{

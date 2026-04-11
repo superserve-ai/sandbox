@@ -1390,8 +1390,9 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
-				// args[10] is the metadata jsonb (11th positional, 0-indexed).
-				if b, ok := args[10].([]byte); ok {
+				// Positional args (0-indexed): id, team_id, name, status,
+				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[11].([]byte); ok {
 					capturedMetadata = b
 				}
 				// Echo metadata back through the row so the response carries it.
@@ -1450,7 +1451,9 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
-				if b, ok := args[10].([]byte); ok {
+				// Positional args (0-indexed): id, team_id, name, status,
+				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[11].([]byte); ok {
 					capturedMetadata = b
 				}
 				return sandboxRow(db.Sandbox{

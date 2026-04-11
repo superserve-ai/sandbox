@@ -107,12 +107,13 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 }
 
 const createSandbox = `-- name: CreateSandbox :one
-INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
 `
 
 type CreateSandboxParams struct {
+	ID             uuid.UUID     `json:"id"`
 	TeamID         uuid.UUID     `json:"team_id"`
 	Name           string        `json:"name"`
 	Status         SandboxStatus `json:"status"`
@@ -126,8 +127,13 @@ type CreateSandboxParams struct {
 	Metadata       []byte        `json:"metadata"`
 }
 
+// ID is supplied by the caller (generated in Go via uuid.New()) rather
+// than defaulted in SQL, so the caller can parallelize this INSERT with
+// the VMD CreateVM call — both need the same sandbox_id and generating
+// it client-side lets them run concurrently instead of strictly serially.
 func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, createSandbox,
+		arg.ID,
 		arg.TeamID,
 		arg.Name,
 		arg.Status,
