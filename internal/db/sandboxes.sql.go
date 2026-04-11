@@ -277,6 +277,52 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 	return items, nil
 }
 
+const listSandboxesByHost = `-- name: ListSandboxesByHost :many
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
+WHERE host_id = $1 AND destroyed_at IS NULL
+`
+
+// Used by the VMD reconciler to find all non-deleted sandboxes scheduled on
+// this host. Includes both active and idle sandboxes because the reconciler
+// needs to validate both states (active → systemd unit, idle → snapshot file).
+func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Sandbox, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByHost, hostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sandbox{}
+	for rows.Next() {
+		var i Sandbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.Status,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.HostID,
+			&i.IpAddress,
+			&i.Pid,
+			&i.SnapshotID,
+			&i.LastActivityAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DestroyedAt,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.Metadata,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxesByTeam = `-- name: ListSandboxesByTeam :many
 SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
@@ -374,6 +420,20 @@ func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSan
 		return nil, err
 	}
 	return items, nil
+}
+
+const markSandboxFailed = `-- name: MarkSandboxFailed :exec
+UPDATE sandbox
+SET status = 'failed', updated_at = now()
+WHERE id = $1 AND destroyed_at IS NULL
+`
+
+// Used by the reconciler to mark a sandbox failed when VMD detects it is
+// actually gone. No team_id filter — the reconciler runs with host scope,
+// not team scope.
+func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markSandboxFailed, id)
+	return err
 }
 
 const sandboxExists = `-- name: SandboxExists :one

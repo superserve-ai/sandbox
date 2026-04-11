@@ -5,6 +5,11 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // ReconcilerConfig controls the periodic reconciler.
@@ -20,6 +25,13 @@ type ReconcilerConfig struct {
 	// logs a paging alert and stops taking destructive action until
 	// the counter resets.
 	MaxAutoFailPerHour int
+	// HostID is this host's identifier in the `host` table. The reconciler
+	// only operates on sandboxes with this host_id.
+	HostID string
+	// DB is optional. When set, the reconciler does three-way drift
+	// detection (BoltDB ↔ systemd ↔ DB) and writes audit log entries.
+	// When nil, it only compares BoltDB and systemd.
+	DB *db.Queries
 }
 
 // DefaultReconcilerConfig returns sensible defaults from the design doc.
@@ -87,10 +99,12 @@ func (r *Reconciler) Run(ctx context.Context) {
 }
 
 // runOnce performs a single reconciliation pass. Each pass:
-//  1. Queries BoltDB and systemd for all known/running VMs on this host.
-//  2. Compares the two sets.
-//  3. For each drifted VM, records the drift timestamp and (only if the
-//     drift has persisted past the grace period) applies the fix.
+//  1. Queries BoltDB, systemd, and (optionally) the control plane DB.
+//  2. Compares the three sets.
+//  3. Records a "first seen" timestamp for every drift so we can enforce
+//     the grace period (rule C7).
+//  4. Applies fixes that have persisted past the grace period, rate-limited
+//     by MaxAutoFailPerHour (rule C6).
 func (r *Reconciler) runOnce(ctx context.Context) {
 	log := r.mgr.log.With().Str("component", "reconciler").Logger()
 
@@ -124,75 +138,210 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Source C: DB sandbox rows for this host (optional).
+	var dbSandboxes map[string]db.Sandbox
+	if r.cfg.DB != nil && r.cfg.HostID != "" {
+		rows, dbErr := r.cfg.DB.ListSandboxesByHost(ctx, r.cfg.HostID)
+		if dbErr != nil {
+			log.Error().Err(dbErr).Msg("failed to list sandboxes from DB")
+		} else {
+			dbSandboxes = make(map[string]db.Sandbox, len(rows))
+			for _, s := range rows {
+				dbSandboxes[s.ID.String()] = s
+			}
+		}
+	}
+
 	now := time.Now()
-	var drifted []string
 
-	// Drift kind 1: BoltDB says running, systemd has no unit.
-	// This is a dead Firecracker — the process crashed after VMD recorded
-	// it. Mark the BoltDB entry stale.
-	for id, rec := range bolted {
-		if rec.Status != StatusRunning {
-			continue
-		}
-		if r.mgr.useSystemd && !active[id] {
-			r.mu.Lock()
-			if _, seen := r.driftSeen[id]; !seen {
-				r.driftSeen[id] = now
-			}
-			firstSeen := r.driftSeen[id]
-			r.mu.Unlock()
-
-			if now.Sub(firstSeen) >= r.cfg.GracePeriod {
-				drifted = append(drifted, id)
-				log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_systemd_missing").
-					Msg("dead Firecracker detected")
-			}
-			continue
-		}
-		// Also check the socket for non-systemd mode.
-		if !r.mgr.useSystemd && rec.SocketPath != "" {
-			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
-				r.mu.Lock()
-				if _, seen := r.driftSeen[id]; !seen {
-					r.driftSeen[id] = now
-				}
-				firstSeen := r.driftSeen[id]
-				r.mu.Unlock()
-
-				if now.Sub(firstSeen) >= r.cfg.GracePeriod {
-					drifted = append(drifted, id)
-					log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_socket_missing").
-						Msg("dead Firecracker detected")
-				}
+	// Drift 1: DB says active, systemd/socket says dead.
+	// Action: mark sandbox failed in DB + clean up BoltDB + in-memory.
+	if dbSandboxes != nil {
+		for id, sb := range dbSandboxes {
+			if sb.Status != db.SandboxStatusActive {
 				continue
 			}
-		}
-
-		// VM healthy — clear any drift marker.
-		r.mu.Lock()
-		delete(r.driftSeen, id)
-		r.mu.Unlock()
-	}
-
-	// Drift kind 2: systemd has a unit, BoltDB doesn't know about it.
-	// This is an orphan — likely a VMD crash that lost BoltDB state, or
-	// a unit leaked from a previous lifetime. We just log for now; adoption
-	// requires DB context the reconciler doesn't have yet (Phase 3 stage 2).
-	if r.mgr.useSystemd {
-		for id := range active {
-			if _, known := bolted[id]; !known {
-				log.Warn().Str("vm_id", id).Str("drift", "systemd_active_boltdb_missing").
-					Msg("orphan systemd unit detected (no BoltDB record)")
+			if r.isAlive(id, bolted) {
+				r.clearDrift(id)
+				continue
 			}
+			if !r.gracePeriodElapsed(id, now) {
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "db_active_systemd_missing")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
+				Msg("DB says active but VM is dead — marking failed")
+			r.markFailedInDB(ctx, id)
+			r.markStale(id)
+			r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
 		}
 	}
 
-	// Apply fixes, rate-limited by MaxAutoFailPerHour.
-	for _, id := range drifted {
-		if !r.consumeAutoFailBudget(id) {
-			continue
+	// Drift 2: BoltDB says running but VM is actually dead, and DB is
+	// unavailable (reconciler running in BoltDB-only mode). Fall back to
+	// the old behavior: just clean up the stale BoltDB entry.
+	if dbSandboxes == nil {
+		for id, rec := range bolted {
+			if rec.Status != StatusRunning {
+				continue
+			}
+			if r.isAlive(id, bolted) {
+				r.clearDrift(id)
+				continue
+			}
+			if !r.gracePeriodElapsed(id, now) {
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_unit_missing").
+				Msg("dead Firecracker detected (no DB context)")
+			r.markStale(id)
 		}
-		r.markStale(id)
+	}
+
+	// Drift 3: systemd has a unit, DB says the sandbox is deleted or has
+	// no row at all. This is an orphan — stop the unit + clean up.
+	if r.mgr.useSystemd && dbSandboxes != nil {
+		for id := range active {
+			sb, known := dbSandboxes[id]
+			deleted := known && sb.Status == db.SandboxStatusDeleted
+			if known && !deleted {
+				continue
+			}
+			if !r.gracePeriodElapsed("orphan:"+id, now) {
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "systemd_active_db_missing")
+				continue
+			}
+			reason := "systemd unit with no DB row"
+			kind := "systemd_active_db_missing"
+			if deleted {
+				reason = "systemd unit for soft-deleted sandbox"
+				kind = "systemd_active_db_deleted"
+			}
+			log.Warn().Str("vm_id", id).Str("drift", kind).Msg("orphan systemd unit — stopping")
+			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit")
+				continue
+			}
+			removeUnitDropIn(id)
+			r.markStale(id)
+			r.writeAudit(ctx, id, "orphan_stop", reason, kind)
+			r.clearDrift("orphan:" + id)
+		}
+	}
+
+	// Drift 4: DB says idle, snapshot file missing on disk → mark failed.
+	if dbSandboxes != nil {
+		for id, sb := range dbSandboxes {
+			if sb.Status != db.SandboxStatusIdle || !sb.SnapshotID.Valid {
+				continue
+			}
+			// Look up the snapshot path.
+			snap, snapErr := r.cfg.DB.GetSnapshot(ctx, sb.SnapshotID.Bytes)
+			if snapErr != nil {
+				continue
+			}
+			if _, statErr := os.Stat(snap.Path); statErr == nil {
+				r.clearDrift("idle:" + id)
+				continue
+			}
+			if !r.gracePeriodElapsed("idle:"+id, now) {
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "idle_snapshot_missing")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("snapshot_path", snap.Path).
+				Str("drift", "idle_snapshot_missing").
+				Msg("idle sandbox snapshot file missing — marking failed")
+			r.markFailedInDB(ctx, id)
+			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "idle_snapshot_missing")
+			r.clearDrift("idle:" + id)
+		}
+	}
+}
+
+// isAlive returns true when the VM is verifiably running per its runtime
+// channel (systemd unit active, or socket present in non-systemd mode).
+func (r *Reconciler) isAlive(vmID string, bolted map[string]VMRecord) bool {
+	if r.mgr.useSystemd {
+		return isUnitActive(context.Background(), systemdUnitName(vmID))
+	}
+	rec, ok := bolted[vmID]
+	if !ok || rec.SocketPath == "" {
+		return false
+	}
+	_, err := os.Stat(rec.SocketPath)
+	return err == nil
+}
+
+// gracePeriodElapsed records the first-seen timestamp for a drifted ID and
+// returns true once the configured grace period has passed. Used to absorb
+// transient states (e.g. VMD just started a VM and systemd hasn't fully
+// registered it yet).
+func (r *Reconciler) gracePeriodElapsed(key string, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	firstSeen, ok := r.driftSeen[key]
+	if !ok {
+		r.driftSeen[key] = now
+		return false
+	}
+	return now.Sub(firstSeen) >= r.cfg.GracePeriod
+}
+
+// clearDrift removes a drift marker once the VM returns to a healthy state.
+func (r *Reconciler) clearDrift(key string) {
+	r.mu.Lock()
+	delete(r.driftSeen, key)
+	r.mu.Unlock()
+}
+
+// markFailedInDB writes status=failed for the given sandbox ID. No-op if
+// the DB is not configured.
+func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
+	if r.cfg.DB == nil {
+		return
+	}
+	id, err := uuid.Parse(vmID)
+	if err != nil {
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: invalid vm_id for DB mark-failed")
+		return
+	}
+	if err := r.cfg.DB.MarkSandboxFailed(ctx, id); err != nil {
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
+	}
+}
+
+// writeAudit appends a row to the reconciler_log table. No-op if the DB
+// is not configured. Rule C8: every reconciler action produces an audit
+// record.
+func (r *Reconciler) writeAudit(ctx context.Context, vmID, action, reason, driftKind string) {
+	if r.cfg.DB == nil {
+		return
+	}
+	var sandboxID pgtype.UUID
+	if id, err := uuid.Parse(vmID); err == nil {
+		sandboxID = pgtype.UUID{Bytes: id, Valid: true}
+	}
+	kind := driftKind
+	if err := r.cfg.DB.InsertReconcilerLog(ctx, db.InsertReconcilerLogParams{
+		HostID:    r.cfg.HostID,
+		SandboxID: sandboxID,
+		Action:    action,
+		Reason:    reason,
+		DriftKind: &kind,
+	}); err != nil {
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to write audit log")
 	}
 }
 

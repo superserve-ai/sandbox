@@ -60,6 +60,21 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 -- name: SandboxExists :one
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
 
+-- name: ListSandboxesByHost :many
+-- Used by the VMD reconciler to find all non-deleted sandboxes scheduled on
+-- this host. Includes both active and idle sandboxes because the reconciler
+-- needs to validate both states (active → systemd unit, idle → snapshot file).
+SELECT * FROM sandbox
+WHERE host_id = $1 AND destroyed_at IS NULL;
+
+-- name: MarkSandboxFailed :exec
+-- Used by the reconciler to mark a sandbox failed when VMD detects it is
+-- actually gone. No team_id filter — the reconciler runs with host scope,
+-- not team scope.
+UPDATE sandbox
+SET status = 'failed', updated_at = now()
+WHERE id = $1 AND destroyed_at IS NULL;
+
 -- name: ListIdleSandboxes :many
 SELECT * FROM sandbox
 WHERE status = 'idle'

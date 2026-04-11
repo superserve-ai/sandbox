@@ -133,6 +133,16 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type ReconcilerLog struct {
+	ID        int64       `json:"id"`
+	HostID    string      `json:"host_id"`
+	SandboxID pgtype.UUID `json:"sandbox_id"`
+	Action    string      `json:"action"`
+	Reason    string      `json:"reason"`
+	DriftKind *string     `json:"drift_kind"`
+	CreatedAt time.Time   `json:"created_at"`
+}
+
 type Sandbox struct {
 	ID             uuid.UUID          `json:"id"`
 	TeamID         uuid.UUID          `json:"team_id"`

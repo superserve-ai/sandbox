@@ -13,9 +13,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
+	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
@@ -31,6 +33,16 @@ type Config struct {
 	RunDir         string
 	GRPCPort       int
 	HostInterface  string
+
+	// HostID identifies this bare-metal host in the `host` table. Used by
+	// the reconciler to scope its DB queries ("sandboxes on my host").
+	HostID string
+
+	// DatabaseURL is optional. When set, the reconciler does three-way
+	// reconciliation (BoltDB ↔ systemd ↔ control plane DB) and writes
+	// audit log entries. When unset, the reconciler only detects drift
+	// between BoltDB and systemd.
+	DatabaseURL string
 }
 
 func loadConfig() (Config, error) {
@@ -48,6 +60,8 @@ func loadConfig() (Config, error) {
 		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:       port,
 		HostInterface:  envOrDefault("HOST_INTERFACE", "eth0"),
+		HostID:         envOrDefault("HOST_ID", "default"),
+		DatabaseURL:    os.Getenv("DATABASE_URL"),
 	}
 
 	if cfg.KernelPath == "" {
@@ -251,11 +265,35 @@ func main() {
 		log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 	}
 
+	// ---- Optional DB connection for the reconciler ----
+	// VMD does not need the DB for its request path (that stays on gRPC).
+	// The reconciler uses the DB for three-way drift detection and audit
+	// logging. If DATABASE_URL is unset, the reconciler falls back to a
+	// BoltDB ↔ systemd comparison only.
+	var reconcilerDB *dbq.Queries
+	if cfg.DatabaseURL != "" {
+		dbPool, dbErr := pgxpool.New(ctx, cfg.DatabaseURL)
+		if dbErr != nil {
+			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
+		}
+		if err := dbPool.Ping(ctx); err != nil {
+			log.Fatal().Err(err).Msg("failed to ping database for reconciler")
+		}
+		reconcilerDB = dbq.New(dbPool)
+		lc.addCloser("reconciler db pool", func(_ context.Context) error {
+			dbPool.Close()
+			return nil
+		})
+		log.Info().Msg("reconciler DB connection ready")
+	} else {
+		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
+	}
+
 	// ---- Continuous reconciler ----
-	// Detects drift between BoltDB and systemd every 30s and cleans up
-	// stale entries (dead Firecrackers). Rate-limited to bound the blast
-	// radius of reconciler bugs.
-	reconciler := vm.NewReconciler(mgr, vm.DefaultReconcilerConfig())
+	reconcilerCfg := vm.DefaultReconcilerConfig()
+	reconcilerCfg.HostID = cfg.HostID
+	reconcilerCfg.DB = reconcilerDB
+	reconciler := vm.NewReconciler(mgr, reconcilerCfg)
 	lc.start("reconciler", func() error { reconciler.Run(ctx); return nil })
 
 	lc.addCloser("vm manager: active sandboxes", func(_ context.Context) error {
