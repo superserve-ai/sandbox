@@ -593,7 +593,9 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
-		out[i] = h.sandboxToResponse(s)
+		r := h.sandboxToResponse(s)
+		r.AccessToken = ""
+		out[i] = r
 	}
 	c.JSON(http.StatusOK, out)
 }

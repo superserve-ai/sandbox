@@ -3,8 +3,10 @@ package proxy
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 )
@@ -472,4 +475,106 @@ func TestBridge_ConcurrentInputOutput(t *testing.T) {
 			t.Fatalf("only %d of 20 inputs arrived", inputsSeen)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Origin enforcement tests — go through the full serveTerminal handler
+// ---------------------------------------------------------------------------
+
+func TestServeTerminal_WrongOriginRejected(t *testing.T) {
+	env := newFilesTestEnv(t)
+	// Reconfigure with a strict origin list (not "*").
+	env.handler.WithTerminal([]string{"https://allowed.example.com"})
+
+	sandboxID := env.sandboxID
+	token := env.validToken()
+	host := "boxd-" + sandboxID + "." + env.domain
+
+	// Wrap handler to override r.Host so ParseHost routes correctly.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Host = host
+		env.handler.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/terminal"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Origin": []string{"https://evil.example.com"},
+		},
+		Subprotocols: []string{terminalProtocol, "token." + token},
+	})
+	if err == nil {
+		t.Fatal("expected WS dial to fail for wrong origin, but it succeeded")
+	}
+}
+
+func TestServeTerminal_AllowedOriginAccepted(t *testing.T) {
+	fake := newFakeProcessService()
+	path, handler := boxdpbconnect.NewProcessServiceHandler(fake)
+	boxdMux := http.NewServeMux()
+	boxdMux.Handle(path, handler)
+	boxdSrv := httptest.NewUnstartedServer(h2c.NewHandler(boxdMux, &http2.Server{}))
+	boxdSrv.EnableHTTP2 = true
+	boxdSrv.Start()
+	defer boxdSrv.Close()
+
+	seedKey := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
+	sandboxID := "sbx-origtest1"
+	domain := "sandbox.test"
+
+	upURL, _ := url.Parse(boxdSrv.URL)
+	resolver := &stubResolver{
+		info: InstanceInfo{
+			VMIP:      upURL.Hostname(),
+			Status:    "running",
+			StartedAt: time.Now().UnixNano(),
+		},
+	}
+
+	h := NewHandler(domain, resolver, zerolog.Nop())
+	h.WithAuth(seedKey).WithTerminal([]string{"http://127.0.0.1:*"}).WithFiles()
+
+	upHost := upURL.Host
+	h.transports = &transportCache{items: map[string]*transportEntry{}}
+	h.transports.items[sandboxID] = &transportEntry{
+		lifecycleKey: resolver.info.lifecycleKey(),
+		transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, upHost)
+			},
+			DisableKeepAlives: true,
+		},
+		lastUsed: time.Now(),
+	}
+
+	// Wrap the handler to override r.Host so ParseHost sees the
+	// correct boxd host label instead of the test server's address.
+	host := "boxd-" + sandboxID + "." + domain
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Host = host
+		h.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	token := auth.ComputeAccessToken(seedKey, sandboxID)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/terminal"
+
+	fake.pushStart(42)
+	fake.pushEnd(0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ws, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		Subprotocols: []string{terminalProtocol, "token." + token},
+	})
+	if err != nil {
+		t.Fatalf("expected WS dial to succeed for allowed origin, got: %v", err)
+	}
+	ws.Close(websocket.StatusNormalClosure, "done")
 }

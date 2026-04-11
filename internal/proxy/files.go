@@ -28,6 +28,12 @@ const (
 
 	// accessTokenHeader is the carrier for the per-sandbox HMAC access token.
 	accessTokenHeader = "X-Access-Token"
+
+	// maxUploadBytes caps a single file upload at the proxy layer.
+	// The real per-sandbox storage limit is ENOSPC (VM disk size), but
+	// this prevents a caller from streaming an absurdly large payload
+	// that ties up proxy resources before the VM disk fills.
+	maxUploadBytes = 4 << 30 // 4 GB
 )
 
 // serveBoxdPort is the entry point for any request addressed at the
@@ -94,6 +100,10 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		return
 	}
 
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	}
+
 	// Path traversal rejection. boxd's own safePath runs filepath.Clean,
 	// which silently resolves `..` segments instead of refusing them —
 	// `/home/user/../../../etc/x` quietly becomes `/etc/x` and gets
@@ -106,6 +116,10 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	requestedPath := r.URL.Query().Get("path")
 	if requestedPath == "" {
 		http.Error(w, "missing path query parameter", http.StatusBadRequest)
+		return
+	}
+	if strings.ContainsRune(requestedPath, 0) {
+		http.Error(w, "path contains null byte", http.StatusBadRequest)
 		return
 	}
 	for _, seg := range strings.Split(requestedPath, "/") {

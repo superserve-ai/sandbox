@@ -70,6 +70,9 @@ jobs:
           # HMAC seed for per-sandbox access tokens. Hex-encoded, >= 32 bytes.
           # Shared with the control plane. Lives in GitHub secrets (sensitive).
           access_seed = os.environ.get('SANDBOX_ACCESS_TOKEN_SEED', '')
+          if access_seed:
+              # Mask the seed so GitHub Actions redacts it from all log output.
+              print(f'::add-mask::{access_seed}')
           if access_seed and not _re.fullmatch(r'[0-9a-fA-F]{64,}', access_seed):
               print('ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)', file=sys.stderr)
               sys.exit(1)
@@ -211,11 +214,13 @@ jobs:
                   sudo systemctl daemon-reload
                   sudo systemctl enable proxy
 
-                  # Write the proxy env file. Values were validated Python-side.
+                  # Write the proxy env file. The seed is passed via
+                  # _PROXY_SEED env var (set on the ssh command) to avoid
+                  # embedding it in the script string where it could be logged.
                   sudo mkdir -p /etc/superserve
-                  if [ -n "{access_seed}" ]; then
+                  if [ -n "$_PROXY_SEED" ]; then
                       sudo tee /etc/superserve/proxy.env > /dev/null <<PROXYENV
-                  SANDBOX_ACCESS_TOKEN_SEED={access_seed}
+                  SANDBOX_ACCESS_TOKEN_SEED=$_PROXY_SEED
                   TERMINAL_ALLOWED_ORIGINS={terminal_origins}
                   REQUIRE_DATA_PLANE={require_data_plane}
                   PROXYENV
@@ -231,11 +236,13 @@ jobs:
                       exit 1
                   )
               ''')
+              import shlex
+              full_script = f'export _PROXY_SEED={shlex.quote(access_seed)}\n{inject_script}'
               r = subprocess.run([
                   'gcloud', 'compute', 'ssh', name,
                   f'--zone={zone}', f'--project={project}',
                   '--quiet', '--tunnel-through-iap',
-                  '--command', inject_script,
+                  '--command', full_script,
               ], capture_output=True, text=True)
               if r.returncode != 0:
                   # Surface both stdout and stderr so deploy failures are
