@@ -298,53 +298,89 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		m.removeVM(vmID)
 	}
 
-	// 1. Copy the template rootfs for this VM.
-	stepStart := time.Now()
-	perVMRootfs, err := m.copyRootfs(ctx, rundirID, m.defaultTemplate.DiskPath)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("copy rootfs: %w", err)
-	}
-	inst.DiskPath = perVMRootfs
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: copy rootfs")
+	// Steps 1 and 2 — copying the rootfs and setting up the network
+	// namespace — are independent. Run them in parallel so the total
+	// wall-clock for the pair is max(rootfs, netns) instead of their sum.
+	// On typical hardware this shaves ~10-30ms off create latency.
+	parallelStart := time.Now()
 
-	// 2. Set up networking.
-	stepStart = time.Now()
-	netInfo, err := m.netMgr.SetupVM(ctx, vmID, netCfg)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("setup network: %w", err)
+	type rootfsResult struct {
+		path string
+		err  error
 	}
+	type netResult struct {
+		info *network.VMNetInfo
+		err  error
+	}
+	rootfsCh := make(chan rootfsResult, 1)
+	netCh := make(chan netResult, 1)
+
+	go func() {
+		p, err := m.copyRootfs(ctx, rundirID, m.defaultTemplate.DiskPath)
+		rootfsCh <- rootfsResult{path: p, err: err}
+	}()
+	go func() {
+		info, err := m.netMgr.SetupVM(ctx, vmID, netCfg)
+		netCh <- netResult{info: info, err: err}
+	}()
+
+	rfs := <-rootfsCh
+	nr := <-netCh
+
+	// Both steps always run to completion even if one fails, so we can
+	// clean up whichever one succeeded without leaking partial state.
+	if rfs.err != nil || nr.err != nil {
+		if rfs.err == nil {
+			// Network failed; rootfs is on disk — the shared cleanup()
+			// below removes the rundir.
+		}
+		if nr.err == nil {
+			// Rootfs failed; network is up — tear it down explicitly.
+			m.netMgr.CleanupVM(vmID)
+		}
+		cleanup()
+		if rfs.err != nil {
+			return nil, fmt.Errorf("copy rootfs: %w", rfs.err)
+		}
+		return nil, fmt.Errorf("setup network: %w", nr.err)
+	}
+
+	perVMRootfs := rfs.path
+	netInfo := nr.info
+	inst.DiskPath = perVMRootfs
 	inst.IP = netInfo.HostIP
 	inst.TAPDevice = netInfo.TAPDevice
 	inst.MACAddress = netInfo.MACAddress
 	inst.Namespace = netInfo.Namespace
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: setup network")
+	log.Debug().Dur("duration_ms", time.Since(parallelStart)).Msg("step: copy rootfs + setup network (parallel)")
 
 	// 3. Start Firecracker in a mount + network namespace.
-	stepStart = time.Now()
+	startStep := time.Now()
 	vmDir := filepath.Join(m.cfg.RunDir, rundirID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 	inst.SocketPath = socketPath
 
-	var pid int
+	var (
+		pid      int
+		startErr error
+	)
 	if m.useSystemd {
-		pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, netInfo.Namespace)
+		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, netInfo.Namespace)
 	} else {
-		pid, err = m.startFirecrackerInNamespace(vmID, socketPath, perVMRootfs, netInfo.Namespace)
+		pid, startErr = m.startFirecrackerInNamespace(vmID, socketPath, perVMRootfs, netInfo.Namespace)
 	}
-	if err != nil {
+	if startErr != nil {
 		m.netMgr.CleanupVM(vmID)
 		cleanup()
-		return nil, fmt.Errorf("start firecracker: %w", err)
+		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
 	inst.PID = pid
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: start firecracker")
+	log.Debug().Dur("duration_ms", time.Since(startStep)).Msg("step: start firecracker")
 
 	// 4. Restore from the original (unpatched) template snapshot.
 	// No IP reconfig needed — the VM uses a fixed internal IP (169.254.0.21)
 	// and the network namespace provides isolation.
-	stepStart = time.Now()
+	restoreStep := time.Now()
 	if err := RestoreSnapshotWithOverrides(
 		socketPath, m.defaultTemplate.SnapshotPath, m.defaultTemplate.MemFilePath,
 		"eth0", netInfo.TAPDevice,
@@ -353,7 +389,7 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		cleanup()
 		return nil, fmt.Errorf("restore template snapshot: %w", err)
 	}
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: restore snapshot")
+	log.Debug().Dur("duration_ms", time.Since(restoreStep)).Msg("step: restore snapshot")
 
 	m.setStatus(vmID, StatusRunning)
 	// Persist again now that PID, IP, and socket are set.

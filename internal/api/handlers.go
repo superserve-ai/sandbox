@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -995,30 +996,44 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
-	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
-		ID:        sandbox.ID,
-		VcpuCount: int32(actualVcpu),
-		MemoryMib: int32(actualMemMiB),
-		IpAddress: ipAddr,
-		TeamID:    teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
-	}
+	// ActivateSandbox (DB UPDATE) and network rule application (VMD call
+	// + DB UPDATE) are independent — both read VMD's result and write to
+	// their own sink. Run them in parallel so the response latency is
+	// max(activate, network) instead of activate + network.
+	hasNetworkRules := req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0)
 
-	// Apply network rules if provided at creation.
-	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		var allowedCIDRs, allowedDomains []string
-		for _, entry := range req.Network.AllowOut {
-			if isIPOrCIDR(entry) {
-				allowedCIDRs = append(allowedCIDRs, entry)
-			} else {
-				allowedDomains = append(allowedDomains, entry)
-			}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
+			ID:        sandbox.ID,
+			VcpuCount: int32(actualVcpu),
+			MemoryMib: int32(actualMemMiB),
+			IpAddress: ipAddr,
+			TeamID:    teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 		}
+	}()
 
-		if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
-		} else {
+	if hasNetworkRules {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var allowedCIDRs, allowedDomains []string
+			for _, entry := range req.Network.AllowOut {
+				if isIPOrCIDR(entry) {
+					allowedCIDRs = append(allowedCIDRs, entry)
+				} else {
+					allowedDomains = append(allowedDomains, entry)
+				}
+			}
+
+			if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
+				return
+			}
 			networkConfig, _ := json.Marshal(map[string]any{
 				"egress": map[string]any{
 					"allowed_cidrs":   allowedCIDRs,
@@ -1031,8 +1046,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				NetworkConfig: networkConfig,
 				TeamID:        teamID,
 			})
-		}
+		}()
 	}
+	wg.Wait()
 
 	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
