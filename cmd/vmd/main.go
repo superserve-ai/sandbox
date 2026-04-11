@@ -251,6 +251,13 @@ func main() {
 		log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 	}
 
+	// ---- Continuous reconciler ----
+	// Detects drift between BoltDB and systemd every 30s and cleans up
+	// stale entries (dead Firecrackers). Rate-limited to bound the blast
+	// radius of reconciler bugs.
+	reconciler := vm.NewReconciler(mgr, vm.DefaultReconcilerConfig())
+	lc.start("reconciler", func() error { reconciler.Run(ctx); return nil })
+
 	lc.addCloser("vm manager: active sandboxes", func(_ context.Context) error {
 		mgr.ShutdownAll()
 		return nil
