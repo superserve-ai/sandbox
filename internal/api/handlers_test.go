@@ -429,6 +429,14 @@ func snapshotRow(s db.Snapshot) *mockRow {
 	}}
 }
 
+// finalizePauseRow mocks the single-uuid RETURNING clause of FinalizePause.
+func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = snapshotID
+		return nil
+	}}
+}
+
 func resumeRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/resume", nil)
 }
@@ -1059,18 +1067,18 @@ func TestPauseSandbox_Success(t *testing.T) {
 	}
 
 	snapshotID := uuid.New()
-	queryRowCall := 0
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			queryRowCall++
-			if strings.Contains(sql, "FROM sandbox") {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				// BeginPause: atomic transition active → pausing, returns *
 				return sandboxRow(sb)
-			}
-			if strings.Contains(sql, "INSERT INTO snapshot") {
-				return snapshotRow(db.Snapshot{
-					ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
-					Path: "/snapshots/vmstate.snap", Trigger: "pause",
-				})
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				// FinalizePause: CTE insert + update, returns snapshot_id
+				return finalizePauseRow(snapshotID)
+			case strings.Contains(sql, "FROM sandbox"):
+				// Generic GetSandbox (fallback from BeginPause)
+				return sandboxRow(sb)
 			}
 			return activityRow()
 		},
@@ -1104,9 +1112,17 @@ func TestPauseSandbox_NotActive(t *testing.T) {
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusIdle}
 
+	// BeginPause's WHERE status = 'active' clause excludes this idle
+	// sandbox → 0 rows. The handler falls back to GetSandbox, finds the
+	// row (still idle), and returns 409 Conflict.
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'pausing'") {
+				return notFoundRow() // BeginPause: no active row matched
+			}
+			return sandboxRow(sb) // fallback GetSandbox: row exists, idle
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 	vmd := &stubVMD{}
 

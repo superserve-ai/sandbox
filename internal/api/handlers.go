@@ -1075,35 +1075,37 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Verify sandbox exists and belongs to this team.
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+	// Atomic ownership + state check + transition to 'pausing'. Collapses
+	// GetSandbox + UpdateStatus into a single DB roundtrip on the happy
+	// path. An empty result means the sandbox either doesn't exist, isn't
+	// ours, or isn't currently active — we do a fallback lookup to return
+	// the right error code (404 vs 409).
+	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
+		if err != pgx.ErrNoRows {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
+			respondError(c, ErrInternal)
 			return
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Only active sandboxes can be paused.
-	if sandbox.Status != db.SandboxStatusActive {
+		// Disambiguate: is the sandbox missing, or just not active?
+		existing, lookupErr := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		if lookupErr != nil {
+			if lookupErr == pgx.ErrNoRows {
+				respondError(c, ErrSandboxNotFound)
+				return
+			}
+			log.Error().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox (pause fallback) failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		_ = existing // we only needed to know whether the row exists
 		respondError(c, ErrInvalidState)
-		return
-	}
-
-	// Mark as pausing before calling VMD.
-	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
-		ID:     sandboxID,
-		Status: db.SandboxStatusPausing,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus(pausing) failed")
-		respondError(c, ErrInternal)
 		return
 	}
 
@@ -1166,10 +1168,12 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Create snapshot record in DB.
+	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
+	// the sandbox, and flip status from pausing → idle in a single CTE.
+	// Collapses three DB roundtrips into one.
 	triggerName := "pause"
-	snapshot, err := h.DB.CreateSnapshot(postCtx, db.CreateSnapshotParams{
-		SandboxID: sandboxID,
+	snapshotIDVal, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+		ID:        sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
 		SizeBytes: 0,
@@ -1178,28 +1182,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		Trigger:   triggerName,
 	})
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB CreateSnapshot failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Link snapshot to sandbox and mark as idle.
-	if err := h.DB.SetSandboxSnapshot(postCtx, db.SetSandboxSnapshotParams{
-		ID:         sandboxID,
-		SnapshotID: pgtype.UUID{Bytes: snapshot.ID, Valid: true},
-		TeamID:     teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB SetSandboxSnapshot failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sandboxID,
-		Status: db.SandboxStatusIdle,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus(idle) failed")
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB FinalizePause failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -1211,7 +1194,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		"id":          sandboxID.String(),
 		"name":        sandbox.Name,
 		"status":      "idle",
-		"snapshot_id": snapshot.ID.String(),
+		"snapshot_id": snapshotIDVal.String(),
 	})
 }
 

@@ -43,6 +43,50 @@ func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams
 	return err
 }
 
+const beginPause = `-- name: BeginPause :one
+UPDATE sandbox
+SET status = 'pausing', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
+`
+
+type BeginPauseParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Atomic ownership + state check + transition to 'pausing'. Replaces the
+// GetSandbox → check status → UpdateSandboxStatus sequence on the pause
+// hot path, collapsing two DB roundtrips into one. The WHERE clause
+// enforces the invariant (only active, non-deleted sandboxes owned by
+// this team can be paused); a 0-row result means "no such sandbox OR
+// wrong team OR not currently active", and the caller disambiguates via
+// a fallback GetSandbox in the rare error path.
+func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, beginPause, arg.ID, arg.TeamID)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.LastActivityAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+	)
+	return i, err
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH expired AS (
   SELECT id, team_id, name, snapshot_id, host_id
@@ -183,6 +227,51 @@ type DestroySandboxParams struct {
 func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) error {
 	_, err := q.db.Exec(ctx, destroySandbox, arg.ID, arg.TeamID)
 	return err
+}
+
+const finalizePause = `-- name: FinalizePause :one
+WITH new_snapshot AS (
+  INSERT INTO snapshot (sandbox_id, team_id, path, size_bytes, saved, name, trigger)
+  VALUES ($1, $2, $3, $4, $5, $6, $7)
+  RETURNING snapshot.id AS snap_id
+)
+UPDATE sandbox
+SET snapshot_id = (SELECT snap_id FROM new_snapshot),
+    status = 'idle',
+    updated_at = now()
+WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+RETURNING (SELECT snap_id FROM new_snapshot)::uuid AS snapshot_id
+`
+
+type FinalizePauseParams struct {
+	ID        uuid.UUID `json:"id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	Path      string    `json:"path"`
+	SizeBytes int64     `json:"size_bytes"`
+	Saved     bool      `json:"saved"`
+	Name      *string   `json:"name"`
+	Trigger   string    `json:"trigger"`
+}
+
+// Atomically insert the snapshot row, link it to the sandbox, and flip
+// status from 'pausing' to 'idle'. Replaces the sequence
+// CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
+// three DB roundtrips into one and making the entire post-VMD bookkeeping
+// atomic (no window where a snapshot file exists on disk without a
+// database row linking it to the sandbox).
+func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, finalizePause,
+		arg.ID,
+		arg.TeamID,
+		arg.Path,
+		arg.SizeBytes,
+		arg.Saved,
+		arg.Name,
+		arg.Trigger,
+	)
+	var snapshot_id uuid.UUID
+	err := row.Scan(&snapshot_id)
+	return snapshot_id, err
 }
 
 const getSandbox = `-- name: GetSandbox :one

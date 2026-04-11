@@ -79,6 +79,38 @@ UPDATE sandbox
 SET status = 'failed', updated_at = now()
 WHERE id = $1 AND destroyed_at IS NULL;
 
+-- name: BeginPause :one
+-- Atomic ownership + state check + transition to 'pausing'. Replaces the
+-- GetSandbox → check status → UpdateSandboxStatus sequence on the pause
+-- hot path, collapsing two DB roundtrips into one. The WHERE clause
+-- enforces the invariant (only active, non-deleted sandboxes owned by
+-- this team can be paused); a 0-row result means "no such sandbox OR
+-- wrong team OR not currently active", and the caller disambiguates via
+-- a fallback GetSandbox in the rare error path.
+UPDATE sandbox
+SET status = 'pausing', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
+RETURNING *;
+
+-- name: FinalizePause :one
+-- Atomically insert the snapshot row, link it to the sandbox, and flip
+-- status from 'pausing' to 'idle'. Replaces the sequence
+-- CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
+-- three DB roundtrips into one and making the entire post-VMD bookkeeping
+-- atomic (no window where a snapshot file exists on disk without a
+-- database row linking it to the sandbox).
+WITH new_snapshot AS (
+  INSERT INTO snapshot (sandbox_id, team_id, path, size_bytes, saved, name, trigger)
+  VALUES ($1, $2, $3, $4, $5, $6, $7)
+  RETURNING snapshot.id AS snap_id
+)
+UPDATE sandbox
+SET snapshot_id = (SELECT snap_id FROM new_snapshot),
+    status = 'idle',
+    updated_at = now()
+WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+RETURNING (SELECT snap_id FROM new_snapshot)::uuid AS snapshot_id;
+
 -- name: ListIdleSandboxes :many
 SELECT * FROM sandbox
 WHERE status = 'idle'

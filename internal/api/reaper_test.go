@@ -78,8 +78,14 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 	if m.queryRowFn != nil {
 		return m.queryRowFn(ctx, sql, args...)
 	}
-	// Route by SQL content: snapshot insert vs activity insert.
-	if strings.Contains(sql, "snapshot") {
+	// Route by SQL content:
+	//   - FinalizePause returns only a single snapshot_id uuid
+	//   - legacy CreateSnapshot returns a full Snapshot row
+	//   - activity insert returns an activity row
+	switch {
+	case strings.Contains(sql, "WITH new_snapshot"):
+		return finalizePauseRow(uuid.New())
+	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
 	}
 	return activityRow()
@@ -151,21 +157,24 @@ func TestReaper_NothingExpired(t *testing.T) {
 	}
 }
 
-// TestReaper_VMDSucceeds verifies that a claimed sandbox triggers a VMD pause,
-// snapshot creation, and status update to idle.
+// TestReaper_VMDSucceeds verifies that a claimed sandbox triggers a VMD
+// pause followed by the atomic FinalizePause bookkeeping query.
 func TestReaper_VMDSucceeds(t *testing.T) {
 	row := expiredRow("sbx-a")
 	var pausedID string
-	var execCalls []string
+	var finalizeCalls int32
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
 			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
 				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
 			},
-			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-				execCalls = append(execCalls, sql)
-				return pgconn.CommandTag{}, nil
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				if strings.Contains(sql, "WITH new_snapshot") {
+					atomic.AddInt32(&finalizeCalls, 1)
+					return finalizePauseRow(uuid.New())
+				}
+				return activityRow()
 			},
 		},
 		&stubVMD{pauseFn: func(_ context.Context, id string, _ string) (string, string, error) {
@@ -179,10 +188,8 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 	if pausedID != row.ID.String() {
 		t.Fatalf("expected PauseInstance called with %s, got %q", row.ID, pausedID)
 	}
-
-	// Expect SetSandboxSnapshot and UpdateSandboxStatus(idle) execs.
-	if len(execCalls) < 2 {
-		t.Fatalf("expected at least 2 exec calls (SetSandboxSnapshot + UpdateSandboxStatus), got %d", len(execCalls))
+	if got := atomic.LoadInt32(&finalizeCalls); got != 1 {
+		t.Fatalf("expected exactly 1 FinalizePause call, got %d", got)
 	}
 }
 

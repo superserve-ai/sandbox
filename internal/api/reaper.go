@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -151,38 +150,21 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
 	defer postCancel()
 
+	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
+	// the sandbox, and flip status from pausing → idle in a single CTE.
+	// Same query as the user-initiated PauseSandbox handler, so the two
+	// code paths have identical atomicity guarantees.
 	triggerName := "timeout"
-	snapshot, err := h.DB.CreateSnapshot(postCtx, db.CreateSnapshotParams{
-		SandboxID: sbx.ID,
+	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
 		SizeBytes: 0,
 		Saved:     false,
 		Name:      &triggerName,
 		Trigger:   triggerName,
-	})
-	if err != nil {
-		l.Error().Err(err).Msg("reaper: CreateSnapshot failed — rolling back VMD pause")
-		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
-		return
-	}
-
-	if err := h.DB.SetSandboxSnapshot(postCtx, db.SetSandboxSnapshotParams{
-		ID:         sbx.ID,
-		SnapshotID: pgtype.UUID{Bytes: snapshot.ID, Valid: true},
-		TeamID:     sbx.TeamID,
 	}); err != nil {
-		l.Error().Err(err).Msg("reaper: SetSandboxSnapshot failed — rolling back VMD pause")
-		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
-		return
-	}
-
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sbx.ID,
-		Status: db.SandboxStatusIdle,
-		TeamID: sbx.TeamID,
-	}); err != nil {
-		l.Error().Err(err).Msg("reaper: UpdateSandboxStatus(idle) failed — rolling back VMD pause")
+		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
 	}
