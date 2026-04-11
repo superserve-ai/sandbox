@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -1270,26 +1269,12 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		return 0, fmt.Errorf("wait for socket: %w", err)
 	}
 
-	// Read the PID from systemd.
-	pid, err := m.getUnitMainPID(ctx, vmID)
-	if err != nil {
-		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("could not read unit PID, using 0")
-	}
-	return pid, nil
-}
-
-// getUnitMainPID queries systemd for the main PID of a firecracker@ unit.
-func (m *Manager) getUnitMainPID(ctx context.Context, vmID string) (int, error) {
-	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID))
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, err
-	}
-	var pid int
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid); err != nil {
-		return 0, err
-	}
-	return pid, nil
+	// Deliberately skip the PID lookup on the hot path. In systemd mode
+	// VMD never signals the Firecracker process directly (stop/kill go
+	// through `systemctl stop`), so the PID is purely informational and
+	// costs another ~15ms of dbus roundtrip. Callers that need the PID
+	// later can read it via `systemctl show --property=MainPID`.
+	return 0, nil
 }
 
 // startFirecrackerInNamespace launches Firecracker in its own mount namespace
