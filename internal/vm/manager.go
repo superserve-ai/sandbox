@@ -327,38 +327,45 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 	rfs := <-rootfsCh
 	nr := <-netCh
 
-	// Both steps always run to completion even if one fails, so we can
-	// clean up whichever one succeeded without leaking partial state.
+	// Both goroutines always run to completion so we know exactly which
+	// side(s) succeeded and need unwinding. Tear them down in reverse
+	// order of resource ownership: network first (it's tied to kernel
+	// state), rundir last (it's just files, handled by cleanup()).
 	if rfs.err != nil || nr.err != nil {
-		if rfs.err == nil {
-			// Network failed; rootfs is on disk — the shared cleanup()
-			// below removes the rundir.
-		}
+		// If the network came up but the rootfs did not, the kernel
+		// namespace/veth/firewall state must be explicitly freed; the
+		// shared cleanup() only removes the rundir.
 		if nr.err == nil {
-			// Rootfs failed; network is up — tear it down explicitly.
 			m.netMgr.CleanupVM(vmID)
 		}
 		cleanup()
-		if rfs.err != nil {
+		switch {
+		case rfs.err != nil && nr.err != nil:
+			return nil, fmt.Errorf("copy rootfs: %w; setup network: %v", rfs.err, nr.err)
+		case rfs.err != nil:
 			return nil, fmt.Errorf("copy rootfs: %w", rfs.err)
+		default:
+			return nil, fmt.Errorf("setup network: %w", nr.err)
 		}
-		return nil, fmt.Errorf("setup network: %w", nr.err)
 	}
 
 	perVMRootfs := rfs.path
 	netInfo := nr.info
+	// Take inst.mu to write — concurrent readers via ExecCommand /
+	// LookupInstance / persistState take RLock.
+	inst.mu.Lock()
 	inst.DiskPath = perVMRootfs
 	inst.IP = netInfo.HostIP
 	inst.TAPDevice = netInfo.TAPDevice
 	inst.MACAddress = netInfo.MACAddress
 	inst.Namespace = netInfo.Namespace
+	inst.mu.Unlock()
 	log.Debug().Dur("duration_ms", time.Since(parallelStart)).Msg("step: copy rootfs + setup network (parallel)")
 
 	// 3. Start Firecracker in a mount + network namespace.
 	startStep := time.Now()
 	vmDir := filepath.Join(m.cfg.RunDir, rundirID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	inst.SocketPath = socketPath
 
 	var (
 		pid      int
@@ -374,7 +381,10 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		cleanup()
 		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
+	inst.mu.Lock()
+	inst.SocketPath = socketPath
 	inst.PID = pid
+	inst.mu.Unlock()
 	log.Debug().Dur("duration_ms", time.Since(startStep)).Msg("step: start firecracker")
 
 	// 4. Restore from the original (unpatched) template snapshot.
@@ -444,7 +454,6 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("copy rootfs: %w", err)
 	}
-	inst.DiskPath = diskPath
 
 	// 2. Set up networking.
 	netInfo, err := m.netMgr.SetupVM(ctx, vmID, nil)
@@ -453,15 +462,22 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("setup network: %w", err)
 	}
+
+	// inst is already visible via m.vms; take inst.mu for writes so
+	// concurrent readers (ExecCommand, LookupInstance, persistState)
+	// see a consistent view.
+	inst.mu.Lock()
+	inst.DiskPath = diskPath
 	inst.IP = netInfo.HostIP
 	inst.TAPDevice = netInfo.TAPDevice
 	inst.MACAddress = netInfo.MACAddress
 	inst.Namespace = netInfo.Namespace
+	mac := inst.MACAddress
+	inst.mu.Unlock()
 
 	// 3. Build Firecracker machine configuration.
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	inst.SocketPath = socketPath
 
 	fcCfg := FirecrackerConfig{
 		SocketPath: socketPath,
@@ -471,7 +487,7 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		VCPUCount:  1,
 		MemSizeMiB: 1024,
 		TAPDevice:  network.TAPName,
-		MACAddress: inst.MACAddress,
+		MACAddress: mac,
 		VMID:       vmID,
 		VMIP:       network.VMInternalIP,
 		GatewayIP:  network.VMGatewayIP,
@@ -485,10 +501,14 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
+
+	inst.mu.Lock()
+	inst.SocketPath = socketPath
 	inst.PID = pid
+	inst.mu.Unlock()
 
 	m.setStatus(vmID, StatusRunning)
-	log.Info().Int("pid", pid).Str("host_ip", inst.IP).Msg("VM cold-booted")
+	log.Info().Int("pid", pid).Str("host_ip", netInfo.HostIP).Msg("VM cold-booted")
 	return inst, nil
 }
 
@@ -758,7 +778,6 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		log.Debug().Str("disk_path", diskPath).Msg("created rootfs copy for restored VM")
 	}
-	inst.DiskPath = diskPath
 
 	var tapDevice, macAddr, hostIP, nsName string
 
@@ -784,14 +803,21 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		hostIP = netInfo.HostIP
 		nsName = netInfo.Namespace
 	}
+
+	vmDir := filepath.Join(m.cfg.RunDir, vmID)
+	socketPath := filepath.Join(vmDir, "firecracker.sock")
+
+	// Publish all the network/disk/socket fields before starting
+	// Firecracker so the in-memory view is consistent for concurrent
+	// readers. Lock once for the batch.
+	inst.mu.Lock()
+	inst.DiskPath = diskPath
 	inst.IP = hostIP
 	inst.TAPDevice = tapDevice
 	inst.MACAddress = macAddr
 	inst.Namespace = nsName
-
-	vmDir := filepath.Join(m.cfg.RunDir, vmID)
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
 	inst.SocketPath = socketPath
+	inst.mu.Unlock()
 
 	var pid int
 	var startErr error
@@ -808,7 +834,9 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
+	inst.mu.Lock()
 	inst.PID = pid
+	inst.mu.Unlock()
 
 	log.Info().Msg("restoring snapshot")
 
