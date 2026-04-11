@@ -1078,8 +1078,8 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Atomic ownership + state check + transition to 'pausing'. Collapses
 	// GetSandbox + UpdateStatus into a single DB roundtrip on the happy
 	// path. An empty result means the sandbox either doesn't exist, isn't
-	// ours, or isn't currently active — we do a fallback lookup to return
-	// the right error code (404 vs 409).
+	// ours, or isn't currently active — we do a cheap existence check to
+	// return the right error code (404 vs 409).
 	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
 		ID:     sandboxID,
 		TeamID: teamID,
@@ -1090,21 +1090,20 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		// Disambiguate: is the sandbox missing, or just not active?
-		existing, lookupErr := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		// Disambiguate: missing row (404) vs wrong state (409).
+		exists, existsErr := h.DB.SandboxExists(c.Request.Context(), db.SandboxExistsParams{
 			ID:     sandboxID,
 			TeamID: teamID,
 		})
-		if lookupErr != nil {
-			if lookupErr == pgx.ErrNoRows {
-				respondError(c, ErrSandboxNotFound)
-				return
-			}
-			log.Error().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox (pause fallback) failed")
+		if existsErr != nil {
+			log.Error().Err(existsErr).Str("sandbox_id", sandboxID.String()).Msg("DB SandboxExists (pause fallback) failed")
 			respondError(c, ErrInternal)
 			return
 		}
-		_ = existing // we only needed to know whether the row exists
+		if !exists {
+			respondError(c, ErrSandboxNotFound)
+			return
+		}
 		respondError(c, ErrInvalidState)
 		return
 	}
@@ -1182,6 +1181,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		Trigger:   triggerName,
 	})
 	if err != nil {
+		// ErrNoRows here means the sandbox was soft-deleted between
+		// BeginPause and FinalizePause (a rare race with DeleteSandbox).
+		// The VM is already stopped and its snapshot files are on disk —
+		// we can't finalize bookkeeping for a sandbox that no longer
+		// exists, so return 410 Gone.
+		if err == pgx.ErrNoRows {
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("FinalizePause: sandbox deleted mid-pause")
+			respondError(c, ErrSandboxGone)
+			return
+		}
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB FinalizePause failed")
 		respondError(c, ErrInternal)
 		return

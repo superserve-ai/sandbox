@@ -96,20 +96,36 @@ RETURNING *;
 -- Atomically insert the snapshot row, link it to the sandbox, and flip
 -- status from 'pausing' to 'idle'. Replaces the sequence
 -- CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
--- three DB roundtrips into one and making the entire post-VMD bookkeeping
--- atomic (no window where a snapshot file exists on disk without a
--- database row linking it to the sandbox).
-WITH new_snapshot AS (
+-- three DB roundtrips into one.
+--
+-- The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
+-- in the same query. This prevents the common race where a sandbox is
+-- soft-deleted before FinalizePause runs — without the gate, the CTE
+-- INSERT would always execute (per PostgreSQL's rule that data-modifying
+-- CTEs run independently of the main query), producing an orphan snapshot
+-- row and a snapshot file on disk with no owner. A concurrent delete that
+-- commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
+-- can still race, but that window is microseconds and the resulting
+-- orphan is detectable/cleanable by a background job.
+--
+-- When either the sandbox is missing/deleted or the INSERT did not fire,
+-- the query returns 0 rows and the caller maps that to ErrSandboxGone.
+WITH target AS (
+  SELECT id, team_id FROM sandbox
+  WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+),
+new_snapshot AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, size_bytes, saved, name, trigger)
-  VALUES ($1, $2, $3, $4, $5, $6, $7)
+  SELECT target.id, target.team_id, $3, $4, $5, $6, $7 FROM target
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM new_snapshot),
     status = 'idle',
     updated_at = now()
+FROM new_snapshot
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
-RETURNING (SELECT snap_id FROM new_snapshot)::uuid AS snapshot_id;
+RETURNING new_snapshot.snap_id::uuid AS snapshot_id;
 
 -- name: ListIdleSandboxes :many
 SELECT * FROM sandbox

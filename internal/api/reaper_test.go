@@ -83,7 +83,7 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 	//   - legacy CreateSnapshot returns a full Snapshot row
 	//   - activity insert returns an activity row
 	switch {
-	case strings.Contains(sql, "WITH new_snapshot"):
+	case strings.Contains(sql, "new_snapshot AS"):
 		return finalizePauseRow(uuid.New())
 	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
@@ -170,7 +170,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
 			},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-				if strings.Contains(sql, "WITH new_snapshot") {
+				if strings.Contains(sql, "new_snapshot AS") {
 					atomic.AddInt32(&finalizeCalls, 1)
 					return finalizePauseRow(uuid.New())
 				}

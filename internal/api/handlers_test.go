@@ -437,6 +437,14 @@ func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
 	}}
 }
 
+// boolRow mocks a single-bool scan (e.g. SandboxExists).
+func boolRow(value bool) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*bool) = value
+		return nil
+	}}
+}
+
 func resumeRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/resume", nil)
 }
@@ -1110,17 +1118,20 @@ func TestPauseSandbox_Success(t *testing.T) {
 func TestPauseSandbox_NotActive(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusIdle}
 
-	// BeginPause's WHERE status = 'active' clause excludes this idle
-	// sandbox → 0 rows. The handler falls back to GetSandbox, finds the
-	// row (still idle), and returns 409 Conflict.
+	// BeginPause's WHERE status = 'active' clause excludes an idle
+	// sandbox → 0 rows. The handler falls back to SandboxExists to
+	// disambiguate 404 vs 409; since the row exists (just in the wrong
+	// state), we return 409 Conflict.
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			if strings.Contains(sql, "'pausing'") {
 				return notFoundRow() // BeginPause: no active row matched
 			}
-			return sandboxRow(sb) // fallback GetSandbox: row exists, idle
+			if strings.Contains(sql, "EXISTS") {
+				return boolRow(true) // fallback: row exists, but not active
+			}
+			return notFoundRow()
 		},
 		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
@@ -1136,9 +1147,19 @@ func TestPauseSandbox_NotActive(t *testing.T) {
 }
 
 func TestPauseSandbox_NotFound(t *testing.T) {
+	// BeginPause returns 0 rows (sandbox doesn't exist), and the
+	// SandboxExists fallback also returns false → 404.
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'pausing'") {
+				return notFoundRow()
+			}
+			if strings.Contains(sql, "EXISTS") {
+				return boolRow(false)
+			}
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 	vmd := &stubVMD{}
 
