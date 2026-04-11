@@ -216,6 +216,24 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 	return resp.IpAddress, actualVcpu, actualMemMiB, nil
 }
 
+// RestoreSnapshot is the stateless restore path — VMD creates a fresh VM
+// instance from the snapshot files, bypassing any in-memory state. Used as
+// a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
+// map to a crash but the snapshot files are still on disk).
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
+	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
+		VmId:         vmID,
+		SnapshotPath: snapshotPath,
+		MemFilePath:  memPath,
+	})
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
+	}
+	// RestoreSnapshotResponse doesn't carry ResourceLimits in the proto today,
+	// so we return 0,0 and let the caller keep the existing DB values.
+	return resp.IpAddress, 0, 0, nil
+}
+
 func (c *grpcVMDClient) ExecCommand(ctx context.Context, vmID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	stream, err := c.client.ExecCommand(ctx, &vmdpb.ExecCommandRequest{
 		VmId:           vmID,

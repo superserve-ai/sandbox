@@ -167,7 +167,7 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 			}
 			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 			defer vmdCancel()
-			if _, _, _, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), "", "", nil); err != nil {
+			if err := h.wakeIdleSandbox(vmdCtx, vmd, &sandbox); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -212,6 +212,39 @@ func sandboxFromContext(c *gin.Context) *db.Sandbox {
 	val, _ := c.Get("sandbox")
 	sb, _ := val.(*db.Sandbox)
 	return sb
+}
+
+// wakeIdleSandbox transparently brings an idle sandbox back online. It first
+// tries the stateful ResumeInstance path. If VMD has no record of the VM
+// (typically after a VMD restart that lost the in-memory map), it falls back
+// to the stateless RestoreSnapshot path using the snapshot files from the DB.
+//
+// The fallback is only attempted when:
+//   - VMD returned NotFound
+//   - The sandbox has a linked snapshot row
+//   - The snapshot file is still readable on disk
+func (h *Handlers) wakeIdleSandbox(ctx context.Context, vmd VMDClient, sandbox *db.Sandbox) error {
+	sandboxID := sandbox.ID.String()
+	_, _, _, err := vmd.ResumeInstance(ctx, sandboxID, "", "", nil)
+	if err == nil {
+		return nil
+	}
+	if !isVMDNotFound(err) || !sandbox.SnapshotID.Valid {
+		return err
+	}
+
+	snap, snapErr := h.DB.GetSnapshot(ctx, sandbox.SnapshotID.Bytes)
+	if snapErr != nil {
+		return err
+	}
+	if !snapshotFileExists(snap.Path) {
+		return err
+	}
+
+	memPath := filepath.Join(filepath.Dir(snap.Path), "mem.snap")
+	log.Warn().Str("sandbox_id", sandboxID).Msg("auto-wake ResumeInstance NotFound, falling back to stateless restore")
+	_, _, _, err = vmd.RestoreSnapshot(ctx, sandboxID, snap.Path, memPath)
+	return err
 }
 
 // persistedEgressConfig mirrors the jsonb shape stored in sandbox.network_config.
@@ -362,9 +395,32 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	defer vmdCancel()
 	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
-		respondError(c, ErrInternal)
-		return
+		// If VMD has no record of this VM (crashed before pause, or VMD
+		// restart lost its state), fall back to the stateless RestoreSnapshot
+		// path as long as the snapshot files are actually on disk. This is
+		// the "handler degradation" property from the Phase 3 design doc.
+		if isVMDNotFound(err) && snapshotFileExists(snapshotPath) {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
+				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+			if err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
+				respondError(c, ErrInternal)
+				return
+			}
+		} else {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+
+	// The fallback may have returned 0 for vcpu/mem. Fall back to the DB values.
+	if actualVcpu == 0 {
+		actualVcpu = uint32(sandbox.VcpuCount)
+	}
+	if actualMemMiB == 0 {
+		actualMemMiB = uint32(sandbox.MemoryMib)
 	}
 
 	// Past this point the VM is running. Detach from cancellation so a
@@ -452,9 +508,15 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 		defer vmdCancel()
 		if err := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
-			respondError(c, ErrInternal)
-			return
+			// Delete is idempotent — if the VM is already gone, proceed
+			// with DB cleanup instead of failing the request.
+			if isVMDNotFound(err) {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance: VM already gone, proceeding with DB cleanup")
+			} else {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 	}
 
@@ -1008,6 +1070,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	defer vmdCancel()
 	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sandboxID.String(), "")
 	if err != nil {
+		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
+		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
+		// already dead, "active" was a lie.
+		if isVMDNotFound(err) {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance: VM not found, marking sandbox failed")
+			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID)
+			respondError(c, ErrSandboxGone)
+			return
+		}
+
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance failed")
 		// Revert status to active asynchronously. Detach cancellation so
 		// the revert survives client disconnect, but keep trace context
@@ -1136,6 +1208,12 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS))
 	durationMs := int32(time.Since(start).Milliseconds())
 	if err != nil {
+		if isVMDNotFound(err) {
+			log.Warn().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand: VM not found, marking sandbox failed")
+			h.markSandboxFailedAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
+			respondError(c, ErrSandboxGone)
+			return
+		}
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand failed")
 		respondError(c, ErrInternal)
 		return

@@ -29,6 +29,7 @@ type stubVMD struct {
 	destroyFn func(ctx context.Context, id string, force bool) error
 	pauseFn   func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn  func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	restoreFn func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 }
 
@@ -54,6 +55,13 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (st
 func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
 		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath)
+		return ip, 1, 1024, err
+	}
+	return "10.0.0.1", 1, 1024, nil
+}
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string) (string, uint32, uint32, error) {
+	if s.restoreFn != nil {
+		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil

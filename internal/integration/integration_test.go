@@ -124,6 +124,9 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string,
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
+	return "10.0.0.1", 1, 1024, nil
+}
 func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
 	return "hello\n", "", 0, nil
 }
