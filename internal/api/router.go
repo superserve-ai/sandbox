@@ -30,19 +30,6 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// and becomes meaningless for fairness.
 	api.Use(APIKeyAuth(pool), TeamRateLimit(ctx, DefaultTeamRateLimitConfig()))
 	{
-		api.POST("/instances", h.CreateInstance)
-		api.GET("/instances", h.ListInstances)
-		api.GET("/instances/:instance_id", h.GetInstance)
-		api.DELETE("/instances/:instance_id", h.DeleteInstance)
-		api.POST("/instances/:instance_id/pause", h.PauseInstance)
-		api.POST("/instances/:instance_id/resume", h.ResumeInstance)
-
-		api.POST("/instances/:instance_id/exec", h.ExecCommand)
-		api.POST("/instances/:instance_id/exec/stream", h.ExecCommandStream)
-
-		api.PUT("/instances/:instance_id/files/*path", h.UploadFile)
-		api.GET("/instances/:instance_id/files/*path", h.DownloadFile)
-
 		// Sandbox lifecycle (no auto-wake).
 		api.POST("/sandboxes", h.CreateSandbox)
 		api.GET("/sandboxes", h.ListSandboxes)
@@ -58,8 +45,6 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		{
 			sandboxOps.POST("/exec", h.ExecSandbox)
 			sandboxOps.POST("/exec/stream", h.ExecSandboxStream)
-			sandboxOps.PUT("/files/*path", h.UploadSandboxFile)
-			sandboxOps.GET("/files/*path", h.DownloadSandboxFile)
 		}
 	}
 

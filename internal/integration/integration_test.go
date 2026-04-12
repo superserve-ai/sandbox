@@ -114,15 +114,15 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct{}
 
-func (s *stubVMD) CreateInstance(_ context.Context, _ string, _, _, _ uint32, _ map[string]string) (string, error) {
-	return "10.0.0.1", nil
+func (s *stubVMD) CreateInstance(_ context.Context, _ string, _, _, _ uint32, _ map[string]string) (string, uint32, uint32, error) {
+	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
 func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, error) {
-	return "10.0.0.1", nil
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
+	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
 	return "hello\n", "", 0, nil
@@ -131,13 +131,6 @@ func (s *stubVMD) ExecCommandStream(_ context.Context, _, _ string, _ []string, 
 	onChunk([]byte("hello\n"), nil, 0, false)
 	onChunk(nil, nil, 0, true)
 	return nil
-}
-func (s *stubVMD) UploadFile(_ context.Context, _, _ string, r io.Reader) (int64, error) {
-	n, _ := io.Copy(io.Discard, r)
-	return n, nil
-}
-func (s *stubVMD) DownloadFile(_ context.Context, _, _ string) (io.ReadCloser, error) {
-	return io.NopCloser(strings.NewReader("file-content")), nil
 }
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
@@ -295,8 +288,8 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	if sb.VcpuCount != 1 {
 		t.Errorf("vcpu_count = %d, want 1", sb.VcpuCount)
 	}
-	if sb.MemoryMib != 512 {
-		t.Errorf("memory_mib = %d, want 512", sb.MemoryMib)
+	if sb.MemoryMib != 1024 {
+		t.Errorf("memory_mib = %d, want 1024", sb.MemoryMib)
 	}
 }
 
@@ -645,54 +638,6 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 	}
 	if sb.Status != db.SandboxStatusActive {
 		t.Errorf("DB status = %q after auto-wake, want active", sb.Status)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// PUT + GET /sandboxes/:id/files/*path
-// ---------------------------------------------------------------------------
-
-func TestIntegration_FileUploadDownload(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"file-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	// Upload.
-	uw := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/home/user/test.txt", apiKey, []byte("hello sandbox file"))
-	if uw.Code != http.StatusOK {
-		t.Fatalf("upload: expected 200, got %d: %s", uw.Code, uw.Body.String())
-	}
-	ub := mustJSON(t, uw)
-	if ub["path"] != "/home/user/test.txt" {
-		t.Errorf("upload path = %q, want /home/user/test.txt", ub["path"])
-	}
-
-	// Download.
-	dw := do(r, "GET", "/sandboxes/"+sid+"/files/home/user/test.txt", apiKey, "")
-	if dw.Code != http.StatusOK {
-		t.Fatalf("download: expected 200, got %d: %s", dw.Code, dw.Body.String())
-	}
-	if dw.Body.String() != "file-content" { // stubVMD always returns "file-content"
-		t.Errorf("download body = %q, want file-content", dw.Body.String())
-	}
-}
-
-func TestIntegration_FileUpload_PathTraversalRejected(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"pt-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	w := doBinary(r, "PUT", "/sandboxes/"+sid+"/files/../../../etc/passwd", apiKey, []byte("x"))
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for path traversal, got %d", w.Code)
 	}
 }
 

@@ -57,6 +57,19 @@ type Handler struct {
 	sandboxConns *connLimiter
 	ipConns      *connLimiter
 	log          zerolog.Logger
+
+	// seedKey is the HMAC seed shared with the control plane. Both
+	// sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
+	// Set via WithAuth; nil means data-plane endpoints are disabled.
+	seedKey []byte
+
+	// terminal holds the dependencies specific to the /terminal WebSocket
+	// bridge (allowed browser origins for the Origin check). Nil means
+	// the /terminal path is disabled.
+	terminal *terminalBridgeDeps
+
+	// filesEnabled controls whether /files on boxdPort is served.
+	filesEnabled bool
 }
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
@@ -104,6 +117,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// that may be bound on the VM's network interface.
 	if port < minProxiedPort {
 		http.Error(w, "port not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Boxd traffic (port 49983) is handled by a dedicated, token-gated
+	// path. Everything on that port — even outside /files — must never
+	// fall through to the generic reverse proxy, because that would
+	// expose the in-VM connect-rpc services (ProcessService,
+	// FilesystemService) directly to any internet caller who can guess
+	// an instance ID. The file bridge allowlists /files only; anything
+	// else on the boxd port is refused.
+	if port == boxdPort {
+		h.serveBoxdPort(w, r, instanceID)
 		return
 	}
 
@@ -156,8 +181,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.Host = r.Host
 			// Strip all forwarding headers — a client could inject these to
 			// spoof origin info that boxd or user apps might trust.
+			// X-Forwarded-For needs an explicit nil assignment because
+			// httputil.ReverseProxy re-appends it after the Director
+			// runs unless the slot is the nil slice.
+			req.Header["X-Forwarded-For"] = nil
 			for _, h := range []string{
-				"X-Forwarded-For",
 				"X-Forwarded-Host",
 				"X-Forwarded-Proto",
 				"X-Real-Ip",
