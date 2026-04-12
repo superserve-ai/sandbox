@@ -43,6 +43,11 @@ type Config struct {
 	// audit log entries. When unset, the reconciler only detects drift
 	// between BoltDB and systemd.
 	DatabaseURL string
+
+	// ControlPlaneURL is the base URL of the control plane API. Used by
+	// the heartbeat goroutine to POST liveness. Optional — if unset,
+	// heartbeat is disabled.
+	ControlPlaneURL string
 }
 
 func loadConfig() (Config, error) {
@@ -60,8 +65,9 @@ func loadConfig() (Config, error) {
 		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:       port,
 		HostInterface:  envOrDefault("HOST_INTERFACE", "eth0"),
-		HostID:         envOrDefault("HOST_ID", "default"),
-		DatabaseURL:    os.Getenv("DATABASE_URL"),
+		HostID:          envOrDefault("HOST_ID", "default"),
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
 	}
 
 	if cfg.KernelPath == "" {
@@ -295,6 +301,19 @@ func main() {
 	reconcilerCfg.DB = reconcilerDB
 	reconciler := vm.NewReconciler(mgr, reconcilerCfg)
 	lc.start("reconciler", func() error { reconciler.Run(ctx); return nil })
+
+	// ---- Heartbeat to control plane ----
+	if cfg.ControlPlaneURL != "" {
+		lc.start("heartbeat", func() error {
+			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
+				ControlPlaneURL: cfg.ControlPlaneURL,
+				HostID:          cfg.HostID,
+			}, log)
+			return nil
+		})
+	} else {
+		log.Warn().Msg("CONTROL_PLANE_URL unset — heartbeat disabled")
+	}
 
 	lc.addCloser("vm manager: active sandboxes", func(_ context.Context) error {
 		mgr.ShutdownAll()

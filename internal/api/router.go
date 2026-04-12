@@ -50,5 +50,13 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 
 	r.GET("/health", h.Health)
 
+	// Internal endpoints — no API key auth, no rate limiting. These are
+	// called by infrastructure components (VMD heartbeat) and are not
+	// exposed to customers.
+	internal := r.Group("/internal")
+	{
+		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
+	}
+
 	return r
 }

@@ -86,7 +86,7 @@ func run() error {
 		return newGRPCVMDClient(conn), nil
 	}
 	handlers.Hosts = hostreg.New(queries, dialVMD)
-	handlers.Scheduler = &scheduler.PickFirst{DB: queries}
+	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries}
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
@@ -94,6 +94,11 @@ func run() error {
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
 	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+
+	// Launch the host health detector. Marks active hosts as unhealthy
+	// when their VMD heartbeat goes stale (>2 min). The scheduler
+	// excludes unhealthy hosts from placement.
+	go api.StartHostDetector(ctx, queries)
 
 	// Start HTTP server.
 	srv := &http.Server{

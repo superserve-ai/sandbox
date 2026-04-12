@@ -24,3 +24,33 @@ WHERE id = $1;
 UPDATE host
 SET last_heartbeat_at = now(), updated_at = now()
 WHERE id = $1;
+
+-- name: MarkHostUnhealthy :exec
+UPDATE host
+SET status = 'unhealthy', updated_at = now()
+WHERE id = $1 AND status = 'active';
+
+-- name: ListStaleHosts :many
+-- Returns active hosts whose last heartbeat is older than the given
+-- threshold. Used by the unhealthy-host detector.
+SELECT * FROM host
+WHERE status = 'active'
+  AND last_heartbeat_at IS NOT NULL
+  AND last_heartbeat_at < $1
+ORDER BY last_heartbeat_at ASC;
+
+-- name: ListActiveHostsByLoad :many
+-- Returns active hosts sorted by current sandbox count (ascending).
+-- The scheduler picks the first row (least loaded host). One query
+-- replaces N per-host lookups.
+SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
+       h.capacity_memory_mib, h.capacity_vcpus,
+       h.last_heartbeat_at, h.created_at, h.updated_at,
+       COALESCE(COUNT(s.id), 0)::int AS active_sandbox_count
+FROM host h
+LEFT JOIN sandbox s ON s.host_id = h.id
+  AND s.status IN ('active', 'starting')
+  AND s.destroyed_at IS NULL
+WHERE h.status = 'active'
+GROUP BY h.id
+ORDER BY COUNT(s.id) ASC;

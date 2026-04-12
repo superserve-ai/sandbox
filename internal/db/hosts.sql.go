@@ -7,6 +7,9 @@ package db
 
 import (
 	"context"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createHost = `-- name: CreateHost :one
@@ -108,6 +111,69 @@ func (q *Queries) ListActiveHosts(ctx context.Context) ([]Host, error) {
 	return items, nil
 }
 
+const listActiveHostsByLoad = `-- name: ListActiveHostsByLoad :many
+SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
+       h.capacity_memory_mib, h.capacity_vcpus,
+       h.last_heartbeat_at, h.created_at, h.updated_at,
+       COALESCE(COUNT(s.id), 0)::int AS active_sandbox_count
+FROM host h
+LEFT JOIN sandbox s ON s.host_id = h.id
+  AND s.status IN ('active', 'starting')
+  AND s.destroyed_at IS NULL
+WHERE h.status = 'active'
+GROUP BY h.id
+ORDER BY COUNT(s.id) ASC
+`
+
+type ListActiveHostsByLoadRow struct {
+	ID                 string             `json:"id"`
+	VmdAddr            string             `json:"vmd_addr"`
+	ProxyAddr          string             `json:"proxy_addr"`
+	Region             string             `json:"region"`
+	Status             string             `json:"status"`
+	CapacityMemoryMib  int32              `json:"capacity_memory_mib"`
+	CapacityVcpus      int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt    pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	ActiveSandboxCount int32              `json:"active_sandbox_count"`
+}
+
+// Returns active hosts sorted by current sandbox count (ascending).
+// The scheduler picks the first row (least loaded host). One query
+// replaces N per-host lookups.
+func (q *Queries) ListActiveHostsByLoad(ctx context.Context) ([]ListActiveHostsByLoadRow, error) {
+	rows, err := q.db.Query(ctx, listActiveHostsByLoad)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveHostsByLoadRow{}
+	for rows.Next() {
+		var i ListActiveHostsByLoadRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.VmdAddr,
+			&i.ProxyAddr,
+			&i.Region,
+			&i.Status,
+			&i.CapacityMemoryMib,
+			&i.CapacityVcpus,
+			&i.LastHeartbeatAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ActiveSandboxCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listHosts = `-- name: ListHosts :many
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
 ORDER BY created_at ASC
@@ -142,6 +208,58 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const listStaleHosts = `-- name: ListStaleHosts :many
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+WHERE status = 'active'
+  AND last_heartbeat_at IS NOT NULL
+  AND last_heartbeat_at < $1
+ORDER BY last_heartbeat_at ASC
+`
+
+// Returns active hosts whose last heartbeat is older than the given
+// threshold. Used by the unhealthy-host detector.
+func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Timestamptz) ([]Host, error) {
+	rows, err := q.db.Query(ctx, listStaleHosts, lastHeartbeatAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Host{}
+	for rows.Next() {
+		var i Host
+		if err := rows.Scan(
+			&i.ID,
+			&i.VmdAddr,
+			&i.ProxyAddr,
+			&i.Region,
+			&i.Status,
+			&i.CapacityMemoryMib,
+			&i.CapacityVcpus,
+			&i.LastHeartbeatAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markHostUnhealthy = `-- name: MarkHostUnhealthy :exec
+UPDATE host
+SET status = 'unhealthy', updated_at = now()
+WHERE id = $1 AND status = 'active'
+`
+
+func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, markHostUnhealthy, id)
+	return err
 }
 
 const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :exec
