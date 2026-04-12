@@ -307,3 +307,47 @@ func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusPara
 	_, err := q.db.Exec(ctx, updateHostStatus, arg.ID, arg.Status)
 	return err
 }
+
+const upsertHost = `-- name: UpsertHost :one
+INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (id) DO NOTHING
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+`
+
+type UpsertHostParams struct {
+	ID                string `json:"id"`
+	VmdAddr           string `json:"vmd_addr"`
+	ProxyAddr         string `json:"proxy_addr"`
+	Region            string `json:"region"`
+	CapacityMemoryMib int32  `json:"capacity_memory_mib"`
+	CapacityVcpus     int32  `json:"capacity_vcpus"`
+}
+
+// Ensures a host row exists. Inserts if missing, no-ops if already present.
+// Used at control plane startup to seed the default host from env vars so
+// the scheduler always has at least one host to pick from.
+func (q *Queries) UpsertHost(ctx context.Context, arg UpsertHostParams) (Host, error) {
+	row := q.db.QueryRow(ctx, upsertHost,
+		arg.ID,
+		arg.VmdAddr,
+		arg.ProxyAddr,
+		arg.Region,
+		arg.CapacityMemoryMib,
+		arg.CapacityVcpus,
+	)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
