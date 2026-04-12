@@ -275,6 +275,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+
   /sandboxes/{sandbox_id}/exec:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
@@ -340,76 +341,6 @@ paths:
             text/event-stream:
               schema:
                 $ref: "#/components/schemas/ExecStreamEvent"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-  /sandboxes/{sandbox_id}/files/{path}:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-      - name: path
-        in: path
-        required: true
-        schema:
-          type: string
-        description: File path inside the sandbox (without leading slash).
-
-    put:
-      operationId: uploadFile
-      tags: [Files]
-      summary: Upload a file into a sandbox
-      description: Idle sandboxes are automatically resumed before the upload.
-      security:
-        - apiKey: []
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-      responses:
-        "200":
-          description: File uploaded
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  path:
-                    type: string
-                  size:
-                    type: integer
-                    format: int64
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-    get:
-      operationId: downloadFile
-      tags: [Files]
-      summary: Download a file from a sandbox
-      description: Idle sandboxes are automatically resumed before the download.
-      security:
-        - apiKey: []
-      responses:
-        "200":
-          description: File content
-          content:
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -508,6 +439,14 @@ components:
           type: integer
         memory_mib:
           type: integer
+        access_token:
+          type: string
+          description: |
+            Per-sandbox HMAC access token for data-plane operations
+            (file upload/download, terminal). Pass as `X-Access-Token`
+            header when hitting the edge proxy at
+            `boxd-{id}.sandbox.superserve.ai`. Reusable for the
+            lifetime of the sandbox.
         snapshot_id:
           type: string
           format: uuid

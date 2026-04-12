@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -137,7 +136,7 @@ func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
 	}
 }
 
-func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error) {
+func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.CreateVM(ctx, &vmdpb.CreateVMRequest{
 		VmId:     vmID,
 		Metadata: metadata,
@@ -148,9 +147,14 @@ func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, m
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("gRPC CreateVM: %w", err)
+		return "", 0, 0, fmt.Errorf("gRPC CreateVM: %w", err)
 	}
-	return resp.IpAddress, nil
+	var actualVcpu, actualMemMiB uint32
+	if rl := resp.GetResourceLimits(); rl != nil {
+		actualVcpu = rl.GetVcpuCount()
+		actualMemMiB = rl.GetMemoryMib()
+	}
+	return resp.IpAddress, actualVcpu, actualMemMiB, nil
 }
 
 func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force bool) error {
@@ -175,16 +179,21 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 	return resp.SnapshotPath, resp.MemFilePath, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
 	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 	})
 	if err != nil {
-		return "", fmt.Errorf("gRPC ResumeVM: %w", err)
+		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
 	}
-	return resp.IpAddress, nil
+	var actualVcpu, actualMemMiB uint32
+	if rl := resp.GetResourceLimits(); rl != nil {
+		actualVcpu = rl.GetVcpuCount()
+		actualMemMiB = rl.GetMemoryMib()
+	}
+	return resp.IpAddress, actualVcpu, actualMemMiB, nil
 }
 
 func (c *grpcVMDClient) ExecCommand(ctx context.Context, vmID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
@@ -246,91 +255,6 @@ func (c *grpcVMDClient) ExecCommandStream(ctx context.Context, vmID, command str
 			return nil
 		}
 	}
-}
-
-func (c *grpcVMDClient) UploadFile(ctx context.Context, vmID, path string, content io.Reader) (int64, error) {
-	stream, err := c.client.UploadFile(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("gRPC UploadFile: %w", err)
-	}
-
-	buf := make([]byte, 64*1024)
-	first := true
-	for {
-		n, readErr := content.Read(buf)
-		if n > 0 || first {
-			msg := &vmdpb.UploadFileRequest{Data: buf[:n]}
-			if first {
-				msg.VmId = vmID
-				msg.Path = path
-				first = false
-			}
-			if err := stream.Send(msg); err != nil {
-				return 0, fmt.Errorf("gRPC UploadFile send: %w", err)
-			}
-		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				return 0, fmt.Errorf("gRPC UploadFile read content: %w", readErr)
-			}
-			break
-		}
-	}
-
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return 0, fmt.Errorf("gRPC UploadFile close: %w", err)
-	}
-	return resp.BytesWritten, nil
-}
-
-func (c *grpcVMDClient) DownloadFile(ctx context.Context, vmID, path string) (io.ReadCloser, error) {
-	streamCtx, streamCancel := context.WithCancel(ctx)
-
-	stream, err := c.client.DownloadFile(streamCtx, &vmdpb.DownloadFileRequest{
-		VmId: vmID,
-		Path: path,
-	})
-	if err != nil {
-		streamCancel()
-		return nil, fmt.Errorf("gRPC DownloadFile: %w", err)
-	}
-
-	first, err := stream.Recv()
-	if err != nil {
-		streamCancel()
-		if err == io.EOF {
-			return io.NopCloser(strings.NewReader("")), nil
-		}
-		return nil, fmt.Errorf("gRPC DownloadFile: %w", err)
-	}
-
-	pr, pw := io.Pipe()
-	go func() {
-		defer pw.Close()
-		defer streamCancel()
-		if len(first.Data) > 0 {
-			if _, err := pw.Write(first.Data); err != nil {
-				return
-			}
-		}
-		for {
-			resp, err := stream.Recv()
-			if err != nil {
-				if err != io.EOF {
-					pw.CloseWithError(fmt.Errorf("gRPC DownloadFile recv: %w", err))
-				}
-				return
-			}
-			if len(resp.Data) > 0 {
-				if _, err := pw.Write(resp.Data); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	return pr, nil
 }
 
 func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {

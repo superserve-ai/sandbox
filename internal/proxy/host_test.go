@@ -13,40 +13,53 @@ func TestParseHost(t *testing.T) {
 		wantInstanceID string
 		wantErr        bool
 	}{
-		// Happy path
+		// Happy path — boxd label maps to boxdPort
 		{
-			host:           "49983-abc123.sandbox.superserve.ai",
-			wantPort:       49983,
+			host:           "boxd-abc123.sandbox.superserve.ai",
+			wantPort:       boxdPort,
 			wantInstanceID: "abc123",
 		},
+		{
+			host:           "boxd-abc123.sandbox.superserve.ai:443",
+			wantPort:       boxdPort,
+			wantInstanceID: "abc123",
+		},
+		// UUID-style instance IDs (our actual format)
+		{
+			host:           "boxd-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
+			wantPort:       boxdPort,
+			wantInstanceID: "b150ee22-4956-4f5b-926a-f921ed8c37d6",
+		},
+		// User application ports — numeric label
 		{
 			host:           "3000-mybox.sandbox.superserve.ai",
 			wantPort:       3000,
 			wantInstanceID: "mybox",
 		},
 		{
-			host:           "49983-abc123.sandbox.superserve.ai:443",
-			wantPort:       49983,
-			wantInstanceID: "abc123",
-		},
-		// UUID-style instance IDs (our actual format)
-		{
-			host:           "49983-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
-			wantPort:       49983,
+			host:           "8080-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
+			wantPort:       8080,
 			wantInstanceID: "b150ee22-4956-4f5b-926a-f921ed8c37d6",
+		},
+
+		// Boxd's numeric port is intentionally refused — the only way
+		// to reach boxd is via the "boxd" label.
+		{
+			host:    "49983-abc.sandbox.superserve.ai",
+			wantErr: true,
 		},
 
 		// Domain suffix validation
 		{
-			host:    "49983-abc.attacker.com",
+			host:    "boxd-abc.attacker.com",
 			wantErr: true,
 		},
 		{
-			host:    "49983-abc.evil.sandbox.superserve.ai.attacker.com",
+			host:    "boxd-abc.evil.sandbox.superserve.ai.attacker.com",
 			wantErr: true,
 		},
 		{
-			host:    "49983-abc", // no domain at all
+			host:    "boxd-abc", // no domain at all
 			wantErr: true,
 		},
 
@@ -76,7 +89,7 @@ func TestParseHost(t *testing.T) {
 
 		// Empty instance ID
 		{
-			host:    "49983-.sandbox.superserve.ai",
+			host:    "boxd-.sandbox.superserve.ai",
 			wantErr: true,
 		},
 

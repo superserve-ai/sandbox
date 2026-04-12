@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/netip"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -24,14 +24,12 @@ import (
 // VMDClient defines the subset of the VM daemon gRPC interface used by the
 // control plane. This is satisfied by the gRPC adapter in cmd/controlplane.
 type VMDClient interface {
-	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (ipAddress string, err error)
+	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, err error)
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
-	UploadFile(ctx context.Context, instanceID, path string, content io.Reader) (int64, error)
-	DownloadFile(ctx context.Context, instanceID, path string) (io.ReadCloser, error)
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
@@ -138,7 +136,7 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 		case db.SandboxStatusIdle:
 			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 			defer vmdCancel()
-			if _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
+			if _, _, _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -236,248 +234,8 @@ func (h *Handlers) Health(c *gin.Context) {
 }
 
 // ---------------------------------------------------------------------------
-// Instance CRUD
-// ---------------------------------------------------------------------------
-
-type createInstanceRequest struct {
-	Name string `json:"name" binding:"required,min=1,max=64"`
-}
-
-func (h *Handlers) CreateInstance(c *gin.Context) {
-	var req createInstanceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	instanceID := uuid.New().String()
-
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	_, err := h.VMD.CreateInstance(vmdCtx, instanceID, 0, 0, 0, nil)
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID).Msg("VMD CreateInstance failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	c.JSON(http.StatusCreated, gin.H{
-		"id":     instanceID,
-		"name":   req.Name,
-		"status": "RUNNING",
-	})
-}
-
-func (h *Handlers) GetInstance(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	// TODO: when DB is added, look up instance state from DB.
-	// For now, query VMD directly.
-	respondErrorMsg(c, "not_implemented", fmt.Sprintf("GetInstance %s — requires DB (not yet connected)", instanceID), http.StatusNotImplemented)
-}
-
-func (h *Handlers) ListInstances(c *gin.Context) {
-	// TODO: when DB is added, list from DB.
-	respondErrorMsg(c, "not_implemented", "ListInstances — requires DB (not yet connected)", http.StatusNotImplemented)
-}
-
-func (h *Handlers) DeleteInstance(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	if err := h.VMD.DestroyInstance(vmdCtx, instanceID.String(), true); err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("VMD DestroyInstance failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	c.Status(http.StatusNoContent)
-}
-
-// ---------------------------------------------------------------------------
-// Pause / Resume
-// ---------------------------------------------------------------------------
-
-func (h *Handlers) PauseInstance(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	_, _, err = h.VMD.PauseInstance(vmdCtx, instanceID.String(), "")
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("VMD PauseInstance failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"id":     instanceID.String(),
-		"status": "PAUSED",
-	})
-}
-
-func (h *Handlers) ResumeInstance(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	// TODO: when DB is added, read snapshot paths from DB.
-	// For now, pass empty paths — VMD uses its default.
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	ipAddress, err := h.VMD.ResumeInstance(vmdCtx, instanceID.String(), "", "")
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("VMD ResumeInstance failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"id":         instanceID.String(),
-		"status":     "RUNNING",
-		"ip_address": ipAddress,
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Exec
-// ---------------------------------------------------------------------------
-
-type execRequest struct {
-	Command    string            `json:"command" binding:"required,min=1"`
-	Args       []string          `json:"args"`
-	Env        map[string]string `json:"env"`
-	WorkingDir string            `json:"working_dir"`
-	TimeoutS   int               `json:"timeout_s"`
-}
-
-func (h *Handlers) ExecCommand(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	var req execRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	if req.TimeoutS <= 0 {
-		req.TimeoutS = 30
-	}
-
-	stdout, stderr, exitCode, err := h.VMD.ExecCommand(c.Request.Context(), instanceID.String(),
-		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS))
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("VMD ExecCommand failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"stdout":    stdout,
-		"stderr":    stderr,
-		"exit_code": exitCode,
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Files
-// ---------------------------------------------------------------------------
-
-func (h *Handlers) UploadFile(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	bytesWritten, err := h.VMD.UploadFile(c.Request.Context(), instanceID.String(), filePath, c.Request.Body)
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("file upload failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"path": filePath, "size": bytesWritten})
-}
-
-func (h *Handlers) DownloadFile(c *gin.Context) {
-	instanceID, err := parseInstanceID(c)
-	if err != nil {
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	reader, err := h.VMD.DownloadFile(c.Request.Context(), instanceID.String(), filePath)
-	if err != nil {
-		log.Error().Err(err).Str("instance_id", instanceID.String()).Msg("file download failed")
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "not found") {
-			respondErrorMsg(c, "not_found",
-				fmt.Sprintf("File not found: %s", filePath),
-				http.StatusNotFound)
-		} else {
-			respondError(c, ErrInternal)
-		}
-		return
-	}
-	defer reader.Close()
-
-	c.Header("Content-Type", "application/octet-stream")
-	c.Status(http.StatusOK)
-	io.Copy(c.Writer, reader)
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-func cleanFilePath(raw string) (string, error) {
-	raw = strings.TrimPrefix(raw, "/")
-	if raw == "" {
-		return "", fmt.Errorf("file path is required")
-	}
-	if strings.Contains(raw, "..") {
-		return "", fmt.Errorf("path traversal not allowed")
-	}
-	cleaned := filepath.Clean("/" + raw)
-	return cleaned, nil
-}
-
-func parseInstanceID(c *gin.Context) (uuid.UUID, error) {
-	raw := c.Param("instance_id")
-	id, err := uuid.Parse(raw)
-	if err != nil {
-		respondErrorMsg(c, "bad_request",
-			fmt.Sprintf("Invalid instance_id: %q is not a valid UUID", raw),
-			http.StatusBadRequest)
-		return uuid.Nil, err
-	}
-	return id, nil
-}
 
 func parseSandboxID(c *gin.Context) (uuid.UUID, error) {
 	raw := c.Param("sandbox_id")
@@ -563,7 +321,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	// context — if the client hangs up mid-resume, abort the VMD call.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+	ipAddress, actualVcpu, actualMemMiB, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
 		respondError(c, ErrInternal)
@@ -577,26 +335,20 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Update sandbox status to active.
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sandboxID,
-		Status: db.SandboxStatusActive,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus failed")
-		respondError(c, ErrInternal)
-		return
+	var ipAddr *netip.Addr
+	if ipAddress != "" {
+		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
+			ipAddr = &addr
+		}
 	}
-
-	// Update host runtime info.
-	ipAddr, _ := netip.ParseAddr(ipAddress)
-	if err := h.DB.UpdateSandboxHost(postCtx, db.UpdateSandboxHostParams{
+	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
 		ID:        sandboxID,
-		HostID:    sandbox.HostID,
-		IpAddress: &ipAddr,
+		VcpuCount: int32(actualVcpu),
+		MemoryMib: int32(actualMemMiB),
+		IpAddress: ipAddr,
 		TeamID:    teamID,
 	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxHost failed")
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -613,12 +365,11 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	h.updateLastActivityAsync(c.Request.Context(), sandboxID, teamID)
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
-	c.JSON(http.StatusOK, gin.H{
-		"id":         sandboxID.String(),
-		"name":       sandbox.Name,
-		"status":     "active",
-		"ip_address": ipAddress,
-	})
+	sandbox.Status = db.SandboxStatusActive
+	sandbox.VcpuCount = int32(actualVcpu)
+	sandbox.MemoryMib = int32(actualMemMiB)
+	sandbox.IpAddress = ipAddr
+	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
 }
 
 // ---------------------------------------------------------------------------
@@ -723,19 +474,20 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID           `json:"id"`
-	Name           string              `json:"name"`
-	Status         string              `json:"status"`
-	VcpuCount      int32               `json:"vcpu_count"`
-	MemoryMib      int32               `json:"memory_mib"`
-	SnapshotID     *uuid.UUID          `json:"snapshot_id,omitempty"`
-	CreatedAt      time.Time           `json:"created_at"`
-	TimeoutSeconds *int32              `json:"timeout_seconds,omitempty"`
+	ID             uuid.UUID             `json:"id"`
+	Name           string                `json:"name"`
+	Status         string                `json:"status"`
+	VcpuCount      int32                 `json:"vcpu_count"`
+	MemoryMib      int32                 `json:"memory_mib"`
+	AccessToken    string                `json:"access_token,omitempty"`
+	SnapshotID     *uuid.UUID            `json:"snapshot_id,omitempty"`
+	CreatedAt      time.Time             `json:"created_at"`
+	TimeoutSeconds *int32                `json:"timeout_seconds,omitempty"`
 	Network        *networkConfigRequest `json:"network,omitempty"`
-	Metadata       map[string]string   `json:"metadata"`
+	Metadata       map[string]string     `json:"metadata"`
 }
 
-func sandboxToResponse(s db.Sandbox) sandboxResponse {
+func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
 		ID:        s.ID,
 		Name:      s.Name,
@@ -744,6 +496,9 @@ func sandboxToResponse(s db.Sandbox) sandboxResponse {
 		MemoryMib: s.MemoryMib,
 		CreatedAt: s.CreatedAt,
 		Metadata:  decodeMetadata(s.Metadata),
+	}
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
 	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
@@ -838,7 +593,9 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
-		out[i] = sandboxToResponse(s)
+		r := h.sandboxToResponse(s)
+		r.AccessToken = ""
+		out[i] = r
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -901,7 +658,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, sandboxToResponse(sandbox))
+	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
@@ -991,20 +748,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		snapshotMemPath = filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
 	}
 
-	// Default template resources (1 vCPU, 512 MiB).
-	const defaultVcpu int32 = 1
-	const defaultMemoryMib int32 = 512
-
-	// Insert sandbox with status=starting. timeout_seconds is optional —
-	// NULL means the sandbox lives until explicitly paused or deleted.
-	// metadata is always non-NULL (empty object when the user provided none)
-	// to match the DB column constraint and keep read paths nil-free.
+	// Insert sandbox with status=starting. VcpuCount and MemoryMib use
+	// minimal placeholders (1) to satisfy the DB CHECK constraint. The
+	// real values come from VMD's CreateVMResponse and are written by
+	// ActivateSandbox once the VM boots.
 	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
 		TeamID:         teamID,
 		Name:           req.Name,
 		Status:         db.SandboxStatusStarting,
-		VcpuCount:      defaultVcpu,
-		MemoryMib:      defaultMemoryMib,
+		VcpuCount:      1,
+		MemoryMib:      1,
 		SnapshotID:     snapshotID,
 		TimeoutSeconds: req.TimeoutSeconds,
 		Metadata:       metadataJSON,
@@ -1023,12 +776,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	defer vmdCancel()
 
 	var ipAddress string
+	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromSnapshot != nil {
-		ipAddress, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
 	} else {
-		ipAddress, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
-			uint32(defaultVcpu), uint32(defaultMemoryMib), 0, nil)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
+			0, 0, 0, nil)
 	}
 	if vmdErr != nil {
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
@@ -1053,26 +807,29 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Mark active in DB.
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sandbox.ID,
-		Status: db.SandboxStatusActive,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxStatus(active) failed")
-	}
-
-	// Persist the VM's assigned IP. host_id and pid are not tracked yet.
+	// Single atomic transition: starting → active with real resources
+	// and IP. VMD's response is the source of truth for vcpu/memory
+	// (they come from the template snapshot, not from what the control
+	// plane requested).
+	var ipAddr *netip.Addr
 	if ipAddress != "" {
 		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
-			if err := h.DB.UpdateSandboxHost(postCtx, db.UpdateSandboxHostParams{
-				ID:        sandbox.ID,
-				IpAddress: &addr,
-				TeamID:    teamID,
-			}); err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxHost failed")
-			}
+			ipAddr = &addr
 		}
+	}
+	sandbox.Status = db.SandboxStatusActive
+	sandbox.VcpuCount = int32(actualVcpu)
+	sandbox.MemoryMib = int32(actualMemMiB)
+	sandbox.IpAddress = ipAddr
+
+	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
+		ID:        sandbox.ID,
+		VcpuCount: int32(actualVcpu),
+		MemoryMib: int32(actualMemMiB),
+		IpAddress: ipAddr,
+		TeamID:    teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 	}
 
 	// Apply network rules if provided at creation.
@@ -1106,12 +863,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
-	// Build the response from the freshly-inserted row so metadata, IP, and
-	// any other server-populated fields make it back to the client without
-	// having to re-read the row. The row's status is still "starting" from
-	// the INSERT — overwrite it with "active" since we just transitioned.
-	resp := sandboxToResponse(sandbox)
-	resp.Status = string(db.SandboxStatusActive)
+	sandbox.Status = db.SandboxStatusActive
+	resp := h.sandboxToResponse(sandbox)
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
@@ -1253,74 +1006,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		"status":      "idle",
 		"snapshot_id": snapshot.ID.String(),
 	})
-}
-
-// ---------------------------------------------------------------------------
-// Sandbox Files
-// ---------------------------------------------------------------------------
-
-// UploadSandboxFile uploads a file to a sandbox. The sandbox is loaded and
-// auto-woken by the AutoWake middleware.
-func (h *Handlers) UploadSandboxFile(c *gin.Context) {
-	sandbox := sandboxFromContext(c)
-	if sandbox == nil {
-		respondError(c, ErrInternal)
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	bytesWritten, err := h.VMD.UploadFile(c.Request.Context(), sandbox.ID.String(), filePath, c.Request.Body)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("sandbox file upload failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
-
-	c.JSON(http.StatusOK, gin.H{"path": filePath, "size": bytesWritten})
-}
-
-// DownloadSandboxFile downloads a file from a sandbox. The sandbox is loaded
-// and auto-woken by the AutoWake middleware.
-func (h *Handlers) DownloadSandboxFile(c *gin.Context) {
-	sandbox := sandboxFromContext(c)
-	if sandbox == nil {
-		respondError(c, ErrInternal)
-		return
-	}
-
-	filePath, err := cleanFilePath(c.Param("path"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	reader, err := h.VMD.DownloadFile(c.Request.Context(), sandbox.ID.String(), filePath)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("sandbox file download failed")
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "not found") {
-			respondErrorMsg(c, "not_found",
-				fmt.Sprintf("File not found: %s", filePath),
-				http.StatusNotFound)
-		} else {
-			respondError(c, ErrInternal)
-		}
-		return
-	}
-	defer reader.Close()
-
-	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
-
-	c.Header("Content-Type", "application/octet-stream")
-	c.Status(http.StatusOK)
-	io.Copy(c.Writer, reader)
 }
 
 // ---------------------------------------------------------------------------

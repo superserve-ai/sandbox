@@ -53,6 +53,9 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
+          TERMINAL_ALLOWED_ORIGINS: ${{ vars.TERMINAL_ALLOWED_ORIGINS_STAGING }}
+          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
         run: |
           python3 - <<'PYEOF'
           import os, sys, json, subprocess, textwrap
@@ -63,6 +66,25 @@ jobs:
           service     = os.environ.get('VMD_SERVICE', 'vmd')
           install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
           sha         = os.environ['SHA'][:8]
+          import re as _re
+          # HMAC seed for per-sandbox access tokens. Hex-encoded, >= 32 bytes.
+          # Shared with the control plane. Lives in GitHub secrets (sensitive).
+          access_seed = os.environ.get('SANDBOX_ACCESS_TOKEN_SEED', '')
+          if access_seed:
+              # Mask the seed so GitHub Actions redacts it from all log output.
+              print(f'::add-mask::{access_seed}')
+          if access_seed and not _re.fullmatch(r'[0-9a-fA-F]{64,}', access_seed):
+              print('ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)', file=sys.stderr)
+              sys.exit(1)
+          # Allowed browser origins for the WS terminal upgrade.
+          terminal_origins = os.environ.get('TERMINAL_ALLOWED_ORIGINS', '')
+          if terminal_origins and not _re.fullmatch(r'[A-Za-z0-9.,:/*\-]+', terminal_origins):
+              print('ERROR: TERMINAL_ALLOWED_ORIGINS contains disallowed characters', file=sys.stderr)
+              sys.exit(1)
+          require_data_plane = os.environ.get('REQUIRE_DATA_PLANE', '')
+          if require_data_plane not in ('', '0', '1'):
+              print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
+              sys.exit(1)
 
           # Discover instances by label.
           result = subprocess.run([
@@ -192,6 +214,19 @@ jobs:
                   sudo systemctl daemon-reload
                   sudo systemctl enable proxy
 
+                  # Write the proxy env file. The seed is passed via
+                  # _PROXY_SEED env var (set on the ssh command) to avoid
+                  # embedding it in the script string where it could be logged.
+                  sudo mkdir -p /etc/superserve
+                  if [ -n "$_PROXY_SEED" ]; then
+                      sudo tee /etc/superserve/proxy.env > /dev/null <<PROXYENV
+                  SANDBOX_ACCESS_TOKEN_SEED=$_PROXY_SEED
+                  TERMINAL_ALLOWED_ORIGINS={terminal_origins}
+                  REQUIRE_DATA_PLANE={require_data_plane}
+                  PROXYENV
+                      sudo chmod 0600 /etc/superserve/proxy.env
+                  fi
+
                   sudo systemctl restart proxy
                   sleep 3
                   sudo systemctl is-active --quiet proxy || (
@@ -201,11 +236,13 @@ jobs:
                       exit 1
                   )
               ''')
+              import shlex
+              full_script = f'export _PROXY_SEED={shlex.quote(access_seed)}\n{inject_script}'
               r = subprocess.run([
                   'gcloud', 'compute', 'ssh', name,
                   f'--zone={zone}', f'--project={project}',
                   '--quiet', '--tunnel-through-iap',
-                  '--command', inject_script,
+                  '--command', full_script,
               ], capture_output=True, text=True)
               if r.returncode != 0:
                   # Surface both stdout and stderr so deploy failures are

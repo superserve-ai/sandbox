@@ -33,6 +33,15 @@ UPDATE sandbox
 SET host_id = $2, ip_address = $3, pid = $4, updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 
+-- name: ActivateSandbox :exec
+UPDATE sandbox
+SET status = 'active',
+    vcpu_count = $2,
+    memory_mib = $3,
+    ip_address = $4,
+    updated_at = now()
+WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
+
 -- name: UpdateSandboxLastActivity :exec
 UPDATE sandbox
 SET last_activity_at = now(), updated_at = now()

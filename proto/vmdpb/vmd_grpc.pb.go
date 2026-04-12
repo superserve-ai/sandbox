@@ -28,8 +28,6 @@ const (
 	VMDaemon_ExecCommand_FullMethodName          = "/superserve.vmd.v1.VMDaemon/ExecCommand"
 	VMDaemon_GetVMInfo_FullMethodName            = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
 	VMDaemon_SetupNetwork_FullMethodName         = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
-	VMDaemon_UploadFile_FullMethodName           = "/superserve.vmd.v1.VMDaemon/UploadFile"
-	VMDaemon_DownloadFile_FullMethodName         = "/superserve.vmd.v1.VMDaemon/DownloadFile"
 	VMDaemon_UpdateSandboxNetwork_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
 )
 
@@ -57,10 +55,6 @@ type VMDaemonClient interface {
 	GetVMInfo(ctx context.Context, in *GetVMInfoRequest, opts ...grpc.CallOption) (*GetVMInfoResponse, error)
 	// SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
 	SetupNetwork(ctx context.Context, in *SetupNetworkRequest, opts ...grpc.CallOption) (*SetupNetworkResponse, error)
-	// UploadFile streams file content into a VM.
-	UploadFile(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadFileRequest, UploadFileResponse], error)
-	// DownloadFile streams file content out of a VM.
-	DownloadFile(ctx context.Context, in *DownloadFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DownloadFileChunk], error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error)
 }
@@ -172,38 +166,6 @@ func (c *vMDaemonClient) SetupNetwork(ctx context.Context, in *SetupNetworkReque
 	return out, nil
 }
 
-func (c *vMDaemonClient) UploadFile(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadFileRequest, UploadFileResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[1], VMDaemon_UploadFile_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[UploadFileRequest, UploadFileResponse]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type VMDaemon_UploadFileClient = grpc.ClientStreamingClient[UploadFileRequest, UploadFileResponse]
-
-func (c *vMDaemonClient) DownloadFile(ctx context.Context, in *DownloadFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DownloadFileChunk], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[2], VMDaemon_DownloadFile_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[DownloadFileRequest, DownloadFileChunk]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type VMDaemon_DownloadFileClient = grpc.ServerStreamingClient[DownloadFileChunk]
-
 func (c *vMDaemonClient) UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(UpdateSandboxNetworkResponse)
@@ -238,10 +200,6 @@ type VMDaemonServer interface {
 	GetVMInfo(context.Context, *GetVMInfoRequest) (*GetVMInfoResponse, error)
 	// SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
 	SetupNetwork(context.Context, *SetupNetworkRequest) (*SetupNetworkResponse, error)
-	// UploadFile streams file content into a VM.
-	UploadFile(grpc.ClientStreamingServer[UploadFileRequest, UploadFileResponse]) error
-	// DownloadFile streams file content out of a VM.
-	DownloadFile(*DownloadFileRequest, grpc.ServerStreamingServer[DownloadFileChunk]) error
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error)
 	mustEmbedUnimplementedVMDaemonServer()
@@ -280,12 +238,6 @@ func (UnimplementedVMDaemonServer) GetVMInfo(context.Context, *GetVMInfoRequest)
 }
 func (UnimplementedVMDaemonServer) SetupNetwork(context.Context, *SetupNetworkRequest) (*SetupNetworkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetupNetwork not implemented")
-}
-func (UnimplementedVMDaemonServer) UploadFile(grpc.ClientStreamingServer[UploadFileRequest, UploadFileResponse]) error {
-	return status.Error(codes.Unimplemented, "method UploadFile not implemented")
-}
-func (UnimplementedVMDaemonServer) DownloadFile(*DownloadFileRequest, grpc.ServerStreamingServer[DownloadFileChunk]) error {
-	return status.Error(codes.Unimplemented, "method DownloadFile not implemented")
 }
 func (UnimplementedVMDaemonServer) UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateSandboxNetwork not implemented")
@@ -466,24 +418,6 @@ func _VMDaemon_SetupNetwork_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VMDaemon_UploadFile_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(VMDaemonServer).UploadFile(&grpc.GenericServerStream[UploadFileRequest, UploadFileResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type VMDaemon_UploadFileServer = grpc.ClientStreamingServer[UploadFileRequest, UploadFileResponse]
-
-func _VMDaemon_DownloadFile_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(DownloadFileRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(VMDaemonServer).DownloadFile(m, &grpc.GenericServerStream[DownloadFileRequest, DownloadFileChunk]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type VMDaemon_DownloadFileServer = grpc.ServerStreamingServer[DownloadFileChunk]
-
 func _VMDaemon_UpdateSandboxNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpdateSandboxNetworkRequest)
 	if err := dec(in); err != nil {
@@ -550,16 +484,6 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ExecCommand",
 			Handler:       _VMDaemon_ExecCommand_Handler,
-			ServerStreams: true,
-		},
-		{
-			StreamName:    "UploadFile",
-			Handler:       _VMDaemon_UploadFile_Handler,
-			ClientStreams: true,
-		},
-		{
-			StreamName:    "DownloadFile",
-			Handler:       _VMDaemon_DownloadFile_Handler,
 			ServerStreams: true,
 		},
 	},

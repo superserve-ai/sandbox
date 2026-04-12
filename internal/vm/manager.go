@@ -3,7 +3,6 @@ package vm
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,6 +112,8 @@ type TemplateSnapshot struct {
 	MemFilePath  string // e.g., snapshots/template/mem.snap
 	DiskPath     string // e.g., rundir/template/rootfs.ext4
 	RunDir       string // e.g., rundir/template/
+	VCPUCount    uint32 // actual vCPU count baked into the snapshot
+	MemSizeMiB   uint32 // actual RAM in MiB baked into the snapshot
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +208,8 @@ func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
 		MemFilePath:  memPath,
 		DiskPath:     diskPath,
 		RunDir:       m.templateRunDir(),
+		VCPUCount:    inst.Config.VCPU,
+		MemSizeMiB:   inst.Config.MemoryMiB,
 	}
 
 	log.Info().
@@ -267,9 +270,8 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		Metadata:  metadata,
 		RunDirID:  rundirID,
 		Config: VMConfig{
-			VCPU:        vcpu,
-			MemoryMiB:   memMiB,
-			DiskSizeMiB: diskMiB,
+			VCPU:      m.defaultTemplate.VCPUCount,
+			MemoryMiB: m.defaultTemplate.MemSizeMiB,
 		},
 	}
 	m.vms[vmID] = inst
@@ -366,7 +368,7 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		RunDirID:  vmID,
 		Config: VMConfig{
 			VCPU:       1,
-			MemoryMiB:  512,
+			MemoryMiB:  1024,
 			KernelPath: m.cfg.KernelPath,
 			RootfsPath: m.cfg.BaseRootfsPath,
 		},
@@ -832,26 +834,9 @@ func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, t
 }
 
 // ---------------------------------------------------------------------------
-// File operations (raw HTTP to boxd for content, Connect RPC for metadata)
+// File operations (Connect RPC for metadata only; byte transfer lives
+// on the edge proxy's /files endpoint.)
 // ---------------------------------------------------------------------------
-
-// UploadFile writes content to a file inside a running VM.
-func (m *Manager) UploadFile(ctx context.Context, vmID, filePath string, content io.Reader) (int64, error) {
-	vmIP, err := m.getRunningVMIP(vmID)
-	if err != nil {
-		return 0, err
-	}
-	return uploadFile(ctx, vmIP, filePath, content)
-}
-
-// DownloadFile reads a file from inside a running VM.
-func (m *Manager) DownloadFile(ctx context.Context, vmID, filePath string) (io.ReadCloser, error) {
-	vmIP, err := m.getRunningVMIP(vmID)
-	if err != nil {
-		return nil, err
-	}
-	return downloadFile(ctx, vmIP, filePath)
-}
 
 // DeleteFile removes a file or directory inside a running VM via Connect RPC.
 func (m *Manager) DeleteFile(ctx context.Context, vmID, filePath string) error {
