@@ -7,11 +7,13 @@ on:
     paths:
       - 'cmd/vmd/**'
       - 'cmd/boxd/**'
-      - 'cmd/proxy/**'
       - 'internal/vm/**'
       - 'internal/network/**'
-      - 'internal/proxy/**'
-      - 'deploy/proxy.service'
+      - 'deploy/superserve-vmd.service'
+      - 'deploy/firecracker@.service'
+      - 'deploy/firecracker-netns@.service'
+      - 'deploy/sandboxes.slice'
+      - 'scripts/fc-cleanup'
 
 jobs:
   deploy:
@@ -35,7 +37,6 @@ jobs:
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/vmd ./cmd/vmd
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/boxd ./cmd/boxd
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -53,37 +54,17 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
-          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
-          TERMINAL_ALLOWED_ORIGINS: ${{ vars.TERMINAL_ALLOWED_ORIGINS_STAGING }}
-          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
         run: |
           python3 - <<'PYEOF'
-          import os, sys, json, subprocess, textwrap
+          import os, sys, subprocess, textwrap
           from concurrent.futures import ThreadPoolExecutor, as_completed
 
           project     = os.environ['GCP_PROJECT']
           label       = os.environ.get('VMD_LABEL', 'component=vmd')
-          service     = os.environ.get('VMD_SERVICE', 'vmd')
+          service     = os.environ.get('VMD_SERVICE', 'superserve-vmd')
           install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
           sha         = os.environ['SHA'][:8]
-          import re as _re
-          # HMAC seed for per-sandbox access tokens. Hex-encoded, >= 32 bytes.
-          # Shared with the control plane. Lives in GitHub secrets (sensitive).
-          access_seed = os.environ.get('SANDBOX_ACCESS_TOKEN_SEED', '')
-          if access_seed and not _re.fullmatch(r'[0-9a-fA-F]{64,}', access_seed):
-              print('ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)', file=sys.stderr)
-              sys.exit(1)
-          # Allowed browser origins for the WS terminal upgrade.
-          terminal_origins = os.environ.get('TERMINAL_ALLOWED_ORIGINS', '')
-          if terminal_origins and not _re.fullmatch(r'[A-Za-z0-9.,:/*\-]+', terminal_origins):
-              print('ERROR: TERMINAL_ALLOWED_ORIGINS contains disallowed characters', file=sys.stderr)
-              sys.exit(1)
-          require_data_plane = os.environ.get('REQUIRE_DATA_PLANE', '')
-          if require_data_plane not in ('', '0', '1'):
-              print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
-              sys.exit(1)
 
-          # Discover instances by label.
           result = subprocess.run([
               'gcloud', 'compute', 'instances', 'list',
               f'--project={project}',
@@ -102,68 +83,54 @@ jobs:
               print(f'No instances with label {label} found in {project}', file=sys.stderr)
               sys.exit(1)
 
-          print(f'Deploying to {len(instances)} instance(s)')
+          print(f'Deploying VMD to {len(instances)} instance(s)')
 
           def deploy(inst):
               name, zone = inst['name'], inst['zone']
               tag = f'{name}/{zone}'
-
-              for binary in ('vmd', 'boxd', 'proxy'):
-                  subprocess.run([
-                      'gcloud', 'compute', 'scp',
-                      f'bin/{binary}',
-                      f'{name}:/tmp/{binary}-{sha}',
-                      f'--zone={zone}',
-                      f'--project={project}',
-                      '--quiet',
-                      '--tunnel-through-iap',
-                  ], check=True, capture_output=True)
-              subprocess.run([
-                  'gcloud', 'compute', 'scp',
-                  'deploy/proxy.service',
-                  f'{name}:/tmp/proxy.service',
-                  f'--zone={zone}',
-                  f'--project={project}',
-                  '--quiet',
-                  '--tunnel-through-iap',
+              scp = lambda src, dst: subprocess.run([
+                  'gcloud', 'compute', 'scp', src, f'{name}:{dst}',
+                  f'--zone={zone}', f'--project={project}',
+                  '--quiet', '--tunnel-through-iap',
               ], check=True, capture_output=True)
-              print(f'[{tag}] binaries uploaded')
 
-              # Inject updated boxd into the base rootfs atomically:
-              #   1. copy ROOTFS -> ROOTFS.new on the same filesystem
-              #   2. mount the copy, cp boxd into it, umount
-              #   3. mv ROOTFS.new -> ROOTFS (rename is atomic on POSIX)
-              # The original rootfs is untouched until the final rename, so a
-              # failure at any earlier step leaves the system in its
-              # previous working state. The trap ensures we clean up any
-              # staging file/mount on failure.
-              #
-              # textwrap.dedent is used so we can keep the script indented
-              # consistently with the enclosing Python code (which YAML
-              # requires) without leaking that indentation into the shell.
-              # NOTE on braces: GitHub Actions scans the YAML for its own
-              # expression syntax (dollar-double-brace) EVERYWHERE in the
-              # file, including inside Python heredocs and string literals.
-              # We cannot use doubled curly braces in f-strings here because
-              # the raw YAML characters would get parsed as a GitHub
-              # expression and fail with "Unrecognized named-value: ROOTFS".
-              # Workaround: use $ROOTFS / $STAGING without curly braces.
-              # Bash terminates variable names at non-identifier chars
-              # (dot, space, slash), so $ROOTFS.new.$$ works identically.
-              # The cleanup callback is inlined into trap so we avoid any
-              # standalone curly-brace pairs from a bash function body.
+              # Upload binaries
+              scp('bin/vmd', f'/tmp/vmd-{sha}')
+              scp('bin/boxd', f'/tmp/boxd-{sha}')
+
+              # Upload systemd units and helper scripts
+              scp('deploy/superserve-vmd.service', '/tmp/superserve-vmd.service')
+              scp('deploy/firecracker@.service', '/tmp/firecracker@.service')
+              scp('deploy/firecracker-netns@.service', '/tmp/firecracker-netns@.service')
+              scp('deploy/sandboxes.slice', '/tmp/sandboxes.slice')
+              scp('scripts/fc-cleanup', '/tmp/fc-cleanup')
+              print(f'[{tag}] files uploaded')
+
               inject_script = textwrap.dedent(f'''
                   set -euo pipefail
 
+                  # Install binaries
                   sudo mv /tmp/vmd-{sha}  {install_dir}/vmd
                   sudo mv /tmp/boxd-{sha} {install_dir}/boxd
                   sudo chmod +x {install_dir}/vmd {install_dir}/boxd
 
-                  # Resolve the base rootfs path from whichever env file is
-                  # present. We cannot use `grep -s ... file1 file2` because
-                  # grep exits with 2 when ANY listed file is missing (even
-                  # with -s), and `set -euo pipefail` treats that as a fatal
-                  # error via the pipeline. Enumerate candidate files safely.
+                  # Install systemd units
+                  sudo mv /tmp/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
+                  sudo mv /tmp/firecracker@.service /etc/systemd/system/firecracker@.service
+                  sudo mv /tmp/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
+                  sudo mv /tmp/sandboxes.slice /etc/systemd/system/sandboxes.slice
+                  sudo systemctl daemon-reload
+
+                  # Install helper scripts
+                  sudo mv /tmp/fc-cleanup {install_dir}/fc-cleanup
+                  sudo chmod +x {install_dir}/fc-cleanup
+
+                  # Ensure required directories
+                  sudo mkdir -p /var/lib/sandbox/rundir
+                  sudo mkdir -p /var/lib/sandbox/snapshots
+                  sudo mkdir -p /var/lib/sandbox/logs
+
+                  # Inject updated boxd into the base rootfs atomically
                   ROOTFS=""
                   for env_file in /etc/superserve/vmd.env /etc/agentbox/vmd.env; do
                       if [ -f "$env_file" ]; then
@@ -193,41 +160,13 @@ jobs:
                       echo "WARNING: BASE_ROOTFS_PATH not found or not readable; skipping rootfs inject"
                   fi
 
+                  # Restart VMD only. Proxy is NOT restarted — it has its own pipeline.
                   sudo systemctl restart {service}
                   sleep 3
                   sudo systemctl is-active --quiet {service} || (
                       echo "ERROR: {service} failed to become active after restart" >&2
                       sudo systemctl status --no-pager {service} >&2 || true
                       sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                      exit 1
-                  )
-
-                  # Deploy proxy binary and service
-                  sudo mv /tmp/proxy-{sha} {install_dir}/proxy
-                  sudo chmod +x {install_dir}/proxy
-
-                  # Install or update the systemd service file
-                  sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
-                  sudo systemctl daemon-reload
-                  sudo systemctl enable proxy
-
-                  # Write the proxy env file. Values were validated Python-side.
-                  sudo mkdir -p /etc/superserve
-                  if [ -n "{access_seed}" ]; then
-                      sudo tee /etc/superserve/proxy.env > /dev/null <<PROXYENV
-                  SANDBOX_ACCESS_TOKEN_SEED={access_seed}
-                  TERMINAL_ALLOWED_ORIGINS={terminal_origins}
-                  REQUIRE_DATA_PLANE={require_data_plane}
-                  PROXYENV
-                      sudo chmod 0600 /etc/superserve/proxy.env
-                  fi
-
-                  sudo systemctl restart proxy
-                  sleep 3
-                  sudo systemctl is-active --quiet proxy || (
-                      echo "ERROR: proxy failed to become active after restart" >&2
-                      sudo systemctl status --no-pager proxy >&2 || true
-                      sudo journalctl -u proxy --no-pager -n 40 >&2 || true
                       exit 1
                   )
               ''')
@@ -238,11 +177,6 @@ jobs:
                   '--command', inject_script,
               ], capture_output=True, text=True)
               if r.returncode != 0:
-                  # Surface both stdout and stderr so deploy failures are
-                  # actually debuggable from the GitHub Actions log. The
-                  # inject script prints journalctl output to stderr on
-                  # service failure; silently swallowing it was a source of
-                  # long debug sessions.
                   raise RuntimeError(
                       f'service not healthy\n'
                       f'--- stdout ---\n{r.stdout}\n'
@@ -268,5 +202,5 @@ jobs:
               print(f'Deploy failed on: {", ".join(failed)}', file=sys.stderr)
               sys.exit(1)
 
-          print(f'Deployed to {len(instances)} instance(s). sha={sha}')
+          print(f'Deployed VMD to {len(instances)} instance(s). sha={sha}')
           PYEOF
