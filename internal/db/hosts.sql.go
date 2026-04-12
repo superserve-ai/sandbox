@@ -262,15 +262,34 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 	return err
 }
 
-const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :exec
+const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :one
 UPDATE host
-SET last_heartbeat_at = now(), updated_at = now()
+SET last_heartbeat_at = now(),
+    status = CASE WHEN status = 'unhealthy' THEN 'active' ELSE status END,
+    updated_at = now()
 WHERE id = $1
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
 `
 
-func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) error {
-	_, err := q.db.Exec(ctx, updateHostHeartbeat, id)
-	return err
+// Returns the host row so the caller can verify the host exists. Also
+// re-activates unhealthy hosts that resume heartbeating — this is the
+// automatic recovery path after a transient network outage.
+func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (Host, error) {
+	row := q.db.QueryRow(ctx, updateHostHeartbeat, id)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const updateHostStatus = `-- name: UpdateHostStatus :exec

@@ -17,6 +17,10 @@ const (
 
 	// detectorInterval is how often we check for stale hosts.
 	detectorInterval = 30 * time.Second
+
+	// detectorRunTimeout bounds each detection pass so a slow DB can't
+	// wedge the loop.
+	detectorRunTimeout = 15 * time.Second
 )
 
 // StartHostDetector launches a background goroutine that periodically
@@ -39,7 +43,9 @@ func StartHostDetector(ctx context.Context, queries *db.Queries) {
 			log.Info().Msg("host detector exiting")
 			return
 		case <-ticker.C:
-			detectOnce(ctx, queries)
+			runCtx, cancel := context.WithTimeout(ctx, detectorRunTimeout)
+			detectOnce(runCtx, queries)
+			cancel()
 		}
 	}
 }

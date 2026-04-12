@@ -308,6 +308,7 @@ func main() {
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
 				ControlPlaneURL: cfg.ControlPlaneURL,
 				HostID:          cfg.HostID,
+				Token:           os.Getenv("INTERNAL_API_TOKEN"),
 			}, log)
 			return nil
 		})

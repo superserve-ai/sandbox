@@ -50,10 +50,13 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 
 	r.GET("/health", h.Health)
 
-	// Internal endpoints — no API key auth, no rate limiting. These are
-	// called by infrastructure components (VMD heartbeat) and are not
-	// exposed to customers.
+	// Internal endpoints — authenticated via a shared token (not per-team
+	// API keys). Called by infrastructure components (VMD heartbeat) and
+	// not exposed to customers. The token is checked by InternalAuth
+	// middleware; if INTERNAL_API_TOKEN is unset, the middleware rejects
+	// all requests (fail-closed).
 	internal := r.Group("/internal")
+	internal.Use(InternalAuth())
 	{
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
 	}

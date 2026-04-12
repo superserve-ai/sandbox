@@ -20,10 +20,16 @@ UPDATE host
 SET status = $2, updated_at = now()
 WHERE id = $1;
 
--- name: UpdateHostHeartbeat :exec
+-- name: UpdateHostHeartbeat :one
+-- Returns the host row so the caller can verify the host exists. Also
+-- re-activates unhealthy hosts that resume heartbeating — this is the
+-- automatic recovery path after a transient network outage.
 UPDATE host
-SET last_heartbeat_at = now(), updated_at = now()
-WHERE id = $1;
+SET last_heartbeat_at = now(),
+    status = CASE WHEN status = 'unhealthy' THEN 'active' ELSE status END,
+    updated_at = now()
+WHERE id = $1
+RETURNING *;
 
 -- name: MarkHostUnhealthy :exec
 UPDATE host

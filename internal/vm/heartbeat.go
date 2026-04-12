@@ -20,6 +20,10 @@ type HeartbeatConfig struct {
 	// HostID is this host's identifier in the host table.
 	HostID string
 
+	// Token is the shared secret for authenticating internal API calls.
+	// Sent as `Authorization: Bearer <token>`.
+	Token string
+
 	// Interval is how often the heartbeat fires. Default: 30s.
 	Interval time.Duration
 }
@@ -35,6 +39,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	}
 
 	url := fmt.Sprintf("%s/internal/hosts/%s/heartbeat", cfg.ControlPlaneURL, cfg.HostID)
+	token := cfg.Token
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	log.Info().
@@ -46,7 +51,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	defer ticker.Stop()
 
 	// Fire once immediately so the host is marked alive on startup.
-	sendHeartbeat(ctx, client, url, log)
+	sendHeartbeat(ctx, client, url, token, log)
 
 	for {
 		select {
@@ -54,16 +59,19 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			log.Info().Msg("heartbeat exiting")
 			return
 		case <-ticker.C:
-			sendHeartbeat(ctx, client, url, log)
+			sendHeartbeat(ctx, client, url, token, log)
 		}
 	}
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, url string, log zerolog.Logger) {
+func sendHeartbeat(ctx context.Context, client *http.Client, url, token string, log zerolog.Logger) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create heartbeat request")
 		return
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := client.Do(req)
