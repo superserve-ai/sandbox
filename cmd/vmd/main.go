@@ -242,7 +242,6 @@ func main() {
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
-	useSystemd := os.Getenv("VMD_FC_SYSTEMD_MODE") == "1"
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin: cfg.FirecrackerBin,
 		JailerBin:      cfg.JailerBin,
@@ -250,7 +249,6 @@ func main() {
 		BaseRootfsPath: cfg.BaseRootfsPath,
 		SnapshotDir:    cfg.SnapshotDir,
 		RunDir:         cfg.RunDir,
-		UseSystemd:     useSystemd,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

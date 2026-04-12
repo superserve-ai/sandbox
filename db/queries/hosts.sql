@@ -15,15 +15,6 @@ INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacit
 VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
--- name: UpsertHost :one
--- Ensures a host row exists. Inserts if missing, no-ops if already present.
--- Used at control plane startup to seed the default host from env vars so
--- the scheduler always has at least one host to pick from.
-INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
-VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (id) DO NOTHING
-RETURNING *;
-
 -- name: UpdateHostStatus :exec
 UPDATE host
 SET status = $2, updated_at = now()

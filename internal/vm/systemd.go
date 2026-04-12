@@ -14,11 +14,6 @@ func systemdUnitName(vmID string) string {
 	return "firecracker@" + vmID + ".service"
 }
 
-// systemdNetnsUnitName returns the network namespace unit name.
-func systemdNetnsUnitName(vmID string) string {
-	return "firecracker-netns@" + vmID + ".service"
-}
-
 // startUnit starts a systemd unit. Idempotent — starting an already-running
 // unit is a no-op.
 func startUnit(ctx context.Context, unit string) error {

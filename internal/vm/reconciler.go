@@ -139,18 +139,15 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		bolted[rec.ID] = rec
 	}
 
-	// Source B: active systemd units (only meaningful in systemd mode).
-	var active map[string]bool
-	if r.mgr.useSystemd {
-		ids, err := listActiveFirecrackerUnits(ctx)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to list systemd units")
-			return
-		}
-		active = make(map[string]bool, len(ids))
-		for _, id := range ids {
-			active[id] = true
-		}
+	// Source B: active systemd units.
+	ids, err := listActiveFirecrackerUnits(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to list systemd units")
+		return
+	}
+	active := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		active[id] = true
 	}
 
 	// Source C: DB sandbox rows for this host (optional). A short
@@ -224,7 +221,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 
 	// Drift 3: systemd has a unit, DB says the sandbox is deleted or has
 	// no row at all. This is an orphan — stop the unit + clean up.
-	if r.mgr.useSystemd && dbSandboxes != nil {
+	if dbSandboxes != nil {
 		for id := range active {
 			sb, known := dbSandboxes[id]
 			deleted := known && sb.Status == db.SandboxStatusDeleted
@@ -306,7 +303,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
 				Msg("BoltDB entry with no DB row — cleaning up")
 			// Stop the unit if it's still live so we don't leak a VM.
-			if r.mgr.useSystemd && rec.Status == StatusRunning {
+			if rec.Status == StatusRunning {
 				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
 					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB")
 				}
@@ -319,18 +316,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	}
 }
 
-// isAlive returns true when the VM is verifiably running per its runtime
-// channel (systemd unit active, or socket present in non-systemd mode).
-func (r *Reconciler) isAlive(ctx context.Context, vmID string, bolted map[string]VMRecord) bool {
-	if r.mgr.useSystemd {
-		return isUnitActive(ctx, systemdUnitName(vmID))
-	}
-	rec, ok := bolted[vmID]
-	if !ok || rec.SocketPath == "" {
-		return false
-	}
-	_, err := os.Stat(rec.SocketPath)
-	return err == nil
+// isAlive returns true when the VM's systemd unit is currently active.
+func (r *Reconciler) isAlive(ctx context.Context, vmID string, _ map[string]VMRecord) bool {
+	return isUnitActive(ctx, systemdUnitName(vmID))
 }
 
 // gracePeriodElapsed records the first-seen timestamp for a drifted ID and
