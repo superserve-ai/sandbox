@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -74,25 +73,6 @@ func run() error {
 	vmdClient := newGRPCVMDClient(grpcConn)
 	queries := dbq.New(dbPool)
 
-	// Ensure a host row exists for the default host so the scheduler
-	// always has at least one host to place sandboxes on. Uses ON CONFLICT
-	// DO NOTHING so it's safe to run on every startup — only the first
-	// boot actually inserts.
-	if _, err := queries.UpsertHost(ctx, dbq.UpsertHostParams{
-		ID:                cfg.DefaultHostID,
-		VmdAddr:           cfg.VMDAddress,
-		ProxyAddr:         cfg.EdgeProxyDomain,
-		Region:            envOrDefault("HOST_REGION", "default"),
-		CapacityMemoryMib: 32768,
-		CapacityVcpus:     16,
-	}); err != nil {
-		// UpsertHost with ON CONFLICT DO NOTHING returns ErrNoRows when
-		// the row already exists (no RETURNING). That's expected.
-		if err != pgx.ErrNoRows {
-			log.Warn().Err(err).Msg("failed to upsert default host row")
-		}
-	}
-
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
@@ -107,7 +87,7 @@ func run() error {
 		return newGRPCVMDClient(conn), nil
 	}
 	handlers.Hosts = hostreg.New(queries, dialVMD)
-	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries}
+	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
@@ -162,13 +142,6 @@ func run() error {
 
 	log.Info().Msg("controlplane stopped")
 	return nil
-}
-
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
 
 // ---------------------------------------------------------------------------

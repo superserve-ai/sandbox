@@ -19,9 +19,14 @@ const defaultCacheTTL = 30 * time.Second
 // LeastLoaded picks the active host with the fewest running sandboxes.
 // Skips unhealthy and draining hosts. The result is cached with a short
 // TTL so the DB isn't hit on every create.
+//
+// If no host rows exist in the table (single-host deployment that hasn't
+// seeded a row yet), SelectHost falls back to DefaultHostID so sandbox
+// creation keeps working without requiring the host table to be populated.
 type LeastLoaded struct {
-	DB  *db.Queries
-	TTL time.Duration // 0 = use defaultCacheTTL
+	DB            *db.Queries
+	DefaultHostID string        // fallback when no host rows exist
+	TTL           time.Duration // 0 = use defaultCacheTTL
 
 	mu       sync.RWMutex
 	cached   []db.ListActiveHostsByLoadRow
@@ -41,6 +46,9 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if len(hosts) == 0 {
+		if s.DefaultHostID != "" {
+			return s.DefaultHostID, nil
+		}
 		return "", fmt.Errorf("no active hosts available")
 	}
 	// Already sorted by active_sandbox_count ASC — first row is least loaded.
