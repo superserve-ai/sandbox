@@ -68,6 +68,9 @@ type VMNetInfo struct {
 // This supports up to ~32K concurrent VMs per node — hardware (RAM/CPU) is the real limit.
 const MaxSlots = 32000
 
+// ErrNoSlots is returned when no network slots are available.
+var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
+
 type Manager struct {
 	hostInterface string
 	log           zerolog.Logger
@@ -82,6 +85,9 @@ type Manager struct {
 
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
+
+	// Pre-allocated network slot pool (nil = disabled, on-demand setup).
+	pool *Pool
 
 	// Proxy ports for the TCP egress proxy.
 	httpProxyPort  uint16
@@ -150,6 +156,14 @@ func (m *Manager) SetProxyPorts(http, tls, other uint16) {
 // The host reaches the VM at hostIP:<port>. NAT inside the namespace
 // translates to 169.254.0.21:<port>. No guest IP reconfig needed.
 func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNetInfo, error) {
+	// Try the pre-allocated pool first (microseconds instead of ~10-30ms).
+	if m.pool != nil {
+		if info := m.pool.Claim(vmID); info != nil {
+			return info, nil
+		}
+		m.log.Debug().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
+	}
+
 	m.mu.Lock()
 	var idx int
 	if len(m.freeSlots) > 0 {
@@ -158,16 +172,46 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	} else {
 		if m.nextSlot > MaxSlots {
 			m.mu.Unlock()
-			return nil, fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
+			return nil, ErrNoSlots
 		}
 		idx = m.nextSlot
 		m.nextSlot++
 	}
 	m.mu.Unlock()
 
-	log := m.log.With().Str("vm_id", vmID).Int("slot", idx).Logger()
+	info, vethName, err := m.setupSlot(ctx, idx)
+	if err != nil {
+		m.mu.Lock()
+		m.freeSlots = append(m.freeSlots, idx)
+		m.mu.Unlock()
+		return nil, err
+	}
 
-	// Calculate IPs for this slot using /16 subnets.
+	// Host-level nftables rules require the vmID.
+	hostCIDR := fmt.Sprintf("%s/32", info.HostIP)
+	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
+		m.cleanupFull(info.Namespace, vethName)
+		return nil, fmt.Errorf("add host firewall rules: %w", err)
+	}
+
+	m.mu.Lock()
+	m.devices[vmID] = info
+	m.mu.Unlock()
+
+	m.log.Info().
+		Str("vm_id", vmID).
+		Str("namespace", info.Namespace).
+		Str("host_ip", info.HostIP).
+		Msg("network namespace created")
+
+	return info, nil
+}
+
+// setupSlot runs the expensive network setup (namespace, veth, TAP,
+// nftables, routing) for a single slot index. Used by both SetupVM
+// (on-demand) and Pool (pre-allocation). Does NOT add host-level
+// firewall rules — that requires a vmID and is done by the caller.
+func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, error) {
 	hostIP := fmt.Sprintf("10.11.%d.%d", idx/256, idx%256)
 	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
 	vethIP := fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256)
@@ -176,79 +220,70 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	vpeerName := "eth0"
 	hostCIDR := fmt.Sprintf("%s/32", hostIP)
 
-	// 1. Create network namespace.
 	if err := run(ctx, "ip", "netns", "add", nsName); err != nil {
-		return nil, fmt.Errorf("create namespace: %w", err)
+		return nil, "", fmt.Errorf("create namespace: %w", err)
 	}
 
-	// 2. Create veth pair inside the namespace.
 	if err := nsRun(ctx, nsName, "ip", "link", "add", vethName, "type", "veth", "peer", "name", vpeerName); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("create veth pair: %w", err)
+		return nil, "", fmt.Errorf("create veth pair: %w", err)
 	}
 
-	// 3. Configure vpeer (stays in namespace).
 	if err := nsRun(ctx, nsName, "ip", "link", "set", vpeerName, "up"); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("bring up vpeer: %w", err)
+		return nil, "", fmt.Errorf("bring up vpeer: %w", err)
 	}
 	if err := nsRun(ctx, nsName, "ip", "link", "set", vpeerName, "mtu", ifaceMTU); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("set vpeer MTU: %w", err)
+		return nil, "", fmt.Errorf("set vpeer MTU: %w", err)
 	}
 	if err := nsRun(ctx, nsName, "ip", "addr", "add", vpeerIP+"/31", "dev", vpeerName); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("assign vpeer IP: %w", err)
+		return nil, "", fmt.Errorf("assign vpeer IP: %w", err)
 	}
 
-	// 4. Move veth to host namespace.
 	if err := nsRun(ctx, nsName, "ip", "link", "set", vethName, "netns", "1"); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("move veth to host: %w", err)
+		return nil, "", fmt.Errorf("move veth to host: %w", err)
 	}
 
-	// 5. Configure veth on host side.
 	if err := run(ctx, "ip", "link", "set", vethName, "up"); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("bring up veth: %w", err)
+		return nil, "", fmt.Errorf("bring up veth: %w", err)
 	}
 	if err := run(ctx, "ip", "link", "set", vethName, "mtu", ifaceMTU); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("set veth MTU: %w", err)
+		return nil, "", fmt.Errorf("set veth MTU: %w", err)
 	}
 	if err := run(ctx, "ip", "addr", "add", vethIP+"/31", "dev", vethName); err != nil {
 		m.removeNS(nsName)
-		return nil, fmt.Errorf("assign veth IP: %w", err)
+		return nil, "", fmt.Errorf("assign veth IP: %w", err)
 	}
 
-	// 6. Create TAP device inside namespace.
 	if err := nsRun(ctx, nsName, "ip", "tuntap", "add", "dev", TAPName, "mode", "tap"); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("create TAP: %w", err)
+		return nil, "", fmt.Errorf("create TAP: %w", err)
 	}
 	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "up"); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("bring up TAP: %w", err)
+		return nil, "", fmt.Errorf("bring up TAP: %w", err)
 	}
 	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "mtu", ifaceMTU); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("set TAP MTU: %w", err)
+		return nil, "", fmt.Errorf("set TAP MTU: %w", err)
 	}
 	if err := nsRun(ctx, nsName, "ip", "addr", "add", tapCIDR, "dev", TAPName); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("assign TAP IP: %w", err)
+		return nil, "", fmt.Errorf("assign TAP IP: %w", err)
 	}
 
-	// 7. Bring up loopback in namespace.
 	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
 
-	// 8. Default route in namespace → via veth IP (on host side).
 	if err := nsRun(ctx, nsName, "ip", "route", "add", "default", "via", vethIP); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("add default route in ns: %w", err)
+		return nil, "", fmt.Errorf("add default route in ns: %w", err)
 	}
 
-	// 9. Initialize nftables firewall inside namespace (NAT + filtering + MSS clamping + TCP redirect).
 	var fw *Firewall
 	if err := nsExecGo(nsName, func() error {
 		var fwErr error
@@ -265,18 +300,11 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		return fwErr
 	}); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("init firewall: %w", err)
+		return nil, "", fmt.Errorf("init firewall: %w", err)
 	}
 
-	// 10. Host routing: traffic to hostIP goes via vpeer through the veth.
 	if err := run(ctx, "ip", "route", "add", hostCIDR, "via", vpeerIP, "dev", vethName); err != nil {
-		log.Debug().Err(err).Msg("host route (may already exist)")
-	}
-
-	// 11. Host-level nftables: FORWARD + MASQUERADE + MSS clamping for this VM.
-	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, fmt.Errorf("add host firewall rules: %w", err)
+		m.log.Debug().Err(err).Str("ns", nsName).Msg("host route (may already exist)")
 	}
 
 	mac := fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256)
@@ -291,17 +319,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		Firewall:   fw,
 	}
 
-	m.mu.Lock()
-	m.devices[vmID] = info
-	m.mu.Unlock()
-
-	log.Info().
-		Str("namespace", nsName).
-		Str("host_ip", hostIP).
-		Str("vm_ip", VMInternalIP).
-		Msg("network namespace created")
-
-	return info, nil
+	return info, vethName, nil
 }
 
 func (m *Manager) GetVMNetInfo(vmID string) *VMNetInfo {

@@ -241,6 +241,12 @@ func main() {
 	}
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
+	// ---- Pre-allocate network slots ----
+	// Keeps 5 ready-to-use network namespaces so sandbox creation grabs
+	// one in microseconds instead of running ~11 shell commands (~10-30ms).
+	netPool := netMgr.StartPool(ctx, network.PoolConfig{Size: 5})
+	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+
 	// ---- VM manager ----
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin: cfg.FirecrackerBin,

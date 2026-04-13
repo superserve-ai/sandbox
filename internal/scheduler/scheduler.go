@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -16,13 +17,18 @@ type Scheduler interface {
 
 const defaultCacheTTL = 30 * time.Second
 
-// LeastLoaded picks the active host with the fewest running sandboxes.
-// Skips unhealthy and draining hosts. The result is cached with a short
-// TTL so the DB isn't hit on every create.
+// LeastLoaded picks the active host with the fewest running sandboxes
+// using the "power of two random choices" algorithm. Instead of always
+// picking the globally least-loaded host (which causes thundering herd
+// when many creates arrive simultaneously), it samples two random hosts
+// from the active set and picks the one with fewer sandboxes.
 //
-// If no host rows exist in the table (single-host deployment that hasn't
-// seeded a row yet), SelectHost falls back to DefaultHostID so sandbox
-// creation keeps working without requiring the host table to be populated.
+// With one host this degenerates to always picking that host. With two
+// or more it spreads load naturally without coordination. The algorithm
+// is proven to reduce max load from O(log n / log log n) to O(log log n).
+//
+// If no host rows exist in the table, SelectHost falls back to
+// DefaultHostID so sandbox creation works without populating the host table.
 type LeastLoaded struct {
 	DB            *db.Queries
 	DefaultHostID string        // fallback when no host rows exist
@@ -51,8 +57,23 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 		}
 		return "", fmt.Errorf("no active hosts available")
 	}
-	// Already sorted by active_sandbox_count ASC — first row is least loaded.
-	return hosts[0].ID, nil
+	if len(hosts) == 1 {
+		return hosts[0].ID, nil
+	}
+
+	// Power of two random choices: pick two random hosts, return the
+	// one with fewer active sandboxes. This avoids the thundering-herd
+	// problem where every concurrent create picks the same least-loaded
+	// host from a globally-sorted list.
+	a := rand.IntN(len(hosts))
+	b := rand.IntN(len(hosts) - 1)
+	if b >= a {
+		b++ // ensures b != a
+	}
+	if hosts[a].ActiveSandboxCount <= hosts[b].ActiveSandboxCount {
+		return hosts[a].ID, nil
+	}
+	return hosts[b].ID, nil
 }
 
 func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoadRow, error) {
@@ -80,7 +101,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoad
 }
 
 // Invalidate drops the cached host list so the next SelectHost reflects
-// changes immediately. Called when hosts are added, removed, or drained.
+// changes immediately.
 func (s *LeastLoaded) Invalidate() {
 	s.mu.Lock()
 	s.cached = nil
