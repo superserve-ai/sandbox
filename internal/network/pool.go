@@ -9,9 +9,14 @@ import (
 
 // PoolConfig controls the pre-allocated network slot pool.
 type PoolConfig struct {
-	// Size is the number of slots to keep ready. When a slot is claimed,
-	// the pool refills in the background. Default: 5.
-	Size int
+	// NewSize is the number of fresh pre-allocated slots to keep ready.
+	// Default: 32.
+	NewSize int
+	// RecycleSize is the capacity for recycled slots — network namespaces
+	// returned from destroyed sandboxes. Recycled slots skip the full
+	// setup (namespace, veth, TAP, nftables are already configured).
+	// Default: 100.
+	RecycleSize int
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -21,12 +26,13 @@ type PoolConfig struct {
 // The pool is optional — if not started, SetupVM falls back to on-demand
 // setup (the original behavior). Call StartPool after NewManager to enable.
 type Pool struct {
-	mgr    *Manager
-	log    zerolog.Logger
-	size   int
-	ready  chan *preallocSlot
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	mgr      *Manager
+	log      zerolog.Logger
+	newSize  int
+	fresh    chan *preallocSlot // pre-allocated from scratch
+	recycled chan *preallocSlot // returned from destroyed sandboxes
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
 }
 
 // preallocSlot holds a fully configured network namespace ready to be
@@ -39,33 +45,37 @@ type preallocSlot struct {
 }
 
 // StartPool creates and starts the network slot pool. Blocks until the
-// initial batch is filled, then refills in the background.
+// initial batch of fresh slots is filled, then refills in the background.
 func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
-	size := cfg.Size
-	if size <= 0 {
-		size = 5
+	newSize := cfg.NewSize
+	if newSize <= 0 {
+		newSize = 32
+	}
+	recycleSize := cfg.RecycleSize
+	if recycleSize <= 0 {
+		recycleSize = 100
 	}
 
 	p := &Pool{
-		mgr:    m,
-		log:    m.log.With().Str("component", "net_pool").Logger(),
-		size:   size,
-		ready:  make(chan *preallocSlot, size),
-		stopCh: make(chan struct{}),
+		mgr:      m,
+		log:      m.log.With().Str("component", "net_pool").Logger(),
+		newSize:  newSize,
+		fresh:    make(chan *preallocSlot, newSize),
+		recycled: make(chan *preallocSlot, recycleSize),
+		stopCh:   make(chan struct{}),
 	}
 
 	// Fill initial batch synchronously so the pool is warm on first create.
-	for i := 0; i < size; i++ {
+	for i := 0; i < newSize; i++ {
 		slot, err := p.allocate(ctx)
 		if err != nil {
 			p.log.Error().Err(err).Int("filled", i).Msg("initial pool fill incomplete")
 			break
 		}
-		p.ready <- slot
+		p.fresh <- slot
 	}
-	p.log.Info().Int("size", len(p.ready)).Msg("network pool ready")
+	p.log.Info().Int("fresh", len(p.fresh)).Int("recycle_cap", recycleSize).Msg("network pool ready")
 
-	// Background refill goroutine.
 	p.wg.Add(1)
 	go p.refillLoop(ctx)
 
@@ -73,41 +83,64 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	return p
 }
 
-// Claim takes a pre-allocated slot from the pool and assigns it to the
-// given VM ID. Returns nil if the pool is empty (caller should fall back
-// to on-demand SetupVM).
+// Claim takes a slot from the pool and assigns it to the given VM ID.
+// Prefers recycled slots (zero setup cost) over fresh ones (one nftables
+// call). Returns nil if both pools are empty — caller falls back to
+// on-demand SetupVM.
 func (p *Pool) Claim(vmID string) *VMNetInfo {
+	var slot *preallocSlot
+
+	// Prefer recycled slots — they already have host firewall rules
+	// from the previous owner, which get replaced below.
 	select {
-	case slot := <-p.ready:
-		// Add host-level firewall rules (requires vmID, so done at claim
-		// time rather than pre-allocation time). This is one nftables call
-		// (~1ms), far cheaper than the ~10-30ms full setup.
-		hostCIDR := slot.info.HostIP + "/32"
-		if err := p.mgr.hostFW.AddVM(vmID, slot.vethName, hostCIDR); err != nil {
-			p.log.Error().Err(err).Str("vm_id", vmID).Msg("claim: AddVM firewall failed, cleaning up slot")
-			p.cleanup(slot)
+	case slot = <-p.recycled:
+	default:
+		select {
+		case slot = <-p.fresh:
+		default:
 			return nil
 		}
+	}
 
-		p.mgr.mu.Lock()
-		p.mgr.devices[vmID] = slot.info
-		p.mgr.mu.Unlock()
-
-		p.log.Debug().Str("vm_id", vmID).Int("slot", slot.idx).Msg("claimed pre-allocated slot")
-		return slot.info
-	default:
+	// Add host-level firewall rules (requires vmID).
+	hostCIDR := slot.info.HostIP + "/32"
+	if err := p.mgr.hostFW.AddVM(vmID, slot.vethName, hostCIDR); err != nil {
+		p.log.Error().Err(err).Str("vm_id", vmID).Msg("claim: AddVM firewall failed")
+		p.cleanup(slot)
 		return nil
+	}
+
+	p.mgr.mu.Lock()
+	p.mgr.devices[vmID] = slot.info
+	p.mgr.mu.Unlock()
+
+	return slot.info
+}
+
+// Return puts a slot back into the recycled pool after a sandbox is
+// destroyed. The network namespace, veth, TAP, and nftables stay
+// configured — the next Claim reuses them with zero setup cost.
+// If the recycled pool is full, the slot is torn down instead.
+func (p *Pool) Return(slot *preallocSlot) {
+	select {
+	case p.recycled <- slot:
+	default:
+		// Recycle pool full — tear down.
+		p.cleanup(slot)
 	}
 }
 
-// Stop drains the pool and cleans up unclaimed slots.
+// Stop drains both pools and cleans up unclaimed slots.
 func (p *Pool) Stop() {
 	close(p.stopCh)
 	p.wg.Wait()
 
-	// Clean up unclaimed slots.
-	close(p.ready)
-	for slot := range p.ready {
+	close(p.fresh)
+	for slot := range p.fresh {
+		p.cleanup(slot)
+	}
+	close(p.recycled)
+	for slot := range p.recycled {
 		p.cleanup(slot)
 	}
 	p.log.Info().Msg("network pool stopped")
@@ -122,32 +155,33 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			if len(p.ready) >= p.size {
-				// Pool is full — wait for a claim before allocating more.
-				select {
-				case <-p.stopCh:
-					return
-				case <-ctx.Done():
-					return
-				case p.ready <- p.mustAllocate(ctx):
-					// Slot consumed, loop to check if we need another.
-				}
-				continue
-			}
-			slot, err := p.allocate(ctx)
-			if err != nil {
-				p.log.Error().Err(err).Msg("pool refill failed")
-				continue
-			}
+		}
+
+		if len(p.fresh) >= p.newSize {
+			// Pool full — block until a slot is consumed or shutdown.
 			select {
-			case p.ready <- slot:
 			case <-p.stopCh:
-				p.cleanup(slot)
 				return
 			case <-ctx.Done():
-				p.cleanup(slot)
 				return
+			case p.fresh <- p.mustAllocate(ctx):
 			}
+			continue
+		}
+
+		slot, err := p.allocate(ctx)
+		if err != nil {
+			p.log.Error().Err(err).Msg("pool refill failed")
+			continue
+		}
+		select {
+		case p.fresh <- slot:
+		case <-p.stopCh:
+			p.cleanup(slot)
+			return
+		case <-ctx.Done():
+			p.cleanup(slot)
+			return
 		}
 	}
 }
@@ -158,7 +192,7 @@ func (p *Pool) mustAllocate(ctx context.Context) *preallocSlot {
 		if err == nil {
 			return slot
 		}
-		p.log.Error().Err(err).Msg("pool allocate failed, retrying")
+		p.log.Error().Err(err).Msg("pool allocate retry")
 		select {
 		case <-p.stopCh:
 			return nil

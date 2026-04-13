@@ -244,7 +244,7 @@ func main() {
 	// ---- Pre-allocate network slots ----
 	// Keeps 5 ready-to-use network namespaces so sandbox creation grabs
 	// one in microseconds instead of running ~11 shell commands (~10-30ms).
-	netPool := netMgr.StartPool(ctx, network.PoolConfig{Size: 5})
+	netPool := netMgr.StartPool(ctx, network.PoolConfig{})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 
 	// ---- VM manager ----

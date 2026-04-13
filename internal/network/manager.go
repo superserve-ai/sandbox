@@ -345,51 +345,55 @@ func (m *Manager) CleanupVM(vmID string) {
 		return
 	}
 
-	// Parse slot index once.
 	var idx int
 	fmt.Sscanf(info.Namespace, "ns-%d", &idx)
+	vethName := fmt.Sprintf("veth-%d", idx)
 
-	// Recycle the slot index for reuse.
-	m.mu.Lock()
-	m.freeSlots = append(m.freeSlots, idx)
-	m.mu.Unlock()
-
-	log := m.log.With().Str("vm_id", vmID).Logger()
-
-	// Close nftables firewall inside namespace (kernel removes table + all rules).
-	if info.Firewall != nil {
-		if err := info.Firewall.Close(); err != nil {
-			log.Warn().Err(err).Msg("error closing namespace firewall")
-		}
-	}
-
-	// Remove host-level nftables rules for this VM.
+	// Remove host-level nftables rules (vmID-specific).
 	if err := m.hostFW.RemoveVM(vmID); err != nil {
-		log.Warn().Err(err).Msg("error removing host firewall rules")
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error removing host firewall rules")
 	}
 
-	// Remove per-sandbox rules and connection limiter entries from the egress proxy.
+	// Remove per-sandbox egress proxy rules.
 	if m.egressProxy != nil {
 		m.egressProxy.RemoveRules(info.HostIP)
 	}
 
-	vethName := fmt.Sprintf("veth-%d", idx)
+	// Try to recycle the slot into the pool instead of tearing it down.
+	// The namespace, veth, TAP, and base nftables stay configured —
+	// only the vmID-specific host firewall and egress rules were removed
+	// above. The next Claim re-adds them for the new vmID.
+	if m.pool != nil {
+		// Reset user-defined firewall rules to defaults before recycling.
+		if info.Firewall != nil {
+			_ = info.Firewall.ReplaceUserRules(nil, nil)
+		}
+		m.pool.Return(&preallocSlot{idx: idx, info: info, vethName: vethName})
+		return
+	}
+
+	// No pool — full teardown.
+	m.mu.Lock()
+	m.freeSlots = append(m.freeSlots, idx)
+	m.mu.Unlock()
+
+	if info.Firewall != nil {
+		if err := info.Firewall.Close(); err != nil {
+			m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error closing namespace firewall")
+		}
+	}
+
 	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
 	hostCIDR := fmt.Sprintf("%s/32", info.HostIP)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Remove host route.
 	_ = run(ctx, "ip", "route", "del", hostCIDR, "via", vpeerIP, "dev", vethName)
-
-	// Delete veth (also removes peer in namespace).
 	_ = run(ctx, "ip", "link", "del", vethName)
-
-	// Delete namespace.
 	_ = run(ctx, "ip", "netns", "del", info.Namespace)
 
-	log.Info().Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
 }
 
 // UpdateFirewallRules atomically replaces the user allow/deny sets for a VM's firewall.
