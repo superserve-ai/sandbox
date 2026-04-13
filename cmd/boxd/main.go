@@ -56,15 +56,19 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	env := &sandboxEnv{}
+
 	// Connect RPC services.
 	procService := &processService{
 		processes: &sync.Map{},
+		env:       env,
 	}
 	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
 	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
 
-	// Raw HTTP endpoints (file content transfer + health).
+	// Raw HTTP endpoints (file content transfer + health + init).
 	mux.HandleFunc("/files", handleFiles)
+	mux.HandleFunc("/init", handleInit(env))
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", httpPort)
@@ -87,6 +91,32 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok"}`)
 }
 
+func handleInit(env *sandboxEnv) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var body struct {
+			EnvVars map[string]string `json:"env_vars"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+
+		if len(body.EnvVars) > 0 {
+			env.set(body.EnvVars)
+			log.Printf("init: set %d env var(s)", len(body.EnvVars))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok"}`)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Process service (Connect RPC)
 // ---------------------------------------------------------------------------
@@ -96,9 +126,50 @@ type runningProcess struct {
 	tty *os.File // nil for non-PTY processes.
 }
 
+// sandboxEnv holds sandbox-level environment variables set via POST /init.
+// These are injected into every process boxd spawns, underneath per-request
+// overrides from StartRequest.envs.
+type sandboxEnv struct {
+	mu   sync.RWMutex
+	vars map[string]string
+}
+
+func (e *sandboxEnv) set(vars map[string]string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.vars = vars
+}
+
+func (e *sandboxEnv) environ() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]string, 0, len(e.vars))
+	for k, v := range e.vars {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
 type processService struct {
 	boxdpbconnect.UnimplementedProcessServiceHandler
 	processes *sync.Map // pid → *runningProcess
+	env       *sandboxEnv
+}
+
+// buildEnv assembles the environment for a child process. Layers (last wins):
+// 1. OS base env  2. system defaults (PATH, HOME, USER)  3. sandbox-level
+// env vars from /init  4. per-request env vars from StartRequest.envs.
+func (s *processService) buildEnv(requestEnvs map[string]string) []string {
+	env := append(os.Environ(),
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME="+defaultHome,
+		"USER=user",
+	)
+	env = append(env, s.env.environ()...)
+	for k, v := range requestEnvs {
+		env = append(env, k+"="+v)
+	}
+	return env
 }
 
 func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
@@ -116,14 +187,7 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 		cmd.Dir = defaultHome
 	}
 
-	cmd.Env = append(os.Environ(),
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME="+defaultHome,
-		"USER=user",
-	)
-	for k, v := range msg.GetEnvs() {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = s.buildEnv(msg.GetEnvs())
 
 	timeout := time.Duration(msg.GetTimeoutMs()) * time.Millisecond
 	if timeout > 0 {
@@ -135,14 +199,7 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 		if cmd.Dir == "" {
 			cmd.Dir = defaultHome
 		}
-		cmd.Env = append(os.Environ(),
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-			"HOME="+defaultHome,
-			"USER=user",
-		)
-		for k, v := range msg.GetEnvs() {
-			cmd.Env = append(cmd.Env, k+"="+v)
-		}
+		cmd.Env = s.buildEnv(msg.GetEnvs())
 	}
 
 	isPTY := msg.GetPty() != nil

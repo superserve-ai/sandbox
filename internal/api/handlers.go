@@ -24,10 +24,10 @@ import (
 // VMDClient defines the subset of the VM daemon gRPC interface used by the
 // control plane. This is satisfied by the gRPC adapter in cmd/controlplane.
 type VMDClient interface {
-	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
@@ -136,7 +136,7 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 		case db.SandboxStatusIdle:
 			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 			defer vmdCancel()
-			if _, _, _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", ""); err != nil {
+			if _, _, _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", "", nil); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -321,7 +321,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	// context — if the client hangs up mid-resume, abort the VMD call.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+	ipAddress, actualVcpu, actualMemMiB, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
 		respondError(c, ErrInternal)
@@ -471,6 +471,12 @@ type createSandboxRequest struct {
 	// 2 KB values, 16 KB total. Keys starting with `superserve.` or
 	// `_superserve` are reserved for platform use and rejected.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// EnvVars are environment variables injected into every process inside
+	// the sandbox (terminal sessions, exec calls). Not stored in the DB —
+	// they live in boxd's memory for the sandbox's lifetime and survive
+	// pause/resume via snapshot.
+	EnvVars map[string]string `json:"env_vars,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -704,6 +710,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateEnvVars(req.EnvVars); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Marshal once into the canonical jsonb shape. Empty / nil maps are
 	// stored as the empty object so the column is never NULL.
 	metadataJSON, err := json.Marshal(req.Metadata)
@@ -779,10 +789,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromSnapshot != nil {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
 	} else {
 		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
-			0, 0, 0, nil)
+			0, 0, 0, nil, req.EnvVars)
 	}
 	if vmdErr != nil {
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
@@ -1318,6 +1328,39 @@ func validateMetadata(md map[string]string) error {
 		totalBytes += len(k) + len(v)
 		if totalBytes > metadataMaxTotalBytes {
 			return fmt.Errorf("metadata exceeds %d bytes total", metadataMaxTotalBytes)
+		}
+	}
+	return nil
+}
+
+const (
+	envVarsMaxKeys       = 64
+	envVarsMaxKeyLen     = 256
+	envVarsMaxValueLen   = 8192  // 8 KB — API keys, tokens, DSNs
+	envVarsMaxTotalBytes = 65536 // 64 KB
+)
+
+func validateEnvVars(env map[string]string) error {
+	if len(env) == 0 {
+		return nil
+	}
+	if len(env) > envVarsMaxKeys {
+		return fmt.Errorf("env_vars has %d keys, max is %d", len(env), envVarsMaxKeys)
+	}
+	totalBytes := 0
+	for k, v := range env {
+		if k == "" {
+			return fmt.Errorf("env_vars keys cannot be empty")
+		}
+		if len(k) > envVarsMaxKeyLen {
+			return fmt.Errorf("env_vars key %q is %d bytes, max is %d", k, len(k), envVarsMaxKeyLen)
+		}
+		if len(v) > envVarsMaxValueLen {
+			return fmt.Errorf("env_vars value for key %q is %d bytes, max is %d", k, len(v), envVarsMaxValueLen)
+		}
+		totalBytes += len(k) + len(v)
+		if totalBytes > envVarsMaxTotalBytes {
+			return fmt.Errorf("env_vars exceeds %d bytes total", envVarsMaxTotalBytes)
 		}
 	}
 	return nil
