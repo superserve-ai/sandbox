@@ -48,6 +48,10 @@ func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) 
 		return nil, err
 	}
 
+	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
+		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
+	}
+
 	return &vmdpb.CreateVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
@@ -89,6 +93,11 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	if err != nil {
 		return nil, err
 	}
+
+	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
+		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
+	}
+
 	return &vmdpb.ResumeVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,

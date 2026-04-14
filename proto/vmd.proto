@@ -84,6 +84,7 @@ message CreateVMRequest {
   NetworkConfig network_config = 6;
   map<string, string> metadata = 7;   // Arbitrary key-value pairs.
   SandboxNetworkConfig sandbox_network = 8;  // Per-sandbox egress rules (optional).
+  map<string, string> env_vars = 9;   // Environment variables injected into every process in the VM.
 }
 
 message CreateVMResponse {
@@ -133,6 +134,7 @@ message ResumeVMRequest {
   string snapshot_path = 2;
   string mem_file_path = 3;
   SandboxNetworkConfig sandbox_network = 4;  // Reapply egress rules after resume.
+  map<string, string> env_vars = 5;          // Re-inject env vars after resume.
 }
 
 message ResumeVMResponse {
