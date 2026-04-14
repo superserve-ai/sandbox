@@ -136,10 +136,11 @@ func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
 	}
 }
 
-func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.CreateVM(ctx, &vmdpb.CreateVMRequest{
 		VmId:     vmID,
 		Metadata: metadata,
+		EnvVars:  envVars,
 		ResourceLimits: &vmdpb.ResourceLimits{
 			VcpuCount:   vcpu,
 			MemoryMib:   memMiB,
@@ -179,11 +180,12 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 	return resp.SnapshotPath, resp.MemFilePath, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
+		EnvVars:      envVars,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)

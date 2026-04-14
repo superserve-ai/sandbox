@@ -2,6 +2,14 @@ name: Deploy VMD
 
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging always runs first)'
+        required: false
+        type: choice
+        options:
+          - staging
+          - production
   push:
     branches: [main]
     paths:
@@ -14,7 +22,7 @@ on:
       - 'deploy/proxy.service'
 
 jobs:
-  deploy:
+  deploy-staging:
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -56,224 +64,52 @@ jobs:
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
           TERMINAL_ALLOWED_ORIGINS: ${{ vars.TERMINAL_ALLOWED_ORIGINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
+        run: python3 deploy/deploy-proxy.py
+
+  deploy-production:
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binaries
         run: |
-          python3 - <<'PYEOF'
-          import os, sys, json, subprocess, textwrap
-          from concurrent.futures import ThreadPoolExecutor, as_completed
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/vmd ./cmd/vmd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
 
-          project     = os.environ['GCP_PROJECT']
-          label       = os.environ.get('VMD_LABEL', 'component=vmd')
-          service     = os.environ.get('VMD_SERVICE', 'vmd')
-          install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
-          sha         = os.environ['SHA'][:8]
-          import re as _re
-          # HMAC seed for per-sandbox access tokens. Hex-encoded, >= 32 bytes.
-          # Shared with the control plane. Lives in GitHub secrets (sensitive).
-          access_seed = os.environ.get('SANDBOX_ACCESS_TOKEN_SEED', '')
-          if access_seed:
-              # Mask the seed so GitHub Actions redacts it from all log output.
-              print(f'::add-mask::{access_seed}')
-          if access_seed and not _re.fullmatch(r'[0-9a-fA-F]{64,}', access_seed):
-              print('ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)', file=sys.stderr)
-              sys.exit(1)
-          # Allowed browser origins for the WS terminal upgrade.
-          terminal_origins = os.environ.get('TERMINAL_ALLOWED_ORIGINS', '')
-          if terminal_origins and not _re.fullmatch(r'[A-Za-z0-9.,:/*\-]+', terminal_origins):
-              print('ERROR: TERMINAL_ALLOWED_ORIGINS contains disallowed characters', file=sys.stderr)
-              sys.exit(1)
-          require_data_plane = os.environ.get('REQUIRE_DATA_PLANE', '')
-          if require_data_plane not in ('', '0', '1'):
-              print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
-              sys.exit(1)
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-          # Discover instances by label.
-          result = subprocess.run([
-              'gcloud', 'compute', 'instances', 'list',
-              f'--project={project}',
-              f'--filter=labels.{label} AND status=RUNNING',
-              '--format=csv[no-heading](name,zone)',
-          ], capture_output=True, text=True, check=True)
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
 
-          instances = [
-              {'name': r[0], 'zone': r[1]}
-              for line in result.stdout.strip().splitlines()
-              if line.strip()
-              for r in [line.strip().split(',')]
-          ]
-
-          if not instances:
-              print(f'No instances with label {label} found in {project}', file=sys.stderr)
-              sys.exit(1)
-
-          print(f'Deploying to {len(instances)} instance(s)')
-
-          def deploy(inst):
-              name, zone = inst['name'], inst['zone']
-              tag = f'{name}/{zone}'
-
-              for binary in ('vmd', 'boxd', 'proxy'):
-                  subprocess.run([
-                      'gcloud', 'compute', 'scp',
-                      f'bin/{binary}',
-                      f'{name}:/tmp/{binary}-{sha}',
-                      f'--zone={zone}',
-                      f'--project={project}',
-                      '--quiet',
-                      '--tunnel-through-iap',
-                  ], check=True, capture_output=True)
-              subprocess.run([
-                  'gcloud', 'compute', 'scp',
-                  'deploy/proxy.service',
-                  f'{name}:/tmp/proxy.service',
-                  f'--zone={zone}',
-                  f'--project={project}',
-                  '--quiet',
-                  '--tunnel-through-iap',
-              ], check=True, capture_output=True)
-              print(f'[{tag}] binaries uploaded')
-
-              # Inject updated boxd into the base rootfs atomically:
-              #   1. copy ROOTFS -> ROOTFS.new on the same filesystem
-              #   2. mount the copy, cp boxd into it, umount
-              #   3. mv ROOTFS.new -> ROOTFS (rename is atomic on POSIX)
-              # The original rootfs is untouched until the final rename, so a
-              # failure at any earlier step leaves the system in its
-              # previous working state. The trap ensures we clean up any
-              # staging file/mount on failure.
-              #
-              # textwrap.dedent is used so we can keep the script indented
-              # consistently with the enclosing Python code (which YAML
-              # requires) without leaking that indentation into the shell.
-              # NOTE on braces: GitHub Actions scans the YAML for its own
-              # expression syntax (dollar-double-brace) EVERYWHERE in the
-              # file, including inside Python heredocs and string literals.
-              # We cannot use doubled curly braces in f-strings here because
-              # the raw YAML characters would get parsed as a GitHub
-              # expression and fail with "Unrecognized named-value: ROOTFS".
-              # Workaround: use $ROOTFS / $STAGING without curly braces.
-              # Bash terminates variable names at non-identifier chars
-              # (dot, space, slash), so $ROOTFS.new.$$ works identically.
-              # The cleanup callback is inlined into trap so we avoid any
-              # standalone curly-brace pairs from a bash function body.
-              inject_script = textwrap.dedent(f'''
-                  set -euo pipefail
-
-                  sudo mv /tmp/vmd-{sha}  {install_dir}/vmd
-                  sudo mv /tmp/boxd-{sha} {install_dir}/boxd
-                  sudo chmod +x {install_dir}/vmd {install_dir}/boxd
-
-                  # Resolve the base rootfs path from whichever env file is
-                  # present. We cannot use `grep -s ... file1 file2` because
-                  # grep exits with 2 when ANY listed file is missing (even
-                  # with -s), and `set -euo pipefail` treats that as a fatal
-                  # error via the pipeline. Enumerate candidate files safely.
-                  ROOTFS=""
-                  for env_file in /etc/superserve/vmd.env /etc/agentbox/vmd.env; do
-                      if [ -f "$env_file" ]; then
-                          candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
-                          if [ -n "$candidate" ]; then
-                              ROOTFS="$candidate"
-                              break
-                          fi
-                      fi
-                  done
-
-                  if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then
-                      STAGING="$ROOTFS.new.$$"
-                      MNT=$(mktemp -d)
-                      trap '\''if mountpoint -q "$MNT" 2>/dev/null; then sudo umount "$MNT" || true; fi; rmdir "$MNT" 2>/dev/null || true; sudo rm -f "$STAGING" 2>/dev/null || true'\'' EXIT
-
-                      sudo cp --reflink=auto "$ROOTFS" "$STAGING"
-                      sudo mount -o loop "$STAGING" "$MNT"
-                      sudo cp {install_dir}/boxd "$MNT/usr/local/bin/boxd"
-                      sudo chmod +x "$MNT/usr/local/bin/boxd"
-                      sudo umount "$MNT"
-                      rmdir "$MNT"
-                      sudo mv "$STAGING" "$ROOTFS"
-                      trap - EXIT
-                      echo "boxd injected into rootfs atomically"
-                  else
-                      echo "WARNING: BASE_ROOTFS_PATH not found or not readable; skipping rootfs inject"
-                  fi
-
-                  sudo systemctl restart {service}
-                  sleep 3
-                  sudo systemctl is-active --quiet {service} || (
-                      echo "ERROR: {service} failed to become active after restart" >&2
-                      sudo systemctl status --no-pager {service} >&2 || true
-                      sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                      exit 1
-                  )
-
-                  # Deploy proxy binary and service
-                  sudo mv /tmp/proxy-{sha} {install_dir}/proxy
-                  sudo chmod +x {install_dir}/proxy
-
-                  # Install or update the systemd service file
-                  sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
-                  sudo systemctl daemon-reload
-                  sudo systemctl enable proxy
-
-                  # Write the proxy env file. The seed is passed via
-                  # _PROXY_SEED env var (set on the ssh command) to avoid
-                  # embedding it in the script string where it could be logged.
-                  sudo mkdir -p /etc/superserve
-                  if [ -n "$_PROXY_SEED" ]; then
-                      sudo tee /etc/superserve/proxy.env > /dev/null <<PROXYENV
-                  SANDBOX_ACCESS_TOKEN_SEED=$_PROXY_SEED
-                  TERMINAL_ALLOWED_ORIGINS={terminal_origins}
-                  REQUIRE_DATA_PLANE={require_data_plane}
-                  PROXYENV
-                      sudo chmod 0600 /etc/superserve/proxy.env
-                  fi
-
-                  sudo systemctl restart proxy
-                  sleep 3
-                  sudo systemctl is-active --quiet proxy || (
-                      echo "ERROR: proxy failed to become active after restart" >&2
-                      sudo systemctl status --no-pager proxy >&2 || true
-                      sudo journalctl -u proxy --no-pager -n 40 >&2 || true
-                      exit 1
-                  )
-              ''')
-              import shlex
-              full_script = f'export _PROXY_SEED={shlex.quote(access_seed)}\n{inject_script}'
-              r = subprocess.run([
-                  'gcloud', 'compute', 'ssh', name,
-                  f'--zone={zone}', f'--project={project}',
-                  '--quiet', '--tunnel-through-iap',
-                  '--command', full_script,
-              ], capture_output=True, text=True)
-              if r.returncode != 0:
-                  # Surface both stdout and stderr so deploy failures are
-                  # actually debuggable from the GitHub Actions log. The
-                  # inject script prints journalctl output to stderr on
-                  # service failure; silently swallowing it was a source of
-                  # long debug sessions.
-                  raise RuntimeError(
-                      f'service not healthy\n'
-                      f'--- stdout ---\n{r.stdout}\n'
-                      f'--- stderr ---\n{r.stderr}'
-                  )
-              print(f'[{tag}] active')
-              if r.stdout.strip():
-                  print(f'[{tag}] {r.stdout.strip()}')
-
-          failed = []
-          with ThreadPoolExecutor(max_workers=len(instances)) as ex:
-              futures = {ex.submit(deploy, inst): inst for inst in instances}
-              for f in as_completed(futures):
-                  inst = futures[f]
-                  try:
-                      f.result()
-                  except Exception as e:
-                      tag = f"{inst['name']}/{inst['zone']}"
-                      print(f'[{tag}] FAILED: {e}', file=sys.stderr)
-                      failed.append(tag)
-
-          if failed:
-              print(f'Deploy failed on: {", ".join(failed)}', file=sys.stderr)
-              sys.exit(1)
-
-          print(f'Deployed to {len(instances)} instance(s). sha={sha}')
-          PYEOF
+      - name: Discover and deploy to VMD instances
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_SERVICE: ${{ vars.VMD_SERVICE }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          TERMINAL_ALLOWED_ORIGINS: ${{ vars.TERMINAL_ALLOWED_ORIGINS_PROD }}
+          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
+        run: python3 deploy/deploy-proxy.py
