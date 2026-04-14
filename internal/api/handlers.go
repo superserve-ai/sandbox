@@ -241,9 +241,6 @@ func (h *Handlers) wakeIdleSandbox(ctx context.Context, vmd VMDClient, sandbox *
 	if snapErr != nil {
 		return err
 	}
-	if !snapshotFileExists(snap.Path) {
-		return err
-	}
 
 	memPath := filepath.Join(filepath.Dir(snap.Path), "mem.snap")
 	log.Warn().Str("sandbox_id", sandboxID).Msg("auto-wake ResumeInstance NotFound, falling back to stateless restore")
@@ -402,11 +399,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	defer vmdCancel()
 	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
 	if err != nil {
-		// If VMD has no record of this VM (crashed before pause, or VMD
-		// restart lost its state), fall back to the stateless RestoreSnapshot
-		// path as long as the snapshot files are actually on disk. This is
-		// the "handler degradation" property from the Phase 3 design doc.
-		if isVMDNotFound(err) && snapshotFileExists(snapshotPath) {
+		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
 			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)

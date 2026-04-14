@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"os"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
@@ -11,17 +10,6 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
-
-// snapshotFileExists returns true when the snapshot path refers to a
-// readable local file. Used to guard the stateless fallback path so we
-// don't tell VMD to restore from a file it can't actually read.
-func snapshotFileExists(path string) bool {
-	if path == "" {
-		return false
-	}
-	_, err := os.Stat(path)
-	return err == nil
-}
 
 // ErrSandboxGone is returned when a handler detects that the underlying VM
 // is gone (VMD returned NotFound and the sandbox should be marked failed).
