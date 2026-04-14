@@ -78,18 +78,26 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 // internal /files handler.
 func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID string) {
 	if !h.filesEnabled {
-		// The proxy was started without WithFiles — either this is a
-		// legacy deployment that doesn't have the feature on yet or a
-		// misconfigured one. Don't leak which: return the same 404 a
-		// caller would see probing any other internal path.
 		http.NotFound(w, r)
 		return
 	}
 
-	// boxd's /files handler only implements GET (download) and POST
-	// (upload). Anything else is a client bug and should surface loudly.
+	// CORS: allow browser-based file uploads from permitted origins.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		if h.originAllowed(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "3600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, OPTIONS")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}

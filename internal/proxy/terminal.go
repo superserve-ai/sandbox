@@ -48,6 +48,7 @@ func (h *Handler) WithTerminal(allowedOrigins []string) *Handler {
 		panic("proxy: WithTerminal requires WithAuth to be called first")
 	}
 	h.terminal = &terminalBridgeDeps{allowedOrigins: allowedOrigins}
+	h.allowedOrigins = allowedOrigins
 	return h
 }
 

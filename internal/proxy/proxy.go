@@ -70,6 +70,39 @@ type Handler struct {
 
 	// filesEnabled controls whether /files on boxdPort is served.
 	filesEnabled bool
+
+	// allowedOrigins is the set of browser origins allowed for CORS on
+	// data-plane endpoints (/files). Shared with the terminal origin check.
+	allowedOrigins []string
+}
+
+// originAllowed checks whether the given Origin header matches one of the
+// configured allowed origins. Supports simple wildcard patterns like
+// "*.vercel.app" and the literal "*" (allow all).
+func (h *Handler) originAllowed(origin string) bool {
+	for _, pattern := range h.allowedOrigins {
+		if pattern == "*" {
+			return true
+		}
+		if pattern == origin {
+			return true
+		}
+		// Support *.domain.tld patterns
+		if strings.HasPrefix(pattern, "*.") || strings.HasPrefix(pattern, "*") {
+			suffix := strings.TrimPrefix(pattern, "*")
+			if strings.HasSuffix(origin, suffix) {
+				return true
+			}
+			// Also match https://*.domain against https://sub.domain
+			if strings.Contains(origin, "://") {
+				parts := strings.SplitN(origin, "://", 2)
+				if len(parts) == 2 && strings.HasSuffix(parts[1], strings.TrimPrefix(suffix, ".")) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
