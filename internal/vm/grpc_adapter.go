@@ -49,9 +49,7 @@ func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) 
 	}
 
 	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
-		a.mgr.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to post env vars to boxd")
-		// Don't fail the create — the VM is running, env vars just didn't get set.
-		// The caller can still use per-request env vars as a fallback.
+		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
 	return &vmdpb.CreateVMResponse{
@@ -97,7 +95,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	}
 
 	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
-		a.mgr.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to post env vars to boxd on resume")
+		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
 	return &vmdpb.ResumeVMResponse{

@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestComputeAccessToken_Deterministic(t *testing.T) {
 	seed := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
@@ -73,3 +76,35 @@ func TestValidateSeed_Valid(t *testing.T) {
 		t.Errorf("valid seed rejected: %v", err)
 	}
 }
+
+func TestVerifyAccessToken_PreviousWindowAccepted(t *testing.T) {
+	seed := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
+	// A token from the previous window should still be accepted.
+	prevWindow := currentWindow(now()) - 1
+	tok := computeTokenForWindow(seed, "sandbox-123", prevWindow)
+	if !VerifyAccessToken(seed, "sandbox-123", tok) {
+		t.Error("token from previous window rejected")
+	}
+}
+
+func TestVerifyAccessToken_OldWindowRejected(t *testing.T) {
+	seed := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
+	// A token from 2 windows ago should be rejected.
+	oldWindow := currentWindow(now()) - 2
+	tok := computeTokenForWindow(seed, "sandbox-123", oldWindow)
+	if VerifyAccessToken(seed, "sandbox-123", tok) {
+		t.Error("token from 2 windows ago accepted")
+	}
+}
+
+func TestComputeAccessToken_DifferentWindowsDiffer(t *testing.T) {
+	seed := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
+	w := currentWindow(now())
+	tok1 := computeTokenForWindow(seed, "sandbox-123", w)
+	tok2 := computeTokenForWindow(seed, "sandbox-123", w-1)
+	if tok1 == tok2 {
+		t.Error("different windows produced the same token")
+	}
+}
+
+func now() time.Time { return time.Now() }

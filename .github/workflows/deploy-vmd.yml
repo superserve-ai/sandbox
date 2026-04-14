@@ -2,6 +2,14 @@ name: Deploy VMD
 
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging always runs first)'
+        required: false
+        type: choice
+        options:
+          - staging
+          - production
   push:
     branches: [main]
     paths:
@@ -16,7 +24,7 @@ on:
       - 'scripts/fc-cleanup'
 
 jobs:
-  deploy:
+  deploy-staging:
     runs-on: ubuntu-latest
     environment: staging
     permissions:

@@ -158,8 +158,12 @@ type wsControlMessage struct {
 // from the coder/websocket library.
 func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instanceID string) {
 	// The token is carried in the Sec-WebSocket-Protocol header, NOT the
-	// URL. This keeps the token out of GCP LB access logs, browser history,
-	// Referer headers on sub-resources, and any middleware request logger.
+	// URL. This keeps the token out of browser history, Referer headers,
+	// and URL-based logging. Note: the header itself may appear in
+	// request-level access logs (e.g., Application LB or CDN). This is
+	// acceptable because tokens are time-limited (1-2h) and logs are
+	// internal-only. Auth happens before upgrade so unauthenticated
+	// callers never get a WebSocket connection.
 	// See extractTerminalToken for the parser.
 	//
 	// Defence in depth: unconditionally scrub any ?t= query param before

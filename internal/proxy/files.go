@@ -28,6 +28,12 @@ const (
 
 	// accessTokenHeader is the carrier for the per-sandbox HMAC access token.
 	accessTokenHeader = "X-Access-Token"
+
+	// maxUploadBytes caps a single file upload at the proxy layer.
+	// The real per-sandbox storage limit is ENOSPC (VM disk size), but
+	// this prevents a caller from streaming an absurdly large payload
+	// that ties up proxy resources before the VM disk fills.
+	maxUploadBytes = 4 << 30 // 4 GB
 )
 
 // serveBoxdPort is the entry point for any request addressed at the
@@ -78,6 +84,10 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 // internal /files handler.
 func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID string) {
 	if !h.filesEnabled {
+		// The proxy was started without WithFiles — either this is a
+		// legacy deployment that doesn't have the feature on yet or a
+		// misconfigured one. Don't leak which: return the same 404 a
+		// caller would see probing any other internal path.
 		http.NotFound(w, r)
 		return
 	}
@@ -96,11 +106,18 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		}
 	}
 
+	// boxd's /files handler only implements GET (download) and POST
+	// (upload). Anything else is a client bug and should surface loudly.
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST, OPTIONS")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	}
+
 
 	// Path traversal rejection. boxd's own safePath runs filepath.Clean,
 	// which silently resolves `..` segments instead of refusing them —
@@ -114,6 +131,10 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	requestedPath := r.URL.Query().Get("path")
 	if requestedPath == "" {
 		http.Error(w, "missing path query parameter", http.StatusBadRequest)
+		return
+	}
+	if strings.ContainsRune(requestedPath, 0) {
+		http.Error(w, "path contains null byte", http.StatusBadRequest)
 		return
 	}
 	for _, seg := range strings.Split(requestedPath, "/") {

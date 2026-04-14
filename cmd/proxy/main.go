@@ -67,6 +67,9 @@ func main() {
 
 		if originsEnv != "" {
 			origins := splitCSV(originsEnv)
+			if required && len(origins) == 1 && origins[0] == "*" {
+				log.Fatal().Msg("REQUIRE_DATA_PLANE=1 but PROXY_ALLOWED_ORIGINS is wildcard (*) — refusing to start with open origins in production")
+			}
 			proxyHandler.WithTerminal(origins)
 			log.Info().Strs("allowed_origins", origins).Msg("terminal endpoint enabled")
 		} else {

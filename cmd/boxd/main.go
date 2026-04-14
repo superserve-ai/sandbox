@@ -68,8 +68,8 @@ func main() {
 
 	// Raw HTTP endpoints (file content transfer + health + init).
 	mux.HandleFunc("/files", handleFiles)
-	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/init", handleInit(env))
+	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", httpPort)
 	log.Printf("boxd listening on %s (Connect RPC + HTTP)", addr)
