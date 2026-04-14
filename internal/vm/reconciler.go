@@ -216,6 +216,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_unit_missing").
 				Msg("dead Firecracker detected (no DB context)")
 			r.markStale(id)
+			r.writeAudit(ctx, id, "stale_cleanup", "VM dead, DB unavailable", "boltdb_running_unit_missing")
 		}
 	}
 
@@ -437,14 +438,18 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 // in-memory map. The VM is already gone in reality; this just cleans up
 // VMD's cache.
 func (r *Reconciler) markStale(vmID string) {
+	// Delete from BoltDB first. If this fails, keep the in-memory entry
+	// so the state stays consistent — the reconciler will retry on the
+	// next run. Deleting from the map before BoltDB would cause
+	// ReattachAll to resurrect the stale record on next restart.
+	if err := r.mgr.state.Delete(vmID); err != nil {
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state, will retry")
+		return
+	}
+
 	r.mgr.mu.Lock()
 	delete(r.mgr.vms, vmID)
 	r.mgr.mu.Unlock()
-
-	if err := r.mgr.state.Delete(vmID); err != nil {
-		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
-		return
-	}
 
 	r.mu.Lock()
 	delete(r.driftSeen, vmID)

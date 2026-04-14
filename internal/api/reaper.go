@@ -159,6 +159,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
+		MemPath:   &memPath,
 		SizeBytes: 0,
 		Saved:     false,
 		Name:      &triggerName,

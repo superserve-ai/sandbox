@@ -235,8 +235,8 @@ WITH target AS (
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
 new_snapshot AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, size_bytes, saved, name, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6, $7 FROM target
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
+  SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox
@@ -252,6 +252,7 @@ type FinalizePauseParams struct {
 	ID        uuid.UUID `json:"id"`
 	TeamID    uuid.UUID `json:"team_id"`
 	Path      string    `json:"path"`
+	MemPath   *string   `json:"mem_path"`
 	SizeBytes int64     `json:"size_bytes"`
 	Saved     bool      `json:"saved"`
 	Name      *string   `json:"name"`
@@ -280,6 +281,7 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 		arg.ID,
 		arg.TeamID,
 		arg.Path,
+		arg.MemPath,
 		arg.SizeBytes,
 		arg.Saved,
 		arg.Name,

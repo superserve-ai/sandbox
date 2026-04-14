@@ -261,6 +261,21 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
 
+	// ---- TCP egress proxy ----
+	// Must be set before ReattachAll or any VM operations so domain
+	// filtering is active from the start.
+	const maxConnsPerSandbox = 256
+	egressProxy := network.NewEgressProxy(
+		network.DefaultHTTPProxyPort,
+		network.DefaultTLSProxyPort,
+		network.DefaultOtherProxyPort,
+		maxConnsPerSandbox,
+		log,
+	)
+	mgr.SetEgressProxy(egressProxy)
+	netMgr.SetEgressProxy(egressProxy)
+	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
+
 	// ---- BoltDB state store ----
 	statePath := envOrDefault("VMD_STATE_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "vmd.db"))
 	stateStore, err := vm.OpenStateStore(statePath)
@@ -328,21 +343,6 @@ func main() {
 	// Template files are NOT cleaned up on shutdown — they persist on
 	// disk so the next startup can reuse them via hash caching instead
 	// of cold-booting a new template (~3s saved per restart).
-
-	// ---- TCP egress proxy ----
-	// The nftables firewall in each sandbox namespace REDIRECTs TCP traffic
-	// to these ports for HTTP Host header / TLS SNI inspection.
-	const maxConnsPerSandbox = 256
-	egressProxy := network.NewEgressProxy(
-		network.DefaultHTTPProxyPort,
-		network.DefaultTLSProxyPort,
-		network.DefaultOtherProxyPort,
-		maxConnsPerSandbox,
-		log,
-	)
-	mgr.SetEgressProxy(egressProxy)
-	netMgr.SetEgressProxy(egressProxy)
-	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
 
 	// ---- Default template ----
 	// Boot a throwaway VM from the base image, snapshot it, keep the

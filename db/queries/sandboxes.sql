@@ -115,8 +115,8 @@ WITH target AS (
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
 new_snapshot AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, size_bytes, saved, name, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6, $7 FROM target
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
+  SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox

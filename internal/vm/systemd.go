@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
@@ -73,41 +72,8 @@ func listActiveFirecrackerUnits(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// writeUnitDropIn writes a systemd drop-in config file for a firecracker@ unit.
-// This sets per-sandbox resource limits and environment variables that the
-// unit's ExecStart consumes.
-func writeUnitDropIn(vmID string, memoryMax string, cpuQuota string) error {
-	dropInDir := fmt.Sprintf("/etc/systemd/system/firecracker@%s.service.d", vmID)
-	if err := os.MkdirAll(dropInDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir drop-in dir: %w", err)
-	}
-
-	var content strings.Builder
-	content.WriteString("[Service]\n")
-	if memoryMax != "" {
-		content.WriteString("MemoryMax=" + memoryMax + "\n")
-	}
-	if cpuQuota != "" {
-		content.WriteString("CPUQuota=" + cpuQuota + "\n")
-	}
-
-	dropInPath := filepath.Join(dropInDir, "limits.conf")
-	return os.WriteFile(dropInPath, []byte(content.String()), 0o644)
-}
-
 // removeUnitDropIn removes the drop-in directory for a firecracker@ unit.
 func removeUnitDropIn(vmID string) {
 	dropInDir := fmt.Sprintf("/etc/systemd/system/firecracker@%s.service.d", vmID)
 	os.RemoveAll(dropInDir)
-}
-
-// daemonReload tells systemd to re-read unit files. Required after writing
-// drop-in files.
-func daemonReload(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "daemon-reload")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("systemctl daemon-reload: %s: %w", strings.TrimSpace(string(out)), err)
-	}
-	return nil
 }

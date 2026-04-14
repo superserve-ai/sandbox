@@ -242,10 +242,20 @@ func (h *Handlers) wakeIdleSandbox(ctx context.Context, vmd VMDClient, sandbox *
 		return err
 	}
 
-	memPath := filepath.Join(filepath.Dir(snap.Path), "mem.snap")
+	memPath := resolveMemPath(snap)
 	log.Warn().Str("sandbox_id", sandboxID).Msg("auto-wake ResumeInstance NotFound, falling back to stateless restore")
 	_, _, _, err = vmd.RestoreSnapshot(ctx, sandboxID, snap.Path, memPath)
 	return err
+}
+
+// resolveMemPath returns the memory snapshot path from a Snapshot record.
+// Uses the stored mem_path column if set, otherwise falls back to the
+// convention of placing mem.snap alongside the vmstate snapshot.
+func resolveMemPath(snap db.Snapshot) string {
+	if snap.MemPath != nil && *snap.MemPath != "" {
+		return *snap.MemPath
+	}
+	return filepath.Join(filepath.Dir(snap.Path), "mem.snap")
 }
 
 // persistedEgressConfig mirrors the jsonb shape stored in sandbox.network_config.
@@ -383,7 +393,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	}
 
 	snapshotPath := snapshot.Path
-	memPath := filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
+	memPath := resolveMemPath(snapshot)
 
 	// Resolve the VMD client for this sandbox's host.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
@@ -859,7 +869,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 		snapshotID = pgtype.UUID{Bytes: snapUUID, Valid: true}
 		snapshotPath = snapshot.Path
-		snapshotMemPath = filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
+		snapshotMemPath = resolveMemPath(snapshot)
 	}
 
 	// Select a host for this sandbox.
@@ -892,7 +902,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// VMD's ~100-200ms create latency, shaving that much off the p50.
 	sandboxID := uuid.New()
 
-	insertCtx := c.Request.Context()
+	insertCtx := context.WithoutCancel(c.Request.Context())
 	type insertResult struct {
 		sandbox db.Sandbox
 		err     error
@@ -1144,9 +1154,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// TODO: store memPath in snapshot table (requires adding a mem_path column to the
-	// snapshot schema). For now, ResumeSandbox derives it via
-	// filepath.Join(filepath.Dir(snapshotPath), "mem.snap") by convention.
 	log.Debug().
 		Str("sandbox_id", sandboxID.String()).
 		Str("snapshot_path", snapshotPath).
@@ -1168,6 +1175,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		ID:        sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
+		MemPath:   &memPath,
 		SizeBytes: 0,
 		Saved:     false,
 		Name:      &triggerName,

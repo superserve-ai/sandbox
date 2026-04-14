@@ -1,6 +1,6 @@
 -- name: CreateSnapshot :one
-INSERT INTO snapshot (sandbox_id, team_id, path, size_bytes, saved, name, trigger)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
 -- name: GetSnapshot :one
