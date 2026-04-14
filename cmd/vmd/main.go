@@ -325,10 +325,9 @@ func main() {
 		mgr.ShutdownAll()
 		return nil
 	})
-	lc.addCloser("vm manager: template", func(_ context.Context) error {
-		mgr.CleanupTemplate()
-		return nil
-	})
+	// Template files are NOT cleaned up on shutdown — they persist on
+	// disk so the next startup can reuse them via hash caching instead
+	// of cold-booting a new template (~3s saved per restart).
 
 	// ---- TCP egress proxy ----
 	// The nftables firewall in each sandbox namespace REDIRECTs TCP traffic
