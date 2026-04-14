@@ -3,14 +3,13 @@
 # Called by ExecStopPost in firecracker@.service.
 #
 # Usage: fc-cleanup <sandbox-id>
+# RUN_DIR is inherited from the unit's EnvironmentFile.
 
 set -eu
 
 SANDBOX_ID="$1"
-RUNDIR="/var/lib/sandbox/rundir/${SANDBOX_ID}"
-SOCKET="${RUNDIR}/firecracker.sock"
+SOCKET="${RUN_DIR}/${SANDBOX_ID}/firecracker.sock"
 
-# Remove the API socket if it exists.
 rm -f "${SOCKET}"
 
 echo "fc-cleanup: cleaned up ${SANDBOX_ID}"

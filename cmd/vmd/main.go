@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"sync"
@@ -261,7 +262,7 @@ func main() {
 	}
 
 	// ---- BoltDB state store ----
-	statePath := envOrDefault("VMD_STATE_PATH", "/var/lib/sandbox/vmd.db")
+	statePath := envOrDefault("VMD_STATE_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "vmd.db"))
 	stateStore, err := vm.OpenStateStore(statePath)
 	if err != nil {
 		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")

@@ -21,8 +21,6 @@ RestartSec=2
 # Environment
 EnvironmentFile=/etc/superserve/vmd.env
 
-# Filesystem
-ReadWritePaths=/var/lib/sandbox
 LimitNOFILE=65536
 
 StandardOutput=journal

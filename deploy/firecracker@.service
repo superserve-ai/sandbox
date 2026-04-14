@@ -7,10 +7,11 @@ StopWhenUnneeded=no
 Type=simple
 Slice=sandboxes.slice
 
-# Start Firecracker in a mount namespace (rootfs isolation) inside the
-# network namespace (network isolation). The start script is written by
-# VMD before `systemctl start`.
-ExecStart=/var/lib/sandbox/rundir/%i/start.sh
+# Load RUN_DIR from the VMD env file so paths match.
+EnvironmentFile=/etc/superserve/vmd.env
+
+# The start script is written by VMD before `systemctl start`.
+ExecStart=${RUN_DIR}/%i/start.sh
 
 # Post-stop cleanup: remove socket, stale PID files.
 ExecStopPost=/usr/local/bin/fc-cleanup %i
@@ -19,6 +20,5 @@ Restart=no
 KillMode=mixed
 TimeoutStopSec=10
 
-# Per-sandbox log file instead of flooding journald.
-StandardOutput=file:/var/lib/sandbox/logs/%i.log
-StandardError=file:/var/lib/sandbox/logs/%i.log
+StandardOutput=journal
+StandardError=journal

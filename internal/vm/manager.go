@@ -1199,9 +1199,6 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	}
 	_ = os.Remove(socketPath)
 
-	// Ensure log directory exists.
-	os.MkdirAll("/var/lib/sandbox/logs", 0o755)
-
 	templateDir := m.templateRunDir()
 	rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
 

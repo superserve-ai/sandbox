@@ -125,11 +125,6 @@ jobs:
                   sudo mv /tmp/fc-cleanup {install_dir}/fc-cleanup
                   sudo chmod +x {install_dir}/fc-cleanup
 
-                  # Ensure required directories
-                  sudo mkdir -p /var/lib/sandbox/rundir
-                  sudo mkdir -p /var/lib/sandbox/snapshots
-                  sudo mkdir -p /var/lib/sandbox/logs
-
                   # Inject updated boxd into the base rootfs atomically
                   ROOTFS=""
                   for env_file in /etc/superserve/vmd.env /etc/agentbox/vmd.env; do
