@@ -44,7 +44,7 @@ func main() {
 	// Data-plane auth — the HMAC seed is shared with the control plane.
 	// Both sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
 	seedHex := os.Getenv("SANDBOX_ACCESS_TOKEN_SEED")
-	originsEnv := os.Getenv("TERMINAL_ALLOWED_ORIGINS")
+	originsEnv := os.Getenv("PROXY_ALLOWED_ORIGINS")
 	required := os.Getenv("REQUIRE_DATA_PLANE") == "1"
 
 	if seedHex == "" {
@@ -70,7 +70,7 @@ func main() {
 			proxyHandler.WithTerminal(origins)
 			log.Info().Strs("allowed_origins", origins).Msg("terminal endpoint enabled")
 		} else {
-			log.Warn().Msg("terminal endpoint disabled (TERMINAL_ALLOWED_ORIGINS not configured)")
+			log.Warn().Msg("terminal endpoint disabled (PROXY_ALLOWED_ORIGINS not configured)")
 		}
 	}
 

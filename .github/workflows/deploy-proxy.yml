@@ -47,7 +47,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
-          TERMINAL_ALLOWED_ORIGINS: ${{ vars.TERMINAL_ALLOWED_ORIGINS_STAGING }}
+          PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
         run: |
           python3 - <<'PYEOF'
@@ -64,9 +64,9 @@ jobs:
           if access_seed and not _re.fullmatch(r'[0-9a-fA-F]{64,}', access_seed):
               print('ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)', file=sys.stderr)
               sys.exit(1)
-          terminal_origins = os.environ.get('TERMINAL_ALLOWED_ORIGINS', '')
+          terminal_origins = os.environ.get('PROXY_ALLOWED_ORIGINS', '')
           if terminal_origins and not _re.fullmatch(r'[A-Za-z0-9.,:/*\-]+', terminal_origins):
-              print('ERROR: TERMINAL_ALLOWED_ORIGINS contains disallowed characters', file=sys.stderr)
+              print('ERROR: PROXY_ALLOWED_ORIGINS contains disallowed characters', file=sys.stderr)
               sys.exit(1)
           require_data_plane = os.environ.get('REQUIRE_DATA_PLANE', '')
           if require_data_plane not in ('', '0', '1'):
@@ -123,7 +123,7 @@ jobs:
                   if [ -n "{access_seed}" ]; then
                       sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
                   SANDBOX_ACCESS_TOKEN_SEED={access_seed}
-                  TERMINAL_ALLOWED_ORIGINS={terminal_origins}
+                  PROXY_ALLOWED_ORIGINS={terminal_origins}
                   REQUIRE_DATA_PLANE={require_data_plane}
                   PROXYENV
                       sudo chmod 0600 /etc/sandbox/proxy.env
