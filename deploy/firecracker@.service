@@ -7,13 +7,7 @@ StopWhenUnneeded=no
 Type=simple
 Slice=sandboxes.slice
 
-# Load RUN_DIR from the VMD env file so paths match.
-EnvironmentFile=/etc/sandbox/vmd.env
-
-# The start script is written by VMD before `systemctl start`.
-ExecStart=/bin/sh -c '${RUN_DIR}/%i/start.sh'
-
-# Post-stop cleanup: remove socket, stale PID files.
+ExecStart=/var/lib/sandbox/rundir/%i/start.sh
 ExecStopPost=/usr/local/bin/fc-cleanup %i
 
 Restart=no
