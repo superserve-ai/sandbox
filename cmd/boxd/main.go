@@ -103,7 +103,7 @@ func handleInit(env *sandboxEnv) http.HandlerFunc {
 			EnvVars map[string]string `json:"env_vars"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
 		}
 

@@ -1352,6 +1352,11 @@ func validateEnvVars(env map[string]string) error {
 		if k == "" {
 			return fmt.Errorf("env_vars keys cannot be empty")
 		}
+		for _, c := range k {
+			if c == '=' || c == 0 {
+				return fmt.Errorf("env_vars key %q contains invalid character", k)
+			}
+		}
 		if len(k) > envVarsMaxKeyLen {
 			return fmt.Errorf("env_vars key %q is %d bytes, max is %d", k, len(k), envVarsMaxKeyLen)
 		}
