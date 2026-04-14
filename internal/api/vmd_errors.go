@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"os"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
@@ -33,33 +32,19 @@ var ErrSandboxGone = &AppError{
 	HTTPStatus: 410,
 }
 
-// isVMDNotFound returns true when VMD reports that the VM doesn't exist
-// in its in-memory map (gRPC NotFound). This happens when VMD was
-// restarted and the BoltDB entry was lost.
+// isVMDNotFound returns true when VMD reports that the VM is gone
+// (gRPC NotFound). This covers two cases:
+//   - VMD never had the VM in its map (lost BoltDB entry)
+//   - VMD had the VM but detected the process is dead, cleaned up,
+//     and returned NotFound
+//
+// In both cases the sandbox should be marked failed and the client
+// gets 410 Gone.
 func isVMDNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
 	return status.Code(err) == codes.NotFound
-}
-
-// isVMDVMUnavailable returns true when the error indicates the sandbox
-// VM is gone — either VMD doesn't know about it (NotFound), or VMD
-// knows about it but the Firecracker process is dead (connection
-// refused, no route to host, socket errors). In both cases the sandbox
-// should be marked failed and the client gets 410 Gone.
-func isVMDVMUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if isVMDNotFound(err) {
-		return true
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "no route to host") ||
-		strings.Contains(msg, "connect: connection reset") ||
-		strings.Contains(msg, "socket") && strings.Contains(msg, "connect:")
 }
 
 // markSandboxFailedAsync writes status=failed in a detached goroutine.

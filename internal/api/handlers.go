@@ -517,7 +517,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		if err := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
 			// Delete is idempotent — if the VM is already gone, proceed
 			// with DB cleanup instead of failing the request.
-			if isVMDVMUnavailable(err) {
+			if isVMDNotFound(err) {
 				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance: VM already gone, proceeding with DB cleanup")
 			} else {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
@@ -1124,7 +1124,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
 		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
 		// already dead, "active" was a lie.
-		if isVMDVMUnavailable(err) {
+		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
 			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID)
 			respondError(c, ErrSandboxGone)
@@ -1250,7 +1250,7 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS))
 	durationMs := int32(time.Since(start).Milliseconds())
 	if err != nil {
-		if isVMDVMUnavailable(err) {
+		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand: VM unavailable, marking sandbox failed")
 			h.markSandboxFailedAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 			respondError(c, ErrSandboxGone)

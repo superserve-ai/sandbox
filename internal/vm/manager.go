@@ -620,7 +620,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
 	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath); err != nil {
-		return "", "", fmt.Errorf("create snapshot: %w", err)
+		return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 	}
 
 	// Stop the Firecracker process — snapshot is already on disk.
@@ -978,7 +978,11 @@ func (m *Manager) ExecCommand(ctx context.Context, vmID, command string, timeout
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return httpExec(ctx, vmIP, command, timeout, opts)
+	result, err := httpExec(ctx, vmIP, command, timeout, opts)
+	if err != nil {
+		return nil, m.handleVMError(vmID, err)
+	}
+	return result, nil
 }
 
 func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, timeout time.Duration, opts *ExecOptions,
@@ -1007,7 +1011,10 @@ func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, t
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return httpExecStream(ctx, vmIP, command, timeout, opts, onChunk)
+	if err := httpExecStream(ctx, vmIP, command, timeout, opts, onChunk); err != nil {
+		return m.handleVMError(vmID, err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,6 +1050,25 @@ func (m *Manager) getRunningVMIP(vmID string) (string, error) {
 		return "", status.Errorf(codes.Internal, "vm %s has no IP", vmID)
 	}
 	return vmIP, nil
+}
+
+// handleVMError checks whether a connection error to a VM means the VM is
+// dead. If the systemd unit is no longer active, it marks the VM as failed
+// in BoltDB, removes it from the in-memory map, and returns NotFound so
+// the control plane returns 410 Gone. If the unit is still active (transient
+// error), it returns the original error unchanged.
+func (m *Manager) handleVMError(vmID string, origErr error) error {
+	if origErr == nil {
+		return nil
+	}
+	if isUnitActive(context.Background(), systemdUnitName(vmID)) {
+		return origErr
+	}
+	m.log.Warn().Str("vm_id", vmID).Err(origErr).
+		Msg("VM process is dead — cleaning up and returning NotFound")
+	m.setStatus(vmID, StatusStopped)
+	m.removeVM(vmID)
+	return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 }
 
 // InstanceInfo is a snapshot of a VM's address and status for proxy lookups.

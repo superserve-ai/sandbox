@@ -96,7 +96,7 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		// before the call), so we can't downgrade the status code —
 		// instead emit a "gone" event in the stream so clients can
 		// distinguish this from transient errors.
-		if isVMDVMUnavailable(err) {
+		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommandStream: VM unavailable, marking sandbox failed")
 			h.markSandboxFailedAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 			errEvent, _ := json.Marshal(gin.H{
