@@ -17,7 +17,7 @@ Environment=PROXY_DOMAIN=sandbox.superserve.ai
 # Load host-local overrides (SANDBOX_ACCESS_TOKEN_SEED, TERMINAL_ALLOWED_ORIGINS,
 # REQUIRE_DATA_PLANE) from an env file. Leading `-` makes the file optional —
 # the proxy still starts without it, but data-plane endpoints will be disabled.
-EnvironmentFile=-/etc/superserve/proxy.env
+EnvironmentFile=-/etc/sandbox/proxy.env
 
 # Run as a dedicated unprivileged user
 DynamicUser=yes

@@ -119,14 +119,14 @@ jobs:
                   sudo systemctl daemon-reload
                   sudo systemctl enable proxy
 
-                  sudo mkdir -p /etc/superserve
+                  sudo mkdir -p /etc/sandbox
                   if [ -n "{access_seed}" ]; then
-                      sudo tee /etc/superserve/proxy.env > /dev/null <<PROXYENV
+                      sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
                   SANDBOX_ACCESS_TOKEN_SEED={access_seed}
                   TERMINAL_ALLOWED_ORIGINS={terminal_origins}
                   REQUIRE_DATA_PLANE={require_data_plane}
                   PROXYENV
-                      sudo chmod 0600 /etc/superserve/proxy.env
+                      sudo chmod 0600 /etc/sandbox/proxy.env
                   fi
 
                   sudo systemctl restart proxy

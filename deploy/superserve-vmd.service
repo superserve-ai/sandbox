@@ -19,7 +19,7 @@ Restart=always
 RestartSec=2
 
 # Environment
-EnvironmentFile=/etc/superserve/vmd.env
+EnvironmentFile=/etc/sandbox/vmd.env
 
 LimitNOFILE=65536
 

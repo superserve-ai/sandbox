@@ -8,7 +8,7 @@ Type=simple
 Slice=sandboxes.slice
 
 # Load RUN_DIR from the VMD env file so paths match.
-EnvironmentFile=/etc/superserve/vmd.env
+EnvironmentFile=/etc/sandbox/vmd.env
 
 # The start script is written by VMD before `systemctl start`.
 ExecStart=${RUN_DIR}/%i/start.sh

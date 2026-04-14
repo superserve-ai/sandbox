@@ -127,7 +127,7 @@ jobs:
 
                   # Inject updated boxd into the base rootfs atomically
                   ROOTFS=""
-                  for env_file in /etc/superserve/vmd.env /etc/agentbox/vmd.env; do
+                  for env_file in /etc/sandbox/vmd.env; do
                       if [ -f "$env_file" ]; then
                           candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
                           if [ -n "$candidate" ]; then
