@@ -138,19 +138,33 @@ jobs:
                   done
 
                   if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then
-                      STAGING="$ROOTFS.new.$$"
-                      MNT=$(mktemp -d)
-                      trap '\''if mountpoint -q "$MNT" 2>/dev/null; then sudo umount "$MNT" || true; fi; rmdir "$MNT" 2>/dev/null || true; sudo rm -f "$STAGING" 2>/dev/null || true'\'' EXIT
+                      # Only inject boxd if the binary actually changed.
+                      # This preserves the rootfs hash so VMD's template
+                      # cache skips the ~8s cold boot on VMD-only deploys.
+                      NEW_HASH=$(sha256sum {install_dir}/boxd | cut -d' ' -f1)
+                      MNT_CHECK=$(mktemp -d)
+                      sudo mount -o loop,ro "$ROOTFS" "$MNT_CHECK"
+                      OLD_HASH=$(sha256sum "$MNT_CHECK/usr/local/bin/boxd" 2>/dev/null | cut -d' ' -f1)
+                      sudo umount "$MNT_CHECK"
+                      rmdir "$MNT_CHECK"
 
-                      sudo cp --reflink=auto "$ROOTFS" "$STAGING"
-                      sudo mount -o loop "$STAGING" "$MNT"
-                      sudo cp {install_dir}/boxd "$MNT/usr/local/bin/boxd"
-                      sudo chmod +x "$MNT/usr/local/bin/boxd"
-                      sudo umount "$MNT"
-                      rmdir "$MNT"
-                      sudo mv "$STAGING" "$ROOTFS"
-                      trap - EXIT
-                      echo "boxd injected into rootfs atomically"
+                      if [ "$NEW_HASH" = "$OLD_HASH" ]; then
+                          echo "boxd unchanged (hash=$NEW_HASH), skipping rootfs inject"
+                      else
+                          STAGING="$ROOTFS.new.$$"
+                          MNT=$(mktemp -d)
+                          trap '\''if mountpoint -q "$MNT" 2>/dev/null; then sudo umount "$MNT" || true; fi; rmdir "$MNT" 2>/dev/null || true; sudo rm -f "$STAGING" 2>/dev/null || true'\'' EXIT
+
+                          sudo cp --reflink=auto "$ROOTFS" "$STAGING"
+                          sudo mount -o loop "$STAGING" "$MNT"
+                          sudo cp {install_dir}/boxd "$MNT/usr/local/bin/boxd"
+                          sudo chmod +x "$MNT/usr/local/bin/boxd"
+                          sudo umount "$MNT"
+                          rmdir "$MNT"
+                          sudo mv "$STAGING" "$ROOTFS"
+                          trap - EXIT
+                          echo "boxd injected into rootfs (old=$OLD_HASH new=$NEW_HASH)"
+                      fi
                   else
                       echo "WARNING: BASE_ROOTFS_PATH not found or not readable; skipping rootfs inject"
                   fi
