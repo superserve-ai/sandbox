@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -220,6 +221,13 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	vpeerName := "eth0"
 	hostCIDR := fmt.Sprintf("%s/32", hostIP)
 
+	// If the namespace already exists, this slot is in use by a
+	// running sandbox from a previous VMD lifetime. Skip it — the
+	// pool caller will retry with the next slot index.
+	if nsExists(nsName) {
+		return nil, "", fmt.Errorf("namespace %s already exists (slot in use)", nsName)
+	}
+
 	if err := run(ctx, "ip", "netns", "add", nsName); err != nil {
 		return nil, "", fmt.Errorf("create namespace: %w", err)
 	}
@@ -413,6 +421,11 @@ func (m *Manager) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []s
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+func nsExists(nsName string) bool {
+	_, err := os.Stat("/run/netns/" + nsName)
+	return err == nil
+}
 
 func (m *Manager) removeNS(nsName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -224,10 +224,10 @@ func (p *Pool) allocate(ctx context.Context) (*preallocSlot, error) {
 	// This is the expensive part we're moving off the hot path.
 	info, vethName, err := p.mgr.setupSlot(ctx, idx)
 	if err != nil {
-		// Return the slot index so it can be reused.
-		p.mgr.mu.Lock()
-		p.mgr.freeSlots = append(p.mgr.freeSlots, idx)
-		p.mgr.mu.Unlock()
+		// Don't return the index to freeSlots — the namespace may be in
+		// use by a running sandbox from a previous VMD lifetime. Returning
+		// it would cause an infinite retry loop. The index is consumed;
+		// the next allocate will use nextSlot or a different free index.
 		return nil, err
 	}
 
