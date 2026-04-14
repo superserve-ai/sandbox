@@ -32,11 +32,25 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Check if boxd source changed
+        id: boxd-changed
+        run: |
+          # Compare boxd-related paths against the parent commit.
+          if git diff --name-only HEAD~1 HEAD | grep -qE '^cmd/boxd/|^proto/boxdpb/|^proto/boxd\.proto'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build binaries
         run: |
           mkdir -p bin
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/vmd ./cmd/vmd
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
+          if [ "${{ steps.boxd-changed.outputs.changed }}" = "true" ]; then
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
+          else
+            echo "boxd source unchanged — skipping build"
+          fi
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -54,6 +68,7 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          BOXD_CHANGED: ${{ steps.boxd-changed.outputs.changed }}
         run: |
           python3 - <<'PYEOF'
           import os, sys, subprocess, textwrap
@@ -64,6 +79,7 @@ jobs:
           service     = os.environ.get('VMD_SERVICE', 'superserve-vmd')
           install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
           sha         = os.environ['SHA'][:8]
+          boxd_changed = os.environ.get('BOXD_CHANGED', 'true') == 'true'
 
           result = subprocess.run([
               'gcloud', 'compute', 'instances', 'list',
@@ -96,7 +112,8 @@ jobs:
 
               # Upload binaries
               scp('bin/vmd', f'/tmp/vmd-{sha}')
-              scp('bin/boxd', f'/tmp/boxd-{sha}')
+              if boxd_changed:
+                  scp('bin/boxd', f'/tmp/boxd-{sha}')
 
               # Upload systemd units and helper scripts
               scp('deploy/superserve-vmd.service', '/tmp/superserve-vmd.service')
@@ -109,10 +126,9 @@ jobs:
               inject_script = textwrap.dedent(f'''
                   set -euo pipefail
 
-                  # Install binaries
-                  sudo mv /tmp/vmd-{sha}  {install_dir}/vmd
-                  sudo mv /tmp/boxd-{sha} {install_dir}/boxd
-                  sudo chmod +x {install_dir}/vmd {install_dir}/boxd
+                  # Install VMD binary
+                  sudo mv /tmp/vmd-{sha} {install_dir}/vmd
+                  sudo chmod +x {install_dir}/vmd
 
                   # Install systemd units
                   sudo mv /tmp/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
@@ -125,32 +141,26 @@ jobs:
                   sudo mv /tmp/fc-cleanup {install_dir}/fc-cleanup
                   sudo chmod +x {install_dir}/fc-cleanup
 
-                  # Inject updated boxd into the base rootfs atomically
-                  ROOTFS=""
-                  for env_file in /etc/sandbox/vmd.env; do
-                      if [ -f "$env_file" ]; then
-                          candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
-                          if [ -n "$candidate" ]; then
-                              ROOTFS="$candidate"
-                              break
+                  # Only inject boxd + rebuild rootfs when boxd source changed.
+                  # Skipping this preserves the rootfs hash so VMD's template
+                  # cache works — no ~8s cold boot on VMD-only deploys.
+                  BOXD_SRC_CHANGED={'true' if boxd_changed else 'false'}
+                  if [ "$BOXD_SRC_CHANGED" = "true" ]; then
+                      sudo mv /tmp/boxd-{sha} {install_dir}/boxd
+                      sudo chmod +x {install_dir}/boxd
+
+                      ROOTFS=""
+                      for env_file in /etc/sandbox/vmd.env; do
+                          if [ -f "$env_file" ]; then
+                              candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
+                              if [ -n "$candidate" ]; then
+                                  ROOTFS="$candidate"
+                                  break
+                              fi
                           fi
-                      fi
-                  done
+                      done
 
-                  if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then
-                      # Only inject boxd if the binary actually changed.
-                      # This preserves the rootfs hash so VMD's template
-                      # cache skips the ~8s cold boot on VMD-only deploys.
-                      NEW_HASH=$(sha256sum {install_dir}/boxd | cut -d' ' -f1)
-                      MNT_CHECK=$(mktemp -d)
-                      sudo mount -o loop,ro "$ROOTFS" "$MNT_CHECK"
-                      OLD_HASH=$(sha256sum "$MNT_CHECK/usr/local/bin/boxd" 2>/dev/null | cut -d' ' -f1)
-                      sudo umount "$MNT_CHECK"
-                      rmdir "$MNT_CHECK"
-
-                      if [ "$NEW_HASH" = "$OLD_HASH" ]; then
-                          echo "boxd unchanged (hash=$NEW_HASH), skipping rootfs inject"
-                      else
+                      if [ -n "$ROOTFS" ] && [ -f "$ROOTFS" ]; then
                           STAGING="$ROOTFS.new.$$"
                           MNT=$(mktemp -d)
                           trap '\''if mountpoint -q "$MNT" 2>/dev/null; then sudo umount "$MNT" || true; fi; rmdir "$MNT" 2>/dev/null || true; sudo rm -f "$STAGING" 2>/dev/null || true'\'' EXIT
@@ -163,10 +173,12 @@ jobs:
                           rmdir "$MNT"
                           sudo mv "$STAGING" "$ROOTFS"
                           trap - EXIT
-                          echo "boxd injected into rootfs (old=$OLD_HASH new=$NEW_HASH)"
+                          echo "boxd injected into rootfs"
+                      else
+                          echo "WARNING: BASE_ROOTFS_PATH not found; skipping rootfs inject"
                       fi
                   else
-                      echo "WARNING: BASE_ROOTFS_PATH not found or not readable; skipping rootfs inject"
+                      echo "boxd source unchanged — skipping build and rootfs inject"
                   fi
 
                   # Restart VMD only. Proxy is NOT restarted — it has its own pipeline.
