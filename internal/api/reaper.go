@@ -155,7 +155,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	// Same query as the user-initiated PauseSandbox handler, so the two
 	// code paths have identical atomicity guarantees.
 	triggerName := "timeout"
-	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+	finalized, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
@@ -164,7 +164,8 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Saved:     false,
 		Name:      &triggerName,
 		Trigger:   triggerName,
-	}); err != nil {
+	})
+	if err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
@@ -172,6 +173,9 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 
 	l.Info().Msg("reaper: sandbox paused due to timeout")
 	h.logActivityAsync(ctx, sbx.ID, sbx.TeamID, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
+
+	// Async GC for the now-unreachable previous snapshot, if any.
+	h.cleanupOldSnapshotAsync(ctx, sbx.ID, sbx.TeamID, sbx.HostID, finalized.PrevSnapshotID)
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is

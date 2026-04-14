@@ -755,6 +755,75 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	return snapshotPath, memPath, nil
 }
 
+// DeleteSnapshotFiles removes a snapshot's on-disk artifacts (vmstate + memory
+// file). Both paths must resolve to locations under the configured snapshot
+// directory — arbitrary paths are rejected as InvalidArgument to prevent the
+// control plane from accidentally (or maliciously) unlinking unrelated files.
+//
+// The operation is idempotent: missing files are not an error. The enclosing
+// directory is removed on a best-effort basis once both files are gone and it
+// is empty; a non-empty directory is left alone.
+//
+// Callers are responsible for ensuring the snapshot is no longer referenced
+// by any running VM. This method does not inspect instance state.
+func (m *Manager) DeleteSnapshotFiles(snapshotPath, memPath string) error {
+	if snapshotPath == "" && memPath == "" {
+		return status.Error(codes.InvalidArgument, "at least one of snapshot_path/mem_file_path is required")
+	}
+	for _, p := range []string{snapshotPath, memPath} {
+		if p == "" {
+			continue
+		}
+		if err := m.assertUnderSnapshotDir(p); err != nil {
+			return err
+		}
+	}
+
+	for _, p := range []string{snapshotPath, memPath} {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", p, err)
+		}
+	}
+
+	// Best-effort: if the parent directory is now empty, clean it up. Any
+	// error here is swallowed — a non-empty or missing directory is fine.
+	for _, p := range []string{snapshotPath, memPath} {
+		if p == "" {
+			continue
+		}
+		dir := filepath.Dir(p)
+		// Only attempt to remove directories under SnapshotDir — never the
+		// root itself.
+		if dir == "" || dir == m.cfg.SnapshotDir {
+			continue
+		}
+		_ = os.Remove(dir) // removes only if empty
+	}
+	return nil
+}
+
+// assertUnderSnapshotDir returns nil iff `p` is an absolute path that, after
+// cleaning, lies under m.cfg.SnapshotDir. This is the guard that keeps
+// DeleteSnapshotFiles from being used to unlink arbitrary files on the host.
+func (m *Manager) assertUnderSnapshotDir(p string) error {
+	if m.cfg.SnapshotDir == "" {
+		return status.Error(codes.FailedPrecondition, "snapshot_dir not configured")
+	}
+	if !filepath.IsAbs(p) {
+		return status.Errorf(codes.InvalidArgument, "path must be absolute: %s", p)
+	}
+	cleaned := filepath.Clean(p)
+	root := filepath.Clean(m.cfg.SnapshotDir)
+	rel, err := filepath.Rel(root, cleaned)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return status.Errorf(codes.InvalidArgument, "path is outside snapshot directory: %s", p)
+	}
+	return nil
+}
+
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath, diskPath string,
 	resourceLimits VMConfig, netCfg *network.Config,

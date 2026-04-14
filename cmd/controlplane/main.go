@@ -240,6 +240,21 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 	return resp.IpAddress, 0, 0, nil
 }
 
+// DeleteSnapshot removes the on-disk snapshot artifacts for a previous pause.
+// Idempotent — VMD treats missing files as success. Path traversal is blocked
+// VMD-side, so the control plane cannot use this to delete unrelated files.
+func (c *grpcVMDClient) DeleteSnapshot(ctx context.Context, vmID, snapshotPath, memPath string) error {
+	_, err := c.client.DeleteSnapshot(ctx, &vmdpb.DeleteSnapshotRequest{
+		VmId:         vmID,
+		SnapshotPath: snapshotPath,
+		MemFilePath:  memPath,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC DeleteSnapshot: %w", err)
+	}
+	return nil
+}
+
 func (c *grpcVMDClient) ExecCommand(ctx context.Context, vmID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	stream, err := c.client.ExecCommand(ctx, &vmdpb.ExecCommandRequest{
 		VmId:           vmID,
