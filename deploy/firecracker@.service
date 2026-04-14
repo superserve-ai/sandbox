@@ -11,7 +11,7 @@ Slice=sandboxes.slice
 EnvironmentFile=/etc/sandbox/vmd.env
 
 # The start script is written by VMD before `systemctl start`.
-ExecStart=${RUN_DIR}/%i/start.sh
+ExecStart=/bin/sh -c '${RUN_DIR}/%i/start.sh'
 
 # Post-stop cleanup: remove socket, stale PID files.
 ExecStopPost=/usr/local/bin/fc-cleanup %i
