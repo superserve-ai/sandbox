@@ -328,13 +328,12 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		return nil, status.Errorf(codes.AlreadyExists, "vm %s already exists", vmID)
 	}
 
-	rundirID := uuid.New().String()
 	inst := &VMInstance{
 		ID:        vmID,
 		Status:    StatusCreating,
 		CreatedAt: time.Now(),
 		Metadata:  metadata,
-		RunDirID:  rundirID,
+		RunDirID:  vmID,
 		Config: VMConfig{
 			VCPU:      m.defaultTemplate.VCPUCount,
 			MemoryMiB: m.defaultTemplate.MemSizeMiB,
@@ -344,7 +343,7 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 	m.mu.Unlock()
 
 	cleanup := func() {
-		m.cleanupRunDir(rundirID)
+		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		m.removeVM(vmID)
 	}
@@ -367,7 +366,7 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 	netCh := make(chan netResult, 1)
 
 	go func() {
-		p, err := m.copyRootfs(ctx, rundirID, m.defaultTemplate.DiskPath)
+		p, err := m.copyRootfs(ctx, vmID, m.defaultTemplate.DiskPath)
 		rootfsCh <- rootfsResult{path: p, err: err}
 	}()
 	go func() {
@@ -415,7 +414,7 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 
 	// 3. Start Firecracker in a mount + network namespace.
 	startStep := time.Now()
-	vmDir := filepath.Join(m.cfg.RunDir, rundirID)
+	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
 	var (
