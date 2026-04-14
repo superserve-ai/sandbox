@@ -107,145 +107,125 @@ func (h *Handlers) logActivityAsync(reqCtx context.Context, sandboxID, teamID uu
 	}()
 }
 
-// updateLastActivityAsync bumps last_activity_at in a background goroutine.
-// Same detached-but-traced context pattern as logActivityAsync.
-func (h *Handlers) updateLastActivityAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
+// cleanupOldSnapshotAsync garbage-collects a snapshot whose sandbox reference
+// was just overwritten by a newer pause. Runs detached from the request
+// context so it does not add latency to the pause response, but preserves
+// the trace/span so the work is visible in request traces.
+//
+// Order of operations:
+//  1. Look up the snapshot's paths in the DB (also filters out saved=true
+//     snapshots — the DB query returns 0 rows for those).
+//  2. Call VMD to unlink the vmstate + memory files. Idempotent on VMD side.
+//  3. Delete the DB row.
+//
+// On any failure we log and exit: files may remain on disk (detectable by a
+// future janitor) or the row may remain in DB (inert — no sandbox references
+// it). Both outcomes are bounded and safe; the next pause will produce the
+// same cleanup attempt for the newly-orphaned snapshot.
+//
+// prevSnapshotID is typically nil/invalid on a sandbox's first pause — the
+// helper short-circuits in that case.
+func (h *Handlers) cleanupOldSnapshotAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID, hostID string, prevSnapshotID pgtype.UUID) {
+	if !prevSnapshotID.Valid {
+		return
+	}
+	oldSnapshotID := uuid.UUID(prevSnapshotID.Bytes)
+
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
-		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
-		defer cancel()
-		if err := h.DB.UpdateSandboxLastActivity(ctx, db.UpdateSandboxLastActivityParams{
-			ID:     sandboxID,
+		l := log.With().
+			Str("sandbox_id", sandboxID.String()).
+			Str("snapshot_id", oldSnapshotID.String()).
+			Logger()
+
+		lookupCtx, lookupCancel := context.WithTimeout(asyncCtx, asyncTimeout)
+		snap, err := h.DB.GetSnapshotForCleanup(lookupCtx, db.GetSnapshotForCleanupParams{
+			ID:     oldSnapshotID,
 			TeamID: teamID,
-		}); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async last_activity_at update failed")
+		})
+		lookupCancel()
+		if err != nil {
+			// ErrNoRows: either the row is already gone, or it's a
+			// saved=true row we must not auto-delete. Either way, nothing
+			// to do. Any other error is transient — log and stop; a future
+			// janitor can retry.
+			if err != pgx.ErrNoRows {
+				l.Error().Err(err).Msg("cleanup: lookup old snapshot failed")
+			}
+			return
 		}
+
+		vmd, vmdErr := h.vmdForHost(asyncCtx, hostID)
+		if vmdErr != nil {
+			l.Error().Err(vmdErr).Str("host_id", hostID).Msg("cleanup: resolve VMD failed")
+			return
+		}
+
+		memPath := ""
+		if snap.MemPath != nil {
+			memPath = *snap.MemPath
+		}
+
+		vmdCtx, vmdCancel := context.WithTimeout(asyncCtx, vmdTimeout)
+		err = vmd.DeleteSnapshot(vmdCtx, sandboxID.String(), snap.Path, memPath)
+		vmdCancel()
+		if err != nil {
+			// Files may linger on disk; row stays so a janitor (or the next
+			// pause-cleanup after another pause/resume cycle) can retry.
+			l.Error().Err(err).Msg("cleanup: VMD DeleteSnapshot failed, leaving row in place")
+			return
+		}
+
+		delCtx, delCancel := context.WithTimeout(asyncCtx, asyncTimeout)
+		_, err = h.DB.DeleteSnapshotRow(delCtx, db.DeleteSnapshotRowParams{
+			ID:     oldSnapshotID,
+			TeamID: teamID,
+		})
+		delCancel()
+		if err != nil {
+			// Files are gone; row remains. Inert (no sandbox references it)
+			// and cleanable by a janitor later.
+			l.Error().Err(err).Msg("cleanup: DeleteSnapshotRow failed, files already removed")
+			return
+		}
+		l.Debug().Msg("cleanup: previous snapshot garbage-collected")
 	}()
 }
 
-// AutoWake returns middleware that loads a sandbox, verifies team ownership, and
-// transparently resumes idle sandboxes. On success it stores *db.Sandbox under
-// the "sandbox" context key for downstream handlers.
-func (h *Handlers) AutoWake() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		sandboxID, err := parseSandboxID(c)
-		if err != nil {
-			c.Abort()
-			return
-		}
-
-		teamID, err := teamIDFromContext(c)
-		if err != nil {
-			c.Abort()
-			return
-		}
-
-		sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-			ID:     sandboxID,
-			TeamID: teamID,
-		})
-		if err != nil {
-			if err == pgx.ErrNoRows {
-				respondError(c, ErrSandboxNotFound)
-			} else {
-				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-				respondError(c, ErrInternal)
-			}
-			c.Abort()
-			return
-		}
-
-		switch sandbox.Status {
-		case db.SandboxStatusActive:
-			// Ready.
-		case db.SandboxStatusIdle:
-			vmd, vmdErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-			if vmdErr != nil {
-				log.Error().Err(vmdErr).Str("sandbox_id", sandboxID.String()).Msg("auto-wake resolve VMD failed")
-				respondError(c, ErrInternal)
-				c.Abort()
-				return
-			}
-			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-			defer vmdCancel()
-			if err := h.wakeIdleSandbox(vmdCtx, vmd, &sandbox); err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
-				respondError(c, ErrInternal)
-				c.Abort()
-				return
-			}
-			// VM is running — detach from cancellation so a client
-			// disconnect cannot leave the row stuck in "idle", but
-			// keep the trace/span context so post-VMD writes show
-			// up in the same request trace.
-			postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-			defer postCancel()
-			if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-				ID:     sandboxID,
-				Status: db.SandboxStatusActive,
-				TeamID: teamID,
-			}); err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake UpdateSandboxStatus failed")
-				respondError(c, ErrInternal)
-				c.Abort()
-				return
-			}
-			// Reapply persisted egress rules — nftables + proxy state are fresh after restore.
-			if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake reapply network config failed")
-				respondError(c, ErrInternal)
-				c.Abort()
-				return
-			}
-		default:
-			respondError(c, ErrInvalidState)
-			c.Abort()
-			return
-		}
-
-		c.Set("sandbox", &sandbox)
-		c.Next()
-	}
-}
-
-// sandboxFromContext retrieves the *db.Sandbox stored by the AutoWake middleware.
-func sandboxFromContext(c *gin.Context) *db.Sandbox {
-	val, _ := c.Get("sandbox")
-	sb, _ := val.(*db.Sandbox)
-	return sb
-}
-
-// wakeIdleSandbox transparently brings an idle sandbox back online. It first
-// tries the stateful ResumeInstance path. If VMD has no record of the VM
-// (typically after a VMD restart that lost the in-memory map), it falls back
-// to the stateless RestoreSnapshot path using the snapshot files from the DB.
+// loadActiveSandbox fetches a sandbox by ID, verifies team ownership, and
+// requires that it is in the `active` state. Non-active sandboxes (paused,
+// pausing, failed, etc.) are rejected — callers must resume the sandbox
+// explicitly via POST /sandboxes/:id/resume before operating on it.
 //
-// The fallback is only attempted when:
-//   - VMD returned NotFound
-//   - The sandbox has a linked snapshot row
-//   - The snapshot file is still readable on disk
-func (h *Handlers) wakeIdleSandbox(ctx context.Context, vmd VMDClient, sandbox *db.Sandbox) error {
-	sandboxID := sandbox.ID.String()
-	_, _, _, err := vmd.ResumeInstance(ctx, sandboxID, "", "", nil)
-	if err == nil {
+// On any error path this writes the response and returns nil; the caller
+// should simply return. On success it returns the loaded sandbox.
+func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
 		return nil
 	}
-	if !isVMDNotFound(err) || !sandbox.SnapshotID.Valid {
-		return err
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return nil
 	}
-
-	snap, snapErr := h.DB.GetSnapshot(ctx, db.GetSnapshotParams{
-		ID:     sandbox.SnapshotID.Bytes,
-		TeamID: sandbox.TeamID,
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
 	})
-	if snapErr != nil {
-		return err
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			respondError(c, ErrSandboxNotFound)
+		} else {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+			respondError(c, ErrInternal)
+		}
+		return nil
 	}
-
-	memPath := resolveMemPath(snap)
-	log.Warn().Str("sandbox_id", sandboxID).Msg("auto-wake ResumeInstance NotFound, falling back to stateless restore")
-	_, _, _, err = vmd.RestoreSnapshot(ctx, sandboxID, snap.Path, memPath)
-	return err
+	if sandbox.Status != db.SandboxStatusActive {
+		respondError(c, ErrInvalidState)
+		return nil
+	}
+	return &sandbox
 }
 
 // resolveMemPath returns the memory snapshot path from a Snapshot record.
@@ -269,8 +249,8 @@ type persistedEgressConfig struct {
 
 // reapplyNetworkConfig reads the sandbox's persisted egress config from the DB
 // record and pushes it back to VMD. Called after every resume path (explicit
-// /resume, AutoWake, post-restore in CreateSandbox) because the nftables rules
-// and proxy state are fresh after a snapshot restore.
+// /resume, post-restore in CreateSandbox) because the nftables rules and
+// proxy state are fresh after a snapshot restore.
 //
 // Uses a caller-supplied context so the caller controls timeout/cancellation.
 // Silently returns nil if there is no persisted config (default allow-all).
@@ -369,15 +349,15 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	// Only idle sandboxes can be resumed.
-	if sandbox.Status != db.SandboxStatusIdle {
+	// Only paused sandboxes can be resumed.
+	if sandbox.Status != db.SandboxStatusPaused {
 		respondError(c, ErrInvalidState)
 		return
 	}
 
 	// Read the snapshot to get paths for VMD.
 	if !sandbox.SnapshotID.Valid {
-		log.Error().Str("sandbox_id", sandboxID.String()).Msg("idle sandbox has no snapshot_id")
+		log.Error().Str("sandbox_id", sandboxID.String()).Msg("paused sandbox has no snapshot_id")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -434,7 +414,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	}
 
 	// Past this point the VM is running. Detach from cancellation so a
-	// client disconnect cannot leave the sandbox stuck in "idle" while
+	// client disconnect cannot leave the sandbox stuck in "paused" while
 	// the VM is actually up, but preserve the trace/span context so
 	// these DB writes still appear in the request trace.
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
@@ -467,7 +447,6 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	}
 
 	// Async observability writes.
-	h.updateLastActivityAsync(c.Request.Context(), sandboxID, teamID)
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
 	sandbox.Status = db.SandboxStatusActive
@@ -562,7 +541,7 @@ type createSandboxRequest struct {
 
 	// TimeoutSeconds is a hard lifetime cap in seconds, measured from
 	// created_at. When set, the reaper pauses the sandbox that many seconds
-	// after creation if it is still active. Already-idle sandboxes are left
+	// after creation if it is still active. Already-paused sandboxes are left
 	// alone. Matches the user intent "stop this sandbox in N seconds so it
 	// cannot burn resources indefinitely."
 	//
@@ -1168,10 +1147,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	defer postCancel()
 
 	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
-	// the sandbox, and flip status from pausing → idle in a single CTE.
+	// the sandbox, and flip status from pausing → paused in a single CTE.
 	// Collapses three DB roundtrips into one.
 	triggerName := "pause"
-	snapshotIDVal, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+	finalized, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
@@ -1200,11 +1179,17 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Async observability.
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
+	// Async orphan-snapshot cleanup. FinalizePause atomically swapped
+	// sandbox.snapshot_id to the new snapshot, so the previous one (if any)
+	// is now unreferenced. Delete its files + row in the background so pause
+	// latency is not affected by the extra VMD round-trip and DB write.
+	h.cleanupOldSnapshotAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID, finalized.PrevSnapshotID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"id":          sandboxID.String(),
 		"name":        sandbox.Name,
-		"status":      "idle",
-		"snapshot_id": snapshotIDVal.String(),
+		"status":      "paused",
+		"snapshot_id": finalized.SnapshotID.String(),
 	})
 }
 
@@ -1221,11 +1206,11 @@ type sandboxExecRequest struct {
 }
 
 // ExecSandbox runs a command inside a sandbox and returns the result.
-// The sandbox is loaded and auto-woken by the AutoWake middleware.
+// The sandbox must already be active — callers must resume a paused sandbox
+// via POST /sandboxes/:id/resume first.
 func (h *Handlers) ExecSandbox(c *gin.Context) {
-	sandbox := sandboxFromContext(c)
+	sandbox := h.loadActiveSandbox(c)
 	if sandbox == nil {
-		respondError(c, ErrInternal)
 		return
 	}
 
@@ -1263,7 +1248,6 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 	}
 
 	// Async observability writes.
-	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 	metadata, _ := json.Marshal(map[string]any{
 		"command":     req.Command,
 		"exit_code":   exitCode,

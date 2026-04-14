@@ -155,6 +155,20 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	}, nil
 }
 
+// DeleteSnapshot unlinks the vmstate + memory files for a previous snapshot.
+// Idempotent; path traversal is blocked at the Manager layer.
+func (a *GRPCAdapter) DeleteSnapshot(ctx context.Context, req *vmdpb.DeleteSnapshotRequest) (*vmdpb.DeleteSnapshotResponse, error) {
+	snapshotPath := req.GetSnapshotPath()
+	memPath := req.GetMemFilePath()
+	if snapshotPath == "" && memPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot_path and/or mem_file_path must be set")
+	}
+	if err := a.mgr.DeleteSnapshotFiles(snapshotPath, memPath); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteSnapshotResponse{Deleted: true}, nil
+}
+
 func (a *GRPCAdapter) ExecCommand(req *vmdpb.ExecCommandRequest, stream grpc.ServerStreamingServer[vmdpb.ExecCommandResponse]) error {
 	if req.GetCommand() == "" {
 		return status.Error(codes.InvalidArgument, "command is required")

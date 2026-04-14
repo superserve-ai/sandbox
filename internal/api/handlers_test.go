@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,12 +26,13 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubVMD struct {
-	createFn  func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
-	destroyFn func(ctx context.Context, id string, force bool) error
-	pauseFn   func(ctx context.Context, id, snapshotDir string) (string, string, error)
-	resumeFn  func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	restoreFn func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
+	createFn         func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
+	destroyFn        func(ctx context.Context, id string, force bool) error
+	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
+	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
+	execFn           func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 }
 
 func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (string, uint32, uint32, error) {
@@ -65,6 +67,12 @@ func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil
+}
+func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath string) error {
+	if s.deleteSnapshotFn != nil {
+		return s.deleteSnapshotFn(ctx, id, snapshotPath, memPath)
+	}
+	return nil
 }
 func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	if s.execFn != nil {
@@ -111,10 +119,10 @@ func (m *mockDBTX) Query(context.Context, string, ...any) (pgx.Rows, error) {
 // ---------------------------------------------------------------------------
 
 // sandboxRow returns a mockRow that populates a Sandbox from GetSandbox's Scan
-// call (17 destination pointers matching the column order in sqlc-generated
+// call (16 destination pointers matching the column order in sqlc-generated
 // queries: ID, TeamID, Name, Status, VcpuCount, MemoryMib, HostID, IpAddress,
-// Pid, SnapshotID, LastActivityAt, CreatedAt, UpdatedAt, DestroyedAt,
-// NetworkConfig, TimeoutSeconds, Metadata).
+// Pid, SnapshotID, CreatedAt, UpdatedAt, DestroyedAt, NetworkConfig,
+// TimeoutSeconds, Metadata).
 func sandboxRow(s db.Sandbox) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = s.ID
@@ -127,13 +135,12 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[7].(**netip.Addr) = s.IpAddress
 		*dest[8].(**int32) = s.Pid
 		*dest[9].(*pgtype.UUID) = s.SnapshotID
-		*dest[10].(*time.Time) = s.LastActivityAt
-		*dest[11].(*time.Time) = s.CreatedAt
-		*dest[12].(*time.Time) = s.UpdatedAt
-		*dest[13].(*pgtype.Timestamptz) = s.DestroyedAt
-		*dest[14].(*[]byte) = s.NetworkConfig
-		*dest[15].(**int32) = s.TimeoutSeconds
-		*dest[16].(*[]byte) = s.Metadata
+		*dest[10].(*time.Time) = s.CreatedAt
+		*dest[11].(*time.Time) = s.UpdatedAt
+		*dest[12].(*pgtype.Timestamptz) = s.DestroyedAt
+		*dest[13].(*[]byte) = s.NetworkConfig
+		*dest[14].(**int32) = s.TimeoutSeconds
+		*dest[15].(*[]byte) = s.Metadata
 		return nil
 	}}
 }
@@ -182,13 +189,8 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
-	// Routes with auto-wake middleware.
-	ops := r.Group("/sandboxes/:sandbox_id")
-	ops.Use(h.AutoWake())
-	{
-		ops.POST("/exec", h.ExecSandbox)
-		ops.POST("/exec/stream", h.ExecSandboxStream)
-	}
+	r.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
+	r.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
 	return r
 }
 
@@ -429,10 +431,13 @@ func snapshotRow(s db.Snapshot) *mockRow {
 	}}
 }
 
-// finalizePauseRow mocks the single-uuid RETURNING clause of FinalizePause.
-func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
+// finalizePauseRow mocks the two-column RETURNING clause of FinalizePause:
+// (snapshot_id uuid, prev_snapshot_id uuid NULL). Pass pgtype.UUID{Valid:false}
+// as prev to simulate a sandbox being paused for the first time.
+func finalizePauseRow(snapshotID uuid.UUID, prev pgtype.UUID) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = snapshotID
+		*dest[1].(*pgtype.UUID) = prev
 		return nil
 	}}
 }
@@ -454,7 +459,7 @@ func idleSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandbox
 		ID:         sandboxID,
 		TeamID:     teamID,
 		Name:       "test-sb",
-		Status:     db.SandboxStatusIdle,
+		Status:     db.SandboxStatusPaused,
 		SnapshotID: pgtype.UUID{Bytes: snapshotID, Valid: true},
 	}
 }
@@ -608,7 +613,7 @@ func TestResumeSandbox_NoSnapshotID(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	// Idle but no snapshot_id set.
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusIdle}
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPaused}
 
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
@@ -836,50 +841,35 @@ func TestExecSandbox_InvalidState(t *testing.T) {
 	}
 }
 
-func TestExecSandbox_AutoWakeIdle(t *testing.T) {
+// Paused sandboxes must be resumed explicitly via POST /resume before exec
+// works — there is no implicit auto-wake.
+func TestExecSandbox_PausedRejected(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "idle-sb", Status: db.SandboxStatusIdle}
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "paused-sb", Status: db.SandboxStatusPaused}
 
-	var resumeCalled, execCalled bool
+	var execCalled bool
 	vmd := &stubVMD{
-		resumeFn: func(_ context.Context, id, _, _ string) (string, error) {
-			resumeCalled = true
-			if id != sandboxID.String() {
-				t.Errorf("ResumeInstance id = %q, want %q", id, sandboxID)
-			}
-			return "10.0.0.1", nil
-		},
-		execFn: func(_ context.Context, id, command string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
+		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
 			execCalled = true
-			return "ok\n", "", 0, nil
+			return "", "", 0, nil
 		},
 	}
 
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "FROM sandbox") {
-				return sandboxRow(sb)
-			}
-			return activityRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo","args":["hello"]}`))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo"}`))
 
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusConflict, w.Body.String())
 	}
-	if !resumeCalled {
-		t.Error("VMD.ResumeInstance was not called for auto-wake")
-	}
-	if !execCalled {
-		t.Error("VMD.ExecCommand was not called after auto-wake")
+	if execCalled {
+		t.Error("VMD.ExecCommand should not be called on a paused sandbox")
 	}
 }
 
@@ -1083,7 +1073,7 @@ func TestPauseSandbox_Success(t *testing.T) {
 				return sandboxRow(sb)
 			case strings.Contains(sql, "INSERT INTO snapshot"):
 				// FinalizePause: CTE insert + update, returns snapshot_id
-				return finalizePauseRow(snapshotID)
+				return finalizePauseRow(snapshotID, pgtype.UUID{})
 			case strings.Contains(sql, "FROM sandbox"):
 				// Generic GetSandbox (fallback from BeginPause)
 				return sandboxRow(sb)
@@ -1107,11 +1097,233 @@ func TestPauseSandbox_Success(t *testing.T) {
 	}
 
 	body := parseJSON(t, w)
-	if body["status"] != "idle" {
-		t.Errorf("status = %q, want %q", body["status"], "idle")
+	if body["status"] != "paused" {
+		t.Errorf("status = %q, want %q", body["status"], "paused")
 	}
 	if body["snapshot_id"] != snapshotID.String() {
 		t.Errorf("snapshot_id = %q, want %q", body["snapshot_id"], snapshotID)
+	}
+}
+
+// TestPauseSandbox_FirstPauseNoCleanup verifies that the first pause of a
+// sandbox (prev_snapshot_id IS NULL) does not trigger VMD.DeleteSnapshot.
+func TestPauseSandbox_FirstPauseNoCleanup(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	var deleteSnapshotCalled int32
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
+		},
+		deleteSnapshotFn: func(context.Context, string, string, string) error {
+			atomic.AddInt32(&deleteSnapshotCalled, 1)
+			return nil
+		},
+	}
+
+	snapshotID := uuid.New()
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				// prev_snapshot_id = invalid (first pause)
+				return finalizePauseRow(snapshotID, pgtype.UUID{})
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	// The cleanup is fire-and-forget; if prev is NULL the helper returns
+	// immediately before launching the goroutine. A brief sleep is enough
+	// to catch the false-positive case where a goroutine did run.
+	time.Sleep(50 * time.Millisecond)
+	if got := atomic.LoadInt32(&deleteSnapshotCalled); got != 0 {
+		t.Errorf("VMD.DeleteSnapshot called %d times on first pause, want 0", got)
+	}
+}
+
+// TestPauseSandbox_PreviousSnapshotCleanedUp verifies that when a sandbox is
+// re-paused (prev_snapshot_id is set), the old snapshot is garbage-collected:
+// its files are removed via VMD.DeleteSnapshot and its DB row is deleted.
+func TestPauseSandbox_PreviousSnapshotCleanedUp(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	prevSnapshotID := uuid.New()
+	prevPath := "/snapshots/prev/vmstate.snap"
+	prevMemPath := "/snapshots/prev/mem.snap"
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	deleteCalled := make(chan struct{}, 1)
+	var gotSnapshotPath, gotMemPath string
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
+		},
+		deleteSnapshotFn: func(_ context.Context, _id, sp, mp string) error {
+			gotSnapshotPath = sp
+			gotMemPath = mp
+			select {
+			case deleteCalled <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+	}
+
+	newSnapshotID := uuid.New()
+	var deleteRowCalled int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				return finalizePauseRow(newSnapshotID, pgtype.UUID{Bytes: prevSnapshotID, Valid: true})
+			case strings.Contains(sql, "FROM snapshot"):
+				// GetSnapshotForCleanup: return prev snapshot paths.
+				mem := prevMemPath
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = prevSnapshotID
+					*dest[1].(*uuid.UUID) = teamID
+					*dest[2].(*string) = prevPath
+					*dest[3].(**string) = &mem
+					return nil
+				}}
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM snapshot") {
+				atomic.AddInt32(&deleteRowCalled, 1)
+				return pgconn.NewCommandTag("DELETE 1"), nil
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-deleteCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("VMD.DeleteSnapshot was not called within 500ms")
+	}
+
+	if gotSnapshotPath != prevPath {
+		t.Errorf("DeleteSnapshot snapshot_path = %q, want %q", gotSnapshotPath, prevPath)
+	}
+	if gotMemPath != prevMemPath {
+		t.Errorf("DeleteSnapshot mem_path = %q, want %q", gotMemPath, prevMemPath)
+	}
+
+	// DB row delete runs after VMD succeeds; give it a tick.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&deleteRowCalled) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&deleteRowCalled) == 0 {
+		t.Error("DeleteSnapshotRow was not called after successful VMD delete")
+	}
+}
+
+// TestPauseSandbox_CleanupVMDFailureLeavesRow verifies that when VMD delete
+// fails, the DB row is left in place (so a future retry can clean it up).
+func TestPauseSandbox_CleanupVMDFailureLeavesRow(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	prevSnapshotID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	deleteAttempted := make(chan struct{}, 1)
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
+		},
+		deleteSnapshotFn: func(context.Context, string, string, string) error {
+			select {
+			case deleteAttempted <- struct{}{}:
+			default:
+			}
+			return fmt.Errorf("vmd unreachable")
+		},
+	}
+
+	newSnapshotID := uuid.New()
+	var deleteRowCalled int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				return finalizePauseRow(newSnapshotID, pgtype.UUID{Bytes: prevSnapshotID, Valid: true})
+			case strings.Contains(sql, "FROM snapshot"):
+				mem := "/snapshots/prev/mem.snap"
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = prevSnapshotID
+					*dest[1].(*uuid.UUID) = teamID
+					*dest[2].(*string) = "/snapshots/prev/vmstate.snap"
+					*dest[3].(**string) = &mem
+					return nil
+				}}
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM snapshot") {
+				atomic.AddInt32(&deleteRowCalled, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-deleteAttempted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("VMD.DeleteSnapshot was not attempted within 500ms")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt32(&deleteRowCalled) != 0 {
+		t.Error("DeleteSnapshotRow should not run when VMD delete failed")
 	}
 }
 
