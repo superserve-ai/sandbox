@@ -24,6 +24,12 @@ service VMDaemon {
   // RestoreSnapshot boots a VM from a previously captured snapshot.
   rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
 
+  // DeleteSnapshot removes a snapshot's on-disk artifacts (vmstate + memory
+  // file). Idempotent — missing files are treated as success. Used by the
+  // control plane to garbage-collect the previous snapshot when a sandbox is
+  // re-paused and only the latest snapshot is reachable.
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+
   // ExecCommand runs a command inside a VM and streams stdout/stderr back.
   rpc ExecCommand(ExecCommandRequest) returns (stream ExecCommandResponse);
 
@@ -179,6 +185,27 @@ message RestoreSnapshotResponse {
   string socket_path = 2;
   string ip_address = 3;
   uint32 pid = 4;
+}
+
+// ---------------------------------------------------------------------------
+// DeleteSnapshot
+// ---------------------------------------------------------------------------
+
+message DeleteSnapshotRequest {
+  // Optional. Identifies the sandbox this snapshot belongs to — used for
+  // logging and for a sanity check that the paths live inside the expected
+  // snapshot directory. Never required for the delete itself.
+  string vm_id = 1;
+  // Absolute path to the vmstate snapshot file.
+  string snapshot_path = 2;
+  // Absolute path to the memory dump file.
+  string mem_file_path = 3;
+}
+
+message DeleteSnapshotResponse {
+  // True when both files are no longer on disk after this call — either
+  // because this call removed them, or because they were already gone.
+  bool deleted = 1;
 }
 
 // ---------------------------------------------------------------------------

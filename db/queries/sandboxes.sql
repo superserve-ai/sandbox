@@ -46,11 +46,6 @@ SET status = 'active',
     updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 
--- name: UpdateSandboxLastActivity :exec
-UPDATE sandbox
-SET last_activity_at = now(), updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
-
 -- name: SetSandboxSnapshot :exec
 UPDATE sandbox
 SET snapshot_id = $2, updated_at = now()
@@ -65,7 +60,7 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
 
 -- name: ListSandboxesByHost :many
--- Used by the VMD reconciler. snapshot_path is joined so the idle-sandbox
+-- Used by the VMD reconciler. snapshot_path is joined so the paused-sandbox
 -- drift check can stat the file without a per-row snapshot lookup.
 SELECT sqlc.embed(s), snap.path AS snapshot_path
 FROM sandbox s
@@ -95,7 +90,7 @@ RETURNING *;
 
 -- name: FinalizePause :one
 -- Atomically insert the snapshot row, link it to the sandbox, and flip
--- status from 'pausing' to 'idle'. Replaces the sequence
+-- status from 'pausing' to 'paused'. Replaces the sequence
 -- CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
 -- three DB roundtrips into one.
 --
@@ -109,10 +104,14 @@ RETURNING *;
 -- can still race, but that window is microseconds and the resulting
 -- orphan is detectable/cleanable by a background job.
 --
+-- Also captures the sandbox's previous snapshot_id (before we overwrite it)
+-- so the caller can garbage-collect the now-unreachable prior snapshot
+-- asynchronously. Returns NULL for the first pause of a sandbox.
+--
 -- When either the sandbox is missing/deleted or the INSERT did not fire,
 -- the query returns 0 rows and the caller maps that to ErrSandboxGone.
 WITH target AS (
-  SELECT id, team_id FROM sandbox
+  SELECT id, team_id, snapshot_id AS prev_snapshot_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
 new_snapshot AS (
@@ -122,18 +121,30 @@ new_snapshot AS (
 )
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM new_snapshot),
-    status = 'idle',
+    status = 'paused',
     updated_at = now()
 FROM new_snapshot
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
-RETURNING new_snapshot.snap_id::uuid AS snapshot_id;
+RETURNING
+  new_snapshot.snap_id::uuid AS snapshot_id,
+  (SELECT prev_snapshot_id FROM target) AS prev_snapshot_id;
 
--- name: ListIdleSandboxes :many
-SELECT * FROM sandbox
-WHERE status = 'idle'
-  AND destroyed_at IS NULL
-  AND last_activity_at < $1
-ORDER BY last_activity_at ASC;
+-- name: GetSnapshotForCleanup :one
+-- Fetch a snapshot's paths for garbage collection. Returns only non-saved
+-- snapshots — saved=true rows are reserved for the (future) user-named
+-- template feature and must never be auto-deleted. A 0-row result means
+-- the row was already gone or is a saved snapshot; either way the caller
+-- should skip deletion.
+SELECT id, team_id, path, mem_path
+FROM snapshot
+WHERE id = $1 AND team_id = $2 AND saved = false;
+
+-- name: DeleteSnapshotRow :execrows
+-- Remove a snapshot row. Guarded by saved=false so a future template feature
+-- can rely on row durability — auto-GC callers cannot accidentally nuke a
+-- user-saved snapshot even if they passed the wrong ID.
+DELETE FROM snapshot
+WHERE id = $1 AND team_id = $2 AND saved = false;
 
 -- name: UpdateSandboxNetworkConfig :exec
 UPDATE sandbox
@@ -155,7 +166,7 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 -- skip rows already being processed, so multi-replica Cloud Run deployments
 -- do not double-process the same sandbox.
 --
--- Only 'active' sandboxes are claimed — idle sandboxes are already stopped,
+-- Only 'active' sandboxes are claimed — paused sandboxes are already stopped,
 -- and transient states (starting, pausing) are skipped to avoid racing with
 -- in-progress operations. The 60-second grace window prevents reaping a sandbox
 -- that was just created with a very short timeout before it finishes starting up.

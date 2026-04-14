@@ -8,11 +8,11 @@ info:
     ## Sandbox lifecycle
 
     ```
-    active <--> idle --> deleted
+    active <--> paused --> deleted
     ```
 
-    A sandbox is `active` when running and `idle` after being paused. Resuming
-    an idle sandbox returns it to `active`. Deleting releases all resources.
+    A sandbox is `active` when running and `paused` after being paused. Resuming
+    a paused sandbox returns it to `active`. Deleting releases all resources.
   contact:
     name: Superserve Team
   license:
@@ -193,7 +193,7 @@ paths:
       tags: [Sandboxes]
       summary: Pause a running sandbox
       description: |
-        Saves the sandbox's full state and transitions it to `idle`. Resume
+        Saves the sandbox's full state and transitions it to `paused`. Resume
         it later to continue exactly where it left off — same memory, same
         running processes, same files.
       security:
@@ -390,9 +390,9 @@ components:
           type: string
         status:
           type: string
-          enum: [active, idle]
+          enum: [active, paused]
           description: >
-            Current state of the sandbox. `active` means running; `idle`
+            Current state of the sandbox. `active` means running; `paused`
             means paused and awaiting resume.
         vcpu_count:
           type: integer

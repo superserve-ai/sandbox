@@ -84,7 +84,7 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 	//   - activity insert returns an activity row
 	switch {
 	case strings.Contains(sql, "new_snapshot AS"):
-		return finalizePauseRow(uuid.New())
+		return finalizePauseRow(uuid.New(), pgtype.UUID{})
 	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
 	}
@@ -172,7 +172,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 				if strings.Contains(sql, "new_snapshot AS") {
 					atomic.AddInt32(&finalizeCalls, 1)
-					return finalizePauseRow(uuid.New())
+					return finalizePauseRow(uuid.New(), pgtype.UUID{})
 				}
 				return activityRow()
 			},

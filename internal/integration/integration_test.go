@@ -421,14 +421,14 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 		t.Fatalf("pause: expected 204, got %d: %s", pw.Code, pw.Body.String())
 	}
 
-	// DB: sandbox is idle, snapshot record exists and is linked.
+	// DB: sandbox is paused, snapshot record exists and is linked.
 	sandboxID, _ := uuid.Parse(sid)
 	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
 	if err != nil {
 		t.Fatalf("get sandbox: %v", err)
 	}
-	if sb.Status != db.SandboxStatusIdle {
-		t.Errorf("DB status = %q, want idle", sb.Status)
+	if sb.Status != db.SandboxStatusPaused {
+		t.Errorf("DB status = %q, want paused", sb.Status)
 	}
 	if !sb.SnapshotID.Valid {
 		t.Fatal("sandbox snapshot_id should be set after pause")
@@ -602,12 +602,13 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	}
 }
 
-func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
-	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
+// Exec on a paused sandbox must be rejected — callers must resume explicitly
+// via POST /resume. There is no implicit auto-wake on traffic.
+func TestIntegration_ExecSandbox_PausedRejected(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"wake-box"}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -618,21 +619,9 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
-	// Exec on idle sandbox — AutoWake middleware should resume transparently.
 	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello"}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec on idle: expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-
-	// DB: active after auto-wake.
-	time.Sleep(50 * time.Millisecond)
-	sandboxID, _ := uuid.Parse(sid)
-	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
-	if err != nil {
-		t.Fatalf("get sandbox: %v", err)
-	}
-	if sb.Status != db.SandboxStatusActive {
-		t.Errorf("DB status = %q after auto-wake, want active", sb.Status)
+	if ew.Code != http.StatusConflict {
+		t.Fatalf("exec on paused: expected 409, got %d: %s", ew.Code, ew.Body.String())
 	}
 }
 
