@@ -127,15 +127,27 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	}
 	log.Info().Dur("elapsed", time.Since(buildStart)).Msg("build VM up and boxd ready")
 
-	// Phase 4: execute build steps. Stub for day 7 — the executor lands
-	// in day 8 (internal/vm/build_exec.go).
-	if len(req.Spec.Steps) > 0 {
-		log.Warn().Int("steps", len(req.Spec.Steps)).Msg("build steps requested but executor not yet wired (day 8); skipping")
+	// Phase 4: execute build steps in order. On failure, tear down the
+	// build VM and propagate the error — we don't snapshot a half-built
+	// template.
+	if err := m.executeBuildSteps(ctx, inst.IP, req.Spec, log); err != nil {
+		cleanup("build steps failed")
+		return nil, fmt.Errorf("execute build steps: %w", err)
 	}
 
-	// Phase 5: start_cmd / ready_cmd — stub for day 8.
-	if req.Spec.StartCmd != "" || req.Spec.ReadyCmd != "" {
-		log.Warn().Msg("start_cmd / ready_cmd set but handler not yet wired (day 8); skipping")
+	// Phase 5: start_cmd — launch the long-lived process whose live state
+	// we want the snapshot to capture. Fire-and-forget; we don't wait for
+	// exit because the point is to keep it running.
+	if err := m.runStartCmd(ctx, inst.IP, req.Spec, log); err != nil {
+		cleanup("start_cmd failed")
+		return nil, fmt.Errorf("launch start_cmd: %w", err)
+	}
+
+	// Phase 5b: ready_cmd — block until the start process is actually
+	// serving, so the snapshot captures a useful state. No-op if unset.
+	if err := m.pollReadyCmd(ctx, inst.IP, req.Spec, log); err != nil {
+		cleanup("ready_cmd timed out")
+		return nil, fmt.Errorf("ready_cmd: %w", err)
 	}
 
 	// Phase 6: snapshot the running VM. Memory + vmstate land on disk.
