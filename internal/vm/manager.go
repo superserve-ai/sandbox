@@ -531,6 +531,21 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, templateID string, 
 // coldBootVM — used only for InitDefaultTemplate and as fallback
 // ---------------------------------------------------------------------------
 
+// waitForPIDExit polls until the process at pid is gone (kill(pid, 0)
+// returns ESRCH) or the deadline expires. Best-effort: returns silently
+// either way. Used after SIGKILL to ensure the kernel has actually
+// reaped the process and released its fds before we reuse its resources.
+func waitForPIDExit(pid int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		// syscall.Kill(pid, 0) returns ESRCH when the process is gone.
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // coldBootVM is a thin shim that uses the baked-in BaseRootfsPath and default
 // 1-vCPU / 1024-MiB config. Existing callers (InitDefaultTemplate, CreateVM
 // fallback) hit this path; BuildTemplate uses coldBootFromRootfs below.
@@ -658,11 +673,37 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
-	// Stop the systemd unit — this kills Firecracker and runs ExecStopPost cleanup.
+	// Stop the systemd unit if one exists — this is the path for sandbox
+	// VMs launched via startFirecrackerViaSystemd.
 	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
-		log.Warn().Err(err).Msg("systemctl stop failed (unit may already be stopped)")
+		log.Warn().Err(err).Msg("systemctl stop failed (unit may not exist — trying PID-based kill)")
 	}
 	removeUnitDropIn(vmID)
+
+	// Fallback: cold-booted VMs (template build VMs from startFirecrackerColdBoot
+	// and the default-template cold boot) aren't systemd-managed — they run as
+	// plain child processes of vmd. stopUnit is a no-op for them, so we have
+	// to SIGKILL by PID or Firecracker keeps holding its TAP fd, causing the
+	// network pool to hand out a "reusable" slot whose tap0 is still in use.
+	// Next VM that claims the slot fails with EBUSY ("Open tap device failed:
+	// Resource busy"). See internal/network/manager.go:344 for the pool
+	// return path that assumes the previous owner is dead.
+	inst.mu.RLock()
+	pid := inst.PID
+	inst.mu.RUnlock()
+	if pid > 0 {
+		if proc, err := os.FindProcess(pid); err == nil {
+			// SIGKILL is safe here: we're tearing down, no graceful shutdown
+			// is expected. For systemd-managed VMs this is a no-op because
+			// stopUnit already killed the process.
+			_ = proc.Signal(syscall.SIGKILL)
+			// Give the kernel a moment to actually release fds before we
+			// hand the namespace + TAP back to the pool. 100ms is enough
+			// in practice — Linux process teardown is fast once all fds
+			// are dropped.
+			waitForPIDExit(pid, 500*time.Millisecond)
+		}
+	}
 
 	if inst.SocketPath != "" {
 		_ = os.Remove(inst.SocketPath)
