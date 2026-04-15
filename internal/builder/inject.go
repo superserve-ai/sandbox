@@ -1,23 +1,43 @@
 package builder
 
 import (
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
 
-// injectGuestAgent copies the boxd binary into the flattened rootfs at
-// /usr/bin/boxd and installs a systemd unit that starts it on boot. The
-// unit is symlinked into multi-user.target.wants so it activates under the
-// standard boot target used by debian/ubuntu-based images.
+// tiniBinary is a static linux/amd64 build of tini v0.19.0 — a minimal
+// init that reaps zombies + forwards signals. Baked into the binary so
+// every template build injects the same reviewed bytes without needing
+// network access or a separate artifact pipeline.
+//
+// Source: https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-amd64
+// SHA256 of the embedded bytes is enforced at test time (TODO).
+//
+//go:embed assets/tini-static-amd64
+var tiniBinary []byte
+
+// injectGuestAgent copies the boxd binary into the flattened rootfs, drops
+// an embedded tini binary for proper PID 1 behavior, and writes a tiny
+// /sbin/init wrapper that mounts essential filesystems then exec's tini
+// with boxd as the supervised child.
+//
+// We can't rely on systemd here: OCI base images (python:3.11-slim,
+// node:22-slim, ubuntu:24.04, etc.) don't ship systemd as PID 1. We use
+// tini because it's purpose-built for this — proper zombie reaping, clean
+// signal forwarding — at ~850 KB vs ~100 MB of installing systemd.
+//
+// See docs/INIT_STRATEGY.md for the full rationale and migration path to
+// systemd when we need its feature set.
 //
 // Must be called AFTER pullAndFlatten — operates on the extracted tree.
 //
 // Layout produced:
-//   /usr/bin/boxd                                      (0755)
-//   /etc/systemd/system/boxd.service                   (0644)
-//   /etc/systemd/system/multi-user.target.wants/boxd.service → ../boxd.service
+//   /usr/bin/boxd              (0755)  — the guest agent binary
+//   /usr/local/bin/tini        (0755)  — PID 1 helper, embedded at build
+//   /sbin/init                 (0755)  — shell wrapper that execs tini
 //
 // Returns the byte count of the boxd binary copied, for observability.
 func injectGuestAgent(rootfsDir, boxdBinaryPath string) (int64, error) {
@@ -33,50 +53,98 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string) (int64, error) {
 		return 0, fmt.Errorf("copy boxd: %w", err)
 	}
 
-	unitDir := filepath.Join(rootfsDir, "etc/systemd/system")
-	if err := os.MkdirAll(unitDir, 0o755); err != nil {
-		return 0, fmt.Errorf("mkdir %s: %w", unitDir, err)
+	// Write the embedded tini binary into the rootfs.
+	tiniPath := filepath.Join(rootfsDir, "usr/local/bin/tini")
+	if err := os.MkdirAll(filepath.Dir(tiniPath), 0o755); err != nil {
+		return 0, fmt.Errorf("mkdir /usr/local/bin: %w", err)
 	}
-	unitPath := filepath.Join(unitDir, "boxd.service")
-	if err := os.WriteFile(unitPath, []byte(boxdUnit), 0o644); err != nil {
-		return 0, fmt.Errorf("write boxd.service: %w", err)
+	if err := os.WriteFile(tiniPath, tiniBinary, 0o755); err != nil {
+		return 0, fmt.Errorf("write tini: %w", err)
+	}
+	// O_CREATE respects umask; chmod to normalize exactly 0755.
+	if err := os.Chmod(tiniPath, 0o755); err != nil {
+		return 0, fmt.Errorf("chmod tini: %w", err)
 	}
 
-	// Enable: multi-user.target.wants → boxd.service. systemctl enable
-	// would create this link at runtime; we bake it at build time so the
-	// VM comes up with boxd active on the very first boot.
-	wantsDir := filepath.Join(unitDir, "multi-user.target.wants")
-	if err := os.MkdirAll(wantsDir, 0o755); err != nil {
-		return 0, fmt.Errorf("mkdir %s: %w", wantsDir, err)
+	// Write the init wrapper at /sbin/init. Overwrites whatever the base
+	// image had (often a systemd symlink that won't work here). The kernel
+	// defaults to /sbin/init when no init= arg is passed, so this path is
+	// picked up automatically without any Firecracker-side changes.
+	if err := os.MkdirAll(filepath.Join(rootfsDir, "sbin"), 0o755); err != nil {
+		return 0, fmt.Errorf("mkdir /sbin: %w", err)
 	}
-	wantsLink := filepath.Join(wantsDir, "boxd.service")
-	_ = os.Remove(wantsLink) // overwrite if exists from a prior inject
-	if err := os.Symlink("../boxd.service", wantsLink); err != nil {
-		return 0, fmt.Errorf("symlink boxd.service into multi-user.target.wants: %w", err)
+	initPath := filepath.Join(rootfsDir, "sbin/init")
+	_ = os.Remove(initPath)
+	if err := os.WriteFile(initPath, []byte(initScript), 0o755); err != nil {
+		return 0, fmt.Errorf("write /sbin/init: %w", err)
+	}
+	if err := os.Chmod(initPath, 0o755); err != nil {
+		return 0, fmt.Errorf("chmod /sbin/init: %w", err)
+	}
+
+	// Write a static /etc/resolv.conf. Many base images (notably
+	// ubuntu:24.04) ship /etc/resolv.conf as a symlink to
+	// /run/systemd/resolve/stub-resolv.conf expecting systemd-resolved
+	// to provide DNS at 127.0.0.53. We don't run systemd-resolved — so
+	// we nuke the symlink and write a real file pointing at Google +
+	// Cloudflare public resolvers.
+	//
+	// 1.1.1.1 and 8.8.8.8 are both reachable from within our network
+	// namespace via the host's NAT. Order matters slightly: the first
+	// resolver is tried first, the second is a fallback.
+	resolvPath := filepath.Join(rootfsDir, "etc/resolv.conf")
+	if err := os.MkdirAll(filepath.Dir(resolvPath), 0o755); err != nil {
+		return 0, fmt.Errorf("mkdir /etc: %w", err)
+	}
+	_ = os.Remove(resolvPath) // handles the symlink case
+	if err := os.WriteFile(resolvPath, []byte(resolvConf), 0o644); err != nil {
+		return 0, fmt.Errorf("write /etc/resolv.conf: %w", err)
 	}
 
 	return binSize, nil
 }
 
-// boxdUnit is the systemd unit that boxd runs under inside every sandbox VM.
-// Kept minimal — no sandboxing directives because the entire VM is already
-// the isolation boundary. Restart=always so a crash loop surfaces the error
-// via journalctl without silently dropping the guest agent.
-const boxdUnit = `[Unit]
-Description=Superserve guest agent (boxd)
-After=network-online.target
-Wants=network-online.target
+// resolvConf is the minimal DNS config baked into every template rootfs.
+// Kept ASCII-only and ordered for predictable retry behavior.
+const resolvConf = `# Superserve template rootfs — baked at build time.
+# systemd-resolved is not running here; these are direct public resolvers.
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+options timeout:2 attempts:2
+`
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/boxd
-Restart=always
-RestartSec=2
-StandardOutput=journal
-StandardError=journal
+// initScript runs first as PID 1, mounts the filesystems the kernel doesn't
+// auto-mount, then exec's tini to take over. After the exec, tini is PID 1
+// (not the shell) and owns boxd as its supervised child.
+//
+// Why the shell wrapper instead of making /sbin/init be tini directly:
+//
+//	Tini is a C program that doesn't mount /proc, /sys, /dev. The kernel
+//	only mounts rootfs; everything else is userspace responsibility. If
+//	tini were PID 1 without these, libraries that read /proc/self/* —
+//	which boxd's Go runtime does at startup — would fail. A few lines of
+//	shell before the exec gets us a working OS environment, then hands off
+//	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
+//
+// POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
+const initScript = `#!/bin/sh
+# Superserve template init — mounts essentials, then execs tini to become
+# PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
 
-[Install]
-WantedBy=multi-user.target
+set +e
+mkdir -p /proc /sys /dev /run /tmp
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+mount -t tmpfs tmpfs /run 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+mkdir -p /home/user
+
+# Hand off to tini. After exec, tini is PID 1 — it'll reap zombies from
+# any process whose parent exits (common when boxd spawns subprocesses for
+# user ExecCommand calls and those spawn more), and forward SIGTERM to
+# boxd on graceful VM shutdown.
+exec /usr/local/bin/tini -- /usr/bin/boxd
 `
 
 // copyFile copies src → dst, creating parent directories as needed. Overwrites

@@ -915,7 +915,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromTemplate != nil {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+		// RestoreSnapshot (not ResumeInstance) for the from_template path:
+		// ResumeInstance assumes the VM already exists in vmd's in-memory
+		// map (the pause→resume contract), which is fine for a paused
+		// sandbox but not for a fresh one we're creating now. Restore
+		// takes snapshot paths and boots a new VM from them statelessly.
+		//
+		// Env vars for from_template aren't threaded through here — the
+		// template's own start_cmd covers most cases, and the few callers
+		// who need dynamic env can use ExecCommand's env param. Real
+		// env-var-at-create support for from_template is a follow-up.
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath)
 	} else {
 		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),
 			0, 0, 0, nil, req.EnvVars)
