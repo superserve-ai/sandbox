@@ -1,9 +1,10 @@
-.PHONY: build run test test-integration lint clean generate migrate image validate-boot deploy smoke-test seed-apikey up down
+.PHONY: build run test test-integration lint clean generate migrate image validate-boot deploy smoke-test seed-apikey seed-templates up down
 
 # Binary names
 CONTROLPLANE_BIN := bin/controlplane
 VMD_BIN := bin/vmd
 SEED_APIKEY_BIN := bin/seed-apikey
+SEED_TEMPLATES_BIN := bin/seed-templates
 BOXD_BIN := bin/boxd
 PROXY_BIN := bin/proxy
 
@@ -22,6 +23,14 @@ build-vmd:
 
 build-seed-apikey:
 	go build $(LDFLAGS) -o $(SEED_APIKEY_BIN) ./cmd/seed-apikey
+
+build-seed-templates:
+	go build $(LDFLAGS) -o $(SEED_TEMPLATES_BIN) ./cmd/seed-templates
+
+# Seed the 5 curated public templates. Requires DATABASE_URL + SYSTEM_TEAM_ID
+# in the environment. Idempotent — safe to run repeatedly.
+seed-templates: build-seed-templates
+	$(SEED_TEMPLATES_BIN) --dir seeds/templates
 
 build-boxd:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BOXD_BIN) ./cmd/boxd
