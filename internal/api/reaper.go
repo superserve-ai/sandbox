@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // ReaperConfig controls the timeout reaper loop.
@@ -90,6 +91,7 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
 	}
 
 	log.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
+	telemetry.IncReaperReaped(ctx, "timeout", int64(len(expired)))
 
 	for _, sbx := range expired {
 		// Check for shutdown between each pause so we exit promptly.

@@ -1,7 +1,9 @@
 [Unit]
 Description=Superserve VM Daemon
-After=network-online.target
+After=network-online.target superserve-otel-collector.service
 Wants=network-online.target
+# Soft dependency — vmd runs fine if the collector is missing (telemetry
+# becomes a no-op via OTEL_EXPORTER_OTLP_ENDPOINT being unset there).
 
 [Service]
 Type=simple

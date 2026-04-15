@@ -1,0 +1,33 @@
+# Local-dev OpenTelemetry Collector — prints everything to stdout.
+#
+# Use this when iterating on instrumentation code and you just want to see
+# the SDK is emitting what you expect, without standing up Tempo/Loki/Mimir.
+#
+# Run:
+#   otelcol-contrib --config=deploy/dev/otel-collector-stdout.yaml
+#
+# Then in another terminal:
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
+#   ./controlplane   (or vmd / proxy)
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      exporters: [debug]

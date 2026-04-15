@@ -1,0 +1,31 @@
+[Unit]
+Description=Superserve OpenTelemetry Collector (per-host)
+# Start before the apps so they have a collector listening when they boot.
+# Apps are no-op when they can't reach the collector, but starting in the
+# right order avoids harmless connect-refused warnings in journald.
+Before=superserve-vmd.service proxy.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/otelcol-contrib --config=/etc/sandbox/otel-collector.yaml
+EnvironmentFile=/etc/sandbox/otel-collector.env
+
+# Restart on crash but back off so we don't loop hard on a config error.
+Restart=always
+RestartSec=5
+KillMode=process
+
+# Cap memory — collector should never starve apps. memory_limiter inside
+# the config also enforces this in software for finer-grained shedding.
+MemoryMax=512M
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=superserve-otel-collector
+
+[Install]
+WantedBy=multi-user.target

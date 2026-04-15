@@ -16,13 +16,18 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
+
+// version is set by ldflags at build time; falls back to "dev".
+var version = "dev"
 
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
@@ -202,7 +207,8 @@ func main() {
 	log := zerolog.New(os.Stdout).With().
 		Timestamp().
 		Str("service", "vmd").
-		Logger()
+		Logger().
+		Hook(telemetry.ZerologTraceHook{})
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -232,6 +238,21 @@ func main() {
 	// Root context — cancelled on signal or on the first service exit.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Telemetry. No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset. Use HostID
+	// as the node identifier so per-host metrics are distinguishable.
+	tel, telErr := telemetry.New(ctx, "vmd", version, cfg.HostID)
+	if telErr != nil {
+		log.Fatal().Err(telErr).Msg("init telemetry")
+	}
+	defer func() {
+		if err := tel.Shutdown(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("telemetry shutdown")
+		}
+	}()
+	if err := tel.StartRuntimeInstrumentation(); err != nil {
+		log.Warn().Err(err).Msg("runtime instrumentation")
+	}
 
 	lc := newLifecycle(log)
 
@@ -370,6 +391,7 @@ func main() {
 	}
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(64 << 20), // 64 MiB
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 	vmdpb.RegisterVMDaemonServer(grpcServer, vm.NewGRPCAdapter(mgr))
 	lc.start("grpc server", func() error {

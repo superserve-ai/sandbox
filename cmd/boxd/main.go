@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
 	"github.com/creack/pty"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -58,13 +59,24 @@ func main() {
 
 	env := &sandboxEnv{}
 
+	// otelconnect server interceptor extracts trace context from inbound
+	// headers so spans link back to the controlplane → vmd → boxd chain.
+	// boxd does not initialise the telemetry SDK (it runs inside the VM
+	// where the collector is unreachable); spans are no-op locally but the
+	// trace IDs propagate correctly to anything boxd calls out to.
+	otelInt, otelErr := otelconnect.NewInterceptor()
+	var handlerOpts []connect.HandlerOption
+	if otelErr == nil {
+		handlerOpts = append(handlerOpts, connect.WithInterceptors(otelInt))
+	}
+
 	// Connect RPC services.
 	procService := &processService{
 		processes: &sync.Map{},
 		env:       env,
 	}
-	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
-	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
+	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService, handlerOpts...))
+	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}, handlerOpts...))
 
 	// Raw HTTP endpoints (file content transfer + health + init).
 	mux.HandleFunc("/files", handleFiles)

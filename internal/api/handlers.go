@@ -20,8 +20,29 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
+
+// lifecycleTimer captures the start time and emits a single
+// sandbox.lifecycle.duration record on completion. Outcome is derived from
+// the gin response status: 2xx = ok, 408/504 = timeout, anything else = error.
+// The `from` label is only meaningful for create; pass "" elsewhere.
+func lifecycleTimer(c *gin.Context, op telemetry.SandboxLifecycleOp, from string) func() {
+	start := time.Now()
+	return func() {
+		outcome := telemetry.OutcomeOK
+		switch s := c.Writer.Status(); {
+		case s >= 200 && s < 400:
+			outcome = telemetry.OutcomeOK
+		case s == http.StatusRequestTimeout || s == http.StatusGatewayTimeout:
+			outcome = telemetry.OutcomeTimeout
+		default:
+			outcome = telemetry.OutcomeError
+		}
+		telemetry.RecordSandboxLifecycle(c.Request.Context(), op, outcome, from, time.Since(start).Seconds())
+	}
+}
 
 // VMDClient is the interface for talking to a VM daemon.
 type VMDClient = vmdclient.Client
@@ -324,6 +345,7 @@ func teamIDFromContext(c *gin.Context) (uuid.UUID, error) {
 // ---------------------------------------------------------------------------
 
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
+	defer lifecycleTimer(c, telemetry.OpResume, "")()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -461,6 +483,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 func (h *Handlers) DeleteSandbox(c *gin.Context) {
+	defer lifecycleTimer(c, telemetry.OpDestroy, "")()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -762,6 +785,20 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
+	// `from` is determined inside the handler (snapshot vs cold) and the
+	// label would require mutation across the deferred closure. Use a
+	// pointer so the handler can update the from label before the timer
+	// fires. Default is empty (unlabelled).
+	from := ""
+	defer func(start time.Time) {
+		outcome := telemetry.OutcomeOK
+		if s := c.Writer.Status(); s < 200 || s >= 400 {
+			outcome = telemetry.OutcomeError
+		}
+		telemetry.RecordSandboxLifecycle(c.Request.Context(), telemetry.OpCreate, outcome, from, time.Since(start).Seconds())
+	}(time.Now())
+	_ = from // silence unused warning until we wire the snapshot/cold branch label
+
 	var req createSandboxRequest
 	if err := bindJSONStrict(c, &req); err != nil {
 		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
@@ -1047,6 +1084,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
+	defer lifecycleTimer(c, telemetry.OpPause, "")()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
