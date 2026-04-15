@@ -54,6 +54,24 @@ func main() {
 	log.SetPrefix("[boxd] ")
 	log.SetFlags(log.Ltime)
 
+	// Ensure defaultHome exists before we accept any RPCs. Start()
+	// defaults cmd.Dir to defaultHome when the caller omits Cwd; if the
+	// directory is missing, exec fails with "chdir: no such file or
+	// directory" — a cryptic failure mode for template builds whose base
+	// images don't create /home/user (python:3.11, ubuntu:24.04, etc.).
+	//
+	// Fatal on failure — boxd can't reliably serve Start() requests
+	// without a working defaultHome, and silently degrading would push
+	// the failure to the first user exec.
+	if err := os.MkdirAll(defaultHome, 0o755); err != nil {
+		log.Fatalf("ensure defaultHome %s: %v", defaultHome, err)
+	}
+	// Chmod separately — MkdirAll respects umask and may strip group /
+	// other bits. We want exactly 0755 so non-root processes can cd in.
+	if err := os.Chmod(defaultHome, 0o755); err != nil {
+		log.Fatalf("chmod defaultHome %s: %v", defaultHome, err)
+	}
+
 	mux := http.NewServeMux()
 
 	env := &sandboxEnv{}
