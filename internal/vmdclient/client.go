@@ -40,6 +40,13 @@ type Client interface {
 	// CancelBuild tells vmd to abort an in-flight build. Idempotent — safe
 	// to call on unknown or already-terminal builds.
 	CancelBuild(ctx context.Context, buildVMID string) error
+
+	// StreamBuildLogs opens a server-streaming RPC and delivers each event
+	// to onEvent. Replays buffered history first, then streams live events
+	// until the build reaches a terminal status (stream closes cleanly) or
+	// ctx is cancelled. Returns nil on clean close, an error on transport
+	// failure or gRPC NotFound (which callers surface as SSE 404).
+	StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(BuildLogEvent) error) error
 }
 
 // BuildTemplateInput mirrors vmdpb.BuildTemplateRequest at the client layer
@@ -71,6 +78,16 @@ type BuildCopyOp struct {
 type BuildEnvOp struct {
 	Key   string
 	Value string
+}
+
+// BuildLogEvent is one decoded event from StreamBuildLogs. Finished=true
+// signals the build reached a terminal status and the stream has closed.
+type BuildLogEvent struct {
+	TimestampUnixNanos int64
+	Stream             string // "stdout" | "stderr" | "system"
+	Text               string
+	Finished           bool
+	Status             string // "ready" | "failed" | "cancelled" when Finished
 }
 
 // BuildStatusResult is the decoded form of vmdpb.GetBuildStatusResponse.

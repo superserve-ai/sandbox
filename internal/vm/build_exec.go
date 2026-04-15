@@ -39,10 +39,10 @@ const readyProbeInterval = 2 * time.Second
 // vmIP, in order. Returns on first failure (non-zero exit for `run`, decode
 // failure for `copy`, etc.) with a wrapped error.
 //
-// Output streams (stdout/stderr) from each step are logged at INFO level
-// prefixed with the step index. This is the source the supervisor's log
-// buffer will fan out to SSE clients (day 11).
-func (m *Manager) executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec, log zerolog.Logger) error {
+// Output streams (stdout/stderr) are forwarded to the build's log buffer
+// (via m.appendBuildLog) where gRPC/SSE subscribers pick them up. The same
+// data is also logged at INFO for operator-side observability.
+func (m *Manager) executeBuildSteps(ctx context.Context, buildVMID, vmIP string, spec builder.BuildSpec, log zerolog.Logger) error {
 	state := buildStepState{
 		env: map[string]string{},
 	}
@@ -57,8 +57,16 @@ func (m *Manager) executeBuildSteps(ctx context.Context, vmIP string, spec build
 		stepLog := log.With().Int("step", i+1).Int("total", len(spec.Steps)).Logger()
 		stepStart := time.Now()
 
+		// Emit a system event marking the step boundary so log viewers
+		// can visually distinguish steps. The text format is stable — the
+		// SDK may parse it for UI rendering, so keep it consistent.
+		m.appendBuildLog(buildVMID, BuildLogEvent{
+			Stream: LogStreamSystem,
+			Text:   fmt.Sprintf("step %d/%d", i+1, len(spec.Steps)),
+		})
+
 		stepCtx, cancel := context.WithTimeout(ctx, stepTimeout)
-		err := runBuildStep(stepCtx, vmIP, step, &state, stepLog)
+		err := m.runBuildStep(stepCtx, buildVMID, vmIP, step, &state, stepLog)
 		cancel()
 
 		if err != nil {
@@ -72,19 +80,27 @@ func (m *Manager) executeBuildSteps(ctx context.Context, vmIP string, spec build
 // runBuildStep dispatches on the step's op field. Exactly one of run / copy /
 // env / workdir must be set (enforced at the gRPC boundary; a defensive
 // check here catches internal bugs that bypass that boundary).
-func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, state *buildStepState, log zerolog.Logger) error {
+func (m *Manager) runBuildStep(ctx context.Context, buildVMID, vmIP string, step builder.BuildStep, state *buildStepState, log zerolog.Logger) error {
 	switch {
 	case step.Run != nil:
-		return runRunStep(ctx, vmIP, *step.Run, state, log)
+		return m.runRunStep(ctx, buildVMID, vmIP, *step.Run, state, log)
 	case step.Copy != nil:
-		return runCopyStep(ctx, vmIP, step.Copy, state, log)
+		return m.runCopyStep(ctx, buildVMID, vmIP, step.Copy, state, log)
 	case step.Env != nil:
 		state.env[step.Env.Key] = step.Env.Value
 		log.Info().Str("key", step.Env.Key).Msg("env set")
+		m.appendBuildLog(buildVMID, BuildLogEvent{
+			Stream: LogStreamSystem,
+			Text:   fmt.Sprintf("env %s=%s", step.Env.Key, step.Env.Value),
+		})
 		return nil
 	case step.Workdir != nil:
 		state.workdir = *step.Workdir
 		log.Info().Str("workdir", state.workdir).Msg("workdir set")
+		m.appendBuildLog(buildVMID, BuildLogEvent{
+			Stream: LogStreamSystem,
+			Text:   fmt.Sprintf("workdir %s", state.workdir),
+		})
 		return nil
 	default:
 		return fmt.Errorf("build step has no op set")
@@ -95,8 +111,12 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, stat
 // wrapped in /bin/sh -c (via httpExec's default path) so the user can use
 // shell features like pipes, redirects, and variable expansion. Exits non-zero
 // → step failure.
-func runRunStep(ctx context.Context, vmIP string, cmd string, state *buildStepState, log zerolog.Logger) error {
+func (m *Manager) runRunStep(ctx context.Context, buildVMID, vmIP string, cmd string, state *buildStepState, log zerolog.Logger) error {
 	log.Info().Str("cmd", truncate(cmd, 256)).Msg("running step")
+	m.appendBuildLog(buildVMID, BuildLogEvent{
+		Stream: LogStreamSystem,
+		Text:   fmt.Sprintf("$ %s", truncate(cmd, 512)),
+	})
 
 	opts := &ExecOptions{
 		Env:        state.env,
@@ -105,15 +125,18 @@ func runRunStep(ctx context.Context, vmIP string, cmd string, state *buildStepSt
 
 	// Stream output in real time rather than buffering — a long-running
 	// `apt-get install` emits hundreds of KB of output, and buffering it
-	// all in memory before surfacing is both wasteful and hides progress
-	// from the build log stream.
+	// all in memory before surfacing hides progress from the log stream.
 	var lastExit int32
 	err := httpExecStream(ctx, vmIP, cmd, stepTimeout, opts, func(stdout, stderr []byte, exitCode int32, finished bool) {
 		if len(stdout) > 0 {
-			log.Info().Str("stream", "stdout").Str("data", strings.TrimRight(string(stdout), "\n")).Msg("build output")
+			text := strings.TrimRight(string(stdout), "\n")
+			log.Info().Str("stream", "stdout").Str("data", text).Msg("build output")
+			m.appendBuildLog(buildVMID, BuildLogEvent{Stream: LogStreamStdout, Text: text})
 		}
 		if len(stderr) > 0 {
-			log.Info().Str("stream", "stderr").Str("data", strings.TrimRight(string(stderr), "\n")).Msg("build output")
+			text := strings.TrimRight(string(stderr), "\n")
+			log.Info().Str("stream", "stderr").Str("data", text).Msg("build output")
+			m.appendBuildLog(buildVMID, BuildLogEvent{Stream: LogStreamStderr, Text: text})
 		}
 		if finished {
 			lastExit = exitCode
@@ -137,30 +160,27 @@ func runRunStep(ctx context.Context, vmIP string, cmd string, state *buildStepSt
 // coordination; (2) the payload is capped at 1 MiB by API validation, well
 // under typical ARG_MAX (~2 MiB on Linux); (3) atomic from boxd's point of
 // view — one Start call, one exit code, easy to log.
-func runCopyStep(ctx context.Context, vmIP string, op *builder.CopyOp, state *buildStepState, log zerolog.Logger) error {
+func (m *Manager) runCopyStep(ctx context.Context, buildVMID, vmIP string, op *builder.CopyOp, state *buildStepState, log zerolog.Logger) error {
 	if op.Dst == "" {
 		return fmt.Errorf("copy.dst is empty")
 	}
-	// Defensive: we don't want users able to write to paths that break
-	// the system. Reject destinations outside the typical writable areas.
-	// This is belt-and-suspenders; the VM is already isolated, but a user
-	// mistake with `dst: "/"` or `dst: "/boot"` can still damage the
-	// snapshot we're about to take.
 	if !isSafeCopyDst(op.Dst) {
 		return fmt.Errorf("copy.dst must be absolute and not point at a system path (got %q)", op.Dst)
 	}
 
 	log.Info().Str("dst", op.Dst).Int("bytes", len(op.Src)).Msg("copying files")
+	m.appendBuildLog(buildVMID, BuildLogEvent{
+		Stream: LogStreamSystem,
+		Text:   fmt.Sprintf("copy %d bytes → %s", len(op.Src), op.Dst),
+	})
 
 	// Base64 alphabet is [A-Za-z0-9+/=] — no shell metacharacters, so
-	// single-quoting it is safe. printf + sh -c avoids relying on `echo`
-	// which has implementation-defined behavior for backslashes.
+	// single-quoting it is safe.
 	shCmd := fmt.Sprintf(
 		"mkdir -p %s && printf '%%s' '%s' | base64 -d | tar -C %s -xf -",
 		shellQuote(op.Dst), op.Src, shellQuote(op.Dst),
 	)
-
-	return runRunStep(ctx, vmIP, shCmd, state, log)
+	return m.runRunStep(ctx, buildVMID, vmIP, shCmd, state, log)
 }
 
 // isSafeCopyDst returns true when dst is an absolute path that does NOT
@@ -200,11 +220,15 @@ func shellQuote(s string) string {
 // Uses a detached context (context.WithoutCancel of the caller's) so that
 // when the caller's context is cancelled mid-snapshot, we don't also kill
 // the process we just asked to start.
-func (m *Manager) runStartCmd(ctx context.Context, vmIP string, spec builder.BuildSpec, log zerolog.Logger) error {
+func (m *Manager) runStartCmd(ctx context.Context, buildVMID, vmIP string, spec builder.BuildSpec, log zerolog.Logger) error {
 	if spec.StartCmd == "" {
 		return nil
 	}
 	log.Info().Str("cmd", truncate(spec.StartCmd, 256)).Msg("launching start_cmd")
+	m.appendBuildLog(buildVMID, BuildLogEvent{
+		Stream: LogStreamSystem,
+		Text:   fmt.Sprintf("start_cmd: %s", truncate(spec.StartCmd, 256)),
+	})
 
 	// Fire-and-forget pattern: call Start() on boxd, read the first
 	// StartEvent to confirm the process launched, then abandon the stream.
@@ -239,11 +263,15 @@ func (m *Manager) runStartCmd(ctx context.Context, vmIP string, spec builder.Bui
 // Empty ReadyCmd = no wait. Callers should set it whenever StartCmd is set
 // and has any nontrivial startup latency; otherwise the snapshot may capture
 // a process that hasn't bound its port yet.
-func (m *Manager) pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec, log zerolog.Logger) error {
+func (m *Manager) pollReadyCmd(ctx context.Context, buildVMID, vmIP string, spec builder.BuildSpec, log zerolog.Logger) error {
 	if spec.ReadyCmd == "" {
 		return nil
 	}
 	log.Info().Str("cmd", truncate(spec.ReadyCmd, 256)).Msg("polling ready_cmd")
+	m.appendBuildLog(buildVMID, BuildLogEvent{
+		Stream: LogStreamSystem,
+		Text:   fmt.Sprintf("ready_cmd: %s", truncate(spec.ReadyCmd, 256)),
+	})
 
 	probeCtx, cancel := context.WithTimeout(ctx, readyProbeTimeout)
 	defer cancel()

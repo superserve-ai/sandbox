@@ -150,7 +150,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// Phase 4: execute build steps in order. On failure, tear down the
 	// build VM and propagate the error — we don't snapshot a half-built
 	// template.
-	if err := m.executeBuildSteps(ctx, inst.IP, req.Spec, log); err != nil {
+	if err := m.executeBuildSteps(ctx, buildVMID, inst.IP, req.Spec, log); err != nil {
 		cleanup("build steps failed")
 		return nil, fmt.Errorf("execute build steps: %w", err)
 	}
@@ -158,14 +158,14 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// Phase 5: start_cmd — launch the long-lived process whose live state
 	// we want the snapshot to capture. Fire-and-forget; we don't wait for
 	// exit because the point is to keep it running.
-	if err := m.runStartCmd(ctx, inst.IP, req.Spec, log); err != nil {
+	if err := m.runStartCmd(ctx, buildVMID, inst.IP, req.Spec, log); err != nil {
 		cleanup("start_cmd failed")
 		return nil, fmt.Errorf("launch start_cmd: %w", err)
 	}
 
 	// Phase 5b: ready_cmd — block until the start process is actually
 	// serving, so the snapshot captures a useful state. No-op if unset.
-	if err := m.pollReadyCmd(ctx, inst.IP, req.Spec, log); err != nil {
+	if err := m.pollReadyCmd(ctx, buildVMID, inst.IP, req.Spec, log); err != nil {
 		cleanup("ready_cmd timed out")
 		return nil, fmt.Errorf("ready_cmd: %w", err)
 	}
@@ -174,6 +174,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// Flip the registry status so the supervisor (and SDK poller) can tell
 	// when user-step execution ends and the pause/dump phase begins.
 	m.setBuildStatus(buildVMID, BuildStatusSnapshotting)
+	m.appendBuildLog(buildVMID, BuildLogEvent{Stream: LogStreamSystem, Text: "snapshotting"})
 	snapPath, memPath, err := m.CreateVMSnapshot(ctx, buildVMID, snapshotDir)
 	if err != nil {
 		cleanup("snapshot failed")

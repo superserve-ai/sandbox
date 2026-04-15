@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -17,6 +18,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // ---------------------------------------------------------------------------
@@ -677,13 +679,111 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 	return tpl, nil
 }
 
-// StreamTemplateBuildLogs is the SSE log stream endpoint. The real
-// implementation streams ProcessEvent chunks from boxd via the build
-// supervisor's in-memory log buffer (Day 11 in the implementation
-// order). Until then, return 501 so SDKs can probe for support but not
-// hang waiting for events that will never arrive.
+// StreamTemplateBuildLogs is the SSE log stream endpoint. Bridges vmd's
+// server-streaming StreamBuildLogs RPC into Server-Sent Events for the SDK.
+//
+// Flow:
+//  1. Look up the template_build row (team scope check).
+//  2. If no vmd_build_vm_id yet, build is still pending — emit a "pending"
+//     system event and close. Client polls again.
+//  3. Otherwise open vmd.StreamBuildLogs and re-emit each event as SSE.
+//  4. Close when the stream sends Finished or the client disconnects.
 func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
-	respondErrorMsg(c, "not_implemented",
-		"build log streaming is not yet wired (planned: Day 11)",
-		http.StatusNotImplemented)
+	buildID, err := parseBuildID(c)
+	if err != nil {
+		return
+	}
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+
+	build, err := h.DB.GetTemplateBuild(c.Request.Context(), db.GetTemplateBuildParams{
+		ID:     buildID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "not_found", "Build not found", http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("build_id", buildID.String()).Msg("DB GetTemplateBuild failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	writeEvent := func(ev gin.H) {
+		data, marshalErr := json.Marshal(ev)
+		if marshalErr != nil {
+			return
+		}
+		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	// Pending build: no vmd_build_vm_id yet, nothing to stream. Tell the
+	// client explicitly and close — they can re-poll in a few seconds.
+	if build.VmdBuildVmID == nil || *build.VmdBuildVmID == "" {
+		writeEvent(gin.H{
+			"timestamp": time.Now().Format(time.RFC3339Nano),
+			"stream":    "system",
+			"text":      "build is still pending (not yet dispatched to a host)",
+			"finished":  true,
+			"status":    string(build.Status),
+		})
+		return
+	}
+
+	// Resolve the vmd client for the host that's running this build. For
+	// single-host V1 it's the default client; multi-host uses the host
+	// registry. Missing host ID (shouldn't happen post-dispatch) falls
+	// back to the default client.
+	hostID := ""
+	if build.VmdHostID != nil {
+		hostID = *build.VmdHostID
+	}
+	vmdc, vmdErr := h.vmdForHost(c.Request.Context(), hostID)
+	if vmdErr != nil {
+		writeEvent(gin.H{
+			"stream":   "system",
+			"text":     "failed to reach build host",
+			"finished": true,
+			"status":   "failed",
+		})
+		log.Error().Err(vmdErr).Str("build_id", buildID.String()).Msg("resolve VMD for log stream")
+		return
+	}
+
+	streamErr := vmdc.StreamBuildLogs(c.Request.Context(), *build.VmdBuildVmID, func(ev vmdclient.BuildLogEvent) error {
+		writeEvent(gin.H{
+			"timestamp": time.Unix(0, ev.TimestampUnixNanos).Format(time.RFC3339Nano),
+			"stream":    ev.Stream,
+			"text":      ev.Text,
+			"finished":  ev.Finished,
+			"status":    ev.Status,
+		})
+		return nil
+	})
+	if streamErr != nil {
+		// The HTTP response committed 200 at header-send time, so we can't
+		// downgrade the status. Emit a terminal error event so the client
+		// knows what happened.
+		writeEvent(gin.H{
+			"stream":   "system",
+			"text":     fmt.Sprintf("log stream ended with error: %v", streamErr),
+			"finished": true,
+			"status":   "failed",
+		})
+	}
 }

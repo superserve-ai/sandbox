@@ -33,6 +33,7 @@ const (
 	VMDaemon_BuildTemplate_FullMethodName        = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
 	VMDaemon_GetBuildStatus_FullMethodName       = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
 	VMDaemon_CancelBuild_FullMethodName          = "/superserve.vmd.v1.VMDaemon/CancelBuild"
+	VMDaemon_StreamBuildLogs_FullMethodName      = "/superserve.vmd.v1.VMDaemon/StreamBuildLogs"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -77,6 +78,11 @@ type VMDaemonClient interface {
 	// CancelBuild aborts an in-flight build and tears down the build VM.
 	// Idempotent — no-op for unknown or already-terminal builds.
 	CancelBuild(ctx context.Context, in *CancelBuildRequest, opts ...grpc.CallOption) (*CancelBuildResponse, error)
+	// StreamBuildLogs returns a server-streaming feed of log events for a
+	// build. Replays buffered history in order first, then streams live
+	// events as they arrive. Closes when the build reaches a terminal
+	// status. Used by the control plane to drive /builds/:id/logs SSE.
+	StreamBuildLogs(ctx context.Context, in *StreamBuildLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BuildLogEvent], error)
 }
 
 type vMDaemonClient struct {
@@ -236,6 +242,25 @@ func (c *vMDaemonClient) CancelBuild(ctx context.Context, in *CancelBuildRequest
 	return out, nil
 }
 
+func (c *vMDaemonClient) StreamBuildLogs(ctx context.Context, in *StreamBuildLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BuildLogEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[1], VMDaemon_StreamBuildLogs_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamBuildLogsRequest, BuildLogEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type VMDaemon_StreamBuildLogsClient = grpc.ServerStreamingClient[BuildLogEvent]
+
 // VMDaemonServer is the server API for VMDaemon service.
 // All implementations must embed UnimplementedVMDaemonServer
 // for forward compatibility.
@@ -278,6 +303,11 @@ type VMDaemonServer interface {
 	// CancelBuild aborts an in-flight build and tears down the build VM.
 	// Idempotent — no-op for unknown or already-terminal builds.
 	CancelBuild(context.Context, *CancelBuildRequest) (*CancelBuildResponse, error)
+	// StreamBuildLogs returns a server-streaming feed of log events for a
+	// build. Replays buffered history in order first, then streams live
+	// events as they arrive. Closes when the build reaches a terminal
+	// status. Used by the control plane to drive /builds/:id/logs SSE.
+	StreamBuildLogs(*StreamBuildLogsRequest, grpc.ServerStreamingServer[BuildLogEvent]) error
 	mustEmbedUnimplementedVMDaemonServer()
 }
 
@@ -329,6 +359,9 @@ func (UnimplementedVMDaemonServer) GetBuildStatus(context.Context, *GetBuildStat
 }
 func (UnimplementedVMDaemonServer) CancelBuild(context.Context, *CancelBuildRequest) (*CancelBuildResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CancelBuild not implemented")
+}
+func (UnimplementedVMDaemonServer) StreamBuildLogs(*StreamBuildLogsRequest, grpc.ServerStreamingServer[BuildLogEvent]) error {
+	return status.Error(codes.Unimplemented, "method StreamBuildLogs not implemented")
 }
 func (UnimplementedVMDaemonServer) mustEmbedUnimplementedVMDaemonServer() {}
 func (UnimplementedVMDaemonServer) testEmbeddedByValue()                  {}
@@ -596,6 +629,17 @@ func _VMDaemon_CancelBuild_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_StreamBuildLogs_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamBuildLogsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(VMDaemonServer).StreamBuildLogs(m, &grpc.GenericServerStream[StreamBuildLogsRequest, BuildLogEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type VMDaemon_StreamBuildLogsServer = grpc.ServerStreamingServer[BuildLogEvent]
+
 // VMDaemon_ServiceDesc is the grpc.ServiceDesc for VMDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -660,6 +704,11 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ExecCommand",
 			Handler:       _VMDaemon_ExecCommand_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamBuildLogs",
+			Handler:       _VMDaemon_StreamBuildLogs_Handler,
 			ServerStreams: true,
 		},
 	},

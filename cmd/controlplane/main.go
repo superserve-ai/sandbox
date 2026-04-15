@@ -398,3 +398,31 @@ func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error
 	}
 	return nil
 }
+
+func (c *grpcVMDClient) StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(vmdclient.BuildLogEvent) error) error {
+	stream, err := c.client.StreamBuildLogs(ctx, &vmdpb.StreamBuildLogsRequest{BuildVmId: buildVMID})
+	if err != nil {
+		return fmt.Errorf("gRPC StreamBuildLogs: %w", err)
+	}
+	for {
+		pbEv, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("recv build log: %w", err)
+		}
+		if cbErr := onEvent(vmdclient.BuildLogEvent{
+			TimestampUnixNanos: pbEv.GetTimestampUnixNanos(),
+			Stream:             pbEv.GetStream(),
+			Text:               pbEv.GetText(),
+			Finished:           pbEv.GetFinished(),
+			Status:             pbEv.GetStatus(),
+		}); cbErr != nil {
+			return cbErr
+		}
+		if pbEv.GetFinished() {
+			return nil
+		}
+	}
+}

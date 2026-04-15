@@ -344,6 +344,50 @@ func (a *GRPCAdapter) CancelBuild(ctx context.Context, req *vmdpb.CancelBuildReq
 	return &vmdpb.CancelBuildResponse{}, nil
 }
 
+// StreamBuildLogs bridges the manager's in-memory pub-sub into a gRPC
+// server stream. Subscribing replays buffered history first, then streams
+// new events until the build reaches a terminal status (log buffer closes).
+// Returns NotFound when the build is unknown — the client maps that to a
+// 404 on its SSE endpoint.
+func (a *GRPCAdapter) StreamBuildLogs(req *vmdpb.StreamBuildLogsRequest, stream vmdpb.VMDaemon_StreamBuildLogsServer) error {
+	if req.GetBuildVmId() == "" {
+		return status.Error(codes.InvalidArgument, "build_vm_id is required")
+	}
+	sub, unsubscribe, ok := a.mgr.subscribeBuildLogs(req.GetBuildVmId())
+	if !ok {
+		return status.Errorf(codes.NotFound, "build %s not found", req.GetBuildVmId())
+	}
+	defer unsubscribe()
+
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev, open := <-sub:
+			if !open {
+				// Buffer closed → build terminal, stream already emitted
+				// the Finished event. Clean return closes the RPC.
+				return nil
+			}
+			pbEv := &vmdpb.BuildLogEvent{
+				TimestampUnix:      ev.Timestamp.Unix(),
+				TimestampUnixNanos: ev.Timestamp.UnixNano(),
+				Stream:             string(ev.Stream),
+				Text:               ev.Text,
+				Finished:           ev.Finished,
+				Status:             string(ev.Status),
+			}
+			if err := stream.Send(pbEv); err != nil {
+				return err
+			}
+			if ev.Finished {
+				return nil
+			}
+		}
+	}
+}
+
 // buildStepFromProto converts a proto BuildStep to the internal/builder
 // type. Enforces the "exactly one op" invariant at the gRPC boundary so
 // BuildTemplate never has to worry about it.

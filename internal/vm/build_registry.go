@@ -47,6 +47,10 @@ type buildRecord struct {
 	// goroutine notices; CancelBuild also destroys the build VM so boxd
 	// + systemd state gets reclaimed immediately.
 	cancel context.CancelFunc
+
+	// logs is the build's per-build log buffer. Publishers append; SSE /
+	// gRPC stream consumers subscribe. Closed on terminal status.
+	logs *buildLogBuffer
 }
 
 // Snapshot is the client-visible read view of a buildRecord (no cancel fn).
@@ -87,6 +91,7 @@ func (m *Manager) registerBuild(buildVMID, templateID string, cancel context.Can
 		Status:     BuildStatusRunning,
 		StartedAt:  time.Now(),
 		cancel:     cancel,
+		logs:       newBuildLogBuffer(),
 	}
 	m.builds[buildVMID] = rec
 	return rec, nil
@@ -116,12 +121,13 @@ func (m *Manager) setBuildStatus(buildVMID string, newStatus BuildStatus) bool {
 // status wins and this call is a no-op.
 func (m *Manager) completeBuild(buildVMID string, result *BuildTemplateResult, buildErr error) {
 	m.buildsMu.Lock()
-	defer m.buildsMu.Unlock()
 	rec, ok := m.builds[buildVMID]
 	if !ok {
+		m.buildsMu.Unlock()
 		return
 	}
 	if rec.Status.IsTerminal() {
+		m.buildsMu.Unlock()
 		return // cancelled wins over a late success or later failure
 	}
 	rec.EndedAt = time.Now()
@@ -131,6 +137,16 @@ func (m *Manager) completeBuild(buildVMID string, result *BuildTemplateResult, b
 	} else {
 		rec.Status = BuildStatusReady
 		rec.Result = result
+	}
+	logs := rec.logs
+	finalStatus := rec.Status
+	m.buildsMu.Unlock()
+
+	// Close the log buffer OUTSIDE the registry lock so subscribers that
+	// are blocked trying to Read from their channel can unwind without
+	// contending with the registry.
+	if logs != nil {
+		logs.Close(finalStatus)
 	}
 }
 
@@ -154,9 +170,14 @@ func (m *Manager) cancelBuildRecord(buildVMID string, reason string) (BuildStatu
 	rec.Error = reason
 	rec.EndedAt = time.Now()
 	cancelFn := rec.cancel
+	logs := rec.logs
 	m.buildsMu.Unlock()
 	if cancelFn != nil {
 		cancelFn()
+	}
+	// Close log buffer so subscribers get a Finished event and exit.
+	if logs != nil {
+		logs.Close(BuildStatusCancelled)
 	}
 	return prev, true
 }

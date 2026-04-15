@@ -55,6 +55,12 @@ service VMDaemon {
   // CancelBuild aborts an in-flight build and tears down the build VM.
   // Idempotent — no-op for unknown or already-terminal builds.
   rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);
+
+  // StreamBuildLogs returns a server-streaming feed of log events for a
+  // build. Replays buffered history in order first, then streams live
+  // events as they arrive. Closes when the build reaches a terminal
+  // status. Used by the control plane to drive /builds/:id/logs SSE.
+  rpc StreamBuildLogs(StreamBuildLogsRequest) returns (stream BuildLogEvent);
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +142,23 @@ message CancelBuildRequest {
 }
 
 message CancelBuildResponse {}
+
+message StreamBuildLogsRequest {
+  string build_vm_id = 1;
+}
+
+message BuildLogEvent {
+  int64 timestamp_unix = 1;       // Server-side emit time, seconds since epoch.
+  int64 timestamp_unix_nanos = 2; // Nanos-since-epoch for sub-second ordering.
+  // Stream source: "stdout" / "stderr" forwarded from boxd, "system" for
+  // supervisor-emitted text (step boundaries, "snapshotting", terminal).
+  string stream = 3;
+  string text = 4;
+  // Present on the final event emitted when the build finalizes. Caller
+  // should close its SSE connection after receiving a finished event.
+  bool finished = 5;
+  string status = 6; // "ready" | "failed" | "cancelled", set when finished.
+}
 
 // ---------------------------------------------------------------------------
 // Resource limits
