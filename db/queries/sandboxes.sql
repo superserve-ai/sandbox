@@ -3,8 +3,9 @@
 -- than defaulted in SQL, so the caller can parallelize this INSERT with
 -- the VMD CreateVM call — both need the same sandbox_id and generating
 -- it client-side lets them run concurrently instead of strictly serially.
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+-- template_id is optional (NULL when sandbox is not derived from a template).
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 RETURNING *;
 
 -- name: GetSandbox :one

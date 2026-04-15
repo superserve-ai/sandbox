@@ -60,6 +60,138 @@ func (ns NullSandboxStatus) Value() (driver.Value, error) {
 	return string(ns.SandboxStatus), nil
 }
 
+type TemplateBuildStatus string
+
+const (
+	TemplateBuildStatusPending      TemplateBuildStatus = "pending"
+	TemplateBuildStatusBuilding     TemplateBuildStatus = "building"
+	TemplateBuildStatusSnapshotting TemplateBuildStatus = "snapshotting"
+	TemplateBuildStatusReady        TemplateBuildStatus = "ready"
+	TemplateBuildStatusFailed       TemplateBuildStatus = "failed"
+	TemplateBuildStatusCancelled    TemplateBuildStatus = "cancelled"
+)
+
+func (e *TemplateBuildStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = TemplateBuildStatus(s)
+	case string:
+		*e = TemplateBuildStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for TemplateBuildStatus: %T", src)
+	}
+	return nil
+}
+
+type NullTemplateBuildStatus struct {
+	TemplateBuildStatus TemplateBuildStatus `json:"template_build_status"`
+	Valid               bool                `json:"valid"` // Valid is true if TemplateBuildStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullTemplateBuildStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.TemplateBuildStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.TemplateBuildStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullTemplateBuildStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.TemplateBuildStatus), nil
+}
+
+type TemplateStatus string
+
+const (
+	TemplateStatusPending  TemplateStatus = "pending"
+	TemplateStatusBuilding TemplateStatus = "building"
+	TemplateStatusReady    TemplateStatus = "ready"
+	TemplateStatusFailed   TemplateStatus = "failed"
+)
+
+func (e *TemplateStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = TemplateStatus(s)
+	case string:
+		*e = TemplateStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for TemplateStatus: %T", src)
+	}
+	return nil
+}
+
+type NullTemplateStatus struct {
+	TemplateStatus TemplateStatus `json:"template_status"`
+	Valid          bool           `json:"valid"` // Valid is true if TemplateStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullTemplateStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.TemplateStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.TemplateStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullTemplateStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.TemplateStatus), nil
+}
+
+type TemplateVisibility string
+
+const (
+	TemplateVisibilityPrivate TemplateVisibility = "private"
+	TemplateVisibilityPublic  TemplateVisibility = "public"
+)
+
+func (e *TemplateVisibility) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = TemplateVisibility(s)
+	case string:
+		*e = TemplateVisibility(s)
+	default:
+		return fmt.Errorf("unsupported scan type for TemplateVisibility: %T", src)
+	}
+	return nil
+}
+
+type NullTemplateVisibility struct {
+	TemplateVisibility TemplateVisibility `json:"template_visibility"`
+	Valid              bool               `json:"valid"` // Valid is true if TemplateVisibility is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullTemplateVisibility) Scan(value interface{}) error {
+	if value == nil {
+		ns.TemplateVisibility, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.TemplateVisibility.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullTemplateVisibility) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.TemplateVisibility), nil
+}
+
 type Activity struct {
 	ID          uuid.UUID   `json:"id"`
 	SandboxID   uuid.UUID   `json:"sandbox_id"`
@@ -161,7 +293,8 @@ type Sandbox struct {
 	// Hard lifetime cap in seconds from created_at. NULL = no cap. The reaper destroys the sandbox when now() > created_at + (timeout_seconds || ' seconds')::interval, regardless of state (active, paused, idle).
 	TimeoutSeconds *int32 `json:"timeout_seconds"`
 	// User-supplied flat string→string tags attached at creation. Immutable. Filterable on list endpoints via jsonb @> containment. Always non-null; an absent value is the empty object {}, never NULL.
-	Metadata []byte `json:"metadata"`
+	Metadata   []byte      `json:"metadata"`
+	TemplateID pgtype.UUID `json:"template_id"`
 }
 
 type Snapshot struct {
@@ -178,10 +311,11 @@ type Snapshot struct {
 }
 
 type Team struct {
-	ID        uuid.UUID `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID               uuid.UUID `json:"id"`
+	Name             string    `json:"name"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	BuildConcurrency int32     `json:"build_concurrency"`
 }
 
 type TeamMember struct {
@@ -189,4 +323,40 @@ type TeamMember struct {
 	ProfileID uuid.UUID `json:"profile_id"`
 	Role      string    `json:"role"`
 	JoinedAt  time.Time `json:"joined_at"`
+}
+
+type Template struct {
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	Alias        string             `json:"alias"`
+	Visibility   TemplateVisibility `json:"visibility"`
+	Status       TemplateStatus     `json:"status"`
+	BuildSpec    []byte             `json:"build_spec"`
+	Vcpu         int32              `json:"vcpu"`
+	MemoryMib    int32              `json:"memory_mib"`
+	DiskMib      int32              `json:"disk_mib"`
+	RootfsPath   *string            `json:"rootfs_path"`
+	SnapshotPath *string            `json:"snapshot_path"`
+	MemPath      *string            `json:"mem_path"`
+	SizeBytes    *int64             `json:"size_bytes"`
+	ErrorMessage *string            `json:"error_message"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	BuiltAt      pgtype.Timestamptz `json:"built_at"`
+	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type TemplateBuild struct {
+	ID            uuid.UUID           `json:"id"`
+	TemplateID    uuid.UUID           `json:"template_id"`
+	TeamID        uuid.UUID           `json:"team_id"`
+	Status        TemplateBuildStatus `json:"status"`
+	BuildSpecHash string              `json:"build_spec_hash"`
+	VmdHostID     *string             `json:"vmd_host_id"`
+	VmdBuildVmID  *string             `json:"vmd_build_vm_id"`
+	ErrorMessage  *string             `json:"error_message"`
+	StartedAt     pgtype.Timestamptz  `json:"started_at"`
+	FinalizedAt   pgtype.Timestamptz  `json:"finalized_at"`
+	CreatedAt     time.Time           `json:"created_at"`
+	UpdatedAt     time.Time           `json:"updated_at"`
 }

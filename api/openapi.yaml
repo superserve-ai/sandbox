@@ -128,6 +128,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -350,6 +352,274 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /templates:
+    get:
+      operationId: listTemplates
+      tags: [Templates]
+      summary: List templates visible to the caller
+      description: |
+        Returns the team's private templates plus all public templates from
+        any team. Filter with `visibility=private|public` or
+        `alias_prefix=<text>`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: visibility
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [private, public]
+        - name: alias_prefix
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of templates
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TemplateResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: createTemplate
+      tags: [Templates]
+      summary: Create a template (status pending)
+      description: |
+        Creates a template row in `pending` status. The actual build is
+        kicked off by `POST /templates/{template_id}/builds`. Splitting
+        creation from build lets clients validate the spec, see the assigned
+        ID, and decide when to start the build.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTemplateRequest"
+      responses:
+        "201":
+          description: Template created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+
+    get:
+      operationId: getTemplate
+      tags: [Templates]
+      summary: Get a template by ID
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Template details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      operationId: deleteTemplate
+      tags: [Templates]
+      summary: Soft-delete a template
+      description: |
+        Soft-deletes a template owned by the caller's team. Returns `409`
+        if any non-destroyed sandbox still references this template; the
+        caller must destroy those sandboxes first.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Template deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}/builds:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+
+    get:
+      operationId: listTemplateBuilds
+      tags: [Templates]
+      summary: List recent builds for a template
+      security:
+        - apiKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: List of builds, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TemplateBuildResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: createTemplateBuild
+      tags: [Templates]
+      summary: Kick off a build for this template
+      description: |
+        Inserts a build row in `pending` status. The control plane's build
+        supervisor picks it up on its next tick (within 30 seconds).
+
+        ## Idempotency
+
+        If an in-flight build (`pending`/`building`/`snapshotting`) already
+        exists for this template with the same `build_spec_hash`, this
+        endpoint returns the existing build's id with `200` instead of
+        creating a duplicate.
+      security:
+        - apiKey: []
+      responses:
+        "201":
+          description: Build created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildResponse"
+        "200":
+          description: Existing in-flight build returned (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          description: Per-team build concurrency limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}/builds/{build_id}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+      - $ref: "#/components/parameters/BuildId"
+
+    get:
+      operationId: getTemplateBuild
+      tags: [Templates]
+      summary: Get a build by ID
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Build details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      operationId: cancelTemplateBuild
+      tags: [Templates]
+      summary: Cancel an in-flight build
+      description: |
+        Marks the build as `cancelled` and signals vmd to tear down any
+        in-progress build VM. No-op for builds already in a terminal state.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Build cancelled (or was already terminal)
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}/builds/{build_id}/logs:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+      - $ref: "#/components/parameters/BuildId"
+
+    get:
+      operationId: streamTemplateBuildLogs
+      tags: [Templates]
+      summary: Stream build logs via SSE
+      description: |
+        Server-Sent Events stream of the build's stdout/stderr. Connecting
+        replays buffered output from the start of the build, then streams
+        live as it arrives. Closes when the build reaches a terminal state.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: SSE stream of build log events
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/BuildLogEvent"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 components:
   securitySchemes:
     apiKey:
@@ -367,6 +637,24 @@ components:
         format: uuid
       description: The unique identifier of the sandbox.
 
+    TemplateId:
+      name: template_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of the template.
+
+    BuildId:
+      name: build_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of the template build.
+
   schemas:
     CreateSandboxRequest:
       type: object
@@ -377,6 +665,15 @@ components:
           minLength: 1
           maxLength: 64
           description: Human-readable name for the sandbox.
+        from_template:
+          type: string
+          description: >
+            Boot the sandbox from a template. Accepts either a template UUID
+            or an alias (e.g. `superserve/python-ml`). The template must
+            belong to the caller's team OR have `visibility: public`. The
+            template's vCPU, memory, and disk values are inherited by the
+            sandbox — they cannot be overridden per-sandbox because the
+            snapshot dictates VM shape.
         timeout_seconds:
           type: integer
           format: int32
@@ -609,6 +906,203 @@ components:
         metadata:
           env: prod
           owner: agent-7
+
+    BuildSpec:
+      type: object
+      required: [from]
+      description: |
+        Canonical declaration of how to build a template. The server is the
+        source of truth for this schema; SDKs are thin clients that produce it.
+      properties:
+        from:
+          type: string
+          description: >
+            OCI image reference for the base. Examples: `python:3.11`,
+            `node:22-slim`, `ghcr.io/myorg/foo:v1`. Resolved to a digest at
+            build time and recorded for reproducibility. Must be a Linux/amd64
+            image. Alpine and distroless bases are rejected at validation.
+          example: python:3.11
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildStep"
+          description: Ordered list of build steps executed inside the build VM.
+        start_cmd:
+          type: string
+          description: >
+            Optional command started after build steps complete. The snapshot
+            captures the running process, so sandboxes restored from this
+            template come up with the process already live.
+        ready_cmd:
+          type: string
+          description: >
+            Optional readiness probe. Polled every 2s after `start_cmd`, until
+            it exits 0 or 10 minutes elapse. Use to wait for a server to bind
+            its port before snapshotting.
+
+    BuildStep:
+      type: object
+      description: |
+        A single build step. Exactly one of `run`, `copy`, `env`, or
+        `workdir` must be set.
+      properties:
+        run:
+          type: string
+          description: Shell command. Wrapped in `/bin/sh -c` inside the build VM.
+          example: pip install -r requirements.txt
+        copy:
+          type: object
+          required: [src, dst]
+          properties:
+            src:
+              type: string
+              description: >
+                Base64-encoded tar archive of files to copy into the VM. V1 caps
+                this at 1 MB; larger payloads must use the V2 presigned-upload
+                path.
+            dst:
+              type: string
+              description: Absolute path inside the VM to extract into.
+        env:
+          type: object
+          required: [key, value]
+          properties:
+            key:
+              type: string
+            value:
+              type: string
+        workdir:
+          type: string
+          description: Working directory for subsequent steps.
+
+    CreateTemplateRequest:
+      type: object
+      required: [alias, build_spec]
+      properties:
+        alias:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >
+            Human-readable name, unique per team. Used as the
+            `from_template` value when creating sandboxes.
+          example: my-python-env
+        visibility:
+          type: string
+          enum: [private, public]
+          default: private
+          description: >
+            `private` templates are only visible to the owning team.
+            `public` templates are visible to every team. Only the system
+            team can create `public` templates.
+        vcpu:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 1
+        memory_mib:
+          type: integer
+          minimum: 256
+          maximum: 4096
+          default: 1024
+        disk_mib:
+          type: integer
+          minimum: 1024
+          maximum: 8192
+          default: 4096
+        build_spec:
+          $ref: "#/components/schemas/BuildSpec"
+
+    TemplateResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        team_id:
+          type: string
+          format: uuid
+        alias:
+          type: string
+        visibility:
+          type: string
+          enum: [private, public]
+        status:
+          type: string
+          enum: [pending, building, ready, failed]
+        vcpu:
+          type: integer
+        memory_mib:
+          type: integer
+        disk_mib:
+          type: integer
+        size_bytes:
+          type: integer
+          format: int64
+          description: On-disk size of the template's snapshot bundle (present once `ready`).
+        error_message:
+          type: string
+          description: Last build's error message, if status is `failed`.
+        created_at:
+          type: string
+          format: date-time
+        built_at:
+          type: string
+          format: date-time
+          description: When the template most recently transitioned to `ready`.
+        build_spec:
+          $ref: "#/components/schemas/BuildSpec"
+
+    TemplateBuildResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        template_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, building, snapshotting, ready, failed, cancelled]
+        build_spec_hash:
+          type: string
+          description: Stable hash of the build_spec at submission time. Used for idempotent submits.
+        error_message:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finalized_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    BuildLogEvent:
+      type: object
+      description: A single SSE event from the build log stream.
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        stream:
+          type: string
+          enum: [stdout, stderr, system]
+          description: >
+            `stdout`/`stderr` are forwarded from the build VM. `system` is
+            the supervisor's own status text (step boundaries, snapshot
+            phase, terminal status).
+        text:
+          type: string
+        finished:
+          type: boolean
+          description: True on the final event.
+        status:
+          type: string
+          enum: [ready, failed, cancelled]
+          description: Terminal status, present on the final event.
 
     Error:
       type: object

@@ -536,6 +536,7 @@ type networkConfigRequest struct {
 
 type createSandboxRequest struct {
 	Name         string                `json:"name" binding:"required,min=1,max=64"`
+	FromTemplate *string               `json:"from_template,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
 
 	// TimeoutSeconds is a hard lifetime cap in seconds, measured from
@@ -826,6 +827,31 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	// If from_template is provided, resolve to the template's snapshot paths
+	// and reuse the existing snapshot-restore code path.
+	var snapshotPath, snapshotMemPath string
+	var templateID pgtype.UUID
+	if req.FromTemplate != nil {
+		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
+		if err != nil {
+			return // error already responded
+		}
+		if tpl.Status != db.TemplateStatusReady {
+			respondErrorMsg(c, "conflict",
+				fmt.Sprintf("template is not ready (status=%s)", tpl.Status),
+				http.StatusConflict)
+			return
+		}
+		if tpl.SnapshotPath == nil || tpl.MemPath == nil {
+			log.Error().Str("template_id", tpl.ID.String()).Msg("ready template missing snapshot paths")
+			respondError(c, ErrInternal)
+			return
+		}
+		snapshotPath = *tpl.SnapshotPath
+		snapshotMemPath = *tpl.MemPath
+		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
+	}
+
 	// Select a host for this sandbox.
 	var hostID string
 	if h.Scheduler != nil {
@@ -873,6 +899,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			HostID:         hostID,
 			TimeoutSeconds: req.TimeoutSeconds,
 			Metadata:       metadataJSON,
+			TemplateID:     templateID,
 		})
 		insertCh <- insertResult{sandbox: sb, err: insertErr}
 	}()
@@ -884,8 +911,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.CreateInstance(vmdCtx, sandboxID.String(),
-		0, 0, 0, nil, req.EnvVars)
+	var ipAddress string
+	var actualVcpu, actualMemMiB uint32
+	var vmdErr error
+	if req.FromTemplate != nil {
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+	} else {
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),
+			0, 0, 0, nil, req.EnvVars)
+	}
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
