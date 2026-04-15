@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"github.com/rs/zerolog"
 )
 
 const hostTableName = "sandbox-host"
@@ -35,13 +36,157 @@ type HostFirewall struct {
 	vmRuleHandles map[string][]uint64 // vmID → rule handles
 }
 
-// NewHostFirewall creates a host-level nftables table. Must be called from the host namespace.
-func NewHostFirewall(hostIface string) (*HostFirewall, error) {
+// NewHostFirewall creates a host-level nftables table, or reuses one that
+// already exists in the kernel from a previous vmd lifetime.
+//
+// Restart safety:
+//
+//	nftables' NEWCHAIN netlink message REPLACES an existing chain of the
+//	same name, which drops every rule inside it. Naive re-adding of the
+//	"forward" and "postrouting" chains on every startup therefore wipes
+//	the per-VM MASQUERADE/FORWARD rules for every VM that was already
+//	running, leaving them internet-less. The bug manifested as DNS
+//	timeouts inside template build VMs whose slot was claimed after a
+//	vmd restart (see docs/sandbox-templates-v2.md#known-gaps).
+//
+// To avoid that, this constructor looks for an existing table first.
+// When found, it fetches the live chain objects, preserves every rule,
+// and rehydrates vmRuleHandles by reading back the per-VM rules — they
+// carry the vmID in their UserData field, so the mapping is recoverable
+// without any out-of-band bookkeeping. Only on a cold start do we create
+// the table, chains, and static MSS clamp rule.
+//
+// Must be called from the host namespace.
+func NewHostFirewall(hostIface string, log zerolog.Logger) (*HostFirewall, error) {
 	conn, err := nftables.New(nftables.AsLasting())
 	if err != nil {
 		return nil, fmt.Errorf("new nftables conn: %w", err)
 	}
 
+	existing, existsErr := findExistingHostTable(conn)
+	if existsErr != nil {
+		conn.CloseLasting()
+		return nil, fmt.Errorf("probe existing host firewall: %w", existsErr)
+	}
+
+	if existing != nil {
+		hfw, err := reuseExistingHostFirewall(conn, existing, hostIface)
+		if err != nil {
+			conn.CloseLasting()
+			return nil, fmt.Errorf("reuse existing host firewall: %w", err)
+		}
+		log.Info().
+			Str("mode", "reused").
+			Int("rehydrated_vms", len(hfw.vmRuleHandles)).
+			Msg("host firewall ready")
+		return hfw, nil
+	}
+
+	hfw, err := createFreshHostFirewall(conn, hostIface)
+	if err != nil {
+		return nil, err
+	}
+	log.Info().Str("mode", "fresh").Msg("host firewall ready")
+	return hfw, nil
+}
+
+// findExistingHostTable returns the previously-created "sandbox-host"
+// table if one is present in the kernel, or nil if this is a cold start.
+func findExistingHostTable(conn *nftables.Conn) (*nftables.Table, error) {
+	tables, err := conn.ListTables()
+	if err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
+	for _, t := range tables {
+		if t.Name == hostTableName && t.Family == nftables.TableFamilyIPv4 {
+			return t, nil
+		}
+	}
+	return nil, nil
+}
+
+// reuseExistingHostFirewall wires up a HostFirewall to a pre-existing
+// kernel table + chains and rebuilds the vmRuleHandles map from the
+// UserData tag we stamp on every per-VM rule at AddVM time. This is the
+// restart-recovery path — any VM we had rules for before the restart
+// stays connected, and we can still clean up those rules later.
+func reuseExistingHostFirewall(conn *nftables.Conn, table *nftables.Table, hostIface string) (*HostFirewall, error) {
+	chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		return nil, fmt.Errorf("list chains: %w", err)
+	}
+
+	var fwdChain, natChain *nftables.Chain
+	for _, c := range chains {
+		if c.Table == nil || c.Table.Name != hostTableName {
+			continue
+		}
+		switch c.Name {
+		case "forward":
+			fwdChain = c
+		case "postrouting":
+			natChain = c
+		}
+	}
+	if fwdChain == nil || natChain == nil {
+		// Table exists but our chains don't — likely a corrupted prior state.
+		// Safer to fail than to call AddChain and risk wiping half a table.
+		return nil, fmt.Errorf("host table %q present but expected chains missing (forward=%v, postrouting=%v)", hostTableName, fwdChain != nil, natChain != nil)
+	}
+
+	handles, err := rehydrateVMRuleHandles(conn, table, fwdChain, natChain)
+	if err != nil {
+		return nil, fmt.Errorf("rehydrate vm rule handles: %w", err)
+	}
+
+	return &HostFirewall{
+		conn:          conn,
+		table:         table,
+		fwdChain:      fwdChain,
+		natChain:      natChain,
+		hostIface:     hostIface,
+		vmRuleHandles: handles,
+	}, nil
+}
+
+// rehydrateVMRuleHandles walks the existing forward/postrouting rules
+// and groups their handles by the vmID carried in UserData. Rules with
+// no UserData (the static MSS clamp) are skipped. Used only on the
+// restart path.
+func rehydrateVMRuleHandles(conn *nftables.Conn, table *nftables.Table, fwd, nat *nftables.Chain) (map[string][]uint64, error) {
+	handles := make(map[string][]uint64)
+
+	fwdRules, err := conn.GetRules(table, fwd)
+	if err != nil {
+		return nil, fmt.Errorf("get forward rules: %w", err)
+	}
+	for _, r := range fwdRules {
+		if len(r.UserData) == 0 {
+			continue
+		}
+		vmID := string(r.UserData)
+		handles[vmID] = append(handles[vmID], r.Handle)
+	}
+
+	natRules, err := conn.GetRules(table, nat)
+	if err != nil {
+		return nil, fmt.Errorf("get nat rules: %w", err)
+	}
+	for _, r := range natRules {
+		if len(r.UserData) == 0 {
+			continue
+		}
+		vmID := string(r.UserData)
+		handles[vmID] = append(handles[vmID], r.Handle)
+	}
+
+	return handles, nil
+}
+
+// createFreshHostFirewall is the cold-start path: create the table,
+// chains, and static MSS clamp rule. Only runs when no prior vmd has
+// left a host table on this kernel.
+func createFreshHostFirewall(conn *nftables.Conn, hostIface string) (*HostFirewall, error) {
 	table := conn.AddTable(&nftables.Table{
 		Name:   hostTableName,
 		Family: nftables.TableFamilyIPv4,
