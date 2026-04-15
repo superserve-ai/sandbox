@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -49,28 +50,25 @@ type buildSpec struct {
 }
 
 type createTemplateRequest struct {
-	Alias      string     `json:"alias"`
-	Visibility *string    `json:"visibility,omitempty"`
-	Vcpu       *int32     `json:"vcpu,omitempty"`
-	MemoryMib  *int32     `json:"memory_mib,omitempty"`
-	DiskMib    *int32     `json:"disk_mib,omitempty"`
-	BuildSpec  *buildSpec `json:"build_spec,omitempty"`
+	Alias     string     `json:"alias"`
+	Vcpu      *int32     `json:"vcpu,omitempty"`
+	MemoryMib *int32     `json:"memory_mib,omitempty"`
+	DiskMib   *int32     `json:"disk_mib,omitempty"`
+	BuildSpec *buildSpec `json:"build_spec,omitempty"`
 }
 
 type templateResponse struct {
-	ID           uuid.UUID  `json:"id"`
-	TeamID       uuid.UUID  `json:"team_id"`
-	Alias        string     `json:"alias"`
-	Visibility   string     `json:"visibility"`
-	Status       string     `json:"status"`
-	Vcpu         int32      `json:"vcpu"`
-	MemoryMib    int32      `json:"memory_mib"`
-	DiskMib      int32      `json:"disk_mib"`
-	SizeBytes    *int64     `json:"size_bytes,omitempty"`
-	ErrorMessage *string    `json:"error_message,omitempty"`
-	CreatedAt    string     `json:"created_at"`
-	BuiltAt      *string    `json:"built_at,omitempty"`
-	BuildSpec    *buildSpec `json:"build_spec,omitempty"`
+	ID           uuid.UUID `json:"id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	Alias        string    `json:"alias"`
+	Status       string    `json:"status"`
+	Vcpu         int32     `json:"vcpu"`
+	MemoryMib    int32     `json:"memory_mib"`
+	DiskMib      int32     `json:"disk_mib"`
+	SizeBytes    *int64    `json:"size_bytes,omitempty"`
+	ErrorMessage *string   `json:"error_message,omitempty"`
+	CreatedAt    string    `json:"created_at"`
+	BuiltAt      *string   `json:"built_at,omitempty"`
 }
 
 type templateBuildResponse struct {
@@ -190,17 +188,20 @@ func parseBuildID(c *gin.Context) (uuid.UUID, error) {
 	return id, nil
 }
 
+// toTemplateResponse serializes a template for the API. build_spec is never
+// included in responses — it can be large (base64-tar copy payloads) and can
+// contain secrets (env steps). Callers that need the spec should read it
+// server-side from the jsonb column directly.
 func toTemplateResponse(t db.Template) templateResponse {
 	resp := templateResponse{
-		ID:         t.ID,
-		TeamID:     t.TeamID,
-		Alias:      t.Alias,
-		Visibility: string(t.Visibility),
-		Status:     string(t.Status),
-		Vcpu:       t.Vcpu,
-		MemoryMib:  t.MemoryMib,
-		DiskMib:    t.DiskMib,
-		CreatedAt:  t.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		ID:        t.ID,
+		TeamID:    t.TeamID,
+		Alias:     t.Alias,
+		Status:    string(t.Status),
+		Vcpu:      t.Vcpu,
+		MemoryMib: t.MemoryMib,
+		DiskMib:   t.DiskMib,
+		CreatedAt: t.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 	}
 	if t.SizeBytes != nil {
 		resp.SizeBytes = t.SizeBytes
@@ -208,15 +209,9 @@ func toTemplateResponse(t db.Template) templateResponse {
 	if t.ErrorMessage != nil {
 		resp.ErrorMessage = t.ErrorMessage
 	}
-	if t.BuiltAt != nil {
-		s := t.BuiltAt.UTC().Format("2006-01-02T15:04:05Z")
+	if t.BuiltAt.Valid {
+		s := t.BuiltAt.Time.UTC().Format("2006-01-02T15:04:05Z")
 		resp.BuiltAt = &s
-	}
-	if len(t.BuildSpec) > 0 {
-		var spec buildSpec
-		if err := json.Unmarshal(t.BuildSpec, &spec); err == nil {
-			resp.BuildSpec = &spec
-		}
 	}
 	return resp
 }
@@ -232,12 +227,12 @@ func toBuildResponse(b db.TemplateBuild) templateBuildResponse {
 	if b.ErrorMessage != nil {
 		resp.ErrorMessage = b.ErrorMessage
 	}
-	if b.StartedAt != nil {
-		s := b.StartedAt.UTC().Format("2006-01-02T15:04:05Z")
+	if b.StartedAt.Valid {
+		s := b.StartedAt.Time.UTC().Format("2006-01-02T15:04:05Z")
 		resp.StartedAt = &s
 	}
-	if b.FinalizedAt != nil {
-		s := b.FinalizedAt.UTC().Format("2006-01-02T15:04:05Z")
+	if b.FinalizedAt.Valid {
+		s := b.FinalizedAt.Time.UTC().Format("2006-01-02T15:04:05Z")
 		resp.FinalizedAt = &s
 	}
 	return resp
@@ -279,27 +274,6 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			http.StatusBadRequest)
 		return
 	}
-	visibility := db.TemplateVisibilityPrivate
-	if req.Visibility != nil {
-		switch *req.Visibility {
-		case "private":
-			visibility = db.TemplateVisibilityPrivate
-		case "public":
-			// V1: only the system team can publish public templates. Until
-			// system_team_id wiring lands, reject all public submits with
-			// a 403. Internal seeding bypasses the API.
-			respondErrorMsg(c, "forbidden",
-				"public visibility is reserved for system-curated templates",
-				http.StatusForbidden)
-			return
-		default:
-			respondErrorMsg(c, "bad_request",
-				"visibility must be 'private' or 'public'",
-				http.StatusBadRequest)
-			return
-		}
-	}
-
 	vcpu := int32(defaultVcpu)
 	if req.Vcpu != nil {
 		vcpu = *req.Vcpu
@@ -337,13 +311,12 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	}
 
 	tpl, err := h.DB.CreateTemplate(c.Request.Context(), db.CreateTemplateParams{
-		TeamID:     teamID,
-		Alias:      req.Alias,
-		Visibility: visibility,
-		BuildSpec:  specJSON,
-		Vcpu:       vcpu,
-		MemoryMib:  memMib,
-		DiskMib:    diskMib,
+		TeamID:    teamID,
+		Alias:     req.Alias,
+		BuildSpec: specJSON,
+		Vcpu:      vcpu,
+		MemoryMib: memMib,
+		DiskMib:   diskMib,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -371,8 +344,9 @@ func (h *Handlers) GetTemplate(c *gin.Context) {
 	}
 
 	tpl, err := h.DB.GetTemplate(c.Request.Context(), db.GetTemplateParams{
-		ID:     tplID,
-		TeamID: teamID,
+		ID:       tplID,
+		TeamID:   teamID,
+		TeamID_2: h.systemTeamID(),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -393,33 +367,20 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 		return
 	}
 
-	visibility := c.Query("visibility")
 	aliasPrefix := c.Query("alias_prefix")
 
 	var rows []db.Template
-	if visibility == "" && aliasPrefix == "" {
-		rows, err = h.DB.ListTemplatesForTeam(c.Request.Context(), teamID)
+	if aliasPrefix == "" {
+		rows, err = h.DB.ListTemplatesForTeam(c.Request.Context(), db.ListTemplatesForTeamParams{
+			TeamID:   teamID,
+			TeamID_2: h.systemTeamID(),
+		})
 	} else {
-		params := db.ListTemplatesForTeamFilteredParams{TeamID: teamID}
-		if visibility != "" {
-			switch visibility {
-			case "private":
-				v := db.TemplateVisibilityPrivate
-				params.Visibility = &v
-			case "public":
-				v := db.TemplateVisibilityPublic
-				params.Visibility = &v
-			default:
-				respondErrorMsg(c, "bad_request",
-					"visibility must be 'private' or 'public'",
-					http.StatusBadRequest)
-				return
-			}
-		}
-		if aliasPrefix != "" {
-			params.AliasPrefix = &aliasPrefix
-		}
-		rows, err = h.DB.ListTemplatesForTeamFiltered(c.Request.Context(), params)
+		rows, err = h.DB.ListTemplatesForTeamFiltered(c.Request.Context(), db.ListTemplatesForTeamFilteredParams{
+			TeamID:      teamID,
+			TeamID_2:    h.systemTeamID(),
+			AliasPrefix: &aliasPrefix,
+		})
 	}
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB ListTemplates failed")
@@ -432,6 +393,21 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 		out = append(out, toTemplateResponse(t))
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// systemTeamID returns the configured system-team UUID, or uuid.Nil when
+// unset. Passing uuid.Nil into the OR team_id = $N clause matches nothing
+// extra — effectively disabling the system-templates shelf.
+func (h *Handlers) systemTeamID() uuid.UUID {
+	if h.Config == nil || h.Config.SystemTeamID == "" {
+		return uuid.Nil
+	}
+	id, err := uuid.Parse(h.Config.SystemTeamID)
+	if err != nil {
+		log.Warn().Str("value", h.Config.SystemTeamID).Msg("SYSTEM_TEAM_ID is not a valid UUID; ignoring")
+		return uuid.Nil
+	}
+	return id
 }
 
 func (h *Handlers) DeleteTemplate(c *gin.Context) {
@@ -448,7 +424,7 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 	// referencing it — active, paused, or failed. Paused sandboxes hold a
 	// snapshot dependent on the template's files; failed rows hold lineage.
 	// User must destroy dependents first.
-	count, err := h.DB.CountLiveSandboxesForTemplate(c.Request.Context(), uuid.NullUUID{UUID: tplID, Valid: true})
+	count, err := h.DB.CountLiveSandboxesForTemplate(c.Request.Context(), pgtype.UUID{Bytes: tplID, Valid: true})
 	if err != nil {
 		log.Error().Err(err).Str("template_id", tplID.String()).Msg("DB CountLiveSandboxesForTemplate failed")
 		respondError(c, ErrInternal)
@@ -669,8 +645,9 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 	}
 	if id, err := uuid.Parse(ref); err == nil {
 		tpl, err := h.DB.GetTemplate(c.Request.Context(), db.GetTemplateParams{
-			ID:     id,
-			TeamID: teamID,
+			ID:       id,
+			TeamID:   teamID,
+			TeamID_2: h.systemTeamID(),
 		})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -684,8 +661,9 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 		return tpl, nil
 	}
 	tpl, err := h.DB.GetTemplateByAlias(c.Request.Context(), db.GetTemplateByAliasParams{
-		Alias:  ref,
-		TeamID: teamID,
+		Alias:    ref,
+		TeamID:   teamID,
+		TeamID_2: h.systemTeamID(),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

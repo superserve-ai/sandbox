@@ -150,48 +150,6 @@ func (ns NullTemplateStatus) Value() (driver.Value, error) {
 	return string(ns.TemplateStatus), nil
 }
 
-type TemplateVisibility string
-
-const (
-	TemplateVisibilityPrivate TemplateVisibility = "private"
-	TemplateVisibilityPublic  TemplateVisibility = "public"
-)
-
-func (e *TemplateVisibility) Scan(src interface{}) error {
-	switch s := src.(type) {
-	case []byte:
-		*e = TemplateVisibility(s)
-	case string:
-		*e = TemplateVisibility(s)
-	default:
-		return fmt.Errorf("unsupported scan type for TemplateVisibility: %T", src)
-	}
-	return nil
-}
-
-type NullTemplateVisibility struct {
-	TemplateVisibility TemplateVisibility `json:"template_visibility"`
-	Valid              bool               `json:"valid"` // Valid is true if TemplateVisibility is not NULL
-}
-
-// Scan implements the Scanner interface.
-func (ns *NullTemplateVisibility) Scan(value interface{}) error {
-	if value == nil {
-		ns.TemplateVisibility, ns.Valid = "", false
-		return nil
-	}
-	ns.Valid = true
-	return ns.TemplateVisibility.Scan(value)
-}
-
-// Value implements the driver Valuer interface.
-func (ns NullTemplateVisibility) Value() (driver.Value, error) {
-	if !ns.Valid {
-		return nil, nil
-	}
-	return string(ns.TemplateVisibility), nil
-}
-
 type Activity struct {
 	ID          uuid.UUID   `json:"id"`
 	SandboxID   uuid.UUID   `json:"sandbox_id"`
@@ -329,7 +287,6 @@ type Template struct {
 	ID           uuid.UUID          `json:"id"`
 	TeamID       uuid.UUID          `json:"team_id"`
 	Alias        string             `json:"alias"`
-	Visibility   TemplateVisibility `json:"visibility"`
 	Status       TemplateStatus     `json:"status"`
 	BuildSpec    []byte             `json:"build_spec"`
 	Vcpu         int32              `json:"vcpu"`

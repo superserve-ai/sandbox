@@ -3,52 +3,50 @@
 -- off later by POST /templates/:id/build, which inserts into template_build.
 -- ID is generated SQL-side (defaulted) since template create has no parallel
 -- VMD call to coordinate with — unlike CreateSandbox.
-INSERT INTO template (team_id, alias, visibility, build_spec, vcpu, memory_mib, disk_mib)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
 -- name: GetTemplate :one
--- Fetch a template visible to the caller's team: either owned by the team or
--- public. Returns 0 rows if not found, deleted, or private+other-team.
+-- Fetch a template visible to the caller: either owned by the caller's team
+-- or by the system team (system_team_id param — pass uuid.Nil to disable).
+-- Returns 0 rows if the template isn't visible, doesn't exist, or is deleted.
 SELECT * FROM template
 WHERE id = $1
   AND deleted_at IS NULL
-  AND (team_id = $2 OR visibility = 'public');
+  AND (team_id = $2 OR team_id = $3);
 
 -- name: GetTemplateForOwner :one
 -- Fetch a template owned by this team. Used for write paths (build, delete)
--- where public-visibility-of-others is irrelevant — only the owner can mutate.
+-- where system-team visibility is irrelevant — only the owner can mutate.
 SELECT * FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
 -- name: GetTemplateByAlias :one
 -- Resolve alias to a template visible to the caller. Aliases are unique per
--- team, but public templates from other teams are also visible — so we
--- prefer the team's own template when both match (ORDER BY clause).
+-- team, so the same alias can exist in both the caller's team and the system
+-- team — prefer the caller's own (ORDER BY) so overrides work naturally.
 SELECT * FROM template
 WHERE alias = $1
   AND deleted_at IS NULL
-  AND (team_id = $2 OR visibility = 'public')
+  AND (team_id = $2 OR team_id = $3)
 ORDER BY (team_id = $2) DESC
 LIMIT 1;
 
 -- name: ListTemplatesForTeam :many
--- Return the team's private templates plus all public templates from any
--- team. Ordered by created_at desc for stable pagination later.
+-- Return the caller's team's templates plus all system-team templates
+-- (curated base set visible to everyone). Ordered by created_at desc.
 SELECT * FROM template
 WHERE deleted_at IS NULL
-  AND (team_id = $1 OR visibility = 'public')
+  AND (team_id = $1 OR team_id = $2)
 ORDER BY created_at DESC;
 
 -- name: ListTemplatesForTeamFiltered :many
--- Same as ListTemplatesForTeam with optional visibility filter. Pass NULL
--- for both filters to get the unfiltered list (but prefer the unfiltered
--- query in that case).
+-- Same as ListTemplatesForTeam with an optional alias prefix filter. Pass
+-- NULL to get the unfiltered list (but prefer the unfiltered query then).
 SELECT * FROM template
 WHERE deleted_at IS NULL
-  AND (team_id = $1 OR visibility = 'public')
-  AND (sqlc.narg('visibility')::template_visibility IS NULL
-       OR visibility = sqlc.narg('visibility'))
+  AND (team_id = $1 OR team_id = $2)
   AND (sqlc.narg('alias_prefix')::text IS NULL
        OR alias LIKE sqlc.narg('alias_prefix') || '%')
 ORDER BY created_at DESC;

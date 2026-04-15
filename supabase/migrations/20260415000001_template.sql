@@ -4,14 +4,18 @@
 -- created from a template by restoring its snapshot (instead of the baked-in
 -- default template).
 
+-- Curated templates (python-3.11, node-22, etc.) are owned by a designated
+-- "system team". Every user's list query unions their own team's templates
+-- with the system team's — no separate visibility flag needed. The system
+-- team is identified by SYSTEM_TEAM_ID in controlplane config; must point
+-- to a real team row.
+
 CREATE TYPE template_status AS ENUM ('pending', 'building', 'ready', 'failed');
-CREATE TYPE template_visibility AS ENUM ('private', 'public');
 
 CREATE TABLE template (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id         uuid NOT NULL REFERENCES team(id) ON DELETE CASCADE,
     alias           text NOT NULL,
-    visibility      template_visibility NOT NULL DEFAULT 'private',
     status          template_status NOT NULL DEFAULT 'pending',
     build_spec      jsonb NOT NULL,
     vcpu            int NOT NULL DEFAULT 1,
@@ -36,7 +40,6 @@ CREATE TABLE template (
 
 CREATE INDEX idx_template_team ON template(team_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_template_team_status ON template(team_id, status) WHERE deleted_at IS NULL;
-CREATE INDEX idx_template_public ON template(visibility) WHERE visibility = 'public' AND deleted_at IS NULL;
 
 ALTER TABLE sandbox ADD COLUMN template_id uuid REFERENCES template(id);
 CREATE INDEX idx_sandbox_template ON sandbox(template_id) WHERE template_id IS NOT NULL;

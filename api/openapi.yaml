@@ -358,18 +358,11 @@ paths:
       tags: [Templates]
       summary: List templates visible to the caller
       description: |
-        Returns the team's private templates plus all public templates from
-        any team. Filter with `visibility=private|public` or
-        `alias_prefix=<text>`.
+        Returns the caller's team's templates plus the curated system
+        templates (available to everyone). Filter by `alias_prefix=<text>`.
       security:
         - apiKey: []
       parameters:
-        - name: visibility
-          in: query
-          required: false
-          schema:
-            type: string
-            enum: [private, public]
         - name: alias_prefix
           in: query
           required: false
@@ -669,11 +662,11 @@ components:
           type: string
           description: >
             Boot the sandbox from a template. Accepts either a template UUID
-            or an alias (e.g. `superserve/python-ml`). The template must
-            belong to the caller's team OR have `visibility: public`. The
-            template's vCPU, memory, and disk values are inherited by the
-            sandbox — they cannot be overridden per-sandbox because the
-            snapshot dictates VM shape.
+            or an alias (e.g. `python-ml`). The template must be owned by
+            the caller's team OR be a curated system template. The template's
+            vCPU, memory, and disk values are inherited by the sandbox — they
+            cannot be overridden per-sandbox because the snapshot dictates
+            VM shape.
         timeout_seconds:
           type: integer
           format: int32
@@ -987,14 +980,6 @@ components:
             Human-readable name, unique per team. Used as the
             `from_template` value when creating sandboxes.
           example: my-python-env
-        visibility:
-          type: string
-          enum: [private, public]
-          default: private
-          description: >
-            `private` templates are only visible to the owning team.
-            `public` templates are visible to every team. Only the system
-            team can create `public` templates.
         vcpu:
           type: integer
           minimum: 1
@@ -1024,9 +1009,6 @@ components:
           format: uuid
         alias:
           type: string
-        visibility:
-          type: string
-          enum: [private, public]
         status:
           type: string
           enum: [pending, building, ready, failed]
@@ -1050,8 +1032,6 @@ components:
           type: string
           format: date-time
           description: When the template most recently transitioned to `ready`.
-        build_spec:
-          $ref: "#/components/schemas/BuildSpec"
 
     TemplateBuildResponse:
       type: object
