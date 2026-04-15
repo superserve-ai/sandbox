@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // ---------------------------------------------------------------------------
@@ -84,6 +85,21 @@ func (s *stubVMD) ExecCommandStream(context.Context, string, string, []string, m
 	return nil
 }
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
+}
+
+// Template build methods — no-op stubs. Handler tests don't exercise
+// the build pipeline; supervisor integration tests are the right place
+// for that. Kept minimal so adding real behavior per test is easy.
+
+func (s *stubVMD) BuildTemplate(_ context.Context, _ vmdclient.BuildTemplateInput) (string, error) {
+	return "", nil
+}
+func (s *stubVMD) GetBuildStatus(_ context.Context, _ string) (vmdclient.BuildStatusResult, error) {
+	return vmdclient.BuildStatusResult{}, nil
+}
+func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
 	return nil
 }
 
