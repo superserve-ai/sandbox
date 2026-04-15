@@ -748,6 +748,30 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
 	}
 
+	// Verify the snapshot files actually exist on disk. DB can claim
+	// "ready" but the files be missing — common scenarios:
+	//   - vmd host replaced; new host has no cached snapshots
+	//   - operator manually deleted files for disk recovery
+	//   - snapshot directory not mounted
+	//
+	// Return FailedPrecondition so the caller can distinguish "ops
+	// action required" from "transient error" and surface a clear
+	// message to the user instead of a generic 500. The caller (control
+	// plane) adds context about whether this was a template-sourced or
+	// pause-sourced restore.
+	if _, err := os.Stat(snapshotPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.FailedPrecondition, "snapshot file missing on host: %s", snapshotPath)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "stat snapshot %s: %v", snapshotPath, err)
+	}
+	if _, err := os.Stat(memPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
+	}
+
 	rundirKey := vmID
 	if inst.RunDirID != "" {
 		rundirKey = inst.RunDirID

@@ -954,6 +954,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
 		})
+		// FailedPrecondition from vmd = snapshot/mem file missing on host.
+		// Only surfaces via ResumeInstance today, which is the from_template
+		// path. Map to 503 so the user understands this is ops-side, not
+		// a bad request. For pause-snapshot resume failures (same error
+		// shape), this is also the right signal — the sandbox's files are
+		// gone and only ops can recover.
+		if isVMDFileMissing(vmdErr) {
+			respondError(c, ErrHostStateMissing)
+			return
+		}
 		respondError(c, ErrInternal)
 		return
 	}
