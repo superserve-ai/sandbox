@@ -22,6 +22,7 @@ import (
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/supervisor"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -95,6 +96,15 @@ func run() error {
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
 	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+
+	// Launch the template build supervisor. Drives template_build rows
+	// through pending → building → snapshotting → ready/failed by calling
+	// vmd's BuildTemplate / GetBuildStatus / CancelBuild RPCs.
+	supervisor.NewBuildSupervisor(
+		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
+		queries,
+		vmdClient,
+	).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
@@ -327,6 +337,64 @@ func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, a
 	})
 	if err != nil {
 		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) BuildTemplate(ctx context.Context, req vmdclient.BuildTemplateInput) (string, error) {
+	pbReq := &vmdpb.BuildTemplateRequest{
+		TemplateId: req.TemplateID,
+		From:       req.From,
+		StartCmd:   req.StartCmd,
+		ReadyCmd:   req.ReadyCmd,
+		Vcpu:       req.VCPU,
+		MemoryMib:  req.MemoryMiB,
+		DiskMib:    req.DiskMiB,
+	}
+	for _, step := range req.Steps {
+		pstep := &vmdpb.BuildStep{}
+		switch {
+		case step.Run != nil:
+			pstep.Op = &vmdpb.BuildStep_Run{Run: *step.Run}
+		case step.Copy != nil:
+			pstep.Op = &vmdpb.BuildStep_Copy{Copy: &vmdpb.BuildCopyOp{Src: step.Copy.Src, Dst: step.Copy.Dst}}
+		case step.Env != nil:
+			pstep.Op = &vmdpb.BuildStep_Env{Env: &vmdpb.BuildEnvOp{Key: step.Env.Key, Value: step.Env.Value}}
+		case step.Workdir != nil:
+			pstep.Op = &vmdpb.BuildStep_Workdir{Workdir: *step.Workdir}
+		}
+		pbReq.Steps = append(pbReq.Steps, pstep)
+	}
+	resp, err := c.client.BuildTemplate(ctx, pbReq)
+	if err != nil {
+		return "", fmt.Errorf("gRPC BuildTemplate: %w", err)
+	}
+	return resp.GetBuildVmId(), nil
+}
+
+func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (vmdclient.BuildStatusResult, error) {
+	resp, err := c.client.GetBuildStatus(ctx, &vmdpb.GetBuildStatusRequest{BuildVmId: buildVMID})
+	if err != nil {
+		return vmdclient.BuildStatusResult{}, fmt.Errorf("gRPC GetBuildStatus: %w", err)
+	}
+	return vmdclient.BuildStatusResult{
+		NotFound:       resp.GetNotFound(),
+		Status:         resp.GetStatus(),
+		SnapshotPath:   resp.GetSnapshotPath(),
+		MemFilePath:    resp.GetMemFilePath(),
+		RootfsPath:     resp.GetRootfsPath(),
+		ResolvedDigest: resp.GetResolvedDigest(),
+		SizeBytes:      resp.GetSizeBytes(),
+		ErrorMessage:   resp.GetErrorMessage(),
+		StartedAtUnix:  resp.GetStartedAtUnix(),
+		EndedAtUnix:    resp.GetEndedAtUnix(),
+	}, nil
+}
+
+func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error {
+	_, err := c.client.CancelBuild(ctx, &vmdpb.CancelBuildRequest{BuildVmId: buildVMID})
+	if err != nil {
+		return fmt.Errorf("gRPC CancelBuild: %w", err)
 	}
 	return nil
 }

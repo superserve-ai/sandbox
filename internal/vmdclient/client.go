@@ -25,4 +25,65 @@ type Client interface {
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+
+	// BuildTemplate kicks off an async template build on this vmd host.
+	// Returns the opaque build VM id; poll GetBuildStatus with it until a
+	// terminal status is reached. vmd runs the build well past this RPC's
+	// lifetime; the call returns as soon as the build is enqueued.
+	BuildTemplate(ctx context.Context, req BuildTemplateInput) (buildVMID string, err error)
+
+	// GetBuildStatus polls the current state of a build dispatched via
+	// BuildTemplate. NotFound=true signals vmd has no record of this build
+	// (typically after a vmd restart lost the in-memory registry).
+	GetBuildStatus(ctx context.Context, buildVMID string) (BuildStatusResult, error)
+
+	// CancelBuild tells vmd to abort an in-flight build. Idempotent — safe
+	// to call on unknown or already-terminal builds.
+	CancelBuild(ctx context.Context, buildVMID string) error
+}
+
+// BuildTemplateInput mirrors vmdpb.BuildTemplateRequest at the client layer
+// so callers don't have to import the proto package directly.
+type BuildTemplateInput struct {
+	TemplateID string
+	From       string
+	Steps      []BuildStep
+	StartCmd   string
+	ReadyCmd   string
+	VCPU       uint32
+	MemoryMiB  uint32
+	DiskMiB    uint32
+}
+
+// BuildStep mirrors vmdpb.BuildStep — exactly one of Run/Copy/Env/Workdir.
+type BuildStep struct {
+	Run     *string
+	Copy    *BuildCopyOp
+	Env     *BuildEnvOp
+	Workdir *string
+}
+
+type BuildCopyOp struct {
+	Src string // base64-encoded tar
+	Dst string
+}
+
+type BuildEnvOp struct {
+	Key   string
+	Value string
+}
+
+// BuildStatusResult is the decoded form of vmdpb.GetBuildStatusResponse.
+// Status values: "running", "snapshotting", "ready", "failed", "cancelled".
+type BuildStatusResult struct {
+	NotFound       bool
+	Status         string
+	SnapshotPath   string // populated on ready
+	MemFilePath    string // populated on ready
+	RootfsPath     string // populated on ready
+	ResolvedDigest string // populated on ready
+	SizeBytes      int64  // populated on ready
+	ErrorMessage   string // populated on failed/cancelled
+	StartedAtUnix  int64
+	EndedAtUnix    int64
 }

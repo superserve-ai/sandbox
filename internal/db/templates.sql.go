@@ -648,6 +648,52 @@ func (q *Queries) ListBuildsForTemplate(ctx context.Context, arg ListBuildsForTe
 	return items, nil
 }
 
+const listPendingBuildsOrdered = `-- name: ListPendingBuildsOrdered :many
+SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
+WHERE status = 'pending'
+ORDER BY created_at ASC
+LIMIT $1
+`
+
+// Read-only scan of pending builds in FIFO order. Used by the supervisor's
+// per-tick dispatch loop to evaluate admission (host capacity + per-team
+// concurrency) before transitioning any rows. Kept separate from
+// ClaimPendingBuilds so the supervisor can skip individual rows (e.g. a
+// team already at its concurrency limit) without locking them out of a
+// later tick.
+func (q *Queries) ListPendingBuildsOrdered(ctx context.Context, limit int32) ([]TemplateBuild, error) {
+	rows, err := q.db.Query(ctx, listPendingBuildsOrdered, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TemplateBuild{}
+	for rows.Next() {
+		var i TemplateBuild
+		if err := rows.Scan(
+			&i.ID,
+			&i.TemplateID,
+			&i.TeamID,
+			&i.Status,
+			&i.BuildSpecHash,
+			&i.VmdHostID,
+			&i.VmdBuildVmID,
+			&i.ErrorMessage,
+			&i.StartedAt,
+			&i.FinalizedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTemplatesForTeam = `-- name: ListTemplatesForTeam :many
 SELECT id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
 WHERE deleted_at IS NULL
@@ -829,6 +875,32 @@ type SoftDeleteTemplateParams struct {
 // in Go before this call (returns 409 to the user).
 func (q *Queries) SoftDeleteTemplate(ctx context.Context, arg SoftDeleteTemplateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, softDeleteTemplate, arg.ID, arg.TeamID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const tryDispatchBuild = `-- name: TryDispatchBuild :execrows
+UPDATE template_build
+SET status = 'building',
+    started_at = now(),
+    updated_at = now(),
+    vmd_host_id = $2
+WHERE id = $1 AND status = 'pending'
+`
+
+type TryDispatchBuildParams struct {
+	ID        uuid.UUID `json:"id"`
+	VmdHostID *string   `json:"vmd_host_id"`
+}
+
+// Atomic status transition from 'pending' to 'building', stamping the host
+// and start timestamp. Returns rows affected — 1 if we successfully claimed
+// the row, 0 if another supervisor tick (or another replica) already took
+// it. Callers on the 0 path skip; callers on the 1 path dispatch to vmd.
+func (q *Queries) TryDispatchBuild(ctx context.Context, arg TryDispatchBuildParams) (int64, error) {
+	result, err := q.db.Exec(ctx, tryDispatchBuild, arg.ID, arg.VmdHostID)
 	if err != nil {
 		return 0, err
 	}

@@ -127,6 +127,30 @@ FROM claimed
 WHERE template_build.id = claimed.id
 RETURNING template_build.*;
 
+-- name: ListPendingBuildsOrdered :many
+-- Read-only scan of pending builds in FIFO order. Used by the supervisor's
+-- per-tick dispatch loop to evaluate admission (host capacity + per-team
+-- concurrency) before transitioning any rows. Kept separate from
+-- ClaimPendingBuilds so the supervisor can skip individual rows (e.g. a
+-- team already at its concurrency limit) without locking them out of a
+-- later tick.
+SELECT * FROM template_build
+WHERE status = 'pending'
+ORDER BY created_at ASC
+LIMIT $1;
+
+-- name: TryDispatchBuild :execrows
+-- Atomic status transition from 'pending' to 'building', stamping the host
+-- and start timestamp. Returns rows affected — 1 if we successfully claimed
+-- the row, 0 if another supervisor tick (or another replica) already took
+-- it. Callers on the 0 path skip; callers on the 1 path dispatch to vmd.
+UPDATE template_build
+SET status = 'building',
+    started_at = now(),
+    updated_at = now(),
+    vmd_host_id = $2
+WHERE id = $1 AND status = 'pending';
+
 -- name: ListActiveBuilds :many
 -- Read-only: builds the supervisor is currently watching. Used per tick to
 -- poll vmd for status. No row-level lock — these are already past 'pending'.
