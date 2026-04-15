@@ -831,6 +831,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and reuse the existing snapshot-restore code path.
 	var snapshotPath, snapshotMemPath string
 	var templateID pgtype.UUID
+	// Template resources — only populated when the create uses from_template.
+	// vmd.RestoreSnapshot doesn't return ResourceLimits (proto gap), so the
+	// handler substitutes these at ActivateSandbox time. The snapshot was
+	// built with exactly these values, so they're the authoritative shape.
+	var templateVcpu, templateMemMiB uint32
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
 		if err != nil {
@@ -850,6 +855,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		snapshotPath = *tpl.SnapshotPath
 		snapshotMemPath = *tpl.MemPath
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
+		templateVcpu = uint32(tpl.Vcpu)
+		templateMemMiB = uint32(tpl.MemoryMib)
 	}
 
 	// Select a host for this sandbox.
@@ -986,8 +993,22 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Single atomic transition: starting → active with real resources
 	// and IP. VMD's response is the source of truth for vcpu/memory
-	// (they come from the template snapshot, not from what the control
-	// plane requested).
+	// when present.
+	//
+	// from_template exception: vmd.RestoreSnapshot doesn't return
+	// ResourceLimits today (proto gap — tracked in known gaps). It gives
+	// us (ip, 0, 0). The template's own vcpu/memory are the snapshot's
+	// baked-in shape, so we fall back to those when the caller took that
+	// path. Without this fallback, ActivateSandbox's UPDATE hits the
+	// sandbox_memory_positive CHECK constraint and the row never
+	// transitions out of 'starting'.
+	if actualVcpu == 0 && templateVcpu > 0 {
+		actualVcpu = templateVcpu
+	}
+	if actualMemMiB == 0 && templateMemMiB > 0 {
+		actualMemMiB = templateMemMiB
+	}
+
 	var ipAddr *netip.Addr
 	if ipAddress != "" {
 		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
