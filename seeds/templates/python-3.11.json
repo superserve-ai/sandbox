@@ -7,8 +7,7 @@
     "from": "python:3.11-slim",
     "steps": [
       { "run": "apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*" },
-      { "run": "pip install --no-cache-dir requests" },
-      { "workdir": "/workspace" }
+      { "run": "pip install --no-cache-dir requests" }
     ]
   }
 }

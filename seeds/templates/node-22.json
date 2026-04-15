@@ -7,8 +7,7 @@
     "from": "node:22-slim",
     "steps": [
       { "run": "apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*" },
-      { "run": "npm install -g --no-audit --no-fund yarn pnpm typescript" },
-      { "workdir": "/workspace" }
+      { "run": "npm install -g --no-audit --no-fund yarn pnpm typescript" }
     ]
   }
 }

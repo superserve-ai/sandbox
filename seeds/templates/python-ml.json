@@ -7,8 +7,7 @@
     "from": "python:3.11",
     "steps": [
       { "run": "apt-get update && apt-get install -y --no-install-recommends git curl build-essential ca-certificates && rm -rf /var/lib/apt/lists/*" },
-      { "run": "pip install --no-cache-dir numpy pandas scikit-learn matplotlib jupyter ipython requests" },
-      { "workdir": "/workspace" }
+      { "run": "pip install --no-cache-dir numpy pandas scikit-learn matplotlib jupyter ipython requests" }
     ]
   }
 }

@@ -1,0 +1,13 @@
+{
+  "alias": "claude-code",
+  "vcpu": 2,
+  "memory_mib": 2048,
+  "disk_mib": 8192,
+  "build_spec": {
+    "from": "ubuntu:24.04",
+    "steps": [
+      { "run": "apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates build-essential ripgrep vim python3 python3-pip && rm -rf /var/lib/apt/lists/*" },
+      { "run": "curl -fsSL https://claude.ai/install.sh | bash && install -m 0755 /root/.local/bin/claude /usr/local/bin/claude" }
+    ]
+  }
+}
