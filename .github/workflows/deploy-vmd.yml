@@ -40,25 +40,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Check if boxd source changed
-        id: boxd-changed
-        run: |
-          # Compare boxd-related paths against the parent commit.
-          if git diff --name-only HEAD~1 HEAD | grep -qE '^cmd/boxd/|^proto/boxdpb/|^proto/boxd\.proto'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build binaries
+        # Always rebuild both. The previous HEAD~1..HEAD diff check for boxd
+        # dropped the build whenever the triggering commit didn't touch
+        # cmd/boxd/** — even if an earlier commit in the same push did.
+        # That caused silent "stale boxd" deploys where the rootfs kept
+        # running yesterday's guest agent. boxd is tiny (~13 MB) and
+        # compiles in seconds; just always building it avoids a whole
+        # class of drift. Rootfs rebuild downstream keys off the
+        # produced binary's hash so no-op rebuilds are still cheap.
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
-          if [ "${{ steps.boxd-changed.outputs.changed }}" = "true" ]; then
-            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
-          else
-            echo "boxd source unchanged — skipping build"
-          fi
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -76,7 +70,6 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
-          BOXD_CHANGED: ${{ steps.boxd-changed.outputs.changed }}
         run: |
           python3 - <<'PYEOF'
           import os, sys, subprocess, textwrap
@@ -87,7 +80,6 @@ jobs:
           service     = os.environ.get('VMD_SERVICE', 'superserve-vmd')
           install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
           sha         = os.environ['SHA'][:8]
-          boxd_changed = os.environ.get('BOXD_CHANGED', 'true') == 'true'
 
           result = subprocess.run([
               'gcloud', 'compute', 'instances', 'list',
@@ -118,10 +110,11 @@ jobs:
                   '--quiet', '--tunnel-through-iap',
               ], check=True, capture_output=True)
 
-              # Upload binaries
+              # Upload binaries — always upload both. The remote script
+              # below compares hashes before installing boxd and rebuilding
+              # the rootfs, so an unchanged binary is a no-op at rest.
               scp('bin/vmd', f'/tmp/vmd-{sha}')
-              if boxd_changed:
-                  scp('bin/boxd', f'/tmp/boxd-{sha}')
+              scp('bin/boxd', f'/tmp/boxd-{sha}')
 
               # Upload systemd units and helper scripts
               scp('deploy/superserve-vmd.service', '/tmp/superserve-vmd.service')
@@ -149,13 +142,20 @@ jobs:
                   sudo mv /tmp/fc-cleanup {install_dir}/fc-cleanup
                   sudo chmod +x {install_dir}/fc-cleanup
 
-                  # Only inject boxd + rebuild rootfs when boxd source changed.
-                  # Skipping this preserves the rootfs hash so VMD's template
-                  # cache works — no ~8s cold boot on VMD-only deploys.
-                  BOXD_SRC_CHANGED={'true' if boxd_changed else 'false'}
-                  if [ "$BOXD_SRC_CHANGED" = "true" ]; then
-                      sudo mv /tmp/boxd-{sha} {install_dir}/boxd
-                      sudo chmod +x {install_dir}/boxd
+                  # Inject boxd + rebuild rootfs only if the new binary
+                  # differs from what's already installed. `-trimpath
+                  # -ldflags '-s -w'` makes Go builds reproducible, so
+                  # hashes only differ when source actually changed. This
+                  # replaces the old "compare against HEAD~1" git diff
+                  # check, which missed boxd changes that landed in any
+                  # commit other than the very last one on a push.
+                  NEW_HASH=$(sha256sum /tmp/boxd-{sha} | awk '{{print $1}}')
+                  CUR_HASH=$(sha256sum {install_dir}/boxd 2>/dev/null | awk '{{print $1}}' || echo none)
+
+                  if [ "$NEW_HASH" != "$CUR_HASH" ]; then
+                      echo "boxd changed ($CUR_HASH -> $NEW_HASH) — installing + rebuilding rootfs"
+                      sudo install -m 0755 /tmp/boxd-{sha} {install_dir}/boxd
+                      rm -f /tmp/boxd-{sha}
 
                       ROOTFS=""
                       for env_file in /etc/sandbox/vmd.env; do
@@ -186,7 +186,8 @@ jobs:
                           echo "WARNING: BASE_ROOTFS_PATH not found; skipping rootfs inject"
                       fi
                   else
-                      echo "boxd source unchanged — skipping build and rootfs inject"
+                      echo "boxd unchanged ($CUR_HASH) — skipping install + rootfs rebuild"
+                      rm -f /tmp/boxd-{sha}
                   fi
 
                   # Restart VMD only. Proxy is NOT restarted — it has its own pipeline.
