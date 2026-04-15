@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
@@ -135,9 +136,13 @@ type Manager struct {
 	vms       map[string]*VMInstance
 	// templates is keyed by template ID. The baked-in default template is
 	// registered under "default" by InitDefaultTemplate. Build-produced
-	// templates are registered here at build-completion time (future work).
+	// templates are registered here by BuildTemplate.
 	templates map[string]*TemplateSnapshot
 	createSem chan struct{}
+
+	// builder produces rootfs.ext4 files from BuildSpecs. Set via SetBuilder
+	// on vmd hosts that handle template builds; nil elsewhere.
+	builder builder.Builder
 }
 
 // DefaultTemplateID is the key under which the baked-in default template is
@@ -519,11 +524,28 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, templateID string, 
 // coldBootVM — used only for InitDefaultTemplate and as fallback
 // ---------------------------------------------------------------------------
 
-// coldBootVM provisions a VM the slow way: copy rootfs, set up networking,
-// start Firecracker, configure machine, and boot the kernel.
+// coldBootVM is a thin shim that uses the baked-in BaseRootfsPath and default
+// 1-vCPU / 1024-MiB config. Existing callers (InitDefaultTemplate, CreateVM
+// fallback) hit this path; BuildTemplate uses coldBootFromRootfs below.
 func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, error) {
+	return m.coldBootFromRootfs(ctx, vmID, m.cfg.BaseRootfsPath, 1, 1024)
+}
+
+// coldBootFromRootfs is the parameterized form: boot a VM from a specific
+// rootfs at the requested vcpu/memory. Used by BuildTemplate to boot the
+// build VM from a freshly-produced rootfs at the template's target shape.
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath string, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
+	}
+	if rootfsPath == "" {
+		return nil, fmt.Errorf("rootfsPath is required")
+	}
+	if vcpu == 0 {
+		vcpu = 1
+	}
+	if memMiB == 0 {
+		memMiB = 1024
 	}
 
 	m.mu.Lock()
@@ -538,20 +560,20 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		CreatedAt: time.Now(),
 		RunDirID:  vmID,
 		Config: VMConfig{
-			VCPU:       1,
-			MemoryMiB:  1024,
+			VCPU:       vcpu,
+			MemoryMiB:  memMiB,
 			KernelPath: m.cfg.KernelPath,
-			RootfsPath: m.cfg.BaseRootfsPath,
+			RootfsPath: rootfsPath,
 		},
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Msg("cold-booting VM")
+	log.Info().Str("rootfs", rootfsPath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
 
-	// 1. Copy the base rootfs for this VM.
-	diskPath, err := m.copyRootfs(ctx, vmID, m.cfg.BaseRootfsPath)
+	// 1. Copy the rootfs for this VM.
+	diskPath, err := m.copyRootfs(ctx, vmID, rootfsPath)
 	if err != nil {
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
@@ -587,8 +609,8 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		KernelPath: m.cfg.KernelPath,
 		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0",
 		RootfsPath: diskPath,
-		VCPUCount:  1,
-		MemSizeMiB: 1024,
+		VCPUCount:  int(vcpu),
+		MemSizeMiB: int(memMiB),
 		TAPDevice:  network.TAPName,
 		MACAddress: mac,
 		VMID:       vmID,

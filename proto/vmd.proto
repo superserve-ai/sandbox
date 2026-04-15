@@ -41,6 +41,60 @@ service VMDaemon {
 
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
+
+  // BuildTemplate produces a template snapshot from a BuildSpec end-to-end:
+  // pulls the OCI base image, injects the guest agent, boots a Firecracker
+  // VM at the requested shape, runs user build steps inside it, snapshots,
+  // and registers the result so subsequent CreateVM calls can restore from
+  // it via template_id. Synchronous — blocks until done. Day-9 work adds an
+  // async variant with GetBuildStatus / CancelBuild.
+  rpc BuildTemplate(BuildTemplateRequest) returns (BuildTemplateResponse);
+}
+
+// ---------------------------------------------------------------------------
+// BuildTemplate
+// ---------------------------------------------------------------------------
+
+message BuildTemplateRequest {
+  string template_id = 1;          // Key under which the snapshot is registered.
+  string from = 2;                 // OCI image reference, e.g. "python:3.11".
+  repeated BuildStep steps = 3;    // Ordered build steps executed inside the VM.
+  string start_cmd = 4;            // Optional: started before snapshot, captured live.
+  string ready_cmd = 5;            // Optional: polled until exit 0 before snapshot.
+  uint32 vcpu = 6;
+  uint32 memory_mib = 7;
+  uint32 disk_mib = 8;
+}
+
+message BuildStep {
+  // Exactly one of the fields below is set per step. Matches the canonical
+  // build_spec shape persisted in the template table's jsonb column.
+  oneof op {
+    string run = 1;              // Shell command run via /bin/sh -c.
+    BuildCopyOp copy = 2;        // Base64 tar payload extracted at dst.
+    BuildEnvOp env = 3;          // Env var applied to subsequent run steps.
+    string workdir = 4;          // Working directory for subsequent run steps.
+  }
+}
+
+message BuildCopyOp {
+  string src = 1;   // Base64-encoded tar archive.
+  string dst = 2;   // Absolute path inside the VM.
+}
+
+message BuildEnvOp {
+  string key = 1;
+  string value = 2;
+}
+
+message BuildTemplateResponse {
+  string snapshot_path = 1;
+  string mem_file_path = 2;
+  string rootfs_path = 3;
+  string resolved_digest = 4;    // sha256:... of the resolved base image.
+  int64 size_bytes = 5;          // On-disk rootfs size.
+  uint32 vcpu = 6;               // Actual shape of the produced snapshot.
+  uint32 memory_mib = 7;
 }
 
 // ---------------------------------------------------------------------------

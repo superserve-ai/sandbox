@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -271,6 +272,76 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
 }
+
+func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplateRequest) (*vmdpb.BuildTemplateResponse, error) {
+	if req.GetTemplateId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "template_id is required")
+	}
+	if req.GetFrom() == "" {
+		return nil, status.Error(codes.InvalidArgument, "from is required")
+	}
+
+	spec := builder.BuildSpec{
+		From:     req.GetFrom(),
+		StartCmd: req.GetStartCmd(),
+		ReadyCmd: req.GetReadyCmd(),
+	}
+	for i, pstep := range req.GetSteps() {
+		step, err := buildStepFromProto(pstep)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "steps[%d]: %v", i, err)
+		}
+		spec.Steps = append(spec.Steps, step)
+	}
+
+	res, err := a.mgr.BuildTemplate(ctx, BuildTemplateRequest{
+		TemplateID: req.GetTemplateId(),
+		Spec:       spec,
+		VCPU:       req.GetVcpu(),
+		MemoryMiB:  req.GetMemoryMib(),
+		DiskMiB:    req.GetDiskMib(),
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "build template: %v", err)
+	}
+
+	return &vmdpb.BuildTemplateResponse{
+		SnapshotPath:   res.SnapshotPath,
+		MemFilePath:    res.MemFilePath,
+		RootfsPath:     res.RootfsPath,
+		ResolvedDigest: res.ResolvedDigest,
+		SizeBytes:      res.SizeBytes,
+		Vcpu:           req.GetVcpu(),
+		MemoryMib:      req.GetMemoryMib(),
+	}, nil
+}
+
+// buildStepFromProto converts a proto BuildStep to the internal/builder
+// type. Enforces the "exactly one op" invariant at the gRPC boundary so
+// BuildTemplate never has to worry about it.
+func buildStepFromProto(p *vmdpb.BuildStep) (builder.BuildStep, error) {
+	if p == nil {
+		return builder.BuildStep{}, nil
+	}
+	switch op := p.GetOp().(type) {
+	case *vmdpb.BuildStep_Run:
+		run := op.Run
+		return builder.BuildStep{Run: &run}, nil
+	case *vmdpb.BuildStep_Copy:
+		return builder.BuildStep{Copy: &builder.CopyOp{Src: op.Copy.GetSrc(), Dst: op.Copy.GetDst()}}, nil
+	case *vmdpb.BuildStep_Env:
+		return builder.BuildStep{Env: &builder.EnvOp{Key: op.Env.GetKey(), Value: op.Env.GetValue()}}, nil
+	case *vmdpb.BuildStep_Workdir:
+		wd := op.Workdir
+		return builder.BuildStep{Workdir: &wd}, nil
+	default:
+		return builder.BuildStep{}, &fieldError{"op must be one of run/copy/env/workdir"}
+	}
+}
+
+type fieldError struct{ msg string }
+
+func (e *fieldError) Error() string { return e.msg }
 
 func vmStatusToProto(s VMStatus) vmdpb.VMStatus {
 	switch s {

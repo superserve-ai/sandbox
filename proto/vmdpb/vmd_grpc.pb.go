@@ -30,6 +30,7 @@ const (
 	VMDaemon_GetVMInfo_FullMethodName            = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
 	VMDaemon_SetupNetwork_FullMethodName         = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
 	VMDaemon_UpdateSandboxNetwork_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
+	VMDaemon_BuildTemplate_FullMethodName        = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -63,6 +64,13 @@ type VMDaemonClient interface {
 	SetupNetwork(ctx context.Context, in *SetupNetworkRequest, opts ...grpc.CallOption) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error)
+	// BuildTemplate produces a template snapshot from a BuildSpec end-to-end:
+	// pulls the OCI base image, injects the guest agent, boots a Firecracker
+	// VM at the requested shape, runs user build steps inside it, snapshots,
+	// and registers the result so subsequent CreateVM calls can restore from
+	// it via template_id. Synchronous — blocks until done. Day-9 work adds an
+	// async variant with GetBuildStatus / CancelBuild.
+	BuildTemplate(ctx context.Context, in *BuildTemplateRequest, opts ...grpc.CallOption) (*BuildTemplateResponse, error)
 }
 
 type vMDaemonClient struct {
@@ -192,6 +200,16 @@ func (c *vMDaemonClient) UpdateSandboxNetwork(ctx context.Context, in *UpdateSan
 	return out, nil
 }
 
+func (c *vMDaemonClient) BuildTemplate(ctx context.Context, in *BuildTemplateRequest, opts ...grpc.CallOption) (*BuildTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BuildTemplateResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_BuildTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VMDaemonServer is the server API for VMDaemon service.
 // All implementations must embed UnimplementedVMDaemonServer
 // for forward compatibility.
@@ -223,6 +241,13 @@ type VMDaemonServer interface {
 	SetupNetwork(context.Context, *SetupNetworkRequest) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error)
+	// BuildTemplate produces a template snapshot from a BuildSpec end-to-end:
+	// pulls the OCI base image, injects the guest agent, boots a Firecracker
+	// VM at the requested shape, runs user build steps inside it, snapshots,
+	// and registers the result so subsequent CreateVM calls can restore from
+	// it via template_id. Synchronous — blocks until done. Day-9 work adds an
+	// async variant with GetBuildStatus / CancelBuild.
+	BuildTemplate(context.Context, *BuildTemplateRequest) (*BuildTemplateResponse, error)
 	mustEmbedUnimplementedVMDaemonServer()
 }
 
@@ -265,6 +290,9 @@ func (UnimplementedVMDaemonServer) SetupNetwork(context.Context, *SetupNetworkRe
 }
 func (UnimplementedVMDaemonServer) UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateSandboxNetwork not implemented")
+}
+func (UnimplementedVMDaemonServer) BuildTemplate(context.Context, *BuildTemplateRequest) (*BuildTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BuildTemplate not implemented")
 }
 func (UnimplementedVMDaemonServer) mustEmbedUnimplementedVMDaemonServer() {}
 func (UnimplementedVMDaemonServer) testEmbeddedByValue()                  {}
@@ -478,6 +506,24 @@ func _VMDaemon_UpdateSandboxNetwork_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_BuildTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BuildTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).BuildTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_BuildTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).BuildTemplate(ctx, req.(*BuildTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VMDaemon_ServiceDesc is the grpc.ServiceDesc for VMDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -524,6 +570,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateSandboxNetwork",
 			Handler:    _VMDaemon_UpdateSandboxNetwork_Handler,
+		},
+		{
+			MethodName: "BuildTemplate",
+			Handler:    _VMDaemon_BuildTemplate_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
+	"github.com/superserve-ai/sandbox/internal/builder"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -284,6 +285,19 @@ func main() {
 	}
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+
+	// ---- Template builder ----
+	// Wire the in-process builder so BuildTemplate can produce rootfs.ext4
+	// from user-supplied specs. Boxd binary path comes from env; the same
+	// binary baked into the default rootfs is injected into every template.
+	boxdPath := envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd")
+	bld, err := builder.NewBuilder(builder.Config{
+		BoxdBinaryPath: boxdPath,
+	})
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to construct builder")
+	}
+	mgr.SetBuilder(bld)
 
 	// ---- Reattach to running VMs from previous VMD lifetime ----
 	reattached, stale := mgr.ReattachAll(ctx)
