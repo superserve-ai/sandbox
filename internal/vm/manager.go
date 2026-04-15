@@ -316,8 +316,7 @@ func fileHash(path string) (string, error) {
 // CreateVM provisions a new Firecracker microVM by restoring from the default
 // template snapshot. Each VM gets its own rootfs copy and runs in a mount
 // namespace that maps the per-VM rootfs to the template's fixed path.
-func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32,
-	kernelPath, kernelArgs, rootfsPath string, netCfg *network.Config, metadata map[string]string,
+func (m *Manager) CreateVM(ctx context.Context, vmID string, netCfg *network.Config, metadata map[string]string,
 ) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()

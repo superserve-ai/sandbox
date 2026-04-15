@@ -24,13 +24,6 @@ func NewGRPCAdapter(mgr *Manager) *GRPCAdapter {
 }
 
 func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) (*vmdpb.CreateVMResponse, error) {
-	var vcpu, memMiB, diskMiB uint32
-	if rl := req.GetResourceLimits(); rl != nil {
-		vcpu = rl.GetVcpuCount()
-		memMiB = rl.GetMemoryMib()
-		diskMiB = rl.GetDiskSizeMib()
-	}
-
 	var netCfg *network.Config
 	if nc := req.GetNetworkConfig(); nc != nil {
 		netCfg = &network.Config{
@@ -41,9 +34,7 @@ func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) 
 		}
 	}
 
-	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), vcpu, memMiB, diskMiB,
-		req.GetKernelPath(), req.GetKernelArgs(), req.GetBaseRootfsPath(),
-		netCfg, req.GetMetadata())
+	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), netCfg, req.GetMetadata())
 	if err != nil {
 		return nil, err
 	}
