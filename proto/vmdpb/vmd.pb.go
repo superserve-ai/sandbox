@@ -332,6 +332,7 @@ type CreateVMRequest struct {
 	Metadata       map[string]string      `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`              // Arbitrary key-value pairs.
 	SandboxNetwork *SandboxNetworkConfig  `protobuf:"bytes,8,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"`                                                      // Per-sandbox egress rules (optional).
 	EnvVars        map[string]string      `protobuf:"bytes,9,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Environment variables injected into every process in the VM.
+	TemplateId     string                 `protobuf:"bytes,10,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`                                                                 // Which template snapshot to restore from. Empty string means "default".
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -427,6 +428,13 @@ func (x *CreateVMRequest) GetEnvVars() map[string]string {
 		return x.EnvVars
 	}
 	return nil
+}
+
+func (x *CreateVMRequest) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
 }
 
 type CreateVMResponse struct {
@@ -1817,7 +1825,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x1aSandboxNetworkEgressConfig\x12#\n" +
 	"\rallowed_cidrs\x18\x01 \x03(\tR\fallowedCidrs\x12!\n" +
 	"\fdenied_cidrs\x18\x02 \x03(\tR\vdeniedCidrs\x12'\n" +
-	"\x0fallowed_domains\x18\x03 \x03(\tR\x0eallowedDomains\"\x8c\x05\n" +
+	"\x0fallowed_domains\x18\x03 \x03(\tR\x0eallowedDomains\"\xad\x05\n" +
 	"\x0fCreateVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12(\n" +
 	"\x10base_rootfs_path\x18\x02 \x01(\tR\x0ebaseRootfsPath\x12\x1f\n" +
@@ -1829,7 +1837,10 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12L\n" +
 	"\bmetadata\x18\a \x03(\v20.superserve.vmd.v1.CreateVMRequest.MetadataEntryR\bmetadata\x12P\n" +
 	"\x0fsandbox_network\x18\b \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x12J\n" +
-	"\benv_vars\x18\t \x03(\v2/.superserve.vmd.v1.CreateVMRequest.EnvVarsEntryR\aenvVars\x1a;\n" +
+	"\benv_vars\x18\t \x03(\v2/.superserve.vmd.v1.CreateVMRequest.EnvVarsEntryR\aenvVars\x12\x1f\n" +
+	"\vtemplate_id\x18\n" +
+	" \x01(\tR\n" +
+	"templateId\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a:\n" +

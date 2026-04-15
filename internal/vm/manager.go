@@ -131,11 +131,19 @@ type Manager struct {
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
 
-	mu              sync.RWMutex
-	vms             map[string]*VMInstance
-	defaultTemplate *TemplateSnapshot
-	createSem       chan struct{}
+	mu        sync.RWMutex
+	vms       map[string]*VMInstance
+	// templates is keyed by template ID. The baked-in default template is
+	// registered under "default" by InitDefaultTemplate. Build-produced
+	// templates are registered here at build-completion time (future work).
+	templates map[string]*TemplateSnapshot
+	createSem chan struct{}
 }
+
+// DefaultTemplateID is the key under which the baked-in default template is
+// registered in the templates map. CreateVM falls back to this when no
+// template_id is provided.
+const DefaultTemplateID = "default"
 
 // NewManager creates a new VM manager.
 func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) (*Manager, error) {
@@ -144,10 +152,11 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		maxConcurrent = 10
 	}
 	return &Manager{
-		cfg:        cfg,
-		netMgr:     netMgr,
-		log:        log.With().Str("component", "vm_manager").Logger(),
+		cfg:       cfg,
+		netMgr:    netMgr,
+		log:       log.With().Str("component", "vm_manager").Logger(),
 		vms:       make(map[string]*VMInstance),
+		templates: make(map[string]*TemplateSnapshot),
 		createSem: make(chan struct{}, maxConcurrent),
 	}, nil
 }
@@ -204,7 +213,8 @@ func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
 	if hashErr == nil && m.canReuseTemplate(snapPath, memPath, diskPath, hashPath, currentHash) {
 		vcpu, mem := readTemplateMeta(metaPath)
 		log.Info().Uint32("vcpu", vcpu).Uint32("mem_mib", mem).Msg("base rootfs unchanged — reusing cached template snapshot")
-		m.defaultTemplate = &TemplateSnapshot{
+		m.mu.Lock()
+		m.templates[DefaultTemplateID] = &TemplateSnapshot{
 			SnapshotPath: snapPath,
 			MemFilePath:  memPath,
 			DiskPath:     diskPath,
@@ -212,6 +222,7 @@ func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
 			VCPUCount:    vcpu,
 			MemSizeMiB:   mem,
 		}
+		m.mu.Unlock()
 		return nil
 	}
 
@@ -245,7 +256,8 @@ func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
 	}
 	writeTemplateMeta(metaPath, inst.Config.VCPU, inst.Config.MemoryMiB)
 
-	m.defaultTemplate = &TemplateSnapshot{
+	m.mu.Lock()
+	m.templates[DefaultTemplateID] = &TemplateSnapshot{
 		SnapshotPath: snapPath,
 		MemFilePath:  memPath,
 		DiskPath:     diskPath,
@@ -253,12 +265,26 @@ func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
 		VCPUCount:    inst.Config.VCPU,
 		MemSizeMiB:   inst.Config.MemoryMiB,
 	}
+	m.mu.Unlock()
 
 	log.Info().
 		Str("snapshot_path", snapPath).
 		Str("disk_path", diskPath).
 		Msg("default template ready")
 	return nil
+}
+
+// getTemplate returns the snapshot registered under templateID, or the default
+// template when templateID is empty. Returns nil if the requested template is
+// not registered (caller should 404 or fall back).
+func (m *Manager) getTemplate(templateID string) *TemplateSnapshot {
+	if templateID == "" {
+		templateID = DefaultTemplateID
+	}
+	m.mu.RLock()
+	tmpl := m.templates[templateID]
+	m.mu.RUnlock()
+	return tmpl
 }
 
 // readTemplateMeta reads the vCPU and memory values persisted alongside
@@ -313,23 +339,31 @@ func fileHash(path string) (string, error) {
 // CreateVM — single code path via template snapshot restore
 // ---------------------------------------------------------------------------
 
-// CreateVM provisions a new Firecracker microVM by restoring from the default
-// template snapshot. Each VM gets its own rootfs copy and runs in a mount
-// namespace that maps the per-VM rootfs to the template's fixed path.
-func (m *Manager) CreateVM(ctx context.Context, vmID string, netCfg *network.Config, metadata map[string]string,
+// CreateVM provisions a new Firecracker microVM by restoring from a template
+// snapshot. Each VM gets its own rootfs copy and runs in a mount namespace
+// that maps the per-VM rootfs to the template's fixed path. When templateID
+// is empty, falls back to the baked-in "default" template.
+func (m *Manager) CreateVM(ctx context.Context, vmID string, templateID string, netCfg *network.Config, metadata map[string]string,
 ) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
 
-	// If the template isn't ready (e.g., during InitDefaultTemplate itself),
-	// fall through to cold boot.
-	if m.defaultTemplate == nil {
-		return m.coldBootVM(ctx, vmID)
+	tmpl := m.getTemplate(templateID)
+
+	// If no template is ready (e.g., during InitDefaultTemplate itself and
+	// templateID is empty), fall through to cold boot. For a non-empty
+	// templateID that isn't registered, return an explicit NotFound so the
+	// caller can surface a clear error.
+	if tmpl == nil {
+		if templateID == "" || templateID == DefaultTemplateID {
+			return m.coldBootVM(ctx, vmID)
+		}
+		return nil, status.Errorf(codes.NotFound, "template %s not registered on this host", templateID)
 	}
 
 	// Verify template snapshot files are still intact.
-	if err := m.checkTemplateHealth(); err != nil {
+	if err := m.checkTemplateHealth(tmpl); err != nil {
 		return nil, fmt.Errorf("template unhealthy: %w", err)
 	}
 
@@ -358,8 +392,8 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, netCfg *network.Con
 		Metadata:  metadata,
 		RunDirID:  vmID,
 		Config: VMConfig{
-			VCPU:      m.defaultTemplate.VCPUCount,
-			MemoryMiB: m.defaultTemplate.MemSizeMiB,
+			VCPU:      tmpl.VCPUCount,
+			MemoryMiB: tmpl.MemSizeMiB,
 		},
 	}
 	m.vms[vmID] = inst
@@ -389,7 +423,7 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, netCfg *network.Con
 	netCh := make(chan netResult, 1)
 
 	go func() {
-		p, err := m.copyRootfs(ctx, vmID, m.defaultTemplate.DiskPath)
+		p, err := m.copyRootfs(ctx, vmID, tmpl.DiskPath)
 		rootfsCh <- rootfsResult{path: p, err: err}
 	}()
 	go func() {
@@ -461,7 +495,7 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, netCfg *network.Con
 	// and the network namespace provides isolation.
 	restoreStep := time.Now()
 	if err := RestoreSnapshotWithOverrides(
-		socketPath, m.defaultTemplate.SnapshotPath, m.defaultTemplate.MemFilePath,
+		socketPath, tmpl.SnapshotPath, tmpl.MemFilePath,
 		"eth0", netInfo.TAPDevice,
 	); err != nil {
 		m.netMgr.CleanupVM(vmID)
@@ -1453,15 +1487,15 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 	return waitForHTTPHealth(ctx, vmIP, timeout)
 }
 
-// checkTemplateHealth verifies the default template snapshot files are readable.
-func (m *Manager) checkTemplateHealth() error {
-	if m.defaultTemplate == nil {
-		return fmt.Errorf("no default template initialized")
+// checkTemplateHealth verifies the given template's snapshot files exist on disk.
+func (m *Manager) checkTemplateHealth(tmpl *TemplateSnapshot) error {
+	if tmpl == nil {
+		return fmt.Errorf("no template initialized")
 	}
 	for _, path := range []string{
-		m.defaultTemplate.SnapshotPath,
-		m.defaultTemplate.MemFilePath,
-		m.defaultTemplate.DiskPath,
+		tmpl.SnapshotPath,
+		tmpl.MemFilePath,
+		tmpl.DiskPath,
 	} {
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("template file missing: %s: %w", path, err)
@@ -1470,14 +1504,20 @@ func (m *Manager) checkTemplateHealth() error {
 	return nil
 }
 
-
-// CleanupTemplate removes the default template's rundir and snapshot files.
-func (m *Manager) CleanupTemplate() {
-	if m.defaultTemplate == nil {
+// CleanupTemplate removes the named template's rundir and snapshot files and
+// drops it from the templates map. Pass DefaultTemplateID to remove the
+// baked-in default. No-op for unknown template IDs.
+func (m *Manager) CleanupTemplate(templateID string) {
+	if templateID == "" {
+		templateID = DefaultTemplateID
+	}
+	m.mu.Lock()
+	tmpl := m.templates[templateID]
+	delete(m.templates, templateID)
+	m.mu.Unlock()
+	if tmpl == nil {
 		return
 	}
-	tmpl := m.defaultTemplate
-	m.defaultTemplate = nil
 
 	if tmpl.RunDir != "" {
 		if err := os.RemoveAll(tmpl.RunDir); err != nil {
@@ -1490,6 +1530,6 @@ func (m *Manager) CleanupTemplate() {
 			m.log.Warn().Err(err).Str("dir", snapshotDir).Msg("failed to remove template snapshot")
 		}
 	}
-	m.log.Info().Msg("template files cleaned up")
+	m.log.Info().Str("template_id", templateID).Msg("template files cleaned up")
 }
 

@@ -34,7 +34,7 @@ func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) 
 		}
 	}
 
-	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), netCfg, req.GetMetadata())
+	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), req.GetTemplateId(), netCfg, req.GetMetadata())
 	if err != nil {
 		return nil, err
 	}

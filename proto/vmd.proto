@@ -91,6 +91,7 @@ message CreateVMRequest {
   map<string, string> metadata = 7;   // Arbitrary key-value pairs.
   SandboxNetworkConfig sandbox_network = 8;  // Per-sandbox egress rules (optional).
   map<string, string> env_vars = 9;   // Environment variables injected into every process in the VM.
+  string template_id = 10;       // Which template snapshot to restore from. Empty string means "default".
 }
 
 message CreateVMResponse {
