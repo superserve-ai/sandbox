@@ -377,12 +377,6 @@ components:
           minLength: 1
           maxLength: 64
           description: Human-readable name for the sandbox.
-        from_snapshot:
-          type: string
-          format: uuid
-          description: >
-            If provided, boot the sandbox from this snapshot instead of
-            creating a fresh VM. The snapshot must belong to the same team.
         timeout_seconds:
           type: integer
           format: int32
