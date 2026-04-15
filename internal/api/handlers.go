@@ -535,7 +535,6 @@ type networkConfigRequest struct {
 
 type createSandboxRequest struct {
 	Name         string                `json:"name" binding:"required,min=1,max=64"`
-	FromSnapshot *string               `json:"from_snapshot,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
 
 	// TimeoutSeconds is a hard lifetime cap in seconds, measured from
@@ -831,30 +830,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// If from_snapshot is provided, look up the snapshot and verify team ownership.
-	var snapshotID pgtype.UUID
-	var snapshotPath, snapshotMemPath string
-	if req.FromSnapshot != nil {
-		snapUUID, err := uuid.Parse(*req.FromSnapshot)
-		if err != nil {
-			respondErrorMsg(c, "bad_request", "Invalid from_snapshot: not a valid UUID", http.StatusBadRequest)
-			return
-		}
-
-		snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
-			ID:     snapUUID,
-			TeamID: teamID,
-		})
-		if err != nil {
-			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
-			return
-		}
-
-		snapshotID = pgtype.UUID{Bytes: snapUUID, Valid: true}
-		snapshotPath = snapshot.Path
-		snapshotMemPath = resolveMemPath(snapshot)
-	}
-
 	// Select a host for this sandbox.
 	var hostID string
 	if h.Scheduler != nil {
@@ -900,7 +875,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			VcpuCount:      1, // placeholders; real values land via ActivateSandbox
 			MemoryMib:      1,
 			HostID:         hostID,
-			SnapshotID:     snapshotID,
 			TimeoutSeconds: req.TimeoutSeconds,
 			Metadata:       metadataJSON,
 		})
@@ -914,15 +888,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
-	var ipAddress string
-	var actualVcpu, actualMemMiB uint32
-	var vmdErr error
-	if req.FromSnapshot != nil {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
-	} else {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),
-			0, 0, 0, nil, req.EnvVars)
-	}
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.CreateInstance(vmdCtx, sandboxID.String(),
+		0, 0, 0, nil, req.EnvVars)
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
