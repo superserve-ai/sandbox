@@ -42,13 +42,19 @@ service VMDaemon {
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
 
-  // BuildTemplate produces a template snapshot from a BuildSpec end-to-end:
-  // pulls the OCI base image, injects the guest agent, boots a Firecracker
-  // VM at the requested shape, runs user build steps inside it, snapshots,
-  // and registers the result so subsequent CreateVM calls can restore from
-  // it via template_id. Synchronous — blocks until done. Day-9 work adds an
-  // async variant with GetBuildStatus / CancelBuild.
+  // BuildTemplate kicks off a template build asynchronously. Returns a
+  // build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
+  // for progress and uses CancelBuild(build_vm_id) to abort.
   rpc BuildTemplate(BuildTemplateRequest) returns (BuildTemplateResponse);
+
+  // GetBuildStatus returns the current state of a build dispatched via
+  // BuildTemplate. Used by the control plane's build supervisor to poll
+  // until a terminal status is reached.
+  rpc GetBuildStatus(GetBuildStatusRequest) returns (GetBuildStatusResponse);
+
+  // CancelBuild aborts an in-flight build and tears down the build VM.
+  // Idempotent — no-op for unknown or already-terminal builds.
+  rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -88,14 +94,48 @@ message BuildEnvOp {
 }
 
 message BuildTemplateResponse {
-  string snapshot_path = 1;
-  string mem_file_path = 2;
-  string rootfs_path = 3;
-  string resolved_digest = 4;    // sha256:... of the resolved base image.
-  int64 size_bytes = 5;          // On-disk rootfs size.
-  uint32 vcpu = 6;               // Actual shape of the produced snapshot.
-  uint32 memory_mib = 7;
+  // Opaque identifier the caller polls via GetBuildStatus. Typically
+  // "build-" + template_id, but treat as opaque.
+  string build_vm_id = 1;
 }
+
+// ---------------------------------------------------------------------------
+// GetBuildStatus / CancelBuild
+// ---------------------------------------------------------------------------
+
+message GetBuildStatusRequest {
+  string build_vm_id = 1;
+}
+
+message GetBuildStatusResponse {
+  // One of: "running", "snapshotting", "ready", "failed", "cancelled".
+  // "ready"/"failed"/"cancelled" are terminal — no future transitions.
+  string status = 1;
+
+  // Populated on ready.
+  string snapshot_path = 2;
+  string mem_file_path = 3;
+  string rootfs_path = 4;
+  string resolved_digest = 5;
+  int64 size_bytes = 6;
+
+  // Populated on failed / cancelled.
+  string error_message = 7;
+
+  int64 started_at_unix = 8;
+  int64 ended_at_unix = 9;  // 0 until terminal.
+
+  // Present when the caller's build_vm_id is unknown on this host.
+  // Supervisors treat "unknown on this host" as a hard failure since vmd
+  // doesn't survive across restarts for in-memory registry.
+  bool not_found = 10;
+}
+
+message CancelBuildRequest {
+  string build_vm_id = 1;
+}
+
+message CancelBuildResponse {}
 
 // ---------------------------------------------------------------------------
 // Resource limits

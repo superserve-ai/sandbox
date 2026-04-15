@@ -31,6 +31,8 @@ const (
 	VMDaemon_SetupNetwork_FullMethodName         = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
 	VMDaemon_UpdateSandboxNetwork_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
 	VMDaemon_BuildTemplate_FullMethodName        = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
+	VMDaemon_GetBuildStatus_FullMethodName       = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
+	VMDaemon_CancelBuild_FullMethodName          = "/superserve.vmd.v1.VMDaemon/CancelBuild"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -64,13 +66,17 @@ type VMDaemonClient interface {
 	SetupNetwork(ctx context.Context, in *SetupNetworkRequest, opts ...grpc.CallOption) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error)
-	// BuildTemplate produces a template snapshot from a BuildSpec end-to-end:
-	// pulls the OCI base image, injects the guest agent, boots a Firecracker
-	// VM at the requested shape, runs user build steps inside it, snapshots,
-	// and registers the result so subsequent CreateVM calls can restore from
-	// it via template_id. Synchronous — blocks until done. Day-9 work adds an
-	// async variant with GetBuildStatus / CancelBuild.
+	// BuildTemplate kicks off a template build asynchronously. Returns a
+	// build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
+	// for progress and uses CancelBuild(build_vm_id) to abort.
 	BuildTemplate(ctx context.Context, in *BuildTemplateRequest, opts ...grpc.CallOption) (*BuildTemplateResponse, error)
+	// GetBuildStatus returns the current state of a build dispatched via
+	// BuildTemplate. Used by the control plane's build supervisor to poll
+	// until a terminal status is reached.
+	GetBuildStatus(ctx context.Context, in *GetBuildStatusRequest, opts ...grpc.CallOption) (*GetBuildStatusResponse, error)
+	// CancelBuild aborts an in-flight build and tears down the build VM.
+	// Idempotent — no-op for unknown or already-terminal builds.
+	CancelBuild(ctx context.Context, in *CancelBuildRequest, opts ...grpc.CallOption) (*CancelBuildResponse, error)
 }
 
 type vMDaemonClient struct {
@@ -210,6 +216,26 @@ func (c *vMDaemonClient) BuildTemplate(ctx context.Context, in *BuildTemplateReq
 	return out, nil
 }
 
+func (c *vMDaemonClient) GetBuildStatus(ctx context.Context, in *GetBuildStatusRequest, opts ...grpc.CallOption) (*GetBuildStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetBuildStatusResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_GetBuildStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) CancelBuild(ctx context.Context, in *CancelBuildRequest, opts ...grpc.CallOption) (*CancelBuildResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelBuildResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_CancelBuild_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VMDaemonServer is the server API for VMDaemon service.
 // All implementations must embed UnimplementedVMDaemonServer
 // for forward compatibility.
@@ -241,13 +267,17 @@ type VMDaemonServer interface {
 	SetupNetwork(context.Context, *SetupNetworkRequest) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error)
-	// BuildTemplate produces a template snapshot from a BuildSpec end-to-end:
-	// pulls the OCI base image, injects the guest agent, boots a Firecracker
-	// VM at the requested shape, runs user build steps inside it, snapshots,
-	// and registers the result so subsequent CreateVM calls can restore from
-	// it via template_id. Synchronous — blocks until done. Day-9 work adds an
-	// async variant with GetBuildStatus / CancelBuild.
+	// BuildTemplate kicks off a template build asynchronously. Returns a
+	// build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
+	// for progress and uses CancelBuild(build_vm_id) to abort.
 	BuildTemplate(context.Context, *BuildTemplateRequest) (*BuildTemplateResponse, error)
+	// GetBuildStatus returns the current state of a build dispatched via
+	// BuildTemplate. Used by the control plane's build supervisor to poll
+	// until a terminal status is reached.
+	GetBuildStatus(context.Context, *GetBuildStatusRequest) (*GetBuildStatusResponse, error)
+	// CancelBuild aborts an in-flight build and tears down the build VM.
+	// Idempotent — no-op for unknown or already-terminal builds.
+	CancelBuild(context.Context, *CancelBuildRequest) (*CancelBuildResponse, error)
 	mustEmbedUnimplementedVMDaemonServer()
 }
 
@@ -293,6 +323,12 @@ func (UnimplementedVMDaemonServer) UpdateSandboxNetwork(context.Context, *Update
 }
 func (UnimplementedVMDaemonServer) BuildTemplate(context.Context, *BuildTemplateRequest) (*BuildTemplateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BuildTemplate not implemented")
+}
+func (UnimplementedVMDaemonServer) GetBuildStatus(context.Context, *GetBuildStatusRequest) (*GetBuildStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetBuildStatus not implemented")
+}
+func (UnimplementedVMDaemonServer) CancelBuild(context.Context, *CancelBuildRequest) (*CancelBuildResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelBuild not implemented")
 }
 func (UnimplementedVMDaemonServer) mustEmbedUnimplementedVMDaemonServer() {}
 func (UnimplementedVMDaemonServer) testEmbeddedByValue()                  {}
@@ -524,6 +560,42 @@ func _VMDaemon_BuildTemplate_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_GetBuildStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetBuildStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).GetBuildStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_GetBuildStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).GetBuildStatus(ctx, req.(*GetBuildStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_CancelBuild_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelBuildRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).CancelBuild(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_CancelBuild_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).CancelBuild(ctx, req.(*CancelBuildRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VMDaemon_ServiceDesc is the grpc.ServiceDesc for VMDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -574,6 +646,14 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BuildTemplate",
 			Handler:    _VMDaemon_BuildTemplate_Handler,
+		},
+		{
+			MethodName: "GetBuildStatus",
+			Handler:    _VMDaemon_GetBuildStatus_Handler,
+		},
+		{
+			MethodName: "CancelBuild",
+			Handler:    _VMDaemon_CancelBuild_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -44,29 +44,23 @@ func (m *Manager) SetBuilder(b builder.Builder) {
 	m.builder = b
 }
 
-// BuildTemplate produces a template snapshot end-to-end:
+// BuildTemplate starts a template build asynchronously and returns the
+// build VM id immediately. Use GetBuildStatus(build_vm_id) to poll progress
+// and CancelBuild(build_vm_id) to abort.
 //
-//	1. builder.BuildRootfs → rootfs.ext4 on local disk
-//	2. cold-boot a Firecracker VM from that rootfs at the requested shape
-//	3. wait for boxd
-//	4. [steps execution — day 8]
-//	5. [start_cmd / ready_cmd — day 8]
-//	6. pause + CreateVMSnapshot
-//	7. killVMKeepRunDir
-//	8. register m.templates[TemplateID]
-//
-// Synchronous: blocks until done. The supervisor (day 10) wraps this with
-// async status polling. Errors cleanly roll back partial state (destroy VM,
-// remove scratch rootfs) so a failed build doesn't leak resources.
-func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (*BuildTemplateResult, error) {
+// The actual work (pull + boot + steps + snapshot + register) runs in a
+// detached goroutine with a fresh context so the caller's HTTP request
+// cancellation doesn't kill an in-flight build — the supervisor polls via
+// GetBuildStatus instead.
+func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (string, error) {
 	if req.TemplateID == "" {
-		return nil, fmt.Errorf("template_id is required")
+		return "", fmt.Errorf("template_id is required")
 	}
 	if req.Spec.From == "" {
-		return nil, fmt.Errorf("spec.from is required")
+		return "", fmt.Errorf("spec.from is required")
 	}
 	if m.builder == nil {
-		return nil, fmt.Errorf("builder not configured on manager; call SetBuilder before BuildTemplate")
+		return "", fmt.Errorf("builder not configured on manager; call SetBuilder before BuildTemplate")
 	}
 	if req.VCPU == 0 {
 		req.VCPU = 1
@@ -78,7 +72,36 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 		req.DiskMiB = 4096
 	}
 
-	log := m.log.With().Str("template_id", req.TemplateID).Str("from", req.Spec.From).Logger()
+	buildVMID := "build-" + req.TemplateID
+
+	// Fresh context so the build survives the caller's HTTP request
+	// ending. CancelBuild is what stops it.
+	buildCtx, cancel := context.WithCancel(context.Background())
+
+	if _, err := m.registerBuild(buildVMID, req.TemplateID, cancel); err != nil {
+		cancel()
+		return "", err
+	}
+
+	go m.buildTemplateWorker(buildCtx, buildVMID, req)
+
+	return buildVMID, nil
+}
+
+// buildTemplateWorker is the goroutine body. Runs one build end-to-end and
+// records the outcome in the registry. Never returns an error — all failures
+// are logged and surfaced via completeBuild so GetBuildStatus sees them.
+func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest) {
+	result, err := m.buildTemplateSync(ctx, buildVMID, req)
+	m.completeBuild(buildVMID, result, err)
+}
+
+// buildTemplateSync does the actual work. Called by the async worker, but
+// separated so integration tests can exercise the pipeline without going
+// through the registry + goroutine. Callers MUST pass a buildVMID unique
+// on this host.
+func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req BuildTemplateRequest) (*BuildTemplateResult, error) {
+	log := m.log.With().Str("template_id", req.TemplateID).Str("build_vm_id", buildVMID).Str("from", req.Spec.From).Logger()
 	log.Info().Msg("starting template build")
 	buildStart := time.Now()
 
@@ -105,10 +128,7 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	}
 	log.Info().Str("digest", br.ResolvedDigest).Int64("size_bytes", br.SizeBytes).Dur("elapsed", time.Since(buildStart)).Msg("rootfs produced")
 
-	// Phase 2: cold-boot a build VM from that rootfs. We reuse the build
-	// template's own VM id so logs + systemd unit naming line up with the
-	// template for the lifetime of the build.
-	buildVMID := "build-" + req.TemplateID
+	// Phase 2: cold-boot a build VM from that rootfs.
 	inst, err := m.coldBootFromRootfs(ctx, buildVMID, rootfsPath, req.VCPU, req.MemoryMiB)
 	if err != nil {
 		return nil, fmt.Errorf("boot build VM: %w", err)
@@ -151,6 +171,9 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	}
 
 	// Phase 6: snapshot the running VM. Memory + vmstate land on disk.
+	// Flip the registry status so the supervisor (and SDK poller) can tell
+	// when user-step execution ends and the pause/dump phase begins.
+	m.setBuildStatus(buildVMID, BuildStatusSnapshotting)
 	snapPath, memPath, err := m.CreateVMSnapshot(ctx, buildVMID, snapshotDir)
 	if err != nil {
 		cleanup("snapshot failed")

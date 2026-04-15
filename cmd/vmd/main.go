@@ -366,6 +366,13 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize default template")
 	}
 
+	// ---- Orphan build cleanup ----
+	// Reclaim any template build directories left behind by a prior vmd
+	// lifetime that didn't reach a completion marker (crash, kill, cancel).
+	// Safe to run before any gRPC traffic since the build registry is
+	// in-memory only and starts empty at boot.
+	mgr.CleanupOrphanBuilds()
+
 	// ---- Local HTTP server (proxy resolver) ----
 	// Listens on localhost:9090. The edge proxy queries this to resolve
 	// instanceID → vmIP before forwarding data-plane traffic.

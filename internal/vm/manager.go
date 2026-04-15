@@ -143,6 +143,13 @@ type Manager struct {
 	// builder produces rootfs.ext4 files from BuildSpecs. Set via SetBuilder
 	// on vmd hosts that handle template builds; nil elsewhere.
 	builder builder.Builder
+
+	// builds tracks in-flight and completed template builds. Keyed by
+	// build VM id (which is also "build-" + templateID). Entries survive
+	// until process exit so late pollers can read terminal outcomes; a
+	// V2 sweep can evict old records if memory becomes a concern.
+	buildsMu sync.RWMutex
+	builds   map[string]*buildRecord
 }
 
 // DefaultTemplateID is the key under which the baked-in default template is

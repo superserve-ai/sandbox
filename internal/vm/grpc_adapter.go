@@ -294,7 +294,7 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		spec.Steps = append(spec.Steps, step)
 	}
 
-	res, err := a.mgr.BuildTemplate(ctx, BuildTemplateRequest{
+	buildVMID, err := a.mgr.BuildTemplate(ctx, BuildTemplateRequest{
 		TemplateID: req.GetTemplateId(),
 		Spec:       spec,
 		VCPU:       req.GetVcpu(),
@@ -305,15 +305,43 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		return nil, status.Errorf(codes.Internal, "build template: %v", err)
 	}
 
-	return &vmdpb.BuildTemplateResponse{
-		SnapshotPath:   res.SnapshotPath,
-		MemFilePath:    res.MemFilePath,
-		RootfsPath:     res.RootfsPath,
-		ResolvedDigest: res.ResolvedDigest,
-		SizeBytes:      res.SizeBytes,
-		Vcpu:           req.GetVcpu(),
-		MemoryMib:      req.GetMemoryMib(),
-	}, nil
+	return &vmdpb.BuildTemplateResponse{BuildVmId: buildVMID}, nil
+}
+
+func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildStatusRequest) (*vmdpb.GetBuildStatusResponse, error) {
+	if req.GetBuildVmId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
+	}
+	snap, ok := a.mgr.GetBuildStatus(req.GetBuildVmId())
+	if !ok {
+		return &vmdpb.GetBuildStatusResponse{NotFound: true}, nil
+	}
+	resp := &vmdpb.GetBuildStatusResponse{
+		Status:        string(snap.Status),
+		ErrorMessage:  snap.Error,
+		StartedAtUnix: snap.StartedAt.Unix(),
+	}
+	if !snap.EndedAt.IsZero() {
+		resp.EndedAtUnix = snap.EndedAt.Unix()
+	}
+	if snap.Result != nil {
+		resp.SnapshotPath = snap.Result.SnapshotPath
+		resp.MemFilePath = snap.Result.MemFilePath
+		resp.RootfsPath = snap.Result.RootfsPath
+		resp.ResolvedDigest = snap.Result.ResolvedDigest
+		resp.SizeBytes = snap.Result.SizeBytes
+	}
+	return resp, nil
+}
+
+func (a *GRPCAdapter) CancelBuild(ctx context.Context, req *vmdpb.CancelBuildRequest) (*vmdpb.CancelBuildResponse, error) {
+	if req.GetBuildVmId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
+	}
+	if err := a.mgr.CancelBuild(ctx, req.GetBuildVmId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "cancel build: %v", err)
+	}
+	return &vmdpb.CancelBuildResponse{}, nil
 }
 
 // buildStepFromProto converts a proto BuildStep to the internal/builder
