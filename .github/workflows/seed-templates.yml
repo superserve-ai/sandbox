@@ -1,0 +1,86 @@
+# CD — Seed Templates — curated public templates + enqueue their builds.
+#
+# Triggers:
+#   - push to main touching seeds/templates/** or cmd/seed-templates/**:
+#       runs staging, then production
+#   - workflow_dispatch with environment=staging:     staging only
+#   - workflow_dispatch with environment=production:  staging FIRST, then prod
+#
+# Production NEVER seeds without staging first. Same discipline as CD — Migrate.
+#
+# The seeder is idempotent: running it against an already-ready template with
+# an unchanged spec is a no-op. Edit a seed file (spec changes → new hash) to
+# trigger a rebuild on the next run.
+#
+# Expected wall-clock: seeding ~seconds, build wait up to ~15 min. The job
+# timeout is 45 min so even a long build sequence has headroom.
+
+name: CD — Seed Templates
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging always runs first)'
+        required: false
+        type: choice
+        options:
+          - staging
+          - production
+      force_rebuild:
+        description: 'Re-enqueue builds even for ready templates (use after host replacement)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'seeds/templates/**'
+      - 'cmd/seed-templates/**'
+
+jobs:
+  seed-staging:
+    name: Seed Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Seed staging
+        run: |
+          go run ./cmd/seed-templates --dir seeds/templates \
+            $( [ "${FORCE_REBUILD}" = "true" ] && echo "--force-rebuild" || true )
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+          SYSTEM_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_STAGING }}
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
+
+  seed-prod:
+    name: Seed Production
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    needs: [seed-staging]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Seed production
+        run: |
+          go run ./cmd/seed-templates --dir seeds/templates \
+            $( [ "${FORCE_REBUILD}" = "true" ] && echo "--force-rebuild" || true )
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+          SYSTEM_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_PROD }}
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
