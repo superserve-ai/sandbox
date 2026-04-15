@@ -385,12 +385,20 @@ paths:
     post:
       operationId: createTemplate
       tags: [Templates]
-      summary: Create a template (status pending)
+      summary: Create a template and kick off the first build
       description: |
-        Creates a template row in `pending` status. The actual build is
-        kicked off by `POST /templates/{template_id}/builds`. Splitting
-        creation from build lets clients validate the spec, see the assigned
-        ID, and decide when to start the build.
+        Creates a template row AND queues the first build atomically. The
+        response includes both the template id and the build id, so clients
+        can immediately poll `GET /templates/{id}` for overall status or
+        subscribe to `GET /templates/{id}/builds/{build_id}/logs` for live
+        output.
+
+        Template starts in status `building`. Poll until it reaches `ready`
+        before creating sandboxes from it. On failure the status becomes
+        `failed` and `error_message` is populated.
+
+        To rebuild an existing template (e.g. after a failure or when the
+        base image updates), use `POST /templates/{id}/builds`.
       security:
         - apiKey: []
       requestBody:
@@ -400,12 +408,12 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateTemplateRequest"
       responses:
-        "201":
-          description: Template created
+        "202":
+          description: Template created; first build queued
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TemplateResponse"
+                $ref: "#/components/schemas/CreateTemplateResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -499,10 +507,14 @@ paths:
     post:
       operationId: createTemplateBuild
       tags: [Templates]
-      summary: Kick off a build for this template
+      summary: Rebuild an existing template
       description: |
-        Inserts a build row in `pending` status. The control plane's build
-        supervisor picks it up on its next tick (within 30 seconds).
+        Queues a new build for this template. Used to retry after a failed
+        build, or to rebuild when the base image has been updated.
+
+        The **first** build is queued automatically when the template is
+        created via `POST /templates` — this endpoint is only for
+        subsequent builds.
 
         ## Idempotency
 
@@ -997,6 +1009,39 @@ components:
           default: 4096
         build_spec:
           $ref: "#/components/schemas/BuildSpec"
+
+    CreateTemplateResponse:
+      type: object
+      description: |
+        Returned by `POST /templates` — includes both the new template id
+        and the id of the first build that was queued for it. Clients can
+        immediately open the build-log SSE stream or poll the template for
+        status transitions.
+      properties:
+        id:
+          type: string
+          format: uuid
+        team_id:
+          type: string
+          format: uuid
+        alias:
+          type: string
+        status:
+          type: string
+          enum: [building, ready, failed]
+        vcpu:
+          type: integer
+        memory_mib:
+          type: integer
+        disk_mib:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        build_id:
+          type: string
+          format: uuid
+          description: ID of the first build. Use it to stream logs or poll status.
 
     TemplateResponse:
       type: object

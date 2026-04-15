@@ -1,11 +1,35 @@
 -- name: CreateTemplate :one
--- Insert a new template row in 'pending' status. The actual build is kicked
--- off later by POST /templates/:id/build, which inserts into template_build.
--- ID is generated SQL-side (defaulted) since template create has no parallel
--- VMD call to coordinate with — unlike CreateSandbox.
+-- Insert a new template row in 'pending' status (no build attached). Kept
+-- for ops-side seeding that wants to stage rows without triggering builds;
+-- the public API uses CreateTemplateWithBuild to auto-enqueue the first
+-- build in a single transaction.
 INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib)
 VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
+
+-- name: CreateTemplateWithBuild :one
+-- Atomically create a template and its first build in one round-trip.
+-- Used by POST /templates so users don't have to make two calls. Template
+-- starts at 'building' (not 'pending') because the build row is already
+-- queued at insert time; the supervisor picks it up within one tick.
+--
+-- build_spec_hash is computed in Go before the call and passed in so the
+-- idempotency index on template_build catches duplicate submits. Returns
+-- the template row plus the build id so the handler can echo both.
+WITH new_template AS (
+  INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib, status)
+  VALUES ($1, $2, $3, $4, $5, $6, 'building')
+  RETURNING id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib,
+            rootfs_path, snapshot_path, mem_path, size_bytes, error_message,
+            created_at, updated_at, built_at, deleted_at
+),
+new_build AS (
+  INSERT INTO template_build (template_id, team_id, build_spec_hash)
+  SELECT id, team_id, $7 FROM new_template
+  RETURNING id AS build_id
+)
+SELECT new_template.*, new_build.build_id::uuid AS build_id
+FROM new_template, new_build;
 
 -- name: GetTemplate :one
 -- Fetch a template visible to the caller: either owned by the caller's team

@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -184,10 +185,10 @@ type CreateTemplateParams struct {
 	DiskMib   int32     `json:"disk_mib"`
 }
 
-// Insert a new template row in 'pending' status. The actual build is kicked
-// off later by POST /templates/:id/build, which inserts into template_build.
-// ID is generated SQL-side (defaulted) since template create has no parallel
-// VMD call to coordinate with — unlike CreateSandbox.
+// Insert a new template row in 'pending' status (no build attached). Kept
+// for ops-side seeding that wants to stage rows without triggering builds;
+// the public API uses CreateTemplateWithBuild to auto-enqueue the first
+// build in a single transaction.
 func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) (Template, error) {
 	row := q.db.QueryRow(ctx, createTemplate,
 		arg.TeamID,
@@ -252,6 +253,96 @@ func (q *Queries) CreateTemplateBuild(ctx context.Context, arg CreateTemplateBui
 		&i.FinalizedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const createTemplateWithBuild = `-- name: CreateTemplateWithBuild :one
+WITH new_template AS (
+  INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib, status)
+  VALUES ($1, $2, $3, $4, $5, $6, 'building')
+  RETURNING id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib,
+            rootfs_path, snapshot_path, mem_path, size_bytes, error_message,
+            created_at, updated_at, built_at, deleted_at
+),
+new_build AS (
+  INSERT INTO template_build (template_id, team_id, build_spec_hash)
+  SELECT id, team_id, $7 FROM new_template
+  RETURNING id AS build_id
+)
+SELECT new_template.id, new_template.team_id, new_template.alias, new_template.status, new_template.build_spec, new_template.vcpu, new_template.memory_mib, new_template.disk_mib, new_template.rootfs_path, new_template.snapshot_path, new_template.mem_path, new_template.size_bytes, new_template.error_message, new_template.created_at, new_template.updated_at, new_template.built_at, new_template.deleted_at, new_build.build_id::uuid AS build_id
+FROM new_template, new_build
+`
+
+type CreateTemplateWithBuildParams struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	Alias         string    `json:"alias"`
+	BuildSpec     []byte    `json:"build_spec"`
+	Vcpu          int32     `json:"vcpu"`
+	MemoryMib     int32     `json:"memory_mib"`
+	DiskMib       int32     `json:"disk_mib"`
+	BuildSpecHash string    `json:"build_spec_hash"`
+}
+
+type CreateTemplateWithBuildRow struct {
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	Alias        string             `json:"alias"`
+	Status       TemplateStatus     `json:"status"`
+	BuildSpec    []byte             `json:"build_spec"`
+	Vcpu         int32              `json:"vcpu"`
+	MemoryMib    int32              `json:"memory_mib"`
+	DiskMib      int32              `json:"disk_mib"`
+	RootfsPath   *string            `json:"rootfs_path"`
+	SnapshotPath *string            `json:"snapshot_path"`
+	MemPath      *string            `json:"mem_path"`
+	SizeBytes    *int64             `json:"size_bytes"`
+	ErrorMessage *string            `json:"error_message"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	BuiltAt      pgtype.Timestamptz `json:"built_at"`
+	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
+	BuildID      uuid.UUID          `json:"build_id"`
+}
+
+// Atomically create a template and its first build in one round-trip.
+// Used by POST /templates so users don't have to make two calls. Template
+// starts at 'building' (not 'pending') because the build row is already
+// queued at insert time; the supervisor picks it up within one tick.
+//
+// build_spec_hash is computed in Go before the call and passed in so the
+// idempotency index on template_build catches duplicate submits. Returns
+// the template row plus the build id so the handler can echo both.
+func (q *Queries) CreateTemplateWithBuild(ctx context.Context, arg CreateTemplateWithBuildParams) (CreateTemplateWithBuildRow, error) {
+	row := q.db.QueryRow(ctx, createTemplateWithBuild,
+		arg.TeamID,
+		arg.Alias,
+		arg.BuildSpec,
+		arg.Vcpu,
+		arg.MemoryMib,
+		arg.DiskMib,
+		arg.BuildSpecHash,
+	)
+	var i CreateTemplateWithBuildRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Alias,
+		&i.Status,
+		&i.BuildSpec,
+		&i.Vcpu,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.RootfsPath,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.SizeBytes,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BuiltAt,
+		&i.DeletedAt,
+		&i.BuildID,
 	)
 	return i, err
 }

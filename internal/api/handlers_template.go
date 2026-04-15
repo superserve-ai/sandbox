@@ -312,13 +312,24 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		return
 	}
 
-	tpl, err := h.DB.CreateTemplate(c.Request.Context(), db.CreateTemplateParams{
-		TeamID:    teamID,
-		Alias:     req.Alias,
-		BuildSpec: specJSON,
-		Vcpu:      vcpu,
-		MemoryMib: memMib,
-		DiskMib:   diskMib,
+	// Compute the canonical hash before the DB call so template_build's
+	// idempotency index can do its job on insert. The hash covers the
+	// canonical JSON of the spec — same hash → same build.
+	specHash, err := canonicalSpecHash(req.BuildSpec)
+	if err != nil {
+		log.Error().Err(err).Msg("hash build_spec")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	row, err := h.DB.CreateTemplateWithBuild(c.Request.Context(), db.CreateTemplateWithBuildParams{
+		TeamID:        teamID,
+		Alias:         req.Alias,
+		BuildSpec:     specJSON,
+		Vcpu:          vcpu,
+		MemoryMib:     memMib,
+		DiskMib:       diskMib,
+		BuildSpecHash: specHash,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -327,12 +338,51 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 				http.StatusConflict)
 			return
 		}
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("CreateTemplate INSERT failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("CreateTemplateWithBuild failed")
 		respondError(c, ErrInternal)
 		return
 	}
 
-	c.JSON(http.StatusCreated, toTemplateResponse(tpl))
+	// Return 202 Accepted — the template row exists and a build is queued;
+	// the caller polls GetTemplate / GetBuild for progress. Includes the
+	// build_id so clients can also subscribe to log streams immediately.
+	resp := toTemplateResponse(templateFromWithBuild(row))
+	respBody := gin.H{
+		"id":            resp.ID,
+		"team_id":       resp.TeamID,
+		"alias":         resp.Alias,
+		"status":        resp.Status,
+		"vcpu":          resp.Vcpu,
+		"memory_mib":    resp.MemoryMib,
+		"disk_mib":      resp.DiskMib,
+		"created_at":    resp.CreatedAt,
+		"build_id":      row.BuildID,
+	}
+	c.JSON(http.StatusAccepted, respBody)
+}
+
+// templateFromWithBuild adapts the flattened CreateTemplateWithBuild row
+// into a plain db.Template so existing serialization helpers work.
+func templateFromWithBuild(r db.CreateTemplateWithBuildRow) db.Template {
+	return db.Template{
+		ID:           r.ID,
+		TeamID:       r.TeamID,
+		Alias:        r.Alias,
+		Status:       r.Status,
+		BuildSpec:    r.BuildSpec,
+		Vcpu:         r.Vcpu,
+		MemoryMib:    r.MemoryMib,
+		DiskMib:      r.DiskMib,
+		RootfsPath:   r.RootfsPath,
+		SnapshotPath: r.SnapshotPath,
+		MemPath:      r.MemPath,
+		SizeBytes:    r.SizeBytes,
+		ErrorMessage: r.ErrorMessage,
+		CreatedAt:    r.CreatedAt,
+		UpdatedAt:    r.UpdatedAt,
+		BuiltAt:      r.BuiltAt,
+		DeletedAt:    r.DeletedAt,
+	}
 }
 
 func (h *Handlers) GetTemplate(c *gin.Context) {
