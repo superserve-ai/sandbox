@@ -144,6 +144,10 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		SocketPath: inst.SocketPath,
 		IpAddress:  inst.IP,
 		Pid:        uint32(inst.PID),
+		ResourceLimits: &vmdpb.ResourceLimits{
+			VcpuCount: inst.Config.VCPU,
+			MemoryMib: inst.Config.MemoryMiB,
+		},
 	}, nil
 }
 

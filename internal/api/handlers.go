@@ -995,13 +995,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and IP. VMD's response is the source of truth for vcpu/memory
 	// when present.
 	//
-	// from_template exception: vmd.RestoreSnapshot doesn't return
-	// ResourceLimits today (proto gap — tracked in known gaps). It gives
-	// us (ip, 0, 0). The template's own vcpu/memory are the snapshot's
-	// baked-in shape, so we fall back to those when the caller took that
-	// path. Without this fallback, ActivateSandbox's UPDATE hits the
-	// sandbox_memory_positive CHECK constraint and the row never
-	// transitions out of 'starting'.
+	// Defense-in-depth: if vmd returns 0 for vcpu/memory (e.g. old vmd
+	// without ResourceLimits in RestoreSnapshotResponse), fall back to
+	// the template's values. The template's shape IS the snapshot's shape.
 	if actualVcpu == 0 && templateVcpu > 0 {
 		actualVcpu = templateVcpu
 	}

@@ -245,9 +245,12 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
 	}
-	// RestoreSnapshotResponse doesn't carry ResourceLimits in the proto today,
-	// so we return 0,0 and let the caller keep the existing DB values.
-	return resp.IpAddress, 0, 0, nil
+	var vcpu, mem uint32
+	if rl := resp.GetResourceLimits(); rl != nil {
+		vcpu = rl.GetVcpuCount()
+		mem = rl.GetMemoryMib()
+	}
+	return resp.IpAddress, vcpu, mem, nil
 }
 
 // DeleteSnapshot removes the on-disk snapshot artifacts for a previous pause.

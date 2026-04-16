@@ -303,6 +303,7 @@ message RestoreSnapshotResponse {
   string socket_path = 2;
   string ip_address = 3;
   uint32 pid = 4;
+  ResourceLimits resource_limits = 5;
 }
 
 // ---------------------------------------------------------------------------
