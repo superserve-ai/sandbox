@@ -138,7 +138,17 @@ mount -t sysfs sys /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
-mkdir -p /home/user
+mkdir -p /dev/pts /home/user
+
+# Firecracker VMs boot with near-zero entropy (no hardware RNG, no
+# virtio-rng). Python's SSL and anything using /dev/urandom for TLS
+# will hang until the pool is seeded. Read from /proc/sys/kernel/random
+# combined with current nanoseconds to provide an initial seed.
+if [ -c /dev/urandom ]; then
+  head -c 512 /dev/urandom > /dev/null 2>&1
+  dd if=/dev/urandom of=/dev/null bs=1 count=1 2>/dev/null
+  printf '%s%s' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" "$(date +%s%N)" > /dev/urandom 2>/dev/null
+fi
 
 # Hand off to tini. After exec, tini is PID 1 — it'll reap zombies from
 # any process whose parent exits (common when boxd spawns subprocesses for
