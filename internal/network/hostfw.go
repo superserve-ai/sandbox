@@ -94,12 +94,12 @@ func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 		{table: "filter", chain: "FORWARD", args: []string{"-i", hfw.hostIface, "-o", vethName, "-j", "ACCEPT"}},
 		// POSTROUTING: MASQUERADE outbound from this VM's host IP
 		{table: "nat", chain: "POSTROUTING", args: []string{"-s", hostCIDR, "-o", hfw.hostIface, "-j", "MASQUERADE"}},
-		// Egress proxy REDIRECT: intercept TCP on the host-side veth so
-		// packets reach the proxy listener in the host namespace (not
-		// inside the sandbox namespace where nothing listens).
+		// Egress proxy REDIRECT: intercept HTTP/HTTPS on the host-side
+		// veth so packets reach the proxy listener in the host namespace.
+		// Only port 80 and 443 — a catch-all TCP redirect would also
+		// intercept vmd↔boxd RPC traffic (port 49983) and break exec.
 		{table: "nat", chain: "PREROUTING", args: []string{"-i", vethName, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.httpProxyPort)}},
 		{table: "nat", chain: "PREROUTING", args: []string{"-i", vethName, "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.tlsProxyPort)}},
-		{table: "nat", chain: "PREROUTING", args: []string{"-i", vethName, "-p", "tcp", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.otherProxyPort)}},
 	}
 
 	for _, r := range rules {
