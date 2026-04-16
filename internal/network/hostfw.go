@@ -11,32 +11,24 @@ import (
 )
 
 // HostFirewall manages host-level iptables rules for VM internet access.
-// It appends per-VM rules to the kernel's built-in chains:
+// Appends per-VM rules to the kernel's built-in chains:
 //   - filter/FORWARD: allow traffic between each VM's veth and the host interface
 //   - nat/POSTROUTING: MASQUERADE outbound traffic from each VM's host IP
+//   - nat/PREROUTING: REDIRECT HTTP to the egress proxy for domain filtering
 //   - filter/FORWARD: MSS clamping on forwarded TCP SYN packets
 //
-// Uses coreos/go-iptables which appends to existing chains (never
-// creates or destroys them). Rules survive process restarts because
-// they live in the kernel's built-in chains — no custom table or chain
-// lifecycle to manage. This matches E2B's approach and avoids the
-// nftables NEWCHAIN-wipe bug that previously dropped all per-VM rules
-// on every vmd restart.
+// Uses coreos/go-iptables (append to built-in chains, no custom table).
+// Rules persist in the kernel across vmd restarts — leaked rules from
+// prior lifetimes match dead veths and are harmless.
 type HostFirewall struct {
 	mu sync.Mutex
 
 	ipt       *iptables.IPTables
 	hostIface string
 
-	// Egress proxy ports for TCP REDIRECT rules. Traffic arriving on a
-	// VM's veth is redirected to these host-side ports where the proxy
-	// inspects Host/SNI headers before forwarding.
-	httpProxyPort  uint16
-	tlsProxyPort   uint16
-	otherProxyPort uint16
+	httpProxyPort uint16 // egress proxy HTTP inspection port
 
-	// Per-VM rule specs for cleanup. Each entry is a list of iptables
-	// rule specs (chain + args) that were added for that VM.
+	// Per-VM rule specs for cleanup.
 	vmRules map[string][]vmRule
 }
 
@@ -51,19 +43,17 @@ type vmRule struct {
 // previous process are already in the kernel (iptables rules persist)
 // and will be cleaned up when RemoveVM is called — or leaked harmlessly
 // if the VM was already destroyed.
-func NewHostFirewall(hostIface string, httpProxy, tlsProxy, otherProxy uint16, log zerolog.Logger) (*HostFirewall, error) {
+func NewHostFirewall(hostIface string, httpProxyPort uint16, log zerolog.Logger) (*HostFirewall, error) {
 	ipt, err := iptables.New()
 	if err != nil {
 		return nil, fmt.Errorf("init iptables: %w", err)
 	}
 
 	hfw := &HostFirewall{
-		ipt:            ipt,
-		hostIface:      hostIface,
-		httpProxyPort:  httpProxy,
-		tlsProxyPort:   tlsProxy,
-		otherProxyPort: otherProxy,
-		vmRules:        make(map[string][]vmRule),
+		ipt:           ipt,
+		hostIface:     hostIface,
+		httpProxyPort: httpProxyPort,
+		vmRules:       make(map[string][]vmRule),
 	}
 
 	// Static MSS clamp: applies to all forwarded TCP SYN packets going
@@ -94,12 +84,9 @@ func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 		{table: "filter", chain: "FORWARD", args: []string{"-i", hfw.hostIface, "-o", vethName, "-j", "ACCEPT"}},
 		// POSTROUTING: MASQUERADE outbound from this VM's host IP
 		{table: "nat", chain: "POSTROUTING", args: []string{"-s", hostCIDR, "-o", hfw.hostIface, "-j", "MASQUERADE"}},
-		// Egress proxy REDIRECT for HTTP only. The TLS proxy (port 443)
-		// is disabled until its SNI extraction + upstream forwarding is
-		// fixed — currently hangs on HTTPS connections. Since domain-based
-		// egress filtering isn't used in production yet, HTTPS traffic
-		// goes directly to the internet via MASQUERADE (same as before
-		// we moved REDIRECT to host-side).
+		// Egress proxy: redirect HTTP to the proxy for domain filtering.
+		// HTTPS (443) is not redirected — the TLS proxy needs debugging
+		// before it can handle host-side redirected connections.
 		{table: "nat", chain: "PREROUTING", args: []string{"-i", vethName, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.httpProxyPort)}},
 	}
 

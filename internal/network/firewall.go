@@ -46,9 +46,6 @@ type Firewall struct {
 	gatewayIP  string // orchestrator IP allowed through firewall
 
 	// TCP proxy ports for domain-based filtering.
-	httpProxyPort  uint16
-	tlsProxyPort   uint16
-	otherProxyPort uint16
 }
 
 // FirewallConfig holds the parameters needed to create a Firewall.
@@ -58,9 +55,6 @@ type FirewallConfig struct {
 	VMIP           string
 	HostIP         string
 	GatewayIP      string // IP always allowed (orchestrator/gateway)
-	HTTPProxyPort  uint16
-	TLSProxyPort   uint16
-	OtherProxyPort uint16
 }
 
 // NewFirewall creates nftables rules inside the current network namespace.
@@ -183,9 +177,6 @@ func NewFirewall(cfg FirewallConfig) (*Firewall, error) {
 		vmIP:               cfg.VMIP,
 		hostIP:             cfg.HostIP,
 		gatewayIP:          cfg.GatewayIP,
-		httpProxyPort:      cfg.HTTPProxyPort,
-		tlsProxyPort:       cfg.TLSProxyPort,
-		otherProxyPort:     cfg.OtherProxyPort,
 	}
 
 	if err := fw.installRules(); err != nil {
@@ -219,10 +210,8 @@ func (fw *Firewall) installRules() error {
 	fw.installFilterRules()
 	fw.installNATRules()
 	fw.installMSSClamping()
-	// TCP REDIRECT for egress proxy is now on the HOST side (iptables
-	// in hostfw.go AddVM), not in-namespace. Packets arrive at the
-	// host's veth interface and get redirected to the proxy listener
-	// in the host namespace, where it actually runs.
+	// TCP REDIRECT for the egress proxy lives in hostfw.go (host-side
+	// iptables), not here — the proxy listens in the host namespace.
 
 	if err := fw.conn.Flush(); err != nil {
 		return fmt.Errorf("flush nftables rules: %w", err)
@@ -376,54 +365,6 @@ func (fw *Firewall) installMSSClamping() {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// TCP REDIRECT rules for egress proxy
-// ---------------------------------------------------------------------------
-//
-// Redirects TCP traffic from the sandbox to local proxy ports for inspection:
-//   - Port 80  → httpProxyPort  (HTTP Host header inspection)
-//   - Port 443 → tlsProxyPort   (TLS SNI inspection)
-//   - Other    → otherProxyPort (CIDR-only)
-
-func (fw *Firewall) installTCPRedirect() {
-	veth := fw.vethPeer
-
-	// Port 80 → HTTP proxy.
-	fw.conn.AddRule(&nftables.Rule{
-		Table: fw.table,
-		Chain: fw.natChain,
-		Exprs: flatten(
-			iifMatch(veth),
-			protoTCP(),
-			tcpDportMatch(80),
-			redirect(fw.httpProxyPort),
-		),
-	})
-
-	// Port 443 → TLS proxy.
-	fw.conn.AddRule(&nftables.Rule{
-		Table: fw.table,
-		Chain: fw.natChain,
-		Exprs: flatten(
-			iifMatch(veth),
-			protoTCP(),
-			tcpDportMatch(443),
-			redirect(fw.tlsProxyPort),
-		),
-	})
-
-	// All other TCP → CIDR-only proxy.
-	// This rule must come after the port-specific rules.
-	fw.conn.AddRule(&nftables.Rule{
-		Table: fw.table,
-		Chain: fw.natChain,
-		Exprs: flatten(
-			iifMatch(veth),
-			protoTCP(),
-			redirect(fw.otherProxyPort),
-		),
-	})
-}
 
 // ---------------------------------------------------------------------------
 // ReplaceUserRules — atomic set replacement
@@ -642,13 +583,6 @@ func tcpDportMatch(port uint16) []expr.Any {
 	return []expr.Any{
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: binaryutil.BigEndian.PutUint16(port)},
-	}
-}
-
-func redirect(port uint16) []expr.Any {
-	return []expr.Any{
-		&expr.Immediate{Register: 1, Data: binaryutil.BigEndian.PutUint16(port)},
-		&expr.Redir{RegisterProtoMin: 1},
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"time"
 
@@ -165,15 +164,13 @@ func httpExecStream(ctx context.Context, vmIP string, command string, timeout ti
 	}
 	req.Envs = mergedEnv(callerEnv)
 
-	log.Printf("[boxd-debug] calling Start on %s cmd=%s args=%v envs=%d", vmIP, req.Cmd, req.Args, len(req.Envs))
+
 	stream, err := client.Start(ctx, connect.NewRequest(req))
 	if err != nil {
 		return fmt.Errorf("start exec: %w", err)
 	}
-	log.Printf("[boxd-debug] Start returned, entering Receive loop")
 
 	for stream.Receive() {
-		log.Printf("[boxd-debug] received event")
 		event := stream.Msg()
 		switch e := event.Event.(type) {
 		case *pb.ProcessEvent_Data:
@@ -190,13 +187,10 @@ func httpExecStream(ctx context.Context, vmIP string, command string, timeout ti
 		}
 	}
 
-	log.Printf("[boxd-debug] Receive loop exited, checking stream error")
 	if err := stream.Err(); err != nil {
-		log.Printf("[boxd-debug] stream error: %v", err)
 		return fmt.Errorf("exec stream: %w", err)
 	}
 
-	log.Printf("[boxd-debug] stream completed successfully")
 	return nil
 }
 

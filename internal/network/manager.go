@@ -107,7 +107,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger) (
 		return nil, err
 	}
 
-	hostFW, err := NewHostFirewall(hostInterface, DefaultHTTPProxyPort, DefaultTLSProxyPort, DefaultOtherProxyPort, log.With().Str("component", "host_fw").Logger())
+	hostFW, err := NewHostFirewall(hostInterface, DefaultHTTPProxyPort, log.With().Str("component", "host_fw").Logger())
 	if err != nil {
 		return nil, fmt.Errorf("init host firewall: %w", err)
 	}
@@ -301,9 +301,6 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 			VMIP:           VMInternalIP,
 			HostIP:         hostIP,
 			GatewayIP:      VMGatewayIP,
-			HTTPProxyPort:  m.httpProxyPort,
-			TLSProxyPort:   m.tlsProxyPort,
-			OtherProxyPort: m.otherProxyPort,
 		})
 		return fwErr
 	}); err != nil {
