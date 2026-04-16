@@ -1156,6 +1156,17 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		// For running VMs, verify the systemd unit is still active.
 		if !isUnitActive(ctx, systemdUnitName(rec.ID)) {
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
+			// Kill the orphaned Firecracker process if it's still alive.
+			// Cold-booted VMs (from the old build path) were launched with
+			// Setsid: true and no systemd unit, so they survive vmd restarts
+			// as orphans holding TAP fds and contaminating the network pool.
+			if rec.PID > 0 {
+				if proc, err := os.FindProcess(rec.PID); err == nil {
+					if killErr := proc.Signal(syscall.SIGKILL); killErr == nil {
+						log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
+					}
+				}
+			}
 			m.state.Delete(rec.ID)
 			stale++
 			continue
