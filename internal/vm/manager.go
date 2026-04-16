@@ -629,7 +629,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 	fcCfg := FirecrackerConfig{
 		SocketPath: socketPath,
 		KernelPath: m.cfg.KernelPath,
-		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0",
+		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on",
 		RootfsPath: diskPath,
 		VCPUCount:  int(vcpu),
 		MemSizeMiB: int(memMiB),

@@ -70,7 +70,7 @@ func configureMachine(socketPath string, cfg FirecrackerConfig) error {
 
 	bootArgs := cfg.KernelArgs
 	if bootArgs == "" {
-		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0"
+		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on"
 	}
 	if cfg.VMIP != "" && cfg.GatewayIP != "" {
 		bootArgs += fmt.Sprintf(" ip=%s::%s:255.255.255.0::eth0:off", cfg.VMIP, cfg.GatewayIP)
