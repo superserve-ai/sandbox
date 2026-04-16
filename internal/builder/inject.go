@@ -19,6 +19,15 @@ import (
 //go:embed assets/tini-static-amd64
 var tiniBinary []byte
 
+// seedentropyBinary is a static linux/amd64 binary that injects entropy
+// into the kernel's CRNG pool via the RNDADDENTROPY ioctl. Firecracker
+// VMs boot with near-zero entropy (no virtio-rng, no RDRAND on this
+// kernel), which causes getrandom() to block and TLS handshakes to hang.
+// The init script runs this before exec'ing tini to unblock getrandom().
+//
+//go:embed assets/seedentropy-amd64
+var seedentropyBinary []byte
+
 // injectGuestAgent copies the boxd binary into the flattened rootfs, drops
 // an embedded tini binary for proper PID 1 behavior, and writes a tiny
 // /sbin/init wrapper that mounts essential filesystems then exec's tini
@@ -61,9 +70,17 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string) (int64, error) {
 	if err := os.WriteFile(tiniPath, tiniBinary, 0o755); err != nil {
 		return 0, fmt.Errorf("write tini: %w", err)
 	}
-	// O_CREATE respects umask; chmod to normalize exactly 0755.
 	if err := os.Chmod(tiniPath, 0o755); err != nil {
 		return 0, fmt.Errorf("chmod tini: %w", err)
+	}
+
+	// Write the entropy seeder binary.
+	seedPath := filepath.Join(rootfsDir, "usr/local/bin/seedentropy")
+	if err := os.WriteFile(seedPath, seedentropyBinary, 0o755); err != nil {
+		return 0, fmt.Errorf("write seedentropy: %w", err)
+	}
+	if err := os.Chmod(seedPath, 0o755); err != nil {
+		return 0, fmt.Errorf("chmod seedentropy: %w", err)
 	}
 
 	// Write the init wrapper at /sbin/init. Overwrites whatever the base
@@ -140,15 +157,11 @@ mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mkdir -p /dev/pts /home/user
 
-# Firecracker VMs boot with near-zero entropy (no hardware RNG, no
-# virtio-rng). Python's SSL and anything using /dev/urandom for TLS
-# will hang until the pool is seeded. Read from /proc/sys/kernel/random
-# combined with current nanoseconds to provide an initial seed.
-if [ -c /dev/urandom ]; then
-  head -c 512 /dev/urandom > /dev/null 2>&1
-  dd if=/dev/urandom of=/dev/null bs=1 count=1 2>/dev/null
-  printf '%s%s' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" "$(date +%s%N)" > /dev/urandom 2>/dev/null
-fi
+# Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
+# RDRAND, so getrandom() blocks until entropy is credited. The
+# seedentropy binary reads /proc/interrupts + clock and injects it
+# via RNDADDENTROPY ioctl, unblocking TLS for pip/curl/etc.
+/usr/local/bin/seedentropy 2>/dev/null
 
 # Hand off to tini. After exec, tini is PID 1 — it'll reap zombies from
 # any process whose parent exits (common when boxd spawns subprocesses for
