@@ -219,7 +219,10 @@ func (fw *Firewall) installRules() error {
 	fw.installFilterRules()
 	fw.installNATRules()
 	fw.installMSSClamping()
-	fw.installTCPRedirect()
+	// TCP REDIRECT for egress proxy is now on the HOST side (iptables
+	// in hostfw.go AddVM), not in-namespace. Packets arrive at the
+	// host's veth interface and get redirected to the proxy listener
+	// in the host namespace, where it actually runs.
 
 	if err := fw.conn.Flush(); err != nil {
 		return fmt.Errorf("flush nftables rules: %w", err)

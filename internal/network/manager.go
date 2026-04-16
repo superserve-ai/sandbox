@@ -107,7 +107,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger) (
 		return nil, err
 	}
 
-	hostFW, err := NewHostFirewall(hostInterface, log.With().Str("component", "host_fw").Logger())
+	hostFW, err := NewHostFirewall(hostInterface, DefaultHTTPProxyPort, DefaultTLSProxyPort, DefaultOtherProxyPort, log.With().Str("component", "host_fw").Logger())
 	if err != nil {
 		return nil, fmt.Errorf("init host firewall: %w", err)
 	}

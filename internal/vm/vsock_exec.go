@@ -38,6 +38,31 @@ type ExecOptions struct {
 	WorkingDir string
 }
 
+// defaultExecEnv is the baseline environment passed to every command
+// executed inside a VM. Without at least PATH, /bin/sh can't find
+// binaries in /usr/local/bin (where pip, node, etc. live in most OCI
+// base images). Callers can override individual keys via ExecOptions.Env.
+var defaultExecEnv = map[string]string{
+	"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	"HOME":  "/home/user",
+	"USER":  "user",
+	"TERM":  "xterm",
+	"LANG":  "C.UTF-8",
+	"SHELL": "/bin/sh",
+}
+
+// mergedEnv returns defaultExecEnv with caller-supplied overrides applied.
+func mergedEnv(caller map[string]string) map[string]string {
+	env := make(map[string]string, len(defaultExecEnv)+len(caller))
+	for k, v := range defaultExecEnv {
+		env[k] = v
+	}
+	for k, v := range caller {
+		env[k] = v
+	}
+	return env
+}
+
 // httpExec runs a command via Connect RPC ProcessService.Start and collects the result.
 func httpExec(ctx context.Context, vmIP string, command string, timeout time.Duration, opts *ExecOptions) (*ExecResult, error) {
 	client := boxdProcessClient(vmIP)
@@ -60,10 +85,12 @@ func httpExec(ctx context.Context, vmIP string, command string, timeout time.Dur
 		req.Cmd = "/bin/sh"
 		req.Args = []string{"-c", command}
 	}
+	var callerEnv map[string]string
 	if opts != nil {
-		req.Envs = opts.Env
+		callerEnv = opts.Env
 		req.Cwd = opts.WorkingDir
 	}
+	req.Envs = mergedEnv(callerEnv)
 
 	stream, err := client.Start(ctx, connect.NewRequest(req))
 	if err != nil {
@@ -118,10 +145,12 @@ func httpExecStream(ctx context.Context, vmIP string, command string, timeout ti
 		req.Cmd = "/bin/sh"
 		req.Args = []string{"-c", command}
 	}
+	var callerEnv map[string]string
 	if opts != nil {
-		req.Envs = opts.Env
+		callerEnv = opts.Env
 		req.Cwd = opts.WorkingDir
 	}
+	req.Envs = mergedEnv(callerEnv)
 
 	stream, err := client.Start(ctx, connect.NewRequest(req))
 	if err != nil {

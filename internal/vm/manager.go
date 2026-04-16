@@ -1386,6 +1386,9 @@ func (m *Manager) persistState(inst *VMInstance) {
 	if m.state == nil {
 		return
 	}
+	if isBuildVM(inst.ID) {
+		return
+	}
 	if err := m.state.Put(toRecord(inst)); err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
 	}
@@ -1394,6 +1397,9 @@ func (m *Manager) persistState(inst *VMInstance) {
 // deleteState removes a VM record from BoltDB.
 func (m *Manager) deleteState(vmID string) {
 	if m.state == nil {
+		return
+	}
+	if isBuildVM(vmID) {
 		return
 	}
 	if err := m.state.Delete(vmID); err != nil {

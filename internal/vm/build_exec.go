@@ -44,7 +44,14 @@ const readyProbeInterval = 2 * time.Second
 // data is also logged at INFO for operator-side observability.
 func (m *Manager) executeBuildSteps(ctx context.Context, buildVMID, vmIP string, spec builder.BuildSpec, log zerolog.Logger) error {
 	state := buildStepState{
-		env: map[string]string{},
+		env: map[string]string{
+			"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"HOME":  "/root",
+			"USER":  "root",
+			"TERM":  "xterm",
+			"LANG":  "C.UTF-8",
+			"SHELL": "/bin/sh",
+		},
 	}
 
 	for i, step := range spec.Steps {
