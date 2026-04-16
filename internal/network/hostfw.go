@@ -27,6 +27,7 @@ type HostFirewall struct {
 	hostIface string
 
 	httpProxyPort uint16 // egress proxy HTTP inspection port
+	tlsProxyPort  uint16 // egress proxy TLS/SNI inspection port
 
 	// Per-VM rule specs for cleanup.
 	vmRules map[string][]vmRule
@@ -43,7 +44,7 @@ type vmRule struct {
 // previous process are already in the kernel (iptables rules persist)
 // and will be cleaned up when RemoveVM is called — or leaked harmlessly
 // if the VM was already destroyed.
-func NewHostFirewall(hostIface string, httpProxyPort uint16, log zerolog.Logger) (*HostFirewall, error) {
+func NewHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log zerolog.Logger) (*HostFirewall, error) {
 	ipt, err := iptables.New()
 	if err != nil {
 		return nil, fmt.Errorf("init iptables: %w", err)
@@ -53,6 +54,7 @@ func NewHostFirewall(hostIface string, httpProxyPort uint16, log zerolog.Logger)
 		ipt:           ipt,
 		hostIface:     hostIface,
 		httpProxyPort: httpProxyPort,
+		tlsProxyPort:  tlsProxyPort,
 		vmRules:       make(map[string][]vmRule),
 	}
 
@@ -89,6 +91,12 @@ func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 		rules = append(rules, vmRule{
 			table: "nat", chain: "PREROUTING",
 			args: []string{"-i", vethName, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.httpProxyPort)},
+		})
+	}
+	if hfw.tlsProxyPort > 0 {
+		rules = append(rules, vmRule{
+			table: "nat", chain: "PREROUTING",
+			args: []string{"-i", vethName, "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.tlsProxyPort)},
 		})
 	}
 
