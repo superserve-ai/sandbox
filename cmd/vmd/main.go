@@ -246,12 +246,6 @@ func main() {
 	}
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
-	// ---- Pre-allocate network slots ----
-	// Keeps 5 ready-to-use network namespaces so sandbox creation grabs
-	// one in microseconds instead of running ~11 shell commands (~10-30ms).
-	netPool := netMgr.StartPool(ctx, network.PoolConfig{})
-	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
-
 	// ---- VM manager ----
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:     cfg.FirecrackerBin,
@@ -293,10 +287,20 @@ func main() {
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
 	// ---- Reattach to running VMs from previous VMD lifetime ----
+	// Runs BEFORE StartPool so the Phase C orphan-namespace sweep can
+	// clear leaked ns-N/veth-N from prior lifetimes. Otherwise the pool
+	// burns startup retrying colliding slots and ends up with an empty
+	// fresh buffer ("initial pool fill incomplete").
 	reattached, stale := mgr.ReattachAll(ctx)
 	if reattached > 0 || stale > 0 {
 		log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 	}
+
+	// ---- Pre-allocate network slots ----
+	// Keeps a handful of ready-to-use network namespaces so sandbox creation
+	// grabs one in microseconds instead of running ~11 shell commands.
+	netPool := netMgr.StartPool(ctx, network.PoolConfig{})
+	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 
 	// ---- Optional DB connection for the reconciler ----
 	// VMD does not need the DB for its request path (that stays on gRPC).

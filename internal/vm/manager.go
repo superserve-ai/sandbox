@@ -1206,6 +1206,24 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 
+	// Phase C: sweep host network namespaces (ns-N / veth-N) that do not
+	// correspond to any live BoltDB record. Template builds never touch
+	// BoltDB, so a crashed build always leaks; sandbox teardown can also
+	// race the kernel-level delete. Without this sweep the pre-allocated
+	// pool wastes startup retrying colliding slots and kernel state degrades
+	// over time. Re-reading records reflects Phase A's stale deletions.
+	keepNs := make(map[string]bool)
+	if freshRecords, readErr := m.state.All(); readErr == nil {
+		for _, rec := range freshRecords {
+			if rec.Namespace != "" {
+				keepNs[rec.Namespace] = true
+			}
+		}
+	}
+	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
+		m.log.Info().Int("swept", swept).Msg("sweep: removed orphan namespaces")
+	}
+
 	return reattached, stale
 }
 

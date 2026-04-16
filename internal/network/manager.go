@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -421,6 +422,90 @@ func (m *Manager) CleanupVM(vmID string) {
 	_ = run(ctx, "ip", "netns", "del", info.Namespace)
 
 	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+}
+
+// SweepOrphanNamespaces removes host namespaces and veth interfaces matching
+// our slot naming pattern (ns-N, veth-N) that are NOT in the keep set.
+//
+// Called from ReattachAll at startup. Orphans accumulate because:
+//   - Template builds (slot 200+) never write BoltDB and leak on crash.
+//   - Sandboxes whose rundir cleanup raced the namespace delete.
+//   - Pool-preallocated slots that were never claimed when vmd crashed.
+//
+// Left unchecked, these degrade the host over time (86+ observed in staging)
+// and make the network pool spend most of its startup retrying colliding slots.
+//
+// Safety assumptions at call time:
+//   - Systemd KillMode=control-group has killed every subprocess child
+//     (firecracker, template-builder), so no namespace has a live process.
+//   - Phase A of ReattachAll has already marked stale BoltDB records; the
+//     keep set reflects current truth.
+//   - The name pattern check (strings.HasPrefix "ns-"/"veth-") ensures we
+//     never touch user-created or system interfaces.
+func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
+	entries, err := os.ReadDir("/run/netns")
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Msg("sweep: list /run/netns failed")
+		}
+		return 0
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "ns-") {
+			continue
+		}
+		if keep[name] {
+			continue
+		}
+
+		var idx int
+		if _, err := fmt.Sscanf(name, "ns-%d", &idx); err != nil {
+			continue
+		}
+		veth := fmt.Sprintf("veth-%d", idx)
+		m.cleanupFull(name, veth)
+		m.log.Info().Str("ns", name).Str("veth", veth).Msg("swept orphan namespace")
+		swept++
+	}
+
+	// Also sweep host-side veth-N interfaces that survived their namespace
+	// being deleted (happens when the peer end was moved back to the host
+	// before ns deletion, or when a crash left the host side orphaned).
+	if veths, err := listHostVeths(); err == nil {
+		for _, veth := range veths {
+			var idx int
+			if _, err := fmt.Sscanf(veth, "veth-%d", &idx); err != nil {
+				continue
+			}
+			if keep[fmt.Sprintf("ns-%d", idx)] {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+				m.log.Info().Str("veth", veth).Msg("swept orphan host veth")
+			}
+			cancel()
+		}
+	}
+
+	return swept
+}
+
+// listHostVeths returns all veth-N interfaces visible in the host namespace.
+func listHostVeths() ([]string, error) {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "veth-") {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
 }
 
 // UpdateFirewallRules atomically replaces the user allow/deny sets for a VM's firewall.

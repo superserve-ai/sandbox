@@ -331,6 +331,28 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 		return err
 	}
 
+	// Fan stdout + stderr through a multiplex so a single consumer owns
+	// stream.Send. connect-go's ServerStream is not safe for concurrent
+	// use — direct Send from both readers races the HTTP/1.1 chunked
+	// writer and produces malformed frames ("bare LF", "invalid byte in
+	// chunk length") observed under load.
+	mux := NewMultiplexedChannel[*pb.ProcessEvent](256)
+	consumer, _ := mux.Fork()
+
+	sendDone := make(chan error, 1)
+	go func() {
+		var firstErr error
+		for ev := range consumer {
+			if firstErr != nil {
+				continue // keep draining so the mux can close cleanly
+			}
+			if err := stream.Send(ev); err != nil {
+				firstErr = err
+			}
+		}
+		sendDone <- firstErr
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -342,11 +364,11 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 			if n > 0 {
 				data := make([]byte, n)
 				copy(data, buf[:n])
-				_ = stream.Send(&pb.ProcessEvent{
+				mux.Source <- &pb.ProcessEvent{
 					Event: &pb.ProcessEvent_Data{Data: &pb.DataEvent{
 						Output: &pb.DataEvent_Stdout{Stdout: data},
 					}},
-				})
+				}
 			}
 			if readErr != nil {
 				return
@@ -362,11 +384,11 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 			if n > 0 {
 				data := make([]byte, n)
 				copy(data, buf[:n])
-				_ = stream.Send(&pb.ProcessEvent{
+				mux.Source <- &pb.ProcessEvent{
 					Event: &pb.ProcessEvent_Data{Data: &pb.DataEvent{
 						Output: &pb.DataEvent_Stderr{Stderr: data},
 					}},
-				})
+				}
 			}
 			if readErr != nil {
 				return
@@ -376,6 +398,13 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 
 	wg.Wait()
 	cmd.Wait()
+
+	// Flush data events to the stream before sending End. Closing the
+	// mux drains it, closes the consumer channel, and unblocks sendDone.
+	close(mux.Source)
+	if sendErr := <-sendDone; sendErr != nil {
+		return sendErr
+	}
 
 	exitCode := int32(0)
 	if cmd.ProcessState != nil {
