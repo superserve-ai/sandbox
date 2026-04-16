@@ -25,10 +25,22 @@ type ExecResult struct {
 // boxdPort must match httpPort in cmd/boxd/main.go.
 const boxdPort = 49983
 
+// boxdHTTPClient is a dedicated HTTP client for boxd Connect RPC calls.
+// Uses its own Transport (not http.DefaultTransport) to avoid connection
+// pool contamination from the health-check poller in waitForBoxd, which
+// shares DefaultTransport and can leave stale idle connections that
+// cause server-streaming RPCs to hang.
+var boxdHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
+
 // boxdProcessClient returns a Connect RPC client for the ProcessService.
 func boxdProcessClient(vmIP string) boxdpbconnect.ProcessServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
-	return boxdpbconnect.NewProcessServiceClient(http.DefaultClient, baseURL)
+	return boxdpbconnect.NewProcessServiceClient(boxdHTTPClient, baseURL)
 }
 
 // ExecOptions holds optional parameters for command execution.
@@ -251,5 +263,5 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string) e
 // a VM. File byte transfer goes through the edge proxy directly.
 func boxdFilesystemClient(vmIP string) boxdpbconnect.FilesystemServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
-	return boxdpbconnect.NewFilesystemServiceClient(http.DefaultClient, baseURL)
+	return boxdpbconnect.NewFilesystemServiceClient(boxdHTTPClient, baseURL)
 }
