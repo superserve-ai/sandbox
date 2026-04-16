@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,7 +20,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
@@ -101,13 +101,16 @@ type VMConfig struct {
 
 // ManagerConfig holds paths and settings for the VM manager.
 type ManagerConfig struct {
-	FirecrackerBin string
-	JailerBin      string
-	KernelPath     string
-	BaseRootfsPath string
-	SnapshotDir    string
-	RunDir         string
-	MaxConcurrent int // Max concurrent CreateVM operations (0 = default 10).
+	FirecrackerBin     string
+	JailerBin          string
+	KernelPath         string
+	BaseRootfsPath     string
+	SnapshotDir        string
+	RunDir             string
+	MaxConcurrent      int    // Max concurrent CreateVM operations (0 = default 10).
+	TemplateBuilderBin string // Path to template-builder binary.
+	BoxdBinaryPath     string // Path to boxd binary (passed to template-builder).
+	HostInterface      string // Host network interface (e.g. "ens4").
 }
 
 // TemplateSnapshot holds paths for a template snapshot created at startup.
@@ -140,16 +143,17 @@ type Manager struct {
 	templates map[string]*TemplateSnapshot
 	createSem chan struct{}
 
-	// builder produces rootfs.ext4 files from BuildSpecs. Set via SetBuilder
-	// on vmd hosts that handle template builds; nil elsewhere.
-	builder builder.Builder
-
 	// builds tracks in-flight and completed template builds. Keyed by
 	// build VM id (which is also "build-" + templateID). Entries survive
 	// until process exit so late pollers can read terminal outcomes; a
 	// V2 sweep can evict old records if memory becomes a concern.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
+
+	// nextBuildSlot assigns unique network slot indices to concurrent
+	// template-builder subprocesses. Starts at 200 to avoid collision
+	// with vmd's sandbox pool (indices 1-100).
+	nextBuildSlot atomic.Int32
 }
 
 // DefaultTemplateID is the key under which the baked-in default template is
@@ -1460,12 +1464,12 @@ func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath
 		return 0, fmt.Errorf("wait for socket: %w", err)
 	}
 
-	if err := configureMachine(socketPath, fcCfg); err != nil {
+	if err := ConfigureMachine(socketPath, fcCfg); err != nil {
 		_ = cmd.Process.Kill()
 		return 0, fmt.Errorf("configure machine: %w", err)
 	}
 
-	if err := startInstance(socketPath); err != nil {
+	if err := StartInstance(socketPath); err != nil {
 		_ = cmd.Process.Kill()
 		return 0, fmt.Errorf("start instance: %w", err)
 	}

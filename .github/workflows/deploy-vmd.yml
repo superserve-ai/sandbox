@@ -53,6 +53,7 @@ jobs:
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -115,6 +116,7 @@ jobs:
               # the rootfs, so an unchanged binary is a no-op at rest.
               scp('bin/vmd', f'/tmp/vmd-{sha}')
               scp('bin/boxd', f'/tmp/boxd-{sha}')
+              scp('bin/template-builder', f'/tmp/template-builder-{sha}')
 
               # Upload systemd units and helper scripts
               scp('deploy/superserve-vmd.service', '/tmp/superserve-vmd.service')
@@ -127,9 +129,11 @@ jobs:
               inject_script = textwrap.dedent(f'''
                   set -euo pipefail
 
-                  # Install VMD binary
+                  # Install VMD + template-builder binaries
                   sudo mv /tmp/vmd-{sha} {install_dir}/vmd
                   sudo chmod +x {install_dir}/vmd
+                  sudo mv /tmp/template-builder-{sha} {install_dir}/template-builder
+                  sudo chmod +x {install_dir}/template-builder
 
                   # Install systemd units
                   sudo mv /tmp/superserve-vmd.service /etc/systemd/system/superserve-vmd.service

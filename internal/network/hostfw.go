@@ -84,10 +84,12 @@ func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 		{table: "filter", chain: "FORWARD", args: []string{"-i", hfw.hostIface, "-o", vethName, "-j", "ACCEPT"}},
 		// POSTROUTING: MASQUERADE outbound from this VM's host IP
 		{table: "nat", chain: "POSTROUTING", args: []string{"-s", hostCIDR, "-o", hfw.hostIface, "-j", "MASQUERADE"}},
-		// Egress proxy: redirect HTTP to the proxy for domain filtering.
-		// HTTPS (443) is not redirected — the TLS proxy needs debugging
-		// before it can handle host-side redirected connections.
-		{table: "nat", chain: "PREROUTING", args: []string{"-i", vethName, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.httpProxyPort)}},
+	}
+	if hfw.httpProxyPort > 0 {
+		rules = append(rules, vmRule{
+			table: "nat", chain: "PREROUTING",
+			args: []string{"-i", vethName, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.httpProxyPort)},
+		})
 	}
 
 	for _, r := range rules {

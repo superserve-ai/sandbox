@@ -18,7 +18,6 @@ import (
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
-	"github.com/superserve-ai/sandbox/internal/builder"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -27,14 +26,16 @@ import (
 
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
-	FirecrackerBin string
-	JailerBin      string
-	KernelPath     string
-	BaseRootfsPath string
-	SnapshotDir    string
-	RunDir         string
-	GRPCPort       int
-	HostInterface  string
+	FirecrackerBin     string
+	JailerBin          string
+	KernelPath         string
+	BaseRootfsPath     string
+	SnapshotDir        string
+	RunDir             string
+	GRPCPort           int
+	HostInterface      string
+	TemplateBuilderBin string
+	BoxdBinaryPath     string
 
 	// HostID identifies this bare-metal host in the `host` table. Used by
 	// the reconciler to scope its DB queries ("sandboxes on my host").
@@ -66,7 +67,9 @@ func loadConfig() (Config, error) {
 		SnapshotDir:    envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
 		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:       port,
-		HostInterface:  envOrDefault("HOST_INTERFACE", "eth0"),
+		HostInterface:      envOrDefault("HOST_INTERFACE", "eth0"),
+		TemplateBuilderBin: envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
+		BoxdBinaryPath:     envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
 		HostID:          envOrDefault("HOST_ID", "default"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
@@ -251,12 +254,15 @@ func main() {
 
 	// ---- VM manager ----
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin: cfg.FirecrackerBin,
-		JailerBin:      cfg.JailerBin,
-		KernelPath:     cfg.KernelPath,
-		BaseRootfsPath: cfg.BaseRootfsPath,
-		SnapshotDir:    cfg.SnapshotDir,
-		RunDir:         cfg.RunDir,
+		FirecrackerBin:     cfg.FirecrackerBin,
+		JailerBin:          cfg.JailerBin,
+		KernelPath:         cfg.KernelPath,
+		BaseRootfsPath:     cfg.BaseRootfsPath,
+		SnapshotDir:        cfg.SnapshotDir,
+		RunDir:             cfg.RunDir,
+		TemplateBuilderBin: cfg.TemplateBuilderBin,
+		BoxdBinaryPath:     cfg.BoxdBinaryPath,
+		HostInterface:      cfg.HostInterface,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -285,19 +291,6 @@ func main() {
 	}
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
-
-	// ---- Template builder ----
-	// Wire the in-process builder so BuildTemplate can produce rootfs.ext4
-	// from user-supplied specs. Boxd binary path comes from env; the same
-	// binary baked into the default rootfs is injected into every template.
-	boxdPath := envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd")
-	bld, err := builder.NewBuilder(builder.Config{
-		BoxdBinaryPath: boxdPath,
-	})
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to construct builder")
-	}
-	mgr.SetBuilder(bld)
 
 	// ---- Reattach to running VMs from previous VMD lifetime ----
 	reattached, stale := mgr.ReattachAll(ctx)

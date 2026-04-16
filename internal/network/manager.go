@@ -102,26 +102,48 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 	m.egressProxy = p
 }
 
-func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger) (*Manager, error) {
+// ManagerOption configures optional Manager behavior.
+type ManagerOption func(*Manager)
+
+// WithStartSlot sets the starting slot index for network allocation.
+// Use to avoid collision when multiple processes manage VMs on the
+// same host (e.g. vmd uses 1-100, template-builder uses 200+).
+func WithStartSlot(idx int) ManagerOption {
+	return func(m *Manager) { m.nextSlot = idx }
+}
+
+// WithHTTPProxyPort sets the HTTP proxy port for egress REDIRECT rules.
+// Pass 0 to disable REDIRECT (e.g. for build VMs that don't need
+// egress domain filtering).
+func WithHTTPProxyPort(port uint16) ManagerOption {
+	return func(m *Manager) { m.httpProxyPort = port }
+}
+
+func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, opts ...ManagerOption) (*Manager, error) {
 	if err := enableIPForward(ctx); err != nil {
 		return nil, err
 	}
 
-	hostFW, err := NewHostFirewall(hostInterface, DefaultHTTPProxyPort, log.With().Str("component", "host_fw").Logger())
-	if err != nil {
-		return nil, fmt.Errorf("init host firewall: %w", err)
-	}
-
-	return &Manager{
+	mgr := &Manager{
 		hostInterface:  hostInterface,
 		log:            log.With().Str("component", "network").Logger(),
 		devices:        make(map[string]*VMNetInfo),
 		nextSlot:       1,
-		hostFW:         hostFW,
 		httpProxyPort:  DefaultHTTPProxyPort,
 		tlsProxyPort:   DefaultTLSProxyPort,
 		otherProxyPort: DefaultOtherProxyPort,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(mgr)
+	}
+
+	hostFW, err := NewHostFirewall(hostInterface, mgr.httpProxyPort, log.With().Str("component", "host_fw").Logger())
+	if err != nil {
+		return nil, fmt.Errorf("init host firewall: %w", err)
+	}
+	mgr.hostFW = hostFW
+
+	return mgr, nil
 }
 
 // Close tears down the host firewall. Should be called on VMD shutdown.

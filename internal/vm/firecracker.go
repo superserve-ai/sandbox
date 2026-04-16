@@ -64,7 +64,7 @@ func int64Ptr(i int64) *int64 { return &i }
 // configureMachine configures the Firecracker instance via its HTTP API.
 // ---------------------------------------------------------------------------
 
-func configureMachine(socketPath string, cfg FirecrackerConfig) error {
+func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
@@ -170,7 +170,7 @@ func configureMachine(socketPath string, cfg FirecrackerConfig) error {
 // startInstance tells Firecracker to boot the VM.
 // ---------------------------------------------------------------------------
 
-func startInstance(socketPath string) error {
+func StartInstance(socketPath string) error {
 	fc := newFCClient(socketPath)
 	actionType := models.InstanceActionInfoActionTypeInstanceStart
 	if _, err := fc.Operations.CreateSyncAction(&operations.CreateSyncActionParams{

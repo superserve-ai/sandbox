@@ -1,10 +1,12 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -37,13 +39,6 @@ type BuildTemplateResult struct {
 	SizeBytes      int64  // on-disk rootfs size
 }
 
-// SetBuilder attaches a Builder used by BuildTemplate. Must be called before
-// BuildTemplate fires. Separate from NewManager so the builder can be
-// optional for vmd deployments that don't do builds (test envs, etc.).
-func (m *Manager) SetBuilder(b builder.Builder) {
-	m.builder = b
-}
-
 // BuildTemplate starts a template build asynchronously and returns the
 // build VM id immediately. Use GetBuildStatus(build_vm_id) to poll progress
 // and CancelBuild(build_vm_id) to abort.
@@ -59,8 +54,8 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	if req.Spec.From == "" {
 		return "", fmt.Errorf("spec.from is required")
 	}
-	if m.builder == nil {
-		return "", fmt.Errorf("builder not configured on manager; call SetBuilder before BuildTemplate")
+	if m.cfg.TemplateBuilderBin == "" {
+		return "", fmt.Errorf("template-builder binary not configured (set ManagerConfig.TemplateBuilderBin)")
 	}
 	if req.VCPU == 0 {
 		req.VCPU = 1
@@ -96,120 +91,123 @@ func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req
 	m.completeBuild(buildVMID, result, err)
 }
 
-// buildTemplateSync does the actual work. Called by the async worker, but
-// separated so integration tests can exercise the pipeline without going
-// through the registry + goroutine. Callers MUST pass a buildVMID unique
-// on this host.
+// buildTemplateSync delegates the build to the template-builder subprocess.
+// The subprocess owns its own network, Firecracker process, and boxd
+// connection — completely isolated from vmd's sandbox state.
 func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req BuildTemplateRequest) (*BuildTemplateResult, error) {
 	log := m.log.With().Str("template_id", req.TemplateID).Str("build_vm_id", buildVMID).Str("from", req.Spec.From).Logger()
-	log.Info().Msg("starting template build")
+	log.Info().Msg("starting template build (subprocess)")
 	buildStart := time.Now()
 
-	// Layout on disk, mirroring InitDefaultTemplate's convention but under
-	// a templates/<id>/ subtree so concurrent builds don't collide:
-	//   ${RunDir}/templates/<id>/rootfs.ext4
-	//   ${SnapshotDir}/templates/<id>/vmstate.snap
-	//   ${SnapshotDir}/templates/<id>/mem.snap
-	rootfsDir := filepath.Join(m.cfg.RunDir, "templates", req.TemplateID)
-	rootfsPath := filepath.Join(rootfsDir, "rootfs.ext4")
+	specJSON, err := json.Marshal(req.Spec)
+	if err != nil {
+		return nil, fmt.Errorf("marshal spec: %w", err)
+	}
+
+	slotIndex := int(m.nextBuildSlot.Add(1)) + 199
+
+	cmd := exec.CommandContext(ctx, m.cfg.TemplateBuilderBin,
+		"--template-id", req.TemplateID,
+		"--build-id", buildVMID,
+		"--spec", string(specJSON),
+		"--vcpu", fmt.Sprint(req.VCPU),
+		"--memory", fmt.Sprint(req.MemoryMiB),
+		"--disk", fmt.Sprint(req.DiskMiB),
+		"--run-dir", m.cfg.RunDir,
+		"--snapshot-dir", m.cfg.SnapshotDir,
+		"--kernel", m.cfg.KernelPath,
+		"--firecracker", m.cfg.FirecrackerBin,
+		"--boxd", m.cfg.BoxdBinaryPath,
+		"--host-interface", m.cfg.HostInterface,
+		"--slot-index", fmt.Sprint(slotIndex),
+	)
+
+	// Stdout carries structured NDJSON build events — parse and forward
+	// to the build log buffer so SSE subscribers see real-time progress.
+	cmd.Stdout = &buildLogPipe{buildVMID: buildVMID, mgr: m}
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("template-builder exited: %w", err)
+	}
+
+	// Read result from disk.
 	snapshotDir := filepath.Join(m.cfg.SnapshotDir, "templates", req.TemplateID)
-
-	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir rootfs dir: %w", err)
-	}
-	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir snapshot dir: %w", err)
-	}
-
-	// Phase 1: produce the rootfs.ext4.
-	br, err := m.builder.BuildRootfs(ctx, req.Spec, rootfsPath, req.DiskMiB)
+	rootfsDir := filepath.Join(m.cfg.RunDir, "templates", req.TemplateID)
+	result, err := readBuildMetaJSON(snapshotDir)
 	if err != nil {
-		return nil, fmt.Errorf("build rootfs: %w", err)
-	}
-	log.Info().Str("digest", br.ResolvedDigest).Int64("size_bytes", br.SizeBytes).Dur("elapsed", time.Since(buildStart)).Msg("rootfs produced")
-
-	// Phase 2: cold-boot a build VM from that rootfs.
-	inst, err := m.coldBootFromRootfs(ctx, buildVMID, rootfsPath, req.VCPU, req.MemoryMiB)
-	if err != nil {
-		return nil, fmt.Errorf("boot build VM: %w", err)
+		return nil, fmt.Errorf("read build meta: %w", err)
 	}
 
-	// From here on, any failure must tear down the VM so it doesn't linger.
-	cleanup := func(reason string) {
-		log.Warn().Str("reason", reason).Msg("tearing down build VM after failure")
-		_ = m.DestroyVM(context.Background(), buildVMID, true)
-	}
-
-	// Phase 3: wait for the injected boxd to come up.
-	if err := m.waitForBoxd(ctx, inst.IP, 30*time.Second); err != nil {
-		cleanup("boxd not ready")
-		return nil, fmt.Errorf("boxd not ready on build VM: %w", err)
-	}
-	log.Info().Dur("elapsed", time.Since(buildStart)).Msg("build VM up and boxd ready")
-
-	// Phase 4: execute build steps in order. On failure, tear down the
-	// build VM and propagate the error — we don't snapshot a half-built
-	// template.
-	if err := m.executeBuildSteps(ctx, buildVMID, inst.IP, req.Spec, log); err != nil {
-		cleanup("build steps failed")
-		return nil, fmt.Errorf("execute build steps: %w", err)
-	}
-
-	// Phase 5: start_cmd — launch the long-lived process whose live state
-	// we want the snapshot to capture. Fire-and-forget; we don't wait for
-	// exit because the point is to keep it running.
-	if err := m.runStartCmd(ctx, buildVMID, inst.IP, req.Spec, log); err != nil {
-		cleanup("start_cmd failed")
-		return nil, fmt.Errorf("launch start_cmd: %w", err)
-	}
-
-	// Phase 5b: ready_cmd — block until the start process is actually
-	// serving, so the snapshot captures a useful state. No-op if unset.
-	if err := m.pollReadyCmd(ctx, buildVMID, inst.IP, req.Spec, log); err != nil {
-		cleanup("ready_cmd timed out")
-		return nil, fmt.Errorf("ready_cmd: %w", err)
-	}
-
-	// Phase 6: snapshot the running VM. Memory + vmstate land on disk.
-	// Flip the registry status so the supervisor (and SDK poller) can tell
-	// when user-step execution ends and the pause/dump phase begins.
-	m.setBuildStatus(buildVMID, BuildStatusSnapshotting)
-	m.appendBuildLog(buildVMID, BuildLogEvent{Stream: LogStreamSystem, Text: "snapshotting"})
-	snapPath, memPath, err := m.CreateVMSnapshot(ctx, buildVMID, snapshotDir)
-	if err != nil {
-		cleanup("snapshot failed")
-		return nil, fmt.Errorf("snapshot build VM: %w", err)
-	}
-	log.Info().Str("snapshot", snapPath).Str("mem", memPath).Dur("elapsed", time.Since(buildStart)).Msg("snapshot captured")
-
-	// Phase 7: kill the build VM, keep its rundir so the rootfs.ext4 stays
-	// available for future sandbox creations (they copy from it on create).
-	m.killVMKeepRunDir(buildVMID)
-
-	// Persist the digest alongside the snapshot for audit / future cache
-	// keying. Best-effort — failure is logged but not fatal.
-	writeBuildMeta(snapshotDir, br)
-
-	// Phase 8: register the template so CreateVM can use it.
+	// Register the template so CreateVM / RestoreSnapshot can use it.
 	m.mu.Lock()
 	m.templates[req.TemplateID] = &TemplateSnapshot{
-		SnapshotPath: snapPath,
-		MemFilePath:  memPath,
-		DiskPath:     rootfsPath,
+		SnapshotPath: result.SnapshotPath,
+		MemFilePath:  result.MemFilePath,
+		DiskPath:     result.RootfsPath,
 		RunDir:       rootfsDir,
 		VCPUCount:    req.VCPU,
 		MemSizeMiB:   req.MemoryMiB,
 	}
 	m.mu.Unlock()
 
-	log.Info().Dur("total_ms", time.Since(buildStart)).Msg("template build complete")
+	log.Info().Dur("total", time.Since(buildStart)).Msg("template build complete")
+	return result, nil
+}
 
+// buildLogPipe parses NDJSON lines from template-builder's stdout and
+// forwards them to the build log buffer for SSE streaming.
+type buildLogPipe struct {
+	buildVMID string
+	mgr       *Manager
+	buf       []byte
+}
+
+func (p *buildLogPipe) Write(data []byte) (int, error) {
+	p.buf = append(p.buf, data...)
+	for {
+		idx := bytes.IndexByte(p.buf, '\n')
+		if idx < 0 {
+			break
+		}
+		line := p.buf[:idx]
+		p.buf = p.buf[idx+1:]
+		var evt struct {
+			Stream string `json:"stream"`
+			Text   string `json:"text"`
+		}
+		if json.Unmarshal(line, &evt) == nil && evt.Text != "" {
+			p.mgr.appendBuildLog(p.buildVMID, BuildLogEvent{
+				Stream: LogStream(evt.Stream),
+				Text:   evt.Text,
+			})
+		}
+	}
+	return len(data), nil
+}
+
+// readBuildMetaJSON reads the build.meta.json written by template-builder.
+func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
+	data, err := os.ReadFile(filepath.Join(snapshotDir, "build.meta.json"))
+	if err != nil {
+		return nil, err
+	}
+	var meta struct {
+		SnapshotPath   string `json:"snapshot_path"`
+		MemPath        string `json:"mem_path"`
+		RootfsPath     string `json:"rootfs_path"`
+		ResolvedDigest string `json:"resolved_digest"`
+		SizeBytes      int64  `json:"size_bytes"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
 	return &BuildTemplateResult{
-		SnapshotPath:   snapPath,
-		MemFilePath:    memPath,
-		RootfsPath:     rootfsPath,
-		ResolvedDigest: br.ResolvedDigest,
-		SizeBytes:      br.SizeBytes,
+		SnapshotPath:   meta.SnapshotPath,
+		MemFilePath:    meta.MemPath,
+		RootfsPath:     meta.RootfsPath,
+		ResolvedDigest: meta.ResolvedDigest,
+		SizeBytes:      meta.SizeBytes,
 	}, nil
 }
 
