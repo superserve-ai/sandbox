@@ -26,14 +26,12 @@ type ExecResult struct {
 const boxdPort = 49983
 
 // boxdHTTPClient is a dedicated HTTP client for boxd Connect RPC calls.
-// Uses its own Transport (not http.DefaultTransport) to avoid connection
-// pool contamination from the health-check poller in waitForBoxd, which
-// shares DefaultTransport and can leave stale idle connections that
-// cause server-streaming RPCs to hang.
+// Keep-alives are disabled: slot recycling reuses host IPs, so a pooled
+// connection to a recycled slot points at a dead TCP endpoint on the
+// next VM. Fresh connects over veth are sub-millisecond.
 var boxdHTTPClient = &http.Client{
 	Transport: &http.Transport{
-		MaxIdleConnsPerHost: 4,
-		IdleConnTimeout:     30 * time.Second,
+		DisableKeepAlives: true,
 	},
 }
 
