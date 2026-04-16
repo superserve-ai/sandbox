@@ -116,7 +116,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 
 	// Phase 1: produce rootfs.ext4 from OCI image
-	emitLog("system", "building rootfs from %s", cfg.spec.From)
+	emitUser("system", "Pulling image %s", cfg.spec.From)
 	b, err := builder.NewBuilder(builder.Config{BoxdBinaryPath: cfg.boxdBin})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
@@ -125,7 +125,8 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	if err != nil {
 		return fmt.Errorf("build rootfs: %w", err)
 	}
-	emitLog("system", "rootfs produced: %s (%d bytes)", br.ResolvedDigest, br.SizeBytes)
+	emitInternal("system", "rootfs produced: %s (%d bytes)", br.ResolvedDigest, br.SizeBytes)
+	emitUser("system", "Image ready")
 
 	// Phase 2: copy rootfs for the build VM
 	perVMRootfs, err := copyRootfs(cfg.runDir, buildVMID, rootfsPath)
@@ -169,11 +170,12 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	defer killProcess(pid)
 
 	// Phase 5: wait for boxd
-	emitLog("system", "waiting for boxd")
+	emitInternal("system", "waiting for boxd")
 	if err := waitForBoxd(ctx, netInfo.HostIP, 30*time.Second); err != nil {
 		return fmt.Errorf("boxd not ready: %w", err)
 	}
-	emitLog("system", "boxd ready")
+	emitInternal("system", "boxd ready")
+	emitUser("system", "Starting build environment")
 
 	// Phase 6: execute build steps
 	if err := executeBuildSteps(ctx, netInfo.HostIP, cfg.spec); err != nil {
@@ -189,13 +191,13 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 
 	// Phase 8: snapshot
-	emitLog("system", "snapshotting")
+	emitUser("system", "Saving template")
 	snapPath := filepath.Join(snapDir, "vmstate.snap")
 	memPath := filepath.Join(snapDir, "mem.snap")
 	if err := vm.CreateSnapshot(socketPath, snapPath, memPath); err != nil {
 		return fmt.Errorf("snapshot: %w", err)
 	}
-	emitLog("system", "snapshot captured")
+	emitInternal("system", "snapshot captured")
 
 	// Phase 9: write build metadata
 	writeBuildMeta(snapDir, snapPath, memPath, rootfsPath, br)
@@ -348,14 +350,14 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec)
 		default:
 		}
 
-		emitLog("system", "step %d/%d", i+1, len(spec.Steps))
+		emitUser("system", "Step %d/%d", i+1, len(spec.Steps))
 		stepStart := time.Now()
 
 		if err := runBuildStep(ctx, vmIP, step, env); err != nil {
 			return fmt.Errorf("step %d/%d failed after %s: %w",
 				i+1, len(spec.Steps), time.Since(stepStart).Round(time.Millisecond), err)
 		}
-		emitLog("system", "step %d/%d complete (%s)", i+1, len(spec.Steps),
+		emitUser("system", "Step %d/%d completed (%s)", i+1, len(spec.Steps),
 			time.Since(stepStart).Round(time.Millisecond))
 	}
 	return nil
@@ -367,10 +369,10 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, env 
 		return runShellCmd(ctx, vmIP, *step.Run, env, "")
 	case step.Env != nil:
 		env[step.Env.Key] = step.Env.Value
-		emitLog("system", "env %s=%s", step.Env.Key, step.Env.Value)
+		emitUser("system", "Set %s=%s", step.Env.Key, step.Env.Value)
 		return nil
 	case step.Workdir != nil:
-		emitLog("system", "workdir %s", *step.Workdir)
+		emitUser("system", "Working directory: %s", *step.Workdir)
 		return nil
 	case step.Copy != nil:
 		dst := step.Copy.Dst
@@ -383,7 +385,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, env 
 }
 
 func runShellCmd(ctx context.Context, vmIP, cmd string, env map[string]string, workdir string) error {
-	emitLog("system", "$ %s", truncate(cmd, 256))
+	emitUser("system", "$ %s", truncate(cmd, 256))
 
 	stepCtx, cancel := context.WithTimeout(ctx, stepTimeout)
 	defer cancel()
@@ -411,12 +413,12 @@ func runShellCmd(ctx context.Context, vmIP, cmd string, env map[string]string, w
 			case *pb.DataEvent_Stdout:
 				text := strings.TrimRight(string(o.Stdout), "\n")
 				if text != "" {
-					emitLog("stdout", "%s", text)
+					emitUser("stdout", "%s", text)
 				}
 			case *pb.DataEvent_Stderr:
 				text := strings.TrimRight(string(o.Stderr), "\n")
 				if text != "" {
-					emitLog("stderr", "%s", text)
+					emitUser("stderr", "%s", text)
 				}
 			}
 		case *pb.ProcessEvent_End:
@@ -441,7 +443,7 @@ func runStartCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) error
 	if spec.StartCmd == "" {
 		return nil
 	}
-	emitLog("system", "start_cmd: %s", truncate(spec.StartCmd, 256))
+	emitUser("system", "Running start command: %s", truncate(spec.StartCmd, 256))
 
 	go func() {
 		client := processClient(vmIP)
@@ -469,7 +471,7 @@ func pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) erro
 	if spec.ReadyCmd == "" {
 		return nil
 	}
-	emitLog("system", "ready_cmd: %s", truncate(spec.ReadyCmd, 256))
+	emitUser("system", "Waiting for template to be ready: %s", truncate(spec.ReadyCmd, 256))
 
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
@@ -494,7 +496,8 @@ func pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) erro
 				}
 			}
 			if exit == 0 {
-				emitLog("system", "ready_cmd succeeded after %d attempts", attempts+1)
+				emitUser("system", "Template is ready")
+				emitInternal("system", "ready_cmd succeeded after %d attempts", attempts+1)
 				return nil
 			}
 		}
@@ -553,16 +556,27 @@ func writeBuildMeta(dir, snapPath, memPath, rootfsPath string, br builder.BuildR
 
 // ---------------------------------------------------------------------------
 // Structured log output (NDJSON to stdout for vmd to parse)
+//
+// Each event carries a visibility tag: "user" events are surfaced to the
+// end user over the build-log SSE stream; "internal" events stay in the
+// operator journal. This keeps platform plumbing (image digests, slot
+// indices, boxd boot timing) out of customer logs.
 // ---------------------------------------------------------------------------
 
-func emitLog(stream, format string, args ...any) {
+type buildEvent struct {
+	Visibility string `json:"visibility"`
+	Stream     string `json:"stream"`
+	Text       string `json:"text"`
+}
+
+func emit(visibility, stream, format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
-	line, _ := json.Marshal(struct {
-		Stream string `json:"stream"`
-		Text   string `json:"text"`
-	}{Stream: stream, Text: text})
+	line, _ := json.Marshal(buildEvent{Visibility: visibility, Stream: stream, Text: text})
 	fmt.Println(string(line))
 }
+
+func emitUser(stream, format string, args ...any)     { emit("user", stream, format, args...) }
+func emitInternal(stream, format string, args ...any) { emit("internal", stream, format, args...) }
 
 func newLogger(component string) zerolog.Logger {
 	// template-builder logs go to stderr (structured for operators).

@@ -173,15 +173,27 @@ func (p *buildLogPipe) Write(data []byte) (int, error) {
 		line := p.buf[:idx]
 		p.buf = p.buf[idx+1:]
 		var evt struct {
-			Stream string `json:"stream"`
-			Text   string `json:"text"`
+			Visibility string `json:"visibility"`
+			Stream     string `json:"stream"`
+			Text       string `json:"text"`
 		}
-		if json.Unmarshal(line, &evt) == nil && evt.Text != "" {
-			p.mgr.appendBuildLog(p.buildVMID, BuildLogEvent{
-				Stream: LogStream(evt.Stream),
-				Text:   evt.Text,
-			})
+		if json.Unmarshal(line, &evt) != nil || evt.Text == "" {
+			continue
 		}
+		// Internal events stay in the operator journal so we can diagnose
+		// production issues without leaking platform plumbing into the
+		// customer-visible build log stream.
+		if evt.Visibility == "internal" {
+			p.mgr.log.Info().
+				Str("build_vm_id", p.buildVMID).
+				Str("stream", evt.Stream).
+				Msg(evt.Text)
+			continue
+		}
+		p.mgr.appendBuildLog(p.buildVMID, BuildLogEvent{
+			Stream: LogStream(evt.Stream),
+			Text:   evt.Text,
+		})
 	}
 	return len(data), nil
 }
