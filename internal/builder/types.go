@@ -42,7 +42,7 @@ type BuildStep struct {
 }
 
 type CopyOp struct {
-	Src string `json:"src"` // base64-encoded tar; capped at 1 MiB in V1
+	Src string `json:"src"` // base64-encoded tar; capped at 1 MiB
 	Dst string `json:"dst"`
 }
 
@@ -82,7 +82,7 @@ type Config struct {
 	MaxUncompressedSizeBytes int64
 }
 
-// ApplyDefaults fills in zero-valued fields with V1 defaults.
+// ApplyDefaults fills in zero-valued fields with sensible defaults.
 func (c *Config) ApplyDefaults() {
 	if c.PlatformOS == "" {
 		c.PlatformOS = "linux"

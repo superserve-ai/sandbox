@@ -14,7 +14,6 @@ import (
 // network access or a separate artifact pipeline.
 //
 // Source: https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-amd64
-// SHA256 of the embedded bytes is enforced at test time (TODO).
 //
 //go:embed assets/tini-static-amd64
 var tiniBinary []byte

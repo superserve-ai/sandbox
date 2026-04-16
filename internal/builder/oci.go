@@ -99,7 +99,7 @@ func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 		if strings.HasPrefix(strings.ToLower(env), "path=") {
 			if strings.Contains(env, "/sbin:/bin") && !strings.Contains(env, "/usr/sbin") {
 				// Busybox-style layout. Alpine fits this pattern.
-				return fmt.Errorf("image appears to be alpine or busybox-based (PATH looks minimal); these are not supported in V1 — use a debian/ubuntu-based image")
+				return fmt.Errorf("image appears to be alpine or busybox-based (PATH looks minimal); use a debian/ubuntu-based image")
 			}
 		}
 	}

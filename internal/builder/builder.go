@@ -9,11 +9,9 @@ import (
 )
 
 // Builder produces a Firecracker-bootable rootfs.ext4 from a BuildSpec.
-//
-// Single implementation in V1: the in-process pipeline that pulls OCI via
+// The default implementation is in-process: pulls OCI via
 // go-containerregistry, injects boxd as an additional layer, and runs
-// mkfs.ext4 locally. The interface exists so a self-hosted BuildKit or
-// remote build service can slot in later without touching callers.
+// mkfs.ext4 locally. The interface lets callers swap implementations.
 type Builder interface {
 	// BuildRootfs resolves the base image, flattens layers, injects boxd,
 	// and writes rootfs.ext4 at destPath. Returns the resolved digest and

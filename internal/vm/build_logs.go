@@ -112,7 +112,7 @@ func (b *buildLogBuffer) Subscribe() (<-chan BuildLogEvent, func()) {
 	// Replay buffered history into the subscriber's channel first so they
 	// see a coherent tail-from-start view. Gated by the subscriber channel
 	// buffer — if history is bigger than the channel can hold, the fast
-	// prefix goes in and the slow suffix is dropped. Acceptable for V1.
+	// prefix goes in and the slow suffix is dropped.
 	for _, ev := range b.events {
 		select {
 		case ch <- ev:

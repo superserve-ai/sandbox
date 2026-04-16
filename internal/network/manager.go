@@ -424,24 +424,14 @@ func (m *Manager) CleanupVM(vmID string) {
 	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
 }
 
-// SweepOrphanNamespaces removes host namespaces and veth interfaces matching
-// our slot naming pattern (ns-N, veth-N) that are NOT in the keep set.
+// SweepOrphanNamespaces removes host namespaces and veth interfaces
+// matching the ns-N/veth-N naming pattern that are not in the keep set.
+// Called from ReattachAll at startup, after stale BoltDB records have
+// been pruned, so the keep set reflects current truth.
 //
-// Called from ReattachAll at startup. Orphans accumulate because:
-//   - Template builds (slot 200+) never write BoltDB and leak on crash.
-//   - Sandboxes whose rundir cleanup raced the namespace delete.
-//   - Pool-preallocated slots that were never claimed when vmd crashed.
-//
-// Left unchecked, these degrade the host over time (86+ observed in staging)
-// and make the network pool spend most of its startup retrying colliding slots.
-//
-// Safety assumptions at call time:
-//   - Systemd KillMode=control-group has killed every subprocess child
-//     (firecracker, template-builder), so no namespace has a live process.
-//   - Phase A of ReattachAll has already marked stale BoltDB records; the
-//     keep set reflects current truth.
-//   - The name pattern check (strings.HasPrefix "ns-"/"veth-") ensures we
-//     never touch user-created or system interfaces.
+// Safety: relies on systemd killing every subprocess child before
+// ReattachAll runs, so no namespace has a live process. The name-prefix
+// check ensures we never touch user-created or system interfaces.
 func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 	entries, err := os.ReadDir("/run/netns")
 	if err != nil {

@@ -245,13 +245,12 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 }
 
 // markSandboxFailed sets the sandbox to 'failed' as a terminal state for
-// reaper-side compensation paths. Emits a single high-signal log line with
-// `reason` and any context already on `l` so on-call has one place to look
-// when alerting fires on `status=failed`.
+// reaper-side compensation paths. Emits a single log line with `reason`
+// and any context already on `l`.
 //
-// Best-effort: if the DB write itself fails, we log loudly and stop — at
-// that point the sandbox is stuck in 'pausing', but the reaper loop is
-// already bounded because future ticks only claim 'active' sandboxes.
+// Best-effort: if the DB write itself fails, we log and stop — at that
+// point the sandbox is stuck in 'pausing', but the reaper loop is already
+// bounded because future ticks only claim 'active' sandboxes.
 func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, reason string, l zerolog.Logger) {
 	failCtx, failCancel := context.WithTimeout(ctx, asyncTimeout)
 	defer failCancel()

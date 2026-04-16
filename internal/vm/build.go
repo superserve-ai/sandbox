@@ -223,9 +223,8 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 	}, nil
 }
 
-// writeBuildMeta persists the build metadata (digest, size, timestamp) next
-// to the snapshot so it's discoverable on disk. Useful for post-mortem and
-// for a future build cache that keys on digest.
+// writeBuildMeta persists the build metadata (digest, size, timestamp)
+// next to the snapshot so it's discoverable on disk.
 func writeBuildMeta(dir string, br builder.BuildRootfsResult) {
 	meta := struct {
 		ResolvedDigest string `json:"resolved_digest"`

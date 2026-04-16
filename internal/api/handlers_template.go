@@ -33,7 +33,7 @@ type buildStep struct {
 }
 
 type buildCopyOp struct {
-	Src string `json:"src"` // base64-encoded tar; capped at 1 MiB in V1
+	Src string `json:"src"` // base64-encoded tar; capped at 1 MiB
 	Dst string `json:"dst"`
 }
 
@@ -115,7 +115,7 @@ func validateBuildSpec(spec *buildSpec) error {
 	// will do a stricter check post-pull.
 	low := strings.ToLower(spec.From)
 	if strings.Contains(low, "alpine") {
-		return fmt.Errorf("alpine bases are not supported in V1 (musl + non-systemd init); use a debian/ubuntu-based image")
+		return fmt.Errorf("alpine bases are not supported (musl + non-systemd init); use a debian/ubuntu-based image")
 	}
 	if strings.Contains(low, "distroless") {
 		return fmt.Errorf("distroless bases are not supported (no shell for RUN steps)")
@@ -128,7 +128,7 @@ func validateBuildSpec(spec *buildSpec) error {
 		if step.Copy != nil {
 			set++
 			if len(step.Copy.Src) > maxCopySrcBytes {
-				return fmt.Errorf("build_spec.steps[%d].copy.src exceeds %d bytes (V1 cap)", i, maxCopySrcBytes)
+				return fmt.Errorf("build_spec.steps[%d].copy.src exceeds %d bytes", i, maxCopySrcBytes)
 			}
 			if step.Copy.Dst == "" {
 				return fmt.Errorf("build_spec.steps[%d].copy.dst is required", i)
@@ -557,8 +557,8 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 	}
 
 	// Hash the template's persisted spec — we build whatever's currently
-	// stored, not a fresh client-supplied spec. Editing a template's spec
-	// is a separate (V2) concern; for V1 the spec is fixed at create time.
+	// stored, not a fresh client-supplied spec. The spec is fixed at
+	// template create time.
 	var spec buildSpec
 	if err := json.Unmarshal(tpl.BuildSpec, &spec); err != nil {
 		log.Error().Err(err).Str("template_id", tplID.String()).Msg("unmarshal stored build_spec")
@@ -664,10 +664,10 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 		return
 	}
 
-	// V1: cancel just records the terminal status. The supervisor (Day 6)
-	// will pick this up on its next tick and call vmd.CancelBuild to tear
-	// down the build VM. Until the supervisor exists, builds in 'pending'
-	// are immediately effectively cancelled (nothing is running on them).
+	// Cancel records the terminal status; the supervisor picks it up on
+	// its next tick and calls vmd.CancelBuild to tear down the build VM.
+	// Builds still in 'pending' are effectively cancelled immediately
+	// (nothing is running on them yet).
 	rows, err := h.DB.CancelBuild(c.Request.Context(), db.CancelBuildParams{
 		ID:     buildID,
 		TeamID: teamID,
@@ -795,10 +795,8 @@ func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
 		return
 	}
 
-	// Resolve the vmd client for the host that's running this build. For
-	// single-host V1 it's the default client; multi-host uses the host
-	// registry. Missing host ID (shouldn't happen post-dispatch) falls
-	// back to the default client.
+	// Resolve the vmd client for the host running this build; falls back
+	// to the default client when the host ID is absent.
 	hostID := ""
 	if build.VmdHostID != nil {
 		hostID = *build.VmdHostID

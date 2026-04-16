@@ -15,9 +15,7 @@ import (
 
 // buildVMIDPrefix marks VMs owned by the template build pipeline. Their
 // lifecycle is managed by buildTemplateWorker, not the reconciler — they
-// have no sandbox row by design, and destroying them mid-build is what
-// caused the "snapshot: vm not found" and auto-fail-budget-exhausted
-// incidents during template seeding.
+// have no sandbox row by design, so the reconciler skips them.
 const buildVMIDPrefix = "build-"
 
 func isBuildVM(id string) bool { return strings.HasPrefix(id, buildVMIDPrefix) }
@@ -31,9 +29,8 @@ type ReconcilerConfig struct {
 	// just started a VM and systemd hasn't fully registered it yet.
 	GracePeriod time.Duration
 	// MaxAutoFailPerHour caps destructive actions per host to bound the
-	// blast radius of a reconciler bug. If exceeded, the reconciler
-	// logs a paging alert and stops taking destructive action until
-	// the counter resets.
+	// blast radius of a reconciler bug. When the cap is reached, the
+	// reconciler stops taking destructive action until the counter resets.
 	MaxAutoFailPerHour int
 	// HostID is this host's identifier in the `host` table. The reconciler
 	// only operates on sandboxes with this host_id.

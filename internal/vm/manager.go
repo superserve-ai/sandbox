@@ -145,8 +145,7 @@ type Manager struct {
 
 	// builds tracks in-flight and completed template builds. Keyed by
 	// build VM id (which is also "build-" + templateID). Entries survive
-	// until process exit so late pollers can read terminal outcomes; a
-	// V2 sweep can evict old records if memory becomes a concern.
+	// until process exit so late pollers can read terminal outcomes.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
 

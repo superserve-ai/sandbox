@@ -42,8 +42,7 @@ type BuildSupervisorConfig struct {
 	// per-team limits would allow it.
 	GlobalMaxConcurrentBuilds int32
 
-	// HostID is the vmd host the supervisor dispatches to. Single-host V1
-	// uses the controlplane's DefaultHostID; multi-host will select per row.
+	// HostID is the vmd host the supervisor dispatches to.
 	HostID string
 
 	// PendingTimeout is how long a build can wait in 'pending' before it's
@@ -61,8 +60,7 @@ type BuildSupervisorConfig struct {
 	ReapBatchSize int32
 }
 
-// DefaultBuildSupervisorConfig returns V1 defaults tuned for single-host
-// operation at expected volumes (~tens of builds per day).
+// DefaultBuildSupervisorConfig returns sensible defaults.
 func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 	return BuildSupervisorConfig{
 		Interval:                  30 * time.Second,
@@ -86,9 +84,8 @@ type BuildSupervisor struct {
 }
 
 // NewBuildSupervisor constructs a supervisor. vmd must be the client for
-// the host named in cfg.HostID; the supervisor doesn't do host selection
-// (V1 is single-host). q is the sqlc queries handle, shared with the rest
-// of the control plane.
+// the host named in cfg.HostID. q is the sqlc queries handle, shared with
+// the rest of the control plane.
 func NewBuildSupervisor(cfg BuildSupervisorConfig, q *db.Queries, vmd vmdclient.Client) *BuildSupervisor {
 	return &BuildSupervisor{
 		cfg: cfg,

@@ -929,9 +929,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// takes snapshot paths and boots a new VM from them statelessly.
 		//
 		// Env vars for from_template aren't threaded through here — the
-		// template's own start_cmd covers most cases, and the few callers
-		// who need dynamic env can use ExecCommand's env param. Real
-		// env-var-at-create support for from_template is a follow-up.
+		// template's own start_cmd covers most cases; callers needing
+		// dynamic env can use ExecCommand's env param.
 		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath)
 	} else {
 		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),

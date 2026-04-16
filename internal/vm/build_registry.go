@@ -28,11 +28,10 @@ func (s BuildStatus) IsTerminal() bool {
 // buildRecord is the in-memory state of one build. The record is keyed in
 // Manager.builds by the build VM ID (which is also "build-" + templateID).
 //
-// Records are kept indefinitely after terminal status so polling consumers
-// that come back late (e.g. supervisor after a control plane restart) can
-// still read the outcome. A periodic sweep (TODO) can evict old records;
-// for V1 the memory footprint is bounded by the per-team build concurrency
-// × a handful of keys, so it's fine to hold them.
+// Records are kept indefinitely after terminal status so polling
+// consumers that come back late (e.g. supervisor after a control plane
+// restart) can still read the outcome. Memory footprint is bounded by
+// the per-team build concurrency limit times a handful of keys.
 type buildRecord struct {
 	BuildVMID  string
 	TemplateID string
