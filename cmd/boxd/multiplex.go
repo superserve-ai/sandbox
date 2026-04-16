@@ -16,8 +16,6 @@ import (
 // a single consumer goroutine avoids that. Multi-consumer support lets
 // future subscribers (persistent log buffer, audit sink, live tail) be
 // added with a Fork call instead of restructuring the producer path.
-//
-// The pattern mirrors e2b-infra's envd MultiplexedChannel.
 type MultiplexedChannel[T any] struct {
 	Source chan T
 
