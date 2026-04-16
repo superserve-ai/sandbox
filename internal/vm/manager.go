@@ -1066,6 +1066,15 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
+	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
+		if !inPlace {
+			m.netMgr.CleanupVM(vmID)
+		}
+		m.cleanupRunDir(vmID)
+		m.setStatus(vmID, StatusError)
+		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
+	}
+
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM restored from snapshot")
