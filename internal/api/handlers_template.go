@@ -222,7 +222,7 @@ func (h *Handlers) enforceBuildConcurrency(c *gin.Context, teamID uuid.UUID) (bo
 	}
 	if int64(limit) > 0 && active >= int64(limit) {
 		respondErrorMsg(c, "too_many_builds",
-			fmt.Sprintf("team has reached the maximum of %d concurrent builds; wait for one to finish or raise the limit", limit),
+			fmt.Sprintf("team has reached the maximum of %d concurrent builds; contact support to raise the limit", limit),
 			http.StatusTooManyRequests)
 		return false, nil
 	}
