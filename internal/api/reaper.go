@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -17,13 +18,16 @@ type ReaperConfig struct {
 	// BatchSize bounds the number of sandboxes paused per cycle so a
 	// sudden wave of expirations cannot tie up the control plane.
 	BatchSize int32
+	// Parallelism caps concurrent pauses within a single batch. 0 → 16.
+	Parallelism int
 }
 
 // DefaultReaperConfig returns sensible defaults for the timeout reaper.
 func DefaultReaperConfig() ReaperConfig {
 	return ReaperConfig{
-		Interval:  30 * time.Second,
-		BatchSize: 50,
+		Interval:    30 * time.Second,
+		BatchSize:   50,
+		Parallelism: 16,
 	}
 }
 
@@ -48,9 +52,18 @@ func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
+	parallelism := cfg.Parallelism
+	if parallelism <= 0 {
+		parallelism = 16
+	}
+	if int32(parallelism) > cfg.BatchSize {
+		parallelism = int(cfg.BatchSize)
+	}
+
 	log.Info().
 		Dur("interval", cfg.Interval).
 		Int32("batch_size", cfg.BatchSize).
+		Int("parallelism", parallelism).
 		Msg("timeout reaper started")
 
 	ticker := time.NewTicker(cfg.Interval)
@@ -58,7 +71,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
-	h.reapOnce(ctx, cfg.BatchSize)
+	h.reapOnce(ctx, cfg.BatchSize, parallelism)
 
 	for {
 		select {
@@ -66,12 +79,12 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			log.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
-			h.reapOnce(ctx, cfg.BatchSize)
+			h.reapOnce(ctx, cfg.BatchSize, parallelism)
 		}
 	}
 }
 
-func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
+func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int) {
 	// Atomically claim expired active sandboxes and mark them 'pausing' in one
 	// CTE+UPDATE. FOR UPDATE SKIP LOCKED inside the query ensures that
 	// concurrent reaper replicas skip rows already being processed.
@@ -91,16 +104,28 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
 
 	log.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
 
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+
+dispatch:
 	for _, sbx := range expired {
-		// Check for shutdown between each pause so we exit promptly.
+		// Labeled break: a plain break inside the select exits only the
+		// select, not the for loop.
 		select {
 		case <-ctx.Done():
-			return
-		default:
+			break dispatch
+		case sem <- struct{}{}:
 		}
 
-		h.pauseExpired(ctx, sbx)
+		wg.Add(1)
+		go func(sbx db.ClaimExpiredSandboxesRow) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			h.pauseExpired(ctx, sbx)
+		}(sbx)
 	}
+
+	wg.Wait()
 }
 
 // pauseExpired pauses one sandbox that was atomically claimed by

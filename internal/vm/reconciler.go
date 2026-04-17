@@ -128,17 +128,6 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		return
 	}
 
-	// Source A: BoltDB records.
-	records, err := r.mgr.state.All()
-	if err != nil {
-		log.Error().Err(err).Msg("failed to read state store")
-		return
-	}
-	bolted := make(map[string]VMRecord, len(records))
-	for _, rec := range records {
-		bolted[rec.ID] = rec
-	}
-
 	// Source B: active systemd units.
 	ids, err := listActiveFirecrackerUnits(ctx)
 	if err != nil {
@@ -150,9 +139,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		active[id] = true
 	}
 
-	// Source C: DB sandbox rows for this host (optional). A short
-	// per-query deadline keeps a slow DB from stalling the whole run.
-	var dbSandboxes map[string]db.Sandbox
+	// Source C: DB sandbox rows for this host (optional), with their
+	// linked snapshot path joined in so Drift 4 can stat the snapshot
+	// without a per-row lookup. A short per-query deadline keeps a slow
+	// DB from stalling the whole run.
+	var dbSandboxes map[string]db.ListSandboxesByHostRow
 	if r.cfg.DB != nil && r.cfg.HostID != "" {
 		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		rows, dbErr := r.cfg.DB.ListSandboxesByHost(qctx, r.cfg.HostID)
@@ -160,11 +151,35 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		if dbErr != nil {
 			log.Error().Err(dbErr).Msg("failed to list sandboxes from DB")
 		} else {
-			dbSandboxes = make(map[string]db.Sandbox, len(rows))
-			for _, s := range rows {
-				dbSandboxes[s.ID.String()] = s
+			dbSandboxes = make(map[string]db.ListSandboxesByHostRow, len(rows))
+			for _, row := range rows {
+				dbSandboxes[row.Sandbox.ID.String()] = row
 			}
 		}
+	}
+
+	// Source A: BoltDB records. Full records are only needed on the
+	// DB-down fallback path (Drift 2) or for actual orphan cleanup — the
+	// common path uses ID-only iteration.
+	var bolted map[string]VMRecord
+	var boltedIDs map[string]struct{}
+	if dbSandboxes == nil {
+		records, allErr := r.mgr.state.All()
+		if allErr != nil {
+			log.Error().Err(allErr).Msg("failed to read state store")
+			return
+		}
+		bolted = make(map[string]VMRecord, len(records))
+		for _, rec := range records {
+			bolted[rec.ID] = rec
+		}
+	} else {
+		idSet, idsErr := r.mgr.state.IDs()
+		if idsErr != nil {
+			log.Error().Err(idsErr).Msg("failed to list state store IDs")
+			return
+		}
+		boltedIDs = idSet
 	}
 
 	now := time.Now()
@@ -173,10 +188,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// Action: mark sandbox failed in DB + clean up BoltDB + in-memory.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {
-			if sb.Status != db.SandboxStatusActive {
+			if sb.Sandbox.Status != db.SandboxStatusActive {
 				continue
 			}
-			if r.isAlive(ctx, id, bolted) {
+			if r.isAlive(ctx, id) {
 				r.clearDrift(id)
 				continue
 			}
@@ -203,7 +218,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if rec.Status != StatusRunning {
 				continue
 			}
-			if r.isAlive(ctx, id, bolted) {
+			if r.isAlive(ctx, id) {
 				r.clearDrift(id)
 				continue
 			}
@@ -225,7 +240,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	if dbSandboxes != nil {
 		for id := range active {
 			sb, known := dbSandboxes[id]
-			deleted := known && sb.Status == db.SandboxStatusDeleted
+			deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
 			if known && !deleted {
 				continue
 			}
@@ -257,14 +272,17 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// Drift 4: DB says idle, snapshot file missing on disk → mark failed.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {
-			if sb.Status != db.SandboxStatusIdle || !sb.SnapshotID.Valid {
+			if sb.Sandbox.Status != db.SandboxStatusIdle || !sb.Sandbox.SnapshotID.Valid {
 				continue
 			}
-			snap, snapErr := r.getSnapshot(ctx, sb.SnapshotID.Bytes)
-			if snapErr != nil {
+			// snapshot_path is joined in by ListSandboxesByHost, so this
+			// is a cheap struct field read instead of a per-row DB call.
+			// Skip when the snapshot row has been deleted (rare race).
+			if sb.SnapshotPath == nil || *sb.SnapshotPath == "" {
 				continue
 			}
-			if _, statErr := os.Stat(snap.Path); statErr == nil {
+			snapPath := *sb.SnapshotPath
+			if _, statErr := os.Stat(snapPath); statErr == nil {
 				r.clearDrift("idle:" + id)
 				continue
 			}
@@ -275,7 +293,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "idle_snapshot_missing")
 				continue
 			}
-			log.Warn().Str("vm_id", id).Str("snapshot_path", snap.Path).
+			log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
 				Str("drift", "idle_snapshot_missing").
 				Msg("idle sandbox snapshot file missing — marking failed")
 			r.markFailedInDB(ctx, id)
@@ -290,7 +308,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// a systemd unit running for a sandbox the control plane forgot about
 	// is a resource leak and a security risk.
 	if dbSandboxes != nil {
-		for id, rec := range bolted {
+		// Fetch the full record only for the few IDs that look orphaned,
+		// not for every bolted entry.
+		for id := range boltedIDs {
 			if _, ok := dbSandboxes[id]; ok {
 				continue
 			}
@@ -299,6 +319,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			if !r.consumeAutoFailBudget(id) {
 				r.writeAudit(ctx, id, "budget_exhausted", "stale_cleanup suppressed by rate limit", "boltdb_present_db_missing")
+				continue
+			}
+			rec, getErr := r.mgr.state.Get(id)
+			if getErr != nil || rec == nil {
+				r.clearDrift("bolt-orphan:" + id)
 				continue
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
@@ -318,7 +343,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 }
 
 // isAlive returns true when the VM's systemd unit is currently active.
-func (r *Reconciler) isAlive(ctx context.Context, vmID string, _ map[string]VMRecord) bool {
+func (r *Reconciler) isAlive(ctx context.Context, vmID string) bool {
 	return isUnitActive(ctx, systemdUnitName(vmID))
 }
 
@@ -342,16 +367,6 @@ func (r *Reconciler) clearDrift(key string) {
 	r.mu.Lock()
 	delete(r.driftSeen, key)
 	r.mu.Unlock()
-}
-
-// getSnapshot loads a snapshot row by ID via the internal (unscoped)
-// query. The reconciler is host-scoped, not team-scoped, so it uses
-// GetSnapshotByID which bypasses the tenant filter. Guards the call
-// with dbQueryTimeout so a slow DB can't wedge the loop.
-func (r *Reconciler) getSnapshot(ctx context.Context, id [16]byte) (db.Snapshot, error) {
-	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
-	defer cancel()
-	return r.cfg.DB.GetSnapshotByID(qctx, id)
 }
 
 // dbQueryTimeout is the per-query deadline for short reconciler writes

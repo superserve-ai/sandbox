@@ -15,7 +15,9 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
+	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
@@ -76,10 +78,13 @@ func run() error {
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
-	// Falls back to the default vmdClient when the registry has no entry.
-	dialVMD := func(addr string) (vmdclient.Client, error) {
+	// Interceptors below fire onDead on codes.Unavailable so the registry
+	// drops stale cached clients.
+	dialVMD := func(addr string, onDead func()) (vmdclient.Client, error) {
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithUnaryInterceptor(deadHostUnaryInterceptor(onDead)),
+			grpc.WithStreamInterceptor(deadHostStreamInterceptor(onDead)),
 		)
 		if err != nil {
 			return nil, err
@@ -314,4 +319,43 @@ func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, a
 		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
 	}
 	return nil
+}
+
+// deadHostUnaryInterceptor calls onDead when a unary RPC returns
+// codes.Unavailable.
+func deadHostUnaryInterceptor(onDead func()) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		if err != nil && grpcstatus.Code(err) == grpccodes.Unavailable && onDead != nil {
+			onDead()
+		}
+		return err
+	}
+}
+
+// deadHostStreamInterceptor is the streaming counterpart.
+func deadHostStreamInterceptor(onDead func()) grpc.StreamClientInterceptor {
+	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		cs, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			if grpcstatus.Code(err) == grpccodes.Unavailable && onDead != nil {
+				onDead()
+			}
+			return nil, err
+		}
+		return &deadHostClientStream{ClientStream: cs, onDead: onDead}, nil
+	}
+}
+
+type deadHostClientStream struct {
+	grpc.ClientStream
+	onDead func()
+}
+
+func (s *deadHostClientStream) RecvMsg(m any) error {
+	err := s.ClientStream.RecvMsg(m)
+	if err != nil && grpcstatus.Code(err) == grpccodes.Unavailable && s.onDead != nil {
+		s.onDead()
+	}
+	return err
 }

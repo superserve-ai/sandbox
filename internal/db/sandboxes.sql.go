@@ -391,40 +391,47 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 }
 
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
-WHERE host_id = $1 AND destroyed_at IS NULL
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.last_activity_at, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, snap.path AS snapshot_path
+FROM sandbox s
+LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
+WHERE s.host_id = $1 AND s.destroyed_at IS NULL
 `
 
-// Used by the VMD reconciler to find all non-deleted sandboxes scheduled on
-// this host. Includes both active and idle sandboxes because the reconciler
-// needs to validate both states (active → systemd unit, idle → snapshot file).
-func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Sandbox, error) {
+type ListSandboxesByHostRow struct {
+	Sandbox      Sandbox `json:"sandbox"`
+	SnapshotPath *string `json:"snapshot_path"`
+}
+
+// Used by the VMD reconciler. snapshot_path is joined so the idle-sandbox
+// drift check can stat the file without a per-row snapshot lookup.
+func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]ListSandboxesByHostRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByHost, hostID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByHostRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByHostRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.LastActivityAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.LastActivityAt,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.SnapshotPath,
 		); err != nil {
 			return nil, err
 		}

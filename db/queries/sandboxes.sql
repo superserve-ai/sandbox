@@ -65,11 +65,12 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
 
 -- name: ListSandboxesByHost :many
--- Used by the VMD reconciler to find all non-deleted sandboxes scheduled on
--- this host. Includes both active and idle sandboxes because the reconciler
--- needs to validate both states (active → systemd unit, idle → snapshot file).
-SELECT * FROM sandbox
-WHERE host_id = $1 AND destroyed_at IS NULL;
+-- Used by the VMD reconciler. snapshot_path is joined so the idle-sandbox
+-- drift check can stat the file without a per-row snapshot lookup.
+SELECT sqlc.embed(s), snap.path AS snapshot_path
+FROM sandbox s
+LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
+WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
 
 -- name: MarkSandboxFailed :exec
 -- Used by the reconciler to mark a sandbox failed when VMD detects it is
