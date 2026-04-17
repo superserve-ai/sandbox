@@ -1763,8 +1763,11 @@ type RestoreSnapshotRequest struct {
 	OverlayPath    string                 `protobuf:"bytes,4,opt,name=overlay_path,json=overlayPath,proto3" json:"overlay_path,omitempty"` // COW overlay for the restored rootfs.
 	ResourceLimits *ResourceLimits        `protobuf:"bytes,5,opt,name=resource_limits,json=resourceLimits,proto3" json:"resource_limits,omitempty"`
 	NetworkConfig  *NetworkConfig         `protobuf:"bytes,6,opt,name=network_config,json=networkConfig,proto3" json:"network_config,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Per-sandbox env vars merged on top of the template's baked defaults
+	// (captured in the snapshot). Caller keys override template keys.
+	EnvVars       map[string]string `protobuf:"bytes,7,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RestoreSnapshotRequest) Reset() {
@@ -1835,6 +1838,13 @@ func (x *RestoreSnapshotRequest) GetResourceLimits() *ResourceLimits {
 func (x *RestoreSnapshotRequest) GetNetworkConfig() *NetworkConfig {
 	if x != nil {
 		return x.NetworkConfig
+	}
+	return nil
+}
+
+func (x *RestoreSnapshotRequest) GetEnvVars() map[string]string {
+	if x != nil {
+		return x.EnvVars
 	}
 	return nil
 }
@@ -2703,14 +2713,18 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xae\x02\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xbd\x03\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12!\n" +
 	"\foverlay_path\x18\x04 \x01(\tR\voverlayPath\x12J\n" +
 	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12G\n" +
-	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\"\xcc\x01\n" +
+	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12Q\n" +
+	"\benv_vars\x18\a \x03(\v26.superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntryR\aenvVars\x1a:\n" +
+	"\fEnvVarsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcc\x01\n" +
 	"\x17RestoreSnapshotResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +
@@ -2812,7 +2826,7 @@ func file_proto_vmd_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_vmd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_vmd_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
+var file_proto_vmd_proto_msgTypes = make([]protoimpl.MessageInfo, 43)
 var file_proto_vmd_proto_goTypes = []any{
 	(VMStatus)(0),                        // 0: superserve.vmd.v1.VMStatus
 	(*BuildTemplateRequest)(nil),         // 1: superserve.vmd.v1.BuildTemplateRequest
@@ -2855,8 +2869,9 @@ var file_proto_vmd_proto_goTypes = []any{
 	nil,                                  // 38: superserve.vmd.v1.CreateVMRequest.MetadataEntry
 	nil,                                  // 39: superserve.vmd.v1.CreateVMRequest.EnvVarsEntry
 	nil,                                  // 40: superserve.vmd.v1.ResumeVMRequest.EnvVarsEntry
-	nil,                                  // 41: superserve.vmd.v1.ExecCommandRequest.EnvEntry
-	nil,                                  // 42: superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
+	nil,                                  // 41: superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntry
+	nil,                                  // 42: superserve.vmd.v1.ExecCommandRequest.EnvEntry
+	nil,                                  // 43: superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
 }
 var file_proto_vmd_proto_depIdxs = []int32{
 	2,  // 0: superserve.vmd.v1.BuildTemplateRequest.steps:type_name -> superserve.vmd.v1.BuildStep
@@ -2874,48 +2889,49 @@ var file_proto_vmd_proto_depIdxs = []int32{
 	12, // 12: superserve.vmd.v1.ResumeVMResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
 	12, // 13: superserve.vmd.v1.RestoreSnapshotRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
 	13, // 14: superserve.vmd.v1.RestoreSnapshotRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	12, // 15: superserve.vmd.v1.RestoreSnapshotResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	41, // 16: superserve.vmd.v1.ExecCommandRequest.env:type_name -> superserve.vmd.v1.ExecCommandRequest.EnvEntry
-	0,  // 17: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
-	12, // 18: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	42, // 19: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
-	13, // 20: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	15, // 21: superserve.vmd.v1.UpdateSandboxNetworkRequest.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
-	16, // 22: superserve.vmd.v1.VMDaemon.CreateVM:input_type -> superserve.vmd.v1.CreateVMRequest
-	18, // 23: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
-	20, // 24: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
-	22, // 25: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
-	24, // 26: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
-	26, // 27: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
-	28, // 28: superserve.vmd.v1.VMDaemon.DeleteSnapshot:input_type -> superserve.vmd.v1.DeleteSnapshotRequest
-	30, // 29: superserve.vmd.v1.VMDaemon.ExecCommand:input_type -> superserve.vmd.v1.ExecCommandRequest
-	32, // 30: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
-	34, // 31: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
-	36, // 32: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:input_type -> superserve.vmd.v1.UpdateSandboxNetworkRequest
-	1,  // 33: superserve.vmd.v1.VMDaemon.BuildTemplate:input_type -> superserve.vmd.v1.BuildTemplateRequest
-	6,  // 34: superserve.vmd.v1.VMDaemon.GetBuildStatus:input_type -> superserve.vmd.v1.GetBuildStatusRequest
-	8,  // 35: superserve.vmd.v1.VMDaemon.CancelBuild:input_type -> superserve.vmd.v1.CancelBuildRequest
-	10, // 36: superserve.vmd.v1.VMDaemon.StreamBuildLogs:input_type -> superserve.vmd.v1.StreamBuildLogsRequest
-	17, // 37: superserve.vmd.v1.VMDaemon.CreateVM:output_type -> superserve.vmd.v1.CreateVMResponse
-	19, // 38: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
-	21, // 39: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
-	23, // 40: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
-	25, // 41: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
-	27, // 42: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
-	29, // 43: superserve.vmd.v1.VMDaemon.DeleteSnapshot:output_type -> superserve.vmd.v1.DeleteSnapshotResponse
-	31, // 44: superserve.vmd.v1.VMDaemon.ExecCommand:output_type -> superserve.vmd.v1.ExecCommandResponse
-	33, // 45: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
-	35, // 46: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
-	37, // 47: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:output_type -> superserve.vmd.v1.UpdateSandboxNetworkResponse
-	5,  // 48: superserve.vmd.v1.VMDaemon.BuildTemplate:output_type -> superserve.vmd.v1.BuildTemplateResponse
-	7,  // 49: superserve.vmd.v1.VMDaemon.GetBuildStatus:output_type -> superserve.vmd.v1.GetBuildStatusResponse
-	9,  // 50: superserve.vmd.v1.VMDaemon.CancelBuild:output_type -> superserve.vmd.v1.CancelBuildResponse
-	11, // 51: superserve.vmd.v1.VMDaemon.StreamBuildLogs:output_type -> superserve.vmd.v1.BuildLogEvent
-	37, // [37:52] is the sub-list for method output_type
-	22, // [22:37] is the sub-list for method input_type
-	22, // [22:22] is the sub-list for extension type_name
-	22, // [22:22] is the sub-list for extension extendee
-	0,  // [0:22] is the sub-list for field type_name
+	41, // 15: superserve.vmd.v1.RestoreSnapshotRequest.env_vars:type_name -> superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntry
+	12, // 16: superserve.vmd.v1.RestoreSnapshotResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	42, // 17: superserve.vmd.v1.ExecCommandRequest.env:type_name -> superserve.vmd.v1.ExecCommandRequest.EnvEntry
+	0,  // 18: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
+	12, // 19: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	43, // 20: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
+	13, // 21: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	15, // 22: superserve.vmd.v1.UpdateSandboxNetworkRequest.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
+	16, // 23: superserve.vmd.v1.VMDaemon.CreateVM:input_type -> superserve.vmd.v1.CreateVMRequest
+	18, // 24: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
+	20, // 25: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
+	22, // 26: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
+	24, // 27: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
+	26, // 28: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
+	28, // 29: superserve.vmd.v1.VMDaemon.DeleteSnapshot:input_type -> superserve.vmd.v1.DeleteSnapshotRequest
+	30, // 30: superserve.vmd.v1.VMDaemon.ExecCommand:input_type -> superserve.vmd.v1.ExecCommandRequest
+	32, // 31: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
+	34, // 32: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
+	36, // 33: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:input_type -> superserve.vmd.v1.UpdateSandboxNetworkRequest
+	1,  // 34: superserve.vmd.v1.VMDaemon.BuildTemplate:input_type -> superserve.vmd.v1.BuildTemplateRequest
+	6,  // 35: superserve.vmd.v1.VMDaemon.GetBuildStatus:input_type -> superserve.vmd.v1.GetBuildStatusRequest
+	8,  // 36: superserve.vmd.v1.VMDaemon.CancelBuild:input_type -> superserve.vmd.v1.CancelBuildRequest
+	10, // 37: superserve.vmd.v1.VMDaemon.StreamBuildLogs:input_type -> superserve.vmd.v1.StreamBuildLogsRequest
+	17, // 38: superserve.vmd.v1.VMDaemon.CreateVM:output_type -> superserve.vmd.v1.CreateVMResponse
+	19, // 39: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
+	21, // 40: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
+	23, // 41: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
+	25, // 42: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
+	27, // 43: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
+	29, // 44: superserve.vmd.v1.VMDaemon.DeleteSnapshot:output_type -> superserve.vmd.v1.DeleteSnapshotResponse
+	31, // 45: superserve.vmd.v1.VMDaemon.ExecCommand:output_type -> superserve.vmd.v1.ExecCommandResponse
+	33, // 46: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
+	35, // 47: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
+	37, // 48: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:output_type -> superserve.vmd.v1.UpdateSandboxNetworkResponse
+	5,  // 49: superserve.vmd.v1.VMDaemon.BuildTemplate:output_type -> superserve.vmd.v1.BuildTemplateResponse
+	7,  // 50: superserve.vmd.v1.VMDaemon.GetBuildStatus:output_type -> superserve.vmd.v1.GetBuildStatusResponse
+	9,  // 51: superserve.vmd.v1.VMDaemon.CancelBuild:output_type -> superserve.vmd.v1.CancelBuildResponse
+	11, // 52: superserve.vmd.v1.VMDaemon.StreamBuildLogs:output_type -> superserve.vmd.v1.BuildLogEvent
+	38, // [38:53] is the sub-list for method output_type
+	23, // [23:38] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_proto_vmd_proto_init() }
@@ -2935,7 +2951,7 @@ func file_proto_vmd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vmd_proto_rawDesc), len(file_proto_vmd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   42,
+			NumMessages:   43,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -139,6 +139,19 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	if err != nil {
 		return nil, err
 	}
+
+	// Merge caller env vars on top of whatever context the template baked
+	// into the snapshot. Skipping on empty preserves the template's
+	// defaults (boxd already has them loaded from the restored memory).
+	if envVars := req.GetEnvVars(); len(envVars) > 0 {
+		if initErr := postBoxdInit(ctx, inst.IP, envVars); initErr != nil {
+			// Tear the VM down — a sandbox whose env vars weren't applied
+			// would silently serve stale/missing secrets to the user.
+			_ = a.mgr.DestroyVM(ctx, inst.ID, true)
+			return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", initErr)
+		}
+	}
+
 	return &vmdpb.RestoreSnapshotResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,

@@ -392,7 +392,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				respondError(c, ErrInternal)
@@ -927,11 +927,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// map (the pause→resume contract), which is fine for a paused
 		// sandbox but not for a fresh one we're creating now. Restore
 		// takes snapshot paths and boots a new VM from them statelessly.
-		//
-		// Env vars for from_template aren't threaded through here — the
-		// template's own start_cmd covers most cases; callers needing
-		// dynamic env can use ExecCommand's env param.
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath)
+		// Caller env vars are merged on top of the template's baked
+		// defaults by vmd (boxd resumes with template context, then the
+		// restore RPC posts these on top).
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
 	} else {
 		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),
 			0, 0, 0, nil, req.EnvVars)

@@ -35,10 +35,11 @@ type BuildSpec struct {
 // BuildStep is a single tagged-union entry. Exactly one of the fields is
 // set (enforced at spec validation time in the HTTP handler).
 type BuildStep struct {
-	Run     *string      `json:"run,omitempty"`
-	Copy    *CopyOp      `json:"copy,omitempty"`
-	Env     *EnvOp       `json:"env,omitempty"`
-	Workdir *string      `json:"workdir,omitempty"`
+	Run     *string `json:"run,omitempty"`
+	Copy    *CopyOp `json:"copy,omitempty"`
+	Env     *EnvOp  `json:"env,omitempty"`
+	Workdir *string `json:"workdir,omitempty"`
+	User    *UserOp `json:"user,omitempty"`
 }
 
 type CopyOp struct {
@@ -49,6 +50,15 @@ type CopyOp struct {
 type EnvOp struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+// UserOp switches the user subsequent steps execute as, and the default
+// user that sandboxes created from the template use for exec. If the user
+// does not already exist inside the image, it is created with a disabled
+// password. When Sudo is true, the user is granted passwordless sudo.
+type UserOp struct {
+	Name string `json:"name"`
+	Sudo bool   `json:"sudo,omitempty"`
 }
 
 // BuildRootfsResult is the output of producing a rootfs.ext4 from a BuildSpec.

@@ -26,10 +26,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type buildStep struct {
-	Run     *string         `json:"run,omitempty"`
-	Copy    *buildCopyOp    `json:"copy,omitempty"`
-	Env     *buildEnvOp     `json:"env,omitempty"`
-	Workdir *string         `json:"workdir,omitempty"`
+	Run     *string      `json:"run,omitempty"`
+	Copy    *buildCopyOp `json:"copy,omitempty"`
+	Env     *buildEnvOp  `json:"env,omitempty"`
+	Workdir *string      `json:"workdir,omitempty"`
+	User    *buildUserOp `json:"user,omitempty"`
 }
 
 type buildCopyOp struct {
@@ -40,6 +41,11 @@ type buildCopyOp struct {
 type buildEnvOp struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+type buildUserOp struct {
+	Name string `json:"name"`
+	Sudo bool   `json:"sudo,omitempty"`
 }
 
 // buildSpec is the canonical declaration that gets persisted as jsonb in
@@ -143,8 +149,38 @@ func validateBuildSpec(spec *buildSpec) error {
 		if step.Workdir != nil {
 			set++
 		}
+		if step.User != nil {
+			set++
+			if err := validateUserName(step.User.Name); err != nil {
+				return fmt.Errorf("build_spec.steps[%d].user: %w", i, err)
+			}
+		}
 		if set != 1 {
-			return fmt.Errorf("build_spec.steps[%d] must set exactly one of run/copy/env/workdir", i)
+			return fmt.Errorf("build_spec.steps[%d] must set exactly one of run/copy/env/workdir/user", i)
+		}
+	}
+	return nil
+}
+
+// validateUserName enforces a conservative Linux-username policy so we
+// don't shell-inject or collide with system accounts. Follows useradd's
+// NAME_REGEX: lowercase letter/underscore, then letters/digits/_/- up to
+// 31 chars total.
+func validateUserName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if len(name) > 31 {
+		return fmt.Errorf("name exceeds 31 characters")
+	}
+	first := name[0]
+	if !(first == '_' || (first >= 'a' && first <= 'z')) {
+		return fmt.Errorf("name must start with a lowercase letter or underscore")
+	}
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return fmt.Errorf("name contains invalid character %q", c)
 		}
 	}
 	return nil

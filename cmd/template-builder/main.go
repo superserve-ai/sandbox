@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -178,19 +180,30 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitUser("system", "Starting build environment")
 
 	// Phase 6: execute build steps
-	if err := executeBuildSteps(ctx, netInfo.HostIP, cfg.spec); err != nil {
+	bc, err := executeBuildSteps(ctx, netInfo.HostIP, cfg.spec)
+	if err != nil {
 		return fmt.Errorf("build steps: %w", err)
 	}
 
 	// Phase 7: start_cmd + ready_cmd
-	if err := runStartCmd(ctx, netInfo.HostIP, cfg.spec); err != nil {
+	if err := runStartCmd(ctx, netInfo.HostIP, cfg.spec, bc); err != nil {
 		return fmt.Errorf("start_cmd: %w", err)
 	}
-	if err := pollReadyCmd(ctx, netInfo.HostIP, cfg.spec); err != nil {
+	if err := pollReadyCmd(ctx, netInfo.HostIP, cfg.spec, bc); err != nil {
 		return fmt.Errorf("ready_cmd: %w", err)
 	}
 
-	// Phase 8: snapshot
+	// Phase 8: bake the accumulated context into boxd's memory so the
+	// defaults travel in the snapshot. Env vars set via `env` steps plus
+	// the final user/workdir become the template's runtime defaults for
+	// every future sandbox restored from this snapshot.
+	if err := postBoxdInit(ctx, netInfo.HostIP, userEnv(bc.env), bc.user, bc.workdir); err != nil {
+		return fmt.Errorf("bake context into boxd: %w", err)
+	}
+	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
+		bc.user, bc.workdir, len(bc.env))
+
+	// Phase 9: snapshot
 	emitUser("system", "Saving template")
 	snapPath := filepath.Join(snapDir, "vmstate.snap")
 	memPath := filepath.Join(snapDir, "mem.snap")
@@ -327,64 +340,188 @@ func waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error 
 	return fmt.Errorf("boxd not ready after %s", timeout)
 }
 
+// postBoxdInit pushes the template's default context into boxd so it
+// travels in the snapshot. Called once, just before vm.CreateSnapshot.
+// Failure aborts the build — a snapshot without the intended defaults
+// would silently corrupt every sandbox restored from the template.
+func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, defaultUser, defaultWorkdir string) error {
+	body := struct {
+		EnvVars        map[string]string `json:"env_vars,omitempty"`
+		DefaultUser    string            `json:"default_user,omitempty"`
+		DefaultWorkdir string            `json:"default_workdir,omitempty"`
+	}{EnvVars: envVars, DefaultUser: defaultUser, DefaultWorkdir: defaultWorkdir}
+
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal init body: %w", err)
+	}
+	url := fmt.Sprintf("http://%s:%d/init", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+	if err != nil {
+		return fmt.Errorf("build init request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	initClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := initClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /init: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /init: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// userEnv filters the build-time env map down to the keys set via `env`
+// steps, stripping the platform baseline (PATH/HOME/USER/TERM/LANG/SHELL)
+// that template-builder uses to drive build-time exec. Those come from
+// boxd's own env at runtime and shouldn't be baked into the template.
+func userEnv(buildEnv map[string]string) map[string]string {
+	baseline := map[string]struct{}{
+		"PATH": {}, "HOME": {}, "USER": {}, "TERM": {}, "LANG": {}, "SHELL": {},
+	}
+	out := make(map[string]string, len(buildEnv))
+	for k, v := range buildEnv {
+		if _, skip := baseline[k]; skip {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Build step execution
 // ---------------------------------------------------------------------------
 
 const stepTimeout = 10 * time.Minute
 
-func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec) error {
-	env := map[string]string{
-		"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME":  "/root",
-		"USER":  "root",
-		"TERM":  "xterm",
-		"LANG":  "C.UTF-8",
-		"SHELL": "/bin/sh",
+// buildCtx carries the state that threads through template build steps:
+// env vars the next run step sees, the user it runs as, and the cwd. env
+// is the initial baseline plus accumulated env steps; user defaults to
+// root until a user step switches it; workdir defaults empty (boxd's
+// fallback) until a workdir step sets it.
+type buildCtx struct {
+	env     map[string]string
+	user    string
+	workdir string
+}
+
+func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec) (buildCtx, error) {
+	bc := buildCtx{
+		env: map[string]string{
+			"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"HOME":  "/root",
+			"USER":  "root",
+			"TERM":  "xterm",
+			"LANG":  "C.UTF-8",
+			"SHELL": "/bin/sh",
+		},
 	}
 
 	for i, step := range spec.Steps {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return bc, ctx.Err()
 		default:
 		}
 
 		emitUser("system", "Step %d/%d", i+1, len(spec.Steps))
 		stepStart := time.Now()
 
-		if err := runBuildStep(ctx, vmIP, step, env); err != nil {
-			return fmt.Errorf("step %d/%d failed after %s: %w",
+		next, err := runBuildStep(ctx, vmIP, step, bc)
+		if err != nil {
+			return bc, fmt.Errorf("step %d/%d failed after %s: %w",
 				i+1, len(spec.Steps), time.Since(stepStart).Round(time.Millisecond), err)
 		}
+		bc = next
 		emitUser("system", "Step %d/%d completed (%s)", i+1, len(spec.Steps),
 			time.Since(stepStart).Round(time.Millisecond))
 	}
-	return nil
+	return bc, nil
 }
 
-func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, env map[string]string) error {
+func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc buildCtx) (buildCtx, error) {
 	switch {
 	case step.Run != nil:
-		return runShellCmd(ctx, vmIP, *step.Run, env, "")
+		if err := runShellCmd(ctx, vmIP, *step.Run, bc); err != nil {
+			return bc, err
+		}
+		return bc, nil
 	case step.Env != nil:
-		env[step.Env.Key] = step.Env.Value
+		bc.env[step.Env.Key] = step.Env.Value
 		emitUser("system", "Set %s=%s", step.Env.Key, step.Env.Value)
-		return nil
+		return bc, nil
 	case step.Workdir != nil:
-		emitUser("system", "Working directory: %s", *step.Workdir)
-		return nil
+		// Resolve to absolute (Docker semantics: relative paths are joined
+		// with the current workdir; base is "/" when no prior workdir).
+		target := *step.Workdir
+		if !filepath.IsAbs(target) {
+			base := bc.workdir
+			if base == "" {
+				base = "/"
+			}
+			target = filepath.Join(base, target)
+		}
+		// Create the directory as root so we can chown it to the build
+		// user, then switch back. Running everything as root here avoids
+		// permission issues when the user hasn't been created yet.
+		ownUser := bc.user
+		if ownUser == "" {
+			ownUser = "root"
+		}
+		mkdir := fmt.Sprintf("mkdir -p %s && chown -R %s:%s %s",
+			shellQuote(target), shellQuote(ownUser), shellQuote(ownUser), shellQuote(target))
+		root := bc
+		root.user = "root" // ensure mkdir + chown run as root
+		if err := runShellCmd(ctx, vmIP, mkdir, root); err != nil {
+			return bc, fmt.Errorf("create workdir %s: %w", target, err)
+		}
+		bc.workdir = target
+		emitUser("system", "Working directory: %s", target)
+		return bc, nil
+	case step.User != nil:
+		name := step.User.Name
+		// Check if user exists; create if missing. Running as root so the
+		// adduser call can actually create the account.
+		root := bc
+		root.user = "root"
+		check := fmt.Sprintf("id -u %s >/dev/null 2>&1 || adduser --disabled-password --gecos \"\" %s",
+			shellQuote(name), shellQuote(name))
+		if err := runShellCmd(ctx, vmIP, check, root); err != nil {
+			return bc, fmt.Errorf("ensure user %s: %w", name, err)
+		}
+		if step.User.Sudo {
+			sudo := fmt.Sprintf(
+				"usermod -aG sudo %s || true; passwd -d %s || true; "+
+					"grep -q '^%s ALL=(ALL:ALL) NOPASSWD: ALL' /etc/sudoers || "+
+					"echo '%s ALL=(ALL:ALL) NOPASSWD: ALL' >>/etc/sudoers",
+				shellQuote(name), shellQuote(name), name, name,
+			)
+			if err := runShellCmd(ctx, vmIP, sudo, root); err != nil {
+				return bc, fmt.Errorf("grant sudo to %s: %w", name, err)
+			}
+		}
+		bc.user = name
+		emitUser("system", "User: %s", name)
+		return bc, nil
 	case step.Copy != nil:
 		dst := step.Copy.Dst
 		shCmd := fmt.Sprintf("mkdir -p %s && printf '%%s' '%s' | base64 -d | tar -C %s -xf -",
 			shellQuote(dst), step.Copy.Src, shellQuote(dst))
-		return runShellCmd(ctx, vmIP, shCmd, env, "")
+		if err := runShellCmd(ctx, vmIP, shCmd, bc); err != nil {
+			return bc, err
+		}
+		return bc, nil
 	default:
-		return fmt.Errorf("step has no op set")
+		return bc, fmt.Errorf("step has no op set")
 	}
 }
 
-func runShellCmd(ctx context.Context, vmIP, cmd string, env map[string]string, workdir string) error {
+func runShellCmd(ctx context.Context, vmIP, cmd string, bc buildCtx) error {
 	emitUser("system", "$ %s", truncate(cmd, 256))
 
 	stepCtx, cancel := context.WithTimeout(ctx, stepTimeout)
@@ -394,8 +531,9 @@ func runShellCmd(ctx context.Context, vmIP, cmd string, env map[string]string, w
 	req := &pb.StartRequest{
 		Cmd:       "/bin/sh",
 		Args:      []string{"-c", cmd},
-		Envs:      env,
-		Cwd:       workdir,
+		Envs:      bc.env,
+		Cwd:       bc.workdir,
+		User:      bc.user,
 		TimeoutMs: uint32(stepTimeout.Milliseconds()),
 	}
 
@@ -439,7 +577,7 @@ func runShellCmd(ctx context.Context, vmIP, cmd string, env map[string]string, w
 // start_cmd + ready_cmd
 // ---------------------------------------------------------------------------
 
-func runStartCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) error {
+func runStartCmd(ctx context.Context, vmIP string, spec builder.BuildSpec, bc buildCtx) error {
 	if spec.StartCmd == "" {
 		return nil
 	}
@@ -450,6 +588,9 @@ func runStartCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) error
 		req := &pb.StartRequest{
 			Cmd:  "/bin/sh",
 			Args: []string{"-c", spec.StartCmd},
+			Envs: bc.env,
+			Cwd:  bc.workdir,
+			User: bc.user,
 		}
 		stream, err := client.Start(context.Background(), connect.NewRequest(req))
 		if err != nil {
@@ -467,7 +608,7 @@ func runStartCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) error
 	return nil
 }
 
-func pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) error {
+func pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec, bc buildCtx) error {
 	if spec.ReadyCmd == "" {
 		return nil
 	}
@@ -485,6 +626,9 @@ func pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec) erro
 		req := &pb.StartRequest{
 			Cmd:       "/bin/sh",
 			Args:      []string{"-c", spec.ReadyCmd},
+			Envs:      bc.env,
+			Cwd:       bc.workdir,
+			User:      bc.user,
 			TimeoutMs: 2000,
 		}
 		stream, err := client.Start(probeCtx, connect.NewRequest(req))

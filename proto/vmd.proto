@@ -296,6 +296,9 @@ message RestoreSnapshotRequest {
   string overlay_path = 4;         // COW overlay for the restored rootfs.
   ResourceLimits resource_limits = 5;
   NetworkConfig network_config = 6;
+  // Per-sandbox env vars merged on top of the template's baked defaults
+  // (captured in the snapshot). Caller keys override template keys.
+  map<string, string> env_vars = 7;
 }
 
 message RestoreSnapshotResponse {
