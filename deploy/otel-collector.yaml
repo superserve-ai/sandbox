@@ -1,0 +1,105 @@
+# Per-host OpenTelemetry Collector for superserve.
+#
+# Topology:
+#   apps (vmd, controlplane, proxy) → this collector :4317 → central pool
+#
+# This collector lives on the same machine as the apps so its only network
+# hop to them is loopback. It batches and gzips before sending to the
+# central pool, which keeps egress small and decouples app health from
+# central-pool availability — a flap on the central side cannot back-pressure
+# vmd.
+#
+# Set the central endpoint via env var (kept out of git so the same file
+# works in staging and prod):
+#   export OTEL_CENTRAL_ENDPOINT=otel.staging.superserve-internal:4317
+#   export OTEL_CENTRAL_AUTH=Bearer\ <token>           # if backend needs it
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Host metrics — CPU, memory, disk, network, process count.
+  # 30s scrape; high-cardinality fields disabled to keep series count flat.
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+      memory:
+      disk:
+        # Real block devices only — skip loop, ram, and synthetic mounts.
+        include_devices:
+          match_type: regexp
+          devices: ["sd[a-z].*", "nvme.*", "vd[a-z].*"]
+      filesystem:
+        exclude_mount_points:
+          match_type: regexp
+          mount_points: ["/var/lib/docker/.*", "/proc/.*", "/sys/.*", "/run/.*"]
+      load:
+      network:
+        # Skip virtual interfaces — docker, veth, tap pollute series count.
+        exclude:
+          match_type: regexp
+          interfaces: ["docker.*", "veth.*", "br-.*", "tap.*", "lo"]
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  # memory_limiter prevents the collector from OOMing the host if the
+  # central side is unavailable for a long time.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 25
+
+  # Add host_id to every signal for host-level pivoting in the backend.
+  resource:
+    attributes:
+      - key: host.id
+        from_attribute: host.name
+        action: insert
+
+exporters:
+  otlp:
+    endpoint: ${env:OTEL_CENTRAL_ENDPOINT}
+    compression: gzip
+    headers:
+      authorization: ${env:OTEL_CENTRAL_AUTH}
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 5m
+
+  # Useful for sanity-checking what's flowing during incidents:
+  #   journalctl -u superserve-otel-collector | grep -A2 "Span\|Metric"
+  # Disabled by default — comment-in via the pipelines block below.
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters: [otlp]
+    metrics:
+      receivers: [otlp, hostmetrics]
+      processors: [memory_limiter, batch, resource]
+      exporters: [otlp]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters: [otlp]

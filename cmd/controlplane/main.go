@@ -11,9 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -22,14 +24,19 @@ import (
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
+// version is set by ldflags at build time; falls back to "dev".
+var version = "dev"
+
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
-		With().Timestamp().Caller().Logger()
+		With().Timestamp().Caller().Logger().
+		Hook(telemetry.ZerologTraceHook{})
 
 	if err := run(); err != nil {
 		log.Fatal().Err(err).Msg("controlplane exited with error")
@@ -48,8 +55,30 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Connect to PostgreSQL.
-	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	// Telemetry. No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset, so local
+	// dev and tests pay nothing. Shut down with a fresh context so we still
+	// flush after ctx is cancelled by signal handling below.
+	tel, err := telemetry.New(ctx, "controlplane", version, os.Getenv("NODE_ID"))
+	if err != nil {
+		return fmt.Errorf("init telemetry: %w", err)
+	}
+	defer func() {
+		if err := tel.Shutdown(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("telemetry shutdown")
+		}
+	}()
+	if err := tel.StartRuntimeInstrumentation(); err != nil {
+		log.Warn().Err(err).Msg("runtime instrumentation")
+	}
+
+	// Connect to PostgreSQL with otelpgx tracer so every sqlc query is a
+	// child span of the request that issued it.
+	pgxCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("parse database URL: %w", err)
+	}
+	pgxCfg.ConnConfig.Tracer = otelpgx.NewTracer()
+	dbPool, err := pgxpool.NewWithConfig(ctx, pgxCfg)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
@@ -59,9 +88,12 @@ func run() error {
 	}
 	log.Info().Msg("connected to database")
 
-	// Connect to VMD via gRPC.
+	// Connect to VMD via gRPC. otelgrpc stats handler propagates trace
+	// context across the boundary so spans from controlplane continue
+	// inside vmd (once vmd is wired in commit 3).
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
 		return fmt.Errorf("dial VMD gRPC: %w", err)
@@ -80,6 +112,7 @@ func run() error {
 	dialVMD := func(addr string) (vmdclient.Client, error) {
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		)
 		if err != nil {
 			return nil, err

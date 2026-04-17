@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 )
 
 // SetupRouter creates and configures the Gin router with all route groups.
@@ -14,9 +16,16 @@ import (
 // router instance doesn't leak a cleanup goroutine.
 func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
-	// Global middleware: security headers, coarse per-IP rate limit
-	// (unauthenticated flood protection), logging, panic recovery.
+	// otelgin runs first so spans cover all downstream middleware (rate
+	// limiter rejects, auth failures, panic recovery) — those are the
+	// things you most want a trace for.
 	r.Use(
+		otelgin.Middleware("controlplane",
+			otelgin.WithFilter(func(req *http.Request) bool {
+				// Health checks would dominate trace volume with no signal.
+				return req.URL.Path != "/health"
+			}),
+		),
 		SecurityHeaders(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),

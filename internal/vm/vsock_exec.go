@@ -10,10 +10,24 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
 
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 )
+
+// boxdInterceptors carries the otel client interceptor for outbound Connect
+// calls to boxd. otelconnect.NewInterceptor only errors on impossible
+// configuration, so panic at startup is the right escalation. The
+// interceptor is no-op when the global TracerProvider is the SDK noop
+// (i.e. telemetry disabled).
+var boxdInterceptors = func() connect.Option {
+	i, err := otelconnect.NewInterceptor()
+	if err != nil {
+		panic("otelconnect.NewInterceptor: " + err.Error())
+	}
+	return connect.WithInterceptors(i)
+}()
 
 // ExecResult holds the result of a command execution inside a VM.
 type ExecResult struct {
@@ -28,7 +42,7 @@ const boxdPort = 49983
 // boxdProcessClient returns a Connect RPC client for the ProcessService.
 func boxdProcessClient(vmIP string) boxdpbconnect.ProcessServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
-	return boxdpbconnect.NewProcessServiceClient(http.DefaultClient, baseURL)
+	return boxdpbconnect.NewProcessServiceClient(http.DefaultClient, baseURL, boxdInterceptors)
 }
 
 // ExecOptions holds optional parameters for command execution.
@@ -222,5 +236,5 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string) e
 // a VM. File byte transfer goes through the edge proxy directly.
 func boxdFilesystemClient(vmIP string) boxdpbconnect.FilesystemServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
-	return boxdpbconnect.NewFilesystemServiceClient(http.DefaultClient, baseURL)
+	return boxdpbconnect.NewFilesystemServiceClient(http.DefaultClient, baseURL, boxdInterceptors)
 }

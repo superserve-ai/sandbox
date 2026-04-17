@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // authzFailure is a structured rejection from authorizeSandboxRequest.
@@ -32,6 +33,7 @@ func (h *Handler) authorizeSandboxRequest(
 	}
 
 	if !auth.VerifyAccessToken(h.seedKey, requestSandboxID, token) {
+		telemetry.IncProxyHMACFailure(ctx)
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusUnauthorized,
 			Message: "invalid access token",

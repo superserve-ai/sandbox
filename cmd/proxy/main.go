@@ -11,17 +11,23 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/proxy"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
+
+// version is set by ldflags at build time; falls back to "dev".
+var version = "dev"
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log := zerolog.New(os.Stdout).With().
 		Timestamp().
 		Str("service", "proxy").
-		Logger()
+		Logger().
+		Hook(telemetry.ZerologTraceHook{})
 
 	addr := envOrDefault("PROXY_ADDR", ":5007")
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
@@ -36,6 +42,19 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	tel, err := telemetry.New(ctx, "proxy", version, os.Getenv("NODE_ID"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("init telemetry")
+	}
+	defer func() {
+		if err := tel.Shutdown(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("telemetry shutdown")
+		}
+	}()
+	if err := tel.StartRuntimeInstrumentation(); err != nil {
+		log.Warn().Err(err).Msg("runtime instrumentation")
+	}
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domain, resolver, log)
@@ -114,7 +133,15 @@ func main() {
 		}
 	}()
 
-	if err := proxy.ListenAndServe(ctx, addr, mux, log); err != nil {
+	// otelhttp wraps the entire mux so every forwarded request becomes a
+	// span. The /health filter avoids drowning the trace backend in
+	// noise from the LB liveness probe.
+	tracedMux := otelhttp.NewHandler(mux, "proxy",
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return r.URL.Path != "/health"
+		}),
+	)
+	if err := proxy.ListenAndServe(ctx, addr, tracedMux, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
 	}
 

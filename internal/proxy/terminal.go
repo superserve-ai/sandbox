@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
 	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 
@@ -27,6 +28,18 @@ import (
 type terminalBridgeDeps struct {
 	allowedOrigins []string
 }
+
+// terminalBoxdInterceptors injects trace context into outbound Connect calls
+// to boxd. No-op when telemetry is disabled (the global tracer is the SDK
+// noop). otelconnect.NewInterceptor only errors on impossible configuration,
+// so a panic at startup is the right escalation.
+var terminalBoxdInterceptors = func() connect.Option {
+	i, err := otelconnect.NewInterceptor()
+	if err != nil {
+		panic("otelconnect.NewInterceptor: " + err.Error())
+	}
+	return connect.WithInterceptors(i)
+}()
 
 // WithAuth sets the HMAC seed used by every data-plane endpoint on the
 // boxd host label (/terminal, /files). Call once at proxy startup.
@@ -232,7 +245,7 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 	transport := h.transports.get(instanceID, info)
 	httpClient := &http.Client{Transport: transport}
 	baseURL := fmt.Sprintf("http://%s:%d", info.VMIP, boxdPort)
-	procClient := boxdpbconnect.NewProcessServiceClient(httpClient, baseURL)
+	procClient := boxdpbconnect.NewProcessServiceClient(httpClient, baseURL, terminalBoxdInterceptors)
 
 	// Tie the bridge lifetime to the request context so shutdowns
 	// propagate cleanly. The WS will be closed in bridgeTerminal.
