@@ -420,6 +420,8 @@ func specStepsToVMD(steps []builder.BuildStep) []vmdclient.BuildStep {
 			vs.Env = &vmdclient.BuildEnvOp{Key: s.Env.Key, Value: s.Env.Value}
 		case s.Workdir != nil:
 			vs.Workdir = s.Workdir
+		case s.User != nil:
+			vs.User = &vmdclient.BuildUserOp{Name: s.User.Name, Sudo: s.User.Sudo}
 		}
 		out = append(out, vs)
 	}

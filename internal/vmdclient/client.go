@@ -62,12 +62,13 @@ type BuildTemplateInput struct {
 	DiskMiB    uint32
 }
 
-// BuildStep mirrors vmdpb.BuildStep — exactly one of Run/Copy/Env/Workdir.
+// BuildStep mirrors vmdpb.BuildStep — exactly one of Run/Copy/Env/Workdir/User.
 type BuildStep struct {
 	Run     *string
 	Copy    *BuildCopyOp
 	Env     *BuildEnvOp
 	Workdir *string
+	User    *BuildUserOp
 }
 
 type BuildCopyOp struct {
@@ -78,6 +79,11 @@ type BuildCopyOp struct {
 type BuildEnvOp struct {
 	Key   string
 	Value string
+}
+
+type BuildUserOp struct {
+	Name string
+	Sudo bool
 }
 
 // BuildLogEvent is one decoded event from StreamBuildLogs. Finished=true

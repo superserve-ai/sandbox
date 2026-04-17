@@ -366,6 +366,8 @@ func (c *grpcVMDClient) BuildTemplate(ctx context.Context, req vmdclient.BuildTe
 			pstep.Op = &vmdpb.BuildStep_Env{Env: &vmdpb.BuildEnvOp{Key: step.Env.Key, Value: step.Env.Value}}
 		case step.Workdir != nil:
 			pstep.Op = &vmdpb.BuildStep_Workdir{Workdir: *step.Workdir}
+		case step.User != nil:
+			pstep.Op = &vmdpb.BuildStep_User{User: &vmdpb.BuildUserOp{Name: step.User.Name, Sudo: step.User.Sudo}}
 		}
 		pbReq.Steps = append(pbReq.Steps, pstep)
 	}

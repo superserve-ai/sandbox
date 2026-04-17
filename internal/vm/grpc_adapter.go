@@ -423,8 +423,13 @@ func buildStepFromProto(p *vmdpb.BuildStep) (builder.BuildStep, error) {
 	case *vmdpb.BuildStep_Workdir:
 		wd := op.Workdir
 		return builder.BuildStep{Workdir: &wd}, nil
+	case *vmdpb.BuildStep_User:
+		return builder.BuildStep{User: &builder.UserOp{
+			Name: op.User.GetName(),
+			Sudo: op.User.GetSudo(),
+		}}, nil
 	default:
-		return builder.BuildStep{}, &fieldError{"op must be one of run/copy/env/workdir"}
+		return builder.BuildStep{}, &fieldError{"op must be one of run/copy/env/workdir/user"}
 	}
 }
 
