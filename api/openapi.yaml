@@ -3,20 +3,23 @@ info:
   title: Superserve API
   version: 0.1.0
   description: |
-    Superserve provides sandbox infrastructure to run AI Agents in the cloud. Powered by Firecracker MicroVMs.
+    Superserve provides sandbox infrastructure to run AI agents in the cloud.
 
     ## Sandbox lifecycle
 
     ```
-    starting --> active <--> idle --> deleted
+    active <--> idle --> deleted
     ```
+
+    A sandbox is `active` when running and `idle` after being paused. Resuming
+    an idle sandbox returns it to `active`. Deleting releases all resources.
 
     | Endpoint | What it does |
     |----------|-------------|
     | `POST /sandboxes` | Create a new sandbox |
-    | `PATCH /sandboxes/:id` | Partially update a running sandbox (e.g. network rules) |
-    | `POST /sandboxes/:id/pause` | Snapshot full state, suspend the VM |
-    | `POST /sandboxes/:id/resume` | Restore from snapshot, continue where it left off |
+    | `PATCH /sandboxes/:id` | Partially update a sandbox (e.g. network rules) |
+    | `POST /sandboxes/:id/pause` | Pause the sandbox and save its state |
+    | `POST /sandboxes/:id/resume` | Resume a paused sandbox where it left off |
     | `DELETE /sandboxes/:id` | Delete sandbox and all resources |
 
     ## Sandbox environment
@@ -106,9 +109,9 @@ paths:
       tags: [Sandboxes]
       summary: Create a new sandbox
       description: |
-        Creates a sandbox and returns immediately with `status: starting`.
-        The VM boots asynchronously. Poll `GET /sandboxes/{id}` until
-        `status` is `active` before running commands.
+        Creates a sandbox. When the request returns successfully, the
+        sandbox is ready to use — you can run commands against it
+        immediately.
       security:
         - apiKey: []
       requestBody:
@@ -174,7 +177,7 @@ paths:
     patch:
       operationId: patchSandbox
       tags: [Sandboxes]
-      summary: Partially update a running sandbox
+      summary: Partially update a sandbox
       description: |
         Applies a partial update to a running sandbox. Each top-level field
         in the request body is optional; only fields that are present are
@@ -189,11 +192,11 @@ paths:
         ## Currently patchable fields
 
         - `network` — replaces the egress allow/deny rules. The sandbox
-          must be in the `active` state; patching a paused or idle sandbox
+          must be in the `active` state; patching an `idle` sandbox
           returns `409`. Rules take effect immediately and are persisted so
           they survive a future pause/resume cycle.
         - `metadata` — replaces the sandbox's metadata tags. Can be updated
-          regardless of sandbox state (active, paused, idle).
+          regardless of sandbox state.
       security:
         - apiKey: []
       requestBody:
@@ -225,9 +228,9 @@ paths:
       tags: [Sandboxes]
       summary: Pause a running sandbox
       description: |
-        Snapshots the sandbox's full state (memory + disk), suspends the VM,
-        and transitions to `idle`. Resume it later to continue exactly where
-        it left off.
+        Saves the sandbox's full state and transitions it to `idle`. Resume
+        it later to continue exactly where it left off — same memory, same
+        running processes, same files.
       security:
         - apiKey: []
       responses:
@@ -255,8 +258,7 @@ paths:
       tags: [Sandboxes]
       summary: Resume a paused sandbox
       description: |
-        Restores the sandbox from its paused snapshot. Transitions back to
-        `active` with all state intact — same memory, same processes, same files.
+        Restores a paused sandbox to `active` with all state intact.
       security:
         - apiKey: []
       responses:
@@ -381,20 +383,20 @@ components:
           type: string
           format: uuid
           description: >
-            If provided, boot the sandbox from this snapshot instead of
-            creating a fresh VM. The snapshot must belong to the same team.
+            If provided, start the sandbox from this snapshot instead of
+            creating a fresh one. The snapshot must belong to the same team.
         timeout_seconds:
           type: integer
           format: int32
           minimum: 1
           maximum: 604800
           description: >
-            Optional hard lifetime cap in seconds, measured from sandbox
-            creation. When set, the sandbox is destroyed this many seconds
-            after creation regardless of state (active, paused, idle) or
-            activity — the user asked for a hard deadline.
-            When unset, the sandbox lives until explicitly paused or
-            deleted. Maximum 604800 (7 days).
+            Optional cap on how long a sandbox can stay `active`, measured
+            from creation. Once the cap elapses, the sandbox is
+            automatically paused (transitions to `idle`) — its state is
+            preserved and can be resumed later. When unset, the sandbox
+            stays active until you pause or delete it. Maximum 604800
+            (7 days).
         metadata:
           type: object
           additionalProperties:
@@ -426,22 +428,8 @@ components:
             type: string
           description: |
             Environment variables injected into every process inside the
-            sandbox (terminal sessions, exec calls). Not persisted in the
-            database — they live in the VM agent's memory for the sandbox's
-            lifetime and survive pause/resume via snapshot.
-          example:
-            OPENAI_API_KEY: sk-...
-            DEBUG: "1"
-            run_id: 7f3c-21
-        env_vars:
-          type: object
-          additionalProperties:
-            type: string
-          description: |
-            Environment variables injected into every process inside the
-            sandbox (terminal sessions, exec calls). Not persisted in the
-            database — they live in the VM agent's memory for the sandbox's
-            lifetime and survive pause/resume via snapshot.
+            sandbox (terminal sessions, exec calls). Persist for the lifetime
+            of the sandbox and survive pause/resume.
           example:
             OPENAI_API_KEY: sk-...
             DEBUG: "1"
@@ -458,7 +446,10 @@ components:
           type: string
         status:
           type: string
-          enum: [starting, active, pausing, idle, deleted]
+          enum: [active, idle]
+          description: >
+            Current state of the sandbox. `active` means running; `idle`
+            means paused and awaiting resume.
         vcpu_count:
           type: integer
         memory_mib:
@@ -466,11 +457,9 @@ components:
         access_token:
           type: string
           description: |
-            Per-sandbox HMAC access token for data-plane operations
-            (file upload/download, terminal). Pass as `X-Access-Token`
-            header when hitting the edge proxy at
-            `boxd-{id}.sandbox.superserve.ai`. Reusable for the
-            lifetime of the sandbox.
+            Per-sandbox access token for data-plane operations such as
+            file upload/download and terminal. Pass as the `X-Access-Token`
+            header. Reusable for the lifetime of the sandbox.
         snapshot_id:
           type: string
           format: uuid

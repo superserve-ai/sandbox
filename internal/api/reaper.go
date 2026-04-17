@@ -18,7 +18,7 @@ type ReaperConfig struct {
 	// BatchSize bounds the number of sandboxes paused per cycle so a
 	// sudden wave of expirations cannot tie up the control plane.
 	BatchSize int32
-	// Parallelism caps concurrent pauses within a single batch. 0 → 16.
+	// Parallelism caps concurrent pauses within a single batch. 0 → 10.
 	Parallelism int
 }
 
@@ -27,7 +27,7 @@ func DefaultReaperConfig() ReaperConfig {
 	return ReaperConfig{
 		Interval:    30 * time.Second,
 		BatchSize:   50,
-		Parallelism: 16,
+		Parallelism: 10,
 	}
 }
 
@@ -54,7 +54,7 @@ func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	parallelism := cfg.Parallelism
 	if parallelism <= 0 {
-		parallelism = 16
+		parallelism = 10
 	}
 	if int32(parallelism) > cfg.BatchSize {
 		parallelism = int(cfg.BatchSize)
