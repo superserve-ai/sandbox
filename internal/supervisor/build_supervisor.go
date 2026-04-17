@@ -46,8 +46,9 @@ type BuildSupervisorConfig struct {
 	HostID string
 
 	// PendingTimeout is how long a build can wait in 'pending' before it's
-	// reaped as failed. Protects against "build never dispatched because
-	// the supervisor was down for a deploy."
+	// reaped as failed. Pending now only covers "waiting for the next
+	// supervisor tick to dispatch" — concurrency limits are enforced at
+	// submit time, so rows that linger are genuinely stuck.
 	PendingTimeout time.Duration
 
 	// BuildTimeout is the wall-clock cap on a single build from 'building'
@@ -67,7 +68,7 @@ func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 		BatchSize:                 20,
 		GlobalMaxConcurrentBuilds: 10,
 		HostID:                    hostID,
-		PendingTimeout:            10 * time.Minute,
+		PendingTimeout:            2 * time.Minute,
 		BuildTimeout:              30 * time.Minute,
 		ReapBatchSize:             20,
 	}
@@ -211,25 +212,10 @@ func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
 func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBuild) error {
 	rowLog := s.log.With().Str("build_id", row.ID.String()).Str("template_id", row.TemplateID.String()).Logger()
 
-	// Per-team concurrency.
-	concCtx, concCancel := context.WithTimeout(ctx, 5*time.Second)
-	limit, err := s.q.GetTeamBuildConcurrency(concCtx, row.TeamID)
-	concCancel()
-	if err != nil {
-		rowLog.Error().Err(err).Msg("fetch team build_concurrency")
-		return err
-	}
-	countCtx, countCancel := context.WithTimeout(ctx, 5*time.Second)
-	teamInflight, err := s.q.CountInFlightBuildsForTeam(countCtx, row.TeamID)
-	countCancel()
-	if err != nil {
-		rowLog.Error().Err(err).Msg("count team in-flight builds")
-		return err
-	}
-	if teamInflight >= int64(limit) {
-		rowLog.Debug().Int64("team_inflight", teamInflight).Int32("limit", limit).Msg("team at build concurrency limit; leaving pending")
-		return fmt.Errorf("team at build concurrency limit")
-	}
+	// Per-team concurrency is enforced at submit time (CreateTemplate /
+	// CreateTemplateBuild return 429 when the team is at its cap). The
+	// supervisor dispatches pending rows FIFO without re-checking so a
+	// pending row is never blocked by the count of its own siblings.
 
 	// Look up the template to get its vcpu/mem/disk and persisted build_spec.
 	tplCtx, tplCancel := context.WithTimeout(ctx, 5*time.Second)

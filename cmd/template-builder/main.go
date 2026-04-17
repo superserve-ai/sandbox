@@ -84,7 +84,60 @@ func main() {
 		slotIndex:  *slotIndex,
 	})
 	if err != nil {
+		// Emit a user-visible error (stable code + user-friendly message)
+		// so vmd can surface it in the build record instead of a generic
+		// "exit 1". The raw wrapped chain goes to operator logs only.
+		code, msg := classifyBuildError(err)
+		emitUser("error", "%s: %s", code, msg)
+		emitInternal("error", "%v", err)
 		log.Fatalf("build failed: %v", err)
+	}
+}
+
+// classifyBuildError maps the wrapped error chain to (stable_code,
+// user_safe_message). Internal jargon (boxd, rootfs, slot, etc.) stays
+// in the raw error logged to operators — never in the customer-visible
+// message. Falls back to ("build_failed", "template build failed") for
+// anything we haven't explicitly handled.
+func classifyBuildError(err error) (code, userMsg string) {
+	raw := err.Error()
+	switch {
+	case strings.Contains(raw, "build rootfs"),
+		strings.Contains(raw, "pull "),
+		strings.Contains(raw, "manifest "),
+		strings.Contains(raw, "resolve reference"):
+		return "image_pull_failed", "failed to pull base image — check the reference and that the registry is reachable"
+
+	case strings.Contains(raw, "build steps"):
+		// Step failures embed "step N/M failed after X: <subprocess exit
+		// detail>" which is already user-meaningful (their command, their
+		// exit code). Pass it through trimmed.
+		msg := raw
+		if idx := strings.Index(msg, "build steps: "); idx >= 0 {
+			msg = msg[idx+len("build steps: "):]
+		}
+		return "step_failed", msg
+
+	case strings.Contains(raw, "copy rootfs"),
+		strings.Contains(raw, "start firecracker"),
+		strings.Contains(raw, "setup network"),
+		strings.Contains(raw, "boxd not ready"):
+		return "boot_failed", "build environment failed to boot"
+
+	case strings.Contains(raw, "snapshot"):
+		return "snapshot_failed", "failed to capture template snapshot"
+
+	case strings.Contains(raw, "start_cmd"):
+		return "start_cmd_failed", "start_cmd did not launch successfully"
+
+	case strings.Contains(raw, "ready_cmd"):
+		return "ready_cmd_failed", "ready_cmd did not succeed within the readiness timeout"
+
+	case strings.Contains(raw, "bake context"):
+		return "build_failed", "failed to finalize template defaults"
+
+	default:
+		return "build_failed", "template build failed"
 	}
 }
 

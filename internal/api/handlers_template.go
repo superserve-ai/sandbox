@@ -202,6 +202,33 @@ func canonicalSpecHash(spec *buildSpec) (string, error) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// enforceBuildConcurrency rejects with 429 when the team already has the
+// maximum number of actively-running builds in flight. Returns (true, nil)
+// when the caller may proceed. On any failure (limit exceeded or DB error)
+// it writes the response and returns (false, err); err is non-nil only
+// when the handler should log-but-otherwise-stop.
+func (h *Handlers) enforceBuildConcurrency(c *gin.Context, teamID uuid.UUID) (bool, error) {
+	limit, err := h.DB.GetTeamBuildConcurrency(c.Request.Context(), teamID)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeamBuildConcurrency failed")
+		respondError(c, ErrInternal)
+		return false, err
+	}
+	active, err := h.DB.CountInFlightBuildsForTeam(c.Request.Context(), teamID)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountInFlightBuildsForTeam failed")
+		respondError(c, ErrInternal)
+		return false, err
+	}
+	if int64(limit) > 0 && active >= int64(limit) {
+		respondErrorMsg(c, "too_many_builds",
+			fmt.Sprintf("team has reached the maximum of %d concurrent builds; wait for one to finish or raise the limit", limit),
+			http.StatusTooManyRequests)
+		return false, nil
+	}
+	return true, nil
+}
+
 func parseTemplateID(c *gin.Context) (uuid.UUID, error) {
 	raw := c.Param("template_id")
 	id, err := uuid.Parse(raw)
@@ -338,6 +365,17 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	}
 	if err := validateBuildSpec(req.BuildSpec); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Reject at submit if the team is already at its concurrency cap so
+	// callers see back-pressure immediately (429) instead of a row that
+	// silently fails later.
+	if ok, err := h.enforceBuildConcurrency(c, teamID); !ok {
+		if err != nil {
+			// Already responded to the caller inside the helper.
+			return
+		}
 		return
 	}
 
@@ -570,25 +608,7 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 		return
 	}
 
-	// Per-team build concurrency check. Cheap: one COUNT plus one team
-	// lookup. Race window between this check and the INSERT is small but
-	// harmless — the worst case is one extra concurrent build.
-	limit, err := h.DB.GetTeamBuildConcurrency(c.Request.Context(), teamID)
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeamBuildConcurrency failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	inflight, err := h.DB.CountInFlightBuildsForTeam(c.Request.Context(), teamID)
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountInFlightBuildsForTeam failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	if int64(limit) > 0 && inflight >= int64(limit) {
-		respondErrorMsg(c, "rate_limited",
-			fmt.Sprintf("per-team build concurrency limit reached (%d in flight)", inflight),
-			http.StatusTooManyRequests)
+	if ok, _ := h.enforceBuildConcurrency(c, teamID); !ok {
 		return
 	}
 

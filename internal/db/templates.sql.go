@@ -139,11 +139,13 @@ func (q *Queries) ClaimPendingBuilds(ctx context.Context, arg ClaimPendingBuilds
 
 const countInFlightBuildsForTeam = `-- name: CountInFlightBuildsForTeam :one
 SELECT COUNT(*) FROM template_build
-WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting')
+WHERE team_id = $1 AND status IN ('building', 'snapshotting')
 `
 
-// Used by the build supervisor to enforce team.build_concurrency before
-// dispatching a pending build. Counts builds that are not in terminal state.
+// Counts builds actively consuming host resources (building or capturing
+// a snapshot). Pending rows are excluded — they haven't claimed a slot
+// yet and including them would cause a deadlock: submit the limit's
+// worth of builds at once and the count itself blocks any from starting.
 func (q *Queries) CountInFlightBuildsForTeam(ctx context.Context, teamID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countInFlightBuildsForTeam, teamID)
 	var count int64

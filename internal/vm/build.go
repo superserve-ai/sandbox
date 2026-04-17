@@ -124,10 +124,17 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 
 	// Stdout carries structured NDJSON build events — parse and forward
 	// to the build log buffer so SSE subscribers see real-time progress.
-	cmd.Stdout = &buildLogPipe{buildVMID: buildVMID, mgr: m}
+	pipe := &buildLogPipe{buildVMID: buildVMID, mgr: m}
+	cmd.Stdout = pipe
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
+		// Prefer the structured reason the subprocess emitted on its way
+		// out ("image_pull_failed: ...", "step_failed: ...", etc.) over
+		// the opaque "exit status 1" from os/exec.
+		if pipe.lastError != "" {
+			return nil, fmt.Errorf("%s", pipe.lastError)
+		}
 		return nil, fmt.Errorf("template-builder exited: %w", err)
 	}
 
@@ -157,10 +164,15 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 
 // buildLogPipe parses NDJSON lines from template-builder's stdout and
 // forwards them to the build log buffer for SSE streaming.
+//
+// Stream "error" events are also captured in lastError so
+// buildTemplateSync can report the real cause of a non-zero exit instead
+// of the generic "template-builder exited: exit status 1".
 type buildLogPipe struct {
 	buildVMID string
 	mgr       *Manager
 	buf       []byte
+	lastError string
 }
 
 func (p *buildLogPipe) Write(data []byte) (int, error) {
@@ -189,6 +201,9 @@ func (p *buildLogPipe) Write(data []byte) (int, error) {
 				Str("stream", evt.Stream).
 				Msg(evt.Text)
 			continue
+		}
+		if evt.Stream == "error" {
+			p.lastError = evt.Text
 		}
 		p.mgr.appendBuildLog(p.buildVMID, BuildLogEvent{
 			Stream: LogStream(evt.Stream),

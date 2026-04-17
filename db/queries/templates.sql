@@ -126,10 +126,12 @@ ORDER BY created_at DESC
 LIMIT $3;
 
 -- name: CountInFlightBuildsForTeam :one
--- Used by the build supervisor to enforce team.build_concurrency before
--- dispatching a pending build. Counts builds that are not in terminal state.
+-- Counts builds actively consuming host resources (building or capturing
+-- a snapshot). Pending rows are excluded — they haven't claimed a slot
+-- yet and including them would cause a deadlock: submit the limit's
+-- worth of builds at once and the count itself blocks any from starting.
 SELECT COUNT(*) FROM template_build
-WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting');
+WHERE team_id = $1 AND status IN ('building', 'snapshotting');
 
 -- name: ClaimPendingBuilds :many
 -- Atomically claim pending builds for dispatch. FOR UPDATE SKIP LOCKED makes
