@@ -1,7 +1,7 @@
 # CD — Seed Templates — curated public templates + enqueue their builds.
 #
 # Triggers:
-#   - push to main touching seeds/templates/** or cmd/seed-templates/**:
+#   - push to main touching ss_templates/** or cmd/seed-templates/**:
 #       runs staging, then production
 #   - workflow_dispatch with environment=staging:     staging only
 #   - workflow_dispatch with environment=production:  staging FIRST, then prod
@@ -35,7 +35,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'seeds/templates/**'
+      - 'ss_templates/**'
       - 'cmd/seed-templates/**'
 
 jobs:
@@ -54,7 +54,7 @@ jobs:
 
       - name: Seed staging
         run: |
-          go run ./cmd/seed-templates --dir seeds/templates \
+          go run ./cmd/seed-templates --dir ss_templates \
             $( [ "${FORCE_REBUILD}" = "true" ] && echo "--force-rebuild" || true )
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
@@ -78,7 +78,7 @@ jobs:
 
       - name: Seed production
         run: |
-          go run ./cmd/seed-templates --dir seeds/templates \
+          go run ./cmd/seed-templates --dir ss_templates \
             $( [ "${FORCE_REBUILD}" = "true" ] && echo "--force-rebuild" || true )
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}

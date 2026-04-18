@@ -827,6 +827,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	if req.FromTemplate == nil {
+		defaultTpl := "ss/base"
+		req.FromTemplate = &defaultTpl
+	}
+
 	// If from_template is provided, resolve to the template's snapshot paths
 	// and reuse the existing snapshot-restore code path.
 	var snapshotPath, snapshotMemPath string
