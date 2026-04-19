@@ -470,11 +470,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	h.updateLastActivityAsync(c.Request.Context(), sandboxID, teamID)
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
-	sandbox.Status = db.SandboxStatusActive
-	sandbox.VcpuCount = int32(actualVcpu)
-	sandbox.MemoryMib = int32(actualMemMiB)
-	sandbox.IpAddress = ipAddr
-	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
+	resp := gin.H{
+		"id":     sandboxID.String(),
+		"status": string(db.SandboxStatusActive),
+	}
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -620,9 +623,6 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 		CreatedAt: s.CreatedAt,
 		Metadata:  decodeMetadata(s.Metadata),
 	}
-	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
-	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
 		resp.SnapshotID = &id
@@ -648,6 +648,14 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 				}
 			}
 		}
+	}
+	return resp
+}
+
+func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox) sandboxResponse {
+	resp := h.sandboxToResponse(s)
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
 	}
 	return resp
 }
@@ -779,7 +787,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
+	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(sandbox))
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
@@ -1056,7 +1064,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
 	sandbox.Status = db.SandboxStatusActive
-	resp := h.sandboxToResponse(sandbox)
+	resp := h.sandboxToResponseWithToken(sandbox)
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
@@ -1171,7 +1179,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// the sandbox, and flip status from pausing → idle in a single CTE.
 	// Collapses three DB roundtrips into one.
 	triggerName := "pause"
-	snapshotIDVal, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+	_, err = h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
@@ -1200,12 +1208,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Async observability.
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
-	c.JSON(http.StatusOK, gin.H{
-		"id":          sandboxID.String(),
-		"name":        sandbox.Name,
-		"status":      "idle",
-		"snapshot_id": snapshotIDVal.String(),
-	})
+	c.Status(http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------
