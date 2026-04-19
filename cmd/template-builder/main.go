@@ -506,7 +506,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		return bc, nil
 	case step.Env != nil:
 		bc.env[step.Env.Key] = step.Env.Value
-		emitUser("system", "Set %s=%s", step.Env.Key, step.Env.Value)
+		emitUser("system", "Set %s", step.Env.Key)
 		return bc, nil
 	case step.Workdir != nil:
 		// Resolve to absolute (Docker semantics: relative paths are joined
@@ -563,8 +563,8 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		return bc, nil
 	case step.Copy != nil:
 		dst := step.Copy.Dst
-		shCmd := fmt.Sprintf("mkdir -p %s && printf '%%s' '%s' | base64 -d | tar -C %s -xf -",
-			shellQuote(dst), step.Copy.Src, shellQuote(dst))
+		shCmd := fmt.Sprintf("mkdir -p %s && printf '%%s' %s | base64 -d | tar -C %s -xf -",
+			shellQuote(dst), shellQuote(step.Copy.Src), shellQuote(dst))
 		if err := runShellCmd(ctx, vmIP, shCmd, bc); err != nil {
 			return bc, err
 		}

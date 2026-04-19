@@ -80,15 +80,17 @@ func (VMStatus) EnumDescriptor() ([]byte, []int) {
 }
 
 type BuildTemplateRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TemplateId    string                 `protobuf:"bytes,1,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"` // Key under which the snapshot is registered.
-	From          string                 `protobuf:"bytes,2,opt,name=from,proto3" json:"from,omitempty"`                               // OCI image reference, e.g. "python:3.11".
-	Steps         []*BuildStep           `protobuf:"bytes,3,rep,name=steps,proto3" json:"steps,omitempty"`                             // Ordered build steps executed inside the VM.
-	StartCmd      string                 `protobuf:"bytes,4,opt,name=start_cmd,json=startCmd,proto3" json:"start_cmd,omitempty"`       // Optional: started before snapshot, captured live.
-	ReadyCmd      string                 `protobuf:"bytes,5,opt,name=ready_cmd,json=readyCmd,proto3" json:"ready_cmd,omitempty"`       // Optional: polled until exit 0 before snapshot.
-	Vcpu          uint32                 `protobuf:"varint,6,opt,name=vcpu,proto3" json:"vcpu,omitempty"`
-	MemoryMib     uint32                 `protobuf:"varint,7,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
-	DiskMib       uint32                 `protobuf:"varint,8,opt,name=disk_mib,json=diskMib,proto3" json:"disk_mib,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	TemplateId string                 `protobuf:"bytes,1,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"` // Key under which the snapshot is registered.
+	From       string                 `protobuf:"bytes,2,opt,name=from,proto3" json:"from,omitempty"`                               // OCI image reference, e.g. "python:3.11".
+	Steps      []*BuildStep           `protobuf:"bytes,3,rep,name=steps,proto3" json:"steps,omitempty"`                             // Ordered build steps executed inside the VM.
+	StartCmd   string                 `protobuf:"bytes,4,opt,name=start_cmd,json=startCmd,proto3" json:"start_cmd,omitempty"`       // Optional: started before snapshot, captured live.
+	ReadyCmd   string                 `protobuf:"bytes,5,opt,name=ready_cmd,json=readyCmd,proto3" json:"ready_cmd,omitempty"`       // Optional: polled until exit 0 before snapshot.
+	Vcpu       uint32                 `protobuf:"varint,6,opt,name=vcpu,proto3" json:"vcpu,omitempty"`
+	MemoryMib  uint32                 `protobuf:"varint,7,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	DiskMib    uint32                 `protobuf:"varint,8,opt,name=disk_mib,json=diskMib,proto3" json:"disk_mib,omitempty"`
+	// Optional caller-provided id. When empty, vmd generates one.
+	BuildVmId     string `protobuf:"bytes,9,opt,name=build_vm_id,json=buildVmId,proto3" json:"build_vm_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -177,6 +179,13 @@ func (x *BuildTemplateRequest) GetDiskMib() uint32 {
 		return x.DiskMib
 	}
 	return 0
+}
+
+func (x *BuildTemplateRequest) GetBuildVmId() string {
+	if x != nil {
+		return x.BuildVmId
+	}
+	return ""
 }
 
 type BuildStep struct {
@@ -2636,7 +2645,7 @@ var File_proto_vmd_proto protoreflect.FileDescriptor
 
 const file_proto_vmd_proto_rawDesc = "" +
 	"\n" +
-	"\x0fproto/vmd.proto\x12\x11superserve.vmd.v1\"\x87\x02\n" +
+	"\x0fproto/vmd.proto\x12\x11superserve.vmd.v1\"\xa7\x02\n" +
 	"\x14BuildTemplateRequest\x12\x1f\n" +
 	"\vtemplate_id\x18\x01 \x01(\tR\n" +
 	"templateId\x12\x12\n" +
@@ -2647,7 +2656,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x04vcpu\x18\x06 \x01(\rR\x04vcpu\x12\x1d\n" +
 	"\n" +
 	"memory_mib\x18\a \x01(\rR\tmemoryMib\x12\x19\n" +
-	"\bdisk_mib\x18\b \x01(\rR\adiskMib\"\xe0\x01\n" +
+	"\bdisk_mib\x18\b \x01(\rR\adiskMib\x12\x1e\n" +
+	"\vbuild_vm_id\x18\t \x01(\tR\tbuildVmId\"\xe0\x01\n" +
 	"\tBuildStep\x12\x12\n" +
 	"\x03run\x18\x01 \x01(\tH\x00R\x03run\x124\n" +
 	"\x04copy\x18\x02 \x01(\v2\x1e.superserve.vmd.v1.BuildCopyOpH\x00R\x04copy\x121\n" +

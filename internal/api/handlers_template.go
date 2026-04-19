@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -138,6 +138,9 @@ func validateBuildSpec(spec *buildSpec) error {
 			}
 			if step.Copy.Dst == "" {
 				return fmt.Errorf("build_spec.steps[%d].copy.dst is required", i)
+			}
+			if _, err := base64.StdEncoding.DecodeString(step.Copy.Src); err != nil {
+				return fmt.Errorf("build_spec.steps[%d].copy.src must be valid base64: %w", i, err)
 			}
 		}
 		if step.Env != nil {
@@ -546,34 +549,23 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 		return
 	}
 
-	// Refuse to delete a template that still has any non-destroyed sandbox
-	// referencing it — active, paused, or failed. Paused sandboxes hold a
-	// snapshot dependent on the template's files; failed rows hold lineage.
-	// User must destroy dependents first.
-	count, err := h.DB.CountLiveSandboxesForTemplate(c.Request.Context(), pgtype.UUID{Bytes: tplID, Valid: true})
-	if err != nil {
-		log.Error().Err(err).Str("template_id", tplID.String()).Msg("DB CountLiveSandboxesForTemplate failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	if count > 0 {
-		respondErrorMsg(c, "conflict",
-			fmt.Sprintf("template has %d sandbox(es) (active, paused, or failed) still referencing it; destroy them first", count),
-			http.StatusConflict)
-		return
-	}
-
-	rows, err := h.DB.SoftDeleteTemplate(c.Request.Context(), db.SoftDeleteTemplateParams{
+	res, err := h.DB.SoftDeleteTemplateIfUnused(c.Request.Context(), db.SoftDeleteTemplateIfUnusedParams{
 		ID:     tplID,
 		TeamID: teamID,
 	})
 	if err != nil {
-		log.Error().Err(err).Str("template_id", tplID.String()).Msg("DB SoftDeleteTemplate failed")
+		log.Error().Err(err).Str("template_id", tplID.String()).Msg("DB SoftDeleteTemplateIfUnused failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	if rows == 0 {
+	if !res.Found {
 		respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+		return
+	}
+	if !res.Deleted {
+		respondErrorMsg(c, "conflict",
+			fmt.Sprintf("template has %d sandbox(es) (active, paused, or failed) still referencing it; destroy them first", res.LiveCount),
+			http.StatusConflict)
 		return
 	}
 

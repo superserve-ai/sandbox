@@ -317,6 +317,7 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		VCPU:       req.GetVcpu(),
 		MemoryMiB:  req.GetMemoryMib(),
 		DiskMiB:    req.GetDiskMib(),
+		BuildVMID:  req.GetBuildVmId(),
 	})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "build template: %v", err)

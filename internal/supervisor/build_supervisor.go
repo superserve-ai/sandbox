@@ -74,25 +74,26 @@ func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 	}
 }
 
+// Resolver returns the VMD client for a host ID.
+type Resolver func(ctx context.Context, hostID string) (vmdclient.Client, error)
+
 // BuildSupervisor wraps the per-tick logic. Stateless across ticks — all
 // state lives in the DB. Safe to instantiate once at controlplane boot and
 // Start() with the process-lifetime context.
 type BuildSupervisor struct {
-	cfg BuildSupervisorConfig
-	q   *db.Queries
-	vmd vmdclient.Client
-	log zerolog.Logger
+	cfg     BuildSupervisorConfig
+	q       *db.Queries
+	resolve Resolver
+	log     zerolog.Logger
 }
 
-// NewBuildSupervisor constructs a supervisor. vmd must be the client for
-// the host named in cfg.HostID. q is the sqlc queries handle, shared with
-// the rest of the control plane.
-func NewBuildSupervisor(cfg BuildSupervisorConfig, q *db.Queries, vmd vmdclient.Client) *BuildSupervisor {
+// NewBuildSupervisor constructs a supervisor.
+func NewBuildSupervisor(cfg BuildSupervisorConfig, q *db.Queries, resolve Resolver) *BuildSupervisor {
 	return &BuildSupervisor{
-		cfg: cfg,
-		q:   q,
-		vmd: vmd,
-		log: log.With().Str("component", "build_supervisor").Logger(),
+		cfg:     cfg,
+		q:       q,
+		resolve: resolve,
+		log:     log.With().Str("component", "build_supervisor").Logger(),
 	}
 }
 
@@ -159,7 +160,15 @@ func (s *BuildSupervisor) reapStale(ctx context.Context) {
 		// cancel is a no-op on the vmd side.
 		if r.VmdBuildVmID != nil && *r.VmdBuildVmID != "" {
 			cancelCtx, cancelCancel := context.WithTimeout(ctx, 10*time.Second)
-			_ = s.vmd.CancelBuild(cancelCtx, *r.VmdBuildVmID)
+			hostID := ""
+			if r.VmdHostID != nil {
+				hostID = *r.VmdHostID
+			}
+			if vmd, err := s.resolve(cancelCtx, hostID); err == nil {
+				_ = vmd.CancelBuild(cancelCtx, *r.VmdBuildVmID)
+			} else {
+				s.log.Warn().Err(err).Str("build_id", r.ID.String()).Str("host_id", hostID).Msg("resolve VMD for cancel failed")
+			}
 			cancelCancel()
 		}
 	}
@@ -239,13 +248,15 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 		return err
 	}
 
-	// Atomic claim: transition pending → building. Returns 0 rows if
-	// another supervisor (same or different replica) already took it.
-	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
+	// Attach the id before dispatch so a timed-out RPC can be reconciled.
 	hostID := s.cfg.HostID
+	buildVMID := "build-" + row.ID.String()
+
+	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
 	affected, err := s.q.TryDispatchBuild(claimCtx, db.TryDispatchBuildParams{
-		ID:         row.ID,
-		VmdHostID:  &hostID,
+		ID:             row.ID,
+		VmdHostID:      &hostID,
+		VmdBuildVmID:   &buildVMID,
 	})
 	claimCancel()
 	if err != nil {
@@ -257,11 +268,15 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 		return nil
 	}
 
-	// Dispatch to vmd. Runs well past the request context on vmd; we get
-	// back the build_vm_id immediately.
 	dispatchCtx, dispatchCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer dispatchCancel()
-	buildVMID, err := s.vmd.BuildTemplate(dispatchCtx, vmdclient.BuildTemplateInput{
+	vmd, err := s.resolve(dispatchCtx, hostID)
+	if err != nil {
+		rowLog.Error().Err(err).Str("host_id", hostID).Msg("resolve VMD for dispatch failed")
+		s.failBuild(ctx, row.ID, fmt.Sprintf("resolve VMD for host %q: %v", hostID, err))
+		return err
+	}
+	_, err = vmd.BuildTemplate(dispatchCtx, vmdclient.BuildTemplateInput{
 		TemplateID: row.TemplateID.String(),
 		From:       spec.From,
 		Steps:      specStepsToVMD(spec.Steps),
@@ -270,25 +285,13 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 		VCPU:       uint32(tpl.Vcpu),
 		MemoryMiB:  uint32(tpl.MemoryMib),
 		DiskMiB:    uint32(tpl.DiskMib),
+		BuildVMID:  buildVMID,
 	})
 	if err != nil {
-		rowLog.Error().Err(err).Msg("vmd.BuildTemplate dispatch failed")
-		s.failBuild(ctx, row.ID, fmt.Sprintf("dispatch to vmd failed: %v", err))
+		// vmd may have accepted the request; let pollActive reconcile via
+		// GetBuildStatus rather than failing here and orphaning the VM.
+		rowLog.Warn().Err(err).Str("build_vm_id", buildVMID).Msg("vmd.BuildTemplate dispatch errored; next poll will reconcile")
 		return err
-	}
-
-	// Stamp the build VM id on the row so subsequent ticks can poll and
-	// cancel by that id.
-	attachCtx, attachCancel := context.WithTimeout(ctx, 5*time.Second)
-	err = s.q.AttachBuildVM(attachCtx, db.AttachBuildVMParams{
-		ID:            row.ID,
-		VmdBuildVmID:  &buildVMID,
-	})
-	attachCancel()
-	if err != nil {
-		rowLog.Error().Err(err).Str("build_vm_id", buildVMID).Msg("attach build VM id to row")
-		// Don't fail the build — vmd is running it. The poll phase will
-		// find it via the host_id + template_id pair if needed.
 	}
 
 	rowLog.Info().Str("build_vm_id", buildVMID).Msg("build dispatched to vmd")
@@ -324,7 +327,17 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 	rowLog := s.log.With().Str("build_id", row.ID.String()).Str("build_vm_id", *row.VmdBuildVmID).Logger()
 
 	statusCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	res, err := s.vmd.GetBuildStatus(statusCtx, *row.VmdBuildVmID)
+	hostID := ""
+	if row.VmdHostID != nil {
+		hostID = *row.VmdHostID
+	}
+	vmd, err := s.resolve(statusCtx, hostID)
+	if err != nil {
+		cancel()
+		rowLog.Warn().Err(err).Str("host_id", hostID).Msg("resolve VMD for poll failed; will retry next tick")
+		return
+	}
+	res, err := vmd.GetBuildStatus(statusCtx, *row.VmdBuildVmID)
 	cancel()
 	if err != nil {
 		rowLog.Warn().Err(err).Msg("GetBuildStatus failed")

@@ -28,6 +28,9 @@ type BuildTemplateRequest struct {
 	VCPU      uint32
 	MemoryMiB uint32
 	DiskMiB   uint32
+
+	// BuildVMID overrides the default "build-<template_id>" record key.
+	BuildVMID string
 }
 
 // BuildTemplateResult is returned on success.
@@ -67,7 +70,10 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 		req.DiskMiB = 4096
 	}
 
-	buildVMID := "build-" + req.TemplateID
+	buildVMID := req.BuildVMID
+	if buildVMID == "" {
+		buildVMID = "build-" + req.TemplateID
+	}
 
 	// Fresh context so the build survives the caller's HTTP request
 	// ending. CancelBuild is what stops it.

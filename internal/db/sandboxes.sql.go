@@ -215,6 +215,82 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 	return i, err
 }
 
+const createSandboxFromTemplate = `-- name: CreateSandboxFromTemplate :one
+WITH tpl AS (
+  SELECT t.id AS tpl_id FROM template t
+  WHERE t.id = $13
+    AND t.deleted_at IS NULL
+    AND (t.team_id = $14 OR t.team_id = $15)
+  FOR KEY SHARE
+)
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id FROM tpl
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id
+`
+
+type CreateSandboxFromTemplateParams struct {
+	ID             uuid.UUID     `json:"id"`
+	TeamID         uuid.UUID     `json:"team_id"`
+	Name           string        `json:"name"`
+	Status         SandboxStatus `json:"status"`
+	VcpuCount      int32         `json:"vcpu_count"`
+	MemoryMib      int32         `json:"memory_mib"`
+	HostID         string        `json:"host_id"`
+	IpAddress      *netip.Addr   `json:"ip_address"`
+	Pid            *int32        `json:"pid"`
+	SnapshotID     pgtype.UUID   `json:"snapshot_id"`
+	TimeoutSeconds *int32        `json:"timeout_seconds"`
+	Metadata       []byte        `json:"metadata"`
+	ID_2           uuid.UUID     `json:"id_2"`
+	TeamID_2       uuid.UUID     `json:"team_id_2"`
+	TeamID_3       uuid.UUID     `json:"team_id_3"`
+}
+
+// CreateSandbox variant that holds FOR KEY SHARE on the template row
+// during the INSERT, serializing with SoftDeleteTemplateIfUnused's FOR
+// UPDATE. Returns 0 rows if the template is missing, deleted, or not
+// visible to the caller.
+func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandboxFromTemplateParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, createSandboxFromTemplate,
+		arg.ID,
+		arg.TeamID,
+		arg.Name,
+		arg.Status,
+		arg.VcpuCount,
+		arg.MemoryMib,
+		arg.HostID,
+		arg.IpAddress,
+		arg.Pid,
+		arg.SnapshotID,
+		arg.TimeoutSeconds,
+		arg.Metadata,
+		arg.ID_2,
+		arg.TeamID_2,
+		arg.TeamID_3,
+	)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+	)
+	return i, err
+}
+
 const deleteSnapshotRow = `-- name: DeleteSnapshotRow :execrows
 DELETE FROM snapshot
 WHERE id = $1 AND team_id = $2 AND saved = false

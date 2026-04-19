@@ -75,25 +75,30 @@ WHERE deleted_at IS NULL
        OR alias LIKE sqlc.narg('alias_prefix') || '%')
 ORDER BY created_at DESC;
 
--- name: SoftDeleteTemplate :execrows
--- Soft-delete a template owned by this team. Returns row count so the caller
--- can distinguish "not found / not yours" (0) from success (1). Does NOT
--- check for active sandboxes referencing this template — that check is done
--- in Go before this call (returns 409 to the user).
-UPDATE template
-SET deleted_at = now(), updated_at = now()
-WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
-
--- name: CountLiveSandboxesForTemplate :one
--- Used before SoftDeleteTemplate to enforce 409-on-in-use. Counts every
--- sandbox referencing this template that has not been hard-destroyed —
--- including paused and failed sandboxes, not just 'active'. A paused
--- sandbox still has a snapshot bundle dependent on the template's
--- rootfs/snapshot files, so deletion would orphan it. The user must
--- destroy these sandboxes (DELETE /sandboxes/:id) before the template
--- can be removed.
-SELECT COUNT(*) FROM sandbox
-WHERE template_id = $1 AND destroyed_at IS NULL;
+-- name: SoftDeleteTemplateIfUnused :one
+-- Soft-deletes a template only if no live sandbox still references it.
+-- FOR UPDATE here serializes with the FOR KEY SHARE in CreateSandbox.
+WITH locked AS (
+  SELECT t.id AS tpl_id FROM template t
+  WHERE t.id = $1 AND t.team_id = $2 AND t.deleted_at IS NULL
+  FOR UPDATE
+),
+counted AS (
+  SELECT COUNT(*)::bigint AS live_count
+  FROM sandbox
+  WHERE template_id = $1 AND destroyed_at IS NULL
+),
+deleted AS (
+  UPDATE template t
+  SET deleted_at = now(), updated_at = now()
+  WHERE t.id IN (SELECT tpl_id FROM locked)
+    AND (SELECT live_count FROM counted) = 0
+  RETURNING t.id
+)
+SELECT
+  EXISTS(SELECT 1 FROM locked)  AS found,
+  (SELECT live_count FROM counted) AS live_count,
+  EXISTS(SELECT 1 FROM deleted) AS deleted;
 
 -- name: CreateTemplateBuild :one
 -- Insert a new build row. Will fail with a unique-violation if there is
@@ -166,15 +171,15 @@ ORDER BY created_at ASC
 LIMIT $1;
 
 -- name: TryDispatchBuild :execrows
--- Atomic status transition from 'pending' to 'building', stamping the host
--- and start timestamp. Returns rows affected — 1 if we successfully claimed
--- the row, 0 if another supervisor tick (or another replica) already took
--- it. Callers on the 0 path skip; callers on the 1 path dispatch to vmd.
+-- Claims a pending row for dispatch. Stamps host + caller-generated
+-- build_vm_id up front so a timed-out BuildTemplate RPC can still be
+-- reconciled by GetBuildStatus on the next tick.
 UPDATE template_build
 SET status = 'building',
     started_at = now(),
     updated_at = now(),
-    vmd_host_id = $2
+    vmd_host_id = $2,
+    vmd_build_vm_id = $3
 WHERE id = $1 AND status = 'pending';
 
 -- name: ListActiveBuilds :many
@@ -183,14 +188,6 @@ WHERE id = $1 AND status = 'pending';
 SELECT * FROM template_build
 WHERE status IN ('building', 'snapshotting')
 ORDER BY started_at ASC NULLS LAST;
-
--- name: AttachBuildVM :exec
--- Record the vmd-side build VM id once vmd.BuildTemplate has returned it.
--- Lets the supervisor (and cancel path) call vmd.GetBuildStatus / CancelBuild
--- by VM id rather than re-derive it.
-UPDATE template_build
-SET vmd_build_vm_id = $2, updated_at = now()
-WHERE id = $1;
 
 -- name: AdvanceBuildStatus :exec
 -- Used by the supervisor to walk a build through transient statuses

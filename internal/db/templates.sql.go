@@ -32,25 +32,6 @@ func (q *Queries) AdvanceBuildStatus(ctx context.Context, arg AdvanceBuildStatus
 	return err
 }
 
-const attachBuildVM = `-- name: AttachBuildVM :exec
-UPDATE template_build
-SET vmd_build_vm_id = $2, updated_at = now()
-WHERE id = $1
-`
-
-type AttachBuildVMParams struct {
-	ID           uuid.UUID `json:"id"`
-	VmdBuildVmID *string   `json:"vmd_build_vm_id"`
-}
-
-// Record the vmd-side build VM id once vmd.BuildTemplate has returned it.
-// Lets the supervisor (and cancel path) call vmd.GetBuildStatus / CancelBuild
-// by VM id rather than re-derive it.
-func (q *Queries) AttachBuildVM(ctx context.Context, arg AttachBuildVMParams) error {
-	_, err := q.db.Exec(ctx, attachBuildVM, arg.ID, arg.VmdBuildVmID)
-	return err
-}
-
 const cancelBuild = `-- name: CancelBuild :execrows
 UPDATE template_build
 SET status = 'cancelled',
@@ -148,25 +129,6 @@ WHERE team_id = $1 AND status IN ('building', 'snapshotting')
 // worth of builds at once and the count itself blocks any from starting.
 func (q *Queries) CountInFlightBuildsForTeam(ctx context.Context, teamID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countInFlightBuildsForTeam, teamID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const countLiveSandboxesForTemplate = `-- name: CountLiveSandboxesForTemplate :one
-SELECT COUNT(*) FROM sandbox
-WHERE template_id = $1 AND destroyed_at IS NULL
-`
-
-// Used before SoftDeleteTemplate to enforce 409-on-in-use. Counts every
-// sandbox referencing this template that has not been hard-destroyed —
-// including paused and failed sandboxes, not just 'active'. A paused
-// sandbox still has a snapshot bundle dependent on the template's
-// rootfs/snapshot files, so deletion would orphan it. The user must
-// destroy these sandboxes (DELETE /sandboxes/:id) before the template
-// can be removed.
-func (q *Queries) CountLiveSandboxesForTemplate(ctx context.Context, templateID pgtype.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countLiveSandboxesForTemplate, templateID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -951,27 +913,48 @@ func (q *Queries) ReapStaleBuilds(ctx context.Context, arg ReapStaleBuildsParams
 	return items, nil
 }
 
-const softDeleteTemplate = `-- name: SoftDeleteTemplate :execrows
-UPDATE template
-SET deleted_at = now(), updated_at = now()
-WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
+const softDeleteTemplateIfUnused = `-- name: SoftDeleteTemplateIfUnused :one
+WITH locked AS (
+  SELECT t.id AS tpl_id FROM template t
+  WHERE t.id = $1 AND t.team_id = $2 AND t.deleted_at IS NULL
+  FOR UPDATE
+),
+counted AS (
+  SELECT COUNT(*)::bigint AS live_count
+  FROM sandbox
+  WHERE template_id = $1 AND destroyed_at IS NULL
+),
+deleted AS (
+  UPDATE template t
+  SET deleted_at = now(), updated_at = now()
+  WHERE t.id IN (SELECT tpl_id FROM locked)
+    AND (SELECT live_count FROM counted) = 0
+  RETURNING t.id
+)
+SELECT
+  EXISTS(SELECT 1 FROM locked)  AS found,
+  (SELECT live_count FROM counted) AS live_count,
+  EXISTS(SELECT 1 FROM deleted) AS deleted
 `
 
-type SoftDeleteTemplateParams struct {
+type SoftDeleteTemplateIfUnusedParams struct {
 	ID     uuid.UUID `json:"id"`
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Soft-delete a template owned by this team. Returns row count so the caller
-// can distinguish "not found / not yours" (0) from success (1). Does NOT
-// check for active sandboxes referencing this template — that check is done
-// in Go before this call (returns 409 to the user).
-func (q *Queries) SoftDeleteTemplate(ctx context.Context, arg SoftDeleteTemplateParams) (int64, error) {
-	result, err := q.db.Exec(ctx, softDeleteTemplate, arg.ID, arg.TeamID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+type SoftDeleteTemplateIfUnusedRow struct {
+	Found     bool  `json:"found"`
+	LiveCount int64 `json:"live_count"`
+	Deleted   bool  `json:"deleted"`
+}
+
+// Soft-deletes a template only if no live sandbox still references it.
+// FOR UPDATE here serializes with the FOR KEY SHARE in CreateSandbox.
+func (q *Queries) SoftDeleteTemplateIfUnused(ctx context.Context, arg SoftDeleteTemplateIfUnusedParams) (SoftDeleteTemplateIfUnusedRow, error) {
+	row := q.db.QueryRow(ctx, softDeleteTemplateIfUnused, arg.ID, arg.TeamID)
+	var i SoftDeleteTemplateIfUnusedRow
+	err := row.Scan(&i.Found, &i.LiveCount, &i.Deleted)
+	return i, err
 }
 
 const tryDispatchBuild = `-- name: TryDispatchBuild :execrows
@@ -979,21 +962,22 @@ UPDATE template_build
 SET status = 'building',
     started_at = now(),
     updated_at = now(),
-    vmd_host_id = $2
+    vmd_host_id = $2,
+    vmd_build_vm_id = $3
 WHERE id = $1 AND status = 'pending'
 `
 
 type TryDispatchBuildParams struct {
-	ID        uuid.UUID `json:"id"`
-	VmdHostID *string   `json:"vmd_host_id"`
+	ID           uuid.UUID `json:"id"`
+	VmdHostID    *string   `json:"vmd_host_id"`
+	VmdBuildVmID *string   `json:"vmd_build_vm_id"`
 }
 
-// Atomic status transition from 'pending' to 'building', stamping the host
-// and start timestamp. Returns rows affected — 1 if we successfully claimed
-// the row, 0 if another supervisor tick (or another replica) already took
-// it. Callers on the 0 path skip; callers on the 1 path dispatch to vmd.
+// Claims a pending row for dispatch. Stamps host + caller-generated
+// build_vm_id up front so a timed-out BuildTemplate RPC can still be
+// reconciled by GetBuildStatus on the next tick.
 func (q *Queries) TryDispatchBuild(ctx context.Context, arg TryDispatchBuildParams) (int64, error) {
-	result, err := q.db.Exec(ctx, tryDispatchBuild, arg.ID, arg.VmdHostID)
+	result, err := q.db.Exec(ctx, tryDispatchBuild, arg.ID, arg.VmdHostID, arg.VmdBuildVmID)
 	if err != nil {
 		return 0, err
 	}

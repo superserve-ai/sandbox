@@ -76,6 +76,8 @@ message BuildTemplateRequest {
   uint32 vcpu = 6;
   uint32 memory_mib = 7;
   uint32 disk_mib = 8;
+  // Optional caller-provided id. When empty, vmd generates one.
+  string build_vm_id = 9;
 }
 
 message BuildStep {

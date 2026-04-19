@@ -161,6 +161,49 @@ func sandboxRow(s db.Sandbox) *mockRow {
 	}}
 }
 
+// templateRow returns a mockRow that populates a Template from a Scan call
+// matching the 17-column order in sqlc-generated template queries.
+func templateRow(t db.Template) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = t.ID
+		*dest[1].(*uuid.UUID) = t.TeamID
+		*dest[2].(*string) = t.Alias
+		*dest[3].(*db.TemplateStatus) = t.Status
+		*dest[4].(*[]byte) = t.BuildSpec
+		*dest[5].(*int32) = t.Vcpu
+		*dest[6].(*int32) = t.MemoryMib
+		*dest[7].(*int32) = t.DiskMib
+		*dest[8].(**string) = t.RootfsPath
+		*dest[9].(**string) = t.SnapshotPath
+		*dest[10].(**string) = t.MemPath
+		*dest[11].(**int64) = t.SizeBytes
+		*dest[12].(**string) = t.ErrorMessage
+		*dest[13].(*time.Time) = t.CreatedAt
+		*dest[14].(*time.Time) = t.UpdatedAt
+		*dest[15].(*pgtype.Timestamptz) = t.BuiltAt
+		*dest[16].(*pgtype.Timestamptz) = t.DeletedAt
+		return nil
+	}}
+}
+
+// defaultReadyTemplate returns a Template row suitable for tests that don't
+// set from_template explicitly — since the handler now defaults it to
+// "ss/base", creates route through a template lookup even with no body field.
+func defaultReadyTemplate() db.Template {
+	snap := "/snap/vmstate.snap"
+	mem := "/snap/mem.snap"
+	return db.Template{
+		ID:           uuid.New(),
+		Alias:        "ss/base",
+		Status:       db.TemplateStatusReady,
+		Vcpu:         1,
+		MemoryMib:    1024,
+		DiskMib:      4096,
+		SnapshotPath: &snap,
+		MemPath:      &mem,
+	}
+}
+
 func notFoundRow() *mockRow {
 	return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
 }
@@ -957,6 +1000,9 @@ func TestCreateSandbox_Success(t *testing.T) {
 					CreatedAt: time.Now(),
 				})
 			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
 			return activityRow()
 		},
 		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -1029,6 +1075,9 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
 			return "", fmt.Errorf("vmd unreachable")
 		},
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			return "", fmt.Errorf("vmd unreachable")
+		},
 	}
 
 	mock := &mockDBTX{
@@ -1038,6 +1087,9 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 					ID: sandboxID, TeamID: teamID, Name: "sb",
 					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
 				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
 			}
 			return activityRow()
 		},
@@ -1668,6 +1720,9 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 					Metadata:  capturedMetadata,
 				})
 			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
 			return activityRow()
 		},
 		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -1726,6 +1781,9 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 512,
 					CreatedAt: time.Now(),
 				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
 			}
 			return activityRow()
 		},

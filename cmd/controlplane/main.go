@@ -100,10 +100,21 @@ func run() error {
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling
 	// vmd's BuildTemplate / GetBuildStatus / CancelBuild RPCs.
+	buildResolver := func(rctx context.Context, hostID string) (vmdclient.Client, error) {
+		if hostID == "" || handlers.Hosts == nil {
+			return vmdClient, nil
+		}
+		c, err := handlers.Hosts.ClientFor(rctx, hostID)
+		if err != nil {
+			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: host lookup failed, using default client")
+			return vmdClient, nil
+		}
+		return c, nil
+	}
 	supervisor.NewBuildSupervisor(
 		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
 		queries,
-		vmdClient,
+		buildResolver,
 	).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
@@ -354,6 +365,7 @@ func (c *grpcVMDClient) BuildTemplate(ctx context.Context, req vmdclient.BuildTe
 		Vcpu:       req.VCPU,
 		MemoryMib:  req.MemoryMiB,
 		DiskMib:    req.DiskMiB,
+		BuildVmId:  req.BuildVMID,
 	}
 	for _, step := range req.Steps {
 		pstep := &vmdpb.BuildStep{}

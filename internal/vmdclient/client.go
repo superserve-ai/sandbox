@@ -60,6 +60,8 @@ type BuildTemplateInput struct {
 	VCPU       uint32
 	MemoryMiB  uint32
 	DiskMiB    uint32
+	// BuildVMID overrides vmd's default id generation.
+	BuildVMID string
 }
 
 // BuildStep mirrors vmdpb.BuildStep — exactly one of Run/Copy/Env/Workdir/User.

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -901,18 +902,37 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	insertCh := make(chan insertResult, 1)
 	go func() {
-		sb, insertErr := h.DB.CreateSandbox(insertCtx, db.CreateSandboxParams{
-			ID:             sandboxID,
-			TeamID:         teamID,
-			Name:           req.Name,
-			Status:         db.SandboxStatusStarting,
-			VcpuCount:      1, // placeholders; real values land via ActivateSandbox
-			MemoryMib:      1,
-			HostID:         hostID,
-			TimeoutSeconds: req.TimeoutSeconds,
-			Metadata:       metadataJSON,
-			TemplateID:     templateID,
-		})
+		var sb db.Sandbox
+		var insertErr error
+		if templateID.Valid {
+			sb, insertErr = h.DB.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
+				ID:             sandboxID,
+				TeamID:         teamID,
+				Name:           req.Name,
+				Status:         db.SandboxStatusStarting,
+				VcpuCount:      1,
+				MemoryMib:      1,
+				HostID:         hostID,
+				TimeoutSeconds: req.TimeoutSeconds,
+				Metadata:       metadataJSON,
+				ID_2:           uuid.UUID(templateID.Bytes),
+				TeamID_2:       teamID,
+				TeamID_3:       h.systemTeamID(),
+			})
+		} else {
+			sb, insertErr = h.DB.CreateSandbox(insertCtx, db.CreateSandboxParams{
+				ID:             sandboxID,
+				TeamID:         teamID,
+				Name:           req.Name,
+				Status:         db.SandboxStatusStarting,
+				VcpuCount:      1,
+				MemoryMib:      1,
+				HostID:         hostID,
+				TimeoutSeconds: req.TimeoutSeconds,
+				Metadata:       metadataJSON,
+				TemplateID:     templateID,
+			})
+		}
 		insertCh <- insertResult{sandbox: sb, err: insertErr}
 	}()
 
@@ -947,10 +967,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandbox := insertRes.sandbox
 	dbErr := insertRes.err
 
+	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
+	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
+
 	switch {
 	case dbErr != nil && vmdErr != nil:
 		// Both failed — nothing persisted, nothing to clean up.
 		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
+		if templateRace {
+			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
 		respondError(c, ErrInternal)
 		return
 	case dbErr != nil:
@@ -961,6 +988,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
 		cleanupCancel()
+		if templateRace {
+			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
 		respondError(c, ErrInternal)
 		return
 	case vmdErr != nil:
