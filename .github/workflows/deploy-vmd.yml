@@ -164,7 +164,7 @@ jobs:
                       sudo chmod +x {install_dir}/boxd
 
                       ROOTFS=""
-                      for env_file in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+                      for env_file in /etc/sandbox/vmd.env; do
                           if [ -f "$env_file" ]; then
                               candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
                               if [ -n "$candidate" ]; then
@@ -367,7 +367,7 @@ jobs:
                       sudo chmod +x {install_dir}/boxd
 
                       ROOTFS=""
-                      for env_file in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+                      for env_file in /etc/sandbox/vmd.env; do
                           if [ -f "$env_file" ]; then
                               candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
                               if [ -n "$candidate" ]; then
