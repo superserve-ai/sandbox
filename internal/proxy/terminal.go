@@ -47,6 +47,11 @@ func (h *Handler) WithTerminal(allowedOrigins []string) *Handler {
 	if h.seedKey == nil {
 		panic("proxy: WithTerminal requires WithAuth to be called first")
 	}
+	for _, p := range allowedOrigins {
+		if strings.HasPrefix(p, "*") && !strings.HasPrefix(p, "*.") && p != "*" {
+			panic(fmt.Sprintf("proxy: allowed origin %q is missing the dot after * (use %q to mean any subdomain)", p, "*."+strings.TrimPrefix(p, "*")))
+		}
+	}
 	h.terminal = &terminalBridgeDeps{allowedOrigins: allowedOrigins}
 	h.allowedOrigins = allowedOrigins
 	return h

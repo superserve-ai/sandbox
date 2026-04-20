@@ -77,8 +77,9 @@ type Handler struct {
 }
 
 // originAllowed checks whether the given Origin header matches one of the
-// configured allowed origins. Supports simple wildcard patterns like
-// "*.vercel.app" and the literal "*" (allow all).
+// configured allowed origins. Supports "*" (allow all) and "*.domain.tld"
+// wildcards. Patterns without the leading "." after "*" are rejected —
+// "*domain.tld" would otherwise match "evildomain.tld".
 func (h *Handler) originAllowed(origin string) bool {
 	for _, pattern := range h.allowedOrigins {
 		if pattern == "*" {
@@ -87,19 +88,15 @@ func (h *Handler) originAllowed(origin string) bool {
 		if pattern == origin {
 			return true
 		}
-		// Support *.domain.tld patterns
-		if strings.HasPrefix(pattern, "*.") || strings.HasPrefix(pattern, "*") {
-			suffix := strings.TrimPrefix(pattern, "*")
-			if strings.HasSuffix(origin, suffix) {
-				return true
-			}
-			// Also match https://*.domain against https://sub.domain
-			if strings.Contains(origin, "://") {
-				parts := strings.SplitN(origin, "://", 2)
-				if len(parts) == 2 && strings.HasSuffix(parts[1], strings.TrimPrefix(suffix, ".")) {
-					return true
-				}
-			}
+		if !strings.HasPrefix(pattern, "*.") {
+			continue
+		}
+		suffix := strings.TrimPrefix(pattern, "*") // keeps leading "."
+		if strings.HasSuffix(origin, suffix) {
+			return true
+		}
+		if parts := strings.SplitN(origin, "://", 2); len(parts) == 2 && strings.HasSuffix(parts[1], suffix) {
+			return true
 		}
 	}
 	return false

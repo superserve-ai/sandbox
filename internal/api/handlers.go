@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -54,24 +55,19 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 	}
 }
 
-// vmdForHost returns the VMDClient for the given host. When a registry is
-// configured, it resolves via DB lookup. If the lookup fails (e.g. legacy
-// sandbox with a backfilled host_id that has no host row), falls back to
-// the default VMD client so existing sandboxes keep working during the
-// migration period.
 func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
 	if h.Hosts == nil {
 		return h.VMD, nil
 	}
 	c, err := h.Hosts.ClientFor(ctx, hostID)
-	if err != nil {
-		if h.VMD != nil {
-			log.Warn().Err(err).Str("host_id", hostID).Msg("host registry lookup failed, falling back to default VMD client")
-			return h.VMD, nil
-		}
-		return nil, err
+	if err == nil {
+		return c, nil
 	}
-	return c, nil
+	if errors.Is(err, pgx.ErrNoRows) && h.VMD != nil {
+		log.Warn().Err(err).Str("host_id", hostID).Msg("unknown host row; falling back to default VMD client")
+		return h.VMD, nil
+	}
+	return nil, err
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
