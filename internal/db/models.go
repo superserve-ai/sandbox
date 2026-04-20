@@ -107,6 +107,19 @@ type EarlyAccessRequest struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type Host struct {
+	ID                string             `json:"id"`
+	VmdAddr           string             `json:"vmd_addr"`
+	ProxyAddr         string             `json:"proxy_addr"`
+	Region            string             `json:"region"`
+	Status            string             `json:"status"`
+	CapacityMemoryMib int32              `json:"capacity_memory_mib"`
+	CapacityVcpus     int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
 type Profile struct {
 	ID                uuid.UUID `json:"id"`
 	Email             string    `json:"email"`
@@ -120,6 +133,16 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type ReconcilerLog struct {
+	ID        int64       `json:"id"`
+	HostID    string      `json:"host_id"`
+	SandboxID pgtype.UUID `json:"sandbox_id"`
+	Action    string      `json:"action"`
+	Reason    string      `json:"reason"`
+	DriftKind *string     `json:"drift_kind"`
+	CreatedAt time.Time   `json:"created_at"`
+}
+
 type Sandbox struct {
 	ID             uuid.UUID          `json:"id"`
 	TeamID         uuid.UUID          `json:"team_id"`
@@ -127,7 +150,7 @@ type Sandbox struct {
 	Status         SandboxStatus      `json:"status"`
 	VcpuCount      int32              `json:"vcpu_count"`
 	MemoryMib      int32              `json:"memory_mib"`
-	HostID         *string            `json:"host_id"`
+	HostID         string             `json:"host_id"`
 	IpAddress      *netip.Addr        `json:"ip_address"`
 	Pid            *int32             `json:"pid"`
 	SnapshotID     pgtype.UUID        `json:"snapshot_id"`
@@ -152,6 +175,7 @@ type Snapshot struct {
 	Name      *string   `json:"name"`
 	Trigger   string    `json:"trigger"`
 	CreatedAt time.Time `json:"created_at"`
+	MemPath   *string   `json:"mem_path"`
 }
 
 type Team struct {

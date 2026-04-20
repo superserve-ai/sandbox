@@ -2,10 +2,13 @@ package vm
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -103,7 +106,7 @@ type ManagerConfig struct {
 	BaseRootfsPath string
 	SnapshotDir    string
 	RunDir         string
-	MaxConcurrent  int // Max concurrent CreateVM operations (0 = default 10).
+	MaxConcurrent int // Max concurrent CreateVM operations (0 = default 10).
 }
 
 // TemplateSnapshot holds paths for a template snapshot created at startup.
@@ -126,6 +129,7 @@ type Manager struct {
 	netMgr      *network.Manager
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
+	state       *StateStore // persistent local state (BoltDB); nil = no persistence
 
 	mu              sync.RWMutex
 	vms             map[string]*VMInstance
@@ -140,12 +144,18 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		maxConcurrent = 10
 	}
 	return &Manager{
-		cfg:       cfg,
-		netMgr:    netMgr,
-		log:       log.With().Str("component", "vm_manager").Logger(),
+		cfg:        cfg,
+		netMgr:     netMgr,
+		log:        log.With().Str("component", "vm_manager").Logger(),
 		vms:       make(map[string]*VMInstance),
 		createSem: make(chan struct{}, maxConcurrent),
 	}, nil
+}
+
+// SetStateStore attaches a BoltDB state store for durable persistence.
+// Must be called before any VM operations.
+func (m *Manager) SetStateStore(s *StateStore) {
+	m.state = s
 }
 
 // SetEgressProxy sets the TCP egress proxy for domain-based filtering.
@@ -163,45 +173,77 @@ func (m *Manager) templateRunDir() string {
 // InitDefaultTemplate — boot once, snapshot, reuse forever
 // ---------------------------------------------------------------------------
 
-// InitDefaultTemplate cold-boots a throwaway VM from the base image, waits
-// for the guest agent, snapshots the running state, and kills the VM — keeping
-// the rundir and snapshot files on disk. Every subsequent CreateVM restores
-// from this template snapshot instead of cold-booting.
+// InitDefaultTemplate ensures a template snapshot is available for fast
+// sandbox creation. If a valid cached template exists and the base rootfs
+// hasn't changed since it was built, the cached template is reused —
+// skipping the ~2-3s cold boot entirely. This makes VMD restarts fast
+// when only the VMD binary changed (the common deploy case).
 //
-// The template VM uses a fixed directory name ("template") so the snapshot's
-// hardcoded path_on_host is always rundir/template/rootfs.ext4. Each new VM
-// gets mount namespace isolation to present its own rootfs at that path.
+// The template is rebuilt only when:
+//   - No cached snapshot exists on disk (first boot)
+//   - The base rootfs hash changed (new boxd version baked in)
+//   - The cached snapshot files are missing or corrupt
 func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
-	// Use a fixed ID so the rundir is always "template".
 	templateID := templateDirName
 	log := m.log.With().Str("template_id", templateID).Logger()
-	log.Info().Msg("initializing default template — cold-booting throwaway VM")
 
-	// Cold-boot a throwaway VM from the base image.
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, templateDirName)
+	snapPath := filepath.Join(snapshotDir, "vmstate.snap")
+	memPath := filepath.Join(snapshotDir, "mem.snap")
+	diskPath := filepath.Join(m.templateRunDir(), "rootfs.ext4")
+	hashPath := filepath.Join(snapshotDir, "rootfs.sha256")
+
+	// Check if we can reuse the cached template.
+	currentHash, hashErr := fileHash(m.cfg.BaseRootfsPath)
+	if hashErr != nil {
+		log.Warn().Err(hashErr).Msg("could not hash base rootfs — will rebuild template")
+	}
+
+	metaPath := filepath.Join(snapshotDir, "template.meta")
+
+	if hashErr == nil && m.canReuseTemplate(snapPath, memPath, diskPath, hashPath, currentHash) {
+		vcpu, mem := readTemplateMeta(metaPath)
+		log.Info().Uint32("vcpu", vcpu).Uint32("mem_mib", mem).Msg("base rootfs unchanged — reusing cached template snapshot")
+		m.defaultTemplate = &TemplateSnapshot{
+			SnapshotPath: snapPath,
+			MemFilePath:  memPath,
+			DiskPath:     diskPath,
+			RunDir:       m.templateRunDir(),
+			VCPUCount:    vcpu,
+			MemSizeMiB:   mem,
+		}
+		return nil
+	}
+
+	// Cache miss — cold boot a throwaway VM, snapshot it, kill it.
+	log.Info().Msg("building new template — cold-booting throwaway VM")
+
 	inst, err := m.coldBootVM(ctx, templateID)
 	if err != nil {
 		return fmt.Errorf("boot template VM: %w", err)
 	}
 
-	// Wait for boxd to be reachable via HTTP.
 	if err := m.waitForBoxd(ctx, inst.IP, 30*time.Second); err != nil {
 		_ = m.DestroyVM(ctx, templateID, true)
 		return fmt.Errorf("boxd not ready: %w", err)
 	}
 	log.Info().Msg("guest agent ready — creating template snapshot")
 
-	// Snapshot the live VM.
-	snapshotDir := filepath.Join(m.cfg.SnapshotDir, templateDirName)
-	snapPath, memPath, err := m.CreateVMSnapshot(ctx, templateID, snapshotDir)
+	snapPath, memPath, err = m.CreateVMSnapshot(ctx, templateID, snapshotDir)
 	if err != nil {
 		_ = m.DestroyVM(ctx, templateID, true)
 		return fmt.Errorf("snapshot template VM: %w", err)
 	}
 
-	// Kill the VM process but keep the rundir on disk — the snapshot's
-	// path_on_host references these files.
-	diskPath := inst.DiskPath
+	diskPath = inst.DiskPath
 	m.killVMKeepRunDir(templateID)
+
+	// Persist the rootfs hash and resource values so the next startup
+	// can skip the cold boot and restore the correct template config.
+	if currentHash != "" {
+		_ = os.WriteFile(hashPath, []byte(currentHash), 0o644)
+	}
+	writeTemplateMeta(metaPath, inst.Config.VCPU, inst.Config.MemoryMiB)
 
 	m.defaultTemplate = &TemplateSnapshot{
 		SnapshotPath: snapPath,
@@ -217,6 +259,54 @@ func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
 		Str("disk_path", diskPath).
 		Msg("default template ready")
 	return nil
+}
+
+// readTemplateMeta reads the vCPU and memory values persisted alongside
+// the template snapshot. Returns safe defaults (1 vCPU, 1024 MiB) if the
+// file is missing or unreadable.
+func readTemplateMeta(path string) (vcpu, memMiB uint32) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 1, 1024
+	}
+	var v, m uint32
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d %d", &v, &m); err != nil {
+		return 1, 1024
+	}
+	return v, m
+}
+
+func writeTemplateMeta(path string, vcpu, memMiB uint32) {
+	_ = os.WriteFile(path, []byte(fmt.Sprintf("%d %d", vcpu, memMiB)), 0o644)
+}
+
+// canReuseTemplate returns true when all template files exist on disk and
+// the stored rootfs hash matches the current base image.
+func (m *Manager) canReuseTemplate(snapPath, memPath, diskPath, hashPath, currentHash string) bool {
+	for _, p := range []string{snapPath, memPath, diskPath} {
+		if _, err := os.Stat(p); err != nil {
+			return false
+		}
+	}
+	stored, err := os.ReadFile(hashPath)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(stored)) == currentHash
+}
+
+// fileHash returns the SHA-256 hex digest of a file.
+func fileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -262,13 +352,12 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		return nil, status.Errorf(codes.AlreadyExists, "vm %s already exists", vmID)
 	}
 
-	rundirID := uuid.New().String()
 	inst := &VMInstance{
 		ID:        vmID,
 		Status:    StatusCreating,
 		CreatedAt: time.Now(),
 		Metadata:  metadata,
-		RunDirID:  rundirID,
+		RunDirID:  vmID,
 		Config: VMConfig{
 			VCPU:      m.defaultTemplate.VCPUCount,
 			MemoryMiB: m.defaultTemplate.MemSizeMiB,
@@ -278,53 +367,100 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 	m.mu.Unlock()
 
 	cleanup := func() {
-		m.cleanupRunDir(rundirID)
+		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		m.removeVM(vmID)
 	}
 
-	// 1. Copy the template rootfs for this VM.
-	stepStart := time.Now()
-	perVMRootfs, err := m.copyRootfs(ctx, rundirID, m.defaultTemplate.DiskPath)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("copy rootfs: %w", err)
-	}
-	inst.DiskPath = perVMRootfs
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: copy rootfs")
+	// Steps 1 and 2 — copying the rootfs and setting up the network
+	// namespace — are independent. Run them in parallel so the total
+	// wall-clock for the pair is max(rootfs, netns) instead of their sum.
+	// On typical hardware this shaves ~10-30ms off create latency.
+	parallelStart := time.Now()
 
-	// 2. Set up networking.
-	stepStart = time.Now()
-	netInfo, err := m.netMgr.SetupVM(ctx, vmID, netCfg)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("setup network: %w", err)
+	type rootfsResult struct {
+		path string
+		err  error
 	}
+	type netResult struct {
+		info *network.VMNetInfo
+		err  error
+	}
+	rootfsCh := make(chan rootfsResult, 1)
+	netCh := make(chan netResult, 1)
+
+	go func() {
+		p, err := m.copyRootfs(ctx, vmID, m.defaultTemplate.DiskPath)
+		rootfsCh <- rootfsResult{path: p, err: err}
+	}()
+	go func() {
+		info, err := m.netMgr.SetupVM(ctx, vmID, netCfg)
+		netCh <- netResult{info: info, err: err}
+	}()
+
+	rfs := <-rootfsCh
+	nr := <-netCh
+
+	// Both goroutines always run to completion so we know exactly which
+	// side(s) succeeded and need unwinding. Tear them down in reverse
+	// order of resource ownership: network first (it's tied to kernel
+	// state), rundir last (it's just files, handled by cleanup()).
+	if rfs.err != nil || nr.err != nil {
+		// If the network came up but the rootfs did not, the kernel
+		// namespace/veth/firewall state must be explicitly freed; the
+		// shared cleanup() only removes the rundir.
+		if nr.err == nil {
+			m.netMgr.CleanupVM(vmID)
+		}
+		cleanup()
+		switch {
+		case rfs.err != nil && nr.err != nil:
+			return nil, fmt.Errorf("copy rootfs: %w; setup network: %v", rfs.err, nr.err)
+		case rfs.err != nil:
+			return nil, fmt.Errorf("copy rootfs: %w", rfs.err)
+		default:
+			return nil, fmt.Errorf("setup network: %w", nr.err)
+		}
+	}
+
+	perVMRootfs := rfs.path
+	netInfo := nr.info
+	// Take inst.mu to write — concurrent readers via ExecCommand /
+	// LookupInstance / persistState take RLock.
+	inst.mu.Lock()
+	inst.DiskPath = perVMRootfs
 	inst.IP = netInfo.HostIP
 	inst.TAPDevice = netInfo.TAPDevice
 	inst.MACAddress = netInfo.MACAddress
 	inst.Namespace = netInfo.Namespace
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: setup network")
+	inst.mu.Unlock()
+	log.Debug().Dur("duration_ms", time.Since(parallelStart)).Msg("step: copy rootfs + setup network (parallel)")
 
 	// 3. Start Firecracker in a mount + network namespace.
-	stepStart = time.Now()
-	vmDir := filepath.Join(m.cfg.RunDir, rundirID)
+	startStep := time.Now()
+	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	inst.SocketPath = socketPath
 
-	pid, err := m.startFirecrackerInNamespace(vmID, socketPath, perVMRootfs, netInfo.Namespace)
-	if err != nil {
+	var (
+		pid      int
+		startErr error
+	)
+	pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, netInfo.Namespace)
+	if startErr != nil {
 		m.netMgr.CleanupVM(vmID)
 		cleanup()
-		return nil, fmt.Errorf("start firecracker: %w", err)
+		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
+	inst.mu.Lock()
+	inst.SocketPath = socketPath
 	inst.PID = pid
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: start firecracker")
+	inst.mu.Unlock()
+	log.Debug().Dur("duration_ms", time.Since(startStep)).Msg("step: start firecracker")
 
 	// 4. Restore from the original (unpatched) template snapshot.
 	// No IP reconfig needed — the VM uses a fixed internal IP (169.254.0.21)
 	// and the network namespace provides isolation.
-	stepStart = time.Now()
+	restoreStep := time.Now()
 	if err := RestoreSnapshotWithOverrides(
 		socketPath, m.defaultTemplate.SnapshotPath, m.defaultTemplate.MemFilePath,
 		"eth0", netInfo.TAPDevice,
@@ -333,9 +469,11 @@ func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskM
 		cleanup()
 		return nil, fmt.Errorf("restore template snapshot: %w", err)
 	}
-	log.Debug().Dur("duration_ms", time.Since(stepStart)).Msg("step: restore snapshot")
+	log.Debug().Dur("duration_ms", time.Since(restoreStep)).Msg("step: restore snapshot")
 
 	m.setStatus(vmID, StatusRunning)
+	// Persist again now that PID, IP, and socket are set.
+	m.persistState(inst)
 	log.Info().
 		Int("pid", pid).
 		Str("host_ip", inst.IP).
@@ -386,7 +524,6 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("copy rootfs: %w", err)
 	}
-	inst.DiskPath = diskPath
 
 	// 2. Set up networking.
 	netInfo, err := m.netMgr.SetupVM(ctx, vmID, nil)
@@ -395,15 +532,22 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("setup network: %w", err)
 	}
+
+	// inst is already visible via m.vms; take inst.mu for writes so
+	// concurrent readers (ExecCommand, LookupInstance, persistState)
+	// see a consistent view.
+	inst.mu.Lock()
+	inst.DiskPath = diskPath
 	inst.IP = netInfo.HostIP
 	inst.TAPDevice = netInfo.TAPDevice
 	inst.MACAddress = netInfo.MACAddress
 	inst.Namespace = netInfo.Namespace
+	mac := inst.MACAddress
+	inst.mu.Unlock()
 
 	// 3. Build Firecracker machine configuration.
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	inst.SocketPath = socketPath
 
 	fcCfg := FirecrackerConfig{
 		SocketPath: socketPath,
@@ -413,7 +557,7 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		VCPUCount:  1,
 		MemSizeMiB: 1024,
 		TAPDevice:  network.TAPName,
-		MACAddress: inst.MACAddress,
+		MACAddress: mac,
 		VMID:       vmID,
 		VMIP:       network.VMInternalIP,
 		GatewayIP:  network.VMGatewayIP,
@@ -427,10 +571,14 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
+
+	inst.mu.Lock()
+	inst.SocketPath = socketPath
 	inst.PID = pid
+	inst.mu.Unlock()
 
 	m.setStatus(vmID, StatusRunning)
-	log.Info().Int("pid", pid).Str("host_ip", inst.IP).Msg("VM cold-booted")
+	log.Info().Int("pid", pid).Str("host_ip", netInfo.HostIP).Msg("VM cold-booted")
 	return inst, nil
 }
 
@@ -448,24 +596,11 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
-	if inst.PID > 0 {
-		proc, findErr := os.FindProcess(inst.PID)
-		if findErr == nil {
-			if force {
-				_ = proc.Signal(syscall.SIGKILL)
-			} else {
-				_ = proc.Signal(syscall.SIGTERM)
-				done := make(chan error, 1)
-				go func() { _, e := proc.Wait(); done <- e }()
-				select {
-				case <-done:
-				case <-time.After(5 * time.Second):
-					log.Warn().Msg("SIGTERM timed out, sending SIGKILL")
-					_ = proc.Signal(syscall.SIGKILL)
-				}
-			}
-		}
+	// Stop the systemd unit — this kills Firecracker and runs ExecStopPost cleanup.
+	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
+		log.Warn().Err(err).Msg("systemctl stop failed (unit may already be stopped)")
 	}
+	removeUnitDropIn(vmID)
 
 	if inst.SocketPath != "" {
 		_ = os.Remove(inst.SocketPath)
@@ -509,21 +644,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
 	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath); err != nil {
-		return "", "", fmt.Errorf("create snapshot: %w", err)
+		return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 	}
 
-	if inst.PID > 0 {
-		if proc, e := os.FindProcess(inst.PID); e == nil {
-			_ = proc.Signal(syscall.SIGTERM)
-			done := make(chan struct{})
-			go func() { proc.Wait(); close(done) }() //nolint:errcheck
-			select {
-			case <-done:
-			case <-time.After(500 * time.Millisecond):
-				_ = proc.Signal(syscall.SIGKILL)
-				<-done
-			}
-		}
+	// Stop the Firecracker process — snapshot is already on disk.
+	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
+		log.Warn().Err(err).Msg("systemctl stop failed during pause")
 	}
 
 	inst.mu.Lock()
@@ -532,6 +658,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.MemFilePath = memPath
 	inst.mu.Unlock()
 
+	m.persistState(inst)
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, nil
 }
@@ -575,7 +702,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
-	pid, err := m.startFirecrackerInNamespace(vmID, socketPath, rootfsPath, inst.Namespace)
+	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Namespace)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
@@ -591,6 +718,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.Status = StatusRunning
 	inst.mu.Unlock()
 
+	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
 	return inst, nil
 }
@@ -638,23 +766,12 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	m.mu.Lock()
-	existingInst, inPlace := m.vms[vmID]
+	_, inPlace := m.vms[vmID]
 	if inPlace {
-		if existingInst.PID > 0 {
-			if proc, e := os.FindProcess(existingInst.PID); e == nil {
-				_ = proc.Signal(syscall.SIGTERM)
-				// Wait for process to exit instead of sleeping.
-				done := make(chan struct{})
-				go func() { proc.Wait(); close(done) }() //nolint:errcheck
-				select {
-				case <-done:
-				case <-time.After(500 * time.Millisecond):
-					_ = proc.Signal(syscall.SIGKILL)
-					<-done
-				}
-			}
-		}
 		delete(m.vms, vmID)
+		m.mu.Unlock()
+		_ = stopUnit(ctx, systemdUnitName(vmID))
+		m.mu.Lock()
 	}
 
 	inst := &VMInstance{
@@ -678,7 +795,6 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		log.Debug().Str("disk_path", diskPath).Msg("created rootfs copy for restored VM")
 	}
-	inst.DiskPath = diskPath
 
 	var tapDevice, macAddr, hostIP, nsName string
 
@@ -704,25 +820,34 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		hostIP = netInfo.HostIP
 		nsName = netInfo.Namespace
 	}
+
+	vmDir := filepath.Join(m.cfg.RunDir, vmID)
+	socketPath := filepath.Join(vmDir, "firecracker.sock")
+
+	// Publish all the network/disk/socket fields before starting
+	// Firecracker so the in-memory view is consistent for concurrent
+	// readers. Lock once for the batch.
+	inst.mu.Lock()
+	inst.DiskPath = diskPath
 	inst.IP = hostIP
 	inst.TAPDevice = tapDevice
 	inst.MACAddress = macAddr
 	inst.Namespace = nsName
-
-	vmDir := filepath.Join(m.cfg.RunDir, vmID)
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
 	inst.SocketPath = socketPath
+	inst.mu.Unlock()
 
-	pid, err := m.startFirecrackerInNamespace(vmID, socketPath, diskPath, nsName)
-	if err != nil {
+	pid, startErr := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, nsName)
+	if startErr != nil {
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
-		return nil, fmt.Errorf("start firecracker: %w", err)
+		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
+	inst.mu.Lock()
 	inst.PID = pid
+	inst.mu.Unlock()
 
 	log.Info().Msg("restoring snapshot")
 
@@ -742,6 +867,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	m.setStatus(vmID, StatusRunning)
+	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM restored from snapshot")
 	return inst, nil
 }
@@ -758,19 +884,109 @@ func (m *Manager) GetVMInfo(_ context.Context, vmID string) (*VMInstance, error)
 // ShutdownAll
 // ---------------------------------------------------------------------------
 
+// ShutdownAll is a no-op — VMs are owned by systemd and outlive VMD.
 func (m *Manager) ShutdownAll() {
-	m.mu.RLock()
-	ids := make([]string, 0, len(m.vms))
-	for id := range m.vms {
-		ids = append(ids, id)
-	}
-	m.mu.RUnlock()
+	m.log.Info().Msg("VMs are systemd-managed — they will continue running after VMD shutdown")
+}
 
-	for _, id := range ids {
-		if err := m.DestroyVM(context.Background(), id, true); err != nil {
-			m.log.Error().Err(err).Str("vm_id", id).Msg("failed to destroy VM during shutdown")
+// ---------------------------------------------------------------------------
+// ReattachAll — startup recovery
+// ---------------------------------------------------------------------------
+
+// ReattachAll reconstructs the in-memory VM map on startup from two sources:
+//
+//  1. BoltDB — VMD's own cache from the previous lifetime.
+//  2. Systemd — ground truth for which Firecracker units are actually running.
+//
+// For each VM in BoltDB that systemd confirms is alive AND whose Firecracker
+// API socket is reachable, VMD reattaches. Stale BoltDB entries (dead process)
+// are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
+// so the Phase 3 reconciler can handle them.
+func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
+	if m.state == nil {
+		m.log.Warn().Msg("no state store configured — skipping reattach")
+		return 0, 0
+	}
+
+	records, err := m.state.All()
+	if err != nil {
+		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach")
+		return 0, 0
+	}
+
+	// Build a set of BoltDB-known IDs for orphan detection.
+	knownIDs := make(map[string]bool, len(records))
+	for _, rec := range records {
+		knownIDs[rec.ID] = true
+	}
+
+	if len(records) == 0 {
+		m.log.Info().Msg("no VMs in BoltDB — checking systemd for orphans")
+	} else {
+		m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
+	}
+
+	// Phase A: reattach from BoltDB.
+	for _, rec := range records {
+		log := m.log.With().Str("vm_id", rec.ID).Logger()
+
+		// Paused VMs legitimately have no running systemd unit — they
+		// were stopped during pause and are waiting for a resume via
+		// their snapshot. Reattach them with their paused status so the
+		// resume path can find them.
+		if rec.Status == StatusPaused {
+			inst := toInstance(rec)
+			m.mu.Lock()
+			m.vms[rec.ID] = inst
+			m.mu.Unlock()
+			log.Info().Msg("reattached paused VM")
+			reattached++
+			continue
+		}
+
+		// For running VMs, verify the systemd unit is still active.
+		if !isUnitActive(ctx, systemdUnitName(rec.ID)) {
+			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
+			m.state.Delete(rec.ID)
+			stale++
+			continue
+		}
+
+		// Verify the Firecracker API socket is actually reachable.
+		if rec.SocketPath != "" {
+			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
+				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — cleaning up")
+				m.state.Delete(rec.ID)
+				stale++
+				continue
+			}
+		}
+
+		// Reattach: add to in-memory map.
+		inst := toInstance(rec)
+
+		m.mu.Lock()
+		m.vms[rec.ID] = inst
+		m.mu.Unlock()
+
+		m.persistState(inst)
+		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
+		reattached++
+	}
+
+	// Phase B: detect orphan systemd units not in BoltDB.
+	activeIDs, err := listActiveFirecrackerUnits(ctx)
+	if err != nil {
+		m.log.Warn().Err(err).Msg("failed to list active firecracker units — orphan detection skipped")
+	} else {
+		for _, id := range activeIDs {
+			if !knownIDs[id] {
+				m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
+			}
 		}
 	}
+
+	return reattached, stale
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +1017,11 @@ func (m *Manager) ExecCommand(ctx context.Context, vmID, command string, timeout
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return httpExec(ctx, vmIP, command, timeout, opts)
+	result, err := httpExec(ctx, vmIP, command, timeout, opts)
+	if err != nil {
+		return nil, m.handleVMError(vmID, err)
+	}
+	return result, nil
 }
 
 func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, timeout time.Duration, opts *ExecOptions,
@@ -830,7 +1050,10 @@ func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, t
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return httpExecStream(ctx, vmIP, command, timeout, opts, onChunk)
+	if err := httpExecStream(ctx, vmIP, command, timeout, opts, onChunk); err != nil {
+		return m.handleVMError(vmID, err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +1089,43 @@ func (m *Manager) getRunningVMIP(vmID string) (string, error) {
 		return "", status.Errorf(codes.Internal, "vm %s has no IP", vmID)
 	}
 	return vmIP, nil
+}
+
+// handleVMError checks whether a connection error to a VM means the VM is
+// dead. If the systemd unit is no longer active, it marks the VM as failed
+// in BoltDB, removes it from the in-memory map, and returns NotFound so
+// the control plane returns 410 Gone. If the unit is still active (transient
+// error), it returns the original error unchanged.
+func (m *Manager) handleVMError(vmID string, origErr error) error {
+	if origErr == nil {
+		return nil
+	}
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer checkCancel()
+	if isUnitActive(checkCtx, systemdUnitName(vmID)) {
+		return origErr
+	}
+
+	// Single lock acquisition for both status update and removal so
+	// concurrent callers can't race on the same VM.
+	m.mu.Lock()
+	inst, ok := m.vms[vmID]
+	if !ok {
+		m.mu.Unlock()
+		// Already cleaned up by another goroutine.
+		return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
+	}
+	inst.mu.Lock()
+	inst.Status = StatusStopped
+	inst.mu.Unlock()
+	delete(m.vms, vmID)
+	m.mu.Unlock()
+
+	m.log.Warn().Str("vm_id", vmID).Err(origErr).
+		Msg("VM process is dead — cleaning up and returning NotFound")
+	m.persistState(inst)
+	m.deleteState(vmID)
+	return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 }
 
 // InstanceInfo is a snapshot of a VM's address and status for proxy lookups.
@@ -920,12 +1180,36 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 	inst.mu.Lock()
 	inst.Status = s
 	inst.mu.Unlock()
+	m.persistState(inst)
+}
+
+// persistState writes the current VM state to BoltDB. No-op if no state
+// store is configured. Errors are logged but not returned — BoltDB is a
+// cache, not a source of truth.
+func (m *Manager) persistState(inst *VMInstance) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.Put(toRecord(inst)); err != nil {
+		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
+	}
+}
+
+// deleteState removes a VM record from BoltDB.
+func (m *Manager) deleteState(vmID string) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.Delete(vmID); err != nil {
+		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
+	}
 }
 
 func (m *Manager) removeVM(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
 	m.mu.Unlock()
+	m.deleteState(vmID)
 }
 
 // copyRootfs creates a per-VM rootfs by copying the source image.
@@ -988,11 +1272,10 @@ func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath
 	return pid, nil
 }
 
-// startFirecrackerInNamespace launches Firecracker in its own mount namespace
-// AND inside the given network namespace. The mount namespace provides rootfs
-// isolation (tmpfs + symlink to per-VM rootfs), and the network namespace
-// provides network isolation (each VM uses the same internal IP).
-func (m *Manager) startFirecrackerInNamespace(vmID, socketPath, perVMRootfs, netNS string) (int, error) {
+// startFirecrackerViaSystemd writes the start script and launches Firecracker
+// as a standalone systemd unit. The VM survives VMD restarts because systemd
+// owns the process, not VMD.
+func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, netNS string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
 	}
@@ -1001,31 +1284,60 @@ func (m *Manager) startFirecrackerInNamespace(vmID, socketPath, perVMRootfs, net
 	templateDir := m.templateRunDir()
 	rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
 
-	// Write a temporary shell script to avoid shell injection from config values.
-	// The script sets up mount namespace isolation, then exec's Firecracker.
+	// Write the start script that the systemd unit's ExecStart calls.
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	scriptContent := fmt.Sprintf("#!/bin/sh\nmount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && exec %q --api-sock %q --id %q\n",
-		templateDir, perVMRootfs, rootfsLink, m.cfg.FirecrackerBin, socketPath, vmID)
+	scriptContent := fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s unshare -m -- sh -c 'mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && exec %q --api-sock %q --id %q'\n",
+		netNS, templateDir, perVMRootfs, rootfsLink, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
 
-	// Run inside the network namespace with a private mount namespace.
-	cmd := exec.Command("ip", "netns", "exec", netNS,
-		"unshare", "-m", "--", "sh", scriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("exec firecracker in namespace: %w", err)
+	// Start the systemd unit.
+	if err := startUnit(ctx, systemdUnitName(vmID)); err != nil {
+		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
 
+	// Wait for the Firecracker API socket.
 	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
-		_ = cmd.Process.Kill()
+		_ = stopUnit(ctx, systemdUnitName(vmID))
 		return 0, fmt.Errorf("wait for socket: %w", err)
 	}
 
-	go func() { _ = cmd.Wait() }()
-	return cmd.Process.Pid, nil
+	// Read the PID asynchronously so the create path isn't slowed down
+	// by the ~15ms dbus roundtrip. The PID is populated in the instance
+	// shortly after create returns and persisted to BoltDB.
+	go m.resolveAndSetPID(vmID)
+
+	return 0, nil
+}
+
+func (m *Manager) resolveAndSetPID(vmID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID))
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid); err != nil || pid == 0 {
+		return
+	}
+
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	inst.mu.Lock()
+	inst.PID = pid
+	inst.mu.Unlock()
+
+	m.persistState(inst)
+	m.log.Debug().Str("vm_id", vmID).Int("pid", pid).Msg("resolved systemd MainPID")
 }
 
 func waitForSocket(path string, timeout time.Duration) error {
@@ -1040,19 +1352,25 @@ func waitForSocket(path string, timeout time.Duration) error {
 }
 
 // killVMKeepRunDir terminates the VM process and releases networking but
-// leaves the rundir intact on disk.
+// leaves the rundir intact on disk. Used only for the throwaway template
+// VM (which is cold-booted as a direct child, not a systemd unit).
 func (m *Manager) killVMKeepRunDir(vmID string) {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return
 	}
 
+	// Template VMs run as direct child processes (cold boot path).
+	// Regular VMs run as systemd units — stop the unit if it exists.
 	if inst.PID > 0 {
 		if proc, e := os.FindProcess(inst.PID); e == nil {
 			_ = proc.Signal(syscall.SIGKILL)
 			go proc.Wait() //nolint:errcheck
 		}
+	} else {
+		_ = stopUnit(context.Background(), systemdUnitName(vmID))
 	}
+
 	if inst.SocketPath != "" {
 		_ = os.Remove(inst.SocketPath)
 	}
@@ -1107,11 +1425,3 @@ func (m *Manager) CleanupTemplate() {
 	m.log.Info().Msg("template files cleaned up")
 }
 
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}

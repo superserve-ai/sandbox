@@ -7,15 +7,18 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
+	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
@@ -31,6 +34,21 @@ type Config struct {
 	RunDir         string
 	GRPCPort       int
 	HostInterface  string
+
+	// HostID identifies this bare-metal host in the `host` table. Used by
+	// the reconciler to scope its DB queries ("sandboxes on my host").
+	HostID string
+
+	// DatabaseURL is optional. When set, the reconciler does three-way
+	// reconciliation (BoltDB ↔ systemd ↔ control plane DB) and writes
+	// audit log entries. When unset, the reconciler only detects drift
+	// between BoltDB and systemd.
+	DatabaseURL string
+
+	// ControlPlaneURL is the base URL of the control plane API. Used by
+	// the heartbeat goroutine to POST liveness. Optional — if unset,
+	// heartbeat is disabled.
+	ControlPlaneURL string
 }
 
 func loadConfig() (Config, error) {
@@ -44,10 +62,13 @@ func loadConfig() (Config, error) {
 		JailerBin:      envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
 		KernelPath:     requireEnv("KERNEL_PATH"),
 		BaseRootfsPath: requireEnv("BASE_ROOTFS_PATH"),
-		SnapshotDir:    envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
-		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
+		SnapshotDir:    "/var/lib/sandbox/snapshots",
+		RunDir:         "/var/lib/sandbox/rundir",
 		GRPCPort:       port,
 		HostInterface:  envOrDefault("HOST_INTERFACE", "eth0"),
+		HostID:          envOrDefault("HOST_ID", "default"),
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
 	}
 
 	if cfg.KernelPath == "" {
@@ -221,7 +242,15 @@ func main() {
 	}
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
+	// ---- Pre-allocate network slots ----
+	// Keeps 5 ready-to-use network namespaces so sandbox creation grabs
+	// one in microseconds instead of running ~11 shell commands (~10-30ms).
+	netPool := netMgr.StartPool(ctx, network.PoolConfig{})
+	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+
 	// ---- VM manager ----
+	maxConcurrentCreates, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_CREATES", "100"))
+
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin: cfg.FirecrackerBin,
 		JailerBin:      cfg.JailerBin,
@@ -229,22 +258,15 @@ func main() {
 		BaseRootfsPath: cfg.BaseRootfsPath,
 		SnapshotDir:    cfg.SnapshotDir,
 		RunDir:         cfg.RunDir,
+		MaxConcurrent:  maxConcurrentCreates,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
-	lc.addCloser("vm manager: active sandboxes", func(_ context.Context) error {
-		mgr.ShutdownAll()
-		return nil
-	})
-	lc.addCloser("vm manager: template", func(_ context.Context) error {
-		mgr.CleanupTemplate()
-		return nil
-	})
 
 	// ---- TCP egress proxy ----
-	// The nftables firewall in each sandbox namespace REDIRECTs TCP traffic
-	// to these ports for HTTP Host header / TLS SNI inspection.
+	// Must be set before ReattachAll or any VM operations so domain
+	// filtering is active from the start.
 	const maxConnsPerSandbox = 256
 	egressProxy := network.NewEgressProxy(
 		network.DefaultHTTPProxyPort,
@@ -256,6 +278,74 @@ func main() {
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
 	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
+
+	// ---- BoltDB state store ----
+	statePath := envOrDefault("VMD_STATE_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "vmd.db"))
+	stateStore, err := vm.OpenStateStore(statePath)
+	if err != nil {
+		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
+	}
+	mgr.SetStateStore(stateStore)
+	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+
+	// ---- Reattach to running VMs from previous VMD lifetime ----
+	reattached, stale := mgr.ReattachAll(ctx)
+	if reattached > 0 || stale > 0 {
+		log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
+	}
+
+	// ---- Optional DB connection for the reconciler ----
+	// VMD does not need the DB for its request path (that stays on gRPC).
+	// The reconciler uses the DB for three-way drift detection and audit
+	// logging. If DATABASE_URL is unset, the reconciler falls back to a
+	// BoltDB ↔ systemd comparison only.
+	var reconcilerDB *dbq.Queries
+	if cfg.DatabaseURL != "" {
+		dbPool, dbErr := pgxpool.New(ctx, cfg.DatabaseURL)
+		if dbErr != nil {
+			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
+		}
+		if err := dbPool.Ping(ctx); err != nil {
+			log.Fatal().Err(err).Msg("failed to ping database for reconciler")
+		}
+		reconcilerDB = dbq.New(dbPool)
+		lc.addCloser("reconciler db pool", func(_ context.Context) error {
+			dbPool.Close()
+			return nil
+		})
+		log.Info().Msg("reconciler DB connection ready")
+	} else {
+		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
+	}
+
+	// ---- Continuous reconciler ----
+	reconcilerCfg := vm.DefaultReconcilerConfig()
+	reconcilerCfg.HostID = cfg.HostID
+	reconcilerCfg.DB = reconcilerDB
+	reconciler := vm.NewReconciler(mgr, reconcilerCfg)
+	lc.start("reconciler", func() error { reconciler.Run(ctx); return nil })
+
+	// ---- Heartbeat to control plane ----
+	if cfg.ControlPlaneURL != "" {
+		lc.start("heartbeat", func() error {
+			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
+				ControlPlaneURL: cfg.ControlPlaneURL,
+				HostID:          cfg.HostID,
+				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+			}, log)
+			return nil
+		})
+	} else {
+		log.Warn().Msg("CONTROL_PLANE_URL unset — heartbeat disabled")
+	}
+
+	lc.addCloser("vm manager: active sandboxes", func(_ context.Context) error {
+		mgr.ShutdownAll()
+		return nil
+	})
+	// Template files are NOT cleaned up on shutdown — they persist on
+	// disk so the next startup can reuse them via hash caching instead
+	// of cold-booting a new template (~3s saved per restart).
 
 	// ---- Default template ----
 	// Boot a throwaway VM from the base image, snapshot it, keep the

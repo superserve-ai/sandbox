@@ -12,15 +12,16 @@ import (
 )
 
 const createSnapshot = `-- name: CreateSnapshot :one
-INSERT INTO snapshot (sandbox_id, team_id, path, size_bytes, saved, name, trigger)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at
+INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path
 `
 
 type CreateSnapshotParams struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	TeamID    uuid.UUID `json:"team_id"`
 	Path      string    `json:"path"`
+	MemPath   *string   `json:"mem_path"`
 	SizeBytes int64     `json:"size_bytes"`
 	Saved     bool      `json:"saved"`
 	Name      *string   `json:"name"`
@@ -32,6 +33,7 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 		arg.SandboxID,
 		arg.TeamID,
 		arg.Path,
+		arg.MemPath,
 		arg.SizeBytes,
 		arg.Saved,
 		arg.Name,
@@ -48,6 +50,7 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 		&i.Name,
 		&i.Trigger,
 		&i.CreatedAt,
+		&i.MemPath,
 	)
 	return i, err
 }
@@ -63,12 +66,21 @@ func (q *Queries) DeleteSnapshot(ctx context.Context, id uuid.UUID) error {
 }
 
 const getSnapshot = `-- name: GetSnapshot :one
-SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at FROM snapshot
-WHERE id = $1
+SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
+WHERE id = $1 AND team_id = $2
 `
 
-func (q *Queries) GetSnapshot(ctx context.Context, id uuid.UUID) (Snapshot, error) {
-	row := q.db.QueryRow(ctx, getSnapshot, id)
+type GetSnapshotParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Team-scoped snapshot lookup for user-facing handlers. The join on
+// team_id enforces tenant isolation at the SQL layer so callers cannot
+// accidentally leak another team's snapshot metadata by forgetting the
+// in-Go team check.
+func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSnapshot, arg.ID, arg.TeamID)
 	var i Snapshot
 	err := row.Scan(
 		&i.ID,
@@ -80,12 +92,38 @@ func (q *Queries) GetSnapshot(ctx context.Context, id uuid.UUID) (Snapshot, erro
 		&i.Name,
 		&i.Trigger,
 		&i.CreatedAt,
+		&i.MemPath,
+	)
+	return i, err
+}
+
+const getSnapshotByID = `-- name: GetSnapshotByID :one
+SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
+WHERE id = $1
+`
+
+// Unscoped snapshot lookup for internal (host-scoped) code paths such as
+// the VMD reconciler. DO NOT call from user-facing handlers.
+func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSnapshotByID, id)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Saved,
+		&i.Name,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
 	)
 	return i, err
 }
 
 const listSnapshotsBySandbox = `-- name: ListSnapshotsBySandbox :many
-SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
 WHERE sandbox_id = $1
 ORDER BY created_at DESC
 `
@@ -109,6 +147,7 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 			&i.Name,
 			&i.Trigger,
 			&i.CreatedAt,
+			&i.MemPath,
 		); err != nil {
 			return nil, err
 		}
@@ -121,7 +160,7 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 }
 
 const listSnapshotsByTeam = `-- name: ListSnapshotsByTeam :many
-SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
 WHERE team_id = $1
 ORDER BY created_at DESC
 `
@@ -145,6 +184,7 @@ func (q *Queries) ListSnapshotsByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.Name,
 			&i.Trigger,
 			&i.CreatedAt,
+			&i.MemPath,
 		); err != nil {
 			return nil, err
 		}

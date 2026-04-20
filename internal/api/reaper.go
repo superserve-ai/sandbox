@@ -2,9 +2,9 @@ package api
 
 import (
 	"context"
+	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -18,13 +18,16 @@ type ReaperConfig struct {
 	// BatchSize bounds the number of sandboxes paused per cycle so a
 	// sudden wave of expirations cannot tie up the control plane.
 	BatchSize int32
+	// Parallelism caps concurrent pauses within a single batch. 0 → 10.
+	Parallelism int
 }
 
 // DefaultReaperConfig returns sensible defaults for the timeout reaper.
 func DefaultReaperConfig() ReaperConfig {
 	return ReaperConfig{
-		Interval:  30 * time.Second,
-		BatchSize: 50,
+		Interval:    30 * time.Second,
+		BatchSize:   50,
+		Parallelism: 10,
 	}
 }
 
@@ -49,9 +52,18 @@ func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
+	parallelism := cfg.Parallelism
+	if parallelism <= 0 {
+		parallelism = 10
+	}
+	if int32(parallelism) > cfg.BatchSize {
+		parallelism = int(cfg.BatchSize)
+	}
+
 	log.Info().
 		Dur("interval", cfg.Interval).
 		Int32("batch_size", cfg.BatchSize).
+		Int("parallelism", parallelism).
 		Msg("timeout reaper started")
 
 	ticker := time.NewTicker(cfg.Interval)
@@ -59,7 +71,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
-	h.reapOnce(ctx, cfg.BatchSize)
+	h.reapOnce(ctx, cfg.BatchSize, parallelism)
 
 	for {
 		select {
@@ -67,12 +79,12 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			log.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
-			h.reapOnce(ctx, cfg.BatchSize)
+			h.reapOnce(ctx, cfg.BatchSize, parallelism)
 		}
 	}
 }
 
-func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
+func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int) {
 	// Atomically claim expired active sandboxes and mark them 'pausing' in one
 	// CTE+UPDATE. FOR UPDATE SKIP LOCKED inside the query ensures that
 	// concurrent reaper replicas skip rows already being processed.
@@ -92,16 +104,28 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
 
 	log.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
 
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+
+dispatch:
 	for _, sbx := range expired {
-		// Check for shutdown between each pause so we exit promptly.
+		// Labeled break: a plain break inside the select exits only the
+		// select, not the for loop.
 		select {
 		case <-ctx.Done():
-			return
-		default:
+			break dispatch
+		case sem <- struct{}{}:
 		}
 
-		h.pauseExpired(ctx, sbx)
+		wg.Add(1)
+		go func(sbx db.ClaimExpiredSandboxesRow) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			h.pauseExpired(ctx, sbx)
+		}(sbx)
 	}
+
+	wg.Wait()
 }
 
 // pauseExpired pauses one sandbox that was atomically claimed by
@@ -130,8 +154,15 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Str("name", sbx.Name).
 		Logger()
 
+	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
+	if vmdLookupErr != nil {
+		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
+		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
+		return
+	}
+
 	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	snapshotPath, memPath, err := h.VMD.PauseInstance(vmdCtx, sbx.ID.String(), "")
+	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sbx.ID.String(), "")
 	vmdCancel()
 	if err != nil {
 		// VM never stopped — safe to revert DB to active so the reaper
@@ -144,38 +175,22 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
 	defer postCancel()
 
+	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
+	// the sandbox, and flip status from pausing → idle in a single CTE.
+	// Same query as the user-initiated PauseSandbox handler, so the two
+	// code paths have identical atomicity guarantees.
 	triggerName := "timeout"
-	snapshot, err := h.DB.CreateSnapshot(postCtx, db.CreateSnapshotParams{
-		SandboxID: sbx.ID,
+	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
+		MemPath:   &memPath,
 		SizeBytes: 0,
 		Saved:     false,
 		Name:      &triggerName,
 		Trigger:   triggerName,
-	})
-	if err != nil {
-		l.Error().Err(err).Msg("reaper: CreateSnapshot failed — rolling back VMD pause")
-		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
-		return
-	}
-
-	if err := h.DB.SetSandboxSnapshot(postCtx, db.SetSandboxSnapshotParams{
-		ID:         sbx.ID,
-		SnapshotID: pgtype.UUID{Bytes: snapshot.ID, Valid: true},
-		TeamID:     sbx.TeamID,
 	}); err != nil {
-		l.Error().Err(err).Msg("reaper: SetSandboxSnapshot failed — rolling back VMD pause")
-		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
-		return
-	}
-
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sbx.ID,
-		Status: db.SandboxStatusIdle,
-		TeamID: sbx.TeamID,
-	}); err != nil {
-		l.Error().Err(err).Msg("reaper: UpdateSandboxStatus(idle) failed — rolling back VMD pause")
+		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
 	}
@@ -199,8 +214,15 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		AnErr("cause", cause).
 		Logger()
 
+	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
+	if vmdLookupErr != nil {
+		rl.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD for rollback failed")
+		h.markSandboxFailed(ctx, sbx, "resolve VMD failed during rollback", rl)
+		return
+	}
+
 	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	_, _, _, err := h.VMD.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath, nil)
+	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath, nil)
 	vmdCancel()
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")

@@ -347,8 +347,8 @@ func TestFiles_MethodNotAllowed(t *testing.T) {
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", w.Code)
 	}
-	if got := w.Header().Get("Allow"); got != "GET, POST" {
-		t.Errorf("Allow = %q, want 'GET, POST'", got)
+	if got := w.Header().Get("Allow"); got != "GET, POST, OPTIONS" {
+		t.Errorf("Allow = %q, want 'GET, POST, OPTIONS'", got)
 	}
 }
 

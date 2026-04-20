@@ -1,0 +1,18 @@
+[Unit]
+Description=Firecracker VM %i
+After=network-online.target
+StopWhenUnneeded=no
+
+[Service]
+Type=simple
+Slice=sandboxes.slice
+
+ExecStart=/var/lib/sandbox/rundir/%i/start.sh
+ExecStopPost=/usr/local/bin/fc-cleanup %i
+
+Restart=no
+KillMode=mixed
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal

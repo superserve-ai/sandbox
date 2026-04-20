@@ -29,6 +29,7 @@ type stubVMD struct {
 	destroyFn func(ctx context.Context, id string, force bool) error
 	pauseFn   func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn  func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	restoreFn func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 }
 
@@ -54,6 +55,13 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (st
 func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
 		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath)
+		return ip, 1, 1024, err
+	}
+	return "10.0.0.1", 1, 1024, nil
+}
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string) (string, uint32, uint32, error) {
+	if s.restoreFn != nil {
+		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil
@@ -115,7 +123,7 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[3].(*db.SandboxStatus) = s.Status
 		*dest[4].(*int32) = s.VcpuCount
 		*dest[5].(*int32) = s.MemoryMib
-		*dest[6].(**string) = s.HostID
+		*dest[6].(*string) = s.HostID
 		*dest[7].(**netip.Addr) = s.IpAddress
 		*dest[8].(**int32) = s.Pid
 		*dest[9].(*pgtype.UUID) = s.SnapshotID
@@ -417,6 +425,22 @@ func snapshotRow(s db.Snapshot) *mockRow {
 		*dest[6].(**string) = s.Name
 		*dest[7].(*string) = s.Trigger
 		*dest[8].(*time.Time) = s.CreatedAt
+		return nil
+	}}
+}
+
+// finalizePauseRow mocks the single-uuid RETURNING clause of FinalizePause.
+func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = snapshotID
+		return nil
+	}}
+}
+
+// boolRow mocks a single-bool scan (e.g. SandboxExists).
+func boolRow(value bool) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*bool) = value
 		return nil
 	}}
 }
@@ -1051,18 +1075,18 @@ func TestPauseSandbox_Success(t *testing.T) {
 	}
 
 	snapshotID := uuid.New()
-	queryRowCall := 0
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			queryRowCall++
-			if strings.Contains(sql, "FROM sandbox") {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				// BeginPause: atomic transition active → pausing, returns *
 				return sandboxRow(sb)
-			}
-			if strings.Contains(sql, "INSERT INTO snapshot") {
-				return snapshotRow(db.Snapshot{
-					ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
-					Path: "/snapshots/vmstate.snap", Trigger: "pause",
-				})
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				// FinalizePause: CTE insert + update, returns snapshot_id
+				return finalizePauseRow(snapshotID)
+			case strings.Contains(sql, "FROM sandbox"):
+				// Generic GetSandbox (fallback from BeginPause)
+				return sandboxRow(sb)
 			}
 			return activityRow()
 		},
@@ -1075,30 +1099,36 @@ func TestPauseSandbox_Success(t *testing.T) {
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
 
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
 	}
 	if !pauseCalled {
 		t.Error("VMD.PauseInstance was not called")
 	}
-
-	body := parseJSON(t, w)
-	if body["status"] != "idle" {
-		t.Errorf("status = %q, want %q", body["status"], "idle")
-	}
-	if body["snapshot_id"] != snapshotID.String() {
-		t.Errorf("snapshot_id = %q, want %q", body["snapshot_id"], snapshotID)
+	if w.Body.Len() != 0 {
+		t.Errorf("expected empty body on 204, got: %s", w.Body.String())
 	}
 }
 
 func TestPauseSandbox_NotActive(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusIdle}
 
+	// BeginPause's WHERE status = 'active' clause excludes an idle
+	// sandbox → 0 rows. The handler falls back to SandboxExists to
+	// disambiguate 404 vs 409; since the row exists (just in the wrong
+	// state), we return 409 Conflict.
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'pausing'") {
+				return notFoundRow() // BeginPause: no active row matched
+			}
+			if strings.Contains(sql, "EXISTS") {
+				return boolRow(true) // fallback: row exists, but not active
+			}
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 	vmd := &stubVMD{}
 
@@ -1112,9 +1142,19 @@ func TestPauseSandbox_NotActive(t *testing.T) {
 }
 
 func TestPauseSandbox_NotFound(t *testing.T) {
+	// BeginPause returns 0 rows (sandbox doesn't exist), and the
+	// SandboxExists fallback also returns false → 404.
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'pausing'") {
+				return notFoundRow()
+			}
+			if strings.Contains(sql, "EXISTS") {
+				return boolRow(false)
+			}
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 	vmd := &stubVMD{}
 
@@ -1382,8 +1422,9 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
-				// args[10] is the metadata jsonb (11th positional, 0-indexed).
-				if b, ok := args[10].([]byte); ok {
+				// Positional args (0-indexed): id, team_id, name, status,
+				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[11].([]byte); ok {
 					capturedMetadata = b
 				}
 				// Echo metadata back through the row so the response carries it.
@@ -1442,7 +1483,9 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
-				if b, ok := args[10].([]byte); ok {
+				// Positional args (0-indexed): id, team_id, name, status,
+				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[11].([]byte); ok {
 					capturedMetadata = b
 				}
 				return sandboxRow(db.Sandbox{

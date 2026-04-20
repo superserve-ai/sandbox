@@ -43,6 +43,50 @@ func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams
 	return err
 }
 
+const beginPause = `-- name: BeginPause :one
+UPDATE sandbox
+SET status = 'pausing', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
+`
+
+type BeginPauseParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Atomic ownership + state check + transition to 'pausing'. Replaces the
+// GetSandbox → check status → UpdateSandboxStatus sequence on the pause
+// hot path, collapsing two DB roundtrips into one. The WHERE clause
+// enforces the invariant (only active, non-deleted sandboxes owned by
+// this team can be paused); a 0-row result means "no such sandbox OR
+// wrong team OR not currently active", and the caller disambiguates via
+// a fallback GetSandbox in the rare error path.
+func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, beginPause, arg.ID, arg.TeamID)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.LastActivityAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+	)
+	return i, err
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH expired AS (
   SELECT id, team_id, name, snapshot_id, host_id
@@ -68,7 +112,7 @@ type ClaimExpiredSandboxesRow struct {
 	TeamID     uuid.UUID   `json:"team_id"`
 	Name       string      `json:"name"`
 	SnapshotID pgtype.UUID `json:"snapshot_id"`
-	HostID     *string     `json:"host_id"`
+	HostID     string      `json:"host_id"`
 }
 
 // Atomically claims active sandboxes whose hard timeout has elapsed and marks
@@ -107,18 +151,19 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 }
 
 const createSandbox = `-- name: CreateSandbox :one
-INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
 `
 
 type CreateSandboxParams struct {
+	ID             uuid.UUID     `json:"id"`
 	TeamID         uuid.UUID     `json:"team_id"`
 	Name           string        `json:"name"`
 	Status         SandboxStatus `json:"status"`
 	VcpuCount      int32         `json:"vcpu_count"`
 	MemoryMib      int32         `json:"memory_mib"`
-	HostID         *string       `json:"host_id"`
+	HostID         string        `json:"host_id"`
 	IpAddress      *netip.Addr   `json:"ip_address"`
 	Pid            *int32        `json:"pid"`
 	SnapshotID     pgtype.UUID   `json:"snapshot_id"`
@@ -126,8 +171,13 @@ type CreateSandboxParams struct {
 	Metadata       []byte        `json:"metadata"`
 }
 
+// ID is supplied by the caller (generated in Go via uuid.New()) rather
+// than defaulted in SQL, so the caller can parallelize this INSERT with
+// the VMD CreateVM call — both need the same sandbox_id and generating
+// it client-side lets them run concurrently instead of strictly serially.
 func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, createSandbox,
+		arg.ID,
 		arg.TeamID,
 		arg.Name,
 		arg.Status,
@@ -177,6 +227,69 @@ type DestroySandboxParams struct {
 func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) error {
 	_, err := q.db.Exec(ctx, destroySandbox, arg.ID, arg.TeamID)
 	return err
+}
+
+const finalizePause = `-- name: FinalizePause :one
+WITH target AS (
+  SELECT id, team_id FROM sandbox
+  WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+),
+new_snapshot AS (
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
+  SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
+  RETURNING snapshot.id AS snap_id
+)
+UPDATE sandbox
+SET snapshot_id = (SELECT snap_id FROM new_snapshot),
+    status = 'idle',
+    updated_at = now()
+FROM new_snapshot
+WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+RETURNING new_snapshot.snap_id::uuid AS snapshot_id
+`
+
+type FinalizePauseParams struct {
+	ID        uuid.UUID `json:"id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	Path      string    `json:"path"`
+	MemPath   *string   `json:"mem_path"`
+	SizeBytes int64     `json:"size_bytes"`
+	Saved     bool      `json:"saved"`
+	Name      *string   `json:"name"`
+	Trigger   string    `json:"trigger"`
+}
+
+// Atomically insert the snapshot row, link it to the sandbox, and flip
+// status from 'pausing' to 'idle'. Replaces the sequence
+// CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
+// three DB roundtrips into one.
+//
+// The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
+// in the same query. This prevents the common race where a sandbox is
+// soft-deleted before FinalizePause runs — without the gate, the CTE
+// INSERT would always execute (per PostgreSQL's rule that data-modifying
+// CTEs run independently of the main query), producing an orphan snapshot
+// row and a snapshot file on disk with no owner. A concurrent delete that
+// commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
+// can still race, but that window is microseconds and the resulting
+// orphan is detectable/cleanable by a background job.
+//
+// When either the sandbox is missing/deleted or the INSERT did not fire,
+// the query returns 0 rows and the caller maps that to ErrSandboxGone.
+func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, finalizePause,
+		arg.ID,
+		arg.TeamID,
+		arg.Path,
+		arg.MemPath,
+		arg.SizeBytes,
+		arg.Saved,
+		arg.Name,
+		arg.Trigger,
+	)
+	var snapshot_id uuid.UUID
+	err := row.Scan(&snapshot_id)
+	return snapshot_id, err
 }
 
 const getSandbox = `-- name: GetSandbox :one
@@ -266,6 +379,59 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Tim
 			&i.NetworkConfig,
 			&i.TimeoutSeconds,
 			&i.Metadata,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSandboxesByHost = `-- name: ListSandboxesByHost :many
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.last_activity_at, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, snap.path AS snapshot_path
+FROM sandbox s
+LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
+WHERE s.host_id = $1 AND s.destroyed_at IS NULL
+`
+
+type ListSandboxesByHostRow struct {
+	Sandbox      Sandbox `json:"sandbox"`
+	SnapshotPath *string `json:"snapshot_path"`
+}
+
+// Used by the VMD reconciler. snapshot_path is joined so the idle-sandbox
+// drift check can stat the file without a per-row snapshot lookup.
+func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]ListSandboxesByHostRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByHost, hostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxesByHostRow{}
+	for rows.Next() {
+		var i ListSandboxesByHostRow
+		if err := rows.Scan(
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.LastActivityAt,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.SnapshotPath,
 		); err != nil {
 			return nil, err
 		}
@@ -376,6 +542,20 @@ func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSan
 	return items, nil
 }
 
+const markSandboxFailed = `-- name: MarkSandboxFailed :exec
+UPDATE sandbox
+SET status = 'failed', updated_at = now()
+WHERE id = $1 AND destroyed_at IS NULL
+`
+
+// Used by the reconciler to mark a sandbox failed when VMD detects it is
+// actually gone. No team_id filter — the reconciler runs with host scope,
+// not team scope.
+func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markSandboxFailed, id)
+	return err
+}
+
 const sandboxExists = `-- name: SandboxExists :one
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL)
 `
@@ -417,7 +597,7 @@ WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
 
 type UpdateSandboxHostParams struct {
 	ID        uuid.UUID   `json:"id"`
-	HostID    *string     `json:"host_id"`
+	HostID    string      `json:"host_id"`
 	IpAddress *netip.Addr `json:"ip_address"`
 	Pid       *int32      `json:"pid"`
 	TeamID    uuid.UUID   `json:"team_id"`

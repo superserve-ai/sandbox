@@ -53,10 +53,17 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		return
 	}
 
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for exec stream failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
 	start := time.Now()
 	var lastExitCode int32
 
-	err := h.VMD.ExecCommandStream(c.Request.Context(), sandbox.ID.String(),
+	err := vmd.ExecCommandStream(c.Request.Context(), sandbox.ID.String(),
 		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS),
 		func(stdout, stderr []byte, exitCode int32, finished bool) {
 			event := gin.H{
@@ -84,13 +91,30 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		})
 
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("streaming sandbox exec failed")
-		errEvent, _ := json.Marshal(gin.H{
-			"error":    err.Error(),
-			"finished": true,
-		})
-		fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
-		flusher.Flush()
+		// If VMD says the VM is gone, mark the sandbox failed. The HTTP
+		// response has already committed 200 OK (SSE headers flushed
+		// before the call), so we can't downgrade the status code —
+		// instead emit a "gone" event in the stream so clients can
+		// distinguish this from transient errors.
+		if isVMDNotFound(err) {
+			log.Warn().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommandStream: VM unavailable, marking sandbox failed")
+			h.markSandboxFailedAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
+			errEvent, _ := json.Marshal(gin.H{
+				"error":    "sandbox VM is no longer available",
+				"code":     "gone",
+				"finished": true,
+			})
+			fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
+			flusher.Flush()
+		} else {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("streaming sandbox exec failed")
+			errEvent, _ := json.Marshal(gin.H{
+				"error":    err.Error(),
+				"finished": true,
+			})
+			fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
+			flusher.Flush()
+		}
 	}
 
 	durationMs := int32(time.Since(start).Milliseconds())

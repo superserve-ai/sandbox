@@ -1,0 +1,13 @@
+[Unit]
+Description=Sandbox VMs cgroup slice
+
+[Slice]
+# Resource accounting for all sandbox Firecracker units.
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+
+# Safety ceiling: sandboxes cannot consume the entire host.
+# Per-sandbox limits are set via drop-in files on each unit.
+MemoryMax=95%
+CPUQuota=90%

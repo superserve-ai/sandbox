@@ -3,38 +3,24 @@ info:
   title: Superserve API
   version: 0.1.0
   description: |
-    Superserve provides sandbox infrastructure to run AI Agents in the cloud. Powered by Firecracker MicroVMs.
+    Superserve provides sandbox infrastructure to run AI agents in the cloud.
 
     ## Sandbox lifecycle
 
     ```
-    starting --> active <--> idle --> deleted
+    active <--> idle --> deleted
     ```
 
-    | Endpoint | What it does |
-    |----------|-------------|
-    | `POST /sandboxes` | Create a new sandbox |
-    | `PATCH /sandboxes/:id` | Partially update a running sandbox (e.g. network rules) |
-    | `POST /sandboxes/:id/pause` | Snapshot full state, suspend the VM |
-    | `POST /sandboxes/:id/resume` | Restore from snapshot, continue where it left off |
-    | `DELETE /sandboxes/:id` | Delete sandbox and all resources |
-
-    ## Sandbox environment
-
-    Each sandbox runs Ubuntu 24.04 with 1 vCPU, 1 GB RAM, 4 GB disk.
-    Pre-installed: Python 3.12, Node.js 22, npm, git, curl, build-essential.
+    A sandbox is `active` when running and `idle` after being paused. Resuming
+    an idle sandbox returns it to `active`. Deleting releases all resources.
   contact:
     name: Superserve Team
   license:
     name: Proprietary
 
 servers:
-  - url: https://api-staging.superserve.ai
-    description: Staging
   - url: https://api.superserve.ai
     description: Production
-  - url: http://localhost:8080
-    description: Local development
 
 paths:
   /health:
@@ -63,26 +49,17 @@ paths:
       tags: [Sandboxes]
       summary: List all sandboxes
       description: |
-        Returns sandboxes belonging to the authenticated team, optionally
-        filtered by metadata tags.
-
-        ## Filtering by metadata
-
-        Any query parameter prefixed `metadata.` is treated as a filter
-        clause: `?metadata.env=prod&metadata.owner=agent-7`. Multiple
-        filters AND together — a sandbox matches only if every key/value
-        pair is present in its metadata. Values are compared as exact
-        strings; there is no type coercion or substring matching.
+        Returns sandboxes belonging to the authenticated team. Filter by
+        metadata with query parameters prefixed `metadata.`, e.g.
+        `?metadata.env=prod&metadata.owner=agent-7`. Multiple filters AND
+        together.
       security:
         - apiKey: []
       parameters:
         - name: metadata.{key}
           in: query
           required: false
-          description: |
-            Filter sandboxes whose metadata contains an exact `{key}: <value>`
-            pair. Repeat with different keys to AND multiple filters. Values
-            are always strings. Example: `?metadata.env=prod`.
+          description: Exact-match metadata filter (e.g. `?metadata.env=prod`).
           schema:
             type: string
       responses:
@@ -106,9 +83,9 @@ paths:
       tags: [Sandboxes]
       summary: Create a new sandbox
       description: |
-        Creates a sandbox and returns immediately with `status: starting`.
-        The VM boots asynchronously. Poll `GET /sandboxes/{id}` until
-        `status` is `active` before running commands.
+        Creates a sandbox. When the request returns successfully, the
+        sandbox is ready to use — you can run commands against it
+        immediately.
       security:
         - apiKey: []
       requestBody:
@@ -174,26 +151,17 @@ paths:
     patch:
       operationId: patchSandbox
       tags: [Sandboxes]
-      summary: Partially update a running sandbox
+      summary: Partially update a sandbox
       description: |
-        Applies a partial update to a running sandbox. Each top-level field
-        in the request body is optional; only fields that are present are
-        applied. Omitted top-level fields are left unchanged. Nested objects
-        are full replacements when present — to clear a list, send it as an
-        empty array.
+        Applies a partial update. Only fields present in the request body
+        are applied; nested objects are full replacements (send an empty
+        array to clear a list). At least one field must be present.
 
-        At least one top-level field must be present, otherwise the request
-        is rejected with `400`. Unknown top-level fields are also rejected
-        with `400` so typos surface as errors instead of silent no-ops.
+        Patchable fields:
 
-        ## Currently patchable fields
-
-        - `network` — replaces the egress allow/deny rules. The sandbox
-          must be in the `active` state; patching a paused or idle sandbox
-          returns `409`. Rules take effect immediately and are persisted so
-          they survive a future pause/resume cycle.
-        - `metadata` — replaces the sandbox's metadata tags. Can be updated
-          regardless of sandbox state (active, paused, idle).
+        - `network` — replaces egress allow/deny rules. Sandbox must be
+          `active`; `409` otherwise.
+        - `metadata` — replaces metadata tags. Allowed in any state.
       security:
         - apiKey: []
       requestBody:
@@ -225,18 +193,14 @@ paths:
       tags: [Sandboxes]
       summary: Pause a running sandbox
       description: |
-        Snapshots the sandbox's full state (memory + disk), suspends the VM,
-        and transitions to `idle`. Resume it later to continue exactly where
-        it left off.
+        Saves the sandbox's full state and transitions it to `idle`. Resume
+        it later to continue exactly where it left off — same memory, same
+        running processes, same files.
       security:
         - apiKey: []
       responses:
-        "200":
-          description: Sandbox is now idle
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SandboxResponse"
+        "204":
+          description: Sandbox paused
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -255,8 +219,7 @@ paths:
       tags: [Sandboxes]
       summary: Resume a paused sandbox
       description: |
-        Restores the sandbox from its paused snapshot. Transitions back to
-        `active` with all state intact — same memory, same processes, same files.
+        Restores a paused sandbox to `active` with all state intact.
       security:
         - apiKey: []
       responses:
@@ -265,7 +228,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/SandboxResponse"
+                $ref: "#/components/schemas/ResumeResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -381,55 +344,36 @@ components:
           type: string
           format: uuid
           description: >
-            If provided, boot the sandbox from this snapshot instead of
-            creating a fresh VM. The snapshot must belong to the same team.
+            If provided, start the sandbox from this snapshot instead of
+            creating a fresh one. The snapshot must belong to the same team.
         timeout_seconds:
           type: integer
           format: int32
           minimum: 1
           maximum: 604800
           description: >
-            Optional hard lifetime cap in seconds, measured from sandbox
-            creation. When set, the sandbox is destroyed this many seconds
-            after creation regardless of state (active, paused, idle) or
-            activity — the user asked for a hard deadline.
-            When unset, the sandbox lives until explicitly paused or
-            deleted. Maximum 604800 (7 days).
+            Optional cap on how long a sandbox can stay `active`, measured
+            from creation. When elapsed, the sandbox is automatically paused.
+            Maximum 604800 (7 days).
         metadata:
           type: object
           additionalProperties:
             type: string
           description: |
-            Flat string-to-string tags attached to the sandbox at creation.
-            Useful for grouping, owner labels, environment, run IDs, etc.
-
-            ## Constraints
-              - **Strings only.** Values must be strings. There is no type
-                coercion: `metadata.count=42` filters for the *string* "42".
-              - **At most 64 keys.**
-              - Each key may be at most **256 bytes**.
-              - Each value may be at most **2048 bytes** (2 KB).
-              - The serialized object may be at most **16384 bytes** (16 KB)
-                in total.
-              - Keys starting with `superserve.` or `_superserve` (case-
-                insensitive) are reserved for platform use and rejected.
-
-            Metadata can be updated after creation via `PATCH /sandboxes/:id`.
-            Filter sandboxes by metadata via the `metadata.{key}` query
-            parameter on `GET /sandboxes`.
+            String-to-string tags. Limits: 64 keys, 256 B per key, 2 KB per
+            value, 16 KB total. Keys starting with `superserve.` or
+            `_superserve` are reserved.
           example:
             env: prod
             owner: agent-7
-            run_id: 7f3c-21
         env_vars:
           type: object
           additionalProperties:
             type: string
           description: |
             Environment variables injected into every process inside the
-            sandbox (terminal sessions, exec calls). Not persisted in the
-            database — they live in the VM agent's memory for the sandbox's
-            lifetime and survive pause/resume via snapshot.
+            sandbox (terminal sessions, exec calls). Persist for the lifetime
+            of the sandbox and survive pause/resume.
           example:
             OPENAI_API_KEY: sk-...
             DEBUG: "1"
@@ -446,7 +390,10 @@ components:
           type: string
         status:
           type: string
-          enum: [starting, active, pausing, idle, deleted]
+          enum: [active, idle]
+          description: >
+            Current state of the sandbox. `active` means running; `idle`
+            means paused and awaiting resume.
         vcpu_count:
           type: integer
         memory_mib:
@@ -454,11 +401,9 @@ components:
         access_token:
           type: string
           description: |
-            Per-sandbox HMAC access token for data-plane operations
-            (file upload/download, terminal). Pass as `X-Access-Token`
-            header when hitting the edge proxy at
-            `boxd-{id}.sandbox.superserve.ai`. Reusable for the
-            lifetime of the sandbox.
+            Per-sandbox access token for data-plane operations (file
+            upload/download, terminal). Pass as the `X-Access-Token` header.
+            Returned on create and get-by-id only.
         snapshot_id:
           type: string
           format: uuid
@@ -488,6 +433,20 @@ components:
           example:
             env: prod
             owner: agent-7
+
+    ResumeResponse:
+      type: object
+      description: Returned by `POST /sandboxes/{id}/resume`.
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [active]
+        access_token:
+          type: string
+          description: Fresh access token; use this instead of the one from create.
 
     ExecStreamEvent:
       type: object
@@ -519,7 +478,7 @@ components:
         command:
           type: string
           minLength: 1
-          description: Command to execute. Wrapped in `/bin/sh -c` unless `args` is provided.
+          description: Command to execute via shell, unless `args` is provided.
         args:
           type: array
           items:
@@ -532,7 +491,7 @@ components:
           description: Environment variables for the command.
         working_dir:
           type: string
-          description: Working directory (default /home/user).
+          description: Working directory (default `/home/user`).
         timeout_s:
           type: integer
           default: 30
@@ -572,33 +531,17 @@ components:
 
     SandboxPatch:
       type: object
-      description: |
-        Partial update body for `PATCH /sandboxes/{sandbox_id}`. Each
-        top-level field is optional; only fields that are present are
-        applied. Omitted fields are left unchanged. Nested objects are
-        full replacements when present — to clear a list, send it as an
-        empty array.
-
-        At least one top-level field must be set, otherwise the request
-        is rejected with `400`. Unknown fields are also rejected with
-        `400`.
+      description: Partial update body for `PATCH /sandboxes/{sandbox_id}`.
       properties:
         network:
           allOf:
             - $ref: "#/components/schemas/NetworkConfig"
-          description: |
-            Replace the sandbox's egress rules. The sandbox must be in
-            the `active` state. The provided `allow_out` and `deny_out`
-            lists fully replace whatever was previously configured.
+          description: Replace egress rules. Sandbox must be `active`.
         metadata:
           type: object
           additionalProperties:
             type: string
-          description: |
-            Replace the sandbox's metadata tags. Fully replaces the existing
-            metadata — omitted keys are removed. Can be patched regardless of
-            sandbox state. Same validation limits as on create (64 keys,
-            256-byte keys, 2 KB values, 16 KB total).
+          description: Replace metadata tags. Same limits as on create.
       example:
         metadata:
           env: prod

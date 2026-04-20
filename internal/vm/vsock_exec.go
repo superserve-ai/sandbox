@@ -180,6 +180,7 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 
 var boxdInitClient = &http.Client{Timeout: 5 * time.Second}
 
+
 // postBoxdInit sends sandbox-level environment variables to boxd's /init
 // endpoint. These vars are injected into every process boxd spawns.
 func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string) error {

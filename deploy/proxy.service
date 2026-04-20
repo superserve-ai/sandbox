@@ -12,11 +12,10 @@ RestartSec=2
 Environment=PROXY_ADDR=:5007
 Environment=PROXY_REDIRECT_ADDR=:5008
 Environment=VMD_ADDR=http://127.0.0.1:9090
-Environment=PROXY_DOMAIN=sandbox.superserve.ai
-# Load environment from env file. Overrides PROXY_DOMAIN above and adds SANDBOX_ACCESS_TOKEN_SEED,
-# TERMINAL_ALLOWED_ORIGINS, REQUIRE_DATA_PLANE. Leading `-` makes the file optional —
+# Load host-local overrides (SANDBOX_ACCESS_TOKEN_SEED, PROXY_ALLOWED_ORIGINS,
+# REQUIRE_DATA_PLANE) from an env file. Leading `-` makes the file optional —
 # the proxy still starts without it, but data-plane endpoints will be disabled.
-EnvironmentFile=-/etc/superserve/proxy.env
+EnvironmentFile=-/etc/sandbox/proxy.env
 
 # Run as a dedicated unprivileged user
 DynamicUser=yes

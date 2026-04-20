@@ -1,0 +1,31 @@
+[Unit]
+Description=Superserve VM Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vmd
+
+# DO NOT add ExecStartPre commands that kill Firecracker processes or
+# remove network namespaces. VMs are managed by systemd units
+# (firecracker@.service) and must survive VMD restarts.
+
+# mixed: send SIGTERM to the main process only. Do NOT kill the cgroup
+# (which would include firecracker@ units if they were children — they
+# aren't in systemd mode, but this is defense-in-depth).
+KillMode=process
+Restart=always
+RestartSec=2
+
+# Environment
+EnvironmentFile=/etc/sandbox/vmd.env
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vmd
+
+[Install]
+WantedBy=multi-user.target

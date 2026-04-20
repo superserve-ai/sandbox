@@ -1,6 +1,10 @@
 -- name: CreateSandbox :one
-INSERT INTO sandbox (team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+-- ID is supplied by the caller (generated in Go via uuid.New()) rather
+-- than defaulted in SQL, so the caller can parallelize this INSERT with
+-- the VMD CreateVM call — both need the same sandbox_id and generating
+-- it client-side lets them run concurrently instead of strictly serially.
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING *;
 
 -- name: GetSandbox :one
@@ -59,6 +63,70 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
 -- name: SandboxExists :one
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
+
+-- name: ListSandboxesByHost :many
+-- Used by the VMD reconciler. snapshot_path is joined so the idle-sandbox
+-- drift check can stat the file without a per-row snapshot lookup.
+SELECT sqlc.embed(s), snap.path AS snapshot_path
+FROM sandbox s
+LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
+WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
+
+-- name: MarkSandboxFailed :exec
+-- Used by the reconciler to mark a sandbox failed when VMD detects it is
+-- actually gone. No team_id filter — the reconciler runs with host scope,
+-- not team scope.
+UPDATE sandbox
+SET status = 'failed', updated_at = now()
+WHERE id = $1 AND destroyed_at IS NULL;
+
+-- name: BeginPause :one
+-- Atomic ownership + state check + transition to 'pausing'. Replaces the
+-- GetSandbox → check status → UpdateSandboxStatus sequence on the pause
+-- hot path, collapsing two DB roundtrips into one. The WHERE clause
+-- enforces the invariant (only active, non-deleted sandboxes owned by
+-- this team can be paused); a 0-row result means "no such sandbox OR
+-- wrong team OR not currently active", and the caller disambiguates via
+-- a fallback GetSandbox in the rare error path.
+UPDATE sandbox
+SET status = 'pausing', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
+RETURNING *;
+
+-- name: FinalizePause :one
+-- Atomically insert the snapshot row, link it to the sandbox, and flip
+-- status from 'pausing' to 'idle'. Replaces the sequence
+-- CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
+-- three DB roundtrips into one.
+--
+-- The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
+-- in the same query. This prevents the common race where a sandbox is
+-- soft-deleted before FinalizePause runs — without the gate, the CTE
+-- INSERT would always execute (per PostgreSQL's rule that data-modifying
+-- CTEs run independently of the main query), producing an orphan snapshot
+-- row and a snapshot file on disk with no owner. A concurrent delete that
+-- commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
+-- can still race, but that window is microseconds and the resulting
+-- orphan is detectable/cleanable by a background job.
+--
+-- When either the sandbox is missing/deleted or the INSERT did not fire,
+-- the query returns 0 rows and the caller maps that to ErrSandboxGone.
+WITH target AS (
+  SELECT id, team_id FROM sandbox
+  WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+),
+new_snapshot AS (
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
+  SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
+  RETURNING snapshot.id AS snap_id
+)
+UPDATE sandbox
+SET snapshot_id = (SELECT snap_id FROM new_snapshot),
+    status = 'idle',
+    updated_at = now()
+FROM new_snapshot
+WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+RETURNING new_snapshot.snap_id::uuid AS snapshot_id;
 
 -- name: ListIdleSandboxes :many
 SELECT * FROM sandbox
