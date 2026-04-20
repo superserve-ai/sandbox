@@ -417,16 +417,8 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	sid := mustJSON(t, cw)["id"].(string)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
-		t.Fatalf("pause: expected 200, got %d: %s", pw.Code, pw.Body.String())
-	}
-	pb := mustJSON(t, pw)
-	if pb["status"] != "idle" {
-		t.Errorf("pause status = %q, want idle", pb["status"])
-	}
-	snapshotIDStr, ok := pb["snapshot_id"].(string)
-	if !ok || snapshotIDStr == "" {
-		t.Fatal("pause response missing snapshot_id")
+	if pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: expected 204, got %d: %s", pw.Code, pw.Body.String())
 	}
 
 	// DB: sandbox is idle, snapshot record exists and is linked.
@@ -439,10 +431,10 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 		t.Errorf("DB status = %q, want idle", sb.Status)
 	}
 	if !sb.SnapshotID.Valid {
-		t.Error("sandbox snapshot_id should be set after pause")
+		t.Fatal("sandbox snapshot_id should be set after pause")
 	}
 
-	snapID, _ := uuid.Parse(snapshotIDStr)
+	snapID := uuid.UUID(sb.SnapshotID.Bytes)
 	snap, err := testQueries.GetSnapshot(ctx, db.GetSnapshotParams{ID: snapID, TeamID: teamID})
 	if err != nil {
 		t.Fatalf("snapshot not found in DB: %v", err)
@@ -488,7 +480,7 @@ func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	}
 	sid := mustJSON(t, cw)["id"].(string)
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
@@ -622,7 +614,7 @@ func TestIntegration_ExecSandbox_AutoWakeIdleSandbox(t *testing.T) {
 	sid := mustJSON(t, cw)["id"].(string)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
@@ -750,7 +742,7 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 	sandboxID, _ := uuid.Parse(sid)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
@@ -867,7 +859,7 @@ func TestIntegration_PatchSandbox_Network_NotActive(t *testing.T) {
 	sid := mustJSON(t, cw)["id"].(string)
 	// Pause it so it's in idle state.
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 

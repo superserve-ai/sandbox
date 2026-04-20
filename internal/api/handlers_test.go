@@ -1099,19 +1099,14 @@ func TestPauseSandbox_Success(t *testing.T) {
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
 
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
 	}
 	if !pauseCalled {
 		t.Error("VMD.PauseInstance was not called")
 	}
-
-	body := parseJSON(t, w)
-	if body["status"] != "idle" {
-		t.Errorf("status = %q, want %q", body["status"], "idle")
-	}
-	if body["snapshot_id"] != snapshotID.String() {
-		t.Errorf("snapshot_id = %q, want %q", body["snapshot_id"], snapshotID)
+	if w.Body.Len() != 0 {
+		t.Errorf("expected empty body on 204, got: %s", w.Body.String())
 	}
 }
 
