@@ -244,21 +244,3 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 	}, nil
 }
 
-// writeBuildMeta persists the build metadata (digest, size, timestamp)
-// next to the snapshot so it's discoverable on disk.
-func writeBuildMeta(dir string, br builder.BuildRootfsResult) {
-	meta := struct {
-		ResolvedDigest string `json:"resolved_digest"`
-		SizeBytes      int64  `json:"size_bytes"`
-		BuiltAt        string `json:"built_at"`
-	}{
-		ResolvedDigest: br.ResolvedDigest,
-		SizeBytes:      br.SizeBytes,
-		BuiltAt:        time.Now().UTC().Format(time.RFC3339),
-	}
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dir, "build.meta.json"), data, 0o644)
-}

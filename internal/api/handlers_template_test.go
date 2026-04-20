@@ -176,6 +176,3 @@ func TestCanonicalSpecHash_DistinctForDifferentSpecs(t *testing.T) {
 		t.Fatalf("different specs produced same hash: %s", ha)
 	}
 }
-
-// shellQuote + isSafeCopyDst live in internal/vm (build_exec.go); their
-// tests belong there. See internal/vm/build_exec_test.go.
