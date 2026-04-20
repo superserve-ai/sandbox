@@ -91,6 +91,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok"}`)
 }
 
+// handleInit accepts sandbox-level environment variables from VMD after boot.
+// POST /init with JSON body {"env_vars": {"KEY": "VALUE", ...}}.
 func handleInit(env *sandboxEnv) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -103,7 +105,7 @@ func handleInit(env *sandboxEnv) http.HandlerFunc {
 			EnvVars map[string]string `json:"env_vars"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
 

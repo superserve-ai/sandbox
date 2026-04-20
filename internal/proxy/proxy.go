@@ -70,6 +70,36 @@ type Handler struct {
 
 	// filesEnabled controls whether /files on boxdPort is served.
 	filesEnabled bool
+
+	// allowedOrigins is the set of browser origins allowed for CORS on
+	// data-plane endpoints (/files). Shared with the terminal origin check.
+	allowedOrigins []string
+}
+
+// originAllowed checks whether the given Origin header matches one of the
+// configured allowed origins. Supports "*" (allow all) and "*.domain.tld"
+// wildcards. Patterns without the leading "." after "*" are rejected —
+// "*domain.tld" would otherwise match "evildomain.tld".
+func (h *Handler) originAllowed(origin string) bool {
+	for _, pattern := range h.allowedOrigins {
+		if pattern == "*" {
+			return true
+		}
+		if pattern == origin {
+			return true
+		}
+		if !strings.HasPrefix(pattern, "*.") {
+			continue
+		}
+		suffix := strings.TrimPrefix(pattern, "*") // keeps leading "."
+		if strings.HasSuffix(origin, suffix) {
+			return true
+		}
+		if parts := strings.SplitN(origin, "://", 2); len(parts) == 2 && strings.HasSuffix(parts[1], suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host

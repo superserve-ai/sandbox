@@ -42,7 +42,7 @@ func (r *stubRows) Scan(dest ...any) error {
 	*dest[1].(*uuid.UUID) = row.TeamID
 	*dest[2].(*string) = row.Name
 	*dest[3].(*pgtype.UUID) = row.SnapshotID
-	*dest[4].(**string) = row.HostID
+	*dest[4].(*string) = row.HostID
 	return nil
 }
 
@@ -78,8 +78,14 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 	if m.queryRowFn != nil {
 		return m.queryRowFn(ctx, sql, args...)
 	}
-	// Route by SQL content: snapshot insert vs activity insert.
-	if strings.Contains(sql, "snapshot") {
+	// Route by SQL content:
+	//   - FinalizePause returns only a single snapshot_id uuid
+	//   - legacy CreateSnapshot returns a full Snapshot row
+	//   - activity insert returns an activity row
+	switch {
+	case strings.Contains(sql, "new_snapshot AS"):
+		return finalizePauseRow(uuid.New())
+	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
 	}
 	return activityRow()
@@ -144,28 +150,31 @@ func TestReaper_NothingExpired(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	if atomic.LoadInt32(&pauseCalled) != 0 {
 		t.Fatal("PauseInstance should not be called when no sandboxes are expired")
 	}
 }
 
-// TestReaper_VMDSucceeds verifies that a claimed sandbox triggers a VMD pause,
-// snapshot creation, and status update to idle.
+// TestReaper_VMDSucceeds verifies that a claimed sandbox triggers a VMD
+// pause followed by the atomic FinalizePause bookkeeping query.
 func TestReaper_VMDSucceeds(t *testing.T) {
 	row := expiredRow("sbx-a")
 	var pausedID string
-	var execCalls []string
+	var finalizeCalls int32
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
 			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
 				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
 			},
-			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-				execCalls = append(execCalls, sql)
-				return pgconn.CommandTag{}, nil
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				if strings.Contains(sql, "new_snapshot AS") {
+					atomic.AddInt32(&finalizeCalls, 1)
+					return finalizePauseRow(uuid.New())
+				}
+				return activityRow()
 			},
 		},
 		&stubVMD{pauseFn: func(_ context.Context, id string, _ string) (string, string, error) {
@@ -174,15 +183,13 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	if pausedID != row.ID.String() {
 		t.Fatalf("expected PauseInstance called with %s, got %q", row.ID, pausedID)
 	}
-
-	// Expect SetSandboxSnapshot and UpdateSandboxStatus(idle) execs.
-	if len(execCalls) < 2 {
-		t.Fatalf("expected at least 2 exec calls (SetSandboxSnapshot + UpdateSandboxStatus), got %d", len(execCalls))
+	if got := atomic.LoadInt32(&finalizeCalls); got != 1 {
+		t.Fatalf("expected exactly 1 FinalizePause call, got %d", got)
 	}
 }
 
@@ -216,7 +223,7 @@ func TestReaper_VMDFails(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	// Both sandboxes should be attempted even though VMD fails.
 	if got := atomic.LoadInt32(&pauseCallCount); got != 2 {
@@ -245,7 +252,7 @@ func TestReaper_DBError(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	if atomic.LoadInt32(&pauseCalled) != 0 {
 		t.Fatal("PauseInstance should not be called when DB query fails")
@@ -272,7 +279,7 @@ func TestReaper_BatchSizeRespected(t *testing.T) {
 		&stubVMD{},
 	)
 
-	h.reapOnce(context.Background(), 7)
+	h.reapOnce(context.Background(), 7, 1)
 
 	if got := atomic.LoadInt32(&capturedLimit); got != 7 {
 		t.Fatalf("expected batch size 7 passed to query, got %d", got)
@@ -304,7 +311,7 @@ func TestReaper_ContextCancelledMidBatch(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(ctx, 10)
+	h.reapOnce(ctx, 10, 1)
 
 	// The loop checks ctx.Done() between each sandbox. After cancel() the loop
 	// should exit before processing all 5.

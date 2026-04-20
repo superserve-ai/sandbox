@@ -3,11 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,25 +21,29 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// VMDClient defines the subset of the VM daemon gRPC interface used by the
-// control plane. This is satisfied by the gRPC adapter in cmd/controlplane.
-type VMDClient interface {
-	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
-	DestroyInstance(ctx context.Context, instanceID string, force bool) error
-	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
-	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
-	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
-	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+// VMDClient is the interface for talking to a VM daemon.
+type VMDClient = vmdclient.Client
+
+// Scheduler selects a host for new sandboxes.
+type Scheduler interface {
+	SelectHost(ctx context.Context) (hostID string, err error)
+}
+
+// HostRegistry resolves a host ID to a VMD client.
+type HostRegistry interface {
+	ClientFor(ctx context.Context, hostID string) (vmdclient.Client, error)
 }
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	VMD    VMDClient
-	DB     *db.Queries
-	Config *config.Config
+	VMD       VMDClient     // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
+	DB        *db.Queries
+	Config    *config.Config
+	Hosts     HostRegistry  // when set, routes VMD calls via host_id
+	Scheduler Scheduler     // when set, picks host on create
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -47,6 +53,21 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 		DB:     queries,
 		Config: cfg,
 	}
+}
+
+func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
+	if h.Hosts == nil {
+		return h.VMD, nil
+	}
+	c, err := h.Hosts.ClientFor(ctx, hostID)
+	if err == nil {
+		return c, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) && h.VMD != nil {
+		log.Warn().Err(err).Str("host_id", hostID).Msg("unknown host row; falling back to default VMD client")
+		return h.VMD, nil
+	}
+	return nil, err
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -134,9 +155,16 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 		case db.SandboxStatusActive:
 			// Ready.
 		case db.SandboxStatusIdle:
+			vmd, vmdErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+			if vmdErr != nil {
+				log.Error().Err(vmdErr).Str("sandbox_id", sandboxID.String()).Msg("auto-wake resolve VMD failed")
+				respondError(c, ErrInternal)
+				c.Abort()
+				return
+			}
 			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 			defer vmdCancel()
-			if _, _, _, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), "", "", nil); err != nil {
+			if err := h.wakeIdleSandbox(vmdCtx, vmd, &sandbox); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake ResumeInstance failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -159,7 +187,7 @@ func (h *Handlers) AutoWake() gin.HandlerFunc {
 				return
 			}
 			// Reapply persisted egress rules — nftables + proxy state are fresh after restore.
-			if err := h.reapplyNetworkConfig(postCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+			if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("auto-wake reapply network config failed")
 				respondError(c, ErrInternal)
 				c.Abort()
@@ -183,6 +211,49 @@ func sandboxFromContext(c *gin.Context) *db.Sandbox {
 	return sb
 }
 
+// wakeIdleSandbox transparently brings an idle sandbox back online. It first
+// tries the stateful ResumeInstance path. If VMD has no record of the VM
+// (typically after a VMD restart that lost the in-memory map), it falls back
+// to the stateless RestoreSnapshot path using the snapshot files from the DB.
+//
+// The fallback is only attempted when:
+//   - VMD returned NotFound
+//   - The sandbox has a linked snapshot row
+//   - The snapshot file is still readable on disk
+func (h *Handlers) wakeIdleSandbox(ctx context.Context, vmd VMDClient, sandbox *db.Sandbox) error {
+	sandboxID := sandbox.ID.String()
+	_, _, _, err := vmd.ResumeInstance(ctx, sandboxID, "", "", nil)
+	if err == nil {
+		return nil
+	}
+	if !isVMDNotFound(err) || !sandbox.SnapshotID.Valid {
+		return err
+	}
+
+	snap, snapErr := h.DB.GetSnapshot(ctx, db.GetSnapshotParams{
+		ID:     sandbox.SnapshotID.Bytes,
+		TeamID: sandbox.TeamID,
+	})
+	if snapErr != nil {
+		return err
+	}
+
+	memPath := resolveMemPath(snap)
+	log.Warn().Str("sandbox_id", sandboxID).Msg("auto-wake ResumeInstance NotFound, falling back to stateless restore")
+	_, _, _, err = vmd.RestoreSnapshot(ctx, sandboxID, snap.Path, memPath)
+	return err
+}
+
+// resolveMemPath returns the memory snapshot path from a Snapshot record.
+// Uses the stored mem_path column if set, otherwise falls back to the
+// convention of placing mem.snap alongside the vmstate snapshot.
+func resolveMemPath(snap db.Snapshot) string {
+	if snap.MemPath != nil && *snap.MemPath != "" {
+		return *snap.MemPath
+	}
+	return filepath.Join(filepath.Dir(snap.Path), "mem.snap")
+}
+
 // persistedEgressConfig mirrors the jsonb shape stored in sandbox.network_config.
 type persistedEgressConfig struct {
 	Egress struct {
@@ -199,7 +270,7 @@ type persistedEgressConfig struct {
 //
 // Uses a caller-supplied context so the caller controls timeout/cancellation.
 // Silently returns nil if there is no persisted config (default allow-all).
-func (h *Handlers) reapplyNetworkConfig(ctx context.Context, sandboxID string, raw []byte) error {
+func (h *Handlers) reapplyNetworkConfig(ctx context.Context, vmd VMDClient, sandboxID string, raw []byte) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -215,7 +286,7 @@ func (h *Handlers) reapplyNetworkConfig(ctx context.Context, sandboxID string, r
 		return nil
 	}
 
-	return h.VMD.UpdateSandboxNetwork(ctx, sandboxID,
+	return vmd.UpdateSandboxNetwork(ctx, sandboxID,
 		cfg.Egress.AllowedCIDRs,
 		cfg.Egress.DeniedCIDRs,
 		cfg.Egress.AllowedDomains,
@@ -307,7 +378,10 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), sandbox.SnapshotID.Bytes)
+	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
+		ID:     sandbox.SnapshotID.Bytes,
+		TeamID: teamID,
+	})
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
 		respondError(c, ErrInternal)
@@ -315,17 +389,44 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	}
 
 	snapshotPath := snapshot.Path
-	memPath := filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
+	memPath := resolveMemPath(snapshot)
+
+	// Resolve the VMD client for this sandbox's host.
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
+		respondError(c, ErrInternal)
+		return
+	}
 
 	// Resume the VM. Cancellation of this call still follows the request
 	// context — if the client hangs up mid-resume, abort the VMD call.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := h.VMD.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
-		respondError(c, ErrInternal)
-		return
+		if isVMDNotFound(err) {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
+				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+			if err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
+				respondError(c, ErrInternal)
+				return
+			}
+		} else {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+
+	// The fallback may have returned 0 for vcpu/mem. Fall back to the DB values.
+	if actualVcpu == 0 {
+		actualVcpu = uint32(sandbox.VcpuCount)
+	}
+	if actualMemMiB == 0 {
+		actualMemMiB = uint32(sandbox.MemoryMib)
 	}
 
 	// Past this point the VM is running. Detach from cancellation so a
@@ -355,7 +456,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 
 	// Reapply persisted egress rules — the nftables rules and proxy state
 	// are fresh after a snapshot restore, so user rules must be re-pushed.
-	if err := h.reapplyNetworkConfig(postCtx, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
 		respondError(c, ErrInternal)
 		return
@@ -365,11 +466,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	h.updateLastActivityAsync(c.Request.Context(), sandboxID, teamID)
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
-	sandbox.Status = db.SandboxStatusActive
-	sandbox.VcpuCount = int32(actualVcpu)
-	sandbox.MemoryMib = int32(actualMemMiB)
-	sandbox.IpAddress = ipAddr
-	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
+	resp := gin.H{
+		"id":     sandboxID.String(),
+		"status": string(db.SandboxStatusActive),
+	}
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,12 +508,24 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 
 	// Destroy the VM (skip if sandbox never booted).
 	if sandbox.Status != db.SandboxStatusFailed {
-		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-		defer vmdCancel()
-		if err := h.VMD.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
+		vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+		if vmdLookupErr != nil {
+			log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete failed")
 			respondError(c, ErrInternal)
 			return
+		}
+		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+		defer vmdCancel()
+		if err := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
+			// Delete is idempotent — if the VM is already gone, proceed
+			// with DB cleanup instead of failing the request.
+			if isVMDNotFound(err) {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance: VM already gone, proceeding with DB cleanup")
+			} else {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 	}
 
@@ -465,7 +581,7 @@ type createSandboxRequest struct {
 	// Strings only — no nested objects, numbers, or arrays. This is
 	// deliberate: it keeps URL filters unambiguous (no "is 42 the number
 	// or the string?" questions) and matches what every other tagging
-	// system in this space does (E2B, AWS tags, GCE labels, k8s labels).
+	// system in this space does (AWS tags, GCE labels, k8s labels).
 	//
 	// Limits are enforced by validateMetadata: 64 keys, 256-byte keys,
 	// 2 KB values, 16 KB total. Keys starting with `superserve.` or
@@ -503,9 +619,6 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 		CreatedAt: s.CreatedAt,
 		Metadata:  decodeMetadata(s.Metadata),
 	}
-	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
-	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
 		resp.SnapshotID = &id
@@ -531,6 +644,14 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 				}
 			}
 		}
+	}
+	return resp
+}
+
+func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox) sandboxResponse {
+	resp := h.sandboxToResponse(s)
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
 	}
 	return resp
 }
@@ -599,9 +720,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
-		r := h.sandboxToResponse(s)
-		r.AccessToken = ""
-		out[i] = r
+		out[i] = h.sandboxToResponse(s)
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -664,7 +783,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, h.sandboxToResponse(sandbox))
+	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(sandbox))
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
@@ -743,40 +862,71 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return
 		}
 
-		snapshot, err := h.DB.GetSnapshot(c.Request.Context(), snapUUID)
+		snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
+			ID:     snapUUID,
+			TeamID: teamID,
+		})
 		if err != nil {
-			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
-			return
-		}
-		if snapshot.TeamID != teamID {
 			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 			return
 		}
 
 		snapshotID = pgtype.UUID{Bytes: snapUUID, Valid: true}
 		snapshotPath = snapshot.Path
-		snapshotMemPath = filepath.Join(filepath.Dir(snapshotPath), "mem.snap")
+		snapshotMemPath = resolveMemPath(snapshot)
 	}
 
-	// Insert sandbox with status=starting. VcpuCount and MemoryMib use
-	// minimal placeholders (1) to satisfy the DB CHECK constraint. The
-	// real values come from VMD's CreateVMResponse and are written by
-	// ActivateSandbox once the VM boots.
-	sandbox, err := h.DB.CreateSandbox(c.Request.Context(), db.CreateSandboxParams{
-		TeamID:         teamID,
-		Name:           req.Name,
-		Status:         db.SandboxStatusStarting,
-		VcpuCount:      1,
-		MemoryMib:      1,
-		SnapshotID:     snapshotID,
-		TimeoutSeconds: req.TimeoutSeconds,
-		Metadata:       metadataJSON,
-	})
-	if err != nil {
-		log.Error().Err(err).Msg("failed to create sandbox record")
+	// Select a host for this sandbox.
+	var hostID string
+	if h.Scheduler != nil {
+		hostID, err = h.Scheduler.SelectHost(c.Request.Context())
+		if err != nil {
+			log.Error().Err(err).Msg("scheduler SelectHost failed")
+			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
+			return
+		}
+	} else if h.Config != nil && h.Config.DefaultHostID != "" {
+		hostID = h.Config.DefaultHostID
+	} else {
+		hostID = "default"
+	}
+
+	// Resolve the VMD client up front so we don't waste a DB INSERT on
+	// a host we can't reach.
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), hostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Msg("resolve VMD for create failed")
 		respondError(c, ErrInternal)
 		return
 	}
+
+	// Generate the sandbox ID in Go so the DB INSERT and the VMD call
+	// can run in parallel — both need the same ID and neither needs to
+	// wait on the other. This hides the ~10-20ms INSERT roundtrip behind
+	// VMD's ~100-200ms create latency, shaving that much off the p50.
+	sandboxID := uuid.New()
+
+	insertCtx := context.WithoutCancel(c.Request.Context())
+	type insertResult struct {
+		sandbox db.Sandbox
+		err     error
+	}
+	insertCh := make(chan insertResult, 1)
+	go func() {
+		sb, insertErr := h.DB.CreateSandbox(insertCtx, db.CreateSandboxParams{
+			ID:             sandboxID,
+			TeamID:         teamID,
+			Name:           req.Name,
+			Status:         db.SandboxStatusStarting,
+			VcpuCount:      1, // placeholders; real values land via ActivateSandbox
+			MemoryMib:      1,
+			HostID:         hostID,
+			SnapshotID:     snapshotID,
+			TimeoutSeconds: req.TimeoutSeconds,
+			Metadata:       metadataJSON,
+		})
+		insertCh <- insertResult{sandbox: sb, err: insertErr}
+	}()
 
 	// Boot the VM synchronously — the client gets a response only after
 	// the sandbox is fully running and ready to use. This call is still
@@ -789,17 +939,38 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var actualVcpu, actualMemMiB uint32
 	var vmdErr error
 	if req.FromSnapshot != nil {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.ResumeInstance(vmdCtx, sandbox.ID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
 	} else {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = h.VMD.CreateInstance(vmdCtx, sandbox.ID.String(),
+		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),
 			0, 0, 0, nil, req.EnvVars)
 	}
-	if vmdErr != nil {
+
+	// Wait for the parallel INSERT to complete — its result determines
+	// how we handle a VMD failure (mark row failed vs. nothing to mark).
+	insertRes := <-insertCh
+	sandbox := insertRes.sandbox
+	dbErr := insertRes.err
+
+	switch {
+	case dbErr != nil && vmdErr != nil:
+		// Both failed — nothing persisted, nothing to clean up.
+		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
+		respondError(c, ErrInternal)
+		return
+	case dbErr != nil:
+		// DB insert failed but VMD succeeded — destroy the orphan VM so
+		// it doesn't linger on the host. Use a detached context so client
+		// disconnect doesn't leak the VM.
+		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed, destroying orphan VM")
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+		cleanupCancel()
+		respondError(c, ErrInternal)
+		return
+	case vmdErr != nil:
+		// VMD failed but DB row exists — mark it failed so the reaper
+		// doesn't leave it stuck in "starting".
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-		// Mark the row failed using a cancellation-detached context so a
-		// disconnected client does not leave the sandbox stuck in
-		// "starting", but keep trace context so the failure write shows
-		// up in the same request span.
 		failCtx, failCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
 		defer failCancel()
 		_ = h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
@@ -832,30 +1003,44 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
-	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
-		ID:        sandbox.ID,
-		VcpuCount: int32(actualVcpu),
-		MemoryMib: int32(actualMemMiB),
-		IpAddress: ipAddr,
-		TeamID:    teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
-	}
+	// ActivateSandbox (DB UPDATE) and network rule application (VMD call
+	// + DB UPDATE) are independent — both read VMD's result and write to
+	// their own sink. Run them in parallel so the response latency is
+	// max(activate, network) instead of activate + network.
+	hasNetworkRules := req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0)
 
-	// Apply network rules if provided at creation.
-	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		var allowedCIDRs, allowedDomains []string
-		for _, entry := range req.Network.AllowOut {
-			if isIPOrCIDR(entry) {
-				allowedCIDRs = append(allowedCIDRs, entry)
-			} else {
-				allowedDomains = append(allowedDomains, entry)
-			}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
+			ID:        sandbox.ID,
+			VcpuCount: int32(actualVcpu),
+			MemoryMib: int32(actualMemMiB),
+			IpAddress: ipAddr,
+			TeamID:    teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 		}
+	}()
 
-		if err := h.VMD.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
-		} else {
+	if hasNetworkRules {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var allowedCIDRs, allowedDomains []string
+			for _, entry := range req.Network.AllowOut {
+				if isIPOrCIDR(entry) {
+					allowedCIDRs = append(allowedCIDRs, entry)
+				} else {
+					allowedDomains = append(allowedDomains, entry)
+				}
+			}
+
+			if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
+				return
+			}
 			networkConfig, _ := json.Marshal(map[string]any{
 				"egress": map[string]any{
 					"allowed_cidrs":   allowedCIDRs,
@@ -868,13 +1053,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				NetworkConfig: networkConfig,
 				TeamID:        teamID,
 			})
-		}
+		}()
 	}
+	wg.Wait()
 
 	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
 
 	sandbox.Status = db.SandboxStatusActive
-	resp := h.sandboxToResponse(sandbox)
+	resp := h.sandboxToResponseWithToken(sandbox)
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
@@ -896,34 +1082,43 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Verify sandbox exists and belongs to this team.
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+	// Atomic ownership + state check + transition to 'pausing'. Collapses
+	// GetSandbox + UpdateStatus into a single DB roundtrip on the happy
+	// path. An empty result means the sandbox either doesn't exist, isn't
+	// ours, or isn't currently active — we do a cheap existence check to
+	// return the right error code (404 vs 409).
+	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if err != pgx.ErrNoRows {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		// Disambiguate: missing row (404) vs wrong state (409).
+		exists, existsErr := h.DB.SandboxExists(c.Request.Context(), db.SandboxExistsParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		if existsErr != nil {
+			log.Error().Err(existsErr).Str("sandbox_id", sandboxID.String()).Msg("DB SandboxExists (pause fallback) failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if !exists {
 			respondError(c, ErrSandboxNotFound)
 			return
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Only active sandboxes can be paused.
-	if sandbox.Status != db.SandboxStatusActive {
 		respondError(c, ErrInvalidState)
 		return
 	}
 
-	// Mark as pausing before calling VMD.
-	if err := h.DB.UpdateSandboxStatus(c.Request.Context(), db.UpdateSandboxStatusParams{
-		ID:     sandboxID,
-		Status: db.SandboxStatusPausing,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus(pausing) failed")
+	// Resolve the VMD client for this sandbox's host.
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for pause failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -931,8 +1126,18 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Call VMD to pause and snapshot the VM.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	snapshotPath, memPath, err := h.VMD.PauseInstance(vmdCtx, sandboxID.String(), "")
+	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sandboxID.String(), "")
 	if err != nil {
+		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
+		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
+		// already dead, "active" was a lie.
+		if isVMDNotFound(err) {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
+			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID)
+			respondError(c, ErrSandboxGone)
+			return
+		}
+
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance failed")
 		// Revert status to active asynchronously. Detach cancellation so
 		// the revert survives client disconnect, but keep trace context
@@ -953,9 +1158,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// TODO: store memPath in snapshot table (requires adding a mem_path column to the
-	// snapshot schema). For now, ResumeSandbox derives it via
-	// filepath.Join(filepath.Dir(snapshotPath), "mem.snap") by convention.
 	log.Debug().
 		Str("sandbox_id", sandboxID.String()).
 		Str("snapshot_path", snapshotPath).
@@ -969,40 +1171,32 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Create snapshot record in DB.
+	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
+	// the sandbox, and flip status from pausing → idle in a single CTE.
+	// Collapses three DB roundtrips into one.
 	triggerName := "pause"
-	snapshot, err := h.DB.CreateSnapshot(postCtx, db.CreateSnapshotParams{
-		SandboxID: sandboxID,
+	_, err = h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+		ID:        sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
+		MemPath:   &memPath,
 		SizeBytes: 0,
 		Saved:     false,
 		Name:      &triggerName,
 		Trigger:   triggerName,
 	})
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB CreateSnapshot failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Link snapshot to sandbox and mark as idle.
-	if err := h.DB.SetSandboxSnapshot(postCtx, db.SetSandboxSnapshotParams{
-		ID:         sandboxID,
-		SnapshotID: pgtype.UUID{Bytes: snapshot.ID, Valid: true},
-		TeamID:     teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB SetSandboxSnapshot failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	if err := h.DB.UpdateSandboxStatus(postCtx, db.UpdateSandboxStatusParams{
-		ID:     sandboxID,
-		Status: db.SandboxStatusIdle,
-		TeamID: teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxStatus(idle) failed")
+		// ErrNoRows here means the sandbox was soft-deleted between
+		// BeginPause and FinalizePause (a rare race with DeleteSandbox).
+		// The VM is already stopped and its snapshot files are on disk —
+		// we can't finalize bookkeeping for a sandbox that no longer
+		// exists, so return 410 Gone.
+		if err == pgx.ErrNoRows {
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("FinalizePause: sandbox deleted mid-pause")
+			respondError(c, ErrSandboxGone)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB FinalizePause failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -1010,12 +1204,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Async observability.
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
-	c.JSON(http.StatusOK, gin.H{
-		"id":          sandboxID.String(),
-		"name":        sandbox.Name,
-		"status":      "idle",
-		"snapshot_id": snapshot.ID.String(),
-	})
+	c.Status(http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,11 +1238,24 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		req.TimeoutS = 30
 	}
 
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for exec failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
 	start := time.Now()
-	stdout, stderr, exitCode, err := h.VMD.ExecCommand(c.Request.Context(), sandbox.ID.String(),
+	stdout, stderr, exitCode, err := vmd.ExecCommand(c.Request.Context(), sandbox.ID.String(),
 		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS))
 	durationMs := int32(time.Since(start).Milliseconds())
 	if err != nil {
+		if isVMDNotFound(err) {
+			log.Warn().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand: VM unavailable, marking sandbox failed")
+			h.markSandboxFailedAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
+			respondError(c, ErrSandboxGone)
+			return
+		}
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand failed")
 		respondError(c, ErrInternal)
 		return
@@ -1169,10 +1371,18 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			}
 		}
 
+		// Resolve the VMD client for this sandbox's host.
+		vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+		if vmdLookupErr != nil {
+			log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for patch failed")
+			respondError(c, ErrInternal)
+			return
+		}
+
 		// Apply rules to the running VM via VMD.
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 		defer vmdCancel()
-		if err := h.VMD.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
+		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
 			respondError(c, ErrInternal)
 			return
@@ -1304,10 +1514,6 @@ func validateMetadata(md map[string]string) error {
 		return fmt.Errorf("metadata has %d keys, max is %d", len(md), metadataMaxKeys)
 	}
 
-	// Track total size as we iterate so we can fail fast on the offending
-	// key rather than re-marshalling at the end. The size is approximate
-	// (it doesn't include json punctuation) but the cap is conservative
-	// enough that the difference doesn't matter.
 	totalBytes := 0
 	for k, v := range md {
 		if k == "" {
@@ -1333,6 +1539,8 @@ func validateMetadata(md map[string]string) error {
 	return nil
 }
 
+// Env var validation limits. Same key count cap as metadata; values are
+// larger (API keys, connection strings) so 8 KB per value, 64 KB total.
 const (
 	envVarsMaxKeys       = 64
 	envVarsMaxKeyLen     = 256

@@ -15,11 +15,16 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
+	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostreg"
+	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -69,13 +74,37 @@ func run() error {
 	// Build handlers and router.
 	vmdClient := newGRPCVMDClient(grpcConn)
 	queries := dbq.New(dbPool)
+
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
+
+	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
+	// Interceptors below fire onDead on codes.Unavailable so the registry
+	// drops stale cached clients.
+	dialVMD := func(addr string, onDead func()) (vmdclient.Client, error) {
+		conn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithUnaryInterceptor(deadHostUnaryInterceptor(onDead)),
+			grpc.WithStreamInterceptor(deadHostStreamInterceptor(onDead)),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return newGRPCVMDClient(conn), nil
+	}
+	handlers.Hosts = hostreg.New(queries, dialVMD)
+	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
+
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
 	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+
+	// Launch the host health detector. Marks active hosts as unhealthy
+	// when their VMD heartbeat goes stale (>2 min). The scheduler
+	// excludes unhealthy hosts from placement.
+	go api.StartHostDetector(ctx, queries)
 
 	// Start HTTP server.
 	srv := &http.Server{
@@ -198,6 +227,24 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 	return resp.IpAddress, actualVcpu, actualMemMiB, nil
 }
 
+// RestoreSnapshot is the stateless restore path — VMD creates a fresh VM
+// instance from the snapshot files, bypassing any in-memory state. Used as
+// a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
+// map to a crash but the snapshot files are still on disk).
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
+	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
+		VmId:         vmID,
+		SnapshotPath: snapshotPath,
+		MemFilePath:  memPath,
+	})
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
+	}
+	// RestoreSnapshotResponse doesn't carry ResourceLimits in the proto today,
+	// so we return 0,0 and let the caller keep the existing DB values.
+	return resp.IpAddress, 0, 0, nil
+}
+
 func (c *grpcVMDClient) ExecCommand(ctx context.Context, vmID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	stream, err := c.client.ExecCommand(ctx, &vmdpb.ExecCommandRequest{
 		VmId:           vmID,
@@ -272,4 +319,43 @@ func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, a
 		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
 	}
 	return nil
+}
+
+// deadHostUnaryInterceptor calls onDead when a unary RPC returns
+// codes.Unavailable.
+func deadHostUnaryInterceptor(onDead func()) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		if err != nil && grpcstatus.Code(err) == grpccodes.Unavailable && onDead != nil {
+			onDead()
+		}
+		return err
+	}
+}
+
+// deadHostStreamInterceptor is the streaming counterpart.
+func deadHostStreamInterceptor(onDead func()) grpc.StreamClientInterceptor {
+	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		cs, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			if grpcstatus.Code(err) == grpccodes.Unavailable && onDead != nil {
+				onDead()
+			}
+			return nil, err
+		}
+		return &deadHostClientStream{ClientStream: cs, onDead: onDead}, nil
+	}
+}
+
+type deadHostClientStream struct {
+	grpc.ClientStream
+	onDead func()
+}
+
+func (s *deadHostClientStream) RecvMsg(m any) error {
+	err := s.ClientStream.RecvMsg(m)
+	if err != nil && grpcstatus.Code(err) == grpccodes.Unavailable && s.onDead != nil {
+		s.onDead()
+	}
+	return err
 }

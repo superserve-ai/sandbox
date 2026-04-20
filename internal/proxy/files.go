@@ -92,10 +92,24 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		return
 	}
 
+	// CORS: allow browser-based file uploads from permitted origins.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		if h.originAllowed(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "3600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
 	// boxd's /files handler only implements GET (download) and POST
 	// (upload). Anything else is a client bug and should surface loudly.
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, OPTIONS")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -103,6 +117,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	}
+
 
 	// Path traversal rejection. boxd's own safePath runs filepath.Clean,
 	// which silently resolves `..` segments instead of refusing them —

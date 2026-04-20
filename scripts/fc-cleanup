@@ -1,0 +1,15 @@
+#!/bin/sh
+# fc-cleanup — post-stop cleanup for a Firecracker VM unit.
+# Called by ExecStopPost in firecracker@.service.
+#
+# Usage: fc-cleanup <sandbox-id>
+# RUN_DIR is inherited from the unit's EnvironmentFile.
+
+set -eu
+
+SANDBOX_ID="$1"
+SOCKET="${RUN_DIR}/${SANDBOX_ID}/firecracker.sock"
+
+rm -f "${SOCKET}"
+
+echo "fc-cleanup: cleaned up ${SANDBOX_ID}"
