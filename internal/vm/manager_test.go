@@ -56,9 +56,10 @@ func TestDeleteSnapshotFiles_UnderVMDir_OK(t *testing.T) {
 	if _, err := os.Stat(mem); !os.IsNotExist(err) {
 		t.Errorf("mem still exists: %v", err)
 	}
-	// Parent was empty → should be removed.
-	if _, err := os.Stat(filepath.Join(root, vmID)); !os.IsNotExist(err) {
-		t.Errorf("empty vm dir was not cleaned up: %v", err)
+	// The vm's own root dir is preserved — it belongs to the VM's lifecycle,
+	// not the snapshot's. Only strict descendants get the empty-dir cleanup.
+	if _, err := os.Stat(filepath.Join(root, vmID)); err != nil {
+		t.Errorf("vm dir should be preserved even when empty: %v", err)
 	}
 }
 
