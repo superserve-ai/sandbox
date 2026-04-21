@@ -85,6 +85,46 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox
 	return i, err
 }
 
+const beginResume = `-- name: BeginResume :one
+UPDATE sandbox
+SET status = 'resuming', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
+`
+
+type BeginResumeParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Atomic claim for resume: transitions 'paused' to 'resuming' in one
+// statement. A 0-row result means another resume (explicit or auto) has
+// already claimed the sandbox, or it's not in paused state. Used to
+// serialize concurrent /exec and /resume requests.
+func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, beginResume, arg.ID, arg.TeamID)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+	)
+	return i, err
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH expired AS (
   SELECT id, team_id, name, snapshot_id, host_id
@@ -493,6 +533,25 @@ WHERE id = $1 AND destroyed_at IS NULL
 // not team scope.
 func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, markSandboxFailed, id)
+	return err
+}
+
+const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
+UPDATE sandbox
+SET status = 'paused', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming'
+`
+
+type RevertResumeToPausedParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Compensate a failed resume attempt by flipping status back to 'paused'.
+// Guarded on status = 'resuming' so we never clobber a concurrent transition
+// (e.g., ActivateSandbox has already flipped to 'active').
+func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPausedParams) error {
+	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID)
 	return err
 }
 

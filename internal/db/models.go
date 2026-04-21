@@ -23,6 +23,7 @@ const (
 	SandboxStatusPaused   SandboxStatus = "paused"
 	SandboxStatusDeleted  SandboxStatus = "deleted"
 	SandboxStatusFailed   SandboxStatus = "failed"
+	SandboxStatusResuming SandboxStatus = "resuming"
 )
 
 func (e *SandboxStatus) Scan(src interface{}) error {

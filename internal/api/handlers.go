@@ -138,6 +138,186 @@ func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
 	return &sandbox
 }
 
+// loadActiveOrResumeSandbox is like loadActiveSandbox but auto-resumes a
+// paused sandbox. Any other non-active state returns 409.
+func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return nil
+	}
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return nil
+	}
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			respondError(c, ErrSandboxNotFound)
+		} else {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+			respondError(c, ErrInternal)
+		}
+		return nil
+	}
+	switch sandbox.Status {
+	case db.SandboxStatusActive:
+		return &sandbox
+	case db.SandboxStatusPaused:
+		if !h.resumePausedSandbox(c, &sandbox, teamID) {
+			return nil
+		}
+		sandbox.Status = db.SandboxStatusActive
+		return &sandbox
+	default:
+		respondError(c, ErrInvalidState)
+		return nil
+	}
+}
+
+// resumePausedSandbox restores the VM, reapplies network config, and flips
+// the sandbox to active. Starts with an atomic paused→resuming DB claim so
+// concurrent resumes don't both call VMD; the loser gets 409. On any failure
+// after VMD resume succeeds, destroys the VM + reverts to paused.
+func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) bool {
+	sandboxID := sandbox.ID
+
+	if !sandbox.SnapshotID.Valid {
+		log.Error().Str("sandbox_id", sandboxID.String()).Msg("paused sandbox has no snapshot_id")
+		respondError(c, ErrInternal)
+		return false
+	}
+
+	claimed, err := h.DB.BeginResume(c.Request.Context(), db.BeginResumeParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Someone else is already resuming, or the sandbox is no longer
+			// in paused state. Surface as conflict; client retries.
+			respondError(c, ErrInvalidState)
+			return false
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginResume failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+	*sandbox = claimed
+
+	revertCtx := context.WithoutCancel(c.Request.Context())
+	revertToPaused := func() {
+		rctx, rcancel := context.WithTimeout(revertCtx, asyncTimeout)
+		defer rcancel()
+		if err := h.DB.RevertResumeToPaused(rctx, db.RevertResumeToPausedParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("RevertResumeToPaused failed — sandbox may be stuck in 'resuming'")
+		}
+	}
+
+	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
+		ID:     sandbox.SnapshotID.Bytes,
+		TeamID: teamID,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
+		revertToPaused()
+		respondError(c, ErrInternal)
+		return false
+	}
+
+	snapshotPath := snapshot.Path
+	memPath := resolveMemPath(snapshot)
+
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
+		revertToPaused()
+		respondError(c, ErrInternal)
+		return false
+	}
+
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+	defer vmdCancel()
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	if err != nil {
+		if isVMDNotFound(err) {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
+				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+			if err != nil {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
+				revertToPaused()
+				respondError(c, ErrInternal)
+				return false
+			}
+			// RestoreSnapshot's proto doesn't carry ResourceLimits yet; it returns
+			// 0 for vcpu/mem. Keep the DB values so we don't overwrite them with 0.
+			if actualVcpu == 0 {
+				actualVcpu = uint32(sandbox.VcpuCount)
+			}
+			if actualMemMiB == 0 {
+				actualMemMiB = uint32(sandbox.MemoryMib)
+			}
+		} else {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
+			revertToPaused()
+			respondError(c, ErrInternal)
+			return false
+		}
+	}
+
+	// Detach from cancellation so a client disconnect can't leave the sandbox
+	// marked paused while the VM is up. Keep the trace/span context.
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+	defer postCancel()
+
+	var ipAddr *netip.Addr
+	if ipAddress != "" {
+		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
+			ipAddr = &addr
+		}
+	}
+
+	destroyAndRevert := func() {
+		dctx, dcancel := context.WithTimeout(revertCtx, vmdTimeout)
+		defer dcancel()
+		if err := vmd.DestroyInstance(dctx, sandboxID.String(), true); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy VM after resume failure failed")
+		}
+		revertToPaused()
+	}
+
+	// Apply egress rules before committing to 'active' so "active ⇒ rules
+	// applied" holds by construction.
+	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
+		destroyAndRevert()
+		respondError(c, ErrInternal)
+		return false
+	}
+
+	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
+		ID:        sandboxID,
+		VcpuCount: int32(actualVcpu),
+		MemoryMib: int32(actualMemMiB),
+		IpAddress: ipAddr,
+		TeamID:    teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
+		destroyAndRevert()
+		respondError(c, ErrInternal)
+		return false
+	}
+
+	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
+	return true
+}
+
 // resolveMemPath returns the memory snapshot path from a Snapshot record.
 // Uses the stored mem_path column if set, otherwise falls back to the
 // convention of placing mem.snap alongside the vmstate snapshot.
@@ -157,12 +337,11 @@ type persistedEgressConfig struct {
 	} `json:"egress"`
 }
 
-// reapplyNetworkConfig reads the sandbox's persisted egress config from the DB
-// record and pushes it back to VMD. Called after every resume path (explicit
-// /resume, post-restore in CreateSandbox) because the nftables rules and
-// proxy state are fresh after a snapshot restore.
+// reapplyNetworkConfig reads the sandbox's persisted egress config and pushes
+// it to VMD. Called after every snapshot restore (explicit /resume, auto-resume
+// via /exec, and CreateSandbox's from-snapshot path) because nftables rules
+// and proxy state are fresh after restore.
 //
-// Uses a caller-supplied context so the caller controls timeout/cancellation.
 // Silently returns nil if there is no persisted config (default allow-all).
 func (h *Handlers) reapplyNetworkConfig(ctx context.Context, vmd VMDClient, sandboxID string, raw []byte) error {
 	if len(raw) == 0 {
@@ -244,7 +423,6 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	// Verify sandbox exists and belongs to this team.
 	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
 		ID:     sandboxID,
 		TeamID: teamID,
@@ -259,105 +437,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	// Only paused sandboxes can be resumed.
 	if sandbox.Status != db.SandboxStatusPaused {
 		respondError(c, ErrInvalidState)
 		return
 	}
 
-	// Read the snapshot to get paths for VMD.
-	if !sandbox.SnapshotID.Valid {
-		log.Error().Str("sandbox_id", sandboxID.String()).Msg("paused sandbox has no snapshot_id")
-		respondError(c, ErrInternal)
+	if !h.resumePausedSandbox(c, &sandbox, teamID) {
 		return
 	}
-
-	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
-		ID:     sandbox.SnapshotID.Bytes,
-		TeamID: teamID,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	snapshotPath := snapshot.Path
-	memPath := resolveMemPath(snapshot)
-
-	// Resolve the VMD client for this sandbox's host.
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if vmdLookupErr != nil {
-		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Resume the VM. Cancellation of this call still follows the request
-	// context — if the client hangs up mid-resume, abort the VMD call.
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
-	if err != nil {
-		if isVMDNotFound(err) {
-			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
-				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)
-			if err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
-				respondError(c, ErrInternal)
-				return
-			}
-		} else {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
-			respondError(c, ErrInternal)
-			return
-		}
-	}
-
-	// The fallback may have returned 0 for vcpu/mem. Fall back to the DB values.
-	if actualVcpu == 0 {
-		actualVcpu = uint32(sandbox.VcpuCount)
-	}
-	if actualMemMiB == 0 {
-		actualMemMiB = uint32(sandbox.MemoryMib)
-	}
-
-	// Past this point the VM is running. Detach from cancellation so a
-	// client disconnect cannot leave the sandbox stuck in "paused" while
-	// the VM is actually up, but preserve the trace/span context so
-	// these DB writes still appear in the request trace.
-	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-	defer postCancel()
-
-	var ipAddr *netip.Addr
-	if ipAddress != "" {
-		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
-			ipAddr = &addr
-		}
-	}
-	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
-		ID:        sandboxID,
-		VcpuCount: int32(actualVcpu),
-		MemoryMib: int32(actualMemMiB),
-		IpAddress: ipAddr,
-		TeamID:    teamID,
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Reapply persisted egress rules — the nftables rules and proxy state
-	// are fresh after a snapshot restore, so user rules must be re-pushed.
-	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	// Async observability writes.
-	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 
 	resp := gin.H{
 		"id":     sandboxID.String(),
@@ -1075,10 +1162,10 @@ type sandboxExecRequest struct {
 }
 
 // ExecSandbox runs a command inside a sandbox and returns the result.
-// The sandbox must already be active — callers must resume a paused sandbox
-// via POST /sandboxes/:id/resume first.
+// A paused sandbox is resumed transparently before the command runs and is
+// left active afterward.
 func (h *Handlers) ExecSandbox(c *gin.Context) {
-	sandbox := h.loadActiveSandbox(c)
+	sandbox := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
 	}

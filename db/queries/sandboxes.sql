@@ -88,6 +88,24 @@ SET status = 'pausing', updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
 RETURNING *;
 
+-- name: BeginResume :one
+-- Atomic claim for resume: transitions 'paused' to 'resuming' in one
+-- statement. A 0-row result means another resume (explicit or auto) has
+-- already claimed the sandbox, or it's not in paused state. Used to
+-- serialize concurrent /exec and /resume requests.
+UPDATE sandbox
+SET status = 'resuming', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
+RETURNING *;
+
+-- name: RevertResumeToPaused :exec
+-- Compensate a failed resume attempt by flipping status back to 'paused'.
+-- Guarded on status = 'resuming' so we never clobber a concurrent transition
+-- (e.g., ActivateSandbox has already flipped to 'active').
+UPDATE sandbox
+SET status = 'paused', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
+
 -- name: FinalizePause :one
 -- Upsert the sandbox's live snapshot row and flip status to 'paused'.
 -- Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).

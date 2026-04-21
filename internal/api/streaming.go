@@ -23,10 +23,10 @@ type streamExecRequest struct {
 }
 
 // ExecSandboxStream runs a command inside a sandbox and streams output via SSE.
-// The sandbox must already be active — callers must resume a paused sandbox
-// via POST /sandboxes/:id/resume first.
+// A paused sandbox is resumed transparently before the command runs and is
+// left active afterward.
 func (h *Handlers) ExecSandboxStream(c *gin.Context) {
-	sandbox := h.loadActiveSandbox(c)
+	sandbox := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
 	}
