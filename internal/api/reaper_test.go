@@ -320,6 +320,87 @@ func TestReaper_ContextCancelledMidBatch(t *testing.T) {
 	}
 }
 
+// TestReaper_CleansUpPreviousSnapshot verifies that when a reaper pause produces
+// a non-nil prev_snapshot_id, the async cleanup reaches VMD.DeleteSnapshot and
+// the DB row delete — exercising the cleanupOldSnapshotAsync call at the end
+// of pauseExpired.
+func TestReaper_CleansUpPreviousSnapshot(t *testing.T) {
+	row := expiredRow("sbx-cleanup")
+	prevSnapshotID := uuid.New()
+
+	deleteSnapshotCalled := make(chan struct{}, 1)
+	var gotPath, gotMem string
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
+		},
+		deleteSnapshotFn: func(_ context.Context, _id, sp, mp string) error {
+			gotPath = sp
+			gotMem = mp
+			select {
+			case deleteSnapshotCalled <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+	}
+
+	rowDeleted := make(chan struct{}, 1)
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+			},
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "new_snapshot AS"):
+					return finalizePauseRow(uuid.New(), pgtype.UUID{Bytes: prevSnapshotID, Valid: true})
+				case strings.Contains(sql, "FROM snapshot"):
+					mem := "/snapshots/prev/mem.snap"
+					return &mockRow{scanFn: func(dest ...any) error {
+						*dest[0].(*uuid.UUID) = prevSnapshotID
+						*dest[1].(*uuid.UUID) = row.TeamID
+						*dest[2].(*string) = "/snapshots/prev/vmstate.snap"
+						*dest[3].(**string) = &mem
+						return nil
+					}}
+				}
+				return activityRow()
+			},
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				if strings.Contains(sql, "DELETE FROM snapshot") {
+					select {
+					case rowDeleted <- struct{}{}:
+					default:
+					}
+					return pgconn.NewCommandTag("DELETE 1"), nil
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		},
+		vmd,
+	)
+
+	h.reapOnce(context.Background(), 10, 1)
+
+	select {
+	case <-deleteSnapshotCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("VMD.DeleteSnapshot was not called after reaper pause")
+	}
+	if gotPath != "/snapshots/prev/vmstate.snap" {
+		t.Errorf("DeleteSnapshot path = %q, want prev snapshot", gotPath)
+	}
+	if gotMem != "/snapshots/prev/mem.snap" {
+		t.Errorf("DeleteSnapshot mem = %q, want prev mem", gotMem)
+	}
+	select {
+	case <-rowDeleted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("DeleteSnapshotRow was not called after VMD success")
+	}
+}
+
 // TestReaper_LoopRunsImmediately verifies that the reaper processes expired
 // sandboxes on startup without waiting for the first tick.
 func TestReaper_LoopRunsImmediately(t *testing.T) {

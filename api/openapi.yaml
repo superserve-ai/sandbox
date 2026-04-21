@@ -249,8 +249,8 @@ paths:
       summary: Execute a command inside a sandbox
       description: |
         Runs a command inside the sandbox and waits for it to finish, returning
-        stdout, stderr, and exit code. Idle sandboxes are automatically resumed
-        before execution.
+        stdout, stderr, and exit code. Paused sandboxes are rejected with 409;
+        resume explicitly via POST /sandboxes/{sandbox_id}/resume first.
       security:
         - apiKey: []
       requestBody:
@@ -286,7 +286,8 @@ paths:
       description: |
         Runs a command and streams stdout/stderr chunks as Server-Sent Events.
         Each event is a JSON payload. The final event includes `exit_code` and
-        `finished: true`. Idle sandboxes are automatically resumed before execution.
+        `finished: true`. Paused sandboxes are rejected with 409; resume
+        explicitly via POST /sandboxes/{sandbox_id}/resume first.
       security:
         - apiKey: []
       requestBody:

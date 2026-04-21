@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -454,7 +455,7 @@ func resumeRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/resume", nil)
 }
 
-func idleSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandbox {
+func pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandbox {
 	return db.Sandbox{
 		ID:         sandboxID,
 		TeamID:     teamID,
@@ -468,7 +469,7 @@ func TestResumeSandbox_Success(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
-	sb := idleSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID:        snapshotID,
 		SandboxID: sandboxID,
@@ -586,7 +587,7 @@ func TestResumeSandbox_NotFound(t *testing.T) {
 	}
 }
 
-func TestResumeSandbox_NotIdle(t *testing.T) {
+func TestResumeSandbox_NotPaused(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
@@ -612,7 +613,7 @@ func TestResumeSandbox_NotIdle(t *testing.T) {
 func TestResumeSandbox_NoSnapshotID(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	// Idle but no snapshot_id set.
+	// Paused but no snapshot_id set.
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPaused}
 
 	mock := &mockDBTX{
@@ -634,7 +635,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
-	sb := idleSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Saved: true, Trigger: "pause",
@@ -674,7 +675,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
-	sb := idleSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Saved: true, Trigger: "pause",
@@ -1101,19 +1102,21 @@ func TestPauseSandbox_Success(t *testing.T) {
 }
 
 // TestPauseSandbox_FirstPauseNoCleanup verifies that the first pause of a
-// sandbox (prev_snapshot_id IS NULL) does not trigger VMD.DeleteSnapshot.
+// sandbox (prev_snapshot_id IS NULL) does not trigger VMD.DeleteSnapshot
+// through the full handler path. The structural guarantee is asserted in
+// TestCleanupOldSnapshotAsync_InvalidPrevShortCircuits; here we fail fast if
+// the helper ever dispatches the goroutine on the end-to-end path.
 func TestPauseSandbox_FirstPauseNoCleanup(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
 
-	var deleteSnapshotCalled int32
 	vmd := &stubVMD{
 		pauseFn: func(context.Context, string, string) (string, string, error) {
 			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
 		},
 		deleteSnapshotFn: func(context.Context, string, string, string) error {
-			atomic.AddInt32(&deleteSnapshotCalled, 1)
+			t.Error("VMD.DeleteSnapshot must not be called on first pause")
 			return nil
 		},
 	}
@@ -1125,8 +1128,10 @@ func TestPauseSandbox_FirstPauseNoCleanup(t *testing.T) {
 			case strings.Contains(sql, "'pausing'"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "INSERT INTO snapshot"):
-				// prev_snapshot_id = invalid (first pause)
 				return finalizePauseRow(snapshotID, pgtype.UUID{})
+			case strings.Contains(sql, "FROM snapshot"):
+				t.Error("GetSnapshotForCleanup must not run when prev is NULL")
+				return notFoundRow()
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			}
@@ -1144,14 +1149,8 @@ func TestPauseSandbox_FirstPauseNoCleanup(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
 	}
-
-	// The cleanup is fire-and-forget; if prev is NULL the helper returns
-	// immediately before launching the goroutine. A brief sleep is enough
-	// to catch the false-positive case where a goroutine did run.
-	time.Sleep(50 * time.Millisecond)
-	if got := atomic.LoadInt32(&deleteSnapshotCalled); got != 0 {
-		t.Errorf("VMD.DeleteSnapshot called %d times on first pause, want 0", got)
-	}
+	// Drain any would-be goroutine before the test exits.
+	time.Sleep(100 * time.Millisecond)
 }
 
 // TestPauseSandbox_PreviousSnapshotCleanedUp verifies that when a sandbox is
@@ -1322,11 +1321,224 @@ func TestPauseSandbox_CleanupVMDFailureLeavesRow(t *testing.T) {
 	}
 }
 
+// TestPauseSandbox_CleanupRowDeleteFailure covers the leg where VMD deletes
+// the files successfully but the follow-up DB row delete errors. The files
+// are gone from disk; the row stays (inert, since no sandbox references it)
+// for a janitor to clean up later.
+func TestPauseSandbox_CleanupRowDeleteFailure(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	prevSnapshotID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	deleteCalled := make(chan struct{}, 1)
+	rowDeleteAttempted := make(chan struct{}, 1)
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
+		},
+		deleteSnapshotFn: func(context.Context, string, string, string) error {
+			select {
+			case deleteCalled <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+	}
+
+	newSnapshotID := uuid.New()
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				return finalizePauseRow(newSnapshotID, pgtype.UUID{Bytes: prevSnapshotID, Valid: true})
+			case strings.Contains(sql, "FROM snapshot"):
+				mem := "/snapshots/prev/mem.snap"
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = prevSnapshotID
+					*dest[1].(*uuid.UUID) = teamID
+					*dest[2].(*string) = "/snapshots/prev/vmstate.snap"
+					*dest[3].(**string) = &mem
+					return nil
+				}}
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM snapshot") {
+				select {
+				case rowDeleteAttempted <- struct{}{}:
+				default:
+				}
+				return pgconn.CommandTag{}, errors.New("db: row delete failed")
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	select {
+	case <-deleteCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("VMD.DeleteSnapshot was not called within 500ms")
+	}
+	select {
+	case <-rowDeleteAttempted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("DeleteSnapshotRow was not attempted after VMD success")
+	}
+}
+
+// TestPauseSandbox_CleanupSavedSnapshotSkipped verifies that when the lookup
+// finds no row — either because the snapshot is saved=true (filtered out by
+// the SQL) or because it was already deleted — the cleanup short-circuits:
+// no VMD call, no row delete.
+func TestPauseSandbox_CleanupSavedSnapshotSkipped(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	prevSnapshotID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
+		},
+		deleteSnapshotFn: func(context.Context, string, string, string) error {
+			t.Error("VMD.DeleteSnapshot must not be called when lookup returns no rows")
+			return nil
+		},
+	}
+
+	newSnapshotID := uuid.New()
+	var rowDeleteCalled int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				return finalizePauseRow(newSnapshotID, pgtype.UUID{Bytes: prevSnapshotID, Valid: true})
+			case strings.Contains(sql, "FROM snapshot"):
+				return notFoundRow() // saved=true → SQL returns 0 rows
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM snapshot") {
+				atomic.AddInt32(&rowDeleteCalled, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	// Give any stray goroutine time to surface.
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt32(&rowDeleteCalled); got != 0 {
+		t.Errorf("DeleteSnapshotRow called %d times, want 0", got)
+	}
+}
+
+// TestPauseSandbox_CleanupLookupErrorSkipped verifies that a transient lookup
+// error (anything other than ErrNoRows) is logged and aborts the cleanup
+// without issuing downstream calls.
+func TestPauseSandbox_CleanupLookupErrorSkipped(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	prevSnapshotID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/new/vmstate.snap", "/snapshots/new/mem.snap", nil
+		},
+		deleteSnapshotFn: func(context.Context, string, string, string) error {
+			t.Error("VMD.DeleteSnapshot must not be called when lookup fails")
+			return nil
+		},
+	}
+
+	newSnapshotID := uuid.New()
+	var rowDeleteCalled int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				return finalizePauseRow(newSnapshotID, pgtype.UUID{Bytes: prevSnapshotID, Valid: true})
+			case strings.Contains(sql, "FROM snapshot"):
+				return &mockRow{scanFn: func(...any) error { return errors.New("db: connection lost") }}
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM snapshot") {
+				atomic.AddInt32(&rowDeleteCalled, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt32(&rowDeleteCalled); got != 0 {
+		t.Errorf("DeleteSnapshotRow called %d times, want 0", got)
+	}
+}
+
+// TestCleanupOldSnapshotAsync_InvalidPrevShortCircuits proves the helper
+// returns synchronously without launching a goroutine when prev is NULL.
+// This is the structural guarantee behind TestPauseSandbox_FirstPauseNoCleanup.
+func TestCleanupOldSnapshotAsync_InvalidPrevShortCircuits(t *testing.T) {
+	vmd := &stubVMD{
+		deleteSnapshotFn: func(context.Context, string, string, string) error {
+			t.Error("VMD.DeleteSnapshot must not be called when prev is NULL")
+			return nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			t.Error("no DB call should occur when prev is NULL")
+			return notFoundRow()
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	h.cleanupOldSnapshotAsync(context.Background(), uuid.New(), uuid.New(), "host", pgtype.UUID{Valid: false})
+	time.Sleep(50 * time.Millisecond) // catch a stray goroutine if the short-circuit regresses.
+}
+
 func TestPauseSandbox_NotActive(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 
-	// BeginPause's WHERE status = 'active' clause excludes an idle
+	// BeginPause's WHERE status = 'active' clause excludes a paused
 	// sandbox → 0 rows. The handler falls back to SandboxExists to
 	// disambiguate 404 vs 409; since the row exists (just in the wrong
 	// state), we return 409 Conflict.

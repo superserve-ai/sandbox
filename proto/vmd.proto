@@ -192,9 +192,9 @@ message RestoreSnapshotResponse {
 // ---------------------------------------------------------------------------
 
 message DeleteSnapshotRequest {
-  // Optional. Identifies the sandbox this snapshot belongs to — used for
-  // logging and for a sanity check that the paths live inside the expected
-  // snapshot directory. Never required for the delete itself.
+  // Required. Identifies the sandbox this snapshot belongs to. The daemon
+  // enforces that both paths live under <snapshot_dir>/<vm_id>/ so a call
+  // cannot unlink files owned by a different sandbox.
   string vm_id = 1;
   // Absolute path to the vmstate snapshot file.
   string snapshot_path = 2;

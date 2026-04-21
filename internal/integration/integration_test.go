@@ -448,11 +448,11 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	}
 }
 
-func TestIntegration_PauseSandbox_AlreadyIdle(t *testing.T) {
+func TestIntegration_PauseSandbox_AlreadyPaused(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"idle-box"}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -842,22 +842,22 @@ func TestIntegration_PatchSandbox_Network_NotActive(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-idle"}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-paused"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	// Pause it so it's in idle state.
+	// Pause it so it's in paused state.
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
 	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
-	// Try to patch network on idle sandbox — should fail.
+	// Try to patch network on paused sandbox — should fail.
 	nw := do(r, "PATCH", "/sandboxes/"+sid, apiKey,
 		`{"network":{"deny_out":["0.0.0.0/0"]}}`)
 	if nw.Code != http.StatusConflict {
-		t.Fatalf("expected 409 for idle sandbox, got %d: %s", nw.Code, nw.Body.String())
+		t.Fatalf("expected 409 for paused sandbox, got %d: %s", nw.Code, nw.Body.String())
 	}
 }
 
