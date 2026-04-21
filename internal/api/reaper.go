@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -17,19 +18,22 @@ type ReaperConfig struct {
 	// BatchSize bounds the number of sandboxes paused per cycle so a
 	// sudden wave of expirations cannot tie up the control plane.
 	BatchSize int32
+	// Parallelism caps concurrent pauses within a single batch. 0 → 10.
+	Parallelism int
 }
 
 // DefaultReaperConfig returns sensible defaults for the timeout reaper.
 func DefaultReaperConfig() ReaperConfig {
 	return ReaperConfig{
-		Interval:  30 * time.Second,
-		BatchSize: 50,
+		Interval:    30 * time.Second,
+		BatchSize:   50,
+		Parallelism: 10,
 	}
 }
 
 // StartTimeoutReaper launches a background goroutine that periodically
 // pauses active sandboxes whose `timeout_seconds` hard cap has elapsed since
-// their creation. The hard cap is measured from `created_at`. Already-idle
+// their creation. The hard cap is measured from `created_at`. Already-paused
 // sandboxes are left alone — they are already stopped.
 //
 // The reaper exits cleanly when ctx is cancelled. Call once at control
@@ -48,9 +52,18 @@ func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
+	parallelism := cfg.Parallelism
+	if parallelism <= 0 {
+		parallelism = 10
+	}
+	if int32(parallelism) > cfg.BatchSize {
+		parallelism = int(cfg.BatchSize)
+	}
+
 	log.Info().
 		Dur("interval", cfg.Interval).
 		Int32("batch_size", cfg.BatchSize).
+		Int("parallelism", parallelism).
 		Msg("timeout reaper started")
 
 	ticker := time.NewTicker(cfg.Interval)
@@ -58,7 +71,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
-	h.reapOnce(ctx, cfg.BatchSize)
+	h.reapOnce(ctx, cfg.BatchSize, parallelism)
 
 	for {
 		select {
@@ -66,12 +79,12 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			log.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
-			h.reapOnce(ctx, cfg.BatchSize)
+			h.reapOnce(ctx, cfg.BatchSize, parallelism)
 		}
 	}
 }
 
-func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
+func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int) {
 	// Atomically claim expired active sandboxes and mark them 'pausing' in one
 	// CTE+UPDATE. FOR UPDATE SKIP LOCKED inside the query ensures that
 	// concurrent reaper replicas skip rows already being processed.
@@ -91,16 +104,28 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
 
 	log.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
 
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+
+dispatch:
 	for _, sbx := range expired {
-		// Check for shutdown between each pause so we exit promptly.
+		// Labeled break: a plain break inside the select exits only the
+		// select, not the for loop.
 		select {
 		case <-ctx.Done():
-			return
-		default:
+			break dispatch
+		case sem <- struct{}{}:
 		}
 
-		h.pauseExpired(ctx, sbx)
+		wg.Add(1)
+		go func(sbx db.ClaimExpiredSandboxesRow) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			h.pauseExpired(ctx, sbx)
+		}(sbx)
 	}
+
+	wg.Wait()
 }
 
 // pauseExpired pauses one sandbox that was atomically claimed by
@@ -115,13 +140,12 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32) {
 //
 // Order of operations:
 //  1. VMD PauseInstance — stops the VM, writes snapshot files to disk.
-//  2. DB CreateSnapshot — inserts the snapshot row.
-//  3. DB SetSandboxSnapshot — links the snapshot to the sandbox.
-//  4. DB UpdateSandboxStatus(idle) — finalizes the pause.
+//  2. DB FinalizePause — inserts the snapshot row, links it to the sandbox,
+//     and flips status from 'pausing' to 'paused' in a single CTE.
 //
 // Failure handling:
 //   - Step 1 fails → VM is still running → revert DB to 'active'.
-//   - Steps 2-4 fail → VM is stopped → call rollbackPausedVM (resume + revert).
+//   - Step 2 fails → VM is stopped → call rollbackPausedVM (resume + revert).
 func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow) {
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
@@ -150,12 +174,8 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
 	defer postCancel()
 
-	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
-	// the sandbox, and flip status from pausing → idle in a single CTE.
-	// Same query as the user-initiated PauseSandbox handler, so the two
-	// code paths have identical atomicity guarantees.
 	triggerName := "timeout"
-	finalized, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
@@ -164,8 +184,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Saved:     false,
 		Name:      &triggerName,
 		Trigger:   triggerName,
-	})
-	if err != nil {
+	}); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
@@ -173,9 +192,6 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 
 	l.Info().Msg("reaper: sandbox paused due to timeout")
 	h.logActivityAsync(ctx, sbx.ID, sbx.TeamID, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
-
-	// Async GC for the now-unreachable previous snapshot, if any.
-	h.cleanupOldSnapshotAsync(ctx, sbx.ID, sbx.TeamID, sbx.HostID, finalized.PrevSnapshotID)
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is
@@ -245,12 +261,13 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 }
 
 // markSandboxFailed sets the sandbox to 'failed' as a terminal state for
-// reaper-side compensation paths. Emits a single log line with `reason`
-// and any context already on `l`.
+// reaper-side compensation paths. Emits a single high-signal log line with
+// `reason` and any context already on `l` so on-call has one place to look
+// when alerting fires on `status=failed`.
 //
-// Best-effort: if the DB write itself fails, we log and stop — at that
-// point the sandbox is stuck in 'pausing', but the reaper loop is already
-// bounded because future ticks only claim 'active' sandboxes.
+// Best-effort: if the DB write itself fails, we log loudly and stop — at
+// that point the sandbox is stuck in 'pausing', but the reaper loop is
+// already bounded because future ticks only claim 'active' sandboxes.
 func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, reason string, l zerolog.Logger) {
 	failCtx, failCancel := context.WithTimeout(ctx, asyncTimeout)
 	defer failCancel()

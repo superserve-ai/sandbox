@@ -27,6 +27,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // ---------------------------------------------------------------------------
@@ -124,7 +125,7 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string,
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
@@ -136,6 +137,18 @@ func (s *stubVMD) ExecCommandStream(_ context.Context, _, _ string, _ []string, 
 	return nil
 }
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
+}
+func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error { return nil }
+
+func (s *stubVMD) BuildTemplate(_ context.Context, _ vmdclient.BuildTemplateInput) (string, error) {
+	return "build-stub", nil
+}
+func (s *stubVMD) GetBuildStatus(_ context.Context, _ string) (vmdclient.BuildStatusResult, error) {
+	return vmdclient.BuildStatusResult{Status: "ready"}, nil
+}
+func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
 	return nil
 }
 
@@ -417,16 +430,8 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	sid := mustJSON(t, cw)["id"].(string)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
-		t.Fatalf("pause: expected 200, got %d: %s", pw.Code, pw.Body.String())
-	}
-	pb := mustJSON(t, pw)
-	if pb["status"] != "idle" {
-		t.Errorf("pause status = %q, want idle", pb["status"])
-	}
-	snapshotIDStr, ok := pb["snapshot_id"].(string)
-	if !ok || snapshotIDStr == "" {
-		t.Fatal("pause response missing snapshot_id")
+	if pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: expected 204, got %d: %s", pw.Code, pw.Body.String())
 	}
 
 	// DB: sandbox is paused, snapshot record exists and is linked.
@@ -439,10 +444,10 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 		t.Errorf("DB status = %q, want paused", sb.Status)
 	}
 	if !sb.SnapshotID.Valid {
-		t.Error("sandbox snapshot_id should be set after pause")
+		t.Fatal("sandbox snapshot_id should be set after pause")
 	}
 
-	snapID, _ := uuid.Parse(snapshotIDStr)
+	snapID := uuid.UUID(sb.SnapshotID.Bytes)
 	snap, err := testQueries.GetSnapshot(ctx, db.GetSnapshotParams{ID: snapID, TeamID: teamID})
 	if err != nil {
 		t.Fatalf("snapshot not found in DB: %v", err)
@@ -455,11 +460,11 @@ func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	}
 }
 
-func TestIntegration_PauseSandbox_AlreadyIdle(t *testing.T) {
+func TestIntegration_PauseSandbox_AlreadyPaused(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"idle-box"}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-box"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d", cw.Code)
 	}
@@ -488,7 +493,7 @@ func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	}
 	sid := mustJSON(t, cw)["id"].(string)
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
@@ -610,9 +615,9 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	}
 }
 
-// Exec on a paused sandbox must be rejected — callers must resume explicitly
-// via POST /resume. There is no implicit auto-wake on traffic.
-func TestIntegration_ExecSandbox_PausedRejected(t *testing.T) {
+// Exec on a paused sandbox transparently resumes it, runs the command, and
+// leaves the sandbox active.
+func TestIntegration_ExecSandbox_PausedAutoResume(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
@@ -623,13 +628,82 @@ func TestIntegration_ExecSandbox_PausedRejected(t *testing.T) {
 	sid := mustJSON(t, cw)["id"].(string)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
 	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello"}`)
-	if ew.Code != http.StatusConflict {
-		t.Fatalf("exec on paused: expected 409, got %d: %s", ew.Code, ew.Body.String())
+	if ew.Code != http.StatusOK {
+		t.Fatalf("exec on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
+	}
+
+	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
+	status, _ := mustJSON(t, gw)["status"].(string)
+	if status != "active" {
+		t.Errorf("sandbox status after auto-resume = %q, want %q", status, "active")
+	}
+}
+
+// Baseline: /exec/stream on an active sandbox emits a valid SSE response
+// ending with finished=true and exit_code=0.
+func TestIntegration_ExecSandboxStream_Success(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stream-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d", cw.Code)
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+
+	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
+	if ew.Code != http.StatusOK {
+		t.Fatalf("exec/stream: expected 200, got %d: %s", ew.Code, ew.Body.String())
+	}
+	body := ew.Body.String()
+	if !strings.HasPrefix(body, "data: ") {
+		t.Errorf("body does not start with SSE data frame; got: %q", body)
+	}
+	if !strings.Contains(body, `"finished":true`) {
+		t.Errorf("SSE body missing finished event; got: %s", body)
+	}
+	if !strings.Contains(body, `"exit_code":0`) {
+		t.Errorf("SSE body missing exit_code=0; got: %s", body)
+	}
+}
+
+// Same auto-resume behavior on the SSE streaming endpoint.
+func TestIntegration_ExecSandboxStream_PausedAutoResume(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-stream-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d", cw.Code)
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+
+	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
+	if pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+
+	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
+	if ew.Code != http.StatusOK {
+		t.Fatalf("exec/stream on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
+	}
+	body := ew.Body.String()
+	if !strings.Contains(body, `"finished":true`) {
+		t.Errorf("SSE body missing finished event; got: %s", body)
+	}
+	if !strings.Contains(body, `"exit_code":0`) {
+		t.Errorf("SSE body missing exit_code=0; got: %s", body)
+	}
+
+	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
+	status, _ := mustJSON(t, gw)["status"].(string)
+	if status != "active" {
+		t.Errorf("sandbox status after stream auto-resume = %q, want %q", status, "active")
 	}
 }
 
@@ -739,7 +813,7 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 	sandboxID, _ := uuid.Parse(sid)
 
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
@@ -849,22 +923,22 @@ func TestIntegration_PatchSandbox_Network_NotActive(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-idle"}`)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"net-paused"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sid := mustJSON(t, cw)["id"].(string)
-	// Pause it so it's in idle state.
+	// Pause it so it's in paused state.
 	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusOK {
+	if pw.Code != http.StatusNoContent {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
-	// Try to patch network on idle sandbox — should fail.
+	// Try to patch network on paused sandbox — should fail.
 	nw := do(r, "PATCH", "/sandboxes/"+sid, apiKey,
 		`{"network":{"deny_out":["0.0.0.0/0"]}}`)
 	if nw.Code != http.StatusConflict {
-		t.Fatalf("expected 409 for idle sandbox, got %d: %s", nw.Code, nw.Body.String())
+		t.Fatalf("expected 409 for paused sandbox, got %d: %s", nw.Code, nw.Body.String())
 	}
 }
 

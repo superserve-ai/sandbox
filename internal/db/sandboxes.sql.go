@@ -86,6 +86,47 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox
 	return i, err
 }
 
+const beginResume = `-- name: BeginResume :one
+UPDATE sandbox
+SET status = 'resuming', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id
+`
+
+type BeginResumeParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Atomic claim for resume: transitions 'paused' to 'resuming' in one
+// statement. A 0-row result means another resume (explicit or auto) has
+// already claimed the sandbox, or it's not in paused state. Used to
+// serialize concurrent /exec and /resume requests.
+func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, beginResume, arg.ID, arg.TeamID)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+	)
+	return i, err
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH expired AS (
   SELECT id, team_id, name, snapshot_id, host_id
@@ -291,27 +332,6 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 	return i, err
 }
 
-const deleteSnapshotRow = `-- name: DeleteSnapshotRow :execrows
-DELETE FROM snapshot
-WHERE id = $1 AND team_id = $2 AND saved = false
-`
-
-type DeleteSnapshotRowParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
-}
-
-// Remove a snapshot row. Guarded by saved=false so a future template feature
-// can rely on row durability — auto-GC callers cannot accidentally nuke a
-// user-saved snapshot even if they passed the wrong ID.
-func (q *Queries) DeleteSnapshotRow(ctx context.Context, arg DeleteSnapshotRowParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteSnapshotRow, arg.ID, arg.TeamID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const destroySandbox = `-- name: DestroySandbox :exec
 UPDATE sandbox
 SET destroyed_at = now(), status = 'deleted', updated_at = now()
@@ -330,23 +350,28 @@ func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) 
 
 const finalizePause = `-- name: FinalizePause :one
 WITH target AS (
-  SELECT id, team_id, snapshot_id AS prev_snapshot_id FROM sandbox
+  SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
-new_snapshot AS (
+upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
   SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
+  ON CONFLICT (sandbox_id) WHERE saved = false
+  DO UPDATE SET
+    path = EXCLUDED.path,
+    mem_path = EXCLUDED.mem_path,
+    size_bytes = EXCLUDED.size_bytes,
+    name = EXCLUDED.name,
+    trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox
-SET snapshot_id = (SELECT snap_id FROM new_snapshot),
+SET snapshot_id = (SELECT snap_id FROM upserted),
     status = 'paused',
     updated_at = now()
-FROM new_snapshot
+FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
-RETURNING
-  new_snapshot.snap_id::uuid AS snapshot_id,
-  (SELECT prev_snapshot_id FROM target) AS prev_snapshot_id
+RETURNING upserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseParams struct {
@@ -360,33 +385,10 @@ type FinalizePauseParams struct {
 	Trigger   string    `json:"trigger"`
 }
 
-type FinalizePauseRow struct {
-	SnapshotID     uuid.UUID   `json:"snapshot_id"`
-	PrevSnapshotID pgtype.UUID `json:"prev_snapshot_id"`
-}
-
-// Atomically insert the snapshot row, link it to the sandbox, and flip
-// status from 'pausing' to 'paused'. Replaces the sequence
-// CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
-// three DB roundtrips into one.
-//
-// The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
-// in the same query. This prevents the common race where a sandbox is
-// soft-deleted before FinalizePause runs — without the gate, the CTE
-// INSERT would always execute (per PostgreSQL's rule that data-modifying
-// CTEs run independently of the main query), producing an orphan snapshot
-// row and a snapshot file on disk with no owner. A concurrent delete that
-// commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
-// can still race, but that window is microseconds and the resulting
-// orphan is detectable/cleanable by a background job.
-//
-// Also captures the sandbox's previous snapshot_id (before we overwrite it)
-// so the caller can garbage-collect the now-unreachable prior snapshot
-// asynchronously. Returns NULL for the first pause of a sandbox.
-//
-// When either the sandbox is missing/deleted or the INSERT did not fire,
-// the query returns 0 rows and the caller maps that to ErrSandboxGone.
-func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (FinalizePauseRow, error) {
+// Upsert the sandbox's live snapshot row and flip status to 'paused'.
+// Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).
+// The partial unique index on (sandbox_id) WHERE saved = false keys the UPSERT.
+func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, finalizePause,
 		arg.ID,
 		arg.TeamID,
@@ -397,9 +399,9 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (F
 		arg.Name,
 		arg.Trigger,
 	)
-	var i FinalizePauseRow
-	err := row.Scan(&i.SnapshotID, &i.PrevSnapshotID)
-	return i, err
+	var snapshot_id uuid.UUID
+	err := row.Scan(&snapshot_id)
+	return snapshot_id, err
 }
 
 const getSandbox = `-- name: GetSandbox :one
@@ -454,76 +456,48 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	return network_config, err
 }
 
-const getSnapshotForCleanup = `-- name: GetSnapshotForCleanup :one
-SELECT id, team_id, path, mem_path
-FROM snapshot
-WHERE id = $1 AND team_id = $2 AND saved = false
-`
-
-type GetSnapshotForCleanupParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
-}
-
-type GetSnapshotForCleanupRow struct {
-	ID      uuid.UUID `json:"id"`
-	TeamID  uuid.UUID `json:"team_id"`
-	Path    string    `json:"path"`
-	MemPath *string   `json:"mem_path"`
-}
-
-// Fetch a snapshot's paths for garbage collection. Returns only non-saved
-// snapshots — saved=true rows are reserved for the (future) user-named
-// template feature and must never be auto-deleted. A 0-row result means
-// the row was already gone or is a saved snapshot; either way the caller
-// should skip deletion.
-func (q *Queries) GetSnapshotForCleanup(ctx context.Context, arg GetSnapshotForCleanupParams) (GetSnapshotForCleanupRow, error) {
-	row := q.db.QueryRow(ctx, getSnapshotForCleanup, arg.ID, arg.TeamID)
-	var i GetSnapshotForCleanupRow
-	err := row.Scan(
-		&i.ID,
-		&i.TeamID,
-		&i.Path,
-		&i.MemPath,
-	)
-	return i, err
-}
-
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id FROM sandbox
-WHERE host_id = $1 AND destroyed_at IS NULL
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, snap.path AS snapshot_path
+FROM sandbox s
+LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
+WHERE s.host_id = $1 AND s.destroyed_at IS NULL
 `
 
-// Used by the VMD reconciler to find all non-deleted sandboxes scheduled on
-// this host. Includes both active and paused sandboxes because the reconciler
-// needs to validate both states (active → systemd unit, paused → snapshot file).
-func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Sandbox, error) {
+type ListSandboxesByHostRow struct {
+	Sandbox      Sandbox `json:"sandbox"`
+	SnapshotPath *string `json:"snapshot_path"`
+}
+
+// Used by the VMD reconciler. snapshot_path is joined so the paused-sandbox
+// drift check can stat the file without a per-row snapshot lookup.
+func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]ListSandboxesByHostRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByHost, hostID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByHostRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByHostRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.SnapshotPath,
 		); err != nil {
 			return nil, err
 		}
@@ -645,6 +619,25 @@ WHERE id = $1 AND destroyed_at IS NULL
 // not team scope.
 func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, markSandboxFailed, id)
+	return err
+}
+
+const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
+UPDATE sandbox
+SET status = 'paused', updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming'
+`
+
+type RevertResumeToPausedParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Compensate a failed resume attempt by flipping status back to 'paused'.
+// Guarded on status = 'resuming' so we never clobber a concurrent transition
+// (e.g., ActivateSandbox has already flipped to 'active').
+func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPausedParams) error {
+	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID)
 	return err
 }
 

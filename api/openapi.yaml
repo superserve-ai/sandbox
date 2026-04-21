@@ -3,17 +3,20 @@ info:
   title: Superserve API
   version: 0.1.0
   description: |
-    Superserve provides sandbox infrastructure to run AI Agents in the cloud. Powered by Firecracker MicroVMs.
+    Superserve provides sandbox infrastructure to run AI agents in the cloud. Powered by Firecracker MicroVMs.
 
     ## Sandbox lifecycle
 
     ```
-    starting --> active <--> paused --> deleted
+    active <--> paused --> deleted
     ```
+
+    A sandbox is `active` when running and `paused` after being paused. Resuming
+    a paused sandbox returns it to `active`. Deleting releases all resources.
 
     | Endpoint | What it does |
     |----------|-------------|
-    | `POST /sandboxes` | Create a new sandbox |
+    | `POST /sandboxes` | Create a new sandbox (optionally `from_template`) |
     | `PATCH /sandboxes/:id` | Partially update a running sandbox (e.g. network rules) |
     | `POST /sandboxes/:id/pause` | Snapshot full state, suspend the VM |
     | `POST /sandboxes/:id/resume` | Restore from snapshot, continue where it left off |
@@ -21,8 +24,11 @@ info:
 
     ## Sandbox environment
 
-    Each sandbox runs Ubuntu 24.04 with 1 vCPU, 1 GB RAM, 4 GB disk.
-    Pre-installed: Python 3.12, Node.js 22, npm, git, curl, build-essential.
+    By default sandboxes boot from the curated `ss/base` template (Ubuntu 24.04,
+    1 vCPU, 1 GB RAM, 4 GB disk, with Python 3.12, Node.js 22, npm, git, curl,
+    and build-essential pre-installed). Callers can override with any template
+    alias (e.g. `ss/python-3.11`, `ss/node-22`) or a team-owned template UUID
+    via the `from_template` field on `POST /sandboxes`.
   contact:
     name: Superserve Team
   license:
@@ -98,6 +104,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -106,9 +114,10 @@ paths:
       tags: [Sandboxes]
       summary: Create a new sandbox
       description: |
-        Creates a sandbox and returns immediately with `status: starting`.
-        The VM boots asynchronously. Poll `GET /sandboxes/{id}` until
-        `status` is `active` before running commands.
+        Creates a sandbox from a template (defaults to `ss/base` when
+        `from_template` is omitted). When the request returns successfully,
+        the sandbox is ready to use — you can run commands against it
+        immediately.
       security:
         - apiKey: []
       requestBody:
@@ -130,6 +139,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -229,16 +240,12 @@ paths:
       description: |
         Snapshots the sandbox's full state (memory + disk), suspends the VM,
         and transitions to `paused`. Resume it later to continue exactly where
-        it left off.
+        it left off — same memory, same running processes, same files.
       security:
         - apiKey: []
       responses:
-        "200":
-          description: Sandbox is now paused
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SandboxResponse"
+        "204":
+          description: Sandbox paused
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -267,7 +274,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/SandboxResponse"
+                $ref: "#/components/schemas/ResumeResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -288,8 +295,8 @@ paths:
       summary: Execute a command inside a sandbox
       description: |
         Runs a command inside the sandbox and waits for it to finish, returning
-        stdout, stderr, and exit code. Idle sandboxes are automatically resumed
-        before execution.
+        stdout, stderr, and exit code. A paused sandbox is resumed automatically
+        before the command runs and stays active afterward.
       security:
         - apiKey: []
       requestBody:
@@ -311,6 +318,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -325,7 +334,8 @@ paths:
       description: |
         Runs a command and streams stdout/stderr chunks as Server-Sent Events.
         Each event is a JSON payload. The final event includes `exit_code` and
-        `finished: true`. Idle sandboxes are automatically resumed before execution.
+        `finished: true`. A paused sandbox is resumed automatically before the
+        command runs and stays active afterward.
       security:
         - apiKey: []
       requestBody:
@@ -349,6 +359,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -359,7 +371,9 @@ paths:
       summary: List templates visible to the caller
       description: |
         Returns the caller's team's templates plus the curated system
-        templates (available to everyone). Filter by `alias_prefix=<text>`.
+        templates (available to everyone, identified by the `ss/` alias
+        prefix — e.g. `ss/base`, `ss/python-3.11`, `ss/node-22`). Filter
+        by `alias_prefix=<text>`.
       security:
         - apiKey: []
       parameters:
@@ -685,11 +699,13 @@ components:
           type: string
           description: >
             Boot the sandbox from a template. Accepts either a template UUID
-            or an alias (e.g. `python-ml`). The template must be owned by
-            the caller's team OR be a curated system template. The template's
-            vCPU, memory, and disk values are inherited by the sandbox — they
-            cannot be overridden per-sandbox because the snapshot dictates
-            VM shape.
+            or an alias (e.g. `ss/base`, `ss/python-3.11`, `ss/node-22`, or
+            a team-owned alias like `my-python-env`). The template must be
+            owned by the caller's team OR be a curated system template
+            (curated templates use the `ss/` alias prefix). The template's
+            vCPU, memory, and disk values are inherited by the sandbox —
+            they cannot be overridden per-sandbox because the snapshot
+            dictates VM shape. When omitted, defaults to `ss/base`.
         timeout_seconds:
           type: integer
           format: int32
@@ -734,9 +750,9 @@ components:
           description: |
             Environment variables injected into every process inside the
             sandbox (terminal sessions, exec calls). Merged on top of any
-            defaults set by the template's `env` steps — caller keys win
-            on conflict. Not persisted in the database; they live in the
-            VM agent's memory for the sandbox's lifetime and survive
+            defaults set by the template's `env` build steps — caller keys
+            win on conflict. Not persisted in the database; they live in
+            the VM agent's memory for the sandbox's lifetime and survive
             pause/resume via snapshot.
           example:
             OPENAI_API_KEY: sk-...
@@ -755,7 +771,13 @@ components:
           type: string
         status:
           type: string
-          enum: [starting, active, pausing, paused, deleted]
+          enum: [active, paused, resuming]
+          description: >
+            Current state of the sandbox. `active` means running; `paused`
+            means paused and awaiting resume. `resuming` is a transient
+            state observed while the platform restores a paused sandbox
+            (e.g. via auto-resume on `/exec`); clients should retry shortly
+            — it resolves to `active` in a few hundred milliseconds.
         vcpu_count:
           type: integer
         memory_mib:
@@ -797,6 +819,20 @@ components:
           example:
             env: prod
             owner: agent-7
+
+    ResumeResponse:
+      type: object
+      description: Returned by `POST /sandboxes/{id}/resume`.
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [active]
+        access_token:
+          type: string
+          description: Fresh access token; use this instead of the one from create.
 
     ExecStreamEvent:
       type: object
@@ -841,7 +877,7 @@ components:
           description: Environment variables for the command.
         working_dir:
           type: string
-          description: Working directory (default /home/user).
+          description: Working directory (default `/home/user`).
         timeout_s:
           type: integer
           default: 30
@@ -1019,7 +1055,9 @@ components:
           maxLength: 128
           description: >
             Human-readable name, unique per team. Used as the
-            `from_template` value when creating sandboxes.
+            `from_template` value when creating sandboxes. Aliases
+            starting with `ss/` are reserved for curated system templates
+            and rejected for team-owned templates.
           example: my-python-env
         vcpu:
           type: integer
@@ -1166,6 +1204,13 @@ components:
 
     Error:
       type: object
+      description: |
+        Error envelope. `error.code` is a stable, machine-readable identifier
+        (e.g. `bad_request`, `not_found`, `conflict`, `rate_limited`,
+        `too_many_builds`, `image_pull_failed`, `step_failed`,
+        `snapshot_failed`, `start_cmd_failed`, `ready_cmd_failed`,
+        `build_failed`). `error.message` is human-readable and may change
+        between releases; clients should branch on `code`, not `message`.
       properties:
         error:
           type: object
@@ -1196,6 +1241,15 @@ components:
             $ref: "#/components/schemas/Error"
     Conflict:
       description: Sandbox is not in a valid state for this operation
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooManyRequests:
+      description: >
+        Rate limit hit — the caller's per-team request budget is temporarily
+        exhausted. Response body uses error code `rate_limited`. Retry after
+        a short backoff; the bucket refills continuously.
       content:
         application/json:
           schema:

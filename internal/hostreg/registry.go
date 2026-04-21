@@ -9,11 +9,12 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// DialFunc creates a VMD client for the given gRPC address.
-type DialFunc func(addr string) (vmdclient.Client, error)
+// DialFunc creates a VMD client for the given gRPC address. onDead is
+// called when the transport reports the peer unreachable; the registry
+// wires it to Invalidate.
+type DialFunc func(addr string, onDead func()) (vmdclient.Client, error)
 
-// Registry maps host IDs to VMD clients. Clients are lazily created on
-// first use and cached.
+// Registry maps host IDs to VMD clients, cached on first use.
 type Registry struct {
 	db      *db.Queries
 	dial    DialFunc
@@ -53,11 +54,19 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 		return nil, fmt.Errorf("get host %q: %w", hostID, err)
 	}
 
-	c, err = r.dial(host.VmdAddr)
+	c, err = r.dial(host.VmdAddr, func() { r.Invalidate(hostID) })
 	if err != nil {
 		return nil, fmt.Errorf("dial VMD at %s for host %q: %w", host.VmdAddr, hostID, err)
 	}
 
 	r.clients[hostID] = c
 	return c, nil
+}
+
+// Invalidate drops the cached client for hostID so the next ClientFor
+// call re-resolves the host's address.
+func (r *Registry) Invalidate(hostID string) {
+	r.mu.Lock()
+	delete(r.clients, hostID)
+	r.mu.Unlock()
 }

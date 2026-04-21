@@ -65,13 +65,14 @@ func (s *StateStore) Close() error {
 	return s.db.Close()
 }
 
-// Put persists a VM record. Called on every state transition.
+// Put persists a VM record. Batched; the callback is idempotent so
+// Batch's retry-on-failure semantics are safe.
 func (s *StateStore) Put(rec VMRecord) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("marshal vm record: %w", err)
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketName).Put([]byte(rec.ID), data)
 	})
 }
@@ -97,7 +98,7 @@ func (s *StateStore) Get(vmID string) (*VMRecord, error) {
 
 // Delete removes a VM record.
 func (s *StateStore) Delete(vmID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketName).Delete([]byte(vmID))
 	})
 }
@@ -117,6 +118,19 @@ func (s *StateStore) All() ([]VMRecord, error) {
 		})
 	})
 	return records, err
+}
+
+// IDs returns the set of persisted VM IDs without unmarshaling records.
+func (s *StateStore) IDs() (map[string]struct{}, error) {
+	ids := make(map[string]struct{})
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		return b.ForEach(func(k, _ []byte) error {
+			ids[string(k)] = struct{}{}
+			return nil
+		})
+	})
+	return ids, err
 }
 
 // toRecord converts a VMInstance to a persistable VMRecord.

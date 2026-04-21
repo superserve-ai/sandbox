@@ -2004,9 +2004,9 @@ func (x *RestoreSnapshotResponse) GetResourceLimits() *ResourceLimits {
 
 type DeleteSnapshotRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Optional. Identifies the sandbox this snapshot belongs to — used for
-	// logging and for a sanity check that the paths live inside the expected
-	// snapshot directory. Never required for the delete itself.
+	// Required. Identifies the sandbox this snapshot belongs to. The daemon
+	// enforces that both paths live under <snapshot_dir>/<vm_id>/ so a call
+	// cannot unlink files owned by a different sandbox.
 	VmId string `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
 	// Absolute path to the vmstate snapshot file.
 	SnapshotPath string `protobuf:"bytes,2,opt,name=snapshot_path,json=snapshotPath,proto3" json:"snapshot_path,omitempty"`

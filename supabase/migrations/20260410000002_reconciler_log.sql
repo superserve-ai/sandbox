@@ -1,4 +1,5 @@
--- Audit log for every reconciler action.
+-- Audit log for every reconciler action. On-call reads this table first
+-- when diagnosing "my sandbox died at 3am" — no silent actions.
 
 CREATE TABLE reconciler_log (
     id          bigserial PRIMARY KEY,

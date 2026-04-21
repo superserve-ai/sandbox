@@ -165,14 +165,19 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 }
 
 // DeleteSnapshot unlinks the vmstate + memory files for a previous snapshot.
-// Idempotent; path traversal is blocked at the Manager layer.
+// Idempotent; paths are scoped to <SnapshotDir>/<vm_id>/ at the Manager layer,
+// so a call cannot unlink files belonging to a different sandbox.
 func (a *GRPCAdapter) DeleteSnapshot(ctx context.Context, req *vmdpb.DeleteSnapshotRequest) (*vmdpb.DeleteSnapshotResponse, error) {
+	vmID := req.GetVmId()
 	snapshotPath := req.GetSnapshotPath()
 	memPath := req.GetMemFilePath()
+	if vmID == "" {
+		return nil, status.Error(codes.InvalidArgument, "vm_id must be set")
+	}
 	if snapshotPath == "" && memPath == "" {
 		return nil, status.Error(codes.InvalidArgument, "snapshot_path and/or mem_file_path must be set")
 	}
-	if err := a.mgr.DeleteSnapshotFiles(snapshotPath, memPath); err != nil {
+	if err := a.mgr.DeleteSnapshotFiles(vmID, snapshotPath, memPath); err != nil {
 		return nil, err
 	}
 	return &vmdpb.DeleteSnapshotResponse{Deleted: true}, nil

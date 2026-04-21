@@ -1,4 +1,6 @@
--- Host table: one row per machine running VMD.
+-- Host table: models bare-metal machines running VMD. One row per host.
+-- Multi-host-ready from day one — adding a second host is an ops task
+-- (insert a row, deploy VMD), not an engineering project.
 
 CREATE TABLE host (
     id                  text PRIMARY KEY,

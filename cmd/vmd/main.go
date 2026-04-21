@@ -247,6 +247,8 @@ func main() {
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
+	maxConcurrentCreates, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_CREATES", "100"))
+
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:     cfg.FirecrackerBin,
 		JailerBin:          cfg.JailerBin,
@@ -257,6 +259,7 @@ func main() {
 		TemplateBuilderBin: cfg.TemplateBuilderBin,
 		BoxdBinaryPath:     cfg.BoxdBinaryPath,
 		HostInterface:      cfg.HostInterface,
+		MaxConcurrent:      maxConcurrentCreates,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

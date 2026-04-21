@@ -78,13 +78,9 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 	if m.queryRowFn != nil {
 		return m.queryRowFn(ctx, sql, args...)
 	}
-	// Route by SQL content:
-	//   - FinalizePause returns only a single snapshot_id uuid
-	//   - legacy CreateSnapshot returns a full Snapshot row
-	//   - activity insert returns an activity row
 	switch {
-	case strings.Contains(sql, "new_snapshot AS"):
-		return finalizePauseRow(uuid.New(), pgtype.UUID{})
+	case strings.Contains(sql, "upserted AS"):
+		return finalizePauseRow(uuid.New())
 	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
 	}
@@ -150,7 +146,7 @@ func TestReaper_NothingExpired(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	if atomic.LoadInt32(&pauseCalled) != 0 {
 		t.Fatal("PauseInstance should not be called when no sandboxes are expired")
@@ -170,9 +166,9 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
 			},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-				if strings.Contains(sql, "new_snapshot AS") {
+				if strings.Contains(sql, "upserted AS") {
 					atomic.AddInt32(&finalizeCalls, 1)
-					return finalizePauseRow(uuid.New(), pgtype.UUID{})
+					return finalizePauseRow(uuid.New())
 				}
 				return activityRow()
 			},
@@ -183,7 +179,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	if pausedID != row.ID.String() {
 		t.Fatalf("expected PauseInstance called with %s, got %q", row.ID, pausedID)
@@ -223,7 +219,7 @@ func TestReaper_VMDFails(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	// Both sandboxes should be attempted even though VMD fails.
 	if got := atomic.LoadInt32(&pauseCallCount); got != 2 {
@@ -252,7 +248,7 @@ func TestReaper_DBError(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10)
+	h.reapOnce(context.Background(), 10, 1)
 
 	if atomic.LoadInt32(&pauseCalled) != 0 {
 		t.Fatal("PauseInstance should not be called when DB query fails")
@@ -279,7 +275,7 @@ func TestReaper_BatchSizeRespected(t *testing.T) {
 		&stubVMD{},
 	)
 
-	h.reapOnce(context.Background(), 7)
+	h.reapOnce(context.Background(), 7, 1)
 
 	if got := atomic.LoadInt32(&capturedLimit); got != 7 {
 		t.Fatalf("expected batch size 7 passed to query, got %d", got)
@@ -311,7 +307,7 @@ func TestReaper_ContextCancelledMidBatch(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(ctx, 10)
+	h.reapOnce(ctx, 10, 1)
 
 	// The loop checks ctx.Done() between each sandbox. After cancel() the loop
 	// should exit before processing all 5.
