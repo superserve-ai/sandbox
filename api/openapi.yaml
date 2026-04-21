@@ -385,10 +385,10 @@ components:
           type: string
         status:
           type: string
-          enum: [active, paused]
+          enum: [active, paused, resuming]
           description: >
-            Current state of the sandbox. `active` means running; `paused`
-            means paused and awaiting resume.
+            `active` = running, `paused` = stopped with state saved,
+            `resuming` = transient during paused→active (retry shortly).
         vcpu_count:
           type: integer
         memory_mib:

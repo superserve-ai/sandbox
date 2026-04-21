@@ -768,7 +768,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var req createSandboxRequest
 	if err := bindJSONStrict(c, &req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "Request body is not valid JSON or contains unknown fields.", http.StatusBadRequest)
 		return
 	}
 	// Manual field validation — bindJSONStrict uses encoding/json which does
@@ -1172,7 +1172,7 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 
 	var req sandboxExecRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "Request body is not valid JSON or is missing required fields (command is required).", http.StatusBadRequest)
 		return
 	}
 
