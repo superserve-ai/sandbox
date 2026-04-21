@@ -138,6 +138,7 @@ func (s *stubVMD) ExecCommandStream(_ context.Context, _, _ string, _ []string, 
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
+func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error { return nil }
 
 // seedTeamAndKey inserts a team + API key and returns (teamID, rawKey).
 func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
