@@ -269,10 +269,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Drift 4: DB says idle, snapshot file missing on disk → mark failed.
+	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {
-			if sb.Sandbox.Status != db.SandboxStatusIdle || !sb.Sandbox.SnapshotID.Valid {
+			if sb.Sandbox.Status != db.SandboxStatusPaused || !sb.Sandbox.SnapshotID.Valid {
 				continue
 			}
 			// snapshot_path is joined in by ListSandboxesByHost, so this
@@ -283,22 +283,22 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			snapPath := *sb.SnapshotPath
 			if _, statErr := os.Stat(snapPath); statErr == nil {
-				r.clearDrift("idle:" + id)
+				r.clearDrift("paused:" + id)
 				continue
 			}
-			if !r.gracePeriodElapsed("idle:"+id, now) {
+			if !r.gracePeriodElapsed("paused:"+id, now) {
 				continue
 			}
 			if !r.consumeAutoFailBudget(id) {
-				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "idle_snapshot_missing")
+				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "paused_snapshot_missing")
 				continue
 			}
 			log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
-				Str("drift", "idle_snapshot_missing").
-				Msg("idle sandbox snapshot file missing — marking failed")
+				Str("drift", "paused_snapshot_missing").
+				Msg("paused sandbox snapshot file missing — marking failed")
 			r.markFailedInDB(ctx, id)
-			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "idle_snapshot_missing")
-			r.clearDrift("idle:" + id)
+			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
+			r.clearDrift("paused:" + id)
 		}
 	}
 

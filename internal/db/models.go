@@ -20,7 +20,7 @@ const (
 	SandboxStatusStarting SandboxStatus = "starting"
 	SandboxStatusActive   SandboxStatus = "active"
 	SandboxStatusPausing  SandboxStatus = "pausing"
-	SandboxStatusIdle     SandboxStatus = "idle"
+	SandboxStatusPaused   SandboxStatus = "paused"
 	SandboxStatusDeleted  SandboxStatus = "deleted"
 	SandboxStatusFailed   SandboxStatus = "failed"
 )
@@ -144,21 +144,20 @@ type ReconcilerLog struct {
 }
 
 type Sandbox struct {
-	ID             uuid.UUID          `json:"id"`
-	TeamID         uuid.UUID          `json:"team_id"`
-	Name           string             `json:"name"`
-	Status         SandboxStatus      `json:"status"`
-	VcpuCount      int32              `json:"vcpu_count"`
-	MemoryMib      int32              `json:"memory_mib"`
-	HostID         string             `json:"host_id"`
-	IpAddress      *netip.Addr        `json:"ip_address"`
-	Pid            *int32             `json:"pid"`
-	SnapshotID     pgtype.UUID        `json:"snapshot_id"`
-	LastActivityAt time.Time          `json:"last_activity_at"`
-	CreatedAt      time.Time          `json:"created_at"`
-	UpdatedAt      time.Time          `json:"updated_at"`
-	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
-	NetworkConfig  []byte             `json:"network_config"`
+	ID            uuid.UUID          `json:"id"`
+	TeamID        uuid.UUID          `json:"team_id"`
+	Name          string             `json:"name"`
+	Status        SandboxStatus      `json:"status"`
+	VcpuCount     int32              `json:"vcpu_count"`
+	MemoryMib     int32              `json:"memory_mib"`
+	HostID        string             `json:"host_id"`
+	IpAddress     *netip.Addr        `json:"ip_address"`
+	Pid           *int32             `json:"pid"`
+	SnapshotID    pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+	DestroyedAt   pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig []byte             `json:"network_config"`
 	// Hard lifetime cap in seconds from created_at. NULL = no cap. The reaper destroys the sandbox when now() > created_at + (timeout_seconds || ' seconds')::interval, regardless of state (active, paused, idle).
 	TimeoutSeconds *int32 `json:"timeout_seconds"`
 	// User-supplied flat string→string tags attached at creation. Immutable. Filterable on list endpoints via jsonb @> containment. Always non-null; an absent value is the empty object {}, never NULL.

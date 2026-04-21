@@ -17,6 +17,11 @@ type Client interface {
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk).
 	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// DeleteSnapshot removes the on-disk vmstate + memory files for a
+	// previous snapshot. Idempotent: missing files return nil. Used by the
+	// control plane to garbage-collect the previous snapshot after a new
+	// pause writes a fresh one.
+	DeleteSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string) error
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error

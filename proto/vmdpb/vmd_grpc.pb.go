@@ -25,6 +25,7 @@ const (
 	VMDaemon_ResumeVM_FullMethodName             = "/superserve.vmd.v1.VMDaemon/ResumeVM"
 	VMDaemon_CreateSnapshot_FullMethodName       = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
 	VMDaemon_RestoreSnapshot_FullMethodName      = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
+	VMDaemon_DeleteSnapshot_FullMethodName       = "/superserve.vmd.v1.VMDaemon/DeleteSnapshot"
 	VMDaemon_ExecCommand_FullMethodName          = "/superserve.vmd.v1.VMDaemon/ExecCommand"
 	VMDaemon_GetVMInfo_FullMethodName            = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
 	VMDaemon_SetupNetwork_FullMethodName         = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
@@ -49,6 +50,11 @@ type VMDaemonClient interface {
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
 	// RestoreSnapshot boots a VM from a previously captured snapshot.
 	RestoreSnapshot(ctx context.Context, in *RestoreSnapshotRequest, opts ...grpc.CallOption) (*RestoreSnapshotResponse, error)
+	// DeleteSnapshot removes a snapshot's on-disk artifacts (vmstate + memory
+	// file). Idempotent — missing files are treated as success. Used by the
+	// control plane to garbage-collect the previous snapshot when a sandbox is
+	// re-paused and only the latest snapshot is reachable.
+	DeleteSnapshot(ctx context.Context, in *DeleteSnapshotRequest, opts ...grpc.CallOption) (*DeleteSnapshotResponse, error)
 	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
 	ExecCommand(ctx context.Context, in *ExecCommandRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecCommandResponse], error)
 	// GetVMInfo returns the current status and metadata of a VM.
@@ -127,6 +133,16 @@ func (c *vMDaemonClient) RestoreSnapshot(ctx context.Context, in *RestoreSnapsho
 	return out, nil
 }
 
+func (c *vMDaemonClient) DeleteSnapshot(ctx context.Context, in *DeleteSnapshotRequest, opts ...grpc.CallOption) (*DeleteSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSnapshotResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_DeleteSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vMDaemonClient) ExecCommand(ctx context.Context, in *ExecCommandRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecCommandResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[0], VMDaemon_ExecCommand_FullMethodName, cOpts...)
@@ -194,6 +210,11 @@ type VMDaemonServer interface {
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
 	// RestoreSnapshot boots a VM from a previously captured snapshot.
 	RestoreSnapshot(context.Context, *RestoreSnapshotRequest) (*RestoreSnapshotResponse, error)
+	// DeleteSnapshot removes a snapshot's on-disk artifacts (vmstate + memory
+	// file). Idempotent — missing files are treated as success. Used by the
+	// control plane to garbage-collect the previous snapshot when a sandbox is
+	// re-paused and only the latest snapshot is reachable.
+	DeleteSnapshot(context.Context, *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error)
 	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
 	ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error
 	// GetVMInfo returns the current status and metadata of a VM.
@@ -229,6 +250,9 @@ func (UnimplementedVMDaemonServer) CreateSnapshot(context.Context, *CreateSnapsh
 }
 func (UnimplementedVMDaemonServer) RestoreSnapshot(context.Context, *RestoreSnapshotRequest) (*RestoreSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
+}
+func (UnimplementedVMDaemonServer) DeleteSnapshot(context.Context, *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSnapshot not implemented")
 }
 func (UnimplementedVMDaemonServer) ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error {
 	return status.Error(codes.Unimplemented, "method ExecCommand not implemented")
@@ -371,6 +395,24 @@ func _VMDaemon_RestoreSnapshot_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_DeleteSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).DeleteSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_DeleteSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).DeleteSnapshot(ctx, req.(*DeleteSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VMDaemon_ExecCommand_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(ExecCommandRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -466,6 +508,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RestoreSnapshot",
 			Handler:    _VMDaemon_RestoreSnapshot_Handler,
+		},
+		{
+			MethodName: "DeleteSnapshot",
+			Handler:    _VMDaemon_DeleteSnapshot_Handler,
 		},
 		{
 			MethodName: "GetVMInfo",
