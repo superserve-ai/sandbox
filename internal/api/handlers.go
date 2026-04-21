@@ -177,8 +177,10 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 	}
 }
 
-// resumePausedSandbox restores the VM, marks the sandbox active, and reapplies
-// network config. Writes an error response and returns false on failure.
+// resumePausedSandbox restores the VM, reapplies network config, and flips
+// the sandbox to active. Starts with an atomic paused→resuming DB claim so
+// concurrent resumes don't both call VMD; the loser gets 409. On any failure
+// after VMD resume succeeds, destroys the VM + reverts to paused.
 func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) bool {
 	sandboxID := sandbox.ID
 
@@ -188,12 +190,42 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	claimed, err := h.DB.BeginResume(c.Request.Context(), db.BeginResumeParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Someone else is already resuming, or the sandbox is no longer
+			// in paused state. Surface as conflict; client retries.
+			respondError(c, ErrInvalidState)
+			return false
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginResume failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+	*sandbox = claimed
+
+	revertCtx := context.WithoutCancel(c.Request.Context())
+	revertToPaused := func() {
+		rctx, rcancel := context.WithTimeout(revertCtx, asyncTimeout)
+		defer rcancel()
+		if err := h.DB.RevertResumeToPaused(rctx, db.RevertResumeToPausedParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("RevertResumeToPaused failed — sandbox may be stuck in 'resuming'")
+		}
+	}
+
 	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
 		ID:     sandbox.SnapshotID.Bytes,
 		TeamID: teamID,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
+		revertToPaused()
 		respondError(c, ErrInternal)
 		return false
 	}
@@ -204,6 +236,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
+		revertToPaused()
 		respondError(c, ErrInternal)
 		return false
 	}
@@ -218,21 +251,24 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
+				revertToPaused()
 				respondError(c, ErrInternal)
 				return false
 			}
+			// RestoreSnapshot's proto doesn't carry ResourceLimits yet; it returns
+			// 0 for vcpu/mem. Keep the DB values so we don't overwrite them with 0.
+			if actualVcpu == 0 {
+				actualVcpu = uint32(sandbox.VcpuCount)
+			}
+			if actualMemMiB == 0 {
+				actualMemMiB = uint32(sandbox.MemoryMib)
+			}
 		} else {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
+			revertToPaused()
 			respondError(c, ErrInternal)
 			return false
 		}
-	}
-
-	if actualVcpu == 0 {
-		actualVcpu = uint32(sandbox.VcpuCount)
-	}
-	if actualMemMiB == 0 {
-		actualMemMiB = uint32(sandbox.MemoryMib)
 	}
 
 	// Detach from cancellation so a client disconnect can't leave the sandbox
@@ -247,32 +283,33 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	// ActivateSandbox (DB) and reapplyNetworkConfig (VMD) share no state and
-	// both only need the VMD restore to have completed. Run them in parallel.
-	activateErr := make(chan error, 1)
-	networkErr := make(chan error, 1)
-	go func() {
-		activateErr <- h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
-			ID:        sandboxID,
-			VcpuCount: int32(actualVcpu),
-			MemoryMib: int32(actualMemMiB),
-			IpAddress: ipAddr,
-			TeamID:    teamID,
-		})
-	}()
-	go func() {
-		networkErr <- h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig)
-	}()
+	destroyAndRevert := func() {
+		dctx, dcancel := context.WithTimeout(revertCtx, vmdTimeout)
+		defer dcancel()
+		if err := vmd.DestroyInstance(dctx, sandboxID.String(), true); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy VM after resume failure failed")
+		}
+		revertToPaused()
+	}
 
-	aErr := <-activateErr
-	nErr := <-networkErr
-	if aErr != nil {
-		log.Error().Err(aErr).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
+	// Apply egress rules before committing to 'active' so "active ⇒ rules
+	// applied" holds by construction.
+	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
+		destroyAndRevert()
 		respondError(c, ErrInternal)
 		return false
 	}
-	if nErr != nil {
-		log.Error().Err(nErr).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
+
+	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
+		ID:        sandboxID,
+		VcpuCount: int32(actualVcpu),
+		MemoryMib: int32(actualMemMiB),
+		IpAddress: ipAddr,
+		TeamID:    teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
+		destroyAndRevert()
 		respondError(c, ErrInternal)
 		return false
 	}
@@ -300,12 +337,11 @@ type persistedEgressConfig struct {
 	} `json:"egress"`
 }
 
-// reapplyNetworkConfig reads the sandbox's persisted egress config from the DB
-// record and pushes it back to VMD. Called after every resume path (explicit
-// /resume, post-restore in CreateSandbox) because the nftables rules and
-// proxy state are fresh after a snapshot restore.
+// reapplyNetworkConfig reads the sandbox's persisted egress config and pushes
+// it to VMD. Called after every snapshot restore (explicit /resume, auto-resume
+// via /exec, and CreateSandbox's from-snapshot path) because nftables rules
+// and proxy state are fresh after restore.
 //
-// Uses a caller-supplied context so the caller controls timeout/cancellation.
 // Silently returns nil if there is no persisted config (default allow-all).
 func (h *Handlers) reapplyNetworkConfig(ctx context.Context, vmd VMDClient, sandboxID string, raw []byte) error {
 	if len(raw) == 0 {

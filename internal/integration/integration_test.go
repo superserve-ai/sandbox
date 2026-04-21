@@ -603,8 +603,8 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	}
 }
 
-// Exec on a paused sandbox must be rejected — callers must resume explicitly
-// via POST /resume. There is no implicit auto-wake on traffic.
+// Exec on a paused sandbox transparently resumes it, runs the command, and
+// leaves the sandbox active.
 func TestIntegration_ExecSandbox_PausedAutoResume(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
@@ -629,6 +629,69 @@ func TestIntegration_ExecSandbox_PausedAutoResume(t *testing.T) {
 	status, _ := mustJSON(t, gw)["status"].(string)
 	if status != "active" {
 		t.Errorf("sandbox status after auto-resume = %q, want %q", status, "active")
+	}
+}
+
+// Baseline: /exec/stream on an active sandbox emits a valid SSE response
+// ending with finished=true and exit_code=0.
+func TestIntegration_ExecSandboxStream_Success(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stream-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d", cw.Code)
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+
+	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
+	if ew.Code != http.StatusOK {
+		t.Fatalf("exec/stream: expected 200, got %d: %s", ew.Code, ew.Body.String())
+	}
+	body := ew.Body.String()
+	if !strings.HasPrefix(body, "data: ") {
+		t.Errorf("body does not start with SSE data frame; got: %q", body)
+	}
+	if !strings.Contains(body, `"finished":true`) {
+		t.Errorf("SSE body missing finished event; got: %s", body)
+	}
+	if !strings.Contains(body, `"exit_code":0`) {
+		t.Errorf("SSE body missing exit_code=0; got: %s", body)
+	}
+}
+
+// Same auto-resume behavior on the SSE streaming endpoint.
+func TestIntegration_ExecSandboxStream_PausedAutoResume(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-stream-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d", cw.Code)
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+
+	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
+	if pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+
+	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
+	if ew.Code != http.StatusOK {
+		t.Fatalf("exec/stream on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
+	}
+	body := ew.Body.String()
+	if !strings.Contains(body, `"finished":true`) {
+		t.Errorf("SSE body missing finished event; got: %s", body)
+	}
+	if !strings.Contains(body, `"exit_code":0`) {
+		t.Errorf("SSE body missing exit_code=0; got: %s", body)
+	}
+
+	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
+	status, _ := mustJSON(t, gw)["status"].(string)
+	if status != "active" {
+		t.Errorf("sandbox status after stream auto-resume = %q, want %q", status, "active")
 	}
 }
 
