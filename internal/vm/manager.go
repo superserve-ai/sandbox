@@ -34,6 +34,11 @@ import (
 // its own files at the same fixed path.
 const templateDirName = "template"
 
+// boxdRestoreHealthTimeout bounds how long we wait for the guest agent to
+// accept connections after restoring a VM from a snapshot. Boxd typically
+// binds in well under a second; this is a defensive upper bound.
+const boxdRestoreHealthTimeout = 10 * time.Second
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -711,6 +716,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
+	if err := m.waitForBoxd(ctx, inst.IP, boxdRestoreHealthTimeout); err != nil {
+		return nil, fmt.Errorf("boxd not ready after resume: %w", err)
+	}
+
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
@@ -938,6 +947,15 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
+	}
+
+	if err := m.waitForBoxd(ctx, hostIP, boxdRestoreHealthTimeout); err != nil {
+		if !inPlace {
+			m.netMgr.CleanupVM(vmID)
+		}
+		m.cleanupRunDir(vmID)
+		m.setStatus(vmID, StatusError)
+		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 
 	m.setStatus(vmID, StatusRunning)
