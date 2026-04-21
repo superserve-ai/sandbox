@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +34,7 @@ type stubVMD struct {
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
 	execFn           func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
+	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
 func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (string, uint32, uint32, error) {
@@ -82,7 +85,10 @@ func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []st
 func (s *stubVMD) ExecCommandStream(context.Context, string, string, []string, map[string]string, string, uint32, func([]byte, []byte, int32, bool)) error {
 	return nil
 }
-func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, denied, domains []string) error {
+	if s.updateNetworkFn != nil {
+		return s.updateNetworkFn(ctx, id, allowed, denied, domains)
+	}
 	return nil
 }
 
@@ -493,11 +499,11 @@ func TestResumeSandbox_Success(t *testing.T) {
 		},
 	}
 
-	queryRowCall := 0
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			queryRowCall++
 			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb) // BeginResume RETURNING *
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -643,14 +649,16 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 		},
 	}
 
-	queryRowCall := 0
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			queryRowCall++
-			if strings.Contains(sql, "FROM sandbox") {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return snapshotRow(snap)
 			}
-			return snapshotRow(snap)
 		},
 		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
 			return pgconn.NewCommandTag(""), nil
@@ -663,6 +671,171 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+// Network-reapply failure after VMD resume must destroy the VM, revert DB to
+// paused, and never flip status to active.
+func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.NetworkConfig = []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"]}}`)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	var destroyCalled, updateNetworkCalled int32
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			return "10.0.0.5", nil
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			atomic.AddInt32(&destroyCalled, 1)
+			return nil
+		},
+		updateNetworkFn: func(context.Context, string, []string, []string, []string) error {
+			atomic.AddInt32(&updateNetworkCalled, 1)
+			return fmt.Errorf("nftables push failed")
+		},
+	}
+
+	var activateCalled, revertCalled int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "'active'") {
+				atomic.AddInt32(&activateCalled, 1)
+			}
+			if strings.Contains(sql, "SET status = 'paused'") {
+				atomic.AddInt32(&revertCalled, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if got := atomic.LoadInt32(&updateNetworkCalled); got != 1 {
+		t.Errorf("reapplyNetworkConfig calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&destroyCalled); got != 1 {
+		t.Errorf("DestroyInstance calls = %d, want 1 (on failure)", got)
+	}
+	if got := atomic.LoadInt32(&activateCalled); got != 0 {
+		t.Errorf("ActivateSandbox calls = %d, want 0 (network failed before commit)", got)
+	}
+	if got := atomic.LoadInt32(&revertCalled); got != 1 {
+		t.Errorf("RevertResumeToPaused calls = %d, want 1", got)
+	}
+}
+
+// DB activate failure after network reapply must also destroy the VM + revert.
+func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	var destroyCalled int32
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			return "10.0.0.5", nil
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			atomic.AddInt32(&destroyCalled, 1)
+			return nil
+		},
+	}
+
+	var revertCalled int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "'active'") {
+				return pgconn.CommandTag{}, fmt.Errorf("db connection lost")
+			}
+			if strings.Contains(sql, "SET status = 'paused'") {
+				atomic.AddInt32(&revertCalled, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if got := atomic.LoadInt32(&destroyCalled); got != 1 {
+		t.Errorf("DestroyInstance calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&revertCalled); got != 1 {
+		t.Errorf("RevertResumeToPaused calls = %d, want 1", got)
+	}
+}
+
+// Exec on a sandbox in 'pausing' state returns 409 (auto-resume only fires
+// from 'paused').
+func TestExecSandbox_PausingStateRejected(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing}
+
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			t.Error("ResumeInstance must not be called on a pausing sandbox")
+			return "", nil
+		},
+		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
+			t.Error("ExecCommand must not be called on a pausing sandbox")
+			return "", "", 0, nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo"}`))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
 	}
 }
 
@@ -683,11 +856,11 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 		},
 	}
 
-	queryRowCall := 0
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			queryRowCall++
 			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -837,24 +1010,103 @@ func TestExecSandbox_InvalidState(t *testing.T) {
 	}
 }
 
-// Paused sandboxes must be resumed explicitly via POST /resume before exec
-// works — there is no implicit auto-wake.
-func TestExecSandbox_PausedRejected(t *testing.T) {
+// A paused sandbox is auto-resumed when exec is called; the command runs and
+// the sandbox is left active.
+func TestExecSandbox_PausedAutoResume(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "paused-sb", Status: db.SandboxStatusPaused}
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID:        snapshotID,
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		Path:      "/snapshots/test/vmstate.snap",
+		Saved:     false,
+		Trigger:   "pause",
+	}
 
-	var execCalled bool
+	var resumeCalled, execCalled bool
 	vmd := &stubVMD{
-		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
+		resumeFn: func(_ context.Context, id, _, _ string) (string, error) {
+			resumeCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("ResumeInstance id = %q, want %q", id, sandboxID)
+			}
+			return "10.0.0.7", nil
+		},
+		execFn: func(_ context.Context, id, cmd string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
 			execCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("ExecCommand id = %q, want %q", id, sandboxID)
+			}
+			return cmd + " output", "", 0, nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo"}`))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if !resumeCalled {
+		t.Error("VMD.ResumeInstance was not called before exec")
+	}
+	if !execCalled {
+		t.Error("VMD.ExecCommand was not called after auto-resume")
+	}
+}
+
+// Loser of a concurrent BeginResume race returns 409 without calling VMD.
+func TestExecSandbox_ConcurrentResumeLoserReturns409(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			t.Error("VMD.ResumeInstance must not be called when BeginResume lost the race")
+			return "", nil
+		},
+		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
+			t.Error("VMD.ExecCommand must not be called when BeginResume lost the race")
 			return "", "", 0, nil
 		},
 	}
 
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return notFoundRow() // simulate BeginResume 0-row (loser)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag(""), nil
+		},
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
@@ -864,8 +1116,93 @@ func TestExecSandbox_PausedRejected(t *testing.T) {
 	if w.Code != http.StatusConflict {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusConflict, w.Body.String())
 	}
-	if execCalled {
-		t.Error("VMD.ExecCommand should not be called on a paused sandbox")
+}
+
+// Two concurrent /exec requests on the same paused sandbox: exactly one
+// VMD resume, one ActivateSandbox, one exec; the loser gets 409.
+func TestExecSandbox_ConcurrentResumeSerializes(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	paused := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID:        snapshotID,
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		Path:      "/snapshots/test/vmstate.snap",
+		Saved:     false,
+		Trigger:   "pause",
+	}
+
+	var resumeCalls, activateCalls, execCalls int32
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			atomic.AddInt32(&resumeCalls, 1)
+			return "10.0.0.7", nil
+		},
+		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
+			atomic.AddInt32(&execCalls, 1)
+			return "ok", "", 0, nil
+		},
+	}
+
+	var claimed int32 // only first BeginResume wins
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				if atomic.CompareAndSwapInt32(&claimed, 0, 1) {
+					return sandboxRow(paused)
+				}
+				return notFoundRow()
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(paused)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "'active'") {
+				atomic.AddInt32(&activateCalls, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	router := setupTestRouter(h, teamID.String())
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo"}`))
+			codes[idx] = w.Code
+		}(i)
+	}
+	wg.Wait()
+
+	// One 200 (winner: exec ran), one 409 (loser: BeginResume lost).
+	got := map[int]int{}
+	for _, c := range codes {
+		got[c]++
+	}
+	if got[http.StatusOK] != 1 || got[http.StatusConflict] != 1 {
+		t.Fatalf("unexpected status distribution: %v (codes=%v)", got, codes)
+	}
+
+	if got := atomic.LoadInt32(&resumeCalls); got != 1 {
+		t.Errorf("ResumeInstance calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&activateCalls); got != 1 {
+		t.Errorf("ActivateSandbox calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&execCalls); got != 1 {
+		t.Errorf("ExecCommand calls = %d, want 1", got)
 	}
 }
 
