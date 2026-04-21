@@ -605,7 +605,7 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 
 // Exec on a paused sandbox must be rejected — callers must resume explicitly
 // via POST /resume. There is no implicit auto-wake on traffic.
-func TestIntegration_ExecSandbox_PausedRejected(t *testing.T) {
+func TestIntegration_ExecSandbox_PausedAutoResume(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
 
@@ -621,8 +621,14 @@ func TestIntegration_ExecSandbox_PausedRejected(t *testing.T) {
 	}
 
 	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello"}`)
-	if ew.Code != http.StatusConflict {
-		t.Fatalf("exec on paused: expected 409, got %d: %s", ew.Code, ew.Body.String())
+	if ew.Code != http.StatusOK {
+		t.Fatalf("exec on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
+	}
+
+	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
+	status, _ := mustJSON(t, gw)["status"].(string)
+	if status != "active" {
+		t.Errorf("sandbox status after auto-resume = %q, want %q", status, "active")
 	}
 }
 
