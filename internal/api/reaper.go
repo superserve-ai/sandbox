@@ -174,12 +174,8 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
 	defer postCancel()
 
-	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
-	// the sandbox, and flip status from pausing → paused in a single CTE.
-	// Same query as the user-initiated PauseSandbox handler, so the two
-	// code paths have identical atomicity guarantees.
 	triggerName := "timeout"
-	finalized, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
@@ -188,8 +184,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Saved:     false,
 		Name:      &triggerName,
 		Trigger:   triggerName,
-	})
-	if err != nil {
+	}); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
@@ -197,9 +192,6 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 
 	l.Info().Msg("reaper: sandbox paused due to timeout")
 	h.logActivityAsync(ctx, sbx.ID, sbx.TeamID, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
-
-	// Async GC for the now-unreachable previous snapshot, if any.
-	h.cleanupOldSnapshotAsync(ctx, sbx.ID, sbx.TeamID, sbx.HostID, finalized.PrevSnapshotID)
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is
@@ -232,15 +224,6 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		h.markSandboxFailed(ctx, sbx, "rollback resume failed after pause DB error", rl)
 		return
 	}
-
-	// VM is restored into memory; the on-disk snapshot files have no DB row
-	// (FinalizePause never completed) so they're unreferenced. Unlink them
-	// here — a failure only leaks disk, the VM is already running.
-	delCtx, delCancel := context.WithTimeout(ctx, vmdTimeout)
-	if delErr := vmd.DeleteSnapshot(delCtx, sbx.ID.String(), snapshotPath, memPath); delErr != nil {
-		rl.Warn().Err(delErr).Msg("reaper: rollback snapshot cleanup failed — files may linger")
-	}
-	delCancel()
 
 	// VM is running again — revert DB to active so reaper retries cleanly.
 	revertCtx, revertCancel := context.WithTimeout(ctx, asyncTimeout)

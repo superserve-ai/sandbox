@@ -15,7 +15,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
@@ -100,91 +99,6 @@ func (h *Handlers) logActivityAsync(reqCtx context.Context, sandboxID, teamID uu
 		if err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msgf("async %s/%s activity log failed", category, action)
 		}
-	}()
-}
-
-// cleanupOldSnapshotAsync garbage-collects a snapshot whose sandbox reference
-// was just overwritten by a newer pause. Runs detached from the request
-// context so it does not add latency to the pause response, but preserves
-// the trace/span so the work is visible in request traces.
-//
-// Order of operations:
-//  1. Look up the snapshot's paths in the DB (also filters out saved=true
-//     snapshots — the DB query returns 0 rows for those).
-//  2. Call VMD to unlink the vmstate + memory files. Idempotent on VMD side.
-//  3. Delete the DB row.
-//
-// On any failure we log and exit: files may remain on disk (detectable by a
-// future janitor) or the row may remain in DB (inert — no sandbox references
-// it). Both outcomes are bounded and safe; the next pause will produce the
-// same cleanup attempt for the newly-orphaned snapshot.
-//
-// prevSnapshotID is typically nil/invalid on a sandbox's first pause — the
-// helper short-circuits in that case.
-func (h *Handlers) cleanupOldSnapshotAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID, hostID string, prevSnapshotID pgtype.UUID) {
-	if !prevSnapshotID.Valid {
-		return
-	}
-	oldSnapshotID := uuid.UUID(prevSnapshotID.Bytes)
-
-	asyncCtx := context.WithoutCancel(reqCtx)
-	go func() {
-		l := log.With().
-			Str("sandbox_id", sandboxID.String()).
-			Str("snapshot_id", oldSnapshotID.String()).
-			Logger()
-
-		lookupCtx, lookupCancel := context.WithTimeout(asyncCtx, asyncTimeout)
-		snap, err := h.DB.GetSnapshotForCleanup(lookupCtx, db.GetSnapshotForCleanupParams{
-			ID:     oldSnapshotID,
-			TeamID: teamID,
-		})
-		lookupCancel()
-		if err != nil {
-			// ErrNoRows: either the row is already gone, or it's a
-			// saved=true row we must not auto-delete. Either way, nothing
-			// to do. Any other error is transient — log and stop; a future
-			// janitor can retry.
-			if err != pgx.ErrNoRows {
-				l.Error().Err(err).Msg("cleanup: lookup old snapshot failed")
-			}
-			return
-		}
-
-		vmd, vmdErr := h.vmdForHost(asyncCtx, hostID)
-		if vmdErr != nil {
-			l.Error().Err(vmdErr).Str("host_id", hostID).Msg("cleanup: resolve VMD failed")
-			return
-		}
-
-		memPath := ""
-		if snap.MemPath != nil {
-			memPath = *snap.MemPath
-		}
-
-		vmdCtx, vmdCancel := context.WithTimeout(asyncCtx, vmdTimeout)
-		err = vmd.DeleteSnapshot(vmdCtx, sandboxID.String(), snap.Path, memPath)
-		vmdCancel()
-		if err != nil {
-			// Files may linger on disk; row stays so a janitor (or the next
-			// pause-cleanup after another pause/resume cycle) can retry.
-			l.Error().Err(err).Msg("cleanup: VMD DeleteSnapshot failed, leaving row in place")
-			return
-		}
-
-		delCtx, delCancel := context.WithTimeout(asyncCtx, asyncTimeout)
-		_, err = h.DB.DeleteSnapshotRow(delCtx, db.DeleteSnapshotRowParams{
-			ID:     oldSnapshotID,
-			TeamID: teamID,
-		})
-		delCancel()
-		if err != nil {
-			// Files are gone; row remains. Inert (no sandbox references it)
-			// and cleanable by a janitor later.
-			l.Error().Err(err).Msg("cleanup: DeleteSnapshotRow failed, files already removed")
-			return
-		}
-		l.Debug().Msg("cleanup: previous snapshot garbage-collected")
 	}()
 }
 
@@ -1117,11 +1031,8 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Atomic post-VMD bookkeeping: insert the snapshot row, link it to
-	// the sandbox, and flip status from pausing → paused in a single CTE.
-	// Collapses three DB roundtrips into one.
 	triggerName := "pause"
-	finalized, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
+	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
@@ -1130,8 +1041,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		Saved:     false,
 		Name:      &triggerName,
 		Trigger:   triggerName,
-	})
-	if err != nil {
+	}); err != nil {
 		// ErrNoRows here means the sandbox was soft-deleted between
 		// BeginPause and FinalizePause (a rare race with DeleteSandbox).
 		// The VM is already stopped and its snapshot files are on disk —
@@ -1147,13 +1057,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Async observability.
 	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-
-	// Async orphan-snapshot cleanup. FinalizePause atomically swapped
-	// sandbox.snapshot_id to the new snapshot, so the previous one (if any)
-	// is now unreferenced.
-	h.cleanupOldSnapshotAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID, finalized.PrevSnapshotID)
 
 	c.Status(http.StatusNoContent)
 }

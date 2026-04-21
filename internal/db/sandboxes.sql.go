@@ -210,27 +210,6 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 	return i, err
 }
 
-const deleteSnapshotRow = `-- name: DeleteSnapshotRow :execrows
-DELETE FROM snapshot
-WHERE id = $1 AND team_id = $2 AND saved = false
-`
-
-type DeleteSnapshotRowParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
-}
-
-// Remove a snapshot row. Guarded by saved=false so a future template feature
-// can rely on row durability — auto-GC callers cannot accidentally nuke a
-// user-saved snapshot even if they passed the wrong ID.
-func (q *Queries) DeleteSnapshotRow(ctx context.Context, arg DeleteSnapshotRowParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteSnapshotRow, arg.ID, arg.TeamID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const destroySandbox = `-- name: DestroySandbox :exec
 UPDATE sandbox
 SET destroyed_at = now(), status = 'deleted', updated_at = now()
@@ -249,23 +228,28 @@ func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) 
 
 const finalizePause = `-- name: FinalizePause :one
 WITH target AS (
-  SELECT id, team_id, snapshot_id AS prev_snapshot_id FROM sandbox
+  SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
-new_snapshot AS (
+upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
   SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
+  ON CONFLICT (sandbox_id) WHERE saved = false
+  DO UPDATE SET
+    path = EXCLUDED.path,
+    mem_path = EXCLUDED.mem_path,
+    size_bytes = EXCLUDED.size_bytes,
+    name = EXCLUDED.name,
+    trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox
-SET snapshot_id = (SELECT snap_id FROM new_snapshot),
+SET snapshot_id = (SELECT snap_id FROM upserted),
     status = 'paused',
     updated_at = now()
-FROM new_snapshot
+FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
-RETURNING
-  new_snapshot.snap_id::uuid AS snapshot_id,
-  (SELECT prev_snapshot_id FROM target) AS prev_snapshot_id
+RETURNING upserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseParams struct {
@@ -279,33 +263,10 @@ type FinalizePauseParams struct {
 	Trigger   string    `json:"trigger"`
 }
 
-type FinalizePauseRow struct {
-	SnapshotID     uuid.UUID   `json:"snapshot_id"`
-	PrevSnapshotID pgtype.UUID `json:"prev_snapshot_id"`
-}
-
-// Atomically insert the snapshot row, link it to the sandbox, and flip
-// status from 'pausing' to 'paused'. Replaces the sequence
-// CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
-// three DB roundtrips into one.
-//
-// The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
-// in the same query. This prevents the common race where a sandbox is
-// soft-deleted before FinalizePause runs — without the gate, the CTE
-// INSERT would always execute (per PostgreSQL's rule that data-modifying
-// CTEs run independently of the main query), producing an orphan snapshot
-// row and a snapshot file on disk with no owner. A concurrent delete that
-// commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
-// can still race, but that window is microseconds and the resulting
-// orphan is detectable/cleanable by a background job.
-//
-// Also captures the sandbox's previous snapshot_id (before we overwrite it)
-// so the caller can garbage-collect the now-unreachable prior snapshot
-// asynchronously. Returns NULL for the first pause of a sandbox.
-//
-// When either the sandbox is missing/deleted or the INSERT did not fire,
-// the query returns 0 rows and the caller maps that to ErrSandboxGone.
-func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (FinalizePauseRow, error) {
+// Upsert the sandbox's live snapshot row and flip status to 'paused'.
+// Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).
+// The partial unique index on (sandbox_id) WHERE saved = false keys the UPSERT.
+func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, finalizePause,
 		arg.ID,
 		arg.TeamID,
@@ -316,9 +277,9 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (F
 		arg.Name,
 		arg.Trigger,
 	)
-	var i FinalizePauseRow
-	err := row.Scan(&i.SnapshotID, &i.PrevSnapshotID)
-	return i, err
+	var snapshot_id uuid.UUID
+	err := row.Scan(&snapshot_id)
+	return snapshot_id, err
 }
 
 const getSandbox = `-- name: GetSandbox :one
@@ -370,41 +331,6 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	var network_config []byte
 	err := row.Scan(&network_config)
 	return network_config, err
-}
-
-const getSnapshotForCleanup = `-- name: GetSnapshotForCleanup :one
-SELECT id, team_id, path, mem_path
-FROM snapshot
-WHERE id = $1 AND team_id = $2 AND saved = false
-`
-
-type GetSnapshotForCleanupParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
-}
-
-type GetSnapshotForCleanupRow struct {
-	ID      uuid.UUID `json:"id"`
-	TeamID  uuid.UUID `json:"team_id"`
-	Path    string    `json:"path"`
-	MemPath *string   `json:"mem_path"`
-}
-
-// Fetch a snapshot's paths for garbage collection. Returns only non-saved
-// snapshots — saved=true rows are reserved for the (future) user-named
-// template feature and must never be auto-deleted. A 0-row result means
-// the row was already gone or is a saved snapshot; either way the caller
-// should skip deletion.
-func (q *Queries) GetSnapshotForCleanup(ctx context.Context, arg GetSnapshotForCleanupParams) (GetSnapshotForCleanupRow, error) {
-	row := q.db.QueryRow(ctx, getSnapshotForCleanup, arg.ID, arg.TeamID)
-	var i GetSnapshotForCleanupRow
-	err := row.Scan(
-		&i.ID,
-		&i.TeamID,
-		&i.Path,
-		&i.MemPath,
-	)
-	return i, err
 }
 
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many

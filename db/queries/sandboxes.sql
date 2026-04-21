@@ -89,62 +89,32 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
 RETURNING *;
 
 -- name: FinalizePause :one
--- Atomically insert the snapshot row, link it to the sandbox, and flip
--- status from 'pausing' to 'paused'. Replaces the sequence
--- CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
--- three DB roundtrips into one.
---
--- The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
--- in the same query. This prevents the common race where a sandbox is
--- soft-deleted before FinalizePause runs — without the gate, the CTE
--- INSERT would always execute (per PostgreSQL's rule that data-modifying
--- CTEs run independently of the main query), producing an orphan snapshot
--- row and a snapshot file on disk with no owner. A concurrent delete that
--- commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
--- can still race, but that window is microseconds and the resulting
--- orphan is detectable/cleanable by a background job.
---
--- Also captures the sandbox's previous snapshot_id (before we overwrite it)
--- so the caller can garbage-collect the now-unreachable prior snapshot
--- asynchronously. Returns NULL for the first pause of a sandbox.
---
--- When either the sandbox is missing/deleted or the INSERT did not fire,
--- the query returns 0 rows and the caller maps that to ErrSandboxGone.
+-- Upsert the sandbox's live snapshot row and flip status to 'paused'.
+-- Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).
+-- The partial unique index on (sandbox_id) WHERE saved = false keys the UPSERT.
 WITH target AS (
-  SELECT id, team_id, snapshot_id AS prev_snapshot_id FROM sandbox
+  SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
-new_snapshot AS (
+upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
   SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
+  ON CONFLICT (sandbox_id) WHERE saved = false
+  DO UPDATE SET
+    path = EXCLUDED.path,
+    mem_path = EXCLUDED.mem_path,
+    size_bytes = EXCLUDED.size_bytes,
+    name = EXCLUDED.name,
+    trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox
-SET snapshot_id = (SELECT snap_id FROM new_snapshot),
+SET snapshot_id = (SELECT snap_id FROM upserted),
     status = 'paused',
     updated_at = now()
-FROM new_snapshot
+FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
-RETURNING
-  new_snapshot.snap_id::uuid AS snapshot_id,
-  (SELECT prev_snapshot_id FROM target) AS prev_snapshot_id;
-
--- name: GetSnapshotForCleanup :one
--- Fetch a snapshot's paths for garbage collection. Returns only non-saved
--- snapshots — saved=true rows are reserved for the (future) user-named
--- template feature and must never be auto-deleted. A 0-row result means
--- the row was already gone or is a saved snapshot; either way the caller
--- should skip deletion.
-SELECT id, team_id, path, mem_path
-FROM snapshot
-WHERE id = $1 AND team_id = $2 AND saved = false;
-
--- name: DeleteSnapshotRow :execrows
--- Remove a snapshot row. Guarded by saved=false so a future template feature
--- can rely on row durability — auto-GC callers cannot accidentally nuke a
--- user-saved snapshot even if they passed the wrong ID.
-DELETE FROM snapshot
-WHERE id = $1 AND team_id = $2 AND saved = false;
+RETURNING upserted.snap_id::uuid AS snapshot_id;
 
 -- name: UpdateSandboxNetworkConfig :exec
 UPDATE sandbox
