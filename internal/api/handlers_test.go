@@ -837,35 +837,67 @@ func TestExecSandbox_InvalidState(t *testing.T) {
 	}
 }
 
-// Paused sandboxes must be resumed explicitly via POST /resume before exec
-// works — there is no implicit auto-wake.
-func TestExecSandbox_PausedRejected(t *testing.T) {
+// A paused sandbox is auto-resumed when exec is called; the command runs and
+// the sandbox is left active.
+func TestExecSandbox_PausedAutoResume(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "paused-sb", Status: db.SandboxStatusPaused}
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID:        snapshotID,
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		Path:      "/snapshots/test/vmstate.snap",
+		Saved:     false,
+		Trigger:   "pause",
+	}
 
-	var execCalled bool
+	var resumeCalled, execCalled bool
 	vmd := &stubVMD{
-		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
+		resumeFn: func(_ context.Context, id, _, _ string) (string, error) {
+			resumeCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("ResumeInstance id = %q, want %q", id, sandboxID)
+			}
+			return "10.0.0.7", nil
+		},
+		execFn: func(_ context.Context, id, cmd string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
 			execCalled = true
-			return "", "", 0, nil
+			if id != sandboxID.String() {
+				t.Errorf("ExecCommand id = %q, want %q", id, sandboxID)
+			}
+			return cmd + " output", "", 0, nil
 		},
 	}
 
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo"}`))
 
-	if w.Code != http.StatusConflict {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusConflict, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	if execCalled {
-		t.Error("VMD.ExecCommand should not be called on a paused sandbox")
+	if !resumeCalled {
+		t.Error("VMD.ResumeInstance was not called before exec")
+	}
+	if !execCalled {
+		t.Error("VMD.ExecCommand was not called after auto-resume")
 	}
 }
 
