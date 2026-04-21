@@ -25,12 +25,13 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubVMD struct {
-	createFn  func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
-	destroyFn func(ctx context.Context, id string, force bool) error
-	pauseFn   func(ctx context.Context, id, snapshotDir string) (string, string, error)
-	resumeFn  func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	restoreFn func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	execFn    func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
+	createFn         func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
+	destroyFn        func(ctx context.Context, id string, force bool) error
+	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
+	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
+	execFn           func(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error)
 }
 
 func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (string, uint32, uint32, error) {
@@ -65,6 +66,12 @@ func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil
+}
+func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath string) error {
+	if s.deleteSnapshotFn != nil {
+		return s.deleteSnapshotFn(ctx, id, snapshotPath, memPath)
+	}
+	return nil
 }
 func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	if s.execFn != nil {
@@ -111,10 +118,10 @@ func (m *mockDBTX) Query(context.Context, string, ...any) (pgx.Rows, error) {
 // ---------------------------------------------------------------------------
 
 // sandboxRow returns a mockRow that populates a Sandbox from GetSandbox's Scan
-// call (17 destination pointers matching the column order in sqlc-generated
+// call (16 destination pointers matching the column order in sqlc-generated
 // queries: ID, TeamID, Name, Status, VcpuCount, MemoryMib, HostID, IpAddress,
-// Pid, SnapshotID, LastActivityAt, CreatedAt, UpdatedAt, DestroyedAt,
-// NetworkConfig, TimeoutSeconds, Metadata).
+// Pid, SnapshotID, CreatedAt, UpdatedAt, DestroyedAt, NetworkConfig,
+// TimeoutSeconds, Metadata).
 func sandboxRow(s db.Sandbox) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = s.ID
@@ -127,13 +134,12 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[7].(**netip.Addr) = s.IpAddress
 		*dest[8].(**int32) = s.Pid
 		*dest[9].(*pgtype.UUID) = s.SnapshotID
-		*dest[10].(*time.Time) = s.LastActivityAt
-		*dest[11].(*time.Time) = s.CreatedAt
-		*dest[12].(*time.Time) = s.UpdatedAt
-		*dest[13].(*pgtype.Timestamptz) = s.DestroyedAt
-		*dest[14].(*[]byte) = s.NetworkConfig
-		*dest[15].(**int32) = s.TimeoutSeconds
-		*dest[16].(*[]byte) = s.Metadata
+		*dest[10].(*time.Time) = s.CreatedAt
+		*dest[11].(*time.Time) = s.UpdatedAt
+		*dest[12].(*pgtype.Timestamptz) = s.DestroyedAt
+		*dest[13].(*[]byte) = s.NetworkConfig
+		*dest[14].(**int32) = s.TimeoutSeconds
+		*dest[15].(*[]byte) = s.Metadata
 		return nil
 	}}
 }
@@ -182,13 +188,8 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
-	// Routes with auto-wake middleware.
-	ops := r.Group("/sandboxes/:sandbox_id")
-	ops.Use(h.AutoWake())
-	{
-		ops.POST("/exec", h.ExecSandbox)
-		ops.POST("/exec/stream", h.ExecSandboxStream)
-	}
+	r.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
+	r.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
 	return r
 }
 
@@ -429,7 +430,7 @@ func snapshotRow(s db.Snapshot) *mockRow {
 	}}
 }
 
-// finalizePauseRow mocks the single-uuid RETURNING clause of FinalizePause.
+// finalizePauseRow mocks the single-column RETURNING of FinalizePause.
 func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = snapshotID
@@ -449,12 +450,12 @@ func resumeRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/resume", nil)
 }
 
-func idleSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandbox {
+func pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandbox {
 	return db.Sandbox{
 		ID:         sandboxID,
 		TeamID:     teamID,
 		Name:       "test-sb",
-		Status:     db.SandboxStatusIdle,
+		Status:     db.SandboxStatusPaused,
 		SnapshotID: pgtype.UUID{Bytes: snapshotID, Valid: true},
 	}
 }
@@ -463,7 +464,7 @@ func TestResumeSandbox_Success(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
-	sb := idleSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID:        snapshotID,
 		SandboxID: sandboxID,
@@ -581,7 +582,7 @@ func TestResumeSandbox_NotFound(t *testing.T) {
 	}
 }
 
-func TestResumeSandbox_NotIdle(t *testing.T) {
+func TestResumeSandbox_NotPaused(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
@@ -607,8 +608,8 @@ func TestResumeSandbox_NotIdle(t *testing.T) {
 func TestResumeSandbox_NoSnapshotID(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	// Idle but no snapshot_id set.
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusIdle}
+	// Paused but no snapshot_id set.
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPaused}
 
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
@@ -629,7 +630,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
-	sb := idleSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Saved: true, Trigger: "pause",
@@ -669,7 +670,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
-	sb := idleSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Saved: true, Trigger: "pause",
@@ -836,50 +837,35 @@ func TestExecSandbox_InvalidState(t *testing.T) {
 	}
 }
 
-func TestExecSandbox_AutoWakeIdle(t *testing.T) {
+// Paused sandboxes must be resumed explicitly via POST /resume before exec
+// works — there is no implicit auto-wake.
+func TestExecSandbox_PausedRejected(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "idle-sb", Status: db.SandboxStatusIdle}
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "paused-sb", Status: db.SandboxStatusPaused}
 
-	var resumeCalled, execCalled bool
+	var execCalled bool
 	vmd := &stubVMD{
-		resumeFn: func(_ context.Context, id, _, _ string) (string, error) {
-			resumeCalled = true
-			if id != sandboxID.String() {
-				t.Errorf("ResumeInstance id = %q, want %q", id, sandboxID)
-			}
-			return "10.0.0.1", nil
-		},
-		execFn: func(_ context.Context, id, command string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
+		execFn: func(context.Context, string, string, []string, map[string]string, string, uint32) (string, string, int32, error) {
 			execCalled = true
-			return "ok\n", "", 0, nil
+			return "", "", 0, nil
 		},
 	}
 
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "FROM sandbox") {
-				return sandboxRow(sb)
-			}
-			return activityRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo","args":["hello"]}`))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, sandboxExecReq(sandboxID.String(), `{"command":"echo"}`))
 
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusConflict, w.Body.String())
 	}
-	if !resumeCalled {
-		t.Error("VMD.ResumeInstance was not called for auto-wake")
-	}
-	if !execCalled {
-		t.Error("VMD.ExecCommand was not called after auto-wake")
+	if execCalled {
+		t.Error("VMD.ExecCommand should not be called on a paused sandbox")
 	}
 }
 
@@ -1082,7 +1068,7 @@ func TestPauseSandbox_Success(t *testing.T) {
 				// BeginPause: atomic transition active → pausing, returns *
 				return sandboxRow(sb)
 			case strings.Contains(sql, "INSERT INTO snapshot"):
-				// FinalizePause: CTE insert + update, returns snapshot_id
+				// FinalizePause: CTE upsert + update, returns snapshot_id
 				return finalizePauseRow(snapshotID)
 			case strings.Contains(sql, "FROM sandbox"):
 				// Generic GetSandbox (fallback from BeginPause)
@@ -1110,11 +1096,12 @@ func TestPauseSandbox_Success(t *testing.T) {
 	}
 }
 
+
 func TestPauseSandbox_NotActive(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 
-	// BeginPause's WHERE status = 'active' clause excludes an idle
+	// BeginPause's WHERE status = 'active' clause excludes a paused
 	// sandbox → 0 rows. The handler falls back to SandboxExists to
 	// disambiguate 404 vs 409; since the row exists (just in the wrong
 	// state), we return 409 Conflict.

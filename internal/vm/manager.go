@@ -34,6 +34,11 @@ import (
 // its own files at the same fixed path.
 const templateDirName = "template"
 
+// boxdRestoreHealthTimeout bounds how long we wait for the guest agent to
+// accept connections after restoring a VM from a snapshot. Boxd typically
+// binds in well under a second; this is a defensive upper bound.
+const boxdRestoreHealthTimeout = 10 * time.Second
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -316,8 +321,7 @@ func fileHash(path string) (string, error) {
 // CreateVM provisions a new Firecracker microVM by restoring from the default
 // template snapshot. Each VM gets its own rootfs copy and runs in a mount
 // namespace that maps the per-VM rootfs to the template's fixed path.
-func (m *Manager) CreateVM(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32,
-	kernelPath, kernelArgs, rootfsPath string, netCfg *network.Config, metadata map[string]string,
+func (m *Manager) CreateVM(ctx context.Context, vmID string, netCfg *network.Config, metadata map[string]string,
 ) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
@@ -712,6 +716,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
+	if err := m.waitForBoxd(ctx, inst.IP, boxdRestoreHealthTimeout); err != nil {
+		return nil, fmt.Errorf("boxd not ready after resume: %w", err)
+	}
+
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
@@ -753,6 +761,81 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	}
 
 	return snapshotPath, memPath, nil
+}
+
+// DeleteSnapshotFiles removes a snapshot's on-disk artifacts (vmstate + memory
+// file). Both paths must resolve to locations under the configured snapshot
+// directory — arbitrary paths are rejected as InvalidArgument to prevent the
+// control plane from accidentally (or maliciously) unlinking unrelated files.
+//
+// The operation is idempotent: missing files are not an error. The enclosing
+// directory is removed on a best-effort basis once both files are gone and it
+// is empty; a non-empty directory is left alone.
+//
+// Callers are responsible for ensuring the snapshot is no longer referenced
+// by any running VM. This method does not inspect instance state.
+func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error {
+	if snapshotPath == "" && memPath == "" {
+		return status.Error(codes.InvalidArgument, "at least one of snapshot_path/mem_file_path is required")
+	}
+	if vmID == "" {
+		return status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+	for _, p := range []string{snapshotPath, memPath} {
+		if p == "" {
+			continue
+		}
+		if err := m.assertUnderVMSnapshotDir(vmID, p); err != nil {
+			return err
+		}
+	}
+
+	for _, p := range []string{snapshotPath, memPath} {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", p, err)
+		}
+	}
+
+	// Best-effort: if the parent directory is now empty, clean it up. Only
+	// remove directories that are strict descendants of the vm's snapshot
+	// root — never the vm root itself or anything above it. Any error is
+	// swallowed; a non-empty or missing directory is fine.
+	vmRoot := filepath.Clean(filepath.Join(m.cfg.SnapshotDir, vmID))
+	sep := string(filepath.Separator)
+	for _, p := range []string{snapshotPath, memPath} {
+		if p == "" {
+			continue
+		}
+		dir := filepath.Dir(filepath.Clean(p))
+		if dir == vmRoot || !strings.HasPrefix(dir+sep, vmRoot+sep) {
+			continue
+		}
+		_ = os.Remove(dir)
+	}
+	return nil
+}
+
+// assertUnderVMSnapshotDir returns nil iff `p` is an absolute path that, after
+// cleaning, lies strictly under <SnapshotDir>/<vmID>/. This is the guard that
+// keeps DeleteSnapshotFiles from being used to unlink another sandbox's files
+// or the snapshot root itself.
+func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
+	if m.cfg.SnapshotDir == "" {
+		return status.Error(codes.FailedPrecondition, "snapshot_dir not configured")
+	}
+	if !filepath.IsAbs(p) {
+		return status.Errorf(codes.InvalidArgument, "path must be absolute: %s", p)
+	}
+	cleaned := filepath.Clean(p)
+	root := filepath.Clean(filepath.Join(m.cfg.SnapshotDir, vmID))
+	rel, err := filepath.Rel(root, cleaned)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return status.Errorf(codes.InvalidArgument, "path is outside snapshot directory for vm %s: %s", vmID, p)
+	}
+	return nil
 }
 
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
@@ -864,6 +947,15 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
+	}
+
+	if err := m.waitForBoxd(ctx, hostIP, boxdRestoreHealthTimeout); err != nil {
+		if !inPlace {
+			m.netMgr.CleanupVM(vmID)
+		}
+		m.cleanupRunDir(vmID)
+		m.setStatus(vmID, StatusError)
+		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 
 	m.setStatus(vmID, StatusRunning)

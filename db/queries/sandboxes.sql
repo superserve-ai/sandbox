@@ -46,11 +46,6 @@ SET status = 'active',
     updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 
--- name: UpdateSandboxLastActivity :exec
-UPDATE sandbox
-SET last_activity_at = now(), updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
-
 -- name: SetSandboxSnapshot :exec
 UPDATE sandbox
 SET snapshot_id = $2, updated_at = now()
@@ -65,7 +60,7 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
 
 -- name: ListSandboxesByHost :many
--- Used by the VMD reconciler. snapshot_path is joined so the idle-sandbox
+-- Used by the VMD reconciler. snapshot_path is joined so the paused-sandbox
 -- drift check can stat the file without a per-row snapshot lookup.
 SELECT sqlc.embed(s), snap.path AS snapshot_path
 FROM sandbox s
@@ -94,46 +89,32 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
 RETURNING *;
 
 -- name: FinalizePause :one
--- Atomically insert the snapshot row, link it to the sandbox, and flip
--- status from 'pausing' to 'idle'. Replaces the sequence
--- CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
--- three DB roundtrips into one.
---
--- The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
--- in the same query. This prevents the common race where a sandbox is
--- soft-deleted before FinalizePause runs — without the gate, the CTE
--- INSERT would always execute (per PostgreSQL's rule that data-modifying
--- CTEs run independently of the main query), producing an orphan snapshot
--- row and a snapshot file on disk with no owner. A concurrent delete that
--- commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
--- can still race, but that window is microseconds and the resulting
--- orphan is detectable/cleanable by a background job.
---
--- When either the sandbox is missing/deleted or the INSERT did not fire,
--- the query returns 0 rows and the caller maps that to ErrSandboxGone.
+-- Upsert the sandbox's live snapshot row and flip status to 'paused'.
+-- Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).
+-- The partial unique index on (sandbox_id) WHERE saved = false keys the UPSERT.
 WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
-new_snapshot AS (
+upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
   SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
+  ON CONFLICT (sandbox_id) WHERE saved = false
+  DO UPDATE SET
+    path = EXCLUDED.path,
+    mem_path = EXCLUDED.mem_path,
+    size_bytes = EXCLUDED.size_bytes,
+    name = EXCLUDED.name,
+    trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox
-SET snapshot_id = (SELECT snap_id FROM new_snapshot),
-    status = 'idle',
+SET snapshot_id = (SELECT snap_id FROM upserted),
+    status = 'paused',
     updated_at = now()
-FROM new_snapshot
+FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
-RETURNING new_snapshot.snap_id::uuid AS snapshot_id;
-
--- name: ListIdleSandboxes :many
-SELECT * FROM sandbox
-WHERE status = 'idle'
-  AND destroyed_at IS NULL
-  AND last_activity_at < $1
-ORDER BY last_activity_at ASC;
+RETURNING upserted.snap_id::uuid AS snapshot_id;
 
 -- name: UpdateSandboxNetworkConfig :exec
 UPDATE sandbox
@@ -155,7 +136,7 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 -- skip rows already being processed, so multi-replica Cloud Run deployments
 -- do not double-process the same sandbox.
 --
--- Only 'active' sandboxes are claimed — idle sandboxes are already stopped,
+-- Only 'active' sandboxes are claimed — paused sandboxes are already stopped,
 -- and transient states (starting, pausing) are skipped to avoid racing with
 -- in-progress operations. The 60-second grace window prevents reaping a sandbox
 -- that was just created with a very short timeout before it finishes starting up.

@@ -23,11 +23,11 @@ type streamExecRequest struct {
 }
 
 // ExecSandboxStream runs a command inside a sandbox and streams output via SSE.
-// The sandbox is loaded and auto-woken by the AutoWake middleware.
+// The sandbox must already be active — callers must resume a paused sandbox
+// via POST /sandboxes/:id/resume first.
 func (h *Handlers) ExecSandboxStream(c *gin.Context) {
-	sandbox := sandboxFromContext(c)
+	sandbox := h.loadActiveSandbox(c)
 	if sandbox == nil {
-		respondError(c, ErrInternal)
 		return
 	}
 
@@ -120,7 +120,6 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 	durationMs := int32(time.Since(start).Milliseconds())
 
 	// Async observability writes.
-	h.updateLastActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
 	actStatus := "success"
 	if err != nil {
 		actStatus = "error"

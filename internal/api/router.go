@@ -30,7 +30,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// and becomes meaningless for fairness.
 	api.Use(APIKeyAuth(pool), TeamRateLimit(ctx, DefaultTeamRateLimitConfig()))
 	{
-		// Sandbox lifecycle (no auto-wake).
+		// Sandbox lifecycle.
 		api.POST("/sandboxes", h.CreateSandbox)
 		api.GET("/sandboxes", h.ListSandboxes)
 		api.GET("/sandboxes/:sandbox_id", h.GetSandboxByID)
@@ -39,13 +39,10 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
 
-		// Sandbox operations with auto-wake middleware.
-		sandboxOps := api.Group("/sandboxes/:sandbox_id")
-		sandboxOps.Use(h.AutoWake())
-		{
-			sandboxOps.POST("/exec", h.ExecSandbox)
-			sandboxOps.POST("/exec/stream", h.ExecSandboxStream)
-		}
+		// Sandbox operations. Sandbox must already be active — paused
+		// sandboxes must be resumed explicitly via /resume.
+		api.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
+		api.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
 	}
 
 	r.GET("/health", h.Health)

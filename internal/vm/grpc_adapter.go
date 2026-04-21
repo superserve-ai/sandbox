@@ -24,13 +24,6 @@ func NewGRPCAdapter(mgr *Manager) *GRPCAdapter {
 }
 
 func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) (*vmdpb.CreateVMResponse, error) {
-	var vcpu, memMiB, diskMiB uint32
-	if rl := req.GetResourceLimits(); rl != nil {
-		vcpu = rl.GetVcpuCount()
-		memMiB = rl.GetMemoryMib()
-		diskMiB = rl.GetDiskSizeMib()
-	}
-
 	var netCfg *network.Config
 	if nc := req.GetNetworkConfig(); nc != nil {
 		netCfg = &network.Config{
@@ -41,9 +34,7 @@ func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) 
 		}
 	}
 
-	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), vcpu, memMiB, diskMiB,
-		req.GetKernelPath(), req.GetKernelArgs(), req.GetBaseRootfsPath(),
-		netCfg, req.GetMetadata())
+	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), netCfg, req.GetMetadata())
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +144,25 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		IpAddress:  inst.IP,
 		Pid:        uint32(inst.PID),
 	}, nil
+}
+
+// DeleteSnapshot unlinks the vmstate + memory files for a previous snapshot.
+// Idempotent; paths are scoped to <SnapshotDir>/<vm_id>/ at the Manager layer,
+// so a call cannot unlink files belonging to a different sandbox.
+func (a *GRPCAdapter) DeleteSnapshot(ctx context.Context, req *vmdpb.DeleteSnapshotRequest) (*vmdpb.DeleteSnapshotResponse, error) {
+	vmID := req.GetVmId()
+	snapshotPath := req.GetSnapshotPath()
+	memPath := req.GetMemFilePath()
+	if vmID == "" {
+		return nil, status.Error(codes.InvalidArgument, "vm_id must be set")
+	}
+	if snapshotPath == "" && memPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot_path and/or mem_file_path must be set")
+	}
+	if err := a.mgr.DeleteSnapshotFiles(vmID, snapshotPath, memPath); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteSnapshotResponse{Deleted: true}, nil
 }
 
 func (a *GRPCAdapter) ExecCommand(req *vmdpb.ExecCommandRequest, stream grpc.ServerStreamingServer[vmdpb.ExecCommandResponse]) error {

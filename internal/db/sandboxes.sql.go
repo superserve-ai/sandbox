@@ -8,7 +8,6 @@ package db
 import (
 	"context"
 	"net/netip"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -47,7 +46,7 @@ const beginPause = `-- name: BeginPause :one
 UPDATE sandbox
 SET status = 'pausing', updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
 `
 
 type BeginPauseParams struct {
@@ -76,7 +75,6 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox
 		&i.IpAddress,
 		&i.Pid,
 		&i.SnapshotID,
-		&i.LastActivityAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DestroyedAt,
@@ -120,7 +118,7 @@ type ClaimExpiredSandboxesRow struct {
 // skip rows already being processed, so multi-replica Cloud Run deployments
 // do not double-process the same sandbox.
 //
-// Only 'active' sandboxes are claimed — idle sandboxes are already stopped,
+// Only 'active' sandboxes are claimed — paused sandboxes are already stopped,
 // and transient states (starting, pausing) are skipped to avoid racing with
 // in-progress operations. The 60-second grace window prevents reaping a sandbox
 // that was just created with a very short timeout before it finishes starting up.
@@ -153,7 +151,7 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 const createSandbox = `-- name: CreateSandbox :one
 INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata
 `
 
 type CreateSandboxParams struct {
@@ -202,7 +200,6 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		&i.IpAddress,
 		&i.Pid,
 		&i.SnapshotID,
-		&i.LastActivityAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DestroyedAt,
@@ -234,18 +231,25 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
-new_snapshot AS (
+upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
   SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
+  ON CONFLICT (sandbox_id) WHERE saved = false
+  DO UPDATE SET
+    path = EXCLUDED.path,
+    mem_path = EXCLUDED.mem_path,
+    size_bytes = EXCLUDED.size_bytes,
+    name = EXCLUDED.name,
+    trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 )
 UPDATE sandbox
-SET snapshot_id = (SELECT snap_id FROM new_snapshot),
-    status = 'idle',
+SET snapshot_id = (SELECT snap_id FROM upserted),
+    status = 'paused',
     updated_at = now()
-FROM new_snapshot
+FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
-RETURNING new_snapshot.snap_id::uuid AS snapshot_id
+RETURNING upserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseParams struct {
@@ -259,23 +263,9 @@ type FinalizePauseParams struct {
 	Trigger   string    `json:"trigger"`
 }
 
-// Atomically insert the snapshot row, link it to the sandbox, and flip
-// status from 'pausing' to 'idle'. Replaces the sequence
-// CreateSnapshot → SetSandboxSnapshot → UpdateSandboxStatus, collapsing
-// three DB roundtrips into one.
-//
-// The INSERT is gated on a `WHERE EXISTS` against a non-deleted sandbox
-// in the same query. This prevents the common race where a sandbox is
-// soft-deleted before FinalizePause runs — without the gate, the CTE
-// INSERT would always execute (per PostgreSQL's rule that data-modifying
-// CTEs run independently of the main query), producing an orphan snapshot
-// row and a snapshot file on disk with no owner. A concurrent delete that
-// commits BETWEEN the EXISTS check and the INSERT under READ COMMITTED
-// can still race, but that window is microseconds and the resulting
-// orphan is detectable/cleanable by a background job.
-//
-// When either the sandbox is missing/deleted or the INSERT did not fire,
-// the query returns 0 rows and the caller maps that to ErrSandboxGone.
+// Upsert the sandbox's live snapshot row and flip status to 'paused'.
+// Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).
+// The partial unique index on (sandbox_id) WHERE saved = false keys the UPSERT.
 func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, finalizePause,
 		arg.ID,
@@ -293,7 +283,7 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -316,7 +306,6 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.IpAddress,
 		&i.Pid,
 		&i.SnapshotID,
-		&i.LastActivityAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DestroyedAt,
@@ -344,54 +333,8 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	return network_config, err
 }
 
-const listIdleSandboxes = `-- name: ListIdleSandboxes :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
-WHERE status = 'idle'
-  AND destroyed_at IS NULL
-  AND last_activity_at < $1
-ORDER BY last_activity_at ASC
-`
-
-func (q *Queries) ListIdleSandboxes(ctx context.Context, lastActivityAt time.Time) ([]Sandbox, error) {
-	rows, err := q.db.Query(ctx, listIdleSandboxes, lastActivityAt)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Sandbox{}
-	for rows.Next() {
-		var i Sandbox
-		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.LastActivityAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.last_activity_at, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, snap.path AS snapshot_path
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, snap.path AS snapshot_path
 FROM sandbox s
 LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL
@@ -402,7 +345,7 @@ type ListSandboxesByHostRow struct {
 	SnapshotPath *string `json:"snapshot_path"`
 }
 
-// Used by the VMD reconciler. snapshot_path is joined so the idle-sandbox
+// Used by the VMD reconciler. snapshot_path is joined so the paused-sandbox
 // drift check can stat the file without a per-row snapshot lookup.
 func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]ListSandboxesByHostRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByHost, hostID)
@@ -424,7 +367,6 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 			&i.Sandbox.IpAddress,
 			&i.Sandbox.Pid,
 			&i.Sandbox.SnapshotID,
-			&i.Sandbox.LastActivityAt,
 			&i.Sandbox.CreatedAt,
 			&i.Sandbox.UpdatedAt,
 			&i.Sandbox.DestroyedAt,
@@ -444,7 +386,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByTeam = `-- name: ListSandboxesByTeam :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
 ORDER BY created_at DESC
 `
@@ -469,7 +411,6 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.IpAddress,
 			&i.Pid,
 			&i.SnapshotID,
-			&i.LastActivityAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DestroyedAt,
@@ -488,7 +429,7 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 }
 
 const listSandboxesByTeamWithFilter = `-- name: ListSandboxesByTeamWithFilter :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, last_activity_at, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
@@ -524,7 +465,6 @@ func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSan
 			&i.IpAddress,
 			&i.Pid,
 			&i.SnapshotID,
-			&i.LastActivityAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DestroyedAt,
@@ -611,22 +551,6 @@ func (q *Queries) UpdateSandboxHost(ctx context.Context, arg UpdateSandboxHostPa
 		arg.Pid,
 		arg.TeamID,
 	)
-	return err
-}
-
-const updateSandboxLastActivity = `-- name: UpdateSandboxLastActivity :exec
-UPDATE sandbox
-SET last_activity_at = now(), updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-`
-
-type UpdateSandboxLastActivityParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
-}
-
-func (q *Queries) UpdateSandboxLastActivity(ctx context.Context, arg UpdateSandboxLastActivityParams) error {
-	_, err := q.db.Exec(ctx, updateSandboxLastActivity, arg.ID, arg.TeamID)
 	return err
 }
 
