@@ -70,7 +70,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/SandboxResponse"
+                  $ref: "#/components/schemas/SandboxListItem"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -375,7 +375,12 @@ components:
         network:
           $ref: "#/components/schemas/NetworkConfig"
 
-    SandboxResponse:
+    SandboxListItem:
+      description: |
+        Sandbox shape returned by endpoints that list many sandboxes
+        (`GET /sandboxes`). Never includes `access_token` — that is only
+        minted on create/get-by-id/resume where the caller has established
+        ownership of a single sandbox.
       type: object
       properties:
         id:
@@ -393,12 +398,6 @@ components:
           type: integer
         memory_mib:
           type: integer
-        access_token:
-          type: string
-          description: |
-            Per-sandbox access token for data-plane operations (file
-            upload/download, terminal). Pass as the `X-Access-Token` header.
-            Returned on create and get-by-id only.
         snapshot_id:
           type: string
           format: uuid
@@ -428,6 +427,22 @@ components:
           example:
             env: prod
             owner: agent-7
+
+    SandboxResponse:
+      description: |
+        Single-sandbox shape returned on create, get-by-id, and resume
+        paths. Extends `SandboxListItem` with `access_token` (the
+        per-sandbox token for data-plane operations).
+      allOf:
+        - $ref: "#/components/schemas/SandboxListItem"
+        - type: object
+          properties:
+            access_token:
+              type: string
+              description: |
+                Per-sandbox access token for data-plane operations (file
+                upload/download, terminal). Pass as the `X-Access-Token`
+                header.
 
     ResumeResponse:
       type: object
