@@ -264,20 +264,23 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				respondError(c, ErrInternal)
 				return false
 			}
-			// RestoreSnapshot's proto may return 0 for vcpu/mem on older vmd
-			// builds; keep the DB values so we don't overwrite them with 0.
-			if actualVcpu == 0 {
-				actualVcpu = uint32(sandbox.VcpuCount)
-			}
-			if actualMemMiB == 0 {
-				actualMemMiB = uint32(sandbox.MemoryMib)
-			}
 		} else {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
 			revertToPaused()
 			respondError(c, ErrInternal)
 			return false
 		}
+	}
+
+	// Older vmd builds may return 0 for vcpu/mem on both the Resume and
+	// Restore paths (ResourceLimits field was added later). Fall back to
+	// the sandbox row's existing values so ActivateSandbox doesn't
+	// overwrite them with 0 and trip the sandbox_memory_positive CHECK.
+	if actualVcpu == 0 {
+		actualVcpu = uint32(sandbox.VcpuCount)
+	}
+	if actualMemMiB == 0 {
+		actualMemMiB = uint32(sandbox.MemoryMib)
 	}
 
 	// Detach from cancellation so a client disconnect can't leave the sandbox
