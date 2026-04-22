@@ -1325,6 +1325,12 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 			respondError(c, ErrSandboxGone)
 			return
 		}
+		if isVMDInvalidArgument(err) {
+			// User input was rejected by the VM — surface the vmd-supplied
+			// message (e.g. "executable file not found in PATH") as 400.
+			respondErrorMsg(c, "bad_request", vmdErrorMessage(err), http.StatusBadRequest)
+			return
+		}
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand failed")
 		respondError(c, ErrInternal)
 		return

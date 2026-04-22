@@ -58,6 +58,27 @@ func isVMDFileMissing(err error) bool {
 	return status.Code(err) == codes.FailedPrecondition
 }
 
+// isVMDInvalidArgument returns true when vmd returned InvalidArgument —
+// typically from boxd rejecting a user-supplied command (e.g. bare
+// command name that doesn't resolve against the child PATH). The caller
+// maps this to 400 with the vmd-supplied message so the user sees why
+// their input was rejected instead of a generic 500.
+func isVMDInvalidArgument(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.InvalidArgument
+}
+
+// vmdErrorMessage returns the gRPC message from a vmd error, stripping
+// gRPC/transport framing so the string is safe to surface to API callers.
+func vmdErrorMessage(err error) string {
+	if s, ok := status.FromError(err); ok {
+		return s.Message()
+	}
+	return err.Error()
+}
+
 // markSandboxFailedAsync writes status=failed in a detached goroutine.
 // Used when a handler discovers (via VMD NotFound) that the VM is gone.
 // Detaches cancellation so the state transition survives client disconnect,
