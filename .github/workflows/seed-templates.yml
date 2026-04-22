@@ -1,16 +1,19 @@
 # CD — Seed Templates — curated public templates + enqueue their builds.
 #
 # Triggers:
-#   - push to main touching superserve_templates/** or cmd/seed-templates/**:
-#       runs staging, then production
+#   - push to main touching code or data that's baked INTO the template
+#     snapshot: runs staging, then production
 #   - workflow_dispatch with environment=staging:     staging only
 #   - workflow_dispatch with environment=production:  staging FIRST, then prod
 #
 # Production NEVER seeds without staging first. Same discipline as CD — Migrate.
 #
-# The seeder is idempotent: running it against an already-ready template with
-# an unchanged spec is a no-op. Edit a seed file (spec changes → new hash) to
-# trigger a rebuild on the next run.
+# The seeder is idempotent on spec-hash: editing only a template JSON
+# re-runs just that one build. When a path outside the specs changes (boxd,
+# protos, builder internals, embedded binaries) the resulting snapshot would
+# drift from the persisted one even with an unchanged spec, so the workflow
+# auto-passes --force-rebuild in those cases to refresh every template.
+# workflow_dispatch runs also respect the user-supplied force_rebuild toggle.
 #
 # Expected wall-clock: seeding ~seconds, build wait up to ~15 min. The job
 # timeout is 45 min so even a long build sequence has headroom.
@@ -35,8 +38,23 @@ on:
   push:
     branches: [main]
     paths:
+      # Template specs themselves — spec-hash idempotency already covers this.
       - 'superserve_templates/**'
       - 'cmd/seed-templates/**'
+      # Snapshot-underlying code: change any of these and the resulting
+      # rootfs/snapshot would differ from what's persisted even for an
+      # unchanged template spec. See detect-stale step below which sets
+      # --force-rebuild automatically for these.
+      - 'cmd/boxd/**'
+      - 'proto/boxdpb/**'
+      - 'internal/builder/**'
+
+# Serialize runs so two concurrent pushes don't double-trigger the
+# build supervisor with the same specs. In-progress runs complete before
+# the next one starts (no cancel — partial seeds would be worse).
+concurrency:
+  group: seed-templates
+  cancel-in-progress: false
 
 jobs:
   seed-staging:
@@ -46,11 +64,30 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Need HEAD~1 to diff which paths changed on a push.
+          fetch-depth: 2
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      # Detect whether this run was triggered by a change that invalidates
+      # existing template snapshots (boxd, proto, builder internals). If so,
+      # force-rebuild so every template gets refreshed. workflow_dispatch
+      # respects the user's explicit toggle.
+      - name: Detect stale snapshots
+        id: stale
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "force=${{ github.event.inputs.force_rebuild }}" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only HEAD~1 HEAD | grep -qE '^(cmd/boxd/|proto/boxdpb/|internal/builder/)'; then
+            echo "force=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "force=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Decision: force=$(tail -1 "$GITHUB_OUTPUT" | cut -d= -f2)"
 
       - name: Seed staging
         run: |
@@ -59,7 +96,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
           SYSTEM_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_STAGING }}
-          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
+          FORCE_REBUILD: ${{ steps.stale.outputs.force }}
 
   seed-prod:
     name: Seed Production
@@ -70,11 +107,24 @@ jobs:
     needs: [seed-staging]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Detect stale snapshots
+        id: stale
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "force=${{ github.event.inputs.force_rebuild }}" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only HEAD~1 HEAD | grep -qE '^(cmd/boxd/|proto/boxdpb/|internal/builder/)'; then
+            echo "force=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "force=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Seed production
         run: |
@@ -83,4 +133,4 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
           SYSTEM_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_PROD }}
-          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
+          FORCE_REBUILD: ${{ steps.stale.outputs.force }}
