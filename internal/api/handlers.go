@@ -849,12 +849,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Default the create to the `ss/base` template so every sandbox has a
-	// consistent baseline image. Callers can opt out by setting
+	// Default the create to the `superserve/base` template so every sandbox
+	// has a consistent baseline image. Callers can opt out by setting
 	// from_template to some other alias/UUID; today the API always routes
 	// through the template/snapshot-restore path.
 	if req.FromTemplate == nil {
-		defaultTpl := "ss/base"
+		defaultTpl := "superserve/base"
 		req.FromTemplate = &defaultTpl
 	}
 

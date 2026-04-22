@@ -24,10 +24,10 @@ info:
 
     ## Sandbox environment
 
-    By default sandboxes boot from the curated `ss/base` template (Ubuntu 24.04,
+    By default sandboxes boot from the curated `superserve/base` template (Ubuntu 24.04,
     1 vCPU, 1 GB RAM, 4 GB disk, with Python 3.12, Node.js 22, npm, git, curl,
     and build-essential pre-installed). Callers can override with any template
-    alias (e.g. `ss/python-3.11`, `ss/node-22`) or a team-owned template UUID
+    alias (e.g. `superserve/python-3.11`, `superserve/node-22`) or a team-owned template UUID
     via the `from_template` field on `POST /sandboxes`.
   contact:
     name: Superserve Team
@@ -114,7 +114,7 @@ paths:
       tags: [Sandboxes]
       summary: Create a new sandbox
       description: |
-        Creates a sandbox from a template (defaults to `ss/base` when
+        Creates a sandbox from a template (defaults to `superserve/base` when
         `from_template` is omitted). When the request returns successfully,
         the sandbox is ready to use — you can run commands against it
         immediately.
@@ -371,8 +371,8 @@ paths:
       summary: List templates visible to the caller
       description: |
         Returns the caller's team's templates plus the curated system
-        templates (available to everyone, identified by the `ss/` alias
-        prefix — e.g. `ss/base`, `ss/python-3.11`, `ss/node-22`). Filter
+        templates (available to everyone, identified by the `superserve/` alias
+        prefix — e.g. `superserve/base`, `superserve/python-3.11`, `superserve/node-22`). Filter
         by `alias_prefix=<text>`.
       security:
         - apiKey: []
@@ -699,13 +699,13 @@ components:
           type: string
           description: >
             Boot the sandbox from a template. Accepts either a template UUID
-            or an alias (e.g. `ss/base`, `ss/python-3.11`, `ss/node-22`, or
+            or an alias (e.g. `superserve/base`, `superserve/python-3.11`, `superserve/node-22`, or
             a team-owned alias like `my-python-env`). The template must be
             owned by the caller's team OR be a curated system template
-            (curated templates use the `ss/` alias prefix). The template's
+            (curated templates use the `superserve/` alias prefix). The template's
             vCPU, memory, and disk values are inherited by the sandbox —
             they cannot be overridden per-sandbox because the snapshot
-            dictates VM shape. When omitted, defaults to `ss/base`.
+            dictates VM shape. When omitted, defaults to `superserve/base`.
         timeout_seconds:
           type: integer
           format: int32
@@ -1056,7 +1056,7 @@ components:
           description: >
             Human-readable name, unique per team. Used as the
             `from_template` value when creating sandboxes. Aliases
-            starting with `ss/` are reserved for curated system templates
+            starting with `superserve/` are reserved for curated system templates
             and rejected for team-owned templates.
           example: my-python-env
         vcpu:

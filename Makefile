@@ -30,7 +30,7 @@ build-seed-templates:
 # Seed the 5 curated public templates. Requires DATABASE_URL + SYSTEM_TEAM_ID
 # in the environment. Idempotent — safe to run repeatedly.
 seed-templates: build-seed-templates
-	$(SEED_TEMPLATES_BIN) --dir ss_templates
+	$(SEED_TEMPLATES_BIN) --dir superserve_templates
 
 build-boxd:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BOXD_BIN) ./cmd/boxd

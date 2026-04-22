@@ -1,5 +1,5 @@
 {
-  "alias": "ss/code-interpreter",
+  "alias": "superserve/code-interpreter",
   "vcpu": 2,
   "memory_mib": 2048,
   "disk_mib": 8192,

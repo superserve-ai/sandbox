@@ -1,16 +1,16 @@
 {
-  "alias": "ss/python-3.11",
+  "alias": "superserve/node-22",
   "vcpu": 1,
   "memory_mib": 1024,
   "disk_mib": 4096,
   "build_spec": {
-    "from": "python:3.11-slim",
+    "from": "node:22-slim",
     "steps": [
       {
         "run": "apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*"
       },
       {
-        "run": "pip install --no-cache-dir requests"
+        "run": "npm install -g --no-audit --no-fund pnpm typescript"
       }
     ]
   }

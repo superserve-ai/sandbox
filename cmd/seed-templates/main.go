@@ -3,7 +3,7 @@
 // blocks until every build reaches a terminal status.
 //
 // Flow per run:
-//   1. Upsert each JSON under ss_templates/ into the template table
+//   1. Upsert each JSON under superserve_templates/ into the template table
 //      owned by SYSTEM_TEAM_ID (idempotent on alias).
 //   2. Decide whether to enqueue a build for each template:
 //        - Template row just inserted → enqueue.
@@ -53,7 +53,7 @@ func main() {
 		waitDeadline time.Duration
 		noWait       bool
 	)
-	flag.StringVar(&dir, "dir", "ss_templates", "directory containing template JSON files")
+	flag.StringVar(&dir, "dir", "superserve_templates", "directory containing template JSON files")
 	flag.BoolVar(&forceRebuild, "force-rebuild", false, "re-enqueue a build even when the template is already ready; use after host replacement")
 	flag.DurationVar(&waitDeadline, "wait", 30*time.Minute, "max time to wait for all builds to reach terminal status")
 	flag.BoolVar(&noWait, "no-wait", false, "enqueue builds but don't block until they finish")

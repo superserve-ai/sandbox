@@ -193,13 +193,13 @@ func templateRow(t db.Template) *mockRow {
 
 // defaultReadyTemplate returns a Template row suitable for tests that don't
 // set from_template explicitly — since the handler now defaults it to
-// "ss/base", creates route through a template lookup even with no body field.
+// "superserve/base", creates route through a template lookup even with no body field.
 func defaultReadyTemplate() db.Template {
 	snap := "/snap/vmstate.snap"
 	mem := "/snap/mem.snap"
 	return db.Template{
 		ID:           uuid.New(),
-		Alias:        "ss/base",
+		Alias:        "superserve/base",
 		Status:       db.TemplateStatusReady,
 		Vcpu:         1,
 		MemoryMib:    1024,
@@ -1324,7 +1324,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 	sandboxID := uuid.New()
 
 	// Even though the request omits from_template, the handler defaults it
-	// to "ss/base" and routes through RestoreSnapshot. The stub returns
+	// to "superserve/base" and routes through RestoreSnapshot. The stub returns
 	// VMD-reported resources (1 vcpu, 1024 MiB — stubVMD's defaults).
 	vmd := &stubVMD{
 		createFn: func(_ context.Context, id string, _, _, _ uint32, _ map[string]string) (string, error) {
@@ -1412,7 +1412,7 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
-	// With the ss/base default, CreateSandbox now routes through
+	// With the superserve/base default, CreateSandbox now routes through
 	// RestoreSnapshot (not CreateInstance) — fail both to cover either path.
 	vmd := &stubVMD{
 		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {

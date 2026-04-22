@@ -1,5 +1,5 @@
 {
-  "alias": "ss/python-ml",
+  "alias": "superserve/python-ml",
   "vcpu": 2,
   "memory_mib": 2048,
   "disk_mib": 4096,
