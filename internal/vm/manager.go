@@ -921,19 +921,21 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		}
 	}
 
-	// Best-effort: if the parent directory is now empty, clean it up. Any
-	// error here is swallowed — a non-empty or missing directory is fine.
+	// Best-effort: if the parent directory is now empty, clean it up. Only
+	// remove directories that are strict descendants of the vm's snapshot
+	// root — never the vm root itself or anything above it. Any error is
+	// swallowed; a non-empty or missing directory is fine.
+	vmRoot := filepath.Clean(filepath.Join(m.cfg.SnapshotDir, vmID))
+	sep := string(filepath.Separator)
 	for _, p := range []string{snapshotPath, memPath} {
 		if p == "" {
 			continue
 		}
-		dir := filepath.Dir(p)
-		// Only attempt to remove directories under SnapshotDir — never the
-		// root itself.
-		if dir == "" || dir == m.cfg.SnapshotDir {
+		dir := filepath.Dir(filepath.Clean(p))
+		if dir == vmRoot || !strings.HasPrefix(dir+sep, vmRoot+sep) {
 			continue
 		}
-		_ = os.Remove(dir) // removes only if empty
+		_ = os.Remove(dir)
 	}
 	return nil
 }
