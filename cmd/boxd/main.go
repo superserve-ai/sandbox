@@ -240,6 +240,43 @@ func (s *processService) buildEnv(requestEnvs map[string]string, effective *user
 	return env
 }
 
+// pathFromEnv returns the PATH value from a KEY=VALUE slice. The last
+// PATH entry wins, mirroring exec's last-wins env semantics.
+func pathFromEnv(env []string) string {
+	var path string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			path = strings.TrimPrefix(kv, "PATH=")
+		}
+	}
+	return path
+}
+
+// lookPathIn resolves `file` against the given PATH value. Mirrors
+// os/exec.LookPath but uses a passed-in PATH instead of boxd's own.
+// Used so bare command names (e.g. "python") resolve against the child
+// process's effective PATH, which may include per-request overrides.
+func lookPathIn(file, pathEnv string) (string, error) {
+	if pathEnv == "" {
+		return "", fmt.Errorf("PATH is empty")
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			dir = "."
+		}
+		p := filepath.Join(dir, file)
+		fi, err := os.Stat(p)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		// Executable by any of user/group/other.
+		if fi.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("executable file not found in PATH")
+}
+
 // resolveUser looks up a user by name and returns its uid/gid for use with
 // SysProcAttr.Credential. Returns (nil, nil) when the user is empty or is
 // "root" — the caller should run without a Credential in that case so the
@@ -305,9 +342,26 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(ctx, cmdName, args...)
+	// Resolve bare command names against the CHILD's PATH, not boxd's own.
+	// Go's exec.Command would otherwise call exec.LookPath against
+	// os.Getenv("PATH") — which is boxd's inherited PATH (often empty when
+	// boxd is started by a minimal init). Rebuilding the child env first
+	// lets us look up `python` / `node` / `sh` against the PATH the child
+	// is actually about to receive, including any per-request overrides.
+	childEnv := s.buildEnv(msg.GetEnvs(), usr)
+	resolvedCmd := cmdName
+	if filepath.Base(cmdName) == cmdName {
+		p, err := lookPathIn(cmdName, pathFromEnv(childEnv))
+		if err != nil {
+			return connect.NewError(connect.CodeInvalidArgument,
+				fmt.Errorf("resolve %q: %w", cmdName, err))
+		}
+		resolvedCmd = p
+	}
+
+	cmd := exec.CommandContext(ctx, resolvedCmd, args...)
 	cmd.Dir = cwd
-	cmd.Env = s.buildEnv(msg.GetEnvs(), usr)
+	cmd.Env = childEnv
 	if cred != nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
