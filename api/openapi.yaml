@@ -376,7 +376,7 @@ components:
           $ref: "#/components/schemas/NetworkConfig"
 
     SandboxListItem:
-      description: Sandbox shape returned by list endpoints. No `access_token`.
+      description: Sandbox shape returned by list endpoints.
       type: object
       properties:
         id:
