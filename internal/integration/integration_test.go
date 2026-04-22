@@ -35,8 +35,9 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	testPool    *pgxpool.Pool
-	testQueries *db.Queries
+	testPool         *pgxpool.Pool
+	testQueries      *db.Queries
+	testSystemTeamID uuid.UUID
 )
 
 func TestMain(m *testing.M) {
@@ -69,7 +70,52 @@ func TestMain(m *testing.M) {
 	}
 
 	testQueries = db.New(testPool)
+
+	if err := seedSystemTemplate(ctx, testQueries); err != nil {
+		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
+		os.Exit(1)
+	}
+
 	os.Exit(m.Run())
+}
+
+// seedSystemTemplate creates the system team + a ready `superserve/base`
+// template so CreateSandbox's default from_template lookup resolves. Every
+// integration test that POSTs /sandboxes without an explicit from_template
+// relies on this.
+func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
+	team, err := q.CreateTeam(ctx, "superserve-system")
+	if err != nil {
+		return fmt.Errorf("create system team: %w", err)
+	}
+	testSystemTeamID = team.ID
+
+	tpl, err := q.CreateTemplate(ctx, db.CreateTemplateParams{
+		TeamID:    team.ID,
+		Alias:     "superserve/base",
+		BuildSpec: []byte(`{"from":"test","steps":[]}`),
+		Vcpu:      1,
+		MemoryMib: 1024,
+		DiskMib:   4096,
+	})
+	if err != nil {
+		return fmt.Errorf("create superserve/base: %w", err)
+	}
+
+	// Flip to 'ready' with plausible paths so handlers.go's ready-check
+	// passes. The stubVMD ignores these values.
+	_, err = testPool.Exec(ctx,
+		`UPDATE template SET status = 'ready',
+		   rootfs_path = '/tmp/test/rootfs.ext4',
+		   snapshot_path = '/tmp/test/vmstate.snap',
+		   mem_path = '/tmp/test/mem.snap',
+		   size_bytes = 0,
+		   built_at = now()
+		 WHERE id = $1`, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("mark superserve/base ready: %w", err)
+	}
+	return nil
 }
 
 // applyMigrations reads SQL files from supabase/migrations/ and executes them
@@ -184,7 +230,11 @@ func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
 // preventing goroutine leaks across hundreds of test invocations.
 func newRouter(t *testing.T) *gin.Engine {
 	t.Helper()
-	cfg := &config.Config{Port: "0", VMDAddress: "localhost:0"}
+	cfg := &config.Config{
+		Port:         "0",
+		VMDAddress:   "localhost:0",
+		SystemTeamID: testSystemTeamID.String(),
+	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	return api.SetupRouter(t.Context(), h, testPool)
 }
