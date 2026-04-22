@@ -389,8 +389,6 @@ func buildStepFromProto(p *vmdpb.BuildStep) (builder.BuildStep, error) {
 	case *vmdpb.BuildStep_Run:
 		run := op.Run
 		return builder.BuildStep{Run: &run}, nil
-	case *vmdpb.BuildStep_Copy:
-		return builder.BuildStep{Copy: &builder.CopyOp{Src: op.Copy.GetSrc(), Dst: op.Copy.GetDst()}}, nil
 	case *vmdpb.BuildStep_Env:
 		return builder.BuildStep{Env: &builder.EnvOp{Key: op.Env.GetKey(), Value: op.Env.GetValue()}}, nil
 	case *vmdpb.BuildStep_Workdir:

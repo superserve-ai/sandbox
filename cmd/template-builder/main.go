@@ -561,14 +561,6 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		bc.user = name
 		emitUser("system", "User: %s", name)
 		return bc, nil
-	case step.Copy != nil:
-		dst := step.Copy.Dst
-		shCmd := fmt.Sprintf("mkdir -p %s && printf '%%s' %s | base64 -d | tar -C %s -xf -",
-			shellQuote(dst), shellQuote(step.Copy.Src), shellQuote(dst))
-		if err := runShellCmd(ctx, vmIP, shCmd, bc); err != nil {
-			return bc, err
-		}
-		return bc, nil
 	default:
 		return bc, fmt.Errorf("step has no op set")
 	}

@@ -90,31 +90,6 @@ func TestValidateBuildSpec_RequiresExactlyOneOp(t *testing.T) {
 	}
 }
 
-func TestValidateBuildSpec_CopySizeCap(t *testing.T) {
-	bigPayload := strings.Repeat("A", maxCopySrcBytes+1)
-	err := validateBuildSpec(&buildSpec{
-		From: "python:3.11",
-		Steps: []buildStep{
-			{Copy: &buildCopyOp{Src: bigPayload, Dst: "/app"}},
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("copy over cap must be rejected, got: %v", err)
-	}
-}
-
-func TestValidateBuildSpec_CopyRequiresDst(t *testing.T) {
-	err := validateBuildSpec(&buildSpec{
-		From: "python:3.11",
-		Steps: []buildStep{
-			{Copy: &buildCopyOp{Src: "YWJj", Dst: ""}},
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), "dst") {
-		t.Fatalf("copy without dst must be rejected, got: %v", err)
-	}
-}
-
 func TestValidateBuildSpec_EnvRequiresKey(t *testing.T) {
 	err := validateBuildSpec(&buildSpec{
 		From: "python:3.11",

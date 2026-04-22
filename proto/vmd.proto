@@ -80,18 +80,15 @@ message BuildTemplateRequest {
 message BuildStep {
   // Exactly one of the fields below is set per step. Matches the canonical
   // build_spec shape persisted in the template table's jsonb column.
+  // Field number 2 is reserved — previously held a now-removed copy op.
   oneof op {
     string run = 1;              // Shell command run via /bin/sh -c.
-    BuildCopyOp copy = 2;        // Base64 tar payload extracted at dst.
     BuildEnvOp env = 3;          // Env var applied to subsequent run steps.
     string workdir = 4;          // Working directory for subsequent run steps.
     BuildUserOp user = 5;        // Switch the user subsequent steps run as.
   }
-}
-
-message BuildCopyOp {
-  string src = 1;   // Base64-encoded tar archive.
-  string dst = 2;   // Absolute path inside the VM.
+  reserved 2;
+  reserved "copy";
 }
 
 message BuildEnvOp {

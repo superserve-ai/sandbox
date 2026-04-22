@@ -984,26 +984,14 @@ components:
 
     BuildStep:
       type: object
-      description: |
-        A single build step. Exactly one of `run`, `copy`, `env`, `workdir`,
-        or `user` must be set.
+      description: >
+        A single build step. Exactly one of `run`, `env`, `workdir`, or
+        `user` must be set.
       properties:
         run:
           type: string
           description: Shell command. Wrapped in `/bin/sh -c` inside the build VM.
           example: pip install -r requirements.txt
-        copy:
-          type: object
-          required: [src, dst]
-          properties:
-            src:
-              type: string
-              description: >
-                Base64-encoded tar archive of files to copy into the VM.
-                Capped at 1 MB.
-            dst:
-              type: string
-              description: Absolute path inside the VM to extract into.
         env:
           type: object
           required: [key, value]

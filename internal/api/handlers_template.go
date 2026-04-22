@@ -2,7 +2,6 @@ package api
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,15 +26,9 @@ import (
 
 type buildStep struct {
 	Run     *string      `json:"run,omitempty"`
-	Copy    *buildCopyOp `json:"copy,omitempty"`
 	Env     *buildEnvOp  `json:"env,omitempty"`
 	Workdir *string      `json:"workdir,omitempty"`
 	User    *buildUserOp `json:"user,omitempty"`
-}
-
-type buildCopyOp struct {
-	Src string `json:"src"` // base64-encoded tar; capped at 1 MiB
-	Dst string `json:"dst"`
 }
 
 type buildEnvOp struct {
@@ -102,12 +95,11 @@ const (
 	defaultVcpu     = 1
 	defaultMemoryMi = 1024
 	defaultDiskMib  = 4096
-	maxCopySrcBytes = 1024 * 1024 // 1 MiB cap on inline base64-tar payloads
 )
 
 // validateBuildSpec enforces base-image policy and step-shape invariants.
-// Catches obvious problems (alpine, distroless, bad step shape, oversized
-// copy payload) before we persist a row or hand off to the builder.
+// Catches obvious problems (alpine, distroless, bad step shape) before we
+// persist a row or hand off to the builder.
 func validateBuildSpec(spec *buildSpec) error {
 	if spec == nil {
 		return fmt.Errorf("build_spec is required")
@@ -131,18 +123,6 @@ func validateBuildSpec(spec *buildSpec) error {
 		if step.Run != nil {
 			set++
 		}
-		if step.Copy != nil {
-			set++
-			if len(step.Copy.Src) > maxCopySrcBytes {
-				return fmt.Errorf("build_spec.steps[%d].copy.src exceeds %d bytes", i, maxCopySrcBytes)
-			}
-			if step.Copy.Dst == "" {
-				return fmt.Errorf("build_spec.steps[%d].copy.dst is required", i)
-			}
-			if _, err := base64.StdEncoding.DecodeString(step.Copy.Src); err != nil {
-				return fmt.Errorf("build_spec.steps[%d].copy.src must be valid base64: %w", i, err)
-			}
-		}
 		if step.Env != nil {
 			set++
 			if step.Env.Key == "" {
@@ -159,7 +139,7 @@ func validateBuildSpec(spec *buildSpec) error {
 			}
 		}
 		if set != 1 {
-			return fmt.Errorf("build_spec.steps[%d] must set exactly one of run/copy/env/workdir/user", i)
+			return fmt.Errorf("build_spec.steps[%d] must set exactly one of run/env/workdir/user", i)
 		}
 	}
 	return nil
@@ -257,9 +237,8 @@ func parseBuildID(c *gin.Context) (uuid.UUID, error) {
 }
 
 // toTemplateResponse serializes a template for the API. build_spec is never
-// included in responses — it can be large (base64-tar copy payloads) and can
-// contain secrets (env steps). Callers that need the spec should read it
-// server-side from the jsonb column directly.
+// included in responses — it can contain secrets (env steps). Callers that
+// need the spec should read it server-side from the jsonb column directly.
 func toTemplateResponse(t db.Template) templateResponse {
 	resp := templateResponse{
 		ID:        t.ID,

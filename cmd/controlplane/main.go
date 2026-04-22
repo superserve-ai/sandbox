@@ -355,8 +355,6 @@ func (c *grpcVMDClient) BuildTemplate(ctx context.Context, req vmdclient.BuildTe
 		switch {
 		case step.Run != nil:
 			pstep.Op = &vmdpb.BuildStep_Run{Run: *step.Run}
-		case step.Copy != nil:
-			pstep.Op = &vmdpb.BuildStep_Copy{Copy: &vmdpb.BuildCopyOp{Src: step.Copy.Src, Dst: step.Copy.Dst}}
 		case step.Env != nil:
 			pstep.Op = &vmdpb.BuildStep_Env{Env: &vmdpb.BuildEnvOp{Key: step.Env.Key, Value: step.Env.Value}}
 		case step.Workdir != nil:

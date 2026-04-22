@@ -63,18 +63,12 @@ type BuildTemplateInput struct {
 	BuildVMID string
 }
 
-// BuildStep mirrors vmdpb.BuildStep — exactly one of Run/Copy/Env/Workdir/User.
+// BuildStep mirrors vmdpb.BuildStep — exactly one of Run/Env/Workdir/User.
 type BuildStep struct {
 	Run     *string
-	Copy    *BuildCopyOp
 	Env     *BuildEnvOp
 	Workdir *string
 	User    *BuildUserOp
-}
-
-type BuildCopyOp struct {
-	Src string // base64-encoded tar
-	Dst string
 }
 
 type BuildEnvOp struct {

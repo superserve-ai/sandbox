@@ -36,15 +36,9 @@ type BuildSpec struct {
 // set (enforced at spec validation time in the HTTP handler).
 type BuildStep struct {
 	Run     *string `json:"run,omitempty"`
-	Copy    *CopyOp `json:"copy,omitempty"`
 	Env     *EnvOp  `json:"env,omitempty"`
 	Workdir *string `json:"workdir,omitempty"`
 	User    *UserOp `json:"user,omitempty"`
-}
-
-type CopyOp struct {
-	Src string `json:"src"` // base64-encoded tar; capped at 1 MiB
-	Dst string `json:"dst"`
 }
 
 type EnvOp struct {

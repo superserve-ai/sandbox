@@ -427,8 +427,6 @@ func specStepsToVMD(steps []builder.BuildStep) []vmdclient.BuildStep {
 		switch {
 		case s.Run != nil:
 			vs.Run = s.Run
-		case s.Copy != nil:
-			vs.Copy = &vmdclient.BuildCopyOp{Src: s.Copy.Src, Dst: s.Copy.Dst}
 		case s.Env != nil:
 			vs.Env = &vmdclient.BuildEnvOp{Key: s.Env.Key, Value: s.Env.Value}
 		case s.Workdir != nil:
