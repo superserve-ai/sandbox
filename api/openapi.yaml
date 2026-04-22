@@ -376,11 +376,7 @@ components:
           $ref: "#/components/schemas/NetworkConfig"
 
     SandboxListItem:
-      description: |
-        Sandbox shape returned by endpoints that list many sandboxes
-        (`GET /sandboxes`). Never includes `access_token` — that is only
-        minted on create/get-by-id/resume where the caller has established
-        ownership of a single sandbox.
+      description: Sandbox shape returned by list endpoints. No `access_token`.
       type: object
       properties:
         id:
@@ -429,10 +425,7 @@ components:
             owner: agent-7
 
     SandboxResponse:
-      description: |
-        Single-sandbox shape returned on create, get-by-id, and resume
-        paths. Extends `SandboxListItem` with `access_token` (the
-        per-sandbox token for data-plane operations).
+      description: Single-sandbox shape — `SandboxListItem` plus `access_token`.
       allOf:
         - $ref: "#/components/schemas/SandboxListItem"
         - type: object
