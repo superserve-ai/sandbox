@@ -24,39 +24,6 @@ func NewGRPCAdapter(mgr *Manager) *GRPCAdapter {
 	return &GRPCAdapter{mgr: mgr}
 }
 
-func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) (*vmdpb.CreateVMResponse, error) {
-	var netCfg *network.Config
-	if nc := req.GetNetworkConfig(); nc != nil {
-		netCfg = &network.Config{
-			HostInterface: nc.GetHostInterface(),
-			SubnetCIDR:    nc.GetSubnetCidr(),
-			GatewayIP:     nc.GetGatewayIp(),
-			EnableNAT:     nc.GetEnableNat(),
-		}
-	}
-
-	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), req.GetTemplateId(), netCfg, req.GetMetadata())
-	if err != nil {
-		return nil, err
-	}
-
-	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
-		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
-	}
-
-	return &vmdpb.CreateVMResponse{
-		VmId:       inst.ID,
-		SocketPath: inst.SocketPath,
-		IpAddress:  inst.IP,
-		TapDevice:  inst.TAPDevice,
-		Pid:        uint32(inst.PID),
-		ResourceLimits: &vmdpb.ResourceLimits{
-			VcpuCount: inst.Config.VCPU,
-			MemoryMib: inst.Config.MemoryMiB,
-		},
-	}, nil
-}
-
 func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest) (*vmdpb.DestroyVMResponse, error) {
 	err := a.mgr.DestroyVM(ctx, req.GetVmId(), req.GetForce())
 	if err != nil {

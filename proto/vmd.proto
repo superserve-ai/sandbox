@@ -6,9 +6,6 @@ option go_package = "github.com/superserve-ai/sandbox/proto/vmdpb";
 
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 service VMDaemon {
-  // CreateVM provisions a new microVM with the specified configuration.
-  rpc CreateVM(CreateVMRequest) returns (CreateVMResponse);
-
   // DestroyVM terminates a running microVM and cleans up all associated resources.
   rpc DestroyVM(DestroyVMRequest) returns (DestroyVMResponse);
 
@@ -200,32 +197,6 @@ message SandboxNetworkEgressConfig {
   repeated string allowed_cidrs = 1;    // CIDRs explicitly allowed (e.g. "8.8.8.8/32").
   repeated string denied_cidrs = 2;     // CIDRs explicitly denied (e.g. "0.0.0.0/0" to block all).
   repeated string allowed_domains = 3;  // Domains allowed via TCP proxy (e.g. "api.openai.com", "*.github.com").
-}
-
-// ---------------------------------------------------------------------------
-// CreateVM
-// ---------------------------------------------------------------------------
-
-message CreateVMRequest {
-  string vm_id = 1;
-  string base_rootfs_path = 2;   // Path to the base rootfs image.
-  string kernel_path = 3;        // Path to the kernel image.
-  string kernel_args = 4;        // Boot arguments for the kernel.
-  ResourceLimits resource_limits = 5;
-  NetworkConfig network_config = 6;
-  map<string, string> metadata = 7;   // Arbitrary key-value pairs.
-  SandboxNetworkConfig sandbox_network = 8;  // Per-sandbox egress rules (optional).
-  map<string, string> env_vars = 9;   // Environment variables injected into every process in the VM.
-  string template_id = 10;       // Which template snapshot to restore from. Empty string means "default".
-}
-
-message CreateVMResponse {
-  string vm_id = 1;
-  string socket_path = 2;
-  string ip_address = 3;
-  string tap_device = 4;
-  uint32 pid = 5;
-  ResourceLimits resource_limits = 6;
 }
 
 // ---------------------------------------------------------------------------

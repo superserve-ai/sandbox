@@ -144,25 +144,15 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		return nil, fmt.Errorf("template-builder exited: %w", err)
 	}
 
-	// Read result from disk.
+	// Read result from disk. build.meta.json + on-disk snapshot files are
+	// the source of truth; no in-memory registration needed because the
+	// sandbox create path reads snapshot paths from the control plane DB
+	// and calls RestoreSnapshot with those paths directly.
 	snapshotDir := filepath.Join(m.cfg.SnapshotDir, "templates", req.TemplateID)
-	rootfsDir := filepath.Join(m.cfg.RunDir, "templates", req.TemplateID)
 	result, err := readBuildMetaJSON(snapshotDir)
 	if err != nil {
 		return nil, fmt.Errorf("read build meta: %w", err)
 	}
-
-	// Register the template so CreateVM / RestoreSnapshot can use it.
-	m.mu.Lock()
-	m.templates[req.TemplateID] = &TemplateSnapshot{
-		SnapshotPath: result.SnapshotPath,
-		MemFilePath:  result.MemFilePath,
-		DiskPath:     result.RootfsPath,
-		RunDir:       rootfsDir,
-		VCPUCount:    req.VCPU,
-		MemSizeMiB:   req.MemoryMiB,
-	}
-	m.mu.Unlock()
 
 	log.Info().Dur("total", time.Since(buildStart)).Msg("template build complete")
 	return result, nil

@@ -976,23 +976,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
-	var ipAddress string
-	var actualVcpu, actualMemMiB uint32
-	var vmdErr error
-	if templateID.Valid {
-		// RestoreSnapshot (not ResumeInstance) for the from_template path:
-		// ResumeInstance assumes the VM already exists in vmd's in-memory
-		// map (the pause→resume contract), which is fine for a paused
-		// sandbox but not for a fresh one we're creating now. Restore
-		// takes snapshot paths and boots a new VM from them statelessly.
-		// Caller env vars are merged on top of the template's baked
-		// defaults by vmd (boxd resumes with template context, then the
-		// restore RPC posts these on top).
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
-	} else {
-		ipAddress, actualVcpu, actualMemMiB, vmdErr = vmd.CreateInstance(vmdCtx, sandboxID.String(),
-			0, 0, 0, nil, req.EnvVars)
-	}
+	// RestoreSnapshot (not ResumeInstance) for the from_template path:
+	// ResumeInstance assumes the VM already exists in vmd's in-memory map
+	// (the pause→resume contract), which is fine for a paused sandbox but
+	// not for a fresh one we're creating now. Restore takes snapshot paths
+	// and boots a new VM from them statelessly. Caller env vars are merged
+	// on top of the template's baked defaults by vmd (boxd resumes with
+	// template context, then the restore RPC posts these on top).
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).

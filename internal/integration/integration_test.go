@@ -161,9 +161,6 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct{}
 
-func (s *stubVMD) CreateInstance(_ context.Context, _ string, _, _, _ uint32, _ map[string]string, _ map[string]string) (string, uint32, uint32, error) {
-	return "10.0.0.1", 1, 1024, nil
-}
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
 func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil

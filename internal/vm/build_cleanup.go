@@ -10,7 +10,7 @@ import (
 
 // CleanupOrphanBuilds scans the on-disk templates/ subtree for directories
 // that represent incomplete builds and reclaims them. Called once from vmd
-// startup after InitDefaultTemplate and before the gRPC server comes up.
+// startup before the gRPC server comes up.
 //
 // A completed build leaves a build.meta.json sidecar next to the snapshot
 // (written by writeBuildMeta). Directories without that marker — either

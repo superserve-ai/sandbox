@@ -9,7 +9,6 @@ import "context"
 // control plane. Implementations: grpcVMDClient in cmd/controlplane,
 // stubVMD in tests.
 type Client interface {
-	CreateInstance(ctx context.Context, instanceID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)

@@ -247,19 +247,19 @@ func main() {
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
-	maxConcurrentCreates, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_CREATES", "100"))
+	maxRestores, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_RESTORES", "100"))
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin:     cfg.FirecrackerBin,
-		JailerBin:          cfg.JailerBin,
-		KernelPath:         cfg.KernelPath,
-		BaseRootfsPath:     cfg.BaseRootfsPath,
-		SnapshotDir:        cfg.SnapshotDir,
-		RunDir:             cfg.RunDir,
-		TemplateBuilderBin: cfg.TemplateBuilderBin,
-		BoxdBinaryPath:     cfg.BoxdBinaryPath,
-		HostInterface:      cfg.HostInterface,
-		MaxConcurrent:      maxConcurrentCreates,
+		FirecrackerBin:        cfg.FirecrackerBin,
+		JailerBin:             cfg.JailerBin,
+		KernelPath:            cfg.KernelPath,
+		BaseRootfsPath:        cfg.BaseRootfsPath,
+		SnapshotDir:           cfg.SnapshotDir,
+		RunDir:                cfg.RunDir,
+		TemplateBuilderBin:    cfg.TemplateBuilderBin,
+		BoxdBinaryPath:        cfg.BoxdBinaryPath,
+		HostInterface:         cfg.HostInterface,
+		MaxConcurrentRestores: maxRestores,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -355,16 +355,8 @@ func main() {
 		return nil
 	})
 	// Template files are NOT cleaned up on shutdown — they persist on
-	// disk so the next startup can reuse them via hash caching instead
-	// of cold-booting a new template (~3s saved per restart).
-
-	// ---- Default template ----
-	// Boot a throwaway VM from the base image, snapshot it, keep the
-	// snapshot on disk. Every subsequent CreateVM restores from this
-	// template snapshot instead of cold-booting (~90-200ms vs ~933ms).
-	if err := mgr.InitDefaultTemplate(ctx); err != nil {
-		log.Fatal().Err(err).Msg("failed to initialize default template")
-	}
+	// disk so the next startup can reattach via the build pipeline's
+	// on-disk snapshot layout.
 
 	// ---- Orphan build cleanup ----
 	// Reclaim any template build directories left behind by a prior vmd

@@ -28,7 +28,6 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubVMD struct {
-	createFn         func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
 	destroyFn        func(ctx context.Context, id string, force bool) error
 	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
@@ -38,13 +37,6 @@ type stubVMD struct {
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
-func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (string, uint32, uint32, error) {
-	if s.createFn != nil {
-		ip, err := s.createFn(ctx, id, vcpu, memMiB, diskMiB, metadata)
-		return ip, 1, 1024, err
-	}
-	return "10.0.0.1", 1, 1024, nil
-}
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
 		return s.destroyFn(ctx, id, force)
@@ -1326,11 +1318,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 	// Even though the request omits from_template, the handler defaults it
 	// to "superserve/base" and routes through RestoreSnapshot. The stub returns
 	// VMD-reported resources (1 vcpu, 1024 MiB — stubVMD's defaults).
-	vmd := &stubVMD{
-		createFn: func(_ context.Context, id string, _, _, _ uint32, _ map[string]string) (string, error) {
-			return "10.0.0.42", nil
-		},
-	}
+	vmd := &stubVMD{}
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
@@ -1412,12 +1400,9 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
-	// With the superserve/base default, CreateSandbox now routes through
-	// RestoreSnapshot (not CreateInstance) — fail both to cover either path.
+	// With the superserve/base default, CreateSandbox routes through
+	// RestoreSnapshot. Fail it to exercise the VMD-error branch.
 	vmd := &stubVMD{
-		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
-			return "", fmt.Errorf("vmd unreachable")
-		},
 		restoreFn: func(context.Context, string, string, string) (string, error) {
 			return "", fmt.Errorf("vmd unreachable")
 		},
@@ -1820,11 +1805,7 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	sandboxID := uuid.New()
 
 	var capturedMetadata []byte
-	vmd := &stubVMD{
-		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
-			return "10.0.0.42", nil
-		},
-	}
+	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -1884,11 +1865,7 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	sandboxID := uuid.New()
 
 	var capturedMetadata []byte
-	vmd := &stubVMD{
-		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
-			return "10.0.0.42", nil
-		},
-	}
+	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
