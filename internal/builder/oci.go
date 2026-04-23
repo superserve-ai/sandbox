@@ -180,21 +180,20 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 			}
 
 		case tar.TypeSymlink:
-			// Reject symlinks whose resolved target escapes the rootfs. The
-			// symlink itself can point anywhere from inside the rootfs at
-			// build time, but we don't want one that silently reads host
-			// /etc/shadow when later resolved. Relative links resolved
-			// against the symlink's parent; absolute links resolved as if
-			// rooted at destDir (which matches how they'd behave inside
-			// the VM's chroot).
-			if err := validateSymlink(absDest, target, hdr.Linkname); err != nil {
+			// Rewrite absolute linknames to relative form so they resolve
+			// inside the rootfs, not against the HOST root at open time.
+			effectiveLinkname := hdr.Linkname
+			if filepath.IsAbs(hdr.Linkname) {
+				effectiveLinkname = absoluteToRelative(cleaned, hdr.Linkname)
+			}
+			if err := validateSymlink(absDest, target, effectiveLinkname); err != nil {
 				return err
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return fmt.Errorf("mkdir parent of %s: %w", target, err)
 			}
 			_ = os.Remove(target) // overwrite if exists (later layer wins)
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
+			if err := os.Symlink(effectiveLinkname, target); err != nil {
 				return fmt.Errorf("symlink %s: %w", target, err)
 			}
 
@@ -230,18 +229,29 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 	}
 }
 
-// validateSymlink rejects symlinks whose target escapes absDest. Absolute
-// linknames are rejected outright — os.Symlink writes them raw, so they
-// resolve against the HOST root at open time.
+// validateSymlink rejects symlinks whose target escapes absDest. Callers
+// must rewrite absolute linknames to relative form before calling this.
 func validateSymlink(absDest, linkPath, linkname string) error {
 	if filepath.IsAbs(linkname) {
-		return fmt.Errorf("absolute symlink target not allowed: %s → %s", linkPath, linkname)
+		return fmt.Errorf("internal: absolute linkname reached validateSymlink: %s → %s", linkPath, linkname)
 	}
 	resolved := filepath.Clean(filepath.Join(filepath.Dir(linkPath), linkname))
 	if rel, err := filepath.Rel(absDest, resolved); err != nil || strings.HasPrefix(rel, "..") {
 		return fmt.Errorf("symlink target escapes rootfs: %s → %s", linkPath, linkname)
 	}
 	return nil
+}
+
+// absoluteToRelative converts a rootfs-absolute linkname into a path
+// relative to the symlink's own parent directory.
+func absoluteToRelative(cleaned, linkname string) string {
+	linkDirAbs := filepath.Join("/", filepath.Dir(cleaned))
+	targetAbs := filepath.Clean(linkname)
+	rel, err := filepath.Rel(linkDirAbs, targetAbs)
+	if err != nil {
+		return targetAbs
+	}
+	return rel
 }
 
 // umaskZero sets the process umask to 0 for the duration of tar extraction
