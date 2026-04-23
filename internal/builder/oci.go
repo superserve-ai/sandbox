@@ -160,7 +160,9 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return fmt.Errorf("mkdir parent of %s: %w", target, err)
 			}
-			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(hdr.Mode)&0o7777)
+			// O_NOFOLLOW so an earlier symlink entry at `target` can't
+			// redirect this write.
+			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, os.FileMode(hdr.Mode)&0o7777)
 			if err != nil {
 				return fmt.Errorf("create %s: %w", target, err)
 			}
@@ -228,16 +230,14 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 	}
 }
 
-// validateSymlink ensures the resolved target of a symlink created at
-// `linkPath` pointing at `linkname` doesn't escape absDest.
+// validateSymlink rejects symlinks whose target escapes absDest. Absolute
+// linknames are rejected outright — os.Symlink writes them raw, so they
+// resolve against the HOST root at open time.
 func validateSymlink(absDest, linkPath, linkname string) error {
-	var resolved string
 	if filepath.IsAbs(linkname) {
-		resolved = filepath.Join(absDest, linkname)
-	} else {
-		resolved = filepath.Join(filepath.Dir(linkPath), linkname)
+		return fmt.Errorf("absolute symlink target not allowed: %s → %s", linkPath, linkname)
 	}
-	resolved = filepath.Clean(resolved)
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(linkPath), linkname))
 	if rel, err := filepath.Rel(absDest, resolved); err != nil || strings.HasPrefix(rel, "..") {
 		return fmt.Errorf("symlink target escapes rootfs: %s → %s", linkPath, linkname)
 	}

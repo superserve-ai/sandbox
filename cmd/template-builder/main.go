@@ -172,7 +172,10 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 
 	// Phase 1: produce rootfs.ext4 from OCI image
 	emitUser("system", "Pulling image %s", cfg.spec.From)
-	b, err := builder.NewBuilder(builder.Config{BoxdBinaryPath: cfg.boxdBin})
+	b, err := builder.NewBuilder(builder.Config{
+		BoxdBinaryPath:           cfg.boxdBin,
+		MaxUncompressedSizeBytes: int64(cfg.diskMiB) * 1024 * 1024,
+	})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
 	}
@@ -306,7 +309,12 @@ func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID str
 func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS string) (int, error) {
 	cmd := exec.Command("ip", "netns", "exec", netNS,
 		fcBin, "--api-sock", socketPath, "--id", cfg.VMID)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Pdeathsig: kernel kills firecracker if we die for any reason
+	// (including SIGKILL), so orphans can't hold TAP/netns.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:    true,
+		Pdeathsig: syscall.SIGKILL,
+	}
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("exec firecracker: %w", err)

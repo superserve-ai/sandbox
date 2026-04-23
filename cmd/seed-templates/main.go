@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -78,7 +79,8 @@ func main() {
 
 	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
-		log.Fatal().Err(err).Msg("connect to database")
+		// Redact DSN — pgx errors can echo the URL (password included).
+		log.Fatal().Msg("connect to database: " + redactDSN(err.Error(), dbURL))
 	}
 	defer pool.Close()
 
@@ -240,10 +242,11 @@ func seedOne(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, s seedSp
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		// No status filter: the racer's row may have transitioned to
+		// ready/failed between INSERT and this lookup.
 		const existingQ = `
 			SELECT id FROM template_build
 			WHERE template_id = $1 AND build_spec_hash = $2
-			  AND status IN ('pending','building','snapshotting')
 			ORDER BY created_at DESC LIMIT 1;
 		`
 		if scanErr := pool.QueryRow(ctx, existingQ, tplID, specHash).Scan(&buildID); scanErr == nil {
@@ -346,6 +349,14 @@ func queryBuildStatus(ctx context.Context, pool *pgxpool.Pool, buildID uuid.UUID
 	default:
 		return status, errMsg, false, nil
 	}
+}
+
+// redactDSN strips the raw database URL from an error string.
+func redactDSN(msg, dsn string) string {
+	if dsn == "" {
+		return msg
+	}
+	return strings.ReplaceAll(msg, dsn, "<dsn>")
 }
 
 func resolvedResources(s seedSpec) (int32, int32, int32) {

@@ -48,7 +48,8 @@ type BuildSupervisorConfig struct {
 	// PendingTimeout is how long a build can wait in 'pending' before it's
 	// reaped as failed. Pending now only covers "waiting for the next
 	// supervisor tick to dispatch" — concurrency limits are enforced at
-	// submit time, so rows that linger are genuinely stuck.
+	// submit time via a per-team advisory lock + count-including-pending,
+	// so rows that linger are genuinely stuck.
 	PendingTimeout time.Duration
 
 	// BuildTimeout is the wall-clock cap on a single build from 'building'

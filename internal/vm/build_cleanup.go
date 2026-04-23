@@ -1,11 +1,11 @@
 package vm
 
 import (
-	"context"
+	"bytes"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
+	"strconv"
+	"syscall"
 )
 
 // CleanupOrphanBuilds scans the on-disk templates/ subtree for directories
@@ -56,19 +56,12 @@ func (m *Manager) CleanupOrphanBuilds() int {
 			Str("snapshot_dir", snapshotDir).
 			Msg("orphan build directory (no build.meta.json); reclaiming")
 
-		// Stop any lingering build VM systemd unit for this template.
-		// Short timeout — we don't want a misbehaving systemctl call to
-		// hold up vmd startup.
+		// Kill any firecracker reparented to init by a vmd crash before
+		// we RemoveAll the files it's still mmap'ing.
 		buildVMID := "build-" + templateID
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := stopUnit(stopCtx, systemdUnitName(buildVMID)); err != nil {
-			// Expected to error when the unit doesn't exist. Only log
-			// unexpected errors.
-			if !isUnitNotFound(err) {
-				m.log.Warn().Err(err).Str("unit", systemdUnitName(buildVMID)).Msg("stop lingering build unit")
-			}
+		if killed := killOrphanFirecracker(buildVMID); killed > 0 {
+			m.log.Info().Int("killed", killed).Str("build_vm_id", buildVMID).Msg("killed orphan firecracker processes")
 		}
-		stopCancel()
 
 		// Remove the snapshot directory (vmstate + memory + any partial meta).
 		if err := os.RemoveAll(snapshotDir); err != nil {
@@ -99,13 +92,39 @@ func (m *Manager) isCompleteBuild(snapshotDir string) bool {
 	return err == nil
 }
 
-// isUnitNotFound returns true when a systemctl stop error indicates the unit
-// simply doesn't exist (the common case during orphan cleanup). Matches the
-// text systemd emits; brittle but acceptable for a log-only decision.
-func isUnitNotFound(err error) bool {
-	if err == nil {
-		return false
+// killOrphanFirecracker SIGKILLs firecracker processes whose cmdline has
+// `--id <buildVMID>` (build VMs reparented to init after a vmd crash).
+func killOrphanFirecracker(buildVMID string) int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "not loaded") || strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist")
+	killed := 0
+	marker := []byte("--id\x00" + buildVMID + "\x00")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		if !bytes.Contains(cmdline, marker) {
+			continue
+		}
+		// Only kill firecracker — don't touch other processes that happen
+		// to mention the build id in their args.
+		if !bytes.HasPrefix(cmdline, []byte("firecracker")) &&
+			!bytes.Contains(cmdline, []byte("/firecracker\x00")) {
+			continue
+		}
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			killed++
+		}
+	}
+	return killed
 }

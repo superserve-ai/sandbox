@@ -34,9 +34,10 @@ type HostFirewall struct {
 }
 
 type vmRule struct {
-	table string
-	chain string
-	args  []string
+	table   string
+	chain   string
+	args    []string
+	prepend bool // insert at top of chain instead of appending
 }
 
 // NewHostFirewall initializes the host firewall. On first call it adds
@@ -79,14 +80,24 @@ func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 	hfw.mu.Lock()
 	defer hfw.mu.Unlock()
 
-	rules := []vmRule{
-		// FORWARD: veth → host interface (outbound)
-		{table: "filter", chain: "FORWARD", args: []string{"-i", vethName, "-o", hfw.hostIface, "-j", "ACCEPT"}},
-		// FORWARD: host interface → veth (inbound/response)
-		{table: "filter", chain: "FORWARD", args: []string{"-i", hfw.hostIface, "-o", vethName, "-j", "ACCEPT"}},
-		// POSTROUTING: MASQUERADE outbound from this VM's host IP
-		{table: "nat", chain: "POSTROUTING", args: []string{"-s", hostCIDR, "-o", hfw.hostIface, "-j", "MASQUERADE"}},
+	rules := []vmRule{}
+	// Drop UDP/443 so QUIC can't bypass the TCP-only REDIRECT + SNI
+	// allowlist. Must be inserted above the per-veth ACCEPT below.
+	if hfw.tlsProxyPort > 0 {
+		rules = append(rules, vmRule{
+			table: "filter", chain: "FORWARD",
+			args:    []string{"-i", vethName, "-p", "udp", "--dport", "443", "-j", "DROP"},
+			prepend: true,
+		})
 	}
+	rules = append(rules,
+		// FORWARD: veth → host interface (outbound)
+		vmRule{table: "filter", chain: "FORWARD", args: []string{"-i", vethName, "-o", hfw.hostIface, "-j", "ACCEPT"}},
+		// FORWARD: host interface → veth (inbound/response)
+		vmRule{table: "filter", chain: "FORWARD", args: []string{"-i", hfw.hostIface, "-o", vethName, "-j", "ACCEPT"}},
+		// POSTROUTING: MASQUERADE outbound from this VM's host IP
+		vmRule{table: "nat", chain: "POSTROUTING", args: []string{"-s", hostCIDR, "-o", hfw.hostIface, "-j", "MASQUERADE"}},
+	)
 	if hfw.httpProxyPort > 0 {
 		rules = append(rules, vmRule{
 			table: "nat", chain: "PREROUTING",
@@ -101,6 +112,19 @@ func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 	}
 
 	for _, r := range rules {
+		if r.prepend {
+			// Exists-check keeps Insert idempotent across vmd restarts.
+			exists, err := hfw.ipt.Exists(r.table, r.chain, r.args...)
+			if err != nil {
+				return fmt.Errorf("check %s/%s rule for %s: %w", r.table, r.chain, vmID, err)
+			}
+			if !exists {
+				if err := hfw.ipt.Insert(r.table, r.chain, 1, r.args...); err != nil {
+					return fmt.Errorf("insert %s/%s rule for %s: %w", r.table, r.chain, vmID, err)
+				}
+			}
+			continue
+		}
 		if err := hfw.ipt.AppendUnique(r.table, r.chain, r.args...); err != nil {
 			return fmt.Errorf("add %s/%s rule for %s: %w", r.table, r.chain, vmID, err)
 		}

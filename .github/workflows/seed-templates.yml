@@ -46,8 +46,10 @@ on:
       # unchanged template spec. See detect-stale step below which sets
       # --force-rebuild automatically for these.
       - 'cmd/boxd/**'
+      - 'cmd/template-builder/**'
       - 'proto/boxdpb/**'
       - 'internal/builder/**'
+      - 'internal/vm/**'
 
 # Serialize runs so two concurrent pushes don't double-trigger the
 # build supervisor with the same specs. In-progress runs complete before
@@ -65,8 +67,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Need HEAD~1 to diff which paths changed on a push.
-          fetch-depth: 2
+          # Full history so event.before..sha resolves across multi-commit pushes.
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -79,10 +81,15 @@ jobs:
       # respects the user's explicit toggle.
       - name: Detect stale snapshots
         id: stale
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "force=${{ github.event.inputs.force_rebuild }}" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only HEAD~1 HEAD | grep -qE '^(cmd/boxd/|proto/boxdpb/|internal/builder/)'; then
+          elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "force=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | grep -qE '^(cmd/boxd/|cmd/template-builder/|proto/boxdpb/|internal/builder/|internal/vm/)'; then
             echo "force=true" >> "$GITHUB_OUTPUT"
           else
             echo "force=false" >> "$GITHUB_OUTPUT"
@@ -108,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -117,10 +124,15 @@ jobs:
 
       - name: Detect stale snapshots
         id: stale
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "force=${{ github.event.inputs.force_rebuild }}" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only HEAD~1 HEAD | grep -qE '^(cmd/boxd/|proto/boxdpb/|internal/builder/)'; then
+          elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "force=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | grep -qE '^(cmd/boxd/|cmd/template-builder/|proto/boxdpb/|internal/builder/|internal/vm/)'; then
             echo "force=true" >> "$GITHUB_OUTPUT"
           else
             echo "force=false" >> "$GITHUB_OUTPUT"

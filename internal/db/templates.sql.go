@@ -39,94 +39,37 @@ SET status = 'cancelled',
     updated_at = now(),
     error_message = 'cancelled by user'
 WHERE id = $1
-  AND team_id = $2
+  AND template_id = $2
+  AND team_id = $3
   AND status IN ('pending', 'building', 'snapshotting')
 `
 
 type CancelBuildParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
+	ID         uuid.UUID `json:"id"`
+	TemplateID uuid.UUID `json:"template_id"`
+	TeamID     uuid.UUID `json:"team_id"`
 }
 
 // User-initiated cancellation of a build. Only succeeds while the build is
 // still in a non-terminal state. Caller is responsible for calling
 // vmd.CancelBuild before this; this just records the terminal status.
+// Scoped to the given template so the URL's :template_id segment enforces.
 func (q *Queries) CancelBuild(ctx context.Context, arg CancelBuildParams) (int64, error) {
-	result, err := q.db.Exec(ctx, cancelBuild, arg.ID, arg.TeamID)
+	result, err := q.db.Exec(ctx, cancelBuild, arg.ID, arg.TemplateID, arg.TeamID)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
 }
 
-const claimPendingBuilds = `-- name: ClaimPendingBuilds :many
-WITH claimed AS (
-  SELECT id FROM template_build
-  WHERE status = 'pending'
-  ORDER BY created_at ASC
-  LIMIT $1
-  FOR UPDATE SKIP LOCKED
-)
-UPDATE template_build
-SET status = 'building',
-    started_at = now(),
-    updated_at = now(),
-    vmd_host_id = $2
-FROM claimed
-WHERE template_build.id = claimed.id
-RETURNING template_build.id, template_build.template_id, template_build.team_id, template_build.status, template_build.build_spec_hash, template_build.vmd_host_id, template_build.vmd_build_vm_id, template_build.error_message, template_build.started_at, template_build.finalized_at, template_build.created_at, template_build.updated_at
-`
-
-type ClaimPendingBuildsParams struct {
-	Limit     int32   `json:"limit"`
-	VmdHostID *string `json:"vmd_host_id"`
-}
-
-// Atomically claim pending builds for dispatch. FOR UPDATE SKIP LOCKED makes
-// this safe with multiple control plane replicas — concurrent supervisors
-// skip rows another replica already has. Limit caps how many we work per tick.
-func (q *Queries) ClaimPendingBuilds(ctx context.Context, arg ClaimPendingBuildsParams) ([]TemplateBuild, error) {
-	rows, err := q.db.Query(ctx, claimPendingBuilds, arg.Limit, arg.VmdHostID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []TemplateBuild{}
-	for rows.Next() {
-		var i TemplateBuild
-		if err := rows.Scan(
-			&i.ID,
-			&i.TemplateID,
-			&i.TeamID,
-			&i.Status,
-			&i.BuildSpecHash,
-			&i.VmdHostID,
-			&i.VmdBuildVmID,
-			&i.ErrorMessage,
-			&i.StartedAt,
-			&i.FinalizedAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const countInFlightBuildsForTeam = `-- name: CountInFlightBuildsForTeam :one
 SELECT COUNT(*) FROM template_build
-WHERE team_id = $1 AND status IN ('building', 'snapshotting')
+WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting')
 `
 
-// Counts builds actively consuming host resources (building or capturing
-// a snapshot). Pending rows are excluded — they haven't claimed a slot
-// yet and including them would cause a deadlock: submit the limit's
-// worth of builds at once and the count itself blocks any from starting.
+// Counts builds occupying a concurrency slot. Pending is included so a
+// burst of submits can't all pass the cap before any reaches 'building'.
+// Callers must hold the per-team advisory lock around count + insert.
 func (q *Queries) CountInFlightBuildsForTeam(ctx context.Context, teamID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countInFlightBuildsForTeam, teamID)
 	var count int64
@@ -431,20 +374,23 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (T
 const getExistingInflightBuild = `-- name: GetExistingInflightBuild :one
 SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
 WHERE template_id = $1
-  AND build_spec_hash = $2
+  AND team_id = $2
+  AND build_spec_hash = $3
   AND status IN ('pending', 'building', 'snapshotting')
 `
 
 type GetExistingInflightBuildParams struct {
 	TemplateID    uuid.UUID `json:"template_id"`
+	TeamID        uuid.UUID `json:"team_id"`
 	BuildSpecHash string    `json:"build_spec_hash"`
 }
 
 // Fetch the existing in-flight build for this (template_id, build_spec_hash),
 // used after a unique-violation from CreateTemplateBuild to return the
-// pre-existing build id to the caller.
+// pre-existing build id to the caller. team_id is included defensively so
+// the query is safe if called outside the post-admission path.
 func (q *Queries) GetExistingInflightBuild(ctx context.Context, arg GetExistingInflightBuildParams) (TemplateBuild, error) {
-	row := q.db.QueryRow(ctx, getExistingInflightBuild, arg.TemplateID, arg.BuildSpecHash)
+	row := q.db.QueryRow(ctx, getExistingInflightBuild, arg.TemplateID, arg.TeamID, arg.BuildSpecHash)
 	var i TemplateBuild
 	err := row.Scan(
 		&i.ID,
@@ -506,17 +452,19 @@ func (q *Queries) GetTemplate(ctx context.Context, arg GetTemplateParams) (Templ
 
 const getTemplateBuild = `-- name: GetTemplateBuild :one
 SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
-WHERE id = $1 AND team_id = $2
+WHERE id = $1 AND template_id = $2 AND team_id = $3
 `
 
 type GetTemplateBuildParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
+	ID         uuid.UUID `json:"id"`
+	TemplateID uuid.UUID `json:"template_id"`
+	TeamID     uuid.UUID `json:"team_id"`
 }
 
-// Fetch a build visible to the caller's team. Read-only path; team scope only.
+// Fetch a build visible to the caller's team, scoped to the given template
+// so the URL's :template_id path segment is enforced, not just decorative.
 func (q *Queries) GetTemplateBuild(ctx context.Context, arg GetTemplateBuildParams) (TemplateBuild, error) {
-	row := q.db.QueryRow(ctx, getTemplateBuild, arg.ID, arg.TeamID)
+	row := q.db.QueryRow(ctx, getTemplateBuild, arg.ID, arg.TemplateID, arg.TeamID)
 	var i TemplateBuild
 	err := row.Scan(
 		&i.ID,
@@ -710,12 +658,11 @@ ORDER BY created_at ASC
 LIMIT $1
 `
 
-// Read-only scan of pending builds in FIFO order. Used by the supervisor's
-// per-tick dispatch loop to evaluate admission (host capacity + per-team
-// concurrency) before transitioning any rows. Kept separate from
-// ClaimPendingBuilds so the supervisor can skip individual rows (e.g. a
-// team already at its concurrency limit) without locking them out of a
-// later tick.
+// Read-only scan of pending builds in FIFO order. The supervisor's
+// per-tick dispatch loop iterates these and evaluates the global
+// concurrency cap before transitioning each row. Per-team concurrency
+// is enforced at submit time (see CountInFlightBuildsForTeam + advisory
+// lock), not here.
 func (q *Queries) ListPendingBuildsOrdered(ctx context.Context, limit int32) ([]TemplateBuild, error) {
 	rows, err := q.db.Query(ctx, listPendingBuildsOrdered, limit)
 	if err != nil {

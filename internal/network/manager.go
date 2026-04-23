@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -425,13 +427,9 @@ func (m *Manager) CleanupVM(vmID string) {
 }
 
 // SweepOrphanNamespaces removes host namespaces and veth interfaces
-// matching the ns-N/veth-N naming pattern that are not in the keep set.
-// Called from ReattachAll at startup, after stale BoltDB records have
-// been pruned, so the keep set reflects current truth.
-//
-// Safety: relies on systemd killing every subprocess child before
-// ReattachAll runs, so no namespace has a live process. The name-prefix
-// check ensures we never touch user-created or system interfaces.
+// matching ns-N/veth-N that aren't in the keep set. Kills any process
+// still in the ns first so slot recycling can't collide with a
+// vmd-crash-orphaned firecracker still holding veth/TAP peers.
 func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 	entries, err := os.ReadDir("/run/netns")
 	if err != nil {
@@ -453,6 +451,9 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 		var idx int
 		if _, err := fmt.Sscanf(name, "ns-%d", &idx); err != nil {
 			continue
+		}
+		if killed := killProcessesInNs(name); killed > 0 {
+			m.log.Info().Str("ns", name).Int("killed", killed).Msg("killed processes in orphan namespace before sweep")
 		}
 		veth := fmt.Sprintf("veth-%d", idx)
 		m.cleanupFull(name, veth)
@@ -481,6 +482,42 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 	}
 
 	return swept
+}
+
+// killProcessesInNs SIGKILLs every process whose net namespace matches
+// /run/netns/<name>. Returns the number of pids signalled.
+func killProcessesInNs(name string) int {
+	nsPath := "/run/netns/" + name
+	nsStat, err := os.Stat(nsPath)
+	if err != nil {
+		return 0
+	}
+	nsIno := nsStat.Sys().(*syscall.Stat_t).Ino
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	killed := 0
+	for _, e := range procs {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		procNsStat, err := os.Stat("/proc/" + e.Name() + "/ns/net")
+		if err != nil {
+			continue
+		}
+		if procNsStat.Sys().(*syscall.Stat_t).Ino != nsIno {
+			continue
+		}
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			killed++
+		}
+	}
+	return killed
 }
 
 // listHostVeths returns all veth-N interfaces visible in the host namespace.

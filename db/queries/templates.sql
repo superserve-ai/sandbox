@@ -112,16 +112,19 @@ RETURNING *;
 -- name: GetExistingInflightBuild :one
 -- Fetch the existing in-flight build for this (template_id, build_spec_hash),
 -- used after a unique-violation from CreateTemplateBuild to return the
--- pre-existing build id to the caller.
+-- pre-existing build id to the caller. team_id is included defensively so
+-- the query is safe if called outside the post-admission path.
 SELECT * FROM template_build
 WHERE template_id = $1
-  AND build_spec_hash = $2
+  AND team_id = $2
+  AND build_spec_hash = $3
   AND status IN ('pending', 'building', 'snapshotting');
 
 -- name: GetTemplateBuild :one
--- Fetch a build visible to the caller's team. Read-only path; team scope only.
+-- Fetch a build visible to the caller's team, scoped to the given template
+-- so the URL's :template_id path segment is enforced, not just decorative.
 SELECT * FROM template_build
-WHERE id = $1 AND team_id = $2;
+WHERE id = $1 AND template_id = $2 AND team_id = $3;
 
 -- name: ListBuildsForTemplate :many
 -- Recent builds for a template. Used by the SDK to inspect build history.
@@ -131,40 +134,18 @@ ORDER BY created_at DESC
 LIMIT $3;
 
 -- name: CountInFlightBuildsForTeam :one
--- Counts builds actively consuming host resources (building or capturing
--- a snapshot). Pending rows are excluded — they haven't claimed a slot
--- yet and including them would cause a deadlock: submit the limit's
--- worth of builds at once and the count itself blocks any from starting.
+-- Counts builds occupying a concurrency slot. Pending is included so a
+-- burst of submits can't all pass the cap before any reaches 'building'.
+-- Callers must hold the per-team advisory lock around count + insert.
 SELECT COUNT(*) FROM template_build
-WHERE team_id = $1 AND status IN ('building', 'snapshotting');
-
--- name: ClaimPendingBuilds :many
--- Atomically claim pending builds for dispatch. FOR UPDATE SKIP LOCKED makes
--- this safe with multiple control plane replicas — concurrent supervisors
--- skip rows another replica already has. Limit caps how many we work per tick.
-WITH claimed AS (
-  SELECT id FROM template_build
-  WHERE status = 'pending'
-  ORDER BY created_at ASC
-  LIMIT $1
-  FOR UPDATE SKIP LOCKED
-)
-UPDATE template_build
-SET status = 'building',
-    started_at = now(),
-    updated_at = now(),
-    vmd_host_id = $2
-FROM claimed
-WHERE template_build.id = claimed.id
-RETURNING template_build.*;
+WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting');
 
 -- name: ListPendingBuildsOrdered :many
--- Read-only scan of pending builds in FIFO order. Used by the supervisor's
--- per-tick dispatch loop to evaluate admission (host capacity + per-team
--- concurrency) before transitioning any rows. Kept separate from
--- ClaimPendingBuilds so the supervisor can skip individual rows (e.g. a
--- team already at its concurrency limit) without locking them out of a
--- later tick.
+-- Read-only scan of pending builds in FIFO order. The supervisor's
+-- per-tick dispatch loop iterates these and evaluates the global
+-- concurrency cap before transitioning each row. Per-team concurrency
+-- is enforced at submit time (see CountInFlightBuildsForTeam + advisory
+-- lock), not here.
 SELECT * FROM template_build
 WHERE status = 'pending'
 ORDER BY created_at ASC
@@ -247,13 +228,15 @@ RETURNING template.*;
 -- User-initiated cancellation of a build. Only succeeds while the build is
 -- still in a non-terminal state. Caller is responsible for calling
 -- vmd.CancelBuild before this; this just records the terminal status.
+-- Scoped to the given template so the URL's :template_id segment enforces.
 UPDATE template_build
 SET status = 'cancelled',
     finalized_at = now(),
     updated_at = now(),
     error_message = 'cancelled by user'
 WHERE id = $1
-  AND team_id = $2
+  AND template_id = $2
+  AND team_id = $3
   AND status IN ('pending', 'building', 'snapshotting');
 
 -- name: ReapStaleBuilds :many

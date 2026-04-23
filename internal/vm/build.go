@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/builder"
@@ -133,6 +134,11 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	pipe := &buildLogPipe{buildVMID: buildVMID, mgr: m}
 	cmd.Stdout = pipe
 	cmd.Stderr = os.Stderr
+
+	// Graceful cancel: SIGTERM lets template-builder's cleanup defers run;
+	// WaitDelay escalates to SIGKILL if it hangs past 30s.
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 30 * time.Second
 
 	if err := cmd.Run(); err != nil {
 		// Prefer the structured reason the subprocess emitted on its way

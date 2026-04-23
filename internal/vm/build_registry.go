@@ -202,18 +202,11 @@ func (m *Manager) GetBuildStatus(buildVMID string) (BuildStatusSnapshot, bool) {
 	}, true
 }
 
-// CancelBuild marks a build cancelled and tears down its build VM. Safe to
-// call on an unknown or already-terminal build — returns nil and a zero
-// status so the supervisor doesn't have to pre-check.
+// CancelBuild marks a build cancelled and signals its template-builder
+// subprocess (via ctx.Cancel → SIGTERM → cleanup defers). Safe on
+// unknown or already-terminal builds.
 func (m *Manager) CancelBuild(ctx context.Context, buildVMID string) error {
-	_, existed := m.cancelBuildRecord(buildVMID, "cancelled by caller")
-	if !existed {
-		return nil
-	}
-	// Even if the record was already terminal, destroy the VM if still
-	// around — a cancelled-then-crashed-mid-snapshot scenario can leave
-	// the VM lingering.
-	_ = m.DestroyVM(ctx, buildVMID, true)
+	m.cancelBuildRecord(buildVMID, "cancelled by caller")
 	return nil
 }
 

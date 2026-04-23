@@ -233,6 +233,7 @@ func newRouter(t *testing.T) *gin.Engine {
 		SystemTeamID: testSystemTeamID.String(),
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
+	h.Pool = testPool
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 

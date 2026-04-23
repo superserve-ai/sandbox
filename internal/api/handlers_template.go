@@ -185,31 +185,48 @@ func canonicalSpecHash(spec *buildSpec) (string, error) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// enforceBuildConcurrency rejects with 429 when the team already has the
-// maximum number of actively-running builds in flight. Returns (true, nil)
-// when the caller may proceed. On any failure (limit exceeded or DB error)
-// it writes the response and returns (false, err); err is non-nil only
-// when the handler should log-but-otherwise-stop.
-func (h *Handlers) enforceBuildConcurrency(c *gin.Context, teamID uuid.UUID) (bool, error) {
-	limit, err := h.DB.GetTeamBuildConcurrency(c.Request.Context(), teamID)
+// acquireBuildSlot begins a tx, takes a per-team advisory lock, verifies
+// capacity, and returns a tx-bound *db.Queries for the caller to insert
+// into. Caller commits to finalize; defer Rollback as a safety net.
+// On limit exceeded or DB error the response is already written and
+// (nil, nil) is returned — caller just returns.
+func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID) (*db.Queries, pgx.Tx) {
+	ctx := c.Request.Context()
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("BeginTx for build admission failed")
+		respondError(c, ErrInternal)
+		return nil, nil
+	}
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", teamID.String()); err != nil {
+		_ = tx.Rollback(ctx)
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("pg_advisory_xact_lock failed")
+		respondError(c, ErrInternal)
+		return nil, nil
+	}
+	q := h.DB.WithTx(tx)
+	limit, err := q.GetTeamBuildConcurrency(ctx, teamID)
+	if err != nil {
+		_ = tx.Rollback(ctx)
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeamBuildConcurrency failed")
 		respondError(c, ErrInternal)
-		return false, err
+		return nil, nil
 	}
-	active, err := h.DB.CountInFlightBuildsForTeam(c.Request.Context(), teamID)
+	active, err := q.CountInFlightBuildsForTeam(ctx, teamID)
 	if err != nil {
+		_ = tx.Rollback(ctx)
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountInFlightBuildsForTeam failed")
 		respondError(c, ErrInternal)
-		return false, err
+		return nil, nil
 	}
 	if int64(limit) > 0 && active >= int64(limit) {
+		_ = tx.Rollback(ctx)
 		respondErrorMsg(c, "too_many_builds",
 			fmt.Sprintf("team has reached the maximum of %d concurrent builds; contact support to raise the limit", limit),
 			http.StatusTooManyRequests)
-		return false, nil
+		return nil, nil
 	}
-	return true, nil
+	return q, tx
 }
 
 func parseTemplateID(c *gin.Context) (uuid.UUID, error) {
@@ -321,6 +338,16 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			http.StatusBadRequest)
 		return
 	}
+	// `superserve/` is reserved for curated templates owned by the system
+	// team. Other teams cannot create aliases in this namespace — doing so
+	// would shadow the real curated template for their own members. Match
+	// is case-insensitive to block squat variants like `SuperServe/foo`.
+	if strings.HasPrefix(strings.ToLower(req.Alias), "superserve/") && teamID != h.systemTeamID() {
+		respondErrorMsg(c, "bad_request",
+			"aliases starting with 'superserve/' are reserved",
+			http.StatusBadRequest)
+		return
+	}
 	vcpu := int32(defaultVcpu)
 	if req.Vcpu != nil {
 		vcpu = *req.Vcpu
@@ -350,17 +377,6 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		return
 	}
 
-	// Reject at submit if the team is already at its concurrency cap so
-	// callers see back-pressure immediately (429) instead of a row that
-	// silently fails later.
-	if ok, err := h.enforceBuildConcurrency(c, teamID); !ok {
-		if err != nil {
-			// Already responded to the caller inside the helper.
-			return
-		}
-		return
-	}
-
 	specJSON, err := json.Marshal(req.BuildSpec)
 	if err != nil {
 		log.Error().Err(err).Msg("marshal build_spec")
@@ -378,7 +394,16 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		return
 	}
 
-	row, err := h.DB.CreateTemplateWithBuild(c.Request.Context(), db.CreateTemplateWithBuildParams{
+	// Gate on per-team concurrency and do the insert under the same tx,
+	// so concurrent submits serialize cleanly.
+	ctx := c.Request.Context()
+	q, tx := h.acquireBuildSlot(c, teamID)
+	if q == nil {
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	row, err := q.CreateTemplateWithBuild(ctx, db.CreateTemplateWithBuildParams{
 		TeamID:        teamID,
 		Alias:         req.Alias,
 		BuildSpec:     specJSON,
@@ -395,6 +420,11 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			return
 		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("CreateTemplateWithBuild failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit CreateTemplateWithBuild failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -579,10 +609,6 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 		return
 	}
 
-	if ok, _ := h.enforceBuildConcurrency(c, teamID); !ok {
-		return
-	}
-
 	// Hash the template's persisted spec — we build whatever's currently
 	// stored, not a fresh client-supplied spec. The spec is fixed at
 	// template create time.
@@ -599,7 +625,14 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 		return
 	}
 
-	build, err := h.DB.CreateTemplateBuild(c.Request.Context(), db.CreateTemplateBuildParams{
+	ctx := c.Request.Context()
+	q, tx := h.acquireBuildSlot(c, teamID)
+	if q == nil {
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	build, err := q.CreateTemplateBuild(ctx, db.CreateTemplateBuildParams{
 		TemplateID:    tplID,
 		TeamID:        teamID,
 		BuildSpecHash: specHash,
@@ -608,8 +641,13 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 		if isUniqueViolation(err) {
 			// Idempotent submit: another in-flight build for this template
 			// with the same spec_hash already exists. Return it instead.
-			existing, getErr := h.DB.GetExistingInflightBuild(c.Request.Context(), db.GetExistingInflightBuildParams{
+			// The existing row doesn't consume a new slot, so roll back the
+			// admission txn before responding — GetExistingInflightBuild
+			// runs outside the lock since it's read-only.
+			_ = tx.Rollback(ctx)
+			existing, getErr := h.DB.GetExistingInflightBuild(ctx, db.GetExistingInflightBuildParams{
 				TemplateID:    tplID,
+				TeamID:        teamID,
 				BuildSpecHash: specHash,
 			})
 			if getErr == nil {
@@ -622,11 +660,20 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit CreateTemplateBuild failed")
+		respondError(c, ErrInternal)
+		return
+	}
 
 	c.JSON(http.StatusCreated, toBuildResponse(build))
 }
 
 func (h *Handlers) GetTemplateBuild(c *gin.Context) {
+	tplID, err := parseTemplateID(c)
+	if err != nil {
+		return
+	}
 	buildID, err := parseBuildID(c)
 	if err != nil {
 		return
@@ -637,8 +684,9 @@ func (h *Handlers) GetTemplateBuild(c *gin.Context) {
 	}
 
 	build, err := h.DB.GetTemplateBuild(c.Request.Context(), db.GetTemplateBuildParams{
-		ID:     buildID,
-		TeamID: teamID,
+		ID:         buildID,
+		TemplateID: tplID,
+		TeamID:     teamID,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -682,6 +730,10 @@ func (h *Handlers) ListTemplateBuilds(c *gin.Context) {
 }
 
 func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
+	tplID, err := parseTemplateID(c)
+	if err != nil {
+		return
+	}
 	buildID, err := parseBuildID(c)
 	if err != nil {
 		return
@@ -696,8 +748,9 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 	// Builds still in 'pending' are effectively cancelled immediately
 	// (nothing is running on them yet).
 	rows, err := h.DB.CancelBuild(c.Request.Context(), db.CancelBuildParams{
-		ID:     buildID,
-		TeamID: teamID,
+		ID:         buildID,
+		TemplateID: tplID,
+		TeamID:     teamID,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("build_id", buildID.String()).Msg("DB CancelBuild failed")
@@ -766,6 +819,10 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 //  3. Otherwise open vmd.StreamBuildLogs and re-emit each event as SSE.
 //  4. Close when the stream sends Finished or the client disconnects.
 func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
+	tplID, err := parseTemplateID(c)
+	if err != nil {
+		return
+	}
 	buildID, err := parseBuildID(c)
 	if err != nil {
 		return
@@ -776,8 +833,9 @@ func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
 	}
 
 	build, err := h.DB.GetTemplateBuild(c.Request.Context(), db.GetTemplateBuildParams{
-		ID:     buildID,
-		TeamID: teamID,
+		ID:         buildID,
+		TemplateID: tplID,
+		TeamID:     teamID,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
