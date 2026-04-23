@@ -743,24 +743,31 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 		return
 	}
 
-	// Cancel records the terminal status; the supervisor picks it up on
-	// its next tick and calls vmd.CancelBuild to tear down the build VM.
-	// Builds still in 'pending' are effectively cancelled immediately
-	// (nothing is running on them yet).
-	rows, err := h.DB.CancelBuild(c.Request.Context(), db.CancelBuildParams{
+	// Pre-check scope so we can return 404 for wrong team/template instead
+	// of silently 204'ing.
+	if _, err := h.DB.GetTemplateBuild(c.Request.Context(), db.GetTemplateBuildParams{
 		ID:         buildID,
 		TemplateID: tplID,
 		TeamID:     teamID,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("build_id", buildID.String()).Msg("DB CancelBuild failed")
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "not_found", "Build not found", http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("build_id", buildID.String()).Msg("DB GetTemplateBuild failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	if rows == 0 {
-		// Either not found, not yours, or already terminal. We don't
-		// distinguish — terminal-already is functionally a no-op success.
-		c.Status(http.StatusNoContent)
+
+	// Cancel is idempotent on terminal builds (0 rows when status is already
+	// ready/failed/cancelled). Supervisor picks it up on its next tick.
+	if _, err := h.DB.CancelBuild(c.Request.Context(), db.CancelBuildParams{
+		ID:         buildID,
+		TemplateID: tplID,
+		TeamID:     teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("build_id", buildID.String()).Msg("DB CancelBuild failed")
+		respondError(c, ErrInternal)
 		return
 	}
 	c.Status(http.StatusNoContent)
