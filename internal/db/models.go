@@ -152,18 +152,20 @@ func (ns NullTemplateStatus) Value() (driver.Value, error) {
 }
 
 type Activity struct {
-	ID          uuid.UUID   `json:"id"`
-	SandboxID   uuid.UUID   `json:"sandbox_id"`
-	TeamID      uuid.UUID   `json:"team_id"`
-	ActorID     pgtype.UUID `json:"actor_id"`
-	Category    string      `json:"category"`
-	Action      string      `json:"action"`
-	Status      *string     `json:"status"`
-	SandboxName *string     `json:"sandbox_name"`
-	DurationMs  *int32      `json:"duration_ms"`
-	Error       *string     `json:"error"`
-	Metadata    []byte      `json:"metadata"`
-	CreatedAt   time.Time   `json:"created_at"`
+	ID           uuid.UUID   `json:"id"`
+	SandboxID    pgtype.UUID `json:"sandbox_id"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	ActorID      pgtype.UUID `json:"actor_id"`
+	Category     string      `json:"category"`
+	Action       string      `json:"action"`
+	Status       *string     `json:"status"`
+	SandboxName  *string     `json:"sandbox_name"`
+	DurationMs   *int32      `json:"duration_ms"`
+	Error        *string     `json:"error"`
+	Metadata     []byte      `json:"metadata"`
+	CreatedAt    time.Time   `json:"created_at"`
+	TemplateID   pgtype.UUID `json:"template_id"`
+	ResourceType string      `json:"resource_type"`
 }
 
 type ApiKey struct {

@@ -83,29 +83,51 @@ const vmdTimeout = 30 * time.Second
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
-// logActivityAsync writes an activity record in a background goroutine.
-//
-// The caller passes the request context. We strip cancellation via
-// context.WithoutCancel so the goroutine is not killed when the HTTP
-// response completes, but we KEEP the trace/span context so the async
-// write appears in the same request trace as the synchronous work.
-func (h *Handlers) logActivityAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
+// logSandboxActivity writes a sandbox-scoped activity record in a background
+// goroutine. The request context is stripped of cancellation via
+// context.WithoutCancel so the goroutine is not killed when the HTTP response
+// completes, but the trace/span context is kept so the async write appears in
+// the same request trace as the synchronous work.
+func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
-			SandboxID:   sandboxID,
-			TeamID:      teamID,
-			Category:    category,
-			Action:      action,
-			Status:      &status,
-			SandboxName: sandboxName,
-			DurationMs:  durationMs,
-			Metadata:    metadata,
+			SandboxID:    pgtype.UUID{Bytes: sandboxID, Valid: true},
+			ResourceType: "sandbox",
+			TeamID:       teamID,
+			Category:     category,
+			Action:       action,
+			Status:       &status,
+			SandboxName:  sandboxName,
+			DurationMs:   durationMs,
+			Metadata:     metadata,
 		})
 		if err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msgf("async %s/%s activity log failed", category, action)
+		}
+	}()
+}
+
+// logTemplateActivity writes a template-scoped activity record. Same async
+// semantics as logSandboxActivity.
+func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamID uuid.UUID, category, action, status string, metadata []byte) {
+	asyncCtx := context.WithoutCancel(reqCtx)
+	go func() {
+		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
+		defer cancel()
+		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+			TemplateID:   pgtype.UUID{Bytes: templateID, Valid: true},
+			ResourceType: "template",
+			TeamID:       teamID,
+			Category:     category,
+			Action:       action,
+			Status:       &status,
+			Metadata:     metadata,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("template_id", templateID.String()).Msgf("async %s/%s activity log failed", category, action)
 		}
 	}()
 }
@@ -332,7 +354,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
-	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	return true
 }
 
@@ -538,7 +560,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	// Async activity log.
-	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -873,6 +895,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// snapshot was built with exactly these values, so they're the
 	// authoritative shape.
 	var templateVcpu, templateMemMiB uint32
+	var fromTemplateAlias, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
 		if err != nil {
@@ -894,6 +917,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
 		templateVcpu = uint32(tpl.Vcpu)
 		templateMemMiB = uint32(tpl.MemoryMib)
+		fromTemplateAlias = tpl.Alias
+		fromTemplateID = tpl.ID.String()
 	}
 
 	// Select a host for this sandbox.
@@ -1127,7 +1152,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	wg.Wait()
 
-	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
+	var createdMeta []byte
+	if fromTemplateAlias != "" {
+		createdMeta, _ = json.Marshal(map[string]string{
+			"from_template": fromTemplateAlias,
+			"template_id":   fromTemplateID,
+		})
+	}
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
@@ -1273,7 +1305,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	}
 
 	// Async observability.
-	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -1344,7 +1376,7 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		"exit_code":   exitCode,
 		"duration_ms": durationMs,
 	})
-	h.logActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
 
 	c.JSON(http.StatusOK, gin.H{
 		"stdout":    stdout,
@@ -1480,7 +1512,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
 		}
 
-		h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
+		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 	}
 
 	if body.Metadata != nil {
@@ -1500,7 +1532,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			return
 		}
 
-		h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
+		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
 	}
 
 	c.Status(http.StatusNoContent)

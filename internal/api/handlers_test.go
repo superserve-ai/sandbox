@@ -209,11 +209,11 @@ func errorRow(err error) *mockRow {
 	return &mockRow{scanFn: func(...any) error { return err }}
 }
 
-// activityRow returns a mockRow for CreateActivity's Scan (12 fields).
+// activityRow returns a mockRow for CreateActivity's Scan (14 fields).
 func activityRow() *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = uuid.New()
-		*dest[1].(*uuid.UUID) = uuid.Nil
+		*dest[1].(*pgtype.UUID) = pgtype.UUID{}
 		*dest[2].(*uuid.UUID) = uuid.Nil
 		*dest[3].(*pgtype.UUID) = pgtype.UUID{}
 		*dest[4].(*string) = "sandbox"
@@ -224,6 +224,8 @@ func activityRow() *mockRow {
 		*dest[9].(**string) = nil
 		*dest[10].(*[]byte) = nil
 		*dest[11].(*time.Time) = time.Now()
+		*dest[12].(*pgtype.UUID) = pgtype.UUID{}
+		*dest[13].(*string) = "sandbox"
 		return nil
 	}}
 }

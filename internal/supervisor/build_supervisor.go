@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -156,6 +157,7 @@ func (s *BuildSupervisor) reapStale(ctx context.Context) {
 	}
 	for _, r := range reaped {
 		s.log.Warn().Str("build_id", r.ID.String()).Msg("build timed out; marked failed")
+		s.logBuildCompleted(ctx, db.TemplateBuild{ID: r.ID, TemplateID: r.TemplateID, TeamID: r.TeamID}, "error", "build timed out", "")
 		// Tell vmd to cancel so the build VM doesn't linger. Best-effort —
 		// if vmd already finished or the build was only in 'pending', the
 		// cancel is a no-op on the vmd side.
@@ -385,9 +387,39 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			return
 		}
 		rowLog.Info().Str("digest", res.ResolvedDigest).Int64("size", size).Msg("build ready")
+		s.logBuildCompleted(ctx, row, "success", "", res.ResolvedDigest)
 	case "failed", "cancelled":
 		s.failBuild(ctx, row.ID, res.ErrorMessage)
 		rowLog.Info().Str("status", res.Status).Str("error", res.ErrorMessage).Msg("build terminal")
+		s.logBuildCompleted(ctx, row, "error", res.ErrorMessage, "")
+	}
+}
+
+// logBuildCompleted writes a template/build_completed activity row so user
+// audit feeds see terminal transitions that happen inside the supervisor
+// (not on the HTTP path). Best-effort: a write failure logs and continues.
+func (s *BuildSupervisor) logBuildCompleted(ctx context.Context, row db.TemplateBuild, status, errMsg, digest string) {
+	meta := map[string]string{"build_id": row.ID.String()}
+	if errMsg != "" {
+		meta["error"] = errMsg
+	}
+	if digest != "" {
+		meta["digest"] = digest
+	}
+	metaJSON, _ := json.Marshal(meta)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	statusStr := status
+	if _, err := s.q.CreateActivity(writeCtx, db.CreateActivityParams{
+		TemplateID:   pgtype.UUID{Bytes: row.TemplateID, Valid: true},
+		ResourceType: "template",
+		TeamID:       row.TeamID,
+		Category:     "template",
+		Action:       "build_completed",
+		Status:       &statusStr,
+		Metadata:     metaJSON,
+	}); err != nil {
+		s.log.Error().Err(err).Str("build_id", row.ID.String()).Msg("activity log build_completed")
 	}
 }
 

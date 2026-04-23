@@ -128,5 +128,5 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		"exit_code":   lastExitCode,
 		"duration_ms": durationMs,
 	})
-	h.logActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", actStatus, &sandbox.Name, &durationMs, metadata)
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", actStatus, &sandbox.Name, &durationMs, metadata)
 }

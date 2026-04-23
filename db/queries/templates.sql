@@ -255,7 +255,7 @@ WHERE t.id = build_done.tpl_id
 -- caller can call vmd.CancelBuild for orphan VM cleanup. Same idempotent
 -- pattern as ClaimExpiredSandboxes.
 WITH stale AS (
-  SELECT id, vmd_host_id, vmd_build_vm_id FROM template_build
+  SELECT id, template_id, team_id, vmd_host_id, vmd_build_vm_id FROM template_build
   WHERE
     (status = 'pending' AND created_at < now() - (sqlc.arg('pending_timeout_seconds')::int || ' seconds')::interval)
     OR
@@ -271,4 +271,4 @@ SET status = 'failed',
     error_message = 'build timed out'
 FROM stale
 WHERE template_build.id = stale.id
-RETURNING template_build.id, stale.vmd_host_id, stale.vmd_build_vm_id;
+RETURNING template_build.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id;

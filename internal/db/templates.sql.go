@@ -815,7 +815,7 @@ func (q *Queries) ListTemplatesForTeamFiltered(ctx context.Context, arg ListTemp
 
 const reapStaleBuilds = `-- name: ReapStaleBuilds :many
 WITH stale AS (
-  SELECT id, vmd_host_id, vmd_build_vm_id FROM template_build
+  SELECT id, template_id, team_id, vmd_host_id, vmd_build_vm_id FROM template_build
   WHERE
     (status = 'pending' AND created_at < now() - ($2::int || ' seconds')::interval)
     OR
@@ -831,7 +831,7 @@ SET status = 'failed',
     error_message = 'build timed out'
 FROM stale
 WHERE template_build.id = stale.id
-RETURNING template_build.id, stale.vmd_host_id, stale.vmd_build_vm_id
+RETURNING template_build.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id
 `
 
 type ReapStaleBuildsParams struct {
@@ -842,6 +842,8 @@ type ReapStaleBuildsParams struct {
 
 type ReapStaleBuildsRow struct {
 	ID           uuid.UUID `json:"id"`
+	TemplateID   uuid.UUID `json:"template_id"`
+	TeamID       uuid.UUID `json:"team_id"`
 	VmdHostID    *string   `json:"vmd_host_id"`
 	VmdBuildVmID *string   `json:"vmd_build_vm_id"`
 }
@@ -859,7 +861,13 @@ func (q *Queries) ReapStaleBuilds(ctx context.Context, arg ReapStaleBuildsParams
 	items := []ReapStaleBuildsRow{}
 	for rows.Next() {
 		var i ReapStaleBuildsRow
-		if err := rows.Scan(&i.ID, &i.VmdHostID, &i.VmdBuildVmID); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.TemplateID,
+			&i.TeamID,
+			&i.VmdHostID,
+			&i.VmdBuildVmID,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

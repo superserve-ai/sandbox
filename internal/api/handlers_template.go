@@ -445,6 +445,15 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		"build_id":      row.BuildID,
 	}
 	c.JSON(http.StatusAccepted, respBody)
+
+	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, "template", "created", "success", nil)
+	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, "template", "build_started", "success",
+		buildMetadata(row.BuildID))
+}
+
+func buildMetadata(buildID uuid.UUID) []byte {
+	b, _ := json.Marshal(map[string]string{"build_id": buildID.String()})
+	return b
 }
 
 // templateFromWithBuild adapts the flattened CreateTemplateWithBuild row
@@ -579,6 +588,7 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 	}
 
 	c.Status(http.StatusNoContent)
+	h.logTemplateActivity(c.Request.Context(), tplID, teamID, "template", "deleted", "success", nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +677,8 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, toBuildResponse(build))
+	h.logTemplateActivity(c.Request.Context(), tplID, teamID, "template", "build_started", "success",
+		buildMetadata(build.ID))
 }
 
 func (h *Handlers) GetTemplateBuild(c *gin.Context) {
@@ -771,6 +783,8 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+	h.logTemplateActivity(c.Request.Context(), tplID, teamID, "template", "build_cancelled", "success",
+		buildMetadata(buildID))
 }
 
 // lookupTemplateForCreate resolves a from_template ref (UUID or alias) to a
