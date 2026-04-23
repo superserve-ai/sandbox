@@ -33,15 +33,25 @@ func (q *Queries) AdvanceBuildStatus(ctx context.Context, arg AdvanceBuildStatus
 }
 
 const cancelBuild = `-- name: CancelBuild :execrows
-UPDATE template_build
-SET status = 'cancelled',
-    finalized_at = now(),
-    updated_at = now(),
-    error_message = 'cancelled by user'
-WHERE id = $1
-  AND template_id = $2
-  AND team_id = $3
-  AND status IN ('pending', 'building', 'snapshotting')
+WITH build_done AS (
+  UPDATE template_build tb
+  SET status = 'cancelled',
+      finalized_at = now(),
+      updated_at = now(),
+      error_message = 'cancelled by user'
+  WHERE tb.id = $1
+    AND tb.template_id = $2
+    AND tb.team_id = $3
+    AND tb.status IN ('pending', 'building', 'snapshotting')
+  RETURNING tb.template_id AS tpl_id
+)
+UPDATE template t
+SET status = 'failed',
+    error_message = 'build cancelled by user',
+    updated_at = now()
+FROM build_done
+WHERE t.id = build_done.tpl_id
+  AND t.status IN ('pending', 'building')
 `
 
 type CancelBuildParams struct {
@@ -50,10 +60,10 @@ type CancelBuildParams struct {
 	TeamID     uuid.UUID `json:"team_id"`
 }
 
-// User-initiated cancellation of a build. Only succeeds while the build is
-// still in a non-terminal state. Caller is responsible for calling
-// vmd.CancelBuild before this; this just records the terminal status.
-// Scoped to the given template so the URL's :template_id segment enforces.
+// User-initiated cancellation. Atomically transitions template_build →
+// cancelled and (if the template never reached 'ready') transitions
+// template → failed so listings don't show it stuck in 'building' forever.
+// A template with a prior successful build keeps its 'ready' status.
 func (q *Queries) CancelBuild(ctx context.Context, arg CancelBuildParams) (int64, error) {
 	result, err := q.db.Exec(ctx, cancelBuild, arg.ID, arg.TemplateID, arg.TeamID)
 	if err != nil {
