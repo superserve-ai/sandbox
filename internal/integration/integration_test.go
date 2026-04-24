@@ -22,6 +22,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -646,7 +647,7 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	sandboxID, _ := uuid.Parse(sid)
 	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: sandboxID,
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
 		Limit:     20,
 	})
 	if err != nil {
@@ -824,7 +825,7 @@ func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: sandboxID,
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
 		Limit:     20,
 	})
 	if err != nil {
@@ -867,7 +868,7 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: sandboxID,
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
 		Limit:     20,
 	})
 	if err != nil {
