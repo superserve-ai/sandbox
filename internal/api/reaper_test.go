@@ -106,7 +106,6 @@ func reaperSnapshotRow() pgx.Row {
 		TeamID:    uuid.New(),
 		Path:      "/snapshots/vmstate.snap",
 		Trigger:   trigger,
-		Name:      &trigger,
 		CreatedAt: time.Now(),
 	})
 }

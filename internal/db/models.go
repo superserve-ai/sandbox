@@ -264,8 +264,6 @@ type Snapshot struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	Path      string    `json:"path"`
 	SizeBytes int64     `json:"size_bytes"`
-	Saved     bool      `json:"saved"`
-	Name      *string   `json:"name"`
 	Trigger   string    `json:"trigger"`
 	CreatedAt time.Time `json:"created_at"`
 	MemPath   *string   `json:"mem_path"`

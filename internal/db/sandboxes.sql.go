@@ -354,14 +354,13 @@ WITH target AS (
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 ),
 upserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6, $7, $8 FROM target
-  ON CONFLICT (sandbox_id) WHERE saved = false
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
+  SELECT target.id, target.team_id, $3, $4, $5, $6 FROM target
+  ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
     size_bytes = EXCLUDED.size_bytes,
-    name = EXCLUDED.name,
     trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 )
@@ -380,14 +379,13 @@ type FinalizePauseParams struct {
 	Path      string    `json:"path"`
 	MemPath   *string   `json:"mem_path"`
 	SizeBytes int64     `json:"size_bytes"`
-	Saved     bool      `json:"saved"`
-	Name      *string   `json:"name"`
 	Trigger   string    `json:"trigger"`
 }
 
 // Upsert the sandbox's live snapshot row and flip status to 'paused'.
 // Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).
-// The partial unique index on (sandbox_id) WHERE saved = false keys the UPSERT.
+// One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
+// the UPSERT.
 func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, finalizePause,
 		arg.ID,
@@ -395,8 +393,6 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 		arg.Path,
 		arg.MemPath,
 		arg.SizeBytes,
-		arg.Saved,
-		arg.Name,
 		arg.Trigger,
 	)
 	var snapshot_id uuid.UUID

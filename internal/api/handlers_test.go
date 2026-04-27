@@ -69,6 +69,7 @@ func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return nil
 }
+func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	if s.execFn != nil {
 		return s.execFn(ctx, id, command, args, env, workingDir, timeoutS)
@@ -481,10 +482,9 @@ func snapshotRow(s db.Snapshot) *mockRow {
 		*dest[2].(*uuid.UUID) = s.TeamID
 		*dest[3].(*string) = s.Path
 		*dest[4].(*int64) = s.SizeBytes
-		*dest[5].(*bool) = s.Saved
-		*dest[6].(**string) = s.Name
-		*dest[7].(*string) = s.Trigger
-		*dest[8].(*time.Time) = s.CreatedAt
+		*dest[5].(*string) = s.Trigger
+		*dest[6].(*time.Time) = s.CreatedAt
+		*dest[7].(**string) = s.MemPath
 		return nil
 	}}
 }
@@ -530,7 +530,6 @@ func TestResumeSandbox_Success(t *testing.T) {
 		TeamID:    teamID,
 		Path:      "/snapshots/test/vmstate.snap",
 		SizeBytes: 1024,
-		Saved:     true,
 		Trigger:   "pause",
 	}
 
@@ -697,7 +696,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
-		Path: "/snapshots/test/vmstate.snap", Saved: true, Trigger: "pause",
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
 	vmd := &stubVMD{
@@ -904,7 +903,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
-		Path: "/snapshots/test/vmstate.snap", Saved: true, Trigger: "pause",
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
 	vmd := &stubVMD{
@@ -1080,7 +1079,6 @@ func TestExecSandbox_PausedAutoResume(t *testing.T) {
 		SandboxID: sandboxID,
 		TeamID:    teamID,
 		Path:      "/snapshots/test/vmstate.snap",
-		Saved:     false,
 		Trigger:   "pause",
 	}
 
@@ -1188,7 +1186,6 @@ func TestExecSandbox_ConcurrentResumeSerializes(t *testing.T) {
 		SandboxID: sandboxID,
 		TeamID:    teamID,
 		Path:      "/snapshots/test/vmstate.snap",
-		Saved:     false,
 		Trigger:   "pause",
 	}
 
