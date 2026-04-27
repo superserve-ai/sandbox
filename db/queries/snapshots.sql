@@ -1,6 +1,6 @@
 -- name: CreateSnapshot :one
-INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
 -- name: GetSnapshot :one
@@ -26,11 +26,6 @@ ORDER BY created_at DESC;
 SELECT * FROM snapshot
 WHERE team_id = $1
 ORDER BY created_at DESC;
-
--- name: MarkSnapshotSaved :exec
-UPDATE snapshot
-SET saved = true
-WHERE id = $1;
 
 -- name: DeleteSnapshot :exec
 DELETE FROM snapshot

@@ -12,9 +12,9 @@ import (
 )
 
 const createSnapshot = `-- name: CreateSnapshot :one
-INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, saved, name, trigger)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path
+INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path
 `
 
 type CreateSnapshotParams struct {
@@ -23,8 +23,6 @@ type CreateSnapshotParams struct {
 	Path      string    `json:"path"`
 	MemPath   *string   `json:"mem_path"`
 	SizeBytes int64     `json:"size_bytes"`
-	Saved     bool      `json:"saved"`
-	Name      *string   `json:"name"`
 	Trigger   string    `json:"trigger"`
 }
 
@@ -35,8 +33,6 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 		arg.Path,
 		arg.MemPath,
 		arg.SizeBytes,
-		arg.Saved,
-		arg.Name,
 		arg.Trigger,
 	)
 	var i Snapshot
@@ -46,8 +42,6 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 		&i.TeamID,
 		&i.Path,
 		&i.SizeBytes,
-		&i.Saved,
-		&i.Name,
 		&i.Trigger,
 		&i.CreatedAt,
 		&i.MemPath,
@@ -66,7 +60,7 @@ func (q *Queries) DeleteSnapshot(ctx context.Context, id uuid.UUID) error {
 }
 
 const getSnapshot = `-- name: GetSnapshot :one
-SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
 WHERE id = $1 AND team_id = $2
 `
 
@@ -88,8 +82,6 @@ func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snaps
 		&i.TeamID,
 		&i.Path,
 		&i.SizeBytes,
-		&i.Saved,
-		&i.Name,
 		&i.Trigger,
 		&i.CreatedAt,
 		&i.MemPath,
@@ -98,7 +90,7 @@ func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snaps
 }
 
 const getSnapshotByID = `-- name: GetSnapshotByID :one
-SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
 WHERE id = $1
 `
 
@@ -113,8 +105,6 @@ func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, 
 		&i.TeamID,
 		&i.Path,
 		&i.SizeBytes,
-		&i.Saved,
-		&i.Name,
 		&i.Trigger,
 		&i.CreatedAt,
 		&i.MemPath,
@@ -123,7 +113,7 @@ func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, 
 }
 
 const listSnapshotsBySandbox = `-- name: ListSnapshotsBySandbox :many
-SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
 WHERE sandbox_id = $1
 ORDER BY created_at DESC
 `
@@ -143,8 +133,6 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 			&i.TeamID,
 			&i.Path,
 			&i.SizeBytes,
-			&i.Saved,
-			&i.Name,
 			&i.Trigger,
 			&i.CreatedAt,
 			&i.MemPath,
@@ -160,7 +148,7 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 }
 
 const listSnapshotsByTeam = `-- name: ListSnapshotsByTeam :many
-SELECT id, sandbox_id, team_id, path, size_bytes, saved, name, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
 WHERE team_id = $1
 ORDER BY created_at DESC
 `
@@ -180,8 +168,6 @@ func (q *Queries) ListSnapshotsByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.TeamID,
 			&i.Path,
 			&i.SizeBytes,
-			&i.Saved,
-			&i.Name,
 			&i.Trigger,
 			&i.CreatedAt,
 			&i.MemPath,
@@ -194,15 +180,4 @@ func (q *Queries) ListSnapshotsByTeam(ctx context.Context, teamID uuid.UUID) ([]
 		return nil, err
 	}
 	return items, nil
-}
-
-const markSnapshotSaved = `-- name: MarkSnapshotSaved :exec
-UPDATE snapshot
-SET saved = true
-WHERE id = $1
-`
-
-func (q *Queries) MarkSnapshotSaved(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, markSnapshotSaved, id)
-	return err
 }

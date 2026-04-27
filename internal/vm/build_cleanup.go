@@ -2,6 +2,7 @@ package vm
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -90,6 +91,23 @@ func (m *Manager) CleanupOrphanBuilds() int {
 func (m *Manager) isCompleteBuild(snapshotDir string) bool {
 	_, err := os.Stat(filepath.Join(snapshotDir, "build.meta.json"))
 	return err == nil
+}
+
+// DeleteTemplateArtifacts removes a template's snapshot dir and rootfs dir.
+// Idempotent — missing dirs are not an error.
+func (m *Manager) DeleteTemplateArtifacts(templateID string) error {
+	if templateID == "" {
+		return fmt.Errorf("template_id is required")
+	}
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, "templates", templateID)
+	rundir := filepath.Join(m.cfg.RunDir, "templates", templateID)
+	if err := os.RemoveAll(snapshotDir); err != nil {
+		return fmt.Errorf("remove %s: %w", snapshotDir, err)
+	}
+	if err := os.RemoveAll(rundir); err != nil {
+		return fmt.Errorf("remove %s: %w", rundir, err)
+	}
+	return nil
 }
 
 // killOrphanFirecracker SIGKILLs firecracker processes whose cmdline has

@@ -76,28 +76,34 @@ WHERE deleted_at IS NULL
 ORDER BY created_at DESC;
 
 -- name: SoftDeleteTemplateIfUnused :one
--- Soft-deletes a template only if no live sandbox still references it.
--- FOR UPDATE here serializes with the FOR KEY SHARE in CreateSandbox.
+-- Soft-deletes a template only if no live sandbox references it AND no
+-- build is in flight. Blocking on builds prevents the vmd-side artifact
+-- cleanup from racing with template-builder still writing to the same dirs.
 WITH locked AS (
   SELECT t.id AS tpl_id FROM template t
   WHERE t.id = $1 AND t.team_id = $2 AND t.deleted_at IS NULL
   FOR UPDATE
 ),
 counted AS (
-  SELECT COUNT(*)::bigint AS live_count
-  FROM sandbox
-  WHERE template_id = $1 AND destroyed_at IS NULL
+  SELECT
+    (SELECT COUNT(*)::bigint FROM sandbox
+     WHERE template_id = $1 AND destroyed_at IS NULL) AS live_count,
+    (SELECT COUNT(*)::bigint FROM template_build
+     WHERE template_id = $1
+       AND status IN ('pending', 'building', 'snapshotting')) AS inflight_build_count
 ),
 deleted AS (
   UPDATE template t
   SET deleted_at = now(), updated_at = now()
   WHERE t.id IN (SELECT tpl_id FROM locked)
     AND (SELECT live_count FROM counted) = 0
+    AND (SELECT inflight_build_count FROM counted) = 0
   RETURNING t.id
 )
 SELECT
   EXISTS(SELECT 1 FROM locked)  AS found,
   (SELECT live_count FROM counted) AS live_count,
+  (SELECT inflight_build_count FROM counted) AS inflight_build_count,
   EXISTS(SELECT 1 FROM deleted) AS deleted;
 
 -- name: CreateTemplateBuild :one

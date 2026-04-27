@@ -559,10 +559,48 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
+	// Best-effort cleanup of pause snapshots. Failures are logged but
+	// don't fail the delete — manual cleanup may be required if vmd was
+	// unreachable.
+	h.cleanupSandboxSnapshots(c.Request.Context(), sandboxID, sandbox.HostID)
+
 	// Async activity log.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
+}
+
+// cleanupSandboxSnapshots deletes the on-disk snapshot files via vmd and
+// the snapshot DB rows for a destroyed sandbox. Best-effort.
+func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, hostID string) {
+	snaps, err := h.DB.ListSnapshotsBySandbox(reqCtx, sandboxID)
+	if err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("list snapshots for cleanup")
+		return
+	}
+	if len(snaps) == 0 {
+		return
+	}
+	vmd, err := h.vmdForHost(reqCtx, hostID)
+	if err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("resolve vmd for snapshot cleanup; files may need manual cleanup")
+	}
+	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+	defer cancel()
+	for _, s := range snaps {
+		if vmd != nil {
+			memPath := ""
+			if s.MemPath != nil {
+				memPath = *s.MemPath
+			}
+			if delErr := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); delErr != nil && !isVMDNotFound(delErr) {
+				log.Warn().Err(delErr).Str("sandbox_id", sandboxID.String()).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot failed")
+			}
+		}
+		if delErr := h.DB.DeleteSnapshot(ctx, s.ID); delErr != nil {
+			log.Warn().Err(delErr).Str("snapshot_id", s.ID.String()).Msg("DB DeleteSnapshot failed")
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,16 +1316,13 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// to the sandbox, and flip status pausing → paused in a single CTE.
 	// The upsert replaces the old "insert a new row + delete the previous"
 	// flow, so there's no explicit prev-snapshot cleanup to schedule here.
-	triggerName := "pause"
 	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sandboxID,
 		TeamID:    teamID,
 		Path:      snapshotPath,
 		MemPath:   &memPath,
 		SizeBytes: 0,
-		Saved:     false,
-		Name:      &triggerName,
-		Trigger:   triggerName,
+		Trigger:   "pause",
 	}); err != nil {
 		// ErrNoRows here means the sandbox was soft-deleted between
 		// BeginPause and FinalizePause (a rare race with DeleteSandbox).
