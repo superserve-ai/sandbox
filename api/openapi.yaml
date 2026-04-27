@@ -70,7 +70,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/SandboxResponse"
+                  $ref: "#/components/schemas/SandboxListItem"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -375,7 +375,8 @@ components:
         network:
           $ref: "#/components/schemas/NetworkConfig"
 
-    SandboxResponse:
+    SandboxListItem:
+      description: Sandbox shape returned by list endpoints.
       type: object
       properties:
         id:
@@ -385,20 +386,14 @@ components:
           type: string
         status:
           type: string
-          enum: [active, paused]
+          enum: [active, paused, resuming]
           description: >
-            Current state of the sandbox. `active` means running; `paused`
-            means paused and awaiting resume.
+            `active` = running, `paused` = stopped with state saved,
+            `resuming` = transient during paused→active (retry shortly).
         vcpu_count:
           type: integer
         memory_mib:
           type: integer
-        access_token:
-          type: string
-          description: |
-            Per-sandbox access token for data-plane operations (file
-            upload/download, terminal). Pass as the `X-Access-Token` header.
-            Returned on create and get-by-id only.
         snapshot_id:
           type: string
           format: uuid
@@ -428,6 +423,19 @@ components:
           example:
             env: prod
             owner: agent-7
+
+    SandboxResponse:
+      description: Single-sandbox shape — `SandboxListItem` plus `access_token`.
+      allOf:
+        - $ref: "#/components/schemas/SandboxListItem"
+        - type: object
+          properties:
+            access_token:
+              type: string
+              description: |
+                Per-sandbox access token for data-plane operations (file
+                upload/download, terminal). Pass as the `X-Access-Token`
+                header.
 
     ResumeResponse:
       type: object
