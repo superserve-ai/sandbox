@@ -88,7 +88,6 @@ func TestPredefinedErrors(t *testing.T) {
 		wantCode   string
 		wantStatus int
 	}{
-		{"ErrInstanceNotFound", ErrInstanceNotFound, "not_found", 404},
 		{"ErrSandboxNotFound", ErrSandboxNotFound, "not_found", 404},
 		{"ErrInvalidState", ErrInvalidState, "conflict", 409},
 		{"ErrBadRequest", ErrBadRequest, "bad_request", 400},

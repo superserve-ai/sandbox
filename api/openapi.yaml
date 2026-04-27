@@ -99,7 +99,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/SandboxResponse"
+                  $ref: "#/components/schemas/SandboxListItem"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -761,7 +761,8 @@ components:
         network:
           $ref: "#/components/schemas/NetworkConfig"
 
-    SandboxResponse:
+    SandboxListItem:
+      description: Sandbox shape returned by list endpoints.
       type: object
       properties:
         id:
@@ -776,20 +777,11 @@ components:
             Current state of the sandbox. `active` means running; `paused`
             means paused and awaiting resume. `resuming` is a transient
             state observed while the platform restores a paused sandbox
-            (e.g. via auto-resume on `/exec`); clients should retry shortly
-            — it resolves to `active` in a few hundred milliseconds.
+            (e.g. via auto-resume on `/exec`); clients should retry shortly.
         vcpu_count:
           type: integer
         memory_mib:
           type: integer
-        access_token:
-          type: string
-          description: |
-            Per-sandbox HMAC access token for data-plane operations
-            (file upload/download, terminal). Pass as `X-Access-Token`
-            header when hitting the edge proxy at
-            `boxd-{id}.sandbox.superserve.ai`. Reusable for the
-            lifetime of the sandbox.
         snapshot_id:
           type: string
           format: uuid
@@ -819,6 +811,19 @@ components:
           example:
             env: prod
             owner: agent-7
+
+    SandboxResponse:
+      description: Single-sandbox shape — `SandboxListItem` plus `access_token`.
+      allOf:
+        - $ref: "#/components/schemas/SandboxListItem"
+        - type: object
+          properties:
+            access_token:
+              type: string
+              description: |
+                Per-sandbox access token for data-plane operations (file
+                upload/download, terminal). Pass as the `X-Access-Token`
+                header.
 
     ResumeResponse:
       type: object

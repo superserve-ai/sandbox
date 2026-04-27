@@ -33,7 +33,7 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 
 	var req streamExecRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "Request body is not valid JSON or is missing required fields (command is required).", http.StatusBadRequest)
 		return
 	}
 
@@ -105,7 +105,7 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 			code, msg = "bad_request", vmdErrorMessage(err)
 		default:
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("streaming sandbox exec failed")
-			code, msg = "internal_error", "An internal error occurred"
+			code, msg = "exec_failed", "A problem occurred while running the command. Please try again, or contact the team if it persists."
 		}
 		errEvent, _ := json.Marshal(gin.H{
 			"error":    msg,
