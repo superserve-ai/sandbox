@@ -115,7 +115,7 @@ func ErrorHandler() gin.HandlerFunc {
 					Msg("panic recovered")
 
 				respondErrorMsg(c, "internal_error",
-					"An internal error occurred. Please try again or contact support.",
+					"A problem occurred. Please try again, or contact the team if it persists.",
 					http.StatusInternalServerError,
 				)
 				c.Abort()
