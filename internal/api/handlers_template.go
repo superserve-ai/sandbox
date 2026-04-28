@@ -888,17 +888,56 @@ func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
 		flusher.Flush()
 	}
 
-	// Pending build: no vmd_build_vm_id yet, nothing to stream. Tell the
-	// client explicitly and close — they can re-poll in a few seconds.
-	if build.VmdBuildVmID == nil || *build.VmdBuildVmID == "" {
+	// Wait for the build to be dispatched to vmd (or transition terminal
+	// without ever being dispatched, e.g. supervisor couldn't find the
+	// template). Heartbeat each tick so SDKs don't treat the silence as
+	// a finished stream and disconnect prematurely.
+	for build.VmdBuildVmID == nil || *build.VmdBuildVmID == "" {
+		if build.Status == db.TemplateBuildStatusFailed ||
+			build.Status == db.TemplateBuildStatusCancelled ||
+			build.Status == db.TemplateBuildStatusReady {
+			msg := "build " + string(build.Status)
+			if build.ErrorMessage != nil && *build.ErrorMessage != "" {
+				msg = *build.ErrorMessage
+			}
+			writeEvent(gin.H{
+				"timestamp": time.Now().Format(time.RFC3339Nano),
+				"stream":    "system",
+				"text":      msg,
+				"finished":  true,
+				"status":    string(build.Status),
+			})
+			return
+		}
+
 		writeEvent(gin.H{
 			"timestamp": time.Now().Format(time.RFC3339Nano),
 			"stream":    "system",
-			"text":      "build is still pending (not yet dispatched to a host)",
-			"finished":  true,
-			"status":    string(build.Status),
+			"text":      "build queued, waiting for dispatch",
+			"finished":  false,
 		})
-		return
+
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+
+		build, err = h.DB.GetTemplateBuild(c.Request.Context(), db.GetTemplateBuildParams{
+			ID:         buildID,
+			TemplateID: tplID,
+			TeamID:     teamID,
+		})
+		if err != nil {
+			writeEvent(gin.H{
+				"stream":   "system",
+				"text":     "failed to look up build",
+				"finished": true,
+				"status":   "failed",
+			})
+			log.Error().Err(err).Str("build_id", buildID.String()).Msg("re-fetch build during pending wait")
+			return
+		}
 	}
 
 	// Resolve the vmd client for the host running this build; falls back

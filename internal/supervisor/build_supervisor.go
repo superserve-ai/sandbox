@@ -240,14 +240,18 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 		// Template deleted between submission and dispatch — fail the
 		// build cleanly rather than leave it stuck.
 		rowLog.Warn().Err(err).Msg("template missing at dispatch time; failing build")
-		s.failBuild(ctx, row.ID, "template not found (deleted after build submitted)")
+		errMsg := "template_gone: template was deleted before its build started"
+		s.failBuild(ctx, row.ID, errMsg)
+		s.logBuildCompleted(ctx, row, "error", errMsg, "")
 		return err
 	}
 
 	var spec builder.BuildSpec
 	if err := json.Unmarshal(tpl.BuildSpec, &spec); err != nil {
 		rowLog.Error().Err(err).Msg("decode template build_spec")
-		s.failBuild(ctx, row.ID, "invalid build_spec in template row")
+		errMsg := "invalid_spec: template build_spec is invalid"
+		s.failBuild(ctx, row.ID, errMsg)
+		s.logBuildCompleted(ctx, row, "error", errMsg, "")
 		return err
 	}
 
@@ -276,7 +280,9 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 	vmd, err := s.resolve(dispatchCtx, hostID)
 	if err != nil {
 		rowLog.Error().Err(err).Str("host_id", hostID).Msg("resolve VMD for dispatch failed")
-		s.failBuild(ctx, row.ID, fmt.Sprintf("resolve VMD for host %q: %v", hostID, err))
+		errMsg := fmt.Sprintf("dispatch_failed: build host unreachable (%s)", hostID)
+		s.failBuild(ctx, row.ID, errMsg)
+		s.logBuildCompleted(ctx, row, "error", errMsg, "")
 		return err
 	}
 	_, err = vmd.BuildTemplate(dispatchCtx, vmdclient.BuildTemplateInput{
