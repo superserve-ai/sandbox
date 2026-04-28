@@ -53,3 +53,12 @@ migrate
 
 # Docs
 docs/
+
+# Local build outputs (binaries in repo root)
+/boxd
+/controlplane
+/proxy
+/vmd
+/seed-templates
+/seed-apikey
+/template-builder

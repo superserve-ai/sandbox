@@ -19,7 +19,6 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	VMDaemon_CreateVM_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CreateVM"
 	VMDaemon_DestroyVM_FullMethodName            = "/superserve.vmd.v1.VMDaemon/DestroyVM"
 	VMDaemon_PauseVM_FullMethodName              = "/superserve.vmd.v1.VMDaemon/PauseVM"
 	VMDaemon_ResumeVM_FullMethodName             = "/superserve.vmd.v1.VMDaemon/ResumeVM"
@@ -30,6 +29,10 @@ const (
 	VMDaemon_GetVMInfo_FullMethodName            = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
 	VMDaemon_SetupNetwork_FullMethodName         = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
 	VMDaemon_UpdateSandboxNetwork_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
+	VMDaemon_BuildTemplate_FullMethodName        = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
+	VMDaemon_GetBuildStatus_FullMethodName       = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
+	VMDaemon_CancelBuild_FullMethodName          = "/superserve.vmd.v1.VMDaemon/CancelBuild"
+	VMDaemon_StreamBuildLogs_FullMethodName      = "/superserve.vmd.v1.VMDaemon/StreamBuildLogs"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -38,8 +41,6 @@ const (
 //
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 type VMDaemonClient interface {
-	// CreateVM provisions a new microVM with the specified configuration.
-	CreateVM(ctx context.Context, in *CreateVMRequest, opts ...grpc.CallOption) (*CreateVMResponse, error)
 	// DestroyVM terminates a running microVM and cleans up all associated resources.
 	DestroyVM(ctx context.Context, in *DestroyVMRequest, opts ...grpc.CallOption) (*DestroyVMResponse, error)
 	// PauseVM snapshots a running VM's state and suspends it (sleep).
@@ -63,6 +64,22 @@ type VMDaemonClient interface {
 	SetupNetwork(ctx context.Context, in *SetupNetworkRequest, opts ...grpc.CallOption) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error)
+	// BuildTemplate kicks off a template build asynchronously. Returns a
+	// build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
+	// for progress and uses CancelBuild(build_vm_id) to abort.
+	BuildTemplate(ctx context.Context, in *BuildTemplateRequest, opts ...grpc.CallOption) (*BuildTemplateResponse, error)
+	// GetBuildStatus returns the current state of a build dispatched via
+	// BuildTemplate. Used by the control plane's build supervisor to poll
+	// until a terminal status is reached.
+	GetBuildStatus(ctx context.Context, in *GetBuildStatusRequest, opts ...grpc.CallOption) (*GetBuildStatusResponse, error)
+	// CancelBuild aborts an in-flight build and tears down the build VM.
+	// Idempotent — no-op for unknown or already-terminal builds.
+	CancelBuild(ctx context.Context, in *CancelBuildRequest, opts ...grpc.CallOption) (*CancelBuildResponse, error)
+	// StreamBuildLogs returns a server-streaming feed of log events for a
+	// build. Replays buffered history in order first, then streams live
+	// events as they arrive. Closes when the build reaches a terminal
+	// status. Used by the control plane to drive /builds/:id/logs SSE.
+	StreamBuildLogs(ctx context.Context, in *StreamBuildLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BuildLogEvent], error)
 }
 
 type vMDaemonClient struct {
@@ -71,16 +88,6 @@ type vMDaemonClient struct {
 
 func NewVMDaemonClient(cc grpc.ClientConnInterface) VMDaemonClient {
 	return &vMDaemonClient{cc}
-}
-
-func (c *vMDaemonClient) CreateVM(ctx context.Context, in *CreateVMRequest, opts ...grpc.CallOption) (*CreateVMResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CreateVMResponse)
-	err := c.cc.Invoke(ctx, VMDaemon_CreateVM_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func (c *vMDaemonClient) DestroyVM(ctx context.Context, in *DestroyVMRequest, opts ...grpc.CallOption) (*DestroyVMResponse, error) {
@@ -192,14 +199,61 @@ func (c *vMDaemonClient) UpdateSandboxNetwork(ctx context.Context, in *UpdateSan
 	return out, nil
 }
 
+func (c *vMDaemonClient) BuildTemplate(ctx context.Context, in *BuildTemplateRequest, opts ...grpc.CallOption) (*BuildTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BuildTemplateResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_BuildTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) GetBuildStatus(ctx context.Context, in *GetBuildStatusRequest, opts ...grpc.CallOption) (*GetBuildStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetBuildStatusResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_GetBuildStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) CancelBuild(ctx context.Context, in *CancelBuildRequest, opts ...grpc.CallOption) (*CancelBuildResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelBuildResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_CancelBuild_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) StreamBuildLogs(ctx context.Context, in *StreamBuildLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BuildLogEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[1], VMDaemon_StreamBuildLogs_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamBuildLogsRequest, BuildLogEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type VMDaemon_StreamBuildLogsClient = grpc.ServerStreamingClient[BuildLogEvent]
+
 // VMDaemonServer is the server API for VMDaemon service.
 // All implementations must embed UnimplementedVMDaemonServer
 // for forward compatibility.
 //
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 type VMDaemonServer interface {
-	// CreateVM provisions a new microVM with the specified configuration.
-	CreateVM(context.Context, *CreateVMRequest) (*CreateVMResponse, error)
 	// DestroyVM terminates a running microVM and cleans up all associated resources.
 	DestroyVM(context.Context, *DestroyVMRequest) (*DestroyVMResponse, error)
 	// PauseVM snapshots a running VM's state and suspends it (sleep).
@@ -223,6 +277,22 @@ type VMDaemonServer interface {
 	SetupNetwork(context.Context, *SetupNetworkRequest) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error)
+	// BuildTemplate kicks off a template build asynchronously. Returns a
+	// build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
+	// for progress and uses CancelBuild(build_vm_id) to abort.
+	BuildTemplate(context.Context, *BuildTemplateRequest) (*BuildTemplateResponse, error)
+	// GetBuildStatus returns the current state of a build dispatched via
+	// BuildTemplate. Used by the control plane's build supervisor to poll
+	// until a terminal status is reached.
+	GetBuildStatus(context.Context, *GetBuildStatusRequest) (*GetBuildStatusResponse, error)
+	// CancelBuild aborts an in-flight build and tears down the build VM.
+	// Idempotent — no-op for unknown or already-terminal builds.
+	CancelBuild(context.Context, *CancelBuildRequest) (*CancelBuildResponse, error)
+	// StreamBuildLogs returns a server-streaming feed of log events for a
+	// build. Replays buffered history in order first, then streams live
+	// events as they arrive. Closes when the build reaches a terminal
+	// status. Used by the control plane to drive /builds/:id/logs SSE.
+	StreamBuildLogs(*StreamBuildLogsRequest, grpc.ServerStreamingServer[BuildLogEvent]) error
 	mustEmbedUnimplementedVMDaemonServer()
 }
 
@@ -233,9 +303,6 @@ type VMDaemonServer interface {
 // pointer dereference when methods are called.
 type UnimplementedVMDaemonServer struct{}
 
-func (UnimplementedVMDaemonServer) CreateVM(context.Context, *CreateVMRequest) (*CreateVMResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CreateVM not implemented")
-}
 func (UnimplementedVMDaemonServer) DestroyVM(context.Context, *DestroyVMRequest) (*DestroyVMResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DestroyVM not implemented")
 }
@@ -266,6 +333,18 @@ func (UnimplementedVMDaemonServer) SetupNetwork(context.Context, *SetupNetworkRe
 func (UnimplementedVMDaemonServer) UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateSandboxNetwork not implemented")
 }
+func (UnimplementedVMDaemonServer) BuildTemplate(context.Context, *BuildTemplateRequest) (*BuildTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BuildTemplate not implemented")
+}
+func (UnimplementedVMDaemonServer) GetBuildStatus(context.Context, *GetBuildStatusRequest) (*GetBuildStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetBuildStatus not implemented")
+}
+func (UnimplementedVMDaemonServer) CancelBuild(context.Context, *CancelBuildRequest) (*CancelBuildResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelBuild not implemented")
+}
+func (UnimplementedVMDaemonServer) StreamBuildLogs(*StreamBuildLogsRequest, grpc.ServerStreamingServer[BuildLogEvent]) error {
+	return status.Error(codes.Unimplemented, "method StreamBuildLogs not implemented")
+}
 func (UnimplementedVMDaemonServer) mustEmbedUnimplementedVMDaemonServer() {}
 func (UnimplementedVMDaemonServer) testEmbeddedByValue()                  {}
 
@@ -285,24 +364,6 @@ func RegisterVMDaemonServer(s grpc.ServiceRegistrar, srv VMDaemonServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&VMDaemon_ServiceDesc, srv)
-}
-
-func _VMDaemon_CreateVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateVMRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(VMDaemonServer).CreateVM(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: VMDaemon_CreateVM_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(VMDaemonServer).CreateVM(ctx, req.(*CreateVMRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
 func _VMDaemon_DestroyVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -478,6 +539,71 @@ func _VMDaemon_UpdateSandboxNetwork_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_BuildTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BuildTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).BuildTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_BuildTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).BuildTemplate(ctx, req.(*BuildTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_GetBuildStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetBuildStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).GetBuildStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_GetBuildStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).GetBuildStatus(ctx, req.(*GetBuildStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_CancelBuild_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelBuildRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).CancelBuild(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_CancelBuild_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).CancelBuild(ctx, req.(*CancelBuildRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_StreamBuildLogs_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamBuildLogsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(VMDaemonServer).StreamBuildLogs(m, &grpc.GenericServerStream[StreamBuildLogsRequest, BuildLogEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type VMDaemon_StreamBuildLogsServer = grpc.ServerStreamingServer[BuildLogEvent]
+
 // VMDaemon_ServiceDesc is the grpc.ServiceDesc for VMDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -485,10 +611,6 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "superserve.vmd.v1.VMDaemon",
 	HandlerType: (*VMDaemonServer)(nil),
 	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "CreateVM",
-			Handler:    _VMDaemon_CreateVM_Handler,
-		},
 		{
 			MethodName: "DestroyVM",
 			Handler:    _VMDaemon_DestroyVM_Handler,
@@ -525,11 +647,28 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "UpdateSandboxNetwork",
 			Handler:    _VMDaemon_UpdateSandboxNetwork_Handler,
 		},
+		{
+			MethodName: "BuildTemplate",
+			Handler:    _VMDaemon_BuildTemplate_Handler,
+		},
+		{
+			MethodName: "GetBuildStatus",
+			Handler:    _VMDaemon_GetBuildStatus_Handler,
+		},
+		{
+			MethodName: "CancelBuild",
+			Handler:    _VMDaemon_CancelBuild_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "ExecCommand",
 			Handler:       _VMDaemon_ExecCommand_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamBuildLogs",
+			Handler:       _VMDaemon_StreamBuildLogs_Handler,
 			ServerStreams: true,
 		},
 	},

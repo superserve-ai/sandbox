@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy the vmd binary (and optionally boxd + rootfs) to every compute
+"""Deploy the vmd, boxd, and template-builder binaries to every compute
 instance tagged with the configured label, in parallel.
 
 Env vars:
@@ -8,7 +8,11 @@ Env vars:
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
   SHA                  required — commit SHA (only first 8 chars used)
-  BOXD_CHANGED         optional — "true" to rebuild rootfs with new boxd; anything else skips
+
+Binaries are always uploaded. The remote script hash-compares boxd
+against the currently-installed copy and only installs + rebuilds the
+rootfs when the hash differs, keeping no-op redeploys cheap and
+preserving vmd's template cache.
 """
 
 import os
@@ -24,7 +28,6 @@ def main() -> int:
     service = os.environ.get("VMD_SERVICE", "superserve-vmd")
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
-    boxd_changed = os.environ.get("BOXD_CHANGED", "true") == "true"
 
     result = subprocess.run(
         [
@@ -64,8 +67,8 @@ def main() -> int:
             )
 
         scp("bin/vmd", f"/tmp/vmd-{sha}")
-        if boxd_changed:
-            scp("bin/boxd", f"/tmp/boxd-{sha}")
+        scp("bin/boxd", f"/tmp/boxd-{sha}")
+        scp("bin/template-builder", f"/tmp/template-builder-{sha}")
 
         scp("deploy/superserve-vmd.service", "/tmp/superserve-vmd.service")
         scp("deploy/firecracker@.service", "/tmp/firecracker@.service")
@@ -77,9 +80,13 @@ def main() -> int:
         inject_script = textwrap.dedent(f"""
             set -euo pipefail
 
+            # Install vmd + template-builder binaries.
             sudo mv /tmp/vmd-{sha} {install_dir}/vmd
             sudo chmod +x {install_dir}/vmd
+            sudo mv /tmp/template-builder-{sha} {install_dir}/template-builder
+            sudo chmod +x {install_dir}/template-builder
 
+            # Install systemd units.
             sudo mv /tmp/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
             sudo mv /tmp/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo mv /tmp/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
@@ -89,13 +96,18 @@ def main() -> int:
             sudo mv /tmp/fc-cleanup {install_dir}/fc-cleanup
             sudo chmod +x {install_dir}/fc-cleanup
 
-            # Only inject boxd + rebuild rootfs when boxd source changed.
-            # Skipping preserves the rootfs hash so vmd's template cache is
-            # valid — no cold boot on vmd-only deploys.
-            BOXD_SRC_CHANGED={'true' if boxd_changed else 'false'}
-            if [ "$BOXD_SRC_CHANGED" = "true" ]; then
-                sudo mv /tmp/boxd-{sha} {install_dir}/boxd
-                sudo chmod +x {install_dir}/boxd
+            # Inject boxd + rebuild rootfs only when the new binary differs
+            # from what's already installed. `-trimpath -ldflags '-s -w'`
+            # makes Go builds reproducible, so hashes only differ when
+            # source actually changed. Skipping preserves the rootfs hash,
+            # which keeps vmd's template cache valid.
+            NEW_HASH=$(sha256sum /tmp/boxd-{sha} | awk '{{print $1}}')
+            CUR_HASH=$(sha256sum {install_dir}/boxd 2>/dev/null | awk '{{print $1}}' || echo none)
+
+            if [ "$NEW_HASH" != "$CUR_HASH" ]; then
+                echo "boxd changed ($CUR_HASH -> $NEW_HASH) — installing + rebuilding rootfs"
+                sudo install -m 0755 /tmp/boxd-{sha} {install_dir}/boxd
+                rm -f /tmp/boxd-{sha}
 
                 ROOTFS=""
                 for env_file in /etc/sandbox/vmd.env; do
@@ -126,7 +138,8 @@ def main() -> int:
                     echo "WARNING: BASE_ROOTFS_PATH not found; skipping rootfs inject"
                 fi
             else
-                echo "boxd source unchanged — skipping build and rootfs inject"
+                echo "boxd unchanged ($CUR_HASH) — skipping install + rootfs rebuild"
+                rm -f /tmp/boxd-{sha}
             fi
 
             sudo systemctl restart {service}

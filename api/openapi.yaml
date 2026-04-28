@@ -3,7 +3,7 @@ info:
   title: Superserve API
   version: 0.1.0
   description: |
-    Superserve provides sandbox infrastructure to run AI agents in the cloud.
+    Superserve provides sandbox infrastructure to run AI agents in the cloud. Powered by Firecracker MicroVMs.
 
     ## Sandbox lifecycle
 
@@ -13,14 +13,34 @@ info:
 
     A sandbox is `active` when running and `paused` after being paused. Resuming
     a paused sandbox returns it to `active`. Deleting releases all resources.
+
+    | Endpoint | What it does |
+    |----------|-------------|
+    | `POST /sandboxes` | Create a new sandbox (optionally `from_template`) |
+    | `PATCH /sandboxes/:id` | Partially update a running sandbox (e.g. network rules) |
+    | `POST /sandboxes/:id/pause` | Snapshot full state, suspend the VM |
+    | `POST /sandboxes/:id/resume` | Restore from snapshot, continue where it left off |
+    | `DELETE /sandboxes/:id` | Delete sandbox and all resources |
+
+    ## Sandbox environment
+
+    By default sandboxes boot from the curated `superserve/base` template (Ubuntu 24.04,
+    1 vCPU, 1 GB RAM, 4 GB disk, with Python 3.12, Node.js 22, npm, git, curl,
+    and build-essential pre-installed). Callers can override with any template
+    alias (e.g. `superserve/python-3.11`, `superserve/node-22`) or a team-owned template UUID
+    via the `from_template` field on `POST /sandboxes`.
   contact:
     name: Superserve Team
   license:
     name: Proprietary
 
 servers:
+  - url: https://api-staging.superserve.ai
+    description: Staging
   - url: https://api.superserve.ai
     description: Production
+  - url: http://localhost:8080
+    description: Local development
 
 paths:
   /health:
@@ -49,17 +69,26 @@ paths:
       tags: [Sandboxes]
       summary: List all sandboxes
       description: |
-        Returns sandboxes belonging to the authenticated team. Filter by
-        metadata with query parameters prefixed `metadata.`, e.g.
-        `?metadata.env=prod&metadata.owner=agent-7`. Multiple filters AND
-        together.
+        Returns sandboxes belonging to the authenticated team, optionally
+        filtered by metadata tags.
+
+        ## Filtering by metadata
+
+        Any query parameter prefixed `metadata.` is treated as a filter
+        clause: `?metadata.env=prod&metadata.owner=agent-7`. Multiple
+        filters AND together — a sandbox matches only if every key/value
+        pair is present in its metadata. Values are compared as exact
+        strings; there is no type coercion or substring matching.
       security:
         - apiKey: []
       parameters:
         - name: metadata.{key}
           in: query
           required: false
-          description: Exact-match metadata filter (e.g. `?metadata.env=prod`).
+          description: |
+            Filter sandboxes whose metadata contains an exact `{key}: <value>`
+            pair. Repeat with different keys to AND multiple filters. Values
+            are always strings. Example: `?metadata.env=prod`.
           schema:
             type: string
       responses:
@@ -75,6 +104,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -83,8 +114,9 @@ paths:
       tags: [Sandboxes]
       summary: Create a new sandbox
       description: |
-        Creates a sandbox. When the request returns successfully, the
-        sandbox is ready to use — you can run commands against it
+        Creates a sandbox from a template (defaults to `superserve/base` when
+        `from_template` is omitted). When the request returns successfully,
+        the sandbox is ready to use — you can run commands against it
         immediately.
       security:
         - apiKey: []
@@ -105,6 +137,10 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -151,17 +187,26 @@ paths:
     patch:
       operationId: patchSandbox
       tags: [Sandboxes]
-      summary: Partially update a sandbox
+      summary: Partially update a running sandbox
       description: |
-        Applies a partial update. Only fields present in the request body
-        are applied; nested objects are full replacements (send an empty
-        array to clear a list). At least one field must be present.
+        Applies a partial update to a running sandbox. Each top-level field
+        in the request body is optional; only fields that are present are
+        applied. Omitted top-level fields are left unchanged. Nested objects
+        are full replacements when present — to clear a list, send it as an
+        empty array.
 
-        Patchable fields:
+        At least one top-level field must be present, otherwise the request
+        is rejected with `400`. Unknown top-level fields are also rejected
+        with `400` so typos surface as errors instead of silent no-ops.
 
-        - `network` — replaces egress allow/deny rules. Sandbox must be
-          `active`; `409` otherwise.
-        - `metadata` — replaces metadata tags. Allowed in any state.
+        ## Currently patchable fields
+
+        - `network` — replaces the egress allow/deny rules. The sandbox
+          must be in the `active` state; patching a paused sandbox
+          returns `409`. Rules take effect immediately and are persisted so
+          they survive a future pause/resume cycle.
+        - `metadata` — replaces the sandbox's metadata tags. Can be updated
+          regardless of sandbox state (active, paused).
       security:
         - apiKey: []
       requestBody:
@@ -193,9 +238,9 @@ paths:
       tags: [Sandboxes]
       summary: Pause a running sandbox
       description: |
-        Saves the sandbox's full state and transitions it to `paused`. Resume
-        it later to continue exactly where it left off — same memory, same
-        running processes, same files.
+        Snapshots the sandbox's full state (memory + disk), suspends the VM,
+        and transitions to `paused`. Resume it later to continue exactly where
+        it left off — same memory, same running processes, same files.
       security:
         - apiKey: []
       responses:
@@ -219,7 +264,8 @@ paths:
       tags: [Sandboxes]
       summary: Resume a paused sandbox
       description: |
-        Restores a paused sandbox to `active` with all state intact.
+        Restores the sandbox from its paused snapshot. Transitions back to
+        `active` with all state intact — same memory, same processes, same files.
       security:
         - apiKey: []
       responses:
@@ -272,6 +318,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -311,6 +359,294 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates:
+    get:
+      operationId: listTemplates
+      tags: [Templates]
+      summary: List templates visible to the caller
+      description: |
+        Returns the caller's team's templates plus the curated system
+        templates (available to everyone, identified by the `superserve/` alias
+        prefix — e.g. `superserve/base`, `superserve/python-3.11`, `superserve/node-22`). Filter
+        by `alias_prefix=<text>`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: alias_prefix
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of templates
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TemplateResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: createTemplate
+      tags: [Templates]
+      summary: Create a template and kick off the first build
+      description: |
+        Creates a template row AND queues the first build atomically. The
+        response includes both the template id and the build id, so clients
+        can immediately poll `GET /templates/{id}` for overall status or
+        subscribe to `GET /templates/{id}/builds/{build_id}/logs` for live
+        output.
+
+        Template starts in status `building`. Poll until it reaches `ready`
+        before creating sandboxes from it. On failure the status becomes
+        `failed` and `error_message` is populated.
+
+        To rebuild an existing template (e.g. after a failure or when the
+        base image updates), use `POST /templates/{id}/builds`.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTemplateRequest"
+      responses:
+        "202":
+          description: Template created; first build queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateTemplateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          description: >
+            Team has reached the per-team concurrent build limit. Wait for
+            an active build to finish, or contact support to raise the cap.
+            Response body uses error code `too_many_builds`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+
+    get:
+      operationId: getTemplate
+      tags: [Templates]
+      summary: Get a template by ID
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Template details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      operationId: deleteTemplate
+      tags: [Templates]
+      summary: Soft-delete a template
+      description: |
+        Soft-deletes a template owned by the caller's team. Returns `409`
+        if any non-destroyed sandbox still references this template; the
+        caller must destroy those sandboxes first.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Template deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}/builds:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+
+    get:
+      operationId: listTemplateBuilds
+      tags: [Templates]
+      summary: List recent builds for a template
+      security:
+        - apiKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: List of builds, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TemplateBuildResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: createTemplateBuild
+      tags: [Templates]
+      summary: Rebuild an existing template
+      description: |
+        Queues a new build for this template. Used to retry after a failed
+        build, or to rebuild when the base image has been updated.
+
+        The **first** build is queued automatically when the template is
+        created via `POST /templates` — this endpoint is only for
+        subsequent builds.
+
+        ## Idempotency
+
+        If an in-flight build (`pending`/`building`/`snapshotting`) already
+        exists for this template with the same `build_spec_hash`, this
+        endpoint returns the existing build's id with `200` instead of
+        creating a duplicate.
+      security:
+        - apiKey: []
+      responses:
+        "201":
+          description: Build created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildResponse"
+        "200":
+          description: Existing in-flight build returned (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          description: >
+            Team has reached the per-team concurrent build limit. Response
+            body uses error code `too_many_builds`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}/builds/{build_id}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+      - $ref: "#/components/parameters/BuildId"
+
+    get:
+      operationId: getTemplateBuild
+      tags: [Templates]
+      summary: Get a build by ID
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Build details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      operationId: cancelTemplateBuild
+      tags: [Templates]
+      summary: Cancel an in-flight build
+      description: |
+        Marks the build as `cancelled` and signals vmd to tear down any
+        in-progress build VM. No-op for builds already in a terminal state.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Build cancelled (or was already terminal)
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /templates/{template_id}/builds/{build_id}/logs:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+      - $ref: "#/components/parameters/BuildId"
+
+    get:
+      operationId: streamTemplateBuildLogs
+      tags: [Templates]
+      summary: Stream build logs via SSE
+      description: |
+        Server-Sent Events stream of the build's stdout/stderr. Connecting
+        replays buffered output from the start of the build, then streams
+        live as it arrives. Closes when the build reaches a terminal state.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: SSE stream of build log events
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/BuildLogEvent"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -331,6 +667,24 @@ components:
         format: uuid
       description: The unique identifier of the sandbox.
 
+    TemplateId:
+      name: template_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of the template.
+
+    BuildId:
+      name: build_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of the template build.
+
   schemas:
     CreateSandboxRequest:
       type: object
@@ -341,23 +695,51 @@ components:
           minLength: 1
           maxLength: 64
           description: Human-readable name for the sandbox.
+        from_template:
+          type: string
+          description: >
+            Boot the sandbox from a template. Accepts either a template UUID
+            or an alias (e.g. `superserve/base`, `superserve/python-3.11`, `superserve/node-22`, or
+            a team-owned alias like `my-python-env`). The template must be
+            owned by the caller's team OR be a curated system template
+            (curated templates use the `superserve/` alias prefix). The template's
+            vCPU, memory, and disk values are inherited by the sandbox —
+            they cannot be overridden per-sandbox because the snapshot
+            dictates VM shape. When omitted, defaults to `superserve/base`.
         timeout_seconds:
           type: integer
           format: int32
           minimum: 1
           maximum: 604800
           description: >
-            Optional cap on how long a sandbox can stay `active`, measured
-            from creation. When elapsed, the sandbox is automatically paused.
-            Maximum 604800 (7 days).
+            Optional hard lifetime cap in seconds, measured from sandbox
+            creation. When set, the sandbox is destroyed this many seconds
+            after creation regardless of state (active, paused) or
+            activity — the user asked for a hard deadline.
+            When unset, the sandbox lives until explicitly paused or
+            deleted. Maximum 604800 (7 days).
         metadata:
           type: object
           additionalProperties:
             type: string
           description: |
-            String-to-string tags. Limits: 64 keys, 256 B per key, 2 KB per
-            value, 16 KB total. Keys starting with `superserve.` or
-            `_superserve` are reserved.
+            Flat string-to-string tags attached to the sandbox at creation.
+            Useful for grouping, owner labels, environment, run IDs, etc.
+
+            ## Constraints
+              - **Strings only.** Values must be strings. There is no type
+                coercion: `metadata.count=42` filters for the *string* "42".
+              - **At most 64 keys.**
+              - Each key may be at most **256 bytes**.
+              - Each value may be at most **2048 bytes** (2 KB).
+              - The serialized object may be at most **16384 bytes** (16 KB)
+                in total.
+              - Keys starting with `superserve.` or `_superserve` (case-
+                insensitive) are reserved for platform use and rejected.
+
+            Metadata can be updated after creation via `PATCH /sandboxes/:id`.
+            Filter sandboxes by metadata via the `metadata.{key}` query
+            parameter on `GET /sandboxes`.
           example:
             env: prod
             owner: agent-7
@@ -367,11 +749,15 @@ components:
             type: string
           description: |
             Environment variables injected into every process inside the
-            sandbox (terminal sessions, exec calls). Persist for the lifetime
-            of the sandbox and survive pause/resume.
+            sandbox (terminal sessions, exec calls). Merged on top of any
+            defaults set by the template's `env` build steps — caller keys
+            win on conflict. Not persisted in the database; they live in
+            the VM agent's memory for the sandbox's lifetime and survive
+            pause/resume via snapshot.
           example:
             OPENAI_API_KEY: sk-...
             DEBUG: "1"
+            run_id: 7f3c-21
         network:
           $ref: "#/components/schemas/NetworkConfig"
 
@@ -388,8 +774,10 @@ components:
           type: string
           enum: [active, paused, resuming]
           description: >
-            `active` = running, `paused` = stopped with state saved,
-            `resuming` = transient during paused→active (retry shortly).
+            Current state of the sandbox. `active` means running; `paused`
+            means paused and awaiting resume. `resuming` is a transient
+            state observed while the platform restores a paused sandbox
+            (e.g. via auto-resume on `/exec`); clients should retry shortly.
         vcpu_count:
           type: integer
         memory_mib:
@@ -481,7 +869,7 @@ components:
         command:
           type: string
           minLength: 1
-          description: Command to execute via shell, unless `args` is provided.
+          description: Command to execute. Wrapped in `/bin/sh -c` unless `args` is provided.
         args:
           type: array
           items:
@@ -534,24 +922,288 @@ components:
 
     SandboxPatch:
       type: object
-      description: Partial update body for `PATCH /sandboxes/{sandbox_id}`.
+      description: |
+        Partial update body for `PATCH /sandboxes/{sandbox_id}`. Each
+        top-level field is optional; only fields that are present are
+        applied. Omitted fields are left unchanged. Nested objects are
+        full replacements when present — to clear a list, send it as an
+        empty array.
+
+        At least one top-level field must be set, otherwise the request
+        is rejected with `400`. Unknown fields are also rejected with
+        `400`.
       properties:
         network:
           allOf:
             - $ref: "#/components/schemas/NetworkConfig"
-          description: Replace egress rules. Sandbox must be `active`.
+          description: |
+            Replace the sandbox's egress rules. The sandbox must be in
+            the `active` state. The provided `allow_out` and `deny_out`
+            lists fully replace whatever was previously configured.
         metadata:
           type: object
           additionalProperties:
             type: string
-          description: Replace metadata tags. Same limits as on create.
+          description: |
+            Replace the sandbox's metadata tags. Fully replaces the existing
+            metadata — omitted keys are removed. Can be patched regardless of
+            sandbox state. Same validation limits as on create (64 keys,
+            256-byte keys, 2 KB values, 16 KB total).
       example:
         metadata:
           env: prod
           owner: agent-7
 
+    BuildSpec:
+      type: object
+      required: [from]
+      description: |
+        Canonical declaration of how to build a template. The server is the
+        source of truth for this schema; SDKs are thin clients that produce it.
+      properties:
+        from:
+          type: string
+          description: >
+            OCI image reference for the base. Examples: `python:3.11`,
+            `node:22-slim`, `ghcr.io/myorg/foo:v1`. Resolved to a digest at
+            build time and recorded for reproducibility. Must be a Linux/amd64
+            image. Alpine and distroless bases are rejected at validation.
+          example: python:3.11
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildStep"
+          description: Ordered list of build steps executed inside the build VM.
+        start_cmd:
+          type: string
+          description: >
+            Optional command started after build steps complete. The snapshot
+            captures the running process, so sandboxes restored from this
+            template come up with the process already live.
+        ready_cmd:
+          type: string
+          description: >
+            Optional readiness probe. Polled every 2s after `start_cmd`, until
+            it exits 0 or 10 minutes elapse. Use to wait for a server to bind
+            its port before snapshotting.
+
+    BuildStep:
+      type: object
+      description: >
+        A single build step. Exactly one of `run`, `env`, `workdir`, or
+        `user` must be set.
+      properties:
+        run:
+          type: string
+          description: Shell command. Wrapped in `/bin/sh -c` inside the build VM.
+          example: pip install -r requirements.txt
+        env:
+          type: object
+          required: [key, value]
+          description: >
+            Sets an environment variable for subsequent build steps AND the
+            template's runtime default. Sandboxes created from this template
+            inherit it; caller-supplied `env_vars` on sandbox create override
+            on conflict.
+          properties:
+            key:
+              type: string
+            value:
+              type: string
+        workdir:
+          type: string
+          description: >
+            Working directory for subsequent build steps AND the template's
+            runtime default cwd. Absolute paths are used as-is; relative
+            paths resolve against the current workdir (base `/` when none
+            has been set). Auto-created and chowned to the current build
+            user. Per-exec `working_dir` overrides at runtime.
+          example: /srv/app
+        user:
+          type: object
+          required: [name]
+          description: >
+            Switches the user subsequent build steps execute as, and sets
+            the template's runtime default exec user. The user is created
+            if it doesn't exist. Per-exec `user` overrides at runtime.
+          properties:
+            name:
+              type: string
+              description: >
+                Linux username. Must start with a lowercase letter or
+                underscore; allowed characters are [a-z0-9_-], max 31 chars.
+              example: appuser
+            sudo:
+              type: boolean
+              default: false
+              description: When true, grants passwordless sudo to the user.
+
+    CreateTemplateRequest:
+      type: object
+      required: [alias, build_spec]
+      properties:
+        alias:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >
+            Human-readable name, unique per team. Used as the
+            `from_template` value when creating sandboxes. Aliases
+            starting with `superserve/` are reserved for curated system templates
+            and rejected for team-owned templates.
+          example: my-python-env
+        vcpu:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 1
+        memory_mib:
+          type: integer
+          minimum: 256
+          maximum: 4096
+          default: 1024
+        disk_mib:
+          type: integer
+          minimum: 1024
+          maximum: 8192
+          default: 4096
+        build_spec:
+          $ref: "#/components/schemas/BuildSpec"
+
+    CreateTemplateResponse:
+      type: object
+      description: |
+        Returned by `POST /templates` — includes both the new template id
+        and the id of the first build that was queued for it. Clients can
+        immediately open the build-log SSE stream or poll the template for
+        status transitions.
+      properties:
+        id:
+          type: string
+          format: uuid
+        team_id:
+          type: string
+          format: uuid
+        alias:
+          type: string
+        status:
+          type: string
+          enum: [building, ready, failed]
+        vcpu:
+          type: integer
+        memory_mib:
+          type: integer
+        disk_mib:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        build_id:
+          type: string
+          format: uuid
+          description: ID of the first build. Use it to stream logs or poll status.
+
+    TemplateResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        team_id:
+          type: string
+          format: uuid
+        alias:
+          type: string
+        status:
+          type: string
+          enum: [pending, building, ready, failed]
+        vcpu:
+          type: integer
+        memory_mib:
+          type: integer
+        disk_mib:
+          type: integer
+        size_bytes:
+          type: integer
+          format: int64
+          description: On-disk size of the template's snapshot bundle (present once `ready`).
+        error_message:
+          type: string
+          description: Last build's error message, if status is `failed`.
+        created_at:
+          type: string
+          format: date-time
+        built_at:
+          type: string
+          format: date-time
+          description: When the template most recently transitioned to `ready`.
+
+    TemplateBuildResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        template_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, building, snapshotting, ready, failed, cancelled]
+        build_spec_hash:
+          type: string
+          description: Stable hash of the build_spec at submission time. Used for idempotent submits.
+        error_message:
+          type: string
+          description: >
+            Populated when `status = failed`. The message is prefixed with a
+            stable error code the UI / SDK can key on: `image_pull_failed`,
+            `step_failed`, `boot_failed`, `snapshot_failed`, `start_cmd_failed`,
+            `ready_cmd_failed`, or `build_failed` (fallback).
+          example: "step_failed: step 1/2 failed after 3s: exited with code 100"
+        started_at:
+          type: string
+          format: date-time
+        finalized_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    BuildLogEvent:
+      type: object
+      description: A single SSE event from the build log stream.
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        stream:
+          type: string
+          enum: [stdout, stderr, system]
+          description: >
+            `stdout`/`stderr` are forwarded from the build VM. `system` is
+            the supervisor's own status text (step boundaries, snapshot
+            phase, terminal status).
+        text:
+          type: string
+        finished:
+          type: boolean
+          description: True on the final event.
+        status:
+          type: string
+          enum: [ready, failed, cancelled]
+          description: Terminal status, present on the final event.
+
     Error:
       type: object
+      description: |
+        Error envelope. `error.code` is a stable, machine-readable identifier
+        (e.g. `bad_request`, `not_found`, `conflict`, `rate_limited`,
+        `too_many_builds`, `image_pull_failed`, `step_failed`,
+        `snapshot_failed`, `start_cmd_failed`, `ready_cmd_failed`,
+        `build_failed`). `error.message` is human-readable and may change
+        between releases; clients should branch on `code`, not `message`.
       properties:
         error:
           type: object
@@ -582,6 +1234,15 @@ components:
             $ref: "#/components/schemas/Error"
     Conflict:
       description: Sandbox is not in a valid state for this operation
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooManyRequests:
+      description: >
+        Rate limit hit — the caller's per-team request budget is temporarily
+        exhausted. Response body uses error code `rate_limited`. Retry after
+        a short backoff; the bucket refills continuously.
       content:
         application/json:
           schema:

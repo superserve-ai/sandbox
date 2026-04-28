@@ -30,6 +30,9 @@ message StartRequest {
   string cwd = 4;
   PtyConfig pty = 5;     // If set, run in PTY mode.
   uint32 timeout_ms = 6; // 0 = no timeout.
+  // User to run the command as. Empty falls back to boxd's default user
+  // (set by the template or root).
+  string user = 7;
 }
 
 message PtyConfig {

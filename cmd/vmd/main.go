@@ -26,14 +26,16 @@ import (
 
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
-	FirecrackerBin string
-	JailerBin      string
-	KernelPath     string
-	BaseRootfsPath string
-	SnapshotDir    string
-	RunDir         string
-	GRPCPort       int
-	HostInterface  string
+	FirecrackerBin     string
+	JailerBin          string
+	KernelPath         string
+	BaseRootfsPath     string
+	SnapshotDir        string
+	RunDir             string
+	GRPCPort           int
+	HostInterface      string
+	TemplateBuilderBin string
+	BoxdBinaryPath     string
 
 	// HostID identifies this bare-metal host in the `host` table. Used by
 	// the reconciler to scope its DB queries ("sandboxes on my host").
@@ -62,10 +64,12 @@ func loadConfig() (Config, error) {
 		JailerBin:      envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
 		KernelPath:     requireEnv("KERNEL_PATH"),
 		BaseRootfsPath: requireEnv("BASE_ROOTFS_PATH"),
-		SnapshotDir:    "/var/lib/sandbox/snapshots",
-		RunDir:         "/var/lib/sandbox/rundir",
+		SnapshotDir:    envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
+		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:       port,
-		HostInterface:  envOrDefault("HOST_INTERFACE", "eth0"),
+		HostInterface:      envOrDefault("HOST_INTERFACE", "eth0"),
+		TemplateBuilderBin: envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
+		BoxdBinaryPath:     envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
 		HostID:          envOrDefault("HOST_ID", "default"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
@@ -242,23 +246,20 @@ func main() {
 	}
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
-	// ---- Pre-allocate network slots ----
-	// Keeps 5 ready-to-use network namespaces so sandbox creation grabs
-	// one in microseconds instead of running ~11 shell commands (~10-30ms).
-	netPool := netMgr.StartPool(ctx, network.PoolConfig{})
-	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
-
 	// ---- VM manager ----
-	maxConcurrentCreates, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_CREATES", "100"))
+	maxRestores, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_RESTORES", "100"))
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin: cfg.FirecrackerBin,
-		JailerBin:      cfg.JailerBin,
-		KernelPath:     cfg.KernelPath,
-		BaseRootfsPath: cfg.BaseRootfsPath,
-		SnapshotDir:    cfg.SnapshotDir,
-		RunDir:         cfg.RunDir,
-		MaxConcurrent:  maxConcurrentCreates,
+		FirecrackerBin:        cfg.FirecrackerBin,
+		JailerBin:             cfg.JailerBin,
+		KernelPath:            cfg.KernelPath,
+		BaseRootfsPath:        cfg.BaseRootfsPath,
+		SnapshotDir:           cfg.SnapshotDir,
+		RunDir:                cfg.RunDir,
+		TemplateBuilderBin:    cfg.TemplateBuilderBin,
+		BoxdBinaryPath:        cfg.BoxdBinaryPath,
+		HostInterface:         cfg.HostInterface,
+		MaxConcurrentRestores: maxRestores,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -289,10 +290,20 @@ func main() {
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
 	// ---- Reattach to running VMs from previous VMD lifetime ----
+	// Runs BEFORE StartPool so the Phase C orphan-namespace sweep can
+	// clear leaked ns-N/veth-N from prior lifetimes. Otherwise the pool
+	// burns startup retrying colliding slots and ends up with an empty
+	// fresh buffer ("initial pool fill incomplete").
 	reattached, stale := mgr.ReattachAll(ctx)
 	if reattached > 0 || stale > 0 {
 		log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 	}
+
+	// ---- Pre-allocate network slots ----
+	// Keeps a handful of ready-to-use network namespaces so sandbox creation
+	// grabs one in microseconds instead of running ~11 shell commands.
+	netPool := netMgr.StartPool(ctx, network.PoolConfig{})
+	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 
 	// ---- Optional DB connection for the reconciler ----
 	// VMD does not need the DB for its request path (that stays on gRPC).
@@ -344,16 +355,15 @@ func main() {
 		return nil
 	})
 	// Template files are NOT cleaned up on shutdown — they persist on
-	// disk so the next startup can reuse them via hash caching instead
-	// of cold-booting a new template (~3s saved per restart).
+	// disk so the next startup can reattach via the build pipeline's
+	// on-disk snapshot layout.
 
-	// ---- Default template ----
-	// Boot a throwaway VM from the base image, snapshot it, keep the
-	// snapshot on disk. Every subsequent CreateVM restores from this
-	// template snapshot instead of cold-booting (~90-200ms vs ~933ms).
-	if err := mgr.InitDefaultTemplate(ctx); err != nil {
-		log.Fatal().Err(err).Msg("failed to initialize default template")
-	}
+	// ---- Orphan build cleanup ----
+	// Reclaim any template build directories left behind by a prior vmd
+	// lifetime that didn't reach a completion marker (crash, kill, cancel).
+	// Safe to run before any gRPC traffic since the build registry is
+	// in-memory only and starts empty at boot.
+	mgr.CleanupOrphanBuilds()
 
 	// ---- Local HTTP server (proxy resolver) ----
 	// Listens on localhost:9090. The edge proxy queries this to resolve

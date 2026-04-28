@@ -2,14 +2,13 @@ package vm
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,17 +26,11 @@ import (
 // Constants
 // ---------------------------------------------------------------------------
 
-// templateDirName is the fixed directory name used for the template VM's
-// rundir. The snapshot's path_on_host references this directory. Each new VM
-// gets its own mount namespace where a tmpfs is mounted over this directory
-// and the per-VM rootfs is symlinked in — so every Firecracker process sees
-// its own files at the same fixed path.
+// templateDirName is the fixed directory name that every template snapshot's
+// `path_on_host` references. Each new VM gets its own mount namespace where a
+// tmpfs is mounted over this directory and the per-VM rootfs is symlinked in
+// — so every Firecracker process sees its own files at the same fixed path.
 const templateDirName = "template"
-
-// boxdRestoreHealthTimeout bounds how long we wait for the guest agent to
-// accept connections after restoring a VM from a snapshot. Boxd typically
-// binds in well under a second; this is a defensive upper bound.
-const boxdRestoreHealthTimeout = 10 * time.Second
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,23 +98,19 @@ type VMConfig struct {
 
 // ManagerConfig holds paths and settings for the VM manager.
 type ManagerConfig struct {
-	FirecrackerBin string
-	JailerBin      string
-	KernelPath     string
-	BaseRootfsPath string
-	SnapshotDir    string
-	RunDir         string
-	MaxConcurrent int // Max concurrent CreateVM operations (0 = default 10).
-}
-
-// TemplateSnapshot holds paths for a template snapshot created at startup.
-type TemplateSnapshot struct {
-	SnapshotPath string // e.g., snapshots/template/vmstate.snap
-	MemFilePath  string // e.g., snapshots/template/mem.snap
-	DiskPath     string // e.g., rundir/template/rootfs.ext4
-	RunDir       string // e.g., rundir/template/
-	VCPUCount    uint32 // actual vCPU count baked into the snapshot
-	MemSizeMiB   uint32 // actual RAM in MiB baked into the snapshot
+	FirecrackerBin     string
+	JailerBin          string
+	KernelPath         string
+	BaseRootfsPath     string
+	SnapshotDir        string
+	RunDir             string
+	TemplateBuilderBin string // Path to template-builder binary.
+	BoxdBinaryPath     string // Path to boxd binary (passed to template-builder).
+	HostInterface      string // Host network interface (e.g. "ens4").
+	// MaxConcurrentRestores caps parallel RestoreVMSnapshot operations to
+	// prevent a spike of concurrent sandbox creates from saturating host
+	// file I/O, netns setup, and Firecracker boots. 0 → default 100.
+	MaxConcurrentRestores int
 }
 
 // ---------------------------------------------------------------------------
@@ -136,24 +125,37 @@ type Manager struct {
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
 
-	mu              sync.RWMutex
-	vms             map[string]*VMInstance
-	defaultTemplate *TemplateSnapshot
-	createSem       chan struct{}
+	mu  sync.RWMutex
+	vms map[string]*VMInstance
+
+	// restoreSem bounds concurrent RestoreVMSnapshot operations. Buffered
+	// channel; capacity = effective MaxConcurrentRestores.
+	restoreSem chan struct{}
+
+	// builds tracks in-flight and completed template builds. Keyed by
+	// build VM id (which is also "build-" + templateID). Entries survive
+	// until process exit so late pollers can read terminal outcomes.
+	buildsMu sync.RWMutex
+	builds   map[string]*buildRecord
+
+	// nextBuildSlot assigns unique network slot indices to concurrent
+	// template-builder subprocesses. Starts at 200 to avoid collision
+	// with vmd's sandbox pool (indices 1-100).
+	nextBuildSlot atomic.Int32
 }
 
 // NewManager creates a new VM manager.
 func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) (*Manager, error) {
-	maxConcurrent := cfg.MaxConcurrent
-	if maxConcurrent <= 0 {
-		maxConcurrent = 10
+	maxRestores := cfg.MaxConcurrentRestores
+	if maxRestores <= 0 {
+		maxRestores = 100
 	}
 	return &Manager{
 		cfg:        cfg,
 		netMgr:     netMgr,
 		log:        log.With().Str("component", "vm_manager").Logger(),
-		vms:       make(map[string]*VMInstance),
-		createSem: make(chan struct{}, maxConcurrent),
+		vms:        make(map[string]*VMInstance),
+		restoreSem: make(chan struct{}, maxRestores),
 	}, nil
 }
 
@@ -169,332 +171,49 @@ func (m *Manager) SetEgressProxy(proxy *network.EgressProxy) {
 	m.egressProxy = proxy
 }
 
-// templateRunDir returns the fixed path where the template VM's files live.
+// templateRunDir returns the fixed path where every template's rootfs lives
+// at restore time. Each VM mounts a per-instance tmpfs over this path and
+// symlinks its own rootfs in; every Firecracker snapshot references this
+// exact path via its embedded `path_on_host`, so one snapshot works for
+// many VMs.
 func (m *Manager) templateRunDir() string {
 	return filepath.Join(m.cfg.RunDir, templateDirName)
 }
 
 // ---------------------------------------------------------------------------
-// InitDefaultTemplate — boot once, snapshot, reuse forever
+// Cold boot — only used by the template build pipeline
 // ---------------------------------------------------------------------------
 
-// InitDefaultTemplate ensures a template snapshot is available for fast
-// sandbox creation. If a valid cached template exists and the base rootfs
-// hasn't changed since it was built, the cached template is reused —
-// skipping the ~2-3s cold boot entirely. This makes VMD restarts fast
-// when only the VMD binary changed (the common deploy case).
-//
-// The template is rebuilt only when:
-//   - No cached snapshot exists on disk (first boot)
-//   - The base rootfs hash changed (new boxd version baked in)
-//   - The cached snapshot files are missing or corrupt
-func (m *Manager) InitDefaultTemplate(ctx context.Context) error {
-	templateID := templateDirName
-	log := m.log.With().Str("template_id", templateID).Logger()
-
-	snapshotDir := filepath.Join(m.cfg.SnapshotDir, templateDirName)
-	snapPath := filepath.Join(snapshotDir, "vmstate.snap")
-	memPath := filepath.Join(snapshotDir, "mem.snap")
-	diskPath := filepath.Join(m.templateRunDir(), "rootfs.ext4")
-	hashPath := filepath.Join(snapshotDir, "rootfs.sha256")
-
-	// Check if we can reuse the cached template.
-	currentHash, hashErr := fileHash(m.cfg.BaseRootfsPath)
-	if hashErr != nil {
-		log.Warn().Err(hashErr).Msg("could not hash base rootfs — will rebuild template")
-	}
-
-	metaPath := filepath.Join(snapshotDir, "template.meta")
-
-	if hashErr == nil && m.canReuseTemplate(snapPath, memPath, diskPath, hashPath, currentHash) {
-		vcpu, mem := readTemplateMeta(metaPath)
-		log.Info().Uint32("vcpu", vcpu).Uint32("mem_mib", mem).Msg("base rootfs unchanged — reusing cached template snapshot")
-		m.defaultTemplate = &TemplateSnapshot{
-			SnapshotPath: snapPath,
-			MemFilePath:  memPath,
-			DiskPath:     diskPath,
-			RunDir:       m.templateRunDir(),
-			VCPUCount:    vcpu,
-			MemSizeMiB:   mem,
+// waitForPIDExit polls until the process at pid is gone (kill(pid, 0)
+// returns ESRCH) or the deadline expires. Best-effort: returns silently
+// either way. Used after SIGKILL to ensure the kernel has actually
+// reaped the process and released its fds before we reuse its resources.
+func waitForPIDExit(pid int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		// syscall.Kill(pid, 0) returns ESRCH when the process is gone.
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
 		}
-		return nil
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	// Cache miss — cold boot a throwaway VM, snapshot it, kill it.
-	log.Info().Msg("building new template — cold-booting throwaway VM")
-
-	inst, err := m.coldBootVM(ctx, templateID)
-	if err != nil {
-		return fmt.Errorf("boot template VM: %w", err)
-	}
-
-	if err := m.waitForBoxd(ctx, inst.IP, 30*time.Second); err != nil {
-		_ = m.DestroyVM(ctx, templateID, true)
-		return fmt.Errorf("boxd not ready: %w", err)
-	}
-	log.Info().Msg("guest agent ready — creating template snapshot")
-
-	snapPath, memPath, err = m.CreateVMSnapshot(ctx, templateID, snapshotDir)
-	if err != nil {
-		_ = m.DestroyVM(ctx, templateID, true)
-		return fmt.Errorf("snapshot template VM: %w", err)
-	}
-
-	diskPath = inst.DiskPath
-	m.killVMKeepRunDir(templateID)
-
-	// Persist the rootfs hash and resource values so the next startup
-	// can skip the cold boot and restore the correct template config.
-	if currentHash != "" {
-		_ = os.WriteFile(hashPath, []byte(currentHash), 0o644)
-	}
-	writeTemplateMeta(metaPath, inst.Config.VCPU, inst.Config.MemoryMiB)
-
-	m.defaultTemplate = &TemplateSnapshot{
-		SnapshotPath: snapPath,
-		MemFilePath:  memPath,
-		DiskPath:     diskPath,
-		RunDir:       m.templateRunDir(),
-		VCPUCount:    inst.Config.VCPU,
-		MemSizeMiB:   inst.Config.MemoryMiB,
-	}
-
-	log.Info().
-		Str("snapshot_path", snapPath).
-		Str("disk_path", diskPath).
-		Msg("default template ready")
-	return nil
 }
 
-// readTemplateMeta reads the vCPU and memory values persisted alongside
-// the template snapshot. Returns safe defaults (1 vCPU, 1024 MiB) if the
-// file is missing or unreadable.
-func readTemplateMeta(path string) (vcpu, memMiB uint32) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 1, 1024
-	}
-	var v, m uint32
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d %d", &v, &m); err != nil {
-		return 1, 1024
-	}
-	return v, m
-}
-
-func writeTemplateMeta(path string, vcpu, memMiB uint32) {
-	_ = os.WriteFile(path, []byte(fmt.Sprintf("%d %d", vcpu, memMiB)), 0o644)
-}
-
-// canReuseTemplate returns true when all template files exist on disk and
-// the stored rootfs hash matches the current base image.
-func (m *Manager) canReuseTemplate(snapPath, memPath, diskPath, hashPath, currentHash string) bool {
-	for _, p := range []string{snapPath, memPath, diskPath} {
-		if _, err := os.Stat(p); err != nil {
-			return false
-		}
-	}
-	stored, err := os.ReadFile(hashPath)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(stored)) == currentHash
-}
-
-// fileHash returns the SHA-256 hex digest of a file.
-func fileHash(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
-// ---------------------------------------------------------------------------
-// CreateVM — single code path via template snapshot restore
-// ---------------------------------------------------------------------------
-
-// CreateVM provisions a new Firecracker microVM by restoring from the default
-// template snapshot. Each VM gets its own rootfs copy and runs in a mount
-// namespace that maps the per-VM rootfs to the template's fixed path.
-func (m *Manager) CreateVM(ctx context.Context, vmID string, netCfg *network.Config, metadata map[string]string,
-) (*VMInstance, error) {
+// coldBootFromRootfs is the parameterized form: boot a VM from a specific
+// rootfs at the requested vcpu/memory. Used by BuildTemplate to boot the
+// build VM from a freshly-produced rootfs at the template's target shape.
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath string, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
-
-	// If the template isn't ready (e.g., during InitDefaultTemplate itself),
-	// fall through to cold boot.
-	if m.defaultTemplate == nil {
-		return m.coldBootVM(ctx, vmID)
+	if rootfsPath == "" {
+		return nil, fmt.Errorf("rootfsPath is required")
 	}
-
-	// Verify template snapshot files are still intact.
-	if err := m.checkTemplateHealth(); err != nil {
-		return nil, fmt.Errorf("template unhealthy: %w", err)
+	if vcpu == 0 {
+		vcpu = 1
 	}
-
-	// Limit concurrent CreateVM operations to prevent host overload.
-	select {
-	case m.createSem <- struct{}{}:
-		defer func() { <-m.createSem }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	createStart := time.Now()
-	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Msg("creating VM from template snapshot")
-
-	m.mu.Lock()
-	if _, exists := m.vms[vmID]; exists {
-		m.mu.Unlock()
-		return nil, status.Errorf(codes.AlreadyExists, "vm %s already exists", vmID)
-	}
-
-	inst := &VMInstance{
-		ID:        vmID,
-		Status:    StatusCreating,
-		CreatedAt: time.Now(),
-		Metadata:  metadata,
-		RunDirID:  vmID,
-		Config: VMConfig{
-			VCPU:      m.defaultTemplate.VCPUCount,
-			MemoryMiB: m.defaultTemplate.MemSizeMiB,
-		},
-	}
-	m.vms[vmID] = inst
-	m.mu.Unlock()
-
-	cleanup := func() {
-		m.cleanupRunDir(vmID)
-		m.setStatus(vmID, StatusError)
-		m.removeVM(vmID)
-	}
-
-	// Steps 1 and 2 — copying the rootfs and setting up the network
-	// namespace — are independent. Run them in parallel so the total
-	// wall-clock for the pair is max(rootfs, netns) instead of their sum.
-	// On typical hardware this shaves ~10-30ms off create latency.
-	parallelStart := time.Now()
-
-	type rootfsResult struct {
-		path string
-		err  error
-	}
-	type netResult struct {
-		info *network.VMNetInfo
-		err  error
-	}
-	rootfsCh := make(chan rootfsResult, 1)
-	netCh := make(chan netResult, 1)
-
-	go func() {
-		p, err := m.copyRootfs(ctx, vmID, m.defaultTemplate.DiskPath)
-		rootfsCh <- rootfsResult{path: p, err: err}
-	}()
-	go func() {
-		info, err := m.netMgr.SetupVM(ctx, vmID, netCfg)
-		netCh <- netResult{info: info, err: err}
-	}()
-
-	rfs := <-rootfsCh
-	nr := <-netCh
-
-	// Both goroutines always run to completion so we know exactly which
-	// side(s) succeeded and need unwinding. Tear them down in reverse
-	// order of resource ownership: network first (it's tied to kernel
-	// state), rundir last (it's just files, handled by cleanup()).
-	if rfs.err != nil || nr.err != nil {
-		// If the network came up but the rootfs did not, the kernel
-		// namespace/veth/firewall state must be explicitly freed; the
-		// shared cleanup() only removes the rundir.
-		if nr.err == nil {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanup()
-		switch {
-		case rfs.err != nil && nr.err != nil:
-			return nil, fmt.Errorf("copy rootfs: %w; setup network: %v", rfs.err, nr.err)
-		case rfs.err != nil:
-			return nil, fmt.Errorf("copy rootfs: %w", rfs.err)
-		default:
-			return nil, fmt.Errorf("setup network: %w", nr.err)
-		}
-	}
-
-	perVMRootfs := rfs.path
-	netInfo := nr.info
-	// Take inst.mu to write — concurrent readers via ExecCommand /
-	// LookupInstance / persistState take RLock.
-	inst.mu.Lock()
-	inst.DiskPath = perVMRootfs
-	inst.IP = netInfo.HostIP
-	inst.TAPDevice = netInfo.TAPDevice
-	inst.MACAddress = netInfo.MACAddress
-	inst.Namespace = netInfo.Namespace
-	inst.mu.Unlock()
-	log.Debug().Dur("duration_ms", time.Since(parallelStart)).Msg("step: copy rootfs + setup network (parallel)")
-
-	// 3. Start Firecracker in a mount + network namespace.
-	startStep := time.Now()
-	vmDir := filepath.Join(m.cfg.RunDir, vmID)
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
-
-	var (
-		pid      int
-		startErr error
-	)
-	pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, netInfo.Namespace)
-	if startErr != nil {
-		m.netMgr.CleanupVM(vmID)
-		cleanup()
-		return nil, fmt.Errorf("start firecracker: %w", startErr)
-	}
-	inst.mu.Lock()
-	inst.SocketPath = socketPath
-	inst.PID = pid
-	inst.mu.Unlock()
-	log.Debug().Dur("duration_ms", time.Since(startStep)).Msg("step: start firecracker")
-
-	// 4. Restore from the original (unpatched) template snapshot.
-	// No IP reconfig needed — the VM uses a fixed internal IP (169.254.0.21)
-	// and the network namespace provides isolation.
-	restoreStep := time.Now()
-	if err := RestoreSnapshotWithOverrides(
-		socketPath, m.defaultTemplate.SnapshotPath, m.defaultTemplate.MemFilePath,
-		"eth0", netInfo.TAPDevice,
-	); err != nil {
-		m.netMgr.CleanupVM(vmID)
-		cleanup()
-		return nil, fmt.Errorf("restore template snapshot: %w", err)
-	}
-	log.Debug().Dur("duration_ms", time.Since(restoreStep)).Msg("step: restore snapshot")
-
-	m.setStatus(vmID, StatusRunning)
-	// Persist again now that PID, IP, and socket are set.
-	m.persistState(inst)
-	log.Info().
-		Int("pid", pid).
-		Str("host_ip", inst.IP).
-		Dur("total_ms", time.Since(createStart)).
-		Msg("VM created from template snapshot")
-	return inst, nil
-}
-
-// ---------------------------------------------------------------------------
-// coldBootVM — used only for InitDefaultTemplate and as fallback
-// ---------------------------------------------------------------------------
-
-// coldBootVM provisions a VM the slow way: copy rootfs, set up networking,
-// start Firecracker, configure machine, and boot the kernel.
-func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, error) {
-	if vmID == "" {
-		vmID = uuid.New().String()
+	if memMiB == 0 {
+		memMiB = 1024
 	}
 
 	m.mu.Lock()
@@ -509,20 +228,20 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 		CreatedAt: time.Now(),
 		RunDirID:  vmID,
 		Config: VMConfig{
-			VCPU:       1,
-			MemoryMiB:  1024,
+			VCPU:       vcpu,
+			MemoryMiB:  memMiB,
 			KernelPath: m.cfg.KernelPath,
-			RootfsPath: m.cfg.BaseRootfsPath,
+			RootfsPath: rootfsPath,
 		},
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Msg("cold-booting VM")
+	log.Info().Str("rootfs", rootfsPath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
 
-	// 1. Copy the base rootfs for this VM.
-	diskPath, err := m.copyRootfs(ctx, vmID, m.cfg.BaseRootfsPath)
+	// 1. Copy the rootfs for this VM.
+	diskPath, err := m.copyRootfs(ctx, vmID, rootfsPath)
 	if err != nil {
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
@@ -556,10 +275,10 @@ func (m *Manager) coldBootVM(ctx context.Context, vmID string) (*VMInstance, err
 	fcCfg := FirecrackerConfig{
 		SocketPath: socketPath,
 		KernelPath: m.cfg.KernelPath,
-		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0",
+		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on",
 		RootfsPath: diskPath,
-		VCPUCount:  1,
-		MemSizeMiB: 1024,
+		VCPUCount:  int(vcpu),
+		MemSizeMiB: int(memMiB),
 		TAPDevice:  network.TAPName,
 		MACAddress: mac,
 		VMID:       vmID,
@@ -600,11 +319,37 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
-	// Stop the systemd unit — this kills Firecracker and runs ExecStopPost cleanup.
+	// Stop the systemd unit if one exists — this is the path for sandbox
+	// VMs launched via startFirecrackerViaSystemd.
 	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
-		log.Warn().Err(err).Msg("systemctl stop failed (unit may already be stopped)")
+		log.Warn().Err(err).Msg("systemctl stop failed (unit may not exist — trying PID-based kill)")
 	}
 	removeUnitDropIn(vmID)
+
+	// Fallback: cold-booted VMs (template build VMs from startFirecrackerColdBoot
+	// and the default-template cold boot) aren't systemd-managed — they run as
+	// plain child processes of vmd. stopUnit is a no-op for them, so we have
+	// to SIGKILL by PID or Firecracker keeps holding its TAP fd, causing the
+	// network pool to hand out a "reusable" slot whose tap0 is still in use.
+	// Next VM that claims the slot fails with EBUSY ("Open tap device failed:
+	// Resource busy"). See internal/network/manager.go:344 for the pool
+	// return path that assumes the previous owner is dead.
+	inst.mu.RLock()
+	pid := inst.PID
+	inst.mu.RUnlock()
+	if pid > 0 {
+		if proc, err := os.FindProcess(pid); err == nil {
+			// SIGKILL is safe here: we're tearing down, no graceful shutdown
+			// is expected. For systemd-managed VMs this is a no-op because
+			// stopUnit already killed the process.
+			_ = proc.Signal(syscall.SIGKILL)
+			// Give the kernel a moment to actually release fds before we
+			// hand the namespace + TAP back to the pool. 100ms is enough
+			// in practice — Linux process teardown is fast once all fds
+			// are dropped.
+			waitForPIDExit(pid, 500*time.Millisecond)
+		}
+	}
 
 	if inst.SocketPath != "" {
 		_ = os.Remove(inst.SocketPath)
@@ -690,6 +435,30 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
 	}
 
+	// Verify the snapshot files actually exist on disk. DB can claim
+	// "ready" but the files be missing — common scenarios:
+	//   - vmd host replaced; new host has no cached snapshots
+	//   - operator manually deleted files for disk recovery
+	//   - snapshot directory not mounted
+	//
+	// Return FailedPrecondition so the caller can distinguish "ops
+	// action required" from "transient error" and surface a clear
+	// message to the user instead of a generic 500. The caller (control
+	// plane) adds context about whether this was a template-sourced or
+	// pause-sourced restore.
+	if _, err := os.Stat(snapshotPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.FailedPrecondition, "snapshot file missing on host: %s", snapshotPath)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "stat snapshot %s: %v", snapshotPath, err)
+	}
+	if _, err := os.Stat(memPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
+	}
+
 	rundirKey := vmID
 	if inst.RunDirID != "" {
 		rundirKey = inst.RunDirID
@@ -714,10 +483,6 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	if err := RestoreSnapshot(socketPath, snapshotPath, memPath); err != nil {
 		return nil, fmt.Errorf("restore snapshot: %w", err)
-	}
-
-	if err := m.waitForBoxd(ctx, inst.IP, boxdRestoreHealthTimeout); err != nil {
-		return nil, fmt.Errorf("boxd not ready after resume: %w", err)
 	}
 
 	inst.mu.Lock()
@@ -764,9 +529,9 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 }
 
 // DeleteSnapshotFiles removes a snapshot's on-disk artifacts (vmstate + memory
-// file). Both paths must resolve to locations under the configured snapshot
-// directory — arbitrary paths are rejected as InvalidArgument to prevent the
-// control plane from accidentally (or maliciously) unlinking unrelated files.
+// file). Both paths are required to lie strictly under <SnapshotDir>/<vmID>/ —
+// any path outside that directory is rejected as InvalidArgument, so a call
+// cannot unlink files belonging to another sandbox or the snapshot root itself.
 //
 // The operation is idempotent: missing files are not an error. The enclosing
 // directory is removed on a best-effort basis once both files are gone and it
@@ -775,11 +540,11 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 // Callers are responsible for ensuring the snapshot is no longer referenced
 // by any running VM. This method does not inspect instance state.
 func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error {
-	if snapshotPath == "" && memPath == "" {
-		return status.Error(codes.InvalidArgument, "at least one of snapshot_path/mem_file_path is required")
-	}
 	if vmID == "" {
 		return status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+	if snapshotPath == "" && memPath == "" {
+		return status.Error(codes.InvalidArgument, "at least one of snapshot_path/mem_file_path is required")
 	}
 	for _, p := range []string{snapshotPath, memPath} {
 		if p == "" {
@@ -843,6 +608,17 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	resourceLimits VMConfig, netCfg *network.Config,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
+
+	// Bound concurrent restores so a burst of sandbox creates doesn't
+	// saturate host file I/O, netns setup, tmpfs, and Firecracker boots.
+	// Fail fast with ctx.Err() if the caller's deadline fires while we
+	// wait — the sandbox create has its own upstream deadline.
+	select {
+	case m.restoreSem <- struct{}{}:
+		defer func() { <-m.restoreSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	if vmID == "" {
 		vmID = uuid.New().String()
@@ -949,7 +725,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
-	if err := m.waitForBoxd(ctx, hostIP, boxdRestoreHealthTimeout); err != nil {
+	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -1039,6 +815,17 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		// For running VMs, verify the systemd unit is still active.
 		if !isUnitActive(ctx, systemdUnitName(rec.ID)) {
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
+			// Kill the orphaned Firecracker process if it's still alive.
+			// Cold-booted VMs (from the old build path) were launched with
+			// Setsid: true and no systemd unit, so they survive vmd restarts
+			// as orphans holding TAP fds and contaminating the network pool.
+			if rec.PID > 0 {
+				if proc, err := os.FindProcess(rec.PID); err == nil {
+					if killErr := proc.Signal(syscall.SIGKILL); killErr == nil {
+						log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
+					}
+				}
+			}
 			m.state.Delete(rec.ID)
 			stale++
 			continue
@@ -1076,6 +863,24 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 				m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
 			}
 		}
+	}
+
+	// Phase C: sweep host network namespaces (ns-N / veth-N) that do not
+	// correspond to any live BoltDB record. Template builds never touch
+	// BoltDB, so a crashed build always leaks; sandbox teardown can also
+	// race the kernel-level delete. Without this sweep the pre-allocated
+	// pool wastes startup retrying colliding slots and kernel state degrades
+	// over time. Re-reading records reflects Phase A's stale deletions.
+	keepNs := make(map[string]bool)
+	if freshRecords, readErr := m.state.All(); readErr == nil {
+		for _, rec := range freshRecords {
+			if rec.Namespace != "" {
+				keepNs[rec.Namespace] = true
+			}
+		}
+	}
+	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
+		m.log.Info().Int("swept", swept).Msg("sweep: removed orphan namespaces")
 	}
 
 	return reattached, stale
@@ -1282,6 +1087,9 @@ func (m *Manager) persistState(inst *VMInstance) {
 	if m.state == nil {
 		return
 	}
+	if isBuildVM(inst.ID) {
+		return
+	}
 	if err := m.state.Put(toRecord(inst)); err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
 	}
@@ -1290,6 +1098,9 @@ func (m *Manager) persistState(inst *VMInstance) {
 // deleteState removes a VM record from BoltDB.
 func (m *Manager) deleteState(vmID string) {
 	if m.state == nil {
+		return
+	}
+	if isBuildVM(vmID) {
 		return
 	}
 	if err := m.state.Delete(vmID); err != nil {
@@ -1328,7 +1139,9 @@ func (m *Manager) cleanupRunDir(dirName string) {
 }
 
 // startFirecrackerColdBoot launches Firecracker inside a network namespace,
-// configures it, and boots the kernel. Used only for InitDefaultTemplate.
+// configures it, and boots the kernel. Used by the template build pipeline
+// (coldBootFromRootfs) to boot the throwaway VM that we snapshot into a
+// new template.
 func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath string, fcCfg FirecrackerConfig, netNS string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
@@ -1350,12 +1163,12 @@ func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath
 		return 0, fmt.Errorf("wait for socket: %w", err)
 	}
 
-	if err := configureMachine(socketPath, fcCfg); err != nil {
+	if err := ConfigureMachine(socketPath, fcCfg); err != nil {
 		_ = cmd.Process.Kill()
 		return 0, fmt.Errorf("configure machine: %w", err)
 	}
 
-	if err := startInstance(socketPath); err != nil {
+	if err := StartInstance(socketPath); err != nil {
 		_ = cmd.Process.Kill()
 		return 0, fmt.Errorf("start instance: %w", err)
 	}
@@ -1443,77 +1256,8 @@ func waitForSocket(path string, timeout time.Duration) error {
 	return fmt.Errorf("socket %s did not appear within %s", path, timeout)
 }
 
-// killVMKeepRunDir terminates the VM process and releases networking but
-// leaves the rundir intact on disk. Used only for the throwaway template
-// VM (which is cold-booted as a direct child, not a systemd unit).
-func (m *Manager) killVMKeepRunDir(vmID string) {
-	inst, err := m.getInstance(vmID)
-	if err != nil {
-		return
-	}
-
-	// Template VMs run as direct child processes (cold boot path).
-	// Regular VMs run as systemd units — stop the unit if it exists.
-	if inst.PID > 0 {
-		if proc, e := os.FindProcess(inst.PID); e == nil {
-			_ = proc.Signal(syscall.SIGKILL)
-			go proc.Wait() //nolint:errcheck
-		}
-	} else {
-		_ = stopUnit(context.Background(), systemdUnitName(vmID))
-	}
-
-	if inst.SocketPath != "" {
-		_ = os.Remove(inst.SocketPath)
-	}
-	m.netMgr.CleanupVM(vmID)
-
-	m.mu.Lock()
-	delete(m.vms, vmID)
-	m.mu.Unlock()
-}
-
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {
 	return waitForHTTPHealth(ctx, vmIP, timeout)
 }
 
-// checkTemplateHealth verifies the default template snapshot files are readable.
-func (m *Manager) checkTemplateHealth() error {
-	if m.defaultTemplate == nil {
-		return fmt.Errorf("no default template initialized")
-	}
-	for _, path := range []string{
-		m.defaultTemplate.SnapshotPath,
-		m.defaultTemplate.MemFilePath,
-		m.defaultTemplate.DiskPath,
-	} {
-		if _, err := os.Stat(path); err != nil {
-			return fmt.Errorf("template file missing: %s: %w", path, err)
-		}
-	}
-	return nil
-}
-
-
-// CleanupTemplate removes the default template's rundir and snapshot files.
-func (m *Manager) CleanupTemplate() {
-	if m.defaultTemplate == nil {
-		return
-	}
-	tmpl := m.defaultTemplate
-	m.defaultTemplate = nil
-
-	if tmpl.RunDir != "" {
-		if err := os.RemoveAll(tmpl.RunDir); err != nil {
-			m.log.Warn().Err(err).Str("dir", tmpl.RunDir).Msg("failed to remove template rundir")
-		}
-	}
-	snapshotDir := filepath.Dir(tmpl.SnapshotPath)
-	if snapshotDir != "" && snapshotDir != "." {
-		if err := os.RemoveAll(snapshotDir); err != nil {
-			m.log.Warn().Err(err).Str("dir", snapshotDir).Msg("failed to remove template snapshot")
-		}
-	}
-	m.log.Info().Msg("template files cleaned up")
-}
 

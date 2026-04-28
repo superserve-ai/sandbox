@@ -15,6 +15,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
@@ -38,11 +40,12 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	VMD       VMDClient     // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
+	VMD       VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
 	DB        *db.Queries
+	Pool      *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
 	Config    *config.Config
-	Hosts     HostRegistry  // when set, routes VMD calls via host_id
-	Scheduler Scheduler     // when set, picks host on create
+	Hosts     HostRegistry // when set, routes VMD calls via host_id
+	Scheduler Scheduler    // when set, picks host on create
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -54,6 +57,11 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 	}
 }
 
+// vmdForHost returns the VMDClient for the given host. When a registry is
+// configured, it resolves via DB lookup. If the lookup fails because the host
+// row is missing (legacy sandbox with a backfilled host_id whose row is gone),
+// falls back to the default VMD client so existing sandboxes keep working
+// during the migration period. Any other error is surfaced.
 func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
 	if h.Hosts == nil {
 		return h.VMD, nil
@@ -75,29 +83,51 @@ const vmdTimeout = 30 * time.Second
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
-// logActivityAsync writes an activity record in a background goroutine.
-//
-// The caller passes the request context. We strip cancellation via
-// context.WithoutCancel so the goroutine is not killed when the HTTP
-// response completes, but we KEEP the trace/span context so the async
-// write appears in the same request trace as the synchronous work.
-func (h *Handlers) logActivityAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
+// logSandboxActivity writes a sandbox-scoped activity record in a background
+// goroutine. The request context is stripped of cancellation via
+// context.WithoutCancel so the goroutine is not killed when the HTTP response
+// completes, but the trace/span context is kept so the async write appears in
+// the same request trace as the synchronous work.
+func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
-			SandboxID:   sandboxID,
-			TeamID:      teamID,
-			Category:    category,
-			Action:      action,
-			Status:      &status,
-			SandboxName: sandboxName,
-			DurationMs:  durationMs,
-			Metadata:    metadata,
+			SandboxID:    pgtype.UUID{Bytes: sandboxID, Valid: true},
+			ResourceType: "sandbox",
+			TeamID:       teamID,
+			Category:     category,
+			Action:       action,
+			Status:       &status,
+			SandboxName:  sandboxName,
+			DurationMs:   durationMs,
+			Metadata:     metadata,
 		})
 		if err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msgf("async %s/%s activity log failed", category, action)
+		}
+	}()
+}
+
+// logTemplateActivity writes a template-scoped activity record. Same async
+// semantics as logSandboxActivity.
+func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamID uuid.UUID, category, action, status string, metadata []byte) {
+	asyncCtx := context.WithoutCancel(reqCtx)
+	go func() {
+		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
+		defer cancel()
+		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+			TemplateID:   pgtype.UUID{Bytes: templateID, Valid: true},
+			ResourceType: "template",
+			TeamID:       teamID,
+			Category:     category,
+			Action:       action,
+			Status:       &status,
+			Metadata:     metadata,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("template_id", templateID.String()).Msgf("async %s/%s activity log failed", category, action)
 		}
 	}()
 }
@@ -248,20 +278,15 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+			// RestoreSnapshot takes an optional envVars map; we pass nil here
+			// because resume is supposed to preserve whatever envs the sandbox
+			// already has baked into the snapshot — not inject new ones.
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
 				respondError(c, ErrInternal)
 				return false
-			}
-			// RestoreSnapshot's proto doesn't carry ResourceLimits yet; it returns
-			// 0 for vcpu/mem. Keep the DB values so we don't overwrite them with 0.
-			if actualVcpu == 0 {
-				actualVcpu = uint32(sandbox.VcpuCount)
-			}
-			if actualMemMiB == 0 {
-				actualMemMiB = uint32(sandbox.MemoryMib)
 			}
 		} else {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
@@ -269,6 +294,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			respondError(c, ErrInternal)
 			return false
 		}
+	}
+
+	// Older vmd builds may return 0 for vcpu/mem on both the Resume and
+	// Restore paths (ResourceLimits field was added later). Fall back to
+	// the sandbox row's existing values so ActivateSandbox doesn't
+	// overwrite them with 0 and trip the sandbox_memory_positive CHECK.
+	if actualVcpu == 0 {
+		actualVcpu = uint32(sandbox.VcpuCount)
+	}
+	if actualMemMiB == 0 {
+		actualMemMiB = uint32(sandbox.MemoryMib)
 	}
 
 	// Detach from cancellation so a client disconnect can't leave the sandbox
@@ -314,7 +350,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
-	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
+	sandbox.VcpuCount = int32(actualVcpu)
+	sandbox.MemoryMib = int32(actualMemMiB)
+	sandbox.IpAddress = ipAddr
+
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	return true
 }
 
@@ -520,7 +560,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	// Async activity log.
-	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -536,6 +576,7 @@ type networkConfigRequest struct {
 
 type createSandboxRequest struct {
 	Name         string                `json:"name" binding:"required,min=1,max=64"`
+	FromTemplate *string               `json:"from_template,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
 
 	// TimeoutSeconds is a hard lifetime cap in seconds, measured from
@@ -627,6 +668,10 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	return resp
 }
 
+// sandboxToResponseWithToken is like sandboxToResponse but also computes and
+// attaches the per-sandbox access token. Used on create/get/resume where the
+// client needs to authenticate subsequent calls; list responses omit it so
+// we don't leak many tokens in one response.
 func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox) sandboxResponse {
 	resp := h.sandboxToResponse(s)
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
@@ -831,6 +876,51 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	// Default the create to the `superserve/base` template so every sandbox
+	// has a consistent baseline image. Callers can opt out by setting
+	// from_template to some other alias/UUID; today the API always routes
+	// through the template/snapshot-restore path.
+	if req.FromTemplate == nil {
+		defaultTpl := "superserve/base"
+		req.FromTemplate = &defaultTpl
+	}
+
+	// If from_template is provided, resolve to the template's snapshot paths
+	// and reuse the existing snapshot-restore code path.
+	var snapshotPath, snapshotMemPath string
+	var templateID pgtype.UUID
+	// Template resources — only populated when the create uses from_template.
+	// vmd.RestoreSnapshot doesn't return ResourceLimits on older builds (proto
+	// gap), so the handler substitutes these at ActivateSandbox time. The
+	// snapshot was built with exactly these values, so they're the
+	// authoritative shape.
+	var templateVcpu, templateMemMiB uint32
+	var fromTemplateAlias, fromTemplateID string
+	if req.FromTemplate != nil {
+		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
+		if err != nil {
+			return // error already responded
+		}
+		if tpl.Status != db.TemplateStatusReady {
+			respondErrorMsg(c, "conflict",
+				fmt.Sprintf("template is not ready (status=%s)", tpl.Status),
+				http.StatusConflict)
+			return
+		}
+		if tpl.SnapshotPath == nil || tpl.MemPath == nil {
+			log.Error().Str("template_id", tpl.ID.String()).Msg("ready template missing snapshot paths")
+			respondError(c, ErrInternal)
+			return
+		}
+		snapshotPath = *tpl.SnapshotPath
+		snapshotMemPath = *tpl.MemPath
+		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
+		templateVcpu = uint32(tpl.Vcpu)
+		templateMemMiB = uint32(tpl.MemoryMib)
+		fromTemplateAlias = tpl.Alias
+		fromTemplateID = tpl.ID.String()
+	}
+
 	// Select a host for this sandbox.
 	var hostID string
 	if h.Scheduler != nil {
@@ -868,17 +958,41 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	insertCh := make(chan insertResult, 1)
 	go func() {
-		sb, insertErr := h.DB.CreateSandbox(insertCtx, db.CreateSandboxParams{
-			ID:             sandboxID,
-			TeamID:         teamID,
-			Name:           req.Name,
-			Status:         db.SandboxStatusStarting,
-			VcpuCount:      1, // placeholders; real values land via ActivateSandbox
-			MemoryMib:      1,
-			HostID:         hostID,
-			TimeoutSeconds: req.TimeoutSeconds,
-			Metadata:       metadataJSON,
-		})
+		var sb db.Sandbox
+		var insertErr error
+		if templateID.Valid {
+			// CreateSandboxFromTemplate holds FOR KEY SHARE on the template
+			// row, serializing with SoftDeleteTemplateIfUnused's FOR UPDATE
+			// so a concurrent template delete is either blocked (we win,
+			// INSERT succeeds) or completes before us (we lose, 0 rows back).
+			sb, insertErr = h.DB.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
+				ID:             sandboxID,
+				TeamID:         teamID,
+				Name:           req.Name,
+				Status:         db.SandboxStatusStarting,
+				VcpuCount:      1, // placeholders; real values land via ActivateSandbox
+				MemoryMib:      1,
+				HostID:         hostID,
+				TimeoutSeconds: req.TimeoutSeconds,
+				Metadata:       metadataJSON,
+				ID_2:           uuid.UUID(templateID.Bytes),
+				TeamID_2:       teamID,
+				TeamID_3:       h.systemTeamID(),
+			})
+		} else {
+			sb, insertErr = h.DB.CreateSandbox(insertCtx, db.CreateSandboxParams{
+				ID:             sandboxID,
+				TeamID:         teamID,
+				Name:           req.Name,
+				Status:         db.SandboxStatusStarting,
+				VcpuCount:      1,
+				MemoryMib:      1,
+				HostID:         hostID,
+				TimeoutSeconds: req.TimeoutSeconds,
+				Metadata:       metadataJSON,
+				TemplateID:     pgtype.UUID{Valid: false},
+			})
+		}
 		insertCh <- insertResult{sandbox: sb, err: insertErr}
 	}()
 
@@ -889,8 +1003,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.CreateInstance(vmdCtx, sandboxID.String(),
-		0, 0, 0, nil, req.EnvVars)
+	// RestoreSnapshot (not ResumeInstance) for the from_template path:
+	// ResumeInstance assumes the VM already exists in vmd's in-memory map
+	// (the pause→resume contract), which is fine for a paused sandbox but
+	// not for a fresh one we're creating now. Restore takes snapshot paths
+	// and boots a new VM from them statelessly. Caller env vars are merged
+	// on top of the template's baked defaults by vmd (boxd resumes with
+	// template context, then the restore RPC posts these on top).
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
@@ -898,10 +1018,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandbox := insertRes.sandbox
 	dbErr := insertRes.err
 
+	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
+	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
+
 	switch {
 	case dbErr != nil && vmdErr != nil:
 		// Both failed — nothing persisted, nothing to clean up.
 		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
+		if templateRace {
+			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
 		respondError(c, ErrInternal)
 		return
 	case dbErr != nil:
@@ -912,6 +1039,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
 		cleanupCancel()
+		if templateRace {
+			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
 		respondError(c, ErrInternal)
 		return
 	case vmdErr != nil:
@@ -925,6 +1056,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
 		})
+		// FailedPrecondition from vmd = snapshot/mem file missing on host.
+		// Surfaces on the from_template restore path; map to 503 so the
+		// user understands this is ops-side, not a bad request.
+		if isVMDFileMissing(vmdErr) {
+			respondError(c, ErrHostStateMissing)
+			return
+		}
 		respondError(c, ErrInternal)
 		return
 	}
@@ -937,8 +1075,18 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Single atomic transition: starting → active with real resources
 	// and IP. VMD's response is the source of truth for vcpu/memory
-	// (they come from the template snapshot, not from what the control
-	// plane requested).
+	// when present.
+	//
+	// Defense-in-depth: if vmd returns 0 for vcpu/memory (e.g. old vmd
+	// without ResourceLimits in RestoreSnapshotResponse), fall back to
+	// the template's values. The template's shape IS the snapshot's shape.
+	if actualVcpu == 0 && templateVcpu > 0 {
+		actualVcpu = templateVcpu
+	}
+	if actualMemMiB == 0 && templateMemMiB > 0 {
+		actualMemMiB = templateMemMiB
+	}
+
 	var ipAddr *netip.Addr
 	if ipAddress != "" {
 		if addr, parseErr := netip.ParseAddr(ipAddress); parseErr == nil {
@@ -1004,7 +1152,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	wg.Wait()
 
-	h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, nil)
+	var createdMeta []byte
+	if fromTemplateAlias != "" {
+		createdMeta, _ = json.Marshal(map[string]string{
+			"from_template": fromTemplateAlias,
+			"template_id":   fromTemplateID,
+		})
+	}
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
@@ -1118,6 +1273,11 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
+	// Atomic post-VMD bookkeeping: upsert the snapshot row (keyed on the
+	// partial unique index over (sandbox_id) WHERE saved=false), link it
+	// to the sandbox, and flip status pausing → paused in a single CTE.
+	// The upsert replaces the old "insert a new row + delete the previous"
+	// flow, so there's no explicit prev-snapshot cleanup to schedule here.
 	triggerName := "pause"
 	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sandboxID,
@@ -1144,7 +1304,8 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	h.logActivityAsync(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
+	// Async observability.
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -1198,6 +1359,12 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 			respondError(c, ErrSandboxGone)
 			return
 		}
+		if isVMDInvalidArgument(err) {
+			// User input was rejected by the VM — surface the vmd-supplied
+			// message (e.g. "executable file not found in PATH") as 400.
+			respondErrorMsg(c, "bad_request", vmdErrorMessage(err), http.StatusBadRequest)
+			return
+		}
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommand failed")
 		respondError(c, ErrInternal)
 		return
@@ -1209,7 +1376,7 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		"exit_code":   exitCode,
 		"duration_ms": durationMs,
 	})
-	h.logActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
 
 	c.JSON(http.StatusOK, gin.H{
 		"stdout":    stdout,
@@ -1345,7 +1512,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
 		}
 
-		h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
+		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 	}
 
 	if body.Metadata != nil {
@@ -1365,7 +1532,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			return
 		}
 
-		h.logActivityAsync(c.Request.Context(), sandbox.ID, teamID, "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
+		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
 	}
 
 	c.Status(http.StatusNoContent)

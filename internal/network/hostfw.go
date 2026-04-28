@@ -3,273 +3,175 @@ package network
 import (
 	"context"
 	"fmt"
-	"net/netip"
 	"os/exec"
 	"sync"
 
-	"github.com/google/nftables"
-	"github.com/google/nftables/expr"
+	"github.com/coreos/go-iptables/iptables"
+	"github.com/rs/zerolog"
 )
 
-const hostTableName = "sandbox-host"
-
-// HostFirewall manages host-level nftables rules shared across all VMs.
-// It handles:
-//   - FORWARD rules between each VM's veth and the host interface
-//   - MASQUERADE for outbound internet
-//   - MSS clamping on forwarded traffic
+// HostFirewall manages host-level iptables rules for VM internet access.
+// Appends per-VM rules to the kernel's built-in chains:
+//   - filter/FORWARD: allow traffic between each VM's veth and the host interface
+//   - nat/POSTROUTING: MASQUERADE outbound traffic from each VM's host IP
+//   - nat/PREROUTING: REDIRECT HTTP to the egress proxy for domain filtering
+//   - filter/FORWARD: MSS clamping on forwarded TCP SYN packets
 //
-// One HostFirewall is created per Manager and lives for the lifetime of the VMD process.
+// Uses coreos/go-iptables (append to built-in chains, no custom table).
+// Rules persist in the kernel across vmd restarts — leaked rules from
+// prior lifetimes match dead veths and are harmless.
 type HostFirewall struct {
 	mu sync.Mutex
 
-	conn  *nftables.Conn
-	table *nftables.Table
-
-	fwdChain *nftables.Chain // FORWARD: per-VM accept rules + MSS clamping
-	natChain *nftables.Chain // POSTROUTING: per-VM MASQUERADE
-
+	ipt       *iptables.IPTables
 	hostIface string
 
-	// Per-VM rule handles for cleanup. Populated by reading back from kernel after Flush.
-	vmRuleHandles map[string][]uint64 // vmID → rule handles
+	httpProxyPort uint16 // egress proxy HTTP inspection port
+	tlsProxyPort  uint16 // egress proxy TLS/SNI inspection port
+
+	// Per-VM rule specs for cleanup.
+	vmRules map[string][]vmRule
 }
 
-// NewHostFirewall creates a host-level nftables table. Must be called from the host namespace.
-func NewHostFirewall(hostIface string) (*HostFirewall, error) {
-	conn, err := nftables.New(nftables.AsLasting())
+type vmRule struct {
+	table   string
+	chain   string
+	args    []string
+	prepend bool // insert at top of chain instead of appending
+}
+
+// NewHostFirewall initializes the host firewall. On first call it adds
+// a static MSS clamp rule. On restart, existing per-VM rules from the
+// previous process are already in the kernel (iptables rules persist)
+// and will be cleaned up when RemoveVM is called — or leaked harmlessly
+// if the VM was already destroyed.
+func NewHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log zerolog.Logger) (*HostFirewall, error) {
+	ipt, err := iptables.New()
 	if err != nil {
-		return nil, fmt.Errorf("new nftables conn: %w", err)
+		return nil, fmt.Errorf("init iptables: %w", err)
 	}
 
-	table := conn.AddTable(&nftables.Table{
-		Name:   hostTableName,
-		Family: nftables.TableFamilyIPv4,
-	})
-
-	acceptPolicy := nftables.ChainPolicyAccept
-
-	fwdChain := conn.AddChain(&nftables.Chain{
-		Name:     "forward",
-		Table:    table,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookForward,
-		Priority: nftables.ChainPriorityFilter,
-		Policy:   &acceptPolicy,
-	})
-
-	natChain := conn.AddChain(&nftables.Chain{
-		Name:     "postrouting",
-		Table:    table,
-		Type:     nftables.ChainTypeNAT,
-		Hooknum:  nftables.ChainHookPostrouting,
-		Priority: nftables.ChainPriorityNATSource,
-		Policy:   &acceptPolicy,
-	})
-
-	// Static rule: MSS clamping on all forwarded TCP SYN packets going out via host interface.
-	conn.AddRule(&nftables.Rule{
-		Table: table,
-		Chain: fwdChain,
-		Exprs: flatten(
-			oifMatch(hostIface),
-			tcpSYNMatch(),
-			mssClampToPMTU(),
-		),
-	})
-
-	if err := conn.Flush(); err != nil {
-		conn.CloseLasting()
-		return nil, fmt.Errorf("flush host firewall: %w", err)
-	}
-
-	return &HostFirewall{
-		conn:          conn,
-		table:         table,
-		fwdChain:      fwdChain,
-		natChain:      natChain,
+	hfw := &HostFirewall{
+		ipt:           ipt,
 		hostIface:     hostIface,
-		vmRuleHandles: make(map[string][]uint64),
-	}, nil
+		httpProxyPort: httpProxyPort,
+		tlsProxyPort:  tlsProxyPort,
+		vmRules:       make(map[string][]vmRule),
+	}
+
+	// Static MSS clamp: applies to all forwarded TCP SYN packets going
+	// out via the host interface. Idempotent — AppendUnique is a no-op
+	// if the rule already exists from a prior vmd lifetime.
+	mssArgs := []string{
+		"-o", hostIface,
+		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS", "--clamp-mss-to-pmtu",
+	}
+	if err := ipt.AppendUnique("filter", "FORWARD", mssArgs...); err != nil {
+		return nil, fmt.Errorf("add MSS clamp rule: %w", err)
+	}
+
+	log.Info().Str("host_iface", hostIface).Msg("host firewall ready (iptables)")
+	return hfw, nil
 }
 
-// AddVM adds forwarding and MASQUERADE rules for a VM's veth interface.
+// AddVM adds FORWARD + MASQUERADE rules for a VM's veth interface.
 func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
 	hfw.mu.Lock()
 	defer hfw.mu.Unlock()
 
-	hostPrefix, err := netip.ParsePrefix(hostCIDR)
-	if err != nil {
-		return fmt.Errorf("parse host CIDR: %w", err)
+	rules := []vmRule{}
+	// Drop UDP/443 so QUIC can't bypass the TCP-only REDIRECT + SNI
+	// allowlist. Must be inserted above the per-veth ACCEPT below.
+	if hfw.tlsProxyPort > 0 {
+		rules = append(rules, vmRule{
+			table: "filter", chain: "FORWARD",
+			args:    []string{"-i", vethName, "-p", "udp", "--dport", "443", "-j", "DROP"},
+			prepend: true,
+		})
 	}
-	srcIP := hostPrefix.Addr().As4()
-
-	// Snapshot current rule count so we can identify new rules after flush.
-	fwdBefore, err := hfw.conn.GetRules(hfw.table, hfw.fwdChain)
-	if err != nil {
-		return fmt.Errorf("get forward rules: %w", err)
+	rules = append(rules,
+		// FORWARD: veth → host interface (outbound)
+		vmRule{table: "filter", chain: "FORWARD", args: []string{"-i", vethName, "-o", hfw.hostIface, "-j", "ACCEPT"}},
+		// FORWARD: host interface → veth (inbound/response)
+		vmRule{table: "filter", chain: "FORWARD", args: []string{"-i", hfw.hostIface, "-o", vethName, "-j", "ACCEPT"}},
+		// POSTROUTING: MASQUERADE outbound from this VM's host IP
+		vmRule{table: "nat", chain: "POSTROUTING", args: []string{"-s", hostCIDR, "-o", hfw.hostIface, "-j", "MASQUERADE"}},
+	)
+	if hfw.httpProxyPort > 0 {
+		rules = append(rules, vmRule{
+			table: "nat", chain: "PREROUTING",
+			args: []string{"-i", vethName, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.httpProxyPort)},
+		})
 	}
-	natBefore, err := hfw.conn.GetRules(hfw.table, hfw.natChain)
-	if err != nil {
-		return fmt.Errorf("get nat rules: %w", err)
-	}
-
-	// FORWARD: veth → host interface (outbound).
-	hfw.conn.AddRule(&nftables.Rule{
-		Table:    hfw.table,
-		Chain:    hfw.fwdChain,
-		UserData: []byte(vmID),
-		Exprs: flatten(
-			iifMatch(vethName),
-			oifMatch(hfw.hostIface),
-			verdictAccept(),
-		),
-	})
-
-	// FORWARD: host interface → veth (inbound/response).
-	hfw.conn.AddRule(&nftables.Rule{
-		Table:    hfw.table,
-		Chain:    hfw.fwdChain,
-		UserData: []byte(vmID),
-		Exprs: flatten(
-			iifMatch(hfw.hostIface),
-			oifMatch(vethName),
-			verdictAccept(),
-		),
-	})
-
-	// POSTROUTING: MASQUERADE outbound traffic from this VM's host IP.
-	hfw.conn.AddRule(&nftables.Rule{
-		Table:    hfw.table,
-		Chain:    hfw.natChain,
-		UserData: []byte(vmID),
-		Exprs: flatten(
-			oifMatch(hfw.hostIface),
-			[]expr.Any{
-				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
-				&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: srcIP[:]},
-			},
-			[]expr.Any{&expr.Masq{}},
-		),
-	})
-
-	if err := hfw.conn.Flush(); err != nil {
-		return fmt.Errorf("flush VM rules: %w", err)
+	if hfw.tlsProxyPort > 0 {
+		rules = append(rules, vmRule{
+			table: "nat", chain: "PREROUTING",
+			args: []string{"-i", vethName, "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", hfw.tlsProxyPort)},
+		})
 	}
 
-	// Read back rules from kernel to get handles for the rules we just added.
-	var handles []uint64
-
-	fwdAfter, err := hfw.conn.GetRules(hfw.table, hfw.fwdChain)
-	if err != nil {
-		return fmt.Errorf("get forward rules after flush: %w", err)
-	}
-	for _, r := range fwdAfter {
-		if isNewRule(r, fwdBefore) && string(r.UserData) == vmID {
-			handles = append(handles, r.Handle)
+	for _, r := range rules {
+		if r.prepend {
+			// Exists-check keeps Insert idempotent across vmd restarts.
+			exists, err := hfw.ipt.Exists(r.table, r.chain, r.args...)
+			if err != nil {
+				return fmt.Errorf("check %s/%s rule for %s: %w", r.table, r.chain, vmID, err)
+			}
+			if !exists {
+				if err := hfw.ipt.Insert(r.table, r.chain, 1, r.args...); err != nil {
+					return fmt.Errorf("insert %s/%s rule for %s: %w", r.table, r.chain, vmID, err)
+				}
+			}
+			continue
+		}
+		if err := hfw.ipt.AppendUnique(r.table, r.chain, r.args...); err != nil {
+			return fmt.Errorf("add %s/%s rule for %s: %w", r.table, r.chain, vmID, err)
 		}
 	}
 
-	natAfter, err := hfw.conn.GetRules(hfw.table, hfw.natChain)
-	if err != nil {
-		return fmt.Errorf("get nat rules after flush: %w", err)
-	}
-	for _, r := range natAfter {
-		if isNewRule(r, natBefore) && string(r.UserData) == vmID {
-			handles = append(handles, r.Handle)
-		}
-	}
-
-	hfw.vmRuleHandles[vmID] = handles
+	hfw.vmRules[vmID] = rules
 	return nil
 }
 
-// RemoveVM removes all host-level rules for a VM using stored handles.
-//
-// If any step fails, the handles are kept in vmRuleHandles so a caller can
-// retry. Silently dropping errors here used to leak rules into the kernel
-// permanently — both a resource leak and a security issue (stale FORWARD
-// ACCEPT and MASQUERADE for a VM that no longer exists).
+// RemoveVM removes all host-level rules for a VM. Errors are logged
+// but don't prevent cleanup of remaining rules — a leaked iptables
+// rule is harmless (matches a veth/IP that no longer exists).
 func (hfw *HostFirewall) RemoveVM(vmID string) error {
 	hfw.mu.Lock()
 	defer hfw.mu.Unlock()
 
-	handles, ok := hfw.vmRuleHandles[vmID]
+	rules, ok := hfw.vmRules[vmID]
 	if !ok {
 		return nil
 	}
 
-	// Build a lookup once.
-	handleSet := make(map[uint64]bool, len(handles))
-	for _, h := range handles {
-		handleSet[h] = true
-	}
-
-	// Query both chains. If GetRules fails, surface the error — we cannot
-	// safely delete by handle without knowing which chain each handle
-	// belongs to, and we must NOT drop the handles from vmRuleHandles or
-	// a retry will have nothing to work with.
-	fwdRules, err := hfw.conn.GetRules(hfw.table, hfw.fwdChain)
-	if err != nil {
-		return fmt.Errorf("get forward rules for cleanup: %w", err)
-	}
-	natRules, err := hfw.conn.GetRules(hfw.table, hfw.natChain)
-	if err != nil {
-		return fmt.Errorf("get nat rules for cleanup: %w", err)
-	}
-
-	// Enqueue deletes for every matching rule.
-	matched := 0
-	for _, r := range fwdRules {
-		if handleSet[r.Handle] {
-			if err := hfw.conn.DelRule(r); err != nil {
-				return fmt.Errorf("delete forward rule handle %d: %w", r.Handle, err)
-			}
-			matched++
-		}
-	}
-	for _, r := range natRules {
-		if handleSet[r.Handle] {
-			if err := hfw.conn.DelRule(r); err != nil {
-				return fmt.Errorf("delete nat rule handle %d: %w", r.Handle, err)
-			}
-			matched++
+	var firstErr error
+	for _, r := range rules {
+		if err := hfw.ipt.DeleteIfExists(r.table, r.chain, r.args...); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("delete %s/%s rule for %s: %w", r.table, r.chain, vmID, err)
 		}
 	}
 
-	// Flush to the kernel. Only remove the VM from the tracking map on
-	// success — if flush fails, a retry can try again.
-	if err := hfw.conn.Flush(); err != nil {
-		return fmt.Errorf("flush rule deletion for vm %s: %w", vmID, err)
-	}
-
-	delete(hfw.vmRuleHandles, vmID)
-	return nil
+	delete(hfw.vmRules, vmID)
+	return firstErr
 }
 
-// Close tears down the host firewall and removes all rules.
+// Close removes all VM rules we've tracked during this vmd lifetime.
+// Rules from prior lifetimes (if any) are left in the kernel — they
+// match veths/IPs that no longer exist and are effectively dead.
 func (hfw *HostFirewall) Close() error {
 	hfw.mu.Lock()
 	defer hfw.mu.Unlock()
 
-	if hfw.conn == nil {
-		return nil
-	}
-	hfw.conn.DelTable(hfw.table)
-	_ = hfw.conn.Flush()
-	err := hfw.conn.CloseLasting()
-	hfw.conn = nil
-	return err
-}
-
-// isNewRule checks if a rule (by handle) exists in the "before" snapshot.
-func isNewRule(r *nftables.Rule, before []*nftables.Rule) bool {
-	for _, b := range before {
-		if b.Handle == r.Handle {
-			return false
+	for vmID, rules := range hfw.vmRules {
+		for _, r := range rules {
+			_ = hfw.ipt.DeleteIfExists(r.table, r.chain, r.args...)
 		}
+		delete(hfw.vmRules, vmID)
 	}
-	return true
+
+	return nil
 }
 
 // enableIPForward enables IPv4 forwarding. Called once during Manager init.
@@ -280,4 +182,3 @@ func enableIPForward(ctx context.Context) error {
 	}
 	return nil
 }
-

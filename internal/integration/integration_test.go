@@ -22,11 +22,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // ---------------------------------------------------------------------------
@@ -34,8 +36,9 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	testPool    *pgxpool.Pool
-	testQueries *db.Queries
+	testPool         *pgxpool.Pool
+	testQueries      *db.Queries
+	testSystemTeamID uuid.UUID
 )
 
 func TestMain(m *testing.M) {
@@ -68,7 +71,52 @@ func TestMain(m *testing.M) {
 	}
 
 	testQueries = db.New(testPool)
+
+	if err := seedSystemTemplate(ctx, testQueries); err != nil {
+		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
+		os.Exit(1)
+	}
+
 	os.Exit(m.Run())
+}
+
+// seedSystemTemplate creates the system team + a ready `superserve/base`
+// template so CreateSandbox's default from_template lookup resolves. Every
+// integration test that POSTs /sandboxes without an explicit from_template
+// relies on this.
+func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
+	team, err := q.CreateTeam(ctx, "superserve-system")
+	if err != nil {
+		return fmt.Errorf("create system team: %w", err)
+	}
+	testSystemTeamID = team.ID
+
+	tpl, err := q.CreateTemplate(ctx, db.CreateTemplateParams{
+		TeamID:    team.ID,
+		Alias:     "superserve/base",
+		BuildSpec: []byte(`{"from":"test","steps":[]}`),
+		Vcpu:      1,
+		MemoryMib: 1024,
+		DiskMib:   4096,
+	})
+	if err != nil {
+		return fmt.Errorf("create superserve/base: %w", err)
+	}
+
+	// Flip to 'ready' with plausible paths so handlers.go's ready-check
+	// passes. The stubVMD ignores these values.
+	_, err = testPool.Exec(ctx,
+		`UPDATE template SET status = 'ready',
+		   rootfs_path = '/tmp/test/rootfs.ext4',
+		   snapshot_path = '/tmp/test/vmstate.snap',
+		   mem_path = '/tmp/test/mem.snap',
+		   size_bytes = 0,
+		   built_at = now()
+		 WHERE id = $1`, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("mark superserve/base ready: %w", err)
+	}
+	return nil
 }
 
 // applyMigrations reads SQL files from supabase/migrations/ and executes them
@@ -114,9 +162,6 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct{}
 
-func (s *stubVMD) CreateInstance(_ context.Context, _ string, _, _, _ uint32, _ map[string]string, _ map[string]string) (string, uint32, uint32, error) {
-	return "10.0.0.1", 1, 1024, nil
-}
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
 func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil
@@ -124,7 +169,7 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string,
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
@@ -139,6 +184,17 @@ func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []st
 	return nil
 }
 func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error { return nil }
+
+func (s *stubVMD) BuildTemplate(_ context.Context, _ vmdclient.BuildTemplateInput) (string, error) {
+	return "build-stub", nil
+}
+func (s *stubVMD) GetBuildStatus(_ context.Context, _ string) (vmdclient.BuildStatusResult, error) {
+	return vmdclient.BuildStatusResult{Status: "ready"}, nil
+}
+func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
+	return nil
+}
 
 // seedTeamAndKey inserts a team + API key and returns (teamID, rawKey).
 func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
@@ -172,8 +228,13 @@ func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
 // preventing goroutine leaks across hundreds of test invocations.
 func newRouter(t *testing.T) *gin.Engine {
 	t.Helper()
-	cfg := &config.Config{Port: "0", VMDAddress: "localhost:0"}
+	cfg := &config.Config{
+		Port:         "0",
+		VMDAddress:   "localhost:0",
+		SystemTeamID: testSystemTeamID.String(),
+	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
+	h.Pool = testPool
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 
@@ -586,7 +647,7 @@ func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	sandboxID, _ := uuid.Parse(sid)
 	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: sandboxID,
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
 		Limit:     20,
 	})
 	if err != nil {
@@ -764,7 +825,7 @@ func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: sandboxID,
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
 		Limit:     20,
 	})
 	if err != nil {
@@ -807,7 +868,7 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: sandboxID,
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
 		Limit:     20,
 	})
 	if err != nil {

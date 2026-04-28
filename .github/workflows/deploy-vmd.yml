@@ -21,6 +21,7 @@ on:
     paths:
       - 'cmd/vmd/**'
       - 'cmd/boxd/**'
+      - 'cmd/template-builder/**'
       - 'internal/vm/**'
       - 'internal/network/**'
       - 'deploy/superserve-vmd.service'
@@ -46,25 +47,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Check if boxd source changed
-        id: boxd-changed
-        run: |
-          # Compare boxd-related paths against the parent commit.
-          if git diff --name-only HEAD~1 HEAD | grep -qE '^cmd/boxd/|^proto/boxdpb/|^proto/boxd\.proto'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build binaries
+        # Always build all three. Hash-compare on the host decides whether
+        # to install boxd + rebuild the rootfs, so a no-op is cheap at rest.
+        # The previous HEAD~1..HEAD diff check missed boxd changes that
+        # landed in any commit other than the last one on a push.
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
-          if [ "${{ steps.boxd-changed.outputs.changed }}" = "true" ]; then
-            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
-          else
-            echo "boxd source unchanged — skipping build"
-          fi
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -82,7 +74,6 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
-          BOXD_CHANGED: ${{ steps.boxd-changed.outputs.changed }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
 
@@ -104,24 +95,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Check if boxd source changed
-        id: boxd-changed
-        run: |
-          if git diff --name-only HEAD~1 HEAD | grep -qE '^cmd/boxd/|^proto/boxdpb/|^proto/boxd\.proto'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build binaries
+        # Always build all three; hash-compare on the host decides install.
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
-          if [ "${{ steps.boxd-changed.outputs.changed }}" = "true" ]; then
-            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
-          else
-            echo "boxd source unchanged — skipping build"
-          fi
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -139,6 +119,5 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
-          BOXD_CHANGED: ${{ steps.boxd-changed.outputs.changed }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
