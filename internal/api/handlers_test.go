@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // ---------------------------------------------------------------------------
@@ -27,7 +28,6 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubVMD struct {
-	createFn         func(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string) (string, error)
 	destroyFn        func(ctx context.Context, id string, force bool) error
 	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
@@ -37,13 +37,6 @@ type stubVMD struct {
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
-func (s *stubVMD) CreateInstance(ctx context.Context, id string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (string, uint32, uint32, error) {
-	if s.createFn != nil {
-		ip, err := s.createFn(ctx, id, vcpu, memMiB, diskMiB, metadata)
-		return ip, 1, 1024, err
-	}
-	return "10.0.0.1", 1, 1024, nil
-}
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
 		return s.destroyFn(ctx, id, force)
@@ -63,7 +56,7 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string, _ map[string]string) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -89,6 +82,21 @@ func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, 
 	if s.updateNetworkFn != nil {
 		return s.updateNetworkFn(ctx, id, allowed, denied, domains)
 	}
+	return nil
+}
+
+// Template build methods — no-op stubs. Handler tests don't exercise
+// the build pipeline; supervisor integration tests are the right place
+// for that. Kept minimal so adding real behavior per test is easy.
+
+func (s *stubVMD) BuildTemplate(_ context.Context, _ vmdclient.BuildTemplateInput) (string, error) {
+	return "", nil
+}
+func (s *stubVMD) GetBuildStatus(_ context.Context, _ string) (vmdclient.BuildStatusResult, error) {
+	return vmdclient.BuildStatusResult{}, nil
+}
+func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
 	return nil
 }
 
@@ -150,6 +158,49 @@ func sandboxRow(s db.Sandbox) *mockRow {
 	}}
 }
 
+// templateRow returns a mockRow that populates a Template from a Scan call
+// matching the 17-column order in sqlc-generated template queries.
+func templateRow(t db.Template) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = t.ID
+		*dest[1].(*uuid.UUID) = t.TeamID
+		*dest[2].(*string) = t.Alias
+		*dest[3].(*db.TemplateStatus) = t.Status
+		*dest[4].(*[]byte) = t.BuildSpec
+		*dest[5].(*int32) = t.Vcpu
+		*dest[6].(*int32) = t.MemoryMib
+		*dest[7].(*int32) = t.DiskMib
+		*dest[8].(**string) = t.RootfsPath
+		*dest[9].(**string) = t.SnapshotPath
+		*dest[10].(**string) = t.MemPath
+		*dest[11].(**int64) = t.SizeBytes
+		*dest[12].(**string) = t.ErrorMessage
+		*dest[13].(*time.Time) = t.CreatedAt
+		*dest[14].(*time.Time) = t.UpdatedAt
+		*dest[15].(*pgtype.Timestamptz) = t.BuiltAt
+		*dest[16].(*pgtype.Timestamptz) = t.DeletedAt
+		return nil
+	}}
+}
+
+// defaultReadyTemplate returns a Template row suitable for tests that don't
+// set from_template explicitly — since the handler now defaults it to
+// "superserve/base", creates route through a template lookup even with no body field.
+func defaultReadyTemplate() db.Template {
+	snap := "/snap/vmstate.snap"
+	mem := "/snap/mem.snap"
+	return db.Template{
+		ID:           uuid.New(),
+		Alias:        "superserve/base",
+		Status:       db.TemplateStatusReady,
+		Vcpu:         1,
+		MemoryMib:    1024,
+		DiskMib:      4096,
+		SnapshotPath: &snap,
+		MemPath:      &mem,
+	}
+}
+
 func notFoundRow() *mockRow {
 	return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
 }
@@ -158,11 +209,11 @@ func errorRow(err error) *mockRow {
 	return &mockRow{scanFn: func(...any) error { return err }}
 }
 
-// activityRow returns a mockRow for CreateActivity's Scan (12 fields).
+// activityRow returns a mockRow for CreateActivity's Scan (14 fields).
 func activityRow() *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = uuid.New()
-		*dest[1].(*uuid.UUID) = uuid.Nil
+		*dest[1].(*pgtype.UUID) = pgtype.UUID{}
 		*dest[2].(*uuid.UUID) = uuid.Nil
 		*dest[3].(*pgtype.UUID) = pgtype.UUID{}
 		*dest[4].(*string) = "sandbox"
@@ -173,6 +224,8 @@ func activityRow() *mockRow {
 		*dest[9].(**string) = nil
 		*dest[10].(*[]byte) = nil
 		*dest[11].(*time.Time) = time.Now()
+		*dest[12].(*pgtype.UUID) = pgtype.UUID{}
+		*dest[13].(*string) = "sandbox"
 		return nil
 	}}
 }
@@ -528,9 +581,14 @@ func TestResumeSandbox_Success(t *testing.T) {
 		t.Error("VMD.ResumeInstance was not called")
 	}
 
+	// Resume returns the minimal {id, status, access_token} shape, not the
+	// full sandbox response.
 	body := parseJSON(t, w)
 	if body["status"] != "active" {
 		t.Errorf("status = %q, want %q", body["status"], "active")
+	}
+	if body["id"] != sandboxID.String() {
+		t.Errorf("id = %q, want %q", body["id"], sandboxID)
 	}
 }
 
@@ -1259,11 +1317,10 @@ func TestCreateSandbox_Success(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
-	vmd := &stubVMD{
-		createFn: func(_ context.Context, id string, _, _, _ uint32, _ map[string]string) (string, error) {
-			return "10.0.0.42", nil
-		},
-	}
+	// Even though the request omits from_template, the handler defaults it
+	// to "superserve/base" and routes through RestoreSnapshot. The stub returns
+	// VMD-reported resources (1 vcpu, 1024 MiB — stubVMD's defaults).
+	vmd := &stubVMD{}
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
@@ -1273,6 +1330,9 @@ func TestCreateSandbox_Success(t *testing.T) {
 					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
 					CreatedAt: time.Now(),
 				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
 			}
 			return activityRow()
 		},
@@ -1342,8 +1402,10 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
+	// With the superserve/base default, CreateSandbox routes through
+	// RestoreSnapshot. Fail it to exercise the VMD-error branch.
 	vmd := &stubVMD{
-		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
+		restoreFn: func(context.Context, string, string, string) (string, error) {
 			return "", fmt.Errorf("vmd unreachable")
 		},
 	}
@@ -1355,6 +1417,9 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 					ID: sandboxID, TeamID: teamID, Name: "sb",
 					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
 				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
 			}
 			return activityRow()
 		},
@@ -1404,8 +1469,13 @@ func TestPauseSandbox_Success(t *testing.T) {
 			case strings.Contains(sql, "'pausing'"):
 				// BeginPause: atomic transition active → pausing, returns *
 				return sandboxRow(sb)
-			case strings.Contains(sql, "INSERT INTO snapshot"):
+			case strings.Contains(sql, "upserted AS"):
 				// FinalizePause: CTE upsert + update, returns snapshot_id
+				return finalizePauseRow(snapshotID)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				// Belt-and-braces: FinalizePause contains an INSERT inside
+				// the upserted CTE; match that too in case the SQL text
+				// routing misses the CTE alias.
 				return finalizePauseRow(snapshotID)
 			case strings.Contains(sql, "FROM sandbox"):
 				// Generic GetSandbox (fallback from BeginPause)
@@ -1422,6 +1492,7 @@ func TestPauseSandbox_Success(t *testing.T) {
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
 
+	// Pause now returns 204 No Content — no response body.
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
 	}
@@ -1432,7 +1503,6 @@ func TestPauseSandbox_Success(t *testing.T) {
 		t.Errorf("expected empty body on 204, got: %s", w.Body.String())
 	}
 }
-
 
 func TestPauseSandbox_NotActive(t *testing.T) {
 	sandboxID := uuid.New()
@@ -1533,7 +1603,6 @@ func TestPauseSandbox_MissingTeamID(t *testing.T) {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
 	}
 }
-
 
 func TestParseSandboxID_Valid(t *testing.T) {
 	w := httptest.NewRecorder()
@@ -1738,11 +1807,7 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	sandboxID := uuid.New()
 
 	var capturedMetadata []byte
-	vmd := &stubVMD{
-		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
-			return "10.0.0.42", nil
-		},
-	}
+	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -1758,6 +1823,9 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 					CreatedAt: time.Now(),
 					Metadata:  capturedMetadata,
 				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
 			}
 			return activityRow()
 		},
@@ -1799,11 +1867,7 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	sandboxID := uuid.New()
 
 	var capturedMetadata []byte
-	vmd := &stubVMD{
-		createFn: func(context.Context, string, uint32, uint32, uint32, map[string]string) (string, error) {
-			return "10.0.0.42", nil
-		},
-	}
+	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -1817,6 +1881,9 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 512,
 					CreatedAt: time.Now(),
 				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
 			}
 			return activityRow()
 		},

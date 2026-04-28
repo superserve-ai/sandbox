@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,21 +56,39 @@ func main() {
 	log.SetPrefix("[boxd] ")
 	log.SetFlags(log.Ltime)
 
+	// Ensure defaultHome exists before we accept any RPCs. Start()
+	// defaults cmd.Dir to defaultHome when the caller omits Cwd; if the
+	// directory is missing, exec fails with "chdir: no such file or
+	// directory" — a cryptic failure mode for template builds whose base
+	// images don't create /home/user (python:3.11, ubuntu:24.04, etc.).
+	//
+	// Fatal on failure — boxd can't reliably serve Start() requests
+	// without a working defaultHome, and silently degrading would push
+	// the failure to the first user exec.
+	if err := os.MkdirAll(defaultHome, 0o755); err != nil {
+		log.Fatalf("ensure defaultHome %s: %v", defaultHome, err)
+	}
+	// Chmod separately — MkdirAll respects umask and may strip group /
+	// other bits. We want exactly 0755 so non-root processes can cd in.
+	if err := os.Chmod(defaultHome, 0o755); err != nil {
+		log.Fatalf("chmod defaultHome %s: %v", defaultHome, err)
+	}
+
 	mux := http.NewServeMux()
 
-	env := &sandboxEnv{}
+	ctx := &sandboxContext{}
 
 	// Connect RPC services.
 	procService := &processService{
 		processes: &sync.Map{},
-		env:       env,
+		ctx:       ctx,
 	}
 	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
 	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
 
 	// Raw HTTP endpoints (file content transfer + health + init).
 	mux.HandleFunc("/files", handleFiles)
-	mux.HandleFunc("/init", handleInit(env))
+	mux.HandleFunc("/init", handleInit(ctx))
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", httpPort)
@@ -91,9 +111,20 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok"}`)
 }
 
-// handleInit accepts sandbox-level environment variables from VMD after boot.
-// POST /init with JSON body {"env_vars": {"KEY": "VALUE", ...}}.
-func handleInit(env *sandboxEnv) http.HandlerFunc {
+// handleInit updates boxd's in-memory sandbox context. Called at least
+// once by vmd after the VM is healthy, and also by template-builder
+// before it snapshots the template so the context travels in the
+// snapshot. Fields are additive — env_vars merge (new keys overwrite),
+// default_user / default_workdir replace only when non-empty.
+//
+// POST /init
+//
+//	{
+//	  "env_vars":        {"KEY":"VALUE", ...}, // optional
+//	  "default_user":    "appuser",             // optional
+//	  "default_workdir": "/srv/app"             // optional
+//	}
+func handleInit(ctx *sandboxContext) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "POST")
@@ -102,17 +133,18 @@ func handleInit(env *sandboxEnv) http.HandlerFunc {
 		}
 
 		var body struct {
-			EnvVars map[string]string `json:"env_vars"`
+			EnvVars        map[string]string `json:"env_vars"`
+			DefaultUser    string            `json:"default_user"`
+			DefaultWorkdir string            `json:"default_workdir"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
 
-		if len(body.EnvVars) > 0 {
-			env.set(body.EnvVars)
-			log.Printf("init: set %d env var(s)", len(body.EnvVars))
-		}
+		ctx.merge(body.EnvVars, body.DefaultUser, body.DefaultWorkdir)
+		log.Printf("init: merged %d env var(s) user=%q workdir=%q",
+			len(body.EnvVars), body.DefaultUser, body.DefaultWorkdir)
 
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok"}`)
@@ -128,50 +160,144 @@ type runningProcess struct {
 	tty *os.File // nil for non-PTY processes.
 }
 
-// sandboxEnv holds sandbox-level environment variables set via POST /init.
-// These are injected into every process boxd spawns, underneath per-request
-// overrides from StartRequest.envs.
-type sandboxEnv struct {
-	mu   sync.RWMutex
-	vars map[string]string
+// sandboxContext holds the sandbox-level state that persists across exec
+// calls: env vars, the default user commands run as, and the default cwd.
+// Populated by POST /init. Template-builder posts the template's defaults
+// before snapshotting so the context travels in the Firecracker snapshot;
+// vmd posts caller-provided values on restore, which merge on top.
+type sandboxContext struct {
+	mu             sync.RWMutex
+	envVars        map[string]string
+	defaultUser    string
+	defaultWorkdir string
 }
 
-func (e *sandboxEnv) set(vars map[string]string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.vars = vars
-}
-
-func (e *sandboxEnv) environ() []string {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	out := make([]string, 0, len(e.vars))
-	for k, v := range e.vars {
-		out = append(out, k+"="+v)
+// merge applies an /init payload to the context. envVars are merged key by
+// key (later keys overwrite). user/workdir replace only when non-empty so
+// a later restore-time init without those fields preserves template values
+// baked into the snapshot.
+func (c *sandboxContext) merge(envVars map[string]string, user, workdir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.envVars == nil {
+		c.envVars = map[string]string{}
 	}
-	return out
+	for k, v := range envVars {
+		c.envVars[k] = v
+	}
+	if user != "" {
+		c.defaultUser = user
+	}
+	if workdir != "" {
+		c.defaultWorkdir = workdir
+	}
+}
+
+func (c *sandboxContext) snapshot() (map[string]string, string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]string, len(c.envVars))
+	for k, v := range c.envVars {
+		out[k] = v
+	}
+	return out, c.defaultUser, c.defaultWorkdir
 }
 
 type processService struct {
 	boxdpbconnect.UnimplementedProcessServiceHandler
 	processes *sync.Map // pid → *runningProcess
-	env       *sandboxEnv
+	ctx       *sandboxContext
 }
 
 // buildEnv assembles the environment for a child process. Layers (last wins):
-// 1. OS base env  2. system defaults (PATH, HOME, USER)  3. sandbox-level
-// env vars from /init  4. per-request env vars from StartRequest.envs.
-func (s *processService) buildEnv(requestEnvs map[string]string) []string {
+// 1. OS base env  2. system defaults (PATH, HOME, USER — HOME/USER keyed to
+// the effective user)  3. sandbox-level env vars from /init  4. per-request
+// env vars from StartRequest.envs.
+func (s *processService) buildEnv(requestEnvs map[string]string, effective *user.User) []string {
+	envVars, _, _ := s.ctx.snapshot()
+
+	home := defaultHome
+	userName := "user"
+	if effective != nil {
+		home = effective.HomeDir
+		if home == "" {
+			home = "/home/" + effective.Username
+		}
+		userName = effective.Username
+	}
+
 	env := append(os.Environ(),
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME="+defaultHome,
-		"USER=user",
+		"HOME="+home,
+		"USER="+userName,
 	)
-	env = append(env, s.env.environ()...)
+	for k, v := range envVars {
+		env = append(env, k+"="+v)
+	}
 	for k, v := range requestEnvs {
 		env = append(env, k+"="+v)
 	}
 	return env
+}
+
+// pathFromEnv returns the PATH value from a KEY=VALUE slice. The last
+// PATH entry wins, mirroring exec's last-wins env semantics.
+func pathFromEnv(env []string) string {
+	var path string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			path = strings.TrimPrefix(kv, "PATH=")
+		}
+	}
+	return path
+}
+
+// lookPathIn resolves `file` against the given PATH value. Mirrors
+// os/exec.LookPath but uses a passed-in PATH instead of boxd's own.
+// Used so bare command names (e.g. "python") resolve against the child
+// process's effective PATH, which may include per-request overrides.
+func lookPathIn(file, pathEnv string) (string, error) {
+	if pathEnv == "" {
+		return "", fmt.Errorf("PATH is empty")
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			dir = "."
+		}
+		p := filepath.Join(dir, file)
+		fi, err := os.Stat(p)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		// Executable by any of user/group/other.
+		if fi.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("executable file not found in PATH")
+}
+
+// resolveUser looks up a user by name and returns its uid/gid for use with
+// SysProcAttr.Credential. Returns (nil, nil) when the user is empty or is
+// "root" — the caller should run without a Credential in that case so the
+// child inherits boxd's uid (root).
+func resolveUser(name string) (*user.User, *syscall.Credential, error) {
+	if name == "" || name == "root" {
+		return nil, nil, nil
+	}
+	u, err := user.Lookup(name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("user %q not found: %w", name, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse uid for %q: %w", name, err)
+	}
+	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse gid for %q: %w", name, err)
+	}
+	return u, &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
 }
 
 func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
@@ -181,31 +307,66 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 	if cmdName == "" {
 		cmdName = defaultShell
 	}
-
 	args := msg.GetArgs()
-	cmd := exec.Command(cmdName, args...)
-	cmd.Dir = msg.GetCwd()
-	if cmd.Dir == "" {
-		cmd.Dir = defaultHome
+
+	// Resolve effective user: explicit request wins, else template default
+	// (from /init), else boxd's own uid (root).
+	_, defaultUser, defaultWorkdir := s.ctx.snapshot()
+	effectiveUser := msg.GetUser()
+	if effectiveUser == "" {
+		effectiveUser = defaultUser
+	}
+	usr, cred, err := resolveUser(effectiveUser)
+	if err != nil {
+		return connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
-	cmd.Env = s.buildEnv(msg.GetEnvs())
+	// Resolve cwd: explicit request wins, else template default, else
+	// user's home dir (if we resolved a user), else boxd's defaultHome.
+	cwd := msg.GetCwd()
+	if cwd == "" {
+		cwd = defaultWorkdir
+	}
+	if cwd == "" {
+		if usr != nil && usr.HomeDir != "" {
+			cwd = usr.HomeDir
+		} else {
+			cwd = defaultHome
+		}
+	}
 
 	timeout := time.Duration(msg.GetTimeoutMs()) * time.Millisecond
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
-		cmd = exec.CommandContext(ctx, cmdName, args...)
-		cmd.Dir = msg.GetCwd()
-		if cmd.Dir == "" {
-			cmd.Dir = defaultHome
+	}
+
+	// Resolve bare command names against the CHILD's PATH, not boxd's own.
+	// Go's exec.Command would otherwise call exec.LookPath against
+	// os.Getenv("PATH") — which is boxd's inherited PATH (often empty when
+	// boxd is started by a minimal init). Rebuilding the child env first
+	// lets us look up `python` / `node` / `sh` against the PATH the child
+	// is actually about to receive, including any per-request overrides.
+	childEnv := s.buildEnv(msg.GetEnvs(), usr)
+	resolvedCmd := cmdName
+	if filepath.Base(cmdName) == cmdName {
+		p, err := lookPathIn(cmdName, pathFromEnv(childEnv))
+		if err != nil {
+			return connect.NewError(connect.CodeInvalidArgument,
+				fmt.Errorf("resolve %q: %w", cmdName, err))
 		}
-		cmd.Env = s.buildEnv(msg.GetEnvs())
+		resolvedCmd = p
+	}
+
+	cmd := exec.CommandContext(ctx, resolvedCmd, args...)
+	cmd.Dir = cwd
+	cmd.Env = childEnv
+	if cred != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 
 	isPTY := msg.GetPty() != nil
-
 	if isPTY {
 		return s.startPTY(ctx, cmd, msg, stream)
 	}
@@ -313,6 +474,28 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 		return err
 	}
 
+	// Fan stdout + stderr through a multiplex so a single consumer owns
+	// stream.Send. connect-go's ServerStream is not safe for concurrent
+	// use — direct Send from both readers races the HTTP/1.1 chunked
+	// writer and produces malformed frames ("bare LF", "invalid byte in
+	// chunk length") observed under load.
+	mux := NewMultiplexedChannel[*pb.ProcessEvent](256)
+	consumer, _ := mux.Fork()
+
+	sendDone := make(chan error, 1)
+	go func() {
+		var firstErr error
+		for ev := range consumer {
+			if firstErr != nil {
+				continue // keep draining so the mux can close cleanly
+			}
+			if err := stream.Send(ev); err != nil {
+				firstErr = err
+			}
+		}
+		sendDone <- firstErr
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -324,11 +507,11 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 			if n > 0 {
 				data := make([]byte, n)
 				copy(data, buf[:n])
-				_ = stream.Send(&pb.ProcessEvent{
+				mux.Source <- &pb.ProcessEvent{
 					Event: &pb.ProcessEvent_Data{Data: &pb.DataEvent{
 						Output: &pb.DataEvent_Stdout{Stdout: data},
 					}},
-				})
+				}
 			}
 			if readErr != nil {
 				return
@@ -344,11 +527,11 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 			if n > 0 {
 				data := make([]byte, n)
 				copy(data, buf[:n])
-				_ = stream.Send(&pb.ProcessEvent{
+				mux.Source <- &pb.ProcessEvent{
 					Event: &pb.ProcessEvent_Data{Data: &pb.DataEvent{
 						Output: &pb.DataEvent_Stderr{Stderr: data},
 					}},
-				})
+				}
 			}
 			if readErr != nil {
 				return
@@ -358,6 +541,13 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 
 	wg.Wait()
 	cmd.Wait()
+
+	// Flush data events to the stream before sending End. Closing the
+	// mux drains it, closes the consumer channel, and unblocks sendDone.
+	close(mux.Source)
+	if sendErr := <-sendDone; sendErr != nil {
+		return sendErr
+	}
 
 	exitCode := int32(0)
 	if cmd.ProcessState != nil {

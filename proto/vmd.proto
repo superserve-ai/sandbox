@@ -6,9 +6,6 @@ option go_package = "github.com/superserve-ai/sandbox/proto/vmdpb";
 
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 service VMDaemon {
-  // CreateVM provisions a new microVM with the specified configuration.
-  rpc CreateVM(CreateVMRequest) returns (CreateVMResponse);
-
   // DestroyVM terminates a running microVM and cleans up all associated resources.
   rpc DestroyVM(DestroyVMRequest) returns (DestroyVMResponse);
 
@@ -41,6 +38,128 @@ service VMDaemon {
 
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
+
+  // BuildTemplate kicks off a template build asynchronously. Returns a
+  // build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
+  // for progress and uses CancelBuild(build_vm_id) to abort.
+  rpc BuildTemplate(BuildTemplateRequest) returns (BuildTemplateResponse);
+
+  // GetBuildStatus returns the current state of a build dispatched via
+  // BuildTemplate. Used by the control plane's build supervisor to poll
+  // until a terminal status is reached.
+  rpc GetBuildStatus(GetBuildStatusRequest) returns (GetBuildStatusResponse);
+
+  // CancelBuild aborts an in-flight build and tears down the build VM.
+  // Idempotent — no-op for unknown or already-terminal builds.
+  rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);
+
+  // StreamBuildLogs returns a server-streaming feed of log events for a
+  // build. Replays buffered history in order first, then streams live
+  // events as they arrive. Closes when the build reaches a terminal
+  // status. Used by the control plane to drive /builds/:id/logs SSE.
+  rpc StreamBuildLogs(StreamBuildLogsRequest) returns (stream BuildLogEvent);
+}
+
+// ---------------------------------------------------------------------------
+// BuildTemplate
+// ---------------------------------------------------------------------------
+
+message BuildTemplateRequest {
+  string template_id = 1;          // Key under which the snapshot is registered.
+  string from = 2;                 // OCI image reference, e.g. "python:3.11".
+  repeated BuildStep steps = 3;    // Ordered build steps executed inside the VM.
+  string start_cmd = 4;            // Optional: started before snapshot, captured live.
+  string ready_cmd = 5;            // Optional: polled until exit 0 before snapshot.
+  uint32 vcpu = 6;
+  uint32 memory_mib = 7;
+  uint32 disk_mib = 8;
+  // Optional caller-provided id. When empty, vmd generates one.
+  string build_vm_id = 9;
+}
+
+message BuildStep {
+  // Exactly one of the fields below is set per step. Matches the canonical
+  // build_spec shape persisted in the template table's jsonb column.
+  // Field number 2 is reserved — previously held a now-removed copy op.
+  oneof op {
+    string run = 1;              // Shell command run via /bin/sh -c.
+    BuildEnvOp env = 3;          // Env var applied to subsequent run steps.
+    string workdir = 4;          // Working directory for subsequent run steps.
+    BuildUserOp user = 5;        // Switch the user subsequent steps run as.
+  }
+  reserved 2;
+  reserved "copy";
+}
+
+message BuildEnvOp {
+  string key = 1;
+  string value = 2;
+}
+
+message BuildUserOp {
+  string name = 1;
+  bool   sudo = 2;  // Grant passwordless sudo when true.
+}
+
+message BuildTemplateResponse {
+  // Opaque identifier the caller polls via GetBuildStatus. Typically
+  // "build-" + template_id, but treat as opaque.
+  string build_vm_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// GetBuildStatus / CancelBuild
+// ---------------------------------------------------------------------------
+
+message GetBuildStatusRequest {
+  string build_vm_id = 1;
+}
+
+message GetBuildStatusResponse {
+  // One of: "running", "snapshotting", "ready", "failed", "cancelled".
+  // "ready"/"failed"/"cancelled" are terminal — no future transitions.
+  string status = 1;
+
+  // Populated on ready.
+  string snapshot_path = 2;
+  string mem_file_path = 3;
+  string rootfs_path = 4;
+  string resolved_digest = 5;
+  int64 size_bytes = 6;
+
+  // Populated on failed / cancelled.
+  string error_message = 7;
+
+  int64 started_at_unix = 8;
+  int64 ended_at_unix = 9;  // 0 until terminal.
+
+  // Present when the caller's build_vm_id is unknown on this host.
+  // Supervisors treat "unknown on this host" as a hard failure since vmd
+  // doesn't survive across restarts for in-memory registry.
+  bool not_found = 10;
+}
+
+message CancelBuildRequest {
+  string build_vm_id = 1;
+}
+
+message CancelBuildResponse {}
+
+message StreamBuildLogsRequest {
+  string build_vm_id = 1;
+}
+
+message BuildLogEvent {
+  int64 timestamp_unix = 1;       // Server-side emit time, seconds since epoch.
+  int64 timestamp_unix_nanos = 2; // Nanos-since-epoch for sub-second ordering.
+  // Stream source: "stdout" / "stderr" forwarded from boxd, "system" for
+  // supervisor-emitted text (step boundaries, "snapshotting", terminal).
+  string stream = 3;
+  string text = 4;
+  // Present on the final event emitted when the build finalizes. Caller
+  // should close its SSE connection after receiving a finished event.
+  bool finished = 5;
+  string status = 6; // "ready" | "failed" | "cancelled", set when finished.
 }
 
 // ---------------------------------------------------------------------------
@@ -75,31 +194,6 @@ message SandboxNetworkEgressConfig {
   repeated string allowed_cidrs = 1;    // CIDRs explicitly allowed (e.g. "8.8.8.8/32").
   repeated string denied_cidrs = 2;     // CIDRs explicitly denied (e.g. "0.0.0.0/0" to block all).
   repeated string allowed_domains = 3;  // Domains allowed via TCP proxy (e.g. "api.openai.com", "*.github.com").
-}
-
-// ---------------------------------------------------------------------------
-// CreateVM
-// ---------------------------------------------------------------------------
-
-message CreateVMRequest {
-  string vm_id = 1;
-  string base_rootfs_path = 2;   // Path to the base rootfs image.
-  string kernel_path = 3;        // Path to the kernel image.
-  string kernel_args = 4;        // Boot arguments for the kernel.
-  ResourceLimits resource_limits = 5;
-  NetworkConfig network_config = 6;
-  map<string, string> metadata = 7;   // Arbitrary key-value pairs.
-  SandboxNetworkConfig sandbox_network = 8;  // Per-sandbox egress rules (optional).
-  map<string, string> env_vars = 9;   // Environment variables injected into every process in the VM.
-}
-
-message CreateVMResponse {
-  string vm_id = 1;
-  string socket_path = 2;
-  string ip_address = 3;
-  string tap_device = 4;
-  uint32 pid = 5;
-  ResourceLimits resource_limits = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +272,9 @@ message RestoreSnapshotRequest {
   string overlay_path = 4;         // COW overlay for the restored rootfs.
   ResourceLimits resource_limits = 5;
   NetworkConfig network_config = 6;
+  // Per-sandbox env vars merged on top of the template's baked defaults
+  // (captured in the snapshot). Caller keys override template keys.
+  map<string, string> env_vars = 7;
 }
 
 message RestoreSnapshotResponse {
@@ -185,6 +282,7 @@ message RestoreSnapshotResponse {
   string socket_path = 2;
   string ip_address = 3;
   uint32 pid = 4;
+  ResourceLimits resource_limits = 5;
 }
 
 // ---------------------------------------------------------------------------

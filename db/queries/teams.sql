@@ -24,3 +24,7 @@ RETURNING *;
 -- name: DeleteTeam :exec
 DELETE FROM team
 WHERE id = $1;
+
+-- name: GetTeamBuildConcurrency :one
+-- Per-team max concurrent template builds. Used by the build supervisor.
+SELECT build_concurrency FROM team WHERE id = $1;

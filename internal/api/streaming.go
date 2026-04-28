@@ -91,31 +91,29 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		})
 
 	if err != nil {
-		// If VMD says the VM is gone, mark the sandbox failed. The HTTP
-		// response has already committed 200 OK (SSE headers flushed
+		// HTTP response has already committed 200 OK (SSE headers flushed
 		// before the call), so we can't downgrade the status code —
-		// instead emit a "gone" event in the stream so clients can
-		// distinguish this from transient errors.
-		if isVMDNotFound(err) {
+		// instead emit a coded error event in the stream so clients can
+		// distinguish these cases from transient errors.
+		var code, msg string
+		switch {
+		case isVMDNotFound(err):
 			log.Warn().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ExecCommandStream: VM unavailable, marking sandbox failed")
 			h.markSandboxFailedAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID)
-			errEvent, _ := json.Marshal(gin.H{
-				"error":    "sandbox VM is no longer available",
-				"code":     "gone",
-				"finished": true,
-			})
-			fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
-			flusher.Flush()
-		} else {
+			code, msg = "gone", "sandbox VM is no longer available"
+		case isVMDInvalidArgument(err):
+			code, msg = "bad_request", vmdErrorMessage(err)
+		default:
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("streaming sandbox exec failed")
-			errEvent, _ := json.Marshal(gin.H{
-				"error":    "A problem occurred while running the command. Please try again, or contact the team if it persists.",
-				"code":     "exec_failed",
-				"finished": true,
-			})
-			fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
-			flusher.Flush()
+			code, msg = "exec_failed", "A problem occurred while running the command. Please try again, or contact the team if it persists."
 		}
+		errEvent, _ := json.Marshal(gin.H{
+			"error":    msg,
+			"code":     code,
+			"finished": true,
+		})
+		fmt.Fprintf(c.Writer, "data: %s\n\n", errEvent)
+		flusher.Flush()
 	}
 
 	durationMs := int32(time.Since(start).Milliseconds())
@@ -130,5 +128,5 @@ func (h *Handlers) ExecSandboxStream(c *gin.Context) {
 		"exit_code":   lastExitCode,
 		"duration_ms": durationMs,
 	})
-	h.logActivityAsync(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", actStatus, &sandbox.Name, &durationMs, metadata)
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", actStatus, &sandbox.Name, &durationMs, metadata)
 }

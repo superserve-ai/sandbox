@@ -19,7 +19,7 @@ make migrate-up
 make run-controlplane
 ```
 
-VMD requires a Linux host with KVM. VMD + boxd setup docs coming soon.
+VMD requires a Linux host with KVM.
 
 ### Code generation
 

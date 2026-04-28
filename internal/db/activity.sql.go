@@ -13,27 +13,39 @@ import (
 )
 
 const createActivity = `-- name: CreateActivity :one
-INSERT INTO activity (sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at
+INSERT INTO activity (
+  sandbox_id, template_id, resource_type,
+  team_id, actor_id,
+  category, action, status,
+  sandbox_name, duration_ms, error, metadata
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+RETURNING id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at, template_id, resource_type
 `
 
 type CreateActivityParams struct {
-	SandboxID   uuid.UUID   `json:"sandbox_id"`
-	TeamID      uuid.UUID   `json:"team_id"`
-	ActorID     pgtype.UUID `json:"actor_id"`
-	Category    string      `json:"category"`
-	Action      string      `json:"action"`
-	Status      *string     `json:"status"`
-	SandboxName *string     `json:"sandbox_name"`
-	DurationMs  *int32      `json:"duration_ms"`
-	Error       *string     `json:"error"`
-	Metadata    []byte      `json:"metadata"`
+	SandboxID    pgtype.UUID `json:"sandbox_id"`
+	TemplateID   pgtype.UUID `json:"template_id"`
+	ResourceType string      `json:"resource_type"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	ActorID      pgtype.UUID `json:"actor_id"`
+	Category     string      `json:"category"`
+	Action       string      `json:"action"`
+	Status       *string     `json:"status"`
+	SandboxName  *string     `json:"sandbox_name"`
+	DurationMs   *int32      `json:"duration_ms"`
+	Error        *string     `json:"error"`
+	Metadata     []byte      `json:"metadata"`
 }
 
+// Generic insert: caller sets resource_type + the matching FK (sandbox_id or
+// template_id). The CHECK constraint on the table enforces that exactly one
+// FK is populated and matches resource_type.
 func (q *Queries) CreateActivity(ctx context.Context, arg CreateActivityParams) (Activity, error) {
 	row := q.db.QueryRow(ctx, createActivity,
 		arg.SandboxID,
+		arg.TemplateID,
+		arg.ResourceType,
 		arg.TeamID,
 		arg.ActorID,
 		arg.Category,
@@ -58,12 +70,14 @@ func (q *Queries) CreateActivity(ctx context.Context, arg CreateActivityParams) 
 		&i.Error,
 		&i.Metadata,
 		&i.CreatedAt,
+		&i.TemplateID,
+		&i.ResourceType,
 	)
 	return i, err
 }
 
 const listActivityByCategory = `-- name: ListActivityByCategory :many
-SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at FROM activity
+SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at, template_id, resource_type FROM activity
 WHERE team_id = $1 AND category = $2
 ORDER BY created_at DESC
 LIMIT $3
@@ -97,6 +111,8 @@ func (q *Queries) ListActivityByCategory(ctx context.Context, arg ListActivityBy
 			&i.Error,
 			&i.Metadata,
 			&i.CreatedAt,
+			&i.TemplateID,
+			&i.ResourceType,
 		); err != nil {
 			return nil, err
 		}
@@ -109,15 +125,15 @@ func (q *Queries) ListActivityByCategory(ctx context.Context, arg ListActivityBy
 }
 
 const listActivityBySandbox = `-- name: ListActivityBySandbox :many
-SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at FROM activity
+SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at, template_id, resource_type FROM activity
 WHERE sandbox_id = $1
 ORDER BY created_at DESC
 LIMIT $2
 `
 
 type ListActivityBySandboxParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Limit     int32     `json:"limit"`
+	SandboxID pgtype.UUID `json:"sandbox_id"`
+	Limit     int32       `json:"limit"`
 }
 
 func (q *Queries) ListActivityBySandbox(ctx context.Context, arg ListActivityBySandboxParams) ([]Activity, error) {
@@ -142,6 +158,8 @@ func (q *Queries) ListActivityBySandbox(ctx context.Context, arg ListActivityByS
 			&i.Error,
 			&i.Metadata,
 			&i.CreatedAt,
+			&i.TemplateID,
+			&i.ResourceType,
 		); err != nil {
 			return nil, err
 		}
@@ -154,7 +172,7 @@ func (q *Queries) ListActivityBySandbox(ctx context.Context, arg ListActivityByS
 }
 
 const listActivityByTeam = `-- name: ListActivityByTeam :many
-SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at FROM activity
+SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at, template_id, resource_type FROM activity
 WHERE team_id = $1
 ORDER BY created_at DESC
 LIMIT $2
@@ -187,6 +205,55 @@ func (q *Queries) ListActivityByTeam(ctx context.Context, arg ListActivityByTeam
 			&i.Error,
 			&i.Metadata,
 			&i.CreatedAt,
+			&i.TemplateID,
+			&i.ResourceType,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listActivityByTemplate = `-- name: ListActivityByTemplate :many
+SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at, template_id, resource_type FROM activity
+WHERE template_id = $1
+ORDER BY created_at DESC
+LIMIT $2
+`
+
+type ListActivityByTemplateParams struct {
+	TemplateID pgtype.UUID `json:"template_id"`
+	Limit      int32       `json:"limit"`
+}
+
+func (q *Queries) ListActivityByTemplate(ctx context.Context, arg ListActivityByTemplateParams) ([]Activity, error) {
+	rows, err := q.db.Query(ctx, listActivityByTemplate, arg.TemplateID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Activity{}
+	for rows.Next() {
+		var i Activity
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.TeamID,
+			&i.ActorID,
+			&i.Category,
+			&i.Action,
+			&i.Status,
+			&i.SandboxName,
+			&i.DurationMs,
+			&i.Error,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.TemplateID,
+			&i.ResourceType,
 		); err != nil {
 			return nil, err
 		}

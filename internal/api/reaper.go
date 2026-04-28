@@ -191,7 +191,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	}
 
 	l.Info().Msg("reaper: sandbox paused due to timeout")
-	h.logActivityAsync(ctx, sbx.ID, sbx.TeamID, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
+	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is

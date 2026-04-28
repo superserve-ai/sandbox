@@ -14,7 +14,7 @@ import (
 const createTeam = `-- name: CreateTeam :one
 INSERT INTO team (name)
 VALUES ($1)
-RETURNING id, name, created_at, updated_at
+RETURNING id, name, created_at, updated_at, build_concurrency
 `
 
 func (q *Queries) CreateTeam(ctx context.Context, name string) (Team, error) {
@@ -25,6 +25,7 @@ func (q *Queries) CreateTeam(ctx context.Context, name string) (Team, error) {
 		&i.Name,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.BuildConcurrency,
 	)
 	return i, err
 }
@@ -40,7 +41,7 @@ func (q *Queries) DeleteTeam(ctx context.Context, id uuid.UUID) error {
 }
 
 const getTeam = `-- name: GetTeam :one
-SELECT id, name, created_at, updated_at FROM team
+SELECT id, name, created_at, updated_at, build_concurrency FROM team
 WHERE id = $1
 `
 
@@ -52,12 +53,25 @@ func (q *Queries) GetTeam(ctx context.Context, id uuid.UUID) (Team, error) {
 		&i.Name,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.BuildConcurrency,
 	)
 	return i, err
 }
 
+const getTeamBuildConcurrency = `-- name: GetTeamBuildConcurrency :one
+SELECT build_concurrency FROM team WHERE id = $1
+`
+
+// Per-team max concurrent template builds. Used by the build supervisor.
+func (q *Queries) GetTeamBuildConcurrency(ctx context.Context, id uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, getTeamBuildConcurrency, id)
+	var build_concurrency int32
+	err := row.Scan(&build_concurrency)
+	return build_concurrency, err
+}
+
 const getTeamByName = `-- name: GetTeamByName :one
-SELECT id, name, created_at, updated_at FROM team
+SELECT id, name, created_at, updated_at, build_concurrency FROM team
 WHERE name = $1
 `
 
@@ -69,12 +83,13 @@ func (q *Queries) GetTeamByName(ctx context.Context, name string) (Team, error) 
 		&i.Name,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.BuildConcurrency,
 	)
 	return i, err
 }
 
 const listTeams = `-- name: ListTeams :many
-SELECT id, name, created_at, updated_at FROM team
+SELECT id, name, created_at, updated_at, build_concurrency FROM team
 ORDER BY created_at DESC
 `
 
@@ -92,6 +107,7 @@ func (q *Queries) ListTeams(ctx context.Context) ([]Team, error) {
 			&i.Name,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.BuildConcurrency,
 		); err != nil {
 			return nil, err
 		}
@@ -107,7 +123,7 @@ const updateTeamName = `-- name: UpdateTeamName :one
 UPDATE team
 SET name = $2, updated_at = now()
 WHERE id = $1
-RETURNING id, name, created_at, updated_at
+RETURNING id, name, created_at, updated_at, build_concurrency
 `
 
 type UpdateTeamNameParams struct {
@@ -123,6 +139,7 @@ func (q *Queries) UpdateTeamName(ctx context.Context, arg UpdateTeamNameParams) 
 		&i.Name,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.BuildConcurrency,
 	)
 	return i, err
 }

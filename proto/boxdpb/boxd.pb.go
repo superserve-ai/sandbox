@@ -22,13 +22,16 @@ const (
 )
 
 type StartRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Cmd           string                 `protobuf:"bytes,1,opt,name=cmd,proto3" json:"cmd,omitempty"`
-	Args          []string               `protobuf:"bytes,2,rep,name=args,proto3" json:"args,omitempty"`
-	Envs          map[string]string      `protobuf:"bytes,3,rep,name=envs,proto3" json:"envs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Cwd           string                 `protobuf:"bytes,4,opt,name=cwd,proto3" json:"cwd,omitempty"`
-	Pty           *PtyConfig             `protobuf:"bytes,5,opt,name=pty,proto3" json:"pty,omitempty"`                               // If set, run in PTY mode.
-	TimeoutMs     uint32                 `protobuf:"varint,6,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"` // 0 = no timeout.
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Cmd       string                 `protobuf:"bytes,1,opt,name=cmd,proto3" json:"cmd,omitempty"`
+	Args      []string               `protobuf:"bytes,2,rep,name=args,proto3" json:"args,omitempty"`
+	Envs      map[string]string      `protobuf:"bytes,3,rep,name=envs,proto3" json:"envs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Cwd       string                 `protobuf:"bytes,4,opt,name=cwd,proto3" json:"cwd,omitempty"`
+	Pty       *PtyConfig             `protobuf:"bytes,5,opt,name=pty,proto3" json:"pty,omitempty"`                               // If set, run in PTY mode.
+	TimeoutMs uint32                 `protobuf:"varint,6,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"` // 0 = no timeout.
+	// User to run the command as. Empty falls back to boxd's default user
+	// (set by the template or root).
+	User          string `protobuf:"bytes,7,opt,name=user,proto3" json:"user,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -103,6 +106,13 @@ func (x *StartRequest) GetTimeoutMs() uint32 {
 		return x.TimeoutMs
 	}
 	return 0
+}
+
+func (x *StartRequest) GetUser() string {
+	if x != nil {
+		return x.User
+	}
+	return ""
 }
 
 type PtyConfig struct {
@@ -1345,7 +1355,7 @@ var File_proto_boxd_proto protoreflect.FileDescriptor
 
 const file_proto_boxd_proto_rawDesc = "" +
 	"\n" +
-	"\x10proto/boxd.proto\x12\x12superserve.boxd.v1\"\x8f\x02\n" +
+	"\x10proto/boxd.proto\x12\x12superserve.boxd.v1\"\xa3\x02\n" +
 	"\fStartRequest\x12\x10\n" +
 	"\x03cmd\x18\x01 \x01(\tR\x03cmd\x12\x12\n" +
 	"\x04args\x18\x02 \x03(\tR\x04args\x12>\n" +
@@ -1353,7 +1363,8 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\x03cwd\x18\x04 \x01(\tR\x03cwd\x12/\n" +
 	"\x03pty\x18\x05 \x01(\v2\x1d.superserve.boxd.v1.PtyConfigR\x03pty\x12\x1d\n" +
 	"\n" +
-	"timeout_ms\x18\x06 \x01(\rR\ttimeoutMs\x1a7\n" +
+	"timeout_ms\x18\x06 \x01(\rR\ttimeoutMs\x12\x12\n" +
+	"\x04user\x18\a \x01(\tR\x04user\x1a7\n" +
 	"\tEnvsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"A\n" +

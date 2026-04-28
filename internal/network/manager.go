@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -102,26 +105,48 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 	m.egressProxy = p
 }
 
-func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger) (*Manager, error) {
+// ManagerOption configures optional Manager behavior.
+type ManagerOption func(*Manager)
+
+// WithStartSlot sets the starting slot index for network allocation.
+// Use to avoid collision when multiple processes manage VMs on the
+// same host (e.g. vmd uses 1-100, template-builder uses 200+).
+func WithStartSlot(idx int) ManagerOption {
+	return func(m *Manager) { m.nextSlot = idx }
+}
+
+// WithHTTPProxyPort sets the HTTP proxy port for egress REDIRECT rules.
+// Pass 0 to disable REDIRECT (e.g. for build VMs that don't need
+// egress domain filtering).
+func WithHTTPProxyPort(port uint16) ManagerOption {
+	return func(m *Manager) { m.httpProxyPort = port }
+}
+
+func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, opts ...ManagerOption) (*Manager, error) {
 	if err := enableIPForward(ctx); err != nil {
 		return nil, err
 	}
 
-	hostFW, err := NewHostFirewall(hostInterface)
-	if err != nil {
-		return nil, fmt.Errorf("init host firewall: %w", err)
-	}
-
-	return &Manager{
+	mgr := &Manager{
 		hostInterface:  hostInterface,
 		log:            log.With().Str("component", "network").Logger(),
 		devices:        make(map[string]*VMNetInfo),
 		nextSlot:       1,
-		hostFW:         hostFW,
 		httpProxyPort:  DefaultHTTPProxyPort,
 		tlsProxyPort:   DefaultTLSProxyPort,
 		otherProxyPort: DefaultOtherProxyPort,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(mgr)
+	}
+
+	hostFW, err := NewHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, log.With().Str("component", "host_fw").Logger())
+	if err != nil {
+		return nil, fmt.Errorf("init host firewall: %w", err)
+	}
+	mgr.hostFW = hostFW
+
+	return mgr, nil
 }
 
 // Close tears down the host firewall. Should be called on VMD shutdown.
@@ -301,9 +326,6 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 			VMIP:           VMInternalIP,
 			HostIP:         hostIP,
 			GatewayIP:      VMGatewayIP,
-			HTTPProxyPort:  m.httpProxyPort,
-			TLSProxyPort:   m.tlsProxyPort,
-			OtherProxyPort: m.otherProxyPort,
 		})
 		return fwErr
 	}); err != nil {
@@ -402,6 +424,115 @@ func (m *Manager) CleanupVM(vmID string) {
 	_ = run(ctx, "ip", "netns", "del", info.Namespace)
 
 	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+}
+
+// SweepOrphanNamespaces removes host namespaces and veth interfaces
+// matching ns-N/veth-N that aren't in the keep set. Kills any process
+// still in the ns first so slot recycling can't collide with a
+// vmd-crash-orphaned firecracker still holding veth/TAP peers.
+func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
+	entries, err := os.ReadDir("/run/netns")
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Msg("sweep: list /run/netns failed")
+		}
+		return 0
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "ns-") {
+			continue
+		}
+		if keep[name] {
+			continue
+		}
+
+		var idx int
+		if _, err := fmt.Sscanf(name, "ns-%d", &idx); err != nil {
+			continue
+		}
+		if killed := killProcessesInNs(name); killed > 0 {
+			m.log.Info().Str("ns", name).Int("killed", killed).Msg("killed processes in orphan namespace before sweep")
+		}
+		veth := fmt.Sprintf("veth-%d", idx)
+		m.cleanupFull(name, veth)
+		m.log.Info().Str("ns", name).Str("veth", veth).Msg("swept orphan namespace")
+		swept++
+	}
+
+	// Also sweep host-side veth-N interfaces that survived their namespace
+	// being deleted (happens when the peer end was moved back to the host
+	// before ns deletion, or when a crash left the host side orphaned).
+	if veths, err := listHostVeths(); err == nil {
+		for _, veth := range veths {
+			var idx int
+			if _, err := fmt.Sscanf(veth, "veth-%d", &idx); err != nil {
+				continue
+			}
+			if keep[fmt.Sprintf("ns-%d", idx)] {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+				m.log.Info().Str("veth", veth).Msg("swept orphan host veth")
+			}
+			cancel()
+		}
+	}
+
+	return swept
+}
+
+// killProcessesInNs SIGKILLs every process whose net namespace matches
+// /run/netns/<name>. Returns the number of pids signalled.
+func killProcessesInNs(name string) int {
+	nsPath := "/run/netns/" + name
+	nsStat, err := os.Stat(nsPath)
+	if err != nil {
+		return 0
+	}
+	nsIno := nsStat.Sys().(*syscall.Stat_t).Ino
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	killed := 0
+	for _, e := range procs {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		procNsStat, err := os.Stat("/proc/" + e.Name() + "/ns/net")
+		if err != nil {
+			continue
+		}
+		if procNsStat.Sys().(*syscall.Stat_t).Ino != nsIno {
+			continue
+		}
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			killed++
+		}
+	}
+	return killed
+}
+
+// listHostVeths returns all veth-N interfaces visible in the host namespace.
+func listHostVeths() ([]string, error) {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "veth-") {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
 }
 
 // UpdateFirewallRules atomically replaces the user allow/deny sets for a VM's firewall.

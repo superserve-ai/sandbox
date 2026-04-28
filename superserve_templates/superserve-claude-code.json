@@ -1,0 +1,17 @@
+{
+  "alias": "superserve/claude-code",
+  "vcpu": 2,
+  "memory_mib": 2048,
+  "disk_mib": 8192,
+  "build_spec": {
+    "from": "ubuntu:24.04",
+    "steps": [
+      {
+        "run": "apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates build-essential ripgrep vim python3 python3-pip && rm -rf /var/lib/apt/lists/*"
+      },
+      {
+        "run": "set -e; GCS=https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases; VERSION=$(curl -fsSL \"$GCS/latest\"); curl -fsSL \"$GCS/$VERSION/linux-x64/claude\" -o /usr/local/bin/claude; chmod +x /usr/local/bin/claude"
+      }
+    ]
+  }
+}

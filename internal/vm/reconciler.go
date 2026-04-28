@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +12,13 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+// buildVMIDPrefix marks VMs owned by the template build pipeline. Their
+// lifecycle is managed by buildTemplateWorker, not the reconciler — they
+// have no sandbox row by design, so the reconciler skips them.
+const buildVMIDPrefix = "build-"
+
+func isBuildVM(id string) bool { return strings.HasPrefix(id, buildVMIDPrefix) }
 
 // ReconcilerConfig controls the periodic reconciler.
 type ReconcilerConfig struct {
@@ -136,6 +144,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	}
 	active := make(map[string]bool, len(ids))
 	for _, id := range ids {
+		if isBuildVM(id) {
+			continue
+		}
 		active[id] = true
 	}
 
@@ -171,6 +182,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 		bolted = make(map[string]VMRecord, len(records))
 		for _, rec := range records {
+			if isBuildVM(rec.ID) {
+				continue
+			}
 			bolted[rec.ID] = rec
 		}
 	} else {
@@ -179,7 +193,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Error().Err(idsErr).Msg("failed to list state store IDs")
 			return
 		}
-		boltedIDs = idSet
+		boltedIDs = make(map[string]struct{}, len(idSet))
+		for id := range idSet {
+			if isBuildVM(id) {
+				continue
+			}
+			boltedIDs[id] = struct{}{}
+		}
 	}
 
 	now := time.Now()

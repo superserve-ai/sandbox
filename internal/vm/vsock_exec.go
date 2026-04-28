@@ -25,10 +25,20 @@ type ExecResult struct {
 // boxdPort must match httpPort in cmd/boxd/main.go.
 const boxdPort = 49983
 
+// boxdHTTPClient is a dedicated HTTP client for boxd Connect RPC calls.
+// Keep-alives are disabled: slot recycling reuses host IPs, so a pooled
+// connection to a recycled slot points at a dead TCP endpoint on the
+// next VM. Fresh connects over veth are sub-millisecond.
+var boxdHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DisableKeepAlives: true,
+	},
+}
+
 // boxdProcessClient returns a Connect RPC client for the ProcessService.
 func boxdProcessClient(vmIP string) boxdpbconnect.ProcessServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
-	return boxdpbconnect.NewProcessServiceClient(http.DefaultClient, baseURL)
+	return boxdpbconnect.NewProcessServiceClient(boxdHTTPClient, baseURL)
 }
 
 // ExecOptions holds optional parameters for command execution.
@@ -36,6 +46,31 @@ type ExecOptions struct {
 	Args       []string
 	Env        map[string]string
 	WorkingDir string
+}
+
+// defaultExecEnv is the baseline environment passed to every command
+// executed inside a VM. Without at least PATH, /bin/sh can't find
+// binaries in /usr/local/bin (where pip, node, etc. live in most OCI
+// base images). Callers can override individual keys via ExecOptions.Env.
+var defaultExecEnv = map[string]string{
+	"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	"HOME":  "/home/user",
+	"USER":  "user",
+	"TERM":  "xterm",
+	"LANG":  "C.UTF-8",
+	"SHELL": "/bin/sh",
+}
+
+// mergedEnv returns defaultExecEnv with caller-supplied overrides applied.
+func mergedEnv(caller map[string]string) map[string]string {
+	env := make(map[string]string, len(defaultExecEnv)+len(caller))
+	for k, v := range defaultExecEnv {
+		env[k] = v
+	}
+	for k, v := range caller {
+		env[k] = v
+	}
+	return env
 }
 
 // httpExec runs a command via Connect RPC ProcessService.Start and collects the result.
@@ -60,10 +95,12 @@ func httpExec(ctx context.Context, vmIP string, command string, timeout time.Dur
 		req.Cmd = "/bin/sh"
 		req.Args = []string{"-c", command}
 	}
+	var callerEnv map[string]string
 	if opts != nil {
-		req.Envs = opts.Env
+		callerEnv = opts.Env
 		req.Cwd = opts.WorkingDir
 	}
+	req.Envs = mergedEnv(callerEnv)
 
 	stream, err := client.Start(ctx, connect.NewRequest(req))
 	if err != nil {
@@ -118,10 +155,13 @@ func httpExecStream(ctx context.Context, vmIP string, command string, timeout ti
 		req.Cmd = "/bin/sh"
 		req.Args = []string{"-c", command}
 	}
+	var callerEnv map[string]string
 	if opts != nil {
-		req.Envs = opts.Env
+		callerEnv = opts.Env
 		req.Cwd = opts.WorkingDir
 	}
+	req.Envs = mergedEnv(callerEnv)
+
 
 	stream, err := client.Start(ctx, connect.NewRequest(req))
 	if err != nil {
@@ -222,5 +262,5 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string) e
 // a VM. File byte transfer goes through the edge proxy directly.
 func boxdFilesystemClient(vmIP string) boxdpbconnect.FilesystemServiceClient {
 	baseURL := fmt.Sprintf("http://%s:%d", vmIP, boxdPort)
-	return boxdpbconnect.NewFilesystemServiceClient(http.DefaultClient, baseURL)
+	return boxdpbconnect.NewFilesystemServiceClient(boxdHTTPClient, baseURL)
 }

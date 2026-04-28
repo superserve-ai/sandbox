@@ -30,6 +30,12 @@ type Config struct {
 	// DefaultHostID is the fallback host identifier used when no scheduler
 	// is configured. Set via DEFAULT_HOST_ID; defaults to "default".
 	DefaultHostID string
+
+	// SystemTeamID owns curated templates that are visible to every team
+	// (python-3.11, node-22, etc.). Set via SYSTEM_TEAM_ID; empty means
+	// "no system team configured" and users see only their own templates.
+	// Must be a valid UUID matching an existing team row.
+	SystemTeamID string
 }
 
 // Load reads configuration from environment variables.
@@ -54,6 +60,7 @@ func Load() (*Config, error) {
 		SandboxAccessTokenSeed: seed,
 		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
+		SystemTeamID:           os.Getenv("SYSTEM_TEAM_ID"),
 	}
 	return cfg, nil
 }

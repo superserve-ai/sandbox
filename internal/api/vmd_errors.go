@@ -20,6 +20,18 @@ var ErrSandboxGone = &AppError{
 	HTTPStatus: 410,
 }
 
+// ErrHostStateMissing maps to HTTP 503. Returned when vmd reports a
+// file-missing FailedPrecondition while restoring from a template snapshot
+// — the DB says ready but the host doesn't have the files. Recovery is an
+// ops action (re-run `make seed-templates --force-rebuild`), not something
+// the user can fix. 503 signals "service currently unable to handle the
+// request" which is the closest fit semantically.
+var ErrHostStateMissing = &AppError{
+	Code:       "host_state_missing",
+	Message:    "Template files are missing on the host; ops action required. Please retry in a few minutes or contact support if the issue persists.",
+	HTTPStatus: 503,
+}
+
 // isVMDNotFound returns true when VMD reports that the VM is gone
 // (gRPC NotFound). This covers two cases:
 //   - VMD never had the VM in its map (lost BoltDB entry)
@@ -33,6 +45,38 @@ func isVMDNotFound(err error) bool {
 		return false
 	}
 	return status.Code(err) == codes.NotFound
+}
+
+// isVMDFileMissing returns true when vmd returned a FailedPrecondition
+// indicating a snapshot/mem file is missing on disk. The caller maps
+// this to a 503 with `host_state_missing` rather than a generic 500 so
+// users understand it's a service-side issue not a bad request.
+func isVMDFileMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.FailedPrecondition
+}
+
+// isVMDInvalidArgument returns true when vmd returned InvalidArgument —
+// typically from boxd rejecting a user-supplied command (e.g. bare
+// command name that doesn't resolve against the child PATH). The caller
+// maps this to 400 with the vmd-supplied message so the user sees why
+// their input was rejected instead of a generic 500.
+func isVMDInvalidArgument(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.InvalidArgument
+}
+
+// vmdErrorMessage returns the gRPC message from a vmd error, stripping
+// gRPC/transport framing so the string is safe to surface to API callers.
+func vmdErrorMessage(err error) string {
+	if s, ok := status.FromError(err); ok {
+		return s.Message()
+	}
+	return err.Error()
 }
 
 // markSandboxFailedAsync writes status=failed in a detached goroutine.

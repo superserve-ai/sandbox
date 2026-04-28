@@ -43,6 +43,18 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		// sandboxes must be resumed explicitly via /resume.
 		api.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
 		api.POST("/sandboxes/:sandbox_id/exec/stream", h.ExecSandboxStream)
+
+		// Template lifecycle. Builds run async via the build supervisor;
+		// the POST /templates/:id/builds endpoint just enqueues a row.
+		api.GET("/templates", h.ListTemplates)
+		api.POST("/templates", h.CreateTemplate)
+		api.GET("/templates/:template_id", h.GetTemplate)
+		api.DELETE("/templates/:template_id", h.DeleteTemplate)
+		api.GET("/templates/:template_id/builds", h.ListTemplateBuilds)
+		api.POST("/templates/:template_id/builds", h.CreateTemplateBuild)
+		api.GET("/templates/:template_id/builds/:build_id", h.GetTemplateBuild)
+		api.DELETE("/templates/:template_id/builds/:build_id", h.CancelTemplateBuild)
+		api.GET("/templates/:template_id/builds/:build_id/logs", h.StreamTemplateBuildLogs)
 	}
 
 	r.GET("/health", h.Health)

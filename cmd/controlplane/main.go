@@ -24,6 +24,7 @@ import (
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/supervisor"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -76,6 +77,7 @@ func run() error {
 	queries := dbq.New(dbPool)
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
+	handlers.Pool = dbPool
 
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
 	// Interceptors below fire onDead on codes.Unavailable so the registry
@@ -100,6 +102,26 @@ func run() error {
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
 	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+
+	// Launch the template build supervisor. Drives template_build rows
+	// through pending → building → snapshotting → ready/failed by calling
+	// vmd's BuildTemplate / GetBuildStatus / CancelBuild RPCs.
+	buildResolver := func(rctx context.Context, hostID string) (vmdclient.Client, error) {
+		if hostID == "" || handlers.Hosts == nil {
+			return vmdClient, nil
+		}
+		c, err := handlers.Hosts.ClientFor(rctx, hostID)
+		if err != nil {
+			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: host lookup failed, using default client")
+			return vmdClient, nil
+		}
+		return c, nil
+	}
+	supervisor.NewBuildSupervisor(
+		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
+		queries,
+		buildResolver,
+	).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
@@ -165,28 +187,6 @@ func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
 	}
 }
 
-func (c *grpcVMDClient) CreateInstance(ctx context.Context, vmID string, vcpu, memMiB, diskMiB uint32, metadata map[string]string, envVars map[string]string) (string, uint32, uint32, error) {
-	resp, err := c.client.CreateVM(ctx, &vmdpb.CreateVMRequest{
-		VmId:     vmID,
-		Metadata: metadata,
-		EnvVars:  envVars,
-		ResourceLimits: &vmdpb.ResourceLimits{
-			VcpuCount:   vcpu,
-			MemoryMib:   memMiB,
-			DiskSizeMib: diskMiB,
-		},
-	})
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("gRPC CreateVM: %w", err)
-	}
-	var actualVcpu, actualMemMiB uint32
-	if rl := resp.GetResourceLimits(); rl != nil {
-		actualVcpu = rl.GetVcpuCount()
-		actualMemMiB = rl.GetMemoryMib()
-	}
-	return resp.IpAddress, actualVcpu, actualMemMiB, nil
-}
-
 func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force bool) error {
 	_, err := c.client.DestroyVM(ctx, &vmdpb.DestroyVMRequest{
 		VmId:  vmID,
@@ -231,18 +231,22 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. Used as
 // a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
 // map to a crash but the snapshot files are still on disk).
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
+		EnvVars:      envVars,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
 	}
-	// RestoreSnapshotResponse doesn't carry ResourceLimits in the proto today,
-	// so we return 0,0 and let the caller keep the existing DB values.
-	return resp.IpAddress, 0, 0, nil
+	var vcpu, mem uint32
+	if rl := resp.GetResourceLimits(); rl != nil {
+		vcpu = rl.GetVcpuCount()
+		mem = rl.GetMemoryMib()
+	}
+	return resp.IpAddress, vcpu, mem, nil
 }
 
 // DeleteSnapshot removes the on-disk snapshot artifacts for a previous pause.
@@ -334,6 +338,93 @@ func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, a
 		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
 	}
 	return nil
+}
+
+func (c *grpcVMDClient) BuildTemplate(ctx context.Context, req vmdclient.BuildTemplateInput) (string, error) {
+	pbReq := &vmdpb.BuildTemplateRequest{
+		TemplateId: req.TemplateID,
+		From:       req.From,
+		StartCmd:   req.StartCmd,
+		ReadyCmd:   req.ReadyCmd,
+		Vcpu:       req.VCPU,
+		MemoryMib:  req.MemoryMiB,
+		DiskMib:    req.DiskMiB,
+		BuildVmId:  req.BuildVMID,
+	}
+	for _, step := range req.Steps {
+		pstep := &vmdpb.BuildStep{}
+		switch {
+		case step.Run != nil:
+			pstep.Op = &vmdpb.BuildStep_Run{Run: *step.Run}
+		case step.Env != nil:
+			pstep.Op = &vmdpb.BuildStep_Env{Env: &vmdpb.BuildEnvOp{Key: step.Env.Key, Value: step.Env.Value}}
+		case step.Workdir != nil:
+			pstep.Op = &vmdpb.BuildStep_Workdir{Workdir: *step.Workdir}
+		case step.User != nil:
+			pstep.Op = &vmdpb.BuildStep_User{User: &vmdpb.BuildUserOp{Name: step.User.Name, Sudo: step.User.Sudo}}
+		}
+		pbReq.Steps = append(pbReq.Steps, pstep)
+	}
+	resp, err := c.client.BuildTemplate(ctx, pbReq)
+	if err != nil {
+		return "", fmt.Errorf("gRPC BuildTemplate: %w", err)
+	}
+	return resp.GetBuildVmId(), nil
+}
+
+func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (vmdclient.BuildStatusResult, error) {
+	resp, err := c.client.GetBuildStatus(ctx, &vmdpb.GetBuildStatusRequest{BuildVmId: buildVMID})
+	if err != nil {
+		return vmdclient.BuildStatusResult{}, fmt.Errorf("gRPC GetBuildStatus: %w", err)
+	}
+	return vmdclient.BuildStatusResult{
+		NotFound:       resp.GetNotFound(),
+		Status:         resp.GetStatus(),
+		SnapshotPath:   resp.GetSnapshotPath(),
+		MemFilePath:    resp.GetMemFilePath(),
+		RootfsPath:     resp.GetRootfsPath(),
+		ResolvedDigest: resp.GetResolvedDigest(),
+		SizeBytes:      resp.GetSizeBytes(),
+		ErrorMessage:   resp.GetErrorMessage(),
+		StartedAtUnix:  resp.GetStartedAtUnix(),
+		EndedAtUnix:    resp.GetEndedAtUnix(),
+	}, nil
+}
+
+func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error {
+	_, err := c.client.CancelBuild(ctx, &vmdpb.CancelBuildRequest{BuildVmId: buildVMID})
+	if err != nil {
+		return fmt.Errorf("gRPC CancelBuild: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(vmdclient.BuildLogEvent) error) error {
+	stream, err := c.client.StreamBuildLogs(ctx, &vmdpb.StreamBuildLogsRequest{BuildVmId: buildVMID})
+	if err != nil {
+		return fmt.Errorf("gRPC StreamBuildLogs: %w", err)
+	}
+	for {
+		pbEv, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("recv build log: %w", err)
+		}
+		if cbErr := onEvent(vmdclient.BuildLogEvent{
+			TimestampUnixNanos: pbEv.GetTimestampUnixNanos(),
+			Stream:             pbEv.GetStream(),
+			Text:               pbEv.GetText(),
+			Finished:           pbEv.GetFinished(),
+			Status:             pbEv.GetStatus(),
+		}); cbErr != nil {
+			return cbErr
+		}
+		if pbEv.GetFinished() {
+			return nil
+		}
+	}
 }
 
 // deadHostUnaryInterceptor calls onDead when a unary RPC returns

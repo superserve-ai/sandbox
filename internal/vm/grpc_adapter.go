@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -21,39 +22,6 @@ type GRPCAdapter struct {
 // NewGRPCAdapter creates a new adapter that bridges the proto interface to the Manager.
 func NewGRPCAdapter(mgr *Manager) *GRPCAdapter {
 	return &GRPCAdapter{mgr: mgr}
-}
-
-func (a *GRPCAdapter) CreateVM(ctx context.Context, req *vmdpb.CreateVMRequest) (*vmdpb.CreateVMResponse, error) {
-	var netCfg *network.Config
-	if nc := req.GetNetworkConfig(); nc != nil {
-		netCfg = &network.Config{
-			HostInterface: nc.GetHostInterface(),
-			SubnetCIDR:    nc.GetSubnetCidr(),
-			GatewayIP:     nc.GetGatewayIp(),
-			EnableNAT:     nc.GetEnableNat(),
-		}
-	}
-
-	inst, err := a.mgr.CreateVM(ctx, req.GetVmId(), netCfg, req.GetMetadata())
-	if err != nil {
-		return nil, err
-	}
-
-	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
-		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
-	}
-
-	return &vmdpb.CreateVMResponse{
-		VmId:       inst.ID,
-		SocketPath: inst.SocketPath,
-		IpAddress:  inst.IP,
-		TapDevice:  inst.TAPDevice,
-		Pid:        uint32(inst.PID),
-		ResourceLimits: &vmdpb.ResourceLimits{
-			VcpuCount: inst.Config.VCPU,
-			MemoryMib: inst.Config.MemoryMiB,
-		},
-	}, nil
 }
 
 func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest) (*vmdpb.DestroyVMResponse, error) {
@@ -138,11 +106,28 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	if err != nil {
 		return nil, err
 	}
+
+	// Merge caller env vars on top of whatever context the template baked
+	// into the snapshot. Skipping on empty preserves the template's
+	// defaults (boxd already has them loaded from the restored memory).
+	if envVars := req.GetEnvVars(); len(envVars) > 0 {
+		if initErr := postBoxdInit(ctx, inst.IP, envVars); initErr != nil {
+			// Tear the VM down — a sandbox whose env vars weren't applied
+			// would silently serve stale/missing secrets to the user.
+			_ = a.mgr.DestroyVM(ctx, inst.ID, true)
+			return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", initErr)
+		}
+	}
+
 	return &vmdpb.RestoreSnapshotResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
 		IpAddress:  inst.IP,
 		Pid:        uint32(inst.PID),
+		ResourceLimits: &vmdpb.ResourceLimits{
+			VcpuCount: inst.Config.VCPU,
+			MemoryMib: inst.Config.MemoryMiB,
+		},
 	}, nil
 }
 
@@ -276,6 +261,152 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
 }
+
+func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplateRequest) (*vmdpb.BuildTemplateResponse, error) {
+	if req.GetTemplateId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "template_id is required")
+	}
+	if req.GetFrom() == "" {
+		return nil, status.Error(codes.InvalidArgument, "from is required")
+	}
+
+	spec := builder.BuildSpec{
+		From:     req.GetFrom(),
+		StartCmd: req.GetStartCmd(),
+		ReadyCmd: req.GetReadyCmd(),
+	}
+	for i, pstep := range req.GetSteps() {
+		step, err := buildStepFromProto(pstep)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "steps[%d]: %v", i, err)
+		}
+		spec.Steps = append(spec.Steps, step)
+	}
+
+	buildVMID, err := a.mgr.BuildTemplate(ctx, BuildTemplateRequest{
+		TemplateID: req.GetTemplateId(),
+		Spec:       spec,
+		VCPU:       req.GetVcpu(),
+		MemoryMiB:  req.GetMemoryMib(),
+		DiskMiB:    req.GetDiskMib(),
+		BuildVMID:  req.GetBuildVmId(),
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "build template: %v", err)
+	}
+
+	return &vmdpb.BuildTemplateResponse{BuildVmId: buildVMID}, nil
+}
+
+func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildStatusRequest) (*vmdpb.GetBuildStatusResponse, error) {
+	if req.GetBuildVmId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
+	}
+	snap, ok := a.mgr.GetBuildStatus(req.GetBuildVmId())
+	if !ok {
+		return &vmdpb.GetBuildStatusResponse{NotFound: true}, nil
+	}
+	resp := &vmdpb.GetBuildStatusResponse{
+		Status:        string(snap.Status),
+		ErrorMessage:  snap.Error,
+		StartedAtUnix: snap.StartedAt.Unix(),
+	}
+	if !snap.EndedAt.IsZero() {
+		resp.EndedAtUnix = snap.EndedAt.Unix()
+	}
+	if snap.Result != nil {
+		resp.SnapshotPath = snap.Result.SnapshotPath
+		resp.MemFilePath = snap.Result.MemFilePath
+		resp.RootfsPath = snap.Result.RootfsPath
+		resp.ResolvedDigest = snap.Result.ResolvedDigest
+		resp.SizeBytes = snap.Result.SizeBytes
+	}
+	return resp, nil
+}
+
+func (a *GRPCAdapter) CancelBuild(ctx context.Context, req *vmdpb.CancelBuildRequest) (*vmdpb.CancelBuildResponse, error) {
+	if req.GetBuildVmId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
+	}
+	if err := a.mgr.CancelBuild(ctx, req.GetBuildVmId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "cancel build: %v", err)
+	}
+	return &vmdpb.CancelBuildResponse{}, nil
+}
+
+// StreamBuildLogs bridges the manager's in-memory pub-sub into a gRPC
+// server stream. Subscribing replays buffered history first, then streams
+// new events until the build reaches a terminal status (log buffer closes).
+// Returns NotFound when the build is unknown — the client maps that to a
+// 404 on its SSE endpoint.
+func (a *GRPCAdapter) StreamBuildLogs(req *vmdpb.StreamBuildLogsRequest, stream vmdpb.VMDaemon_StreamBuildLogsServer) error {
+	if req.GetBuildVmId() == "" {
+		return status.Error(codes.InvalidArgument, "build_vm_id is required")
+	}
+	sub, unsubscribe, ok := a.mgr.subscribeBuildLogs(req.GetBuildVmId())
+	if !ok {
+		return status.Errorf(codes.NotFound, "build %s not found", req.GetBuildVmId())
+	}
+	defer unsubscribe()
+
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev, open := <-sub:
+			if !open {
+				// Buffer closed → build terminal, stream already emitted
+				// the Finished event. Clean return closes the RPC.
+				return nil
+			}
+			pbEv := &vmdpb.BuildLogEvent{
+				TimestampUnix:      ev.Timestamp.Unix(),
+				TimestampUnixNanos: ev.Timestamp.UnixNano(),
+				Stream:             string(ev.Stream),
+				Text:               ev.Text,
+				Finished:           ev.Finished,
+				Status:             string(ev.Status),
+			}
+			if err := stream.Send(pbEv); err != nil {
+				return err
+			}
+			if ev.Finished {
+				return nil
+			}
+		}
+	}
+}
+
+// buildStepFromProto converts a proto BuildStep to the internal/builder
+// type. Enforces the "exactly one op" invariant at the gRPC boundary so
+// BuildTemplate never has to worry about it.
+func buildStepFromProto(p *vmdpb.BuildStep) (builder.BuildStep, error) {
+	if p == nil {
+		return builder.BuildStep{}, nil
+	}
+	switch op := p.GetOp().(type) {
+	case *vmdpb.BuildStep_Run:
+		run := op.Run
+		return builder.BuildStep{Run: &run}, nil
+	case *vmdpb.BuildStep_Env:
+		return builder.BuildStep{Env: &builder.EnvOp{Key: op.Env.GetKey(), Value: op.Env.GetValue()}}, nil
+	case *vmdpb.BuildStep_Workdir:
+		wd := op.Workdir
+		return builder.BuildStep{Workdir: &wd}, nil
+	case *vmdpb.BuildStep_User:
+		return builder.BuildStep{User: &builder.UserOp{
+			Name: op.User.GetName(),
+			Sudo: op.User.GetSudo(),
+		}}, nil
+	default:
+		return builder.BuildStep{}, &fieldError{"op must be one of run/copy/env/workdir/user"}
+	}
+}
+
+type fieldError struct{ msg string }
+
+func (e *fieldError) Error() string { return e.msg }
 
 func vmStatusToProto(s VMStatus) vmdpb.VMStatus {
 	switch s {
