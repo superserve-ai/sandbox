@@ -102,6 +102,24 @@ func main() {
 func classifyBuildError(err error) (code, userMsg string) {
 	raw := err.Error()
 	switch {
+	// Specific-cause cases must come before the broad "build rootfs" / "pull "
+	// match below, which would otherwise swallow them as registry failures.
+
+	case strings.Contains(raw, "flattened image exceeds"):
+		return "image_too_large", "image is too large for the requested disk_mib; increase disk_mib"
+
+	case strings.Contains(raw, "parse image reference"):
+		return "bad_reference", "image reference is malformed; check the format like 'python:3.11' or 'ghcr.io/org/image:tag'"
+
+	case strings.Contains(raw, "image os is "),
+		strings.Contains(raw, "image architecture is "):
+		return "unsupported_platform", "only linux/amd64 images are supported"
+
+	case strings.Contains(raw, "tar entry escapes"),
+		strings.Contains(raw, "symlink target escapes"),
+		strings.Contains(raw, "hardlink target escapes"):
+		return "image_unsafe", "image was rejected: contains unsafe path entries"
+
 	case strings.Contains(raw, "build rootfs"),
 		strings.Contains(raw, "pull "),
 		strings.Contains(raw, "manifest "),
