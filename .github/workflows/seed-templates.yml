@@ -20,6 +20,10 @@
 
 name: CD — Seed Templates
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -74,6 +78,34 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # If Deploy VMD was triggered by the same commit, wait for it to finish.
+      # Seeding while vmd is being redeployed kills in-flight builds.
+      - name: Wait for Deploy VMD
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DEADLINE=$(( $(date +%s) + 900 ))
+          while true; do
+            RUN=$(gh run list --workflow=deploy-vmd.yml --commit="${{ github.sha }}" --limit 1 --json status,conclusion --jq '.[0]')
+            if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then
+              echo "no Deploy VMD run for this commit — proceeding"
+              exit 0
+            fi
+            STATUS=$(echo "$RUN" | jq -r .status)
+            CONCLUSION=$(echo "$RUN" | jq -r .conclusion)
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "Deploy VMD complete — proceeding"
+                exit 0
+              fi
+              echo "Deploy VMD finished with conclusion=$CONCLUSION; refusing to seed"
+              exit 1
+            fi
+            echo "Deploy VMD status=$STATUS; waiting 30s..."
+            sleep 30
+            [ $(date +%s) -lt "$DEADLINE" ] || { echo "timeout waiting for Deploy VMD"; exit 1; }
+          done
+
       # Detect whether this run was triggered by a change that invalidates
       # existing template snapshots (boxd, proto, builder internals). If so,
       # force-rebuild so every template gets refreshed. workflow_dispatch
@@ -120,6 +152,32 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Wait for Deploy VMD
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DEADLINE=$(( $(date +%s) + 900 ))
+          while true; do
+            RUN=$(gh run list --workflow=deploy-vmd.yml --commit="${{ github.sha }}" --limit 1 --json status,conclusion --jq '.[0]')
+            if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then
+              echo "no Deploy VMD run for this commit — proceeding"
+              exit 0
+            fi
+            STATUS=$(echo "$RUN" | jq -r .status)
+            CONCLUSION=$(echo "$RUN" | jq -r .conclusion)
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "Deploy VMD complete — proceeding"
+                exit 0
+              fi
+              echo "Deploy VMD finished with conclusion=$CONCLUSION; refusing to seed"
+              exit 1
+            fi
+            echo "Deploy VMD status=$STATUS; waiting 30s..."
+            sleep 30
+            [ $(date +%s) -lt "$DEADLINE" ] || { echo "timeout waiting for Deploy VMD"; exit 1; }
+          done
 
       - name: Detect stale snapshots
         id: stale
