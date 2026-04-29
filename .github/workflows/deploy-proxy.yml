@@ -20,6 +20,7 @@ on:
     paths:
       - 'cmd/proxy/**'
       - 'internal/proxy/**'
+      - 'internal/auth/**'
       - 'deploy/proxy.service'
 
 jobs:
