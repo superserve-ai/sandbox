@@ -473,11 +473,11 @@ paths:
     delete:
       operationId: deleteTemplate
       tags: [Templates]
-      summary: Soft-delete a template
+      summary: Delete a template
       description: |
-        Soft-deletes a template owned by the caller's team. Returns `409`
-        if any non-destroyed sandbox still references this template; the
-        caller must destroy those sandboxes first.
+        Delete a template owned by the caller's team. Returns `409` if any
+        active or paused sandbox still references this template, or if a
+        build is currently in progress; cancel those first.
       security:
         - apiKey: []
       responses:
