@@ -401,11 +401,10 @@ paths:
       tags: [Templates]
       summary: Create a template and kick off the first build
       description: |
-        Creates a template row AND queues the first build atomically. The
-        response includes both the template id and the build id, so clients
-        can immediately poll `GET /templates/{id}` for overall status or
-        subscribe to `GET /templates/{id}/builds/{build_id}/logs` for live
-        output.
+        Creates a template and queues the first build. The response includes
+        both the template id and the build id, so clients can immediately
+        poll `GET /templates/{id}` for overall status or subscribe to
+        `GET /templates/{id}/builds/{build_id}/logs` for live output.
 
         Template starts in status `building`. Poll until it reaches `ready`
         before creating sandboxes from it. On failure the status becomes
@@ -473,11 +472,11 @@ paths:
     delete:
       operationId: deleteTemplate
       tags: [Templates]
-      summary: Soft-delete a template
+      summary: Delete a template
       description: |
-        Soft-deletes a template owned by the caller's team. Returns `409`
-        if any non-destroyed sandbox still references this template; the
-        caller must destroy those sandboxes first.
+        Delete a template owned by the caller's team. Returns `409` if any
+        active or paused sandbox still references this template, or if a
+        build is currently in progress; cancel those first.
       security:
         - apiKey: []
       responses:
@@ -542,9 +541,9 @@ paths:
         ## Idempotency
 
         If an in-flight build (`pending`/`building`/`snapshotting`) already
-        exists for this template with the same `build_spec_hash`, this
-        endpoint returns the existing build's id with `200` instead of
-        creating a duplicate.
+        exists for this template with the same build spec, this endpoint
+        returns the existing build's id with `200` instead of creating a
+        duplicate.
       security:
         - apiKey: []
       responses:
@@ -607,8 +606,7 @@ paths:
       tags: [Templates]
       summary: Cancel an in-flight build
       description: |
-        Marks the build as `cancelled` and signals vmd to tear down any
-        in-progress build VM. No-op for builds already in a terminal state.
+        Cancels an in-flight build. No-op for builds already in a terminal state.
       security:
         - apiKey: []
       responses:
@@ -751,9 +749,7 @@ components:
             Environment variables injected into every process inside the
             sandbox (terminal sessions, exec calls). Merged on top of any
             defaults set by the template's `env` build steps — caller keys
-            win on conflict. Not persisted in the database; they live in
-            the VM agent's memory for the sandbox's lifetime and survive
-            pause/resume via snapshot.
+            win on conflict. Survive pause/resume.
           example:
             OPENAI_API_KEY: sk-...
             DEBUG: "1"
@@ -957,9 +953,7 @@ components:
     BuildSpec:
       type: object
       required: [from]
-      description: |
-        Canonical declaration of how to build a template. The server is the
-        source of truth for this schema; SDKs are thin clients that produce it.
+      description: Declaration of how to build a template.
       properties:
         from:
           type: string
@@ -1182,8 +1176,8 @@ components:
           type: string
           enum: [stdout, stderr, system]
           description: >
-            `stdout`/`stderr` are forwarded from the build VM. `system` is
-            the supervisor's own status text (step boundaries, snapshot
+            `stdout`/`stderr` are forwarded from the build process. `system`
+            is platform-emitted status text (step boundaries, snapshot
             phase, terminal status).
         text:
           type: string
@@ -1233,7 +1227,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: Sandbox is not in a valid state for this operation
+      description: Operation conflicts with the resource's current state
       content:
         application/json:
           schema:
