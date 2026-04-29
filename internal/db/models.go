@@ -287,7 +287,7 @@ type TeamMember struct {
 type Template struct {
 	ID           uuid.UUID          `json:"id"`
 	TeamID       uuid.UUID          `json:"team_id"`
-	Alias        string             `json:"alias"`
+	Name         string             `json:"name"`
 	Status       TemplateStatus     `json:"status"`
 	BuildSpec    []byte             `json:"build_spec"`
 	Vcpu         int32              `json:"vcpu"`

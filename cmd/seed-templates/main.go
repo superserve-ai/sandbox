@@ -4,7 +4,7 @@
 //
 // Flow per run:
 //   1. Upsert each JSON under superserve_templates/ into the template table
-//      owned by SYSTEM_TEAM_ID (idempotent on alias).
+//      owned by SYSTEM_TEAM_ID (idempotent on name).
 //   2. Decide whether to enqueue a build for each template:
 //        - Template row just inserted → enqueue.
 //        - Previous build failed / never ran → enqueue.
@@ -98,7 +98,7 @@ func main() {
 		log.Warn().Str("dir", dir).Msg("no seed files found")
 		return
 	}
-	sort.Slice(specs, func(i, j int) bool { return specs[i].Alias < specs[j].Alias })
+	sort.Slice(specs, func(i, j int) bool { return specs[i].Name < specs[j].Name })
 
 	var queued []uuid.UUID
 	var seedFailures int
@@ -106,15 +106,15 @@ func main() {
 		buildID, queuedIt, err := seedOne(ctx, pool, systemTeamID, s, forceRebuild)
 		if err != nil {
 			seedFailures++
-			log.Error().Err(err).Str("alias", s.Alias).Msg("seed failed")
+			log.Error().Err(err).Str("name", s.Name).Msg("seed failed")
 			continue
 		}
 		if !queuedIt {
-			log.Info().Str("alias", s.Alias).Msg("already up-to-date; nothing to build (pass --force-rebuild to override)")
+			log.Info().Str("name", s.Name).Msg("already up-to-date; nothing to build (pass --force-rebuild to override)")
 			continue
 		}
 		queued = append(queued, buildID)
-		log.Info().Str("alias", s.Alias).Str("build_id", buildID.String()).Msg("build queued")
+		log.Info().Str("name", s.Name).Str("build_id", buildID.String()).Msg("build queued")
 	}
 
 	if noWait || len(queued) == 0 {
@@ -139,7 +139,7 @@ func main() {
 // seedSpec mirrors the wire shape users POST to /templates. Kept local so
 // this binary doesn't pull in the HTTP handler package.
 type seedSpec struct {
-	Alias     string          `json:"alias"`
+	Name      string          `json:"name"`
 	Vcpu      *int32          `json:"vcpu,omitempty"`
 	MemoryMib *int32          `json:"memory_mib,omitempty"`
 	DiskMib   *int32          `json:"disk_mib,omitempty"`
@@ -168,8 +168,8 @@ func loadSpecs(dir string) ([]seedSpec, error) {
 		if err := dec.Decode(&s); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-		if s.Alias == "" {
-			return nil, fmt.Errorf("%s: alias is required", path)
+		if s.Name == "" {
+			return nil, fmt.Errorf("%s: name is required", path)
 		}
 		if len(s.BuildSpec) == 0 {
 			return nil, fmt.Errorf("%s: build_spec is required", path)
@@ -193,9 +193,9 @@ func seedOne(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, s seedSp
 	// Upsert and capture the resulting status so we can decide whether to
 	// enqueue a build in one follow-up query.
 	const upsertQ = `
-		INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib)
+		INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib)
 		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (team_id, alias) DO UPDATE
+		ON CONFLICT (team_id, name) WHERE deleted_at IS NULL DO UPDATE
 		SET build_spec = EXCLUDED.build_spec,
 		    vcpu = EXCLUDED.vcpu,
 		    memory_mib = EXCLUDED.memory_mib,
@@ -206,7 +206,7 @@ func seedOne(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, s seedSp
 	var tplID uuid.UUID
 	var tplStatus string
 	if err := pool.QueryRow(ctx, upsertQ,
-		teamID, s.Alias, []byte(s.BuildSpec), vcpu, memMib, diskMib,
+		teamID, s.Name, []byte(s.BuildSpec), vcpu, memMib, diskMib,
 	).Scan(&tplID, &tplStatus); err != nil {
 		return uuid.Nil, false, fmt.Errorf("upsert template: %w", err)
 	}

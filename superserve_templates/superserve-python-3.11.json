@@ -1,5 +1,5 @@
 {
-  "alias": "superserve/python-3.11",
+  "name": "superserve/python-3.11",
   "vcpu": 1,
   "memory_mib": 1024,
   "disk_mib": 4096,

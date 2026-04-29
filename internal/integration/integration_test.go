@@ -93,7 +93,7 @@ func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
 
 	tpl, err := q.CreateTemplate(ctx, db.CreateTemplateParams{
 		TeamID:    team.ID,
-		Alias:     "superserve/base",
+		Name:      "superserve/base",
 		BuildSpec: []byte(`{"from":"test","steps":[]}`),
 		Vcpu:      1,
 		MemoryMib: 1024,
