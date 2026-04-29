@@ -97,3 +97,43 @@ jobs:
             git diff
             exit 1
           fi
+
+  migration-order:
+    name: Migration Order
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject migrations dated at or before the highest on main
+        run: |
+          git fetch origin main
+          HIGHEST_MAIN=$(git ls-tree -r origin/main --name-only \
+            | grep '^supabase/migrations/' \
+            | grep -oE '[0-9]{14}' \
+            | sort -n | tail -n1)
+          if [ -z "$HIGHEST_MAIN" ]; then
+            echo "no migrations on main yet; nothing to compare against"
+            exit 0
+          fi
+          echo "highest version on main: $HIGHEST_MAIN"
+
+          NEW=$(git diff --name-status origin/main...HEAD -- supabase/migrations/ \
+            | awk '$1=="A" {print $2}')
+          if [ -z "$NEW" ]; then
+            echo "no new migrations in this PR"
+            exit 0
+          fi
+
+          fail=0
+          for file in $NEW; do
+            v=$(basename "$file" | grep -oE '^[0-9]{14}')
+            if [ "$v" -le "$HIGHEST_MAIN" ]; then
+              echo "::error file=$file::migration $v is at or before highest-on-main $HIGHEST_MAIN — supabase db push will refuse without --include-all; bump the timestamp"
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] && echo "all new migrations are correctly ordered"
+          exit $fail
