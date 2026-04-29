@@ -49,7 +49,6 @@ on:
       - 'cmd/template-builder/**'
       - 'proto/boxdpb/**'
       - 'internal/builder/**'
-      - 'internal/vm/**'
 
 # Serialize runs so two concurrent pushes don't double-trigger the
 # build supervisor with the same specs. In-progress runs complete before
@@ -89,7 +88,7 @@ jobs:
             echo "force=${{ github.event.inputs.force_rebuild }}" >> "$GITHUB_OUTPUT"
           elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
             echo "force=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | grep -qE '^(cmd/boxd/|cmd/template-builder/|proto/boxdpb/|internal/builder/|internal/vm/)'; then
+          elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | grep -qE '^(cmd/boxd/|cmd/template-builder/|proto/boxdpb/|internal/builder/)'; then
             echo "force=true" >> "$GITHUB_OUTPUT"
           else
             echo "force=false" >> "$GITHUB_OUTPUT"
@@ -132,7 +131,7 @@ jobs:
             echo "force=${{ github.event.inputs.force_rebuild }}" >> "$GITHUB_OUTPUT"
           elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
             echo "force=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | grep -qE '^(cmd/boxd/|cmd/template-builder/|proto/boxdpb/|internal/builder/|internal/vm/)'; then
+          elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | grep -qE '^(cmd/boxd/|cmd/template-builder/|proto/boxdpb/|internal/builder/)'; then
             echo "force=true" >> "$GITHUB_OUTPUT"
           else
             echo "force=false" >> "$GITHUB_OUTPUT"
