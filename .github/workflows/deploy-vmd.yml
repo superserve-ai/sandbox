@@ -25,6 +25,7 @@ on:
       - 'internal/vm/**'
       - 'internal/network/**'
       - 'internal/builder/**'
+      - 'internal/db/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
