@@ -150,6 +150,19 @@ func (a *GRPCAdapter) DeleteSnapshot(ctx context.Context, req *vmdpb.DeleteSnaps
 	return &vmdpb.DeleteSnapshotResponse{Deleted: true}, nil
 }
 
+// DeleteTemplateArtifacts removes a template's snapshot dir + rootfs dir.
+// Idempotent.
+func (a *GRPCAdapter) DeleteTemplateArtifacts(ctx context.Context, req *vmdpb.DeleteTemplateArtifactsRequest) (*vmdpb.DeleteTemplateArtifactsResponse, error) {
+	tplID := req.GetTemplateId()
+	if tplID == "" {
+		return nil, status.Error(codes.InvalidArgument, "template_id must be set")
+	}
+	if err := a.mgr.DeleteTemplateArtifacts(tplID); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteTemplateArtifactsResponse{Deleted: true}, nil
+}
+
 func (a *GRPCAdapter) ExecCommand(req *vmdpb.ExecCommandRequest, stream grpc.ServerStreamingServer[vmdpb.ExecCommandResponse]) error {
 	if req.GetCommand() == "" {
 		return status.Error(codes.InvalidArgument, "command is required")

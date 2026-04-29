@@ -27,6 +27,10 @@ service VMDaemon {
   // re-paused and only the latest snapshot is reachable.
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
 
+  // DeleteTemplateArtifacts removes a template's on-disk snapshot dir and
+  // rootfs. Idempotent.
+  rpc DeleteTemplateArtifacts(DeleteTemplateArtifactsRequest) returns (DeleteTemplateArtifactsResponse);
+
   // ExecCommand runs a command inside a VM and streams stdout/stderr back.
   rpc ExecCommand(ExecCommandRequest) returns (stream ExecCommandResponse);
 
@@ -303,6 +307,18 @@ message DeleteSnapshotRequest {
 message DeleteSnapshotResponse {
   // True when both files are no longer on disk after this call — either
   // because this call removed them, or because they were already gone.
+  bool deleted = 1;
+}
+
+// ---------------------------------------------------------------------------
+// DeleteTemplateArtifacts
+// ---------------------------------------------------------------------------
+
+message DeleteTemplateArtifactsRequest {
+  string template_id = 1;
+}
+
+message DeleteTemplateArtifactsResponse {
   bool deleted = 1;
 }
 
