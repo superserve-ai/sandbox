@@ -174,16 +174,13 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
 	defer postCancel()
 
-	triggerName := "timeout"
 	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
 		MemPath:   &memPath,
 		SizeBytes: 0,
-		Saved:     false,
-		Name:      &triggerName,
-		Trigger:   triggerName,
+		Trigger:   "timeout",
 	}); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)

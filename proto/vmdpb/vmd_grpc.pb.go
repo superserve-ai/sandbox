@@ -19,20 +19,21 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	VMDaemon_DestroyVM_FullMethodName            = "/superserve.vmd.v1.VMDaemon/DestroyVM"
-	VMDaemon_PauseVM_FullMethodName              = "/superserve.vmd.v1.VMDaemon/PauseVM"
-	VMDaemon_ResumeVM_FullMethodName             = "/superserve.vmd.v1.VMDaemon/ResumeVM"
-	VMDaemon_CreateSnapshot_FullMethodName       = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
-	VMDaemon_RestoreSnapshot_FullMethodName      = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
-	VMDaemon_DeleteSnapshot_FullMethodName       = "/superserve.vmd.v1.VMDaemon/DeleteSnapshot"
-	VMDaemon_ExecCommand_FullMethodName          = "/superserve.vmd.v1.VMDaemon/ExecCommand"
-	VMDaemon_GetVMInfo_FullMethodName            = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
-	VMDaemon_SetupNetwork_FullMethodName         = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
-	VMDaemon_UpdateSandboxNetwork_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
-	VMDaemon_BuildTemplate_FullMethodName        = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
-	VMDaemon_GetBuildStatus_FullMethodName       = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
-	VMDaemon_CancelBuild_FullMethodName          = "/superserve.vmd.v1.VMDaemon/CancelBuild"
-	VMDaemon_StreamBuildLogs_FullMethodName      = "/superserve.vmd.v1.VMDaemon/StreamBuildLogs"
+	VMDaemon_DestroyVM_FullMethodName               = "/superserve.vmd.v1.VMDaemon/DestroyVM"
+	VMDaemon_PauseVM_FullMethodName                 = "/superserve.vmd.v1.VMDaemon/PauseVM"
+	VMDaemon_ResumeVM_FullMethodName                = "/superserve.vmd.v1.VMDaemon/ResumeVM"
+	VMDaemon_CreateSnapshot_FullMethodName          = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
+	VMDaemon_RestoreSnapshot_FullMethodName         = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
+	VMDaemon_DeleteSnapshot_FullMethodName          = "/superserve.vmd.v1.VMDaemon/DeleteSnapshot"
+	VMDaemon_DeleteTemplateArtifacts_FullMethodName = "/superserve.vmd.v1.VMDaemon/DeleteTemplateArtifacts"
+	VMDaemon_ExecCommand_FullMethodName             = "/superserve.vmd.v1.VMDaemon/ExecCommand"
+	VMDaemon_GetVMInfo_FullMethodName               = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
+	VMDaemon_SetupNetwork_FullMethodName            = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
+	VMDaemon_UpdateSandboxNetwork_FullMethodName    = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
+	VMDaemon_BuildTemplate_FullMethodName           = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
+	VMDaemon_GetBuildStatus_FullMethodName          = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
+	VMDaemon_CancelBuild_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CancelBuild"
+	VMDaemon_StreamBuildLogs_FullMethodName         = "/superserve.vmd.v1.VMDaemon/StreamBuildLogs"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -56,6 +57,9 @@ type VMDaemonClient interface {
 	// control plane to garbage-collect the previous snapshot when a sandbox is
 	// re-paused and only the latest snapshot is reachable.
 	DeleteSnapshot(ctx context.Context, in *DeleteSnapshotRequest, opts ...grpc.CallOption) (*DeleteSnapshotResponse, error)
+	// DeleteTemplateArtifacts removes a template's on-disk snapshot dir and
+	// rootfs. Idempotent.
+	DeleteTemplateArtifacts(ctx context.Context, in *DeleteTemplateArtifactsRequest, opts ...grpc.CallOption) (*DeleteTemplateArtifactsResponse, error)
 	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
 	ExecCommand(ctx context.Context, in *ExecCommandRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecCommandResponse], error)
 	// GetVMInfo returns the current status and metadata of a VM.
@@ -144,6 +148,16 @@ func (c *vMDaemonClient) DeleteSnapshot(ctx context.Context, in *DeleteSnapshotR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DeleteSnapshotResponse)
 	err := c.cc.Invoke(ctx, VMDaemon_DeleteSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) DeleteTemplateArtifacts(ctx context.Context, in *DeleteTemplateArtifactsRequest, opts ...grpc.CallOption) (*DeleteTemplateArtifactsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteTemplateArtifactsResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_DeleteTemplateArtifacts_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +283,9 @@ type VMDaemonServer interface {
 	// control plane to garbage-collect the previous snapshot when a sandbox is
 	// re-paused and only the latest snapshot is reachable.
 	DeleteSnapshot(context.Context, *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error)
+	// DeleteTemplateArtifacts removes a template's on-disk snapshot dir and
+	// rootfs. Idempotent.
+	DeleteTemplateArtifacts(context.Context, *DeleteTemplateArtifactsRequest) (*DeleteTemplateArtifactsResponse, error)
 	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
 	ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error
 	// GetVMInfo returns the current status and metadata of a VM.
@@ -320,6 +337,9 @@ func (UnimplementedVMDaemonServer) RestoreSnapshot(context.Context, *RestoreSnap
 }
 func (UnimplementedVMDaemonServer) DeleteSnapshot(context.Context, *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteSnapshot not implemented")
+}
+func (UnimplementedVMDaemonServer) DeleteTemplateArtifacts(context.Context, *DeleteTemplateArtifactsRequest) (*DeleteTemplateArtifactsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteTemplateArtifacts not implemented")
 }
 func (UnimplementedVMDaemonServer) ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error {
 	return status.Error(codes.Unimplemented, "method ExecCommand not implemented")
@@ -470,6 +490,24 @@ func _VMDaemon_DeleteSnapshot_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VMDaemonServer).DeleteSnapshot(ctx, req.(*DeleteSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_DeleteTemplateArtifacts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteTemplateArtifactsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).DeleteTemplateArtifacts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_DeleteTemplateArtifacts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).DeleteTemplateArtifacts(ctx, req.(*DeleteTemplateArtifactsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -634,6 +672,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteSnapshot",
 			Handler:    _VMDaemon_DeleteSnapshot_Handler,
+		},
+		{
+			MethodName: "DeleteTemplateArtifacts",
+			Handler:    _VMDaemon_DeleteTemplateArtifacts_Handler,
 		},
 		{
 			MethodName: "GetVMInfo",

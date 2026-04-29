@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -581,14 +582,34 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 		return
 	}
 	if !res.Deleted {
-		respondErrorMsg(c, "conflict",
-			fmt.Sprintf("template has %d sandbox(es) (active, paused, or failed) still referencing it; destroy them first", res.LiveCount),
-			http.StatusConflict)
+		switch {
+		case res.LiveCount > 0:
+			respondErrorMsg(c, "conflict",
+				fmt.Sprintf("template has %d sandbox(es) (active, paused, or failed) still referencing it; destroy them first", res.LiveCount),
+				http.StatusConflict)
+		case res.InflightBuildCount > 0:
+			respondErrorMsg(c, "conflict",
+				fmt.Sprintf("template has %d in-flight build(s); cancel them first", res.InflightBuildCount),
+				http.StatusConflict)
+		default:
+			respondError(c, ErrInternal)
+		}
 		return
 	}
 
 	c.Status(http.StatusNoContent)
 	h.logTemplateActivity(c.Request.Context(), tplID, teamID, "template", "deleted", "success", nil)
+
+	// Drop the on-disk snapshot + rootfs. Safe because SoftDeleteTemplateIfUnused
+	// blocks while any build is in flight, so no template-builder is
+	// currently writing into these dirs.
+	if h.VMD != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+		defer cancel()
+		if err := h.VMD.DeleteTemplateArtifacts(ctx, tplID.String()); err != nil {
+			log.Warn().Err(err).Str("template_id", tplID.String()).Msg("vmd DeleteTemplateArtifacts failed; manual cleanup may be required")
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
