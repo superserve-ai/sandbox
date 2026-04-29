@@ -24,6 +24,7 @@ on:
       - 'cmd/template-builder/**'
       - 'internal/vm/**'
       - 'internal/network/**'
+      - 'internal/builder/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
