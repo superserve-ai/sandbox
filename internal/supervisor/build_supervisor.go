@@ -30,8 +30,7 @@ import (
 
 // BuildSupervisorConfig controls the supervisor's ticker cadence and bounds.
 type BuildSupervisorConfig struct {
-	// Interval is the poll period. 30s matches the sandbox timeout reaper
-	// and trades "a bit of dispatch latency" for "low DB/vmd chatter."
+	// Interval is the poll period.
 	Interval time.Duration
 
 	// BatchSize caps how many pending rows we evaluate per tick. Bounds the
@@ -66,7 +65,7 @@ type BuildSupervisorConfig struct {
 // DefaultBuildSupervisorConfig returns sensible defaults.
 func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 	return BuildSupervisorConfig{
-		Interval:                  30 * time.Second,
+		Interval:                  1 * time.Second,
 		BatchSize:                 20,
 		GlobalMaxConcurrentBuilds: 10,
 		HostID:                    hostID,
