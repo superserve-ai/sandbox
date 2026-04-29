@@ -155,6 +155,7 @@ mount -t devtmpfs dev /dev 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mkdir -p /dev/pts /home/user
+mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 
 # Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The
