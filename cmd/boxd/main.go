@@ -122,7 +122,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 //	{
 //	  "env_vars":        {"KEY":"VALUE", ...}, // optional
 //	  "default_user":    "appuser",             // optional
-//	  "default_workdir": "/srv/app"             // optional
+//	  "default_workdir": "/srv/app",            // optional
+//	  "hostname":        "sandbox-abc12345"     // optional
 //	}
 func handleInit(ctx *sandboxContext) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +137,7 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 			EnvVars        map[string]string `json:"env_vars"`
 			DefaultUser    string            `json:"default_user"`
 			DefaultWorkdir string            `json:"default_workdir"`
+			Hostname       string            `json:"hostname"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
@@ -146,9 +148,28 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 		log.Printf("init: merged %d env var(s) user=%q workdir=%q",
 			len(body.EnvVars), body.DefaultUser, body.DefaultWorkdir)
 
+		if body.Hostname != "" {
+			if err := setHostname(body.Hostname); err != nil {
+				log.Printf("init: set hostname %q failed: %v", body.Hostname, err)
+			} else {
+				log.Printf("init: hostname set to %q", body.Hostname)
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok"}`)
 	}
+}
+
+// setHostname sets the kernel hostname and writes /etc/hostname.
+func setHostname(name string) error {
+	if err := syscall.Sethostname([]byte(name)); err != nil {
+		return fmt.Errorf("sethostname: %w", err)
+	}
+	if err := os.WriteFile("/etc/hostname", []byte(name+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write /etc/hostname: %w", err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

@@ -53,7 +53,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, err
 	}
 
-	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars()); err != nil {
+	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); err != nil {
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
@@ -107,16 +107,12 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, err
 	}
 
-	// Merge caller env vars on top of whatever context the template baked
-	// into the snapshot. Skipping on empty preserves the template's
-	// defaults (boxd already has them loaded from the restored memory).
-	if envVars := req.GetEnvVars(); len(envVars) > 0 {
-		if initErr := postBoxdInit(ctx, inst.IP, envVars); initErr != nil {
-			// Tear the VM down — a sandbox whose env vars weren't applied
-			// would silently serve stale/missing secrets to the user.
-			_ = a.mgr.DestroyVM(ctx, inst.ID, true)
-			return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", initErr)
-		}
+	// Apply caller env vars and the per-sandbox hostname.
+	if initErr := postBoxdInit(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); initErr != nil {
+		// Tear the VM down — a sandbox whose env vars weren't applied
+		// would silently serve stale/missing secrets to the user.
+		_ = a.mgr.DestroyVM(ctx, inst.ID, true)
+		return nil, status.Errorf(codes.Internal, "post-restore init failed: %v", initErr)
 	}
 
 	return &vmdpb.RestoreSnapshotResponse{
