@@ -432,26 +432,6 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		return
 	}
 
-	// Per-team template count cap. System team is exempt.
-	if teamID != h.systemTeamID() {
-		count, err := h.DB.CountActiveTemplatesForTeam(c.Request.Context(), teamID)
-		if err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountActiveTemplatesForTeam failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		effMaxTemplates := int64(defaultMaxTemplates)
-		if team.MaxTemplates != nil {
-			effMaxTemplates = int64(*team.MaxTemplates)
-		}
-		if count >= effMaxTemplates {
-			respondErrorMsg(c, "too_many_templates",
-				fmt.Sprintf("team has reached the limit of %d templates; delete some or contact support@superserve.ai for higher", effMaxTemplates),
-				http.StatusTooManyRequests)
-			return
-		}
-	}
-
 	specJSON, err := json.Marshal(req.BuildSpec)
 	if err != nil {
 		log.Error().Err(err).Msg("marshal build_spec")
@@ -477,6 +457,27 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback(ctx)
+
+	// Per-team template count cap. Inside the advisory lock so concurrent
+	// submits at limit-1 don't both pass. System team is exempt.
+	if teamID != h.systemTeamID() {
+		count, err := q.CountActiveTemplatesForTeam(ctx, teamID)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountActiveTemplatesForTeam failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		effMaxTemplates := int64(defaultMaxTemplates)
+		if team.MaxTemplates != nil {
+			effMaxTemplates = int64(*team.MaxTemplates)
+		}
+		if count >= effMaxTemplates {
+			respondErrorMsg(c, "too_many_templates",
+				fmt.Sprintf("team has reached the limit of %d templates; delete some or contact support@superserve.ai for higher", effMaxTemplates),
+				http.StatusTooManyRequests)
+			return
+		}
+	}
 
 	row, err := q.CreateTemplateWithBuild(ctx, db.CreateTemplateWithBuildParams{
 		TeamID:        teamID,

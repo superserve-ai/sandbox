@@ -28,6 +28,17 @@ import (
 // VMDClient is the interface for talking to a VM daemon.
 type VMDClient = vmdclient.Client
 
+// sandboxQuotaError is the sentinel returned from CreateSandbox's INSERT
+// goroutine when the per-team count cap is reached. Carries the cap so
+// the handler can include it in the user-facing error.
+type sandboxQuotaError struct{ limit int64 }
+
+func (e sandboxQuotaError) Error() string {
+	return fmt.Sprintf("sandbox quota exceeded (limit=%d)", e.limit)
+}
+
+func errSandboxQuotaExceeded(limit int64) error { return sandboxQuotaError{limit: limit} }
+
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
 	SelectHost(ctx context.Context) (hostID string, err error)
@@ -914,32 +925,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Per-team sandbox count cap. System team is exempt.
-	if teamID != h.systemTeamID() {
-		team, err := h.DB.GetTeam(c.Request.Context(), teamID)
-		if err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeam failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		count, err := h.DB.CountActiveSandboxesForTeam(c.Request.Context(), teamID)
-		if err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountActiveSandboxesForTeam failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		effMaxSandboxes := int64(defaultMaxSandboxes)
-		if team.MaxSandboxes != nil {
-			effMaxSandboxes = int64(*team.MaxSandboxes)
-		}
-		if count >= effMaxSandboxes {
-			respondErrorMsg(c, "too_many_sandboxes",
-				fmt.Sprintf("team has reached the limit of %d sandboxes; pause/delete some or contact support@superserve.ai for higher", effMaxSandboxes),
-				http.StatusTooManyRequests)
-			return
-		}
-	}
-
 	// Default the create to the `superserve/base` template so every sandbox
 	// has a consistent baseline image. Callers can opt out by setting
 	// from_template to some other name/UUID; today the API always routes
@@ -1022,6 +1007,43 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	insertCh := make(chan insertResult, 1)
 	go func() {
+		// Wrap count + insert in a tx with the per-team advisory lock so
+		// concurrent submits can't both pass at limit-1.
+		tx, err := h.Pool.BeginTx(insertCtx, pgx.TxOptions{})
+		if err != nil {
+			insertCh <- insertResult{err: err}
+			return
+		}
+		defer tx.Rollback(insertCtx)
+
+		if _, err := tx.Exec(insertCtx, "SELECT pg_advisory_xact_lock(hashtext($1))", teamID.String()); err != nil {
+			insertCh <- insertResult{err: err}
+			return
+		}
+		q := h.DB.WithTx(tx)
+
+		// Per-team sandbox count cap. System team is exempt.
+		if teamID != h.systemTeamID() {
+			team, err := q.GetTeam(insertCtx, teamID)
+			if err != nil {
+				insertCh <- insertResult{err: err}
+				return
+			}
+			count, err := q.CountActiveSandboxesForTeam(insertCtx, teamID)
+			if err != nil {
+				insertCh <- insertResult{err: err}
+				return
+			}
+			effMaxSandboxes := int64(defaultMaxSandboxes)
+			if team.MaxSandboxes != nil {
+				effMaxSandboxes = int64(*team.MaxSandboxes)
+			}
+			if count >= effMaxSandboxes {
+				insertCh <- insertResult{err: errSandboxQuotaExceeded(effMaxSandboxes)}
+				return
+			}
+		}
+
 		var sb db.Sandbox
 		var insertErr error
 		if templateID.Valid {
@@ -1029,7 +1051,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			// row, serializing with SoftDeleteTemplateIfUnused's FOR UPDATE
 			// so a concurrent template delete is either blocked (we win,
 			// INSERT succeeds) or completes before us (we lose, 0 rows back).
-			sb, insertErr = h.DB.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
+			sb, insertErr = q.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
 				ID:             sandboxID,
 				TeamID:         teamID,
 				Name:           req.Name,
@@ -1044,7 +1066,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				TeamID_3:       h.systemTeamID(),
 			})
 		} else {
-			sb, insertErr = h.DB.CreateSandbox(insertCtx, db.CreateSandboxParams{
+			sb, insertErr = q.CreateSandbox(insertCtx, db.CreateSandboxParams{
 				ID:             sandboxID,
 				TeamID:         teamID,
 				Name:           req.Name,
@@ -1056,6 +1078,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				Metadata:       metadataJSON,
 				TemplateID:     pgtype.UUID{Valid: false},
 			})
+		}
+		if insertErr == nil {
+			insertErr = tx.Commit(insertCtx)
 		}
 		insertCh <- insertResult{sandbox: sb, err: insertErr}
 	}()
@@ -1085,12 +1110,22 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
 	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
 
+	// Per-team sandbox count cap; surfaced from the goroutine via sentinel.
+	var quotaErr sandboxQuotaError
+	quotaExceeded := errors.As(dbErr, &quotaErr)
+
 	switch {
 	case dbErr != nil && vmdErr != nil:
 		// Both failed — nothing persisted, nothing to clean up.
 		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
 		if templateRace {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
+		if quotaExceeded {
+			respondErrorMsg(c, "too_many_sandboxes",
+				fmt.Sprintf("team has reached the limit of %d sandboxes; pause/delete some or contact support@superserve.ai for higher", quotaErr.limit),
+				http.StatusTooManyRequests)
 			return
 		}
 		respondError(c, ErrInternal)
@@ -1105,6 +1140,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		cleanupCancel()
 		if templateRace {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
+		if quotaExceeded {
+			respondErrorMsg(c, "too_many_sandboxes",
+				fmt.Sprintf("team has reached the limit of %d sandboxes; pause/delete some or contact support@superserve.ai for higher", quotaErr.limit),
+				http.StatusTooManyRequests)
 			return
 		}
 		respondError(c, ErrInternal)
