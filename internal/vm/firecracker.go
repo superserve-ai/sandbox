@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 
 	httptransport "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
@@ -59,6 +60,21 @@ func newFCClient(socketPath string) *fcclient.Firecracker {
 func strPtr(s string) *string { return &s }
 func boolPtr(b bool) *bool    { return &b }
 func int64Ptr(i int64) *int64 { return &i }
+
+// vmHostname returns a short hostname for a VM.
+func vmHostname(vmID string) string {
+	if rest, ok := strings.CutPrefix(vmID, "build-"); ok {
+		return "build-" + shortID(rest)
+	}
+	return "sandbox-" + shortID(vmID)
+}
+
+func shortID(s string) string {
+	if len(s) >= 8 {
+		return s[:8]
+	}
+	return s
+}
 
 // ---------------------------------------------------------------------------
 // configureMachine configures the Firecracker instance via its HTTP API.
