@@ -1006,7 +1006,51 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		err     error
 	}
 	insertCh := make(chan insertResult, 1)
+	// runInsert performs the INSERT against the supplied tx-bound queries.
+	// Closure captures sandboxID/teamID/req/templateID/hostID/metadataJSON.
+	runInsert := func(q *db.Queries) (db.Sandbox, error) {
+		if templateID.Valid {
+			// CreateSandboxFromTemplate holds FOR KEY SHARE on the template
+			// row, serializing with SoftDeleteTemplateIfUnused's FOR UPDATE
+			// so a concurrent template delete is either blocked (we win,
+			// INSERT succeeds) or completes before us (we lose, 0 rows back).
+			return q.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
+				ID:             sandboxID,
+				TeamID:         teamID,
+				Name:           req.Name,
+				Status:         db.SandboxStatusStarting,
+				VcpuCount:      1, // placeholders; real values land via ActivateSandbox
+				MemoryMib:      1,
+				HostID:         hostID,
+				TimeoutSeconds: req.TimeoutSeconds,
+				Metadata:       metadataJSON,
+				ID_2:           uuid.UUID(templateID.Bytes),
+				TeamID_2:       teamID,
+				TeamID_3:       h.systemTeamID(),
+			})
+		}
+		return q.CreateSandbox(insertCtx, db.CreateSandboxParams{
+			ID:             sandboxID,
+			TeamID:         teamID,
+			Name:           req.Name,
+			Status:         db.SandboxStatusStarting,
+			VcpuCount:      1,
+			MemoryMib:      1,
+			HostID:         hostID,
+			TimeoutSeconds: req.TimeoutSeconds,
+			Metadata:       metadataJSON,
+			TemplateID:     pgtype.UUID{Valid: false},
+		})
+	}
 	go func() {
+		// Test path: when no Pool is wired (unit tests with a mock DBTX),
+		// skip the count check and just do the INSERT.
+		if h.Pool == nil {
+			sb, err := runInsert(h.DB)
+			insertCh <- insertResult{sandbox: sb, err: err}
+			return
+		}
+
 		// Wrap count + insert in a tx with the per-team advisory lock so
 		// concurrent submits can't both pass at limit-1.
 		tx, err := h.Pool.BeginTx(insertCtx, pgx.TxOptions{})
@@ -1044,41 +1088,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			}
 		}
 
-		var sb db.Sandbox
-		var insertErr error
-		if templateID.Valid {
-			// CreateSandboxFromTemplate holds FOR KEY SHARE on the template
-			// row, serializing with SoftDeleteTemplateIfUnused's FOR UPDATE
-			// so a concurrent template delete is either blocked (we win,
-			// INSERT succeeds) or completes before us (we lose, 0 rows back).
-			sb, insertErr = q.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
-				ID:             sandboxID,
-				TeamID:         teamID,
-				Name:           req.Name,
-				Status:         db.SandboxStatusStarting,
-				VcpuCount:      1, // placeholders; real values land via ActivateSandbox
-				MemoryMib:      1,
-				HostID:         hostID,
-				TimeoutSeconds: req.TimeoutSeconds,
-				Metadata:       metadataJSON,
-				ID_2:           uuid.UUID(templateID.Bytes),
-				TeamID_2:       teamID,
-				TeamID_3:       h.systemTeamID(),
-			})
-		} else {
-			sb, insertErr = q.CreateSandbox(insertCtx, db.CreateSandboxParams{
-				ID:             sandboxID,
-				TeamID:         teamID,
-				Name:           req.Name,
-				Status:         db.SandboxStatusStarting,
-				VcpuCount:      1,
-				MemoryMib:      1,
-				HostID:         hostID,
-				TimeoutSeconds: req.TimeoutSeconds,
-				Metadata:       metadataJSON,
-				TemplateID:     pgtype.UUID{Valid: false},
-			})
-		}
+		sb, insertErr := runInsert(q)
 		if insertErr == nil {
 			insertErr = tx.Commit(insertCtx)
 		}
