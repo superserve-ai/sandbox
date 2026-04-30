@@ -143,8 +143,9 @@ paths:
           description: |
             Rate-limited or quota reached. The `error.code` distinguishes:
             - `rate_limited` — request rate exceeded; retry after a short backoff.
-            - `too_many_sandboxes` — team has reached its sandbox count limit;
-              pause/delete existing sandboxes or contact support to raise the cap.
+            - `too_many_sandboxes` — team has reached its sandbox count limit
+              (paused sandboxes count toward this cap; only DELETE frees a slot);
+              delete existing sandboxes or contact support to raise the cap.
           content:
             application/json:
               schema:

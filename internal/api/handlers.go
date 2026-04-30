@@ -1124,7 +1124,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if quotaExceeded {
 			respondErrorMsg(c, "too_many_sandboxes",
-				fmt.Sprintf("team has reached the limit of %d sandboxes; pause/delete some or contact support@superserve.ai for higher", quotaErr.limit),
+				fmt.Sprintf("team has reached the limit of %d sandboxes; delete some or contact support@superserve.ai for higher", quotaErr.limit),
 				http.StatusTooManyRequests)
 			return
 		}
@@ -1144,7 +1144,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if quotaExceeded {
 			respondErrorMsg(c, "too_many_sandboxes",
-				fmt.Sprintf("team has reached the limit of %d sandboxes; pause/delete some or contact support@superserve.ai for higher", quotaErr.limit),
+				fmt.Sprintf("team has reached the limit of %d sandboxes; delete some or contact support@superserve.ai for higher", quotaErr.limit),
 				http.StatusTooManyRequests)
 			return
 		}
