@@ -93,7 +93,7 @@ func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
 
 	tpl, err := q.CreateTemplate(ctx, db.CreateTemplateParams{
 		TeamID:    team.ID,
-		Alias:     "superserve/base",
+		Name:      "superserve/base",
 		BuildSpec: []byte(`{"from":"test","steps":[]}`),
 		Vcpu:      1,
 		MemoryMib: 1024,
@@ -1352,5 +1352,135 @@ func TestIntegration_RateLimit_Headers(t *testing.T) {
 	}
 	if w.Header().Get("RateLimit-Remaining") == "" {
 		t.Error("missing RateLimit-Remaining header")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------
+
+// TestIntegration_CreateTemplate_NameReusableAfterDelete verifies the partial
+// unique index on (team_id, name) WHERE deleted_at IS NULL: once a template
+// is soft-deleted its name can be reused for a fresh template.
+func TestIntegration_CreateTemplate_NameReusableAfterDelete(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	const name = "reuse-me"
+
+	// Insert a template directly and mark it soft-deleted, simulating the
+	// state after DELETE /templates/{id}. We bypass POST /templates here
+	// because that path queues a build, which would block deletion.
+	old, err := testQueries.CreateTemplate(ctx, db.CreateTemplateParams{
+		TeamID:    teamID,
+		Name:      name,
+		BuildSpec: []byte(`{"from":"debian:12-slim","steps":[]}`),
+		Vcpu:      1,
+		MemoryMib: 1024,
+		DiskMib:   4096,
+	})
+	if err != nil {
+		t.Fatalf("seed template: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET deleted_at = now() WHERE id = $1`, old.ID); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
+
+	// Same name on a fresh POST /templates must succeed.
+	body := fmt.Sprintf(`{"name":%q,"build_spec":{"from":"debian:12-slim","steps":[]}}`, name)
+	w := do(r, "POST", "/templates", apiKey, body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := mustJSON(t, w)
+	if resp["name"] != name {
+		t.Errorf("name = %q, want %q", resp["name"], name)
+	}
+
+	newID, _ := uuid.Parse(resp["id"].(string))
+	if newID == old.ID {
+		t.Fatal("expected a fresh template id; got the soft-deleted row's id")
+	}
+
+	// Both rows exist in DB: the old one with deleted_at set, the new one without.
+	var liveCount, deletedCount int
+	if err := testPool.QueryRow(ctx,
+		`SELECT
+		   COUNT(*) FILTER (WHERE deleted_at IS NULL),
+		   COUNT(*) FILTER (WHERE deleted_at IS NOT NULL)
+		 FROM template WHERE team_id = $1 AND name = $2`,
+		teamID, name,
+	).Scan(&liveCount, &deletedCount); err != nil {
+		t.Fatalf("count check: %v", err)
+	}
+	if liveCount != 1 || deletedCount != 1 {
+		t.Errorf("DB state: live=%d deleted=%d, want 1/1", liveCount, deletedCount)
+	}
+}
+
+// TestIntegration_CreateTemplate_NameCharSet rejects names that don't match
+// the lowercase/`._/-` allowlist with a 400.
+func TestIntegration_CreateTemplate_NameCharSet(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cases := []struct {
+		name    string
+		ok      bool
+		comment string
+	}{
+		{"foo", true, "lowercase ok"},
+		{"my-python-env", true, "hyphens ok"},
+		{"a/b/c", true, "slashes ok"},
+		{"foo.bar", true, "dot ok"},
+		{"f", true, "single char ok"},
+		{"Foo", false, "capitals rejected"},
+		{"foo bar", false, "space rejected"},
+		{"-foo", false, "leading hyphen rejected"},
+		{"foo-", false, "trailing hyphen rejected"},
+		{"/foo", false, "leading slash rejected"},
+		{"foo/", false, "trailing slash rejected"},
+		{"foo!", false, "punctuation rejected"},
+		{"", false, "empty rejected"},
+	}
+	for _, tc := range cases {
+		body := fmt.Sprintf(`{"name":%q,"build_spec":{"from":"debian:12-slim","steps":[]}}`, tc.name)
+		w := do(r, "POST", "/templates", apiKey, body)
+		if tc.ok {
+			if w.Code != http.StatusAccepted {
+				t.Errorf("%s: expected 202, got %d (%s)", tc.comment, w.Code, w.Body.String())
+			}
+		} else {
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("%s: name=%q expected 400, got %d", tc.comment, tc.name, w.Code)
+			}
+		}
+	}
+}
+
+// TestIntegration_CreateTemplate_DuplicateLiveNameReturns409 is the negative
+// case: a non-deleted template's name still blocks a duplicate.
+func TestIntegration_CreateTemplate_DuplicateLiveNameReturns409(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	const name = "taken"
+	if _, err := testQueries.CreateTemplate(ctx, db.CreateTemplateParams{
+		TeamID:    teamID,
+		Name:      name,
+		BuildSpec: []byte(`{"from":"debian:12-slim","steps":[]}`),
+		Vcpu:      1,
+		MemoryMib: 1024,
+		DiskMib:   4096,
+	}); err != nil {
+		t.Fatalf("seed template: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"name":%q,"build_spec":{"from":"debian:12-slim","steps":[]}}`, name)
+	w := do(r, "POST", "/templates", apiKey, body)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
 	}
 }

@@ -1,5 +1,5 @@
 {
-  "alias": "superserve/node-22",
+  "name": "superserve/node-22",
   "vcpu": 1,
   "memory_mib": 1024,
   "disk_mib": 4096,

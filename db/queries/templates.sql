@@ -3,7 +3,7 @@
 -- for ops-side seeding that wants to stage rows without triggering builds;
 -- the public API uses CreateTemplateWithBuild to auto-enqueue the first
 -- build in a single transaction.
-INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib)
+INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib)
 VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
@@ -17,9 +17,9 @@ RETURNING *;
 -- idempotency index on template_build catches duplicate submits. Returns
 -- the template row plus the build id so the handler can echo both.
 WITH new_template AS (
-  INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib, status)
+  INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib, status)
   VALUES ($1, $2, $3, $4, $5, $6, 'building')
-  RETURNING id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib,
+  RETURNING id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib,
             rootfs_path, snapshot_path, mem_path, size_bytes, error_message,
             created_at, updated_at, built_at, deleted_at
 ),
@@ -46,12 +46,12 @@ WHERE id = $1
 SELECT * FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
--- name: GetTemplateByAlias :one
--- Resolve alias to a template visible to the caller. Aliases are unique per
--- team, so the same alias can exist in both the caller's team and the system
+-- name: GetTemplateByName :one
+-- Resolve name to a template visible to the caller. Names are unique per
+-- team, so the same name can exist in both the caller's team and the system
 -- team — prefer the caller's own (ORDER BY) so overrides work naturally.
 SELECT * FROM template
-WHERE alias = $1
+WHERE name = $1
   AND deleted_at IS NULL
   AND (team_id = $2 OR team_id = $3)
 ORDER BY (team_id = $2) DESC
@@ -66,13 +66,13 @@ WHERE deleted_at IS NULL
 ORDER BY created_at DESC;
 
 -- name: ListTemplatesForTeamFiltered :many
--- Same as ListTemplatesForTeam with an optional alias prefix filter. Pass
+-- Same as ListTemplatesForTeam with an optional name prefix filter. Pass
 -- NULL to get the unfiltered list (but prefer the unfiltered query then).
 SELECT * FROM template
 WHERE deleted_at IS NULL
   AND (team_id = $1 OR team_id = $2)
-  AND (sqlc.narg('alias_prefix')::text IS NULL
-       OR alias LIKE sqlc.narg('alias_prefix') || '%')
+  AND (sqlc.narg('name_prefix')::text IS NULL
+       OR name LIKE sqlc.narg('name_prefix') || '%')
 ORDER BY created_at DESC;
 
 -- name: SoftDeleteTemplateIfUnused :one

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -52,7 +53,7 @@ type buildSpec struct {
 }
 
 type createTemplateRequest struct {
-	Alias     string     `json:"alias"`
+	Name      string     `json:"name"`
 	Vcpu      *int32     `json:"vcpu,omitempty"`
 	MemoryMib *int32     `json:"memory_mib,omitempty"`
 	DiskMib   *int32     `json:"disk_mib,omitempty"`
@@ -62,7 +63,7 @@ type createTemplateRequest struct {
 type templateResponse struct {
 	ID           uuid.UUID `json:"id"`
 	TeamID       uuid.UUID `json:"team_id"`
-	Alias        string    `json:"alias"`
+	Name         string    `json:"name"`
 	Status       string    `json:"status"`
 	Vcpu         int32     `json:"vcpu"`
 	MemoryMib    int32     `json:"memory_mib"`
@@ -89,7 +90,7 @@ type templateBuildResponse struct {
 // ---------------------------------------------------------------------------
 
 const (
-	maxAlias        = 128
+	maxName         = 128
 	maxVcpu         = 4
 	maxMemoryMib    = 4096
 	maxDiskMib      = 8192
@@ -97,6 +98,10 @@ const (
 	defaultMemoryMi = 1024
 	defaultDiskMib  = 4096
 )
+
+// templateNameRE restricts template names to lowercase alphanumeric with
+// `.`, `_`, `/`, `-` in the middle. URL-safe, shell-safe, no Unicode.
+var templateNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$`)
 
 // validateBuildSpec enforces base-image policy and step-shape invariants.
 // Catches obvious problems (alpine, distroless, bad step shape) before we
@@ -261,7 +266,7 @@ func toTemplateResponse(t db.Template) templateResponse {
 	resp := templateResponse{
 		ID:        t.ID,
 		TeamID:    t.TeamID,
-		Alias:     t.Alias,
+		Name:      t.Name,
 		Status:    string(t.Status),
 		Vcpu:      t.Vcpu,
 		MemoryMib: t.MemoryMib,
@@ -332,20 +337,23 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	}
 
 	// Field validation (manual; bindJSONStrict doesn't honor `binding` tags).
-	req.Alias = strings.TrimSpace(req.Alias)
-	if req.Alias == "" || len(req.Alias) > maxAlias {
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len(req.Name) > maxName {
 		respondErrorMsg(c, "bad_request",
-			fmt.Sprintf("alias is required and must be 1-%d characters", maxAlias),
+			fmt.Sprintf("name is required and must be 1-%d characters", maxName),
 			http.StatusBadRequest)
 		return
 	}
-	// `superserve/` is reserved for curated templates owned by the system
-	// team. Other teams cannot create aliases in this namespace — doing so
-	// would shadow the real curated template for their own members. Match
-	// is case-insensitive to block squat variants like `SuperServe/foo`.
-	if strings.HasPrefix(strings.ToLower(req.Alias), "superserve/") && teamID != h.systemTeamID() {
+	if !templateNameRE.MatchString(req.Name) {
 		respondErrorMsg(c, "bad_request",
-			"aliases starting with 'superserve/' are reserved",
+			"name must be lowercase, start and end with a letter or digit, and contain only letters, digits, '.', '_', '/', '-'",
+			http.StatusBadRequest)
+		return
+	}
+	// `superserve/` is reserved for curated templates owned by the system team.
+	if strings.HasPrefix(req.Name, "superserve/") && teamID != h.systemTeamID() {
+		respondErrorMsg(c, "bad_request",
+			"names starting with 'superserve/' are reserved",
 			http.StatusBadRequest)
 		return
 	}
@@ -406,7 +414,7 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 
 	row, err := q.CreateTemplateWithBuild(ctx, db.CreateTemplateWithBuildParams{
 		TeamID:        teamID,
-		Alias:         req.Alias,
+		Name:          req.Name,
 		BuildSpec:     specJSON,
 		Vcpu:          vcpu,
 		MemoryMib:     memMib,
@@ -416,7 +424,7 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	if err != nil {
 		if isUniqueViolation(err) {
 			respondErrorMsg(c, "conflict",
-				fmt.Sprintf("a template with alias %q already exists for this team", req.Alias),
+				fmt.Sprintf("a template with name %q already exists for this team", req.Name),
 				http.StatusConflict)
 			return
 		}
@@ -437,7 +445,7 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	respBody := gin.H{
 		"id":            resp.ID,
 		"team_id":       resp.TeamID,
-		"alias":         resp.Alias,
+		"name":          resp.Name,
 		"status":        resp.Status,
 		"vcpu":          resp.Vcpu,
 		"memory_mib":    resp.MemoryMib,
@@ -463,7 +471,7 @@ func templateFromWithBuild(r db.CreateTemplateWithBuildRow) db.Template {
 	return db.Template{
 		ID:           r.ID,
 		TeamID:       r.TeamID,
-		Alias:        r.Alias,
+		Name:         r.Name,
 		Status:       r.Status,
 		BuildSpec:    r.BuildSpec,
 		Vcpu:         r.Vcpu,
@@ -515,19 +523,19 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 		return
 	}
 
-	aliasPrefix := c.Query("alias_prefix")
+	namePrefix := c.Query("name_prefix")
 
 	var rows []db.Template
-	if aliasPrefix == "" {
+	if namePrefix == "" {
 		rows, err = h.DB.ListTemplatesForTeam(c.Request.Context(), db.ListTemplatesForTeamParams{
 			TeamID:   teamID,
 			TeamID_2: h.systemTeamID(),
 		})
 	} else {
 		rows, err = h.DB.ListTemplatesForTeamFiltered(c.Request.Context(), db.ListTemplatesForTeamFilteredParams{
-			TeamID:      teamID,
-			TeamID_2:    h.systemTeamID(),
-			AliasPrefix: &aliasPrefix,
+			TeamID:     teamID,
+			TeamID_2:   h.systemTeamID(),
+			NamePrefix: &namePrefix,
 		})
 	}
 	if err != nil {
@@ -808,7 +816,7 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 		buildMetadata(buildID))
 }
 
-// lookupTemplateForCreate resolves a from_template ref (UUID or alias) to a
+// lookupTemplateForCreate resolves a from_template ref (UUID or name) to a
 // Template row that is visible to teamID. Writes a 4xx response and returns
 // a non-nil error on failure so callers can early-return.
 func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref string) (db.Template, error) {
@@ -834,8 +842,8 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 		}
 		return tpl, nil
 	}
-	tpl, err := h.DB.GetTemplateByAlias(c.Request.Context(), db.GetTemplateByAliasParams{
-		Alias:    ref,
+	tpl, err := h.DB.GetTemplateByName(c.Request.Context(), db.GetTemplateByNameParams{
+		Name:     ref,
 		TeamID:   teamID,
 		TeamID_2: h.systemTeamID(),
 	})
@@ -844,7 +852,7 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
 			return db.Template{}, err
 		}
-		log.Error().Err(err).Str("alias", ref).Msg("DB GetTemplateByAlias failed")
+		log.Error().Err(err).Str("name", ref).Msg("DB GetTemplateByName failed")
 		respondError(c, ErrInternal)
 		return db.Template{}, err
 	}
