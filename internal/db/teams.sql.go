@@ -14,7 +14,7 @@ import (
 const createTeam = `-- name: CreateTeam :one
 INSERT INTO team (name)
 VALUES ($1)
-RETURNING id, name, created_at, updated_at, build_concurrency
+RETURNING id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes
 `
 
 func (q *Queries) CreateTeam(ctx context.Context, name string) (Team, error) {
@@ -26,6 +26,11 @@ func (q *Queries) CreateTeam(ctx context.Context, name string) (Team, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.BuildConcurrency,
+		&i.MaxTemplateVcpu,
+		&i.MaxTemplateMemoryMib,
+		&i.MaxTemplateDiskMib,
+		&i.MaxTemplates,
+		&i.MaxSandboxes,
 	)
 	return i, err
 }
@@ -41,7 +46,7 @@ func (q *Queries) DeleteTeam(ctx context.Context, id uuid.UUID) error {
 }
 
 const getTeam = `-- name: GetTeam :one
-SELECT id, name, created_at, updated_at, build_concurrency FROM team
+SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes FROM team
 WHERE id = $1
 `
 
@@ -54,6 +59,11 @@ func (q *Queries) GetTeam(ctx context.Context, id uuid.UUID) (Team, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.BuildConcurrency,
+		&i.MaxTemplateVcpu,
+		&i.MaxTemplateMemoryMib,
+		&i.MaxTemplateDiskMib,
+		&i.MaxTemplates,
+		&i.MaxSandboxes,
 	)
 	return i, err
 }
@@ -71,7 +81,7 @@ func (q *Queries) GetTeamBuildConcurrency(ctx context.Context, id uuid.UUID) (in
 }
 
 const getTeamByName = `-- name: GetTeamByName :one
-SELECT id, name, created_at, updated_at, build_concurrency FROM team
+SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes FROM team
 WHERE name = $1
 `
 
@@ -84,12 +94,17 @@ func (q *Queries) GetTeamByName(ctx context.Context, name string) (Team, error) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.BuildConcurrency,
+		&i.MaxTemplateVcpu,
+		&i.MaxTemplateMemoryMib,
+		&i.MaxTemplateDiskMib,
+		&i.MaxTemplates,
+		&i.MaxSandboxes,
 	)
 	return i, err
 }
 
 const listTeams = `-- name: ListTeams :many
-SELECT id, name, created_at, updated_at, build_concurrency FROM team
+SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes FROM team
 ORDER BY created_at DESC
 `
 
@@ -108,6 +123,11 @@ func (q *Queries) ListTeams(ctx context.Context) ([]Team, error) {
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.BuildConcurrency,
+			&i.MaxTemplateVcpu,
+			&i.MaxTemplateMemoryMib,
+			&i.MaxTemplateDiskMib,
+			&i.MaxTemplates,
+			&i.MaxSandboxes,
 		); err != nil {
 			return nil, err
 		}
@@ -123,7 +143,7 @@ const updateTeamName = `-- name: UpdateTeamName :one
 UPDATE team
 SET name = $2, updated_at = now()
 WHERE id = $1
-RETURNING id, name, created_at, updated_at, build_concurrency
+RETURNING id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes
 `
 
 type UpdateTeamNameParams struct {
@@ -140,6 +160,11 @@ func (q *Queries) UpdateTeamName(ctx context.Context, arg UpdateTeamNameParams) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.BuildConcurrency,
+		&i.MaxTemplateVcpu,
+		&i.MaxTemplateMemoryMib,
+		&i.MaxTemplateDiskMib,
+		&i.MaxTemplates,
+		&i.MaxSandboxes,
 	)
 	return i, err
 }

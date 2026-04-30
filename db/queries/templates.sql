@@ -57,6 +57,13 @@ WHERE name = $1
 ORDER BY (team_id = $2) DESC
 LIMIT 1;
 
+-- name: CountActiveTemplatesForTeam :one
+-- Active = not deleted and not in a terminal-failure state. Failed
+-- templates don't hold a snapshot, so they shouldn't consume the count
+-- cap (matches CountInFlightBuildsForTeam, which also excludes failed).
+SELECT COUNT(*)::bigint FROM template
+WHERE team_id = $1 AND deleted_at IS NULL AND status != 'failed';
+
 -- name: ListTemplatesForTeam :many
 -- Return the caller's team's templates plus all system-team templates
 -- (curated base set visible to everyone). Ordered by created_at desc.
