@@ -165,7 +165,7 @@ func templateRow(t db.Template) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = t.ID
 		*dest[1].(*uuid.UUID) = t.TeamID
-		*dest[2].(*string) = t.Alias
+		*dest[2].(*string) = t.Name
 		*dest[3].(*db.TemplateStatus) = t.Status
 		*dest[4].(*[]byte) = t.BuildSpec
 		*dest[5].(*int32) = t.Vcpu
@@ -192,7 +192,7 @@ func defaultReadyTemplate() db.Template {
 	mem := "/snap/mem.snap"
 	return db.Template{
 		ID:           uuid.New(),
-		Alias:        "superserve/base",
+		Name:         "superserve/base",
 		Status:       db.TemplateStatusReady,
 		Vcpu:         1,
 		MemoryMib:    1024,

@@ -916,7 +916,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Default the create to the `superserve/base` template so every sandbox
 	// has a consistent baseline image. Callers can opt out by setting
-	// from_template to some other alias/UUID; today the API always routes
+	// from_template to some other name/UUID; today the API always routes
 	// through the template/snapshot-restore path.
 	if req.FromTemplate == nil {
 		defaultTpl := "superserve/base"
@@ -933,7 +933,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// snapshot was built with exactly these values, so they're the
 	// authoritative shape.
 	var templateVcpu, templateMemMiB uint32
-	var fromTemplateAlias, fromTemplateID string
+	var fromTemplateName, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
 		if err != nil {
@@ -955,7 +955,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
 		templateVcpu = uint32(tpl.Vcpu)
 		templateMemMiB = uint32(tpl.MemoryMib)
-		fromTemplateAlias = tpl.Alias
+		fromTemplateName = tpl.Name
 		fromTemplateID = tpl.ID.String()
 	}
 
@@ -1191,9 +1191,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	wg.Wait()
 
 	var createdMeta []byte
-	if fromTemplateAlias != "" {
+	if fromTemplateName != "" {
 		createdMeta, _ = json.Marshal(map[string]string{
-			"from_template": fromTemplateAlias,
+			"from_template": fromTemplateName,
 			"template_id":   fromTemplateID,
 		})
 	}

@@ -88,14 +88,14 @@ func (q *Queries) CountInFlightBuildsForTeam(ctx context.Context, teamID uuid.UU
 }
 
 const createTemplate = `-- name: CreateTemplate :one
-INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib)
+INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at
+RETURNING id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at
 `
 
 type CreateTemplateParams struct {
 	TeamID    uuid.UUID `json:"team_id"`
-	Alias     string    `json:"alias"`
+	Name      string    `json:"name"`
 	BuildSpec []byte    `json:"build_spec"`
 	Vcpu      int32     `json:"vcpu"`
 	MemoryMib int32     `json:"memory_mib"`
@@ -109,7 +109,7 @@ type CreateTemplateParams struct {
 func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) (Template, error) {
 	row := q.db.QueryRow(ctx, createTemplate,
 		arg.TeamID,
-		arg.Alias,
+		arg.Name,
 		arg.BuildSpec,
 		arg.Vcpu,
 		arg.MemoryMib,
@@ -119,7 +119,7 @@ func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) 
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
-		&i.Alias,
+		&i.Name,
 		&i.Status,
 		&i.BuildSpec,
 		&i.Vcpu,
@@ -176,9 +176,9 @@ func (q *Queries) CreateTemplateBuild(ctx context.Context, arg CreateTemplateBui
 
 const createTemplateWithBuild = `-- name: CreateTemplateWithBuild :one
 WITH new_template AS (
-  INSERT INTO template (team_id, alias, build_spec, vcpu, memory_mib, disk_mib, status)
+  INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib, status)
   VALUES ($1, $2, $3, $4, $5, $6, 'building')
-  RETURNING id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib,
+  RETURNING id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib,
             rootfs_path, snapshot_path, mem_path, size_bytes, error_message,
             created_at, updated_at, built_at, deleted_at
 ),
@@ -187,13 +187,13 @@ new_build AS (
   SELECT id, team_id, $7 FROM new_template
   RETURNING id AS build_id
 )
-SELECT new_template.id, new_template.team_id, new_template.alias, new_template.status, new_template.build_spec, new_template.vcpu, new_template.memory_mib, new_template.disk_mib, new_template.rootfs_path, new_template.snapshot_path, new_template.mem_path, new_template.size_bytes, new_template.error_message, new_template.created_at, new_template.updated_at, new_template.built_at, new_template.deleted_at, new_build.build_id::uuid AS build_id
+SELECT new_template.id, new_template.team_id, new_template.name, new_template.status, new_template.build_spec, new_template.vcpu, new_template.memory_mib, new_template.disk_mib, new_template.rootfs_path, new_template.snapshot_path, new_template.mem_path, new_template.size_bytes, new_template.error_message, new_template.created_at, new_template.updated_at, new_template.built_at, new_template.deleted_at, new_build.build_id::uuid AS build_id
 FROM new_template, new_build
 `
 
 type CreateTemplateWithBuildParams struct {
 	TeamID        uuid.UUID `json:"team_id"`
-	Alias         string    `json:"alias"`
+	Name          string    `json:"name"`
 	BuildSpec     []byte    `json:"build_spec"`
 	Vcpu          int32     `json:"vcpu"`
 	MemoryMib     int32     `json:"memory_mib"`
@@ -204,7 +204,7 @@ type CreateTemplateWithBuildParams struct {
 type CreateTemplateWithBuildRow struct {
 	ID           uuid.UUID          `json:"id"`
 	TeamID       uuid.UUID          `json:"team_id"`
-	Alias        string             `json:"alias"`
+	Name         string             `json:"name"`
 	Status       TemplateStatus     `json:"status"`
 	BuildSpec    []byte             `json:"build_spec"`
 	Vcpu         int32              `json:"vcpu"`
@@ -233,7 +233,7 @@ type CreateTemplateWithBuildRow struct {
 func (q *Queries) CreateTemplateWithBuild(ctx context.Context, arg CreateTemplateWithBuildParams) (CreateTemplateWithBuildRow, error) {
 	row := q.db.QueryRow(ctx, createTemplateWithBuild,
 		arg.TeamID,
-		arg.Alias,
+		arg.Name,
 		arg.BuildSpec,
 		arg.Vcpu,
 		arg.MemoryMib,
@@ -244,7 +244,7 @@ func (q *Queries) CreateTemplateWithBuild(ctx context.Context, arg CreateTemplat
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
-		&i.Alias,
+		&i.Name,
 		&i.Status,
 		&i.BuildSpec,
 		&i.Vcpu,
@@ -280,7 +280,7 @@ SET status = 'failed',
     updated_at = now()
 FROM build_done
 WHERE template.id = build_done.template_id
-RETURNING template.id, template.team_id, template.alias, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at
+RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at
 `
 
 type FailBuildParams struct {
@@ -296,7 +296,7 @@ func (q *Queries) FailBuild(ctx context.Context, arg FailBuildParams) (Template,
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
-		&i.Alias,
+		&i.Name,
 		&i.Status,
 		&i.BuildSpec,
 		&i.Vcpu,
@@ -335,7 +335,7 @@ SET status = 'ready',
     error_message = NULL
 FROM build_done
 WHERE template.id = build_done.template_id
-RETURNING template.id, template.team_id, template.alias, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at
+RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at
 `
 
 type FinalizeBuildParams struct {
@@ -362,7 +362,7 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (T
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
-		&i.Alias,
+		&i.Name,
 		&i.Status,
 		&i.BuildSpec,
 		&i.Vcpu,
@@ -420,7 +420,7 @@ func (q *Queries) GetExistingInflightBuild(ctx context.Context, arg GetExistingI
 }
 
 const getTemplate = `-- name: GetTemplate :one
-SELECT id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
 WHERE id = $1
   AND deleted_at IS NULL
   AND (team_id = $2 OR team_id = $3)
@@ -441,7 +441,7 @@ func (q *Queries) GetTemplate(ctx context.Context, arg GetTemplateParams) (Templ
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
-		&i.Alias,
+		&i.Name,
 		&i.Status,
 		&i.BuildSpec,
 		&i.Vcpu,
@@ -493,31 +493,31 @@ func (q *Queries) GetTemplateBuild(ctx context.Context, arg GetTemplateBuildPara
 	return i, err
 }
 
-const getTemplateByAlias = `-- name: GetTemplateByAlias :one
-SELECT id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
-WHERE alias = $1
+const getTemplateByName = `-- name: GetTemplateByName :one
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
+WHERE name = $1
   AND deleted_at IS NULL
   AND (team_id = $2 OR team_id = $3)
 ORDER BY (team_id = $2) DESC
 LIMIT 1
 `
 
-type GetTemplateByAliasParams struct {
-	Alias    string    `json:"alias"`
+type GetTemplateByNameParams struct {
+	Name     string    `json:"name"`
 	TeamID   uuid.UUID `json:"team_id"`
 	TeamID_2 uuid.UUID `json:"team_id_2"`
 }
 
-// Resolve alias to a template visible to the caller. Aliases are unique per
-// team, so the same alias can exist in both the caller's team and the system
+// Resolve name to a template visible to the caller. Names are unique per
+// team, so the same name can exist in both the caller's team and the system
 // team — prefer the caller's own (ORDER BY) so overrides work naturally.
-func (q *Queries) GetTemplateByAlias(ctx context.Context, arg GetTemplateByAliasParams) (Template, error) {
-	row := q.db.QueryRow(ctx, getTemplateByAlias, arg.Alias, arg.TeamID, arg.TeamID_2)
+func (q *Queries) GetTemplateByName(ctx context.Context, arg GetTemplateByNameParams) (Template, error) {
+	row := q.db.QueryRow(ctx, getTemplateByName, arg.Name, arg.TeamID, arg.TeamID_2)
 	var i Template
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
-		&i.Alias,
+		&i.Name,
 		&i.Status,
 		&i.BuildSpec,
 		&i.Vcpu,
@@ -537,7 +537,7 @@ func (q *Queries) GetTemplateByAlias(ctx context.Context, arg GetTemplateByAlias
 }
 
 const getTemplateForOwner = `-- name: GetTemplateForOwner :one
-SELECT id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
 `
 
@@ -554,7 +554,7 @@ func (q *Queries) GetTemplateForOwner(ctx context.Context, arg GetTemplateForOwn
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
-		&i.Alias,
+		&i.Name,
 		&i.Status,
 		&i.BuildSpec,
 		&i.Vcpu,
@@ -707,7 +707,7 @@ func (q *Queries) ListPendingBuildsOrdered(ctx context.Context, limit int32) ([]
 }
 
 const listTemplatesForTeam = `-- name: ListTemplatesForTeam :many
-SELECT id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
 WHERE deleted_at IS NULL
   AND (team_id = $1 OR team_id = $2)
 ORDER BY created_at DESC
@@ -732,7 +732,7 @@ func (q *Queries) ListTemplatesForTeam(ctx context.Context, arg ListTemplatesFor
 		if err := rows.Scan(
 			&i.ID,
 			&i.TeamID,
-			&i.Alias,
+			&i.Name,
 			&i.Status,
 			&i.BuildSpec,
 			&i.Vcpu,
@@ -759,24 +759,24 @@ func (q *Queries) ListTemplatesForTeam(ctx context.Context, arg ListTemplatesFor
 }
 
 const listTemplatesForTeamFiltered = `-- name: ListTemplatesForTeamFiltered :many
-SELECT id, team_id, alias, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at FROM template
 WHERE deleted_at IS NULL
   AND (team_id = $1 OR team_id = $2)
   AND ($3::text IS NULL
-       OR alias LIKE $3 || '%')
+       OR name LIKE $3 || '%')
 ORDER BY created_at DESC
 `
 
 type ListTemplatesForTeamFilteredParams struct {
-	TeamID      uuid.UUID `json:"team_id"`
-	TeamID_2    uuid.UUID `json:"team_id_2"`
-	AliasPrefix *string   `json:"alias_prefix"`
+	TeamID     uuid.UUID `json:"team_id"`
+	TeamID_2   uuid.UUID `json:"team_id_2"`
+	NamePrefix *string   `json:"name_prefix"`
 }
 
-// Same as ListTemplatesForTeam with an optional alias prefix filter. Pass
+// Same as ListTemplatesForTeam with an optional name prefix filter. Pass
 // NULL to get the unfiltered list (but prefer the unfiltered query then).
 func (q *Queries) ListTemplatesForTeamFiltered(ctx context.Context, arg ListTemplatesForTeamFilteredParams) ([]Template, error) {
-	rows, err := q.db.Query(ctx, listTemplatesForTeamFiltered, arg.TeamID, arg.TeamID_2, arg.AliasPrefix)
+	rows, err := q.db.Query(ctx, listTemplatesForTeamFiltered, arg.TeamID, arg.TeamID_2, arg.NamePrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -787,7 +787,7 @@ func (q *Queries) ListTemplatesForTeamFiltered(ctx context.Context, arg ListTemp
 		if err := rows.Scan(
 			&i.ID,
 			&i.TeamID,
-			&i.Alias,
+			&i.Name,
 			&i.Status,
 			&i.BuildSpec,
 			&i.Vcpu,
