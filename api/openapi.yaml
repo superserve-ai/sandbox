@@ -1040,11 +1040,14 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+          pattern: "^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$"
           description: >
             Human-readable name, unique per team. Used as the
-            `from_template` value when creating sandboxes. Names
-            starting with `superserve/` are reserved for curated system templates
-            and rejected for team-owned templates.
+            `from_template` value when creating sandboxes. Lowercase
+            letters, digits, and `.` `_` `/` `-` only; must start and
+            end with a letter or digit. Names starting with `superserve/`
+            are reserved for curated system templates and rejected for
+            team-owned templates.
           example: my-python-env
         vcpu:
           type: integer

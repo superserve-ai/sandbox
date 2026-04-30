@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -97,6 +98,10 @@ const (
 	defaultMemoryMi = 1024
 	defaultDiskMib  = 4096
 )
+
+// templateNameRE restricts template names to lowercase alphanumeric with
+// `.`, `_`, `/`, `-` in the middle. URL-safe, shell-safe, no Unicode.
+var templateNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$`)
 
 // validateBuildSpec enforces base-image policy and step-shape invariants.
 // Catches obvious problems (alpine, distroless, bad step shape) before we
@@ -339,11 +344,14 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			http.StatusBadRequest)
 		return
 	}
-	// `superserve/` is reserved for curated templates owned by the system
-	// team. Other teams cannot create names in this namespace — doing so
-	// would shadow the real curated template for their own members. Match
-	// is case-insensitive to block squat variants like `SuperServe/foo`.
-	if strings.HasPrefix(strings.ToLower(req.Name), "superserve/") && teamID != h.systemTeamID() {
+	if !templateNameRE.MatchString(req.Name) {
+		respondErrorMsg(c, "bad_request",
+			"name must be lowercase, start and end with a letter or digit, and contain only letters, digits, '.', '_', '/', '-'",
+			http.StatusBadRequest)
+		return
+	}
+	// `superserve/` is reserved for curated templates owned by the system team.
+	if strings.HasPrefix(req.Name, "superserve/") && teamID != h.systemTeamID() {
 		respondErrorMsg(c, "bad_request",
 			"names starting with 'superserve/' are reserved",
 			http.StatusBadRequest)

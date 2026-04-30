@@ -5,7 +5,7 @@
 
 ALTER TABLE template RENAME COLUMN alias TO name;
 
-ALTER TABLE template DROP CONSTRAINT template_alias_unique_per_team;
+ALTER TABLE template DROP CONSTRAINT IF EXISTS template_alias_unique_per_team;
 
 CREATE UNIQUE INDEX template_name_unique_per_team_active
   ON template (team_id, name) WHERE deleted_at IS NULL;

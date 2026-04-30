@@ -191,7 +191,8 @@ func seedOne(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, s seedSp
 	}
 
 	// Upsert and capture the resulting status so we can decide whether to
-	// enqueue a build in one follow-up query.
+	// enqueue a build in one follow-up query. ON CONFLICT only matches live
+	// rows; a soft-deleted template would be re-inserted rather than updated.
 	const upsertQ = `
 		INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib)
 		VALUES ($1, $2, $3, $4, $5, $6)
