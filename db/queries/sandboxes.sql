@@ -28,6 +28,11 @@ RETURNING *;
 SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
+-- name: CountActiveSandboxesForTeam :one
+-- Active = non-destroyed (active + paused).
+SELECT COUNT(*)::bigint FROM sandbox
+WHERE team_id = $1 AND destroyed_at IS NULL;
+
 -- name: ListSandboxesByTeam :many
 SELECT * FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL

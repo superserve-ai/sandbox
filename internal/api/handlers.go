@@ -914,6 +914,32 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	// Per-team sandbox count cap. System team is exempt.
+	if teamID != h.systemTeamID() {
+		team, err := h.DB.GetTeam(c.Request.Context(), teamID)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeam failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		count, err := h.DB.CountActiveSandboxesForTeam(c.Request.Context(), teamID)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountActiveSandboxesForTeam failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		effMaxSandboxes := int64(defaultMaxSandboxes)
+		if team.MaxSandboxes != nil {
+			effMaxSandboxes = int64(*team.MaxSandboxes)
+		}
+		if count >= effMaxSandboxes {
+			respondErrorMsg(c, "too_many_sandboxes",
+				fmt.Sprintf("team has reached the limit of %d sandboxes; pause/delete some or contact support@superserve.ai for higher", effMaxSandboxes),
+				http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	// Default the create to the `superserve/base` template so every sandbox
 	// has a consistent baseline image. Callers can opt out by setting
 	// from_template to some other name/UUID; today the API always routes

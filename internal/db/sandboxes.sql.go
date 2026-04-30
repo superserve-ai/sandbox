@@ -190,6 +190,20 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 	return items, nil
 }
 
+const countActiveSandboxesForTeam = `-- name: CountActiveSandboxesForTeam :one
+SELECT COUNT(*)::bigint FROM sandbox
+WHERE team_id = $1 AND destroyed_at IS NULL
+`
+
+// Counts non-destroyed sandboxes (active + paused) owned by this team. Used
+// to enforce the per-team sandbox count cap on POST /sandboxes.
+func (q *Queries) CountActiveSandboxesForTeam(ctx context.Context, teamID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveSandboxesForTeam, teamID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const createSandbox = `-- name: CreateSandbox :one
 INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)

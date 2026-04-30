@@ -90,10 +90,20 @@ type templateBuildResponse struct {
 // ---------------------------------------------------------------------------
 
 const (
-	maxName         = 128
-	maxVcpu         = 4
-	maxMemoryMib    = 4096
-	maxDiskMib      = 8192
+	maxName = 128
+
+	// Platform ceiling — applies to every team including system.
+	absoluteMaxVcpu      = 4
+	absoluteMaxMemoryMib = 4096
+	absoluteMaxDiskMib   = 8192
+
+	// Customer-team defaults (overridable via team.max_template_*).
+	defaultMaxVcpu      = 2
+	defaultMaxMemoryMib = 2048
+	defaultMaxDiskMib   = 8192
+	defaultMaxTemplates = 10
+	defaultMaxSandboxes = 50
+
 	defaultVcpu     = 1
 	defaultMemoryMi = 1024
 	defaultDiskMib  = 4096
@@ -102,6 +112,44 @@ const (
 // templateNameRE restricts template names to lowercase alphanumeric with
 // `.`, `_`, `/`, `-` in the middle. URL-safe, shell-safe, no Unicode.
 var templateNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$`)
+
+// validateTemplateShape returns a user-facing error message on failure, "" on pass.
+func validateTemplateShape(team db.Team, systemTeamID uuid.UUID, vcpu, memMib, diskMib int32) string {
+	if vcpu < 1 || vcpu > absoluteMaxVcpu {
+		return fmt.Sprintf("vcpu must be 1-%d", absoluteMaxVcpu)
+	}
+	if memMib < 256 || memMib > absoluteMaxMemoryMib {
+		return fmt.Sprintf("memory_mib must be 256-%d", absoluteMaxMemoryMib)
+	}
+	if diskMib < 1024 || diskMib > absoluteMaxDiskMib {
+		return fmt.Sprintf("disk_mib must be 1024-%d", absoluteMaxDiskMib)
+	}
+	if team.ID == systemTeamID {
+		return ""
+	}
+	effMaxVcpu := int32(defaultMaxVcpu)
+	if team.MaxTemplateVcpu != nil {
+		effMaxVcpu = *team.MaxTemplateVcpu
+	}
+	if vcpu > effMaxVcpu {
+		return fmt.Sprintf("vcpu must be 1-%d (your team's limit); contact support@superserve.ai for higher", effMaxVcpu)
+	}
+	effMaxMem := int32(defaultMaxMemoryMib)
+	if team.MaxTemplateMemoryMib != nil {
+		effMaxMem = *team.MaxTemplateMemoryMib
+	}
+	if memMib > effMaxMem {
+		return fmt.Sprintf("memory_mib must be 256-%d (your team's limit); contact support@superserve.ai for higher", effMaxMem)
+	}
+	effMaxDisk := int32(defaultMaxDiskMib)
+	if team.MaxTemplateDiskMib != nil {
+		effMaxDisk = *team.MaxTemplateDiskMib
+	}
+	if diskMib > effMaxDisk {
+		return fmt.Sprintf("disk_mib must be 1024-%d (your team's limit); contact support@superserve.ai for higher", effMaxDisk)
+	}
+	return ""
+}
 
 // validateBuildSpec enforces base-image policy and step-shape invariants.
 // Catches obvious problems (alpine, distroless, bad step shape) before we
@@ -369,21 +417,39 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	if req.DiskMib != nil {
 		diskMib = *req.DiskMib
 	}
-	if vcpu < 1 || vcpu > maxVcpu {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("vcpu must be 1-%d", maxVcpu), http.StatusBadRequest)
+	team, err := h.DB.GetTeam(c.Request.Context(), teamID)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeam failed")
+		respondError(c, ErrInternal)
 		return
 	}
-	if memMib < 256 || memMib > maxMemoryMib {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("memory_mib must be 256-%d", maxMemoryMib), http.StatusBadRequest)
-		return
-	}
-	if diskMib < 1024 || diskMib > maxDiskMib {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("disk_mib must be 1024-%d", maxDiskMib), http.StatusBadRequest)
+	if msg := validateTemplateShape(team, h.systemTeamID(), vcpu, memMib, diskMib); msg != "" {
+		respondErrorMsg(c, "bad_request", msg, http.StatusBadRequest)
 		return
 	}
 	if err := validateBuildSpec(req.BuildSpec); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Per-team template count cap. System team is exempt.
+	if teamID != h.systemTeamID() {
+		count, err := h.DB.CountActiveTemplatesForTeam(c.Request.Context(), teamID)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountActiveTemplatesForTeam failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		effMaxTemplates := int64(defaultMaxTemplates)
+		if team.MaxTemplates != nil {
+			effMaxTemplates = int64(*team.MaxTemplates)
+		}
+		if count >= effMaxTemplates {
+			respondErrorMsg(c, "too_many_templates",
+				fmt.Sprintf("team has reached the limit of %d templates; delete some or contact support@superserve.ai for higher", effMaxTemplates),
+				http.StatusTooManyRequests)
+			return
+		}
 	}
 
 	specJSON, err := json.Marshal(req.BuildSpec)
