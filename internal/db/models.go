@@ -270,11 +270,16 @@ type Snapshot struct {
 }
 
 type Team struct {
-	ID               uuid.UUID `json:"id"`
-	Name             string    `json:"name"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	BuildConcurrency int32     `json:"build_concurrency"`
+	ID                   uuid.UUID `json:"id"`
+	Name                 string    `json:"name"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	BuildConcurrency     int32     `json:"build_concurrency"`
+	MaxTemplateVcpu      *int32    `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib *int32    `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib   *int32    `json:"max_template_disk_mib"`
+	MaxTemplates         *int32    `json:"max_templates"`
+	MaxSandboxes         *int32    `json:"max_sandboxes"`
 }
 
 type TeamMember struct {

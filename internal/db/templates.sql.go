@@ -72,6 +72,21 @@ func (q *Queries) CancelBuild(ctx context.Context, arg CancelBuildParams) (int64
 	return result.RowsAffected(), nil
 }
 
+const countActiveTemplatesForTeam = `-- name: CountActiveTemplatesForTeam :one
+SELECT COUNT(*)::bigint FROM template
+WHERE team_id = $1 AND deleted_at IS NULL AND status != 'failed'
+`
+
+// Active = not deleted and not in a terminal-failure state. Failed
+// templates don't hold a snapshot, so they shouldn't consume the count
+// cap (matches CountInFlightBuildsForTeam, which also excludes failed).
+func (q *Queries) CountActiveTemplatesForTeam(ctx context.Context, teamID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveTemplatesForTeam, teamID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countInFlightBuildsForTeam = `-- name: CountInFlightBuildsForTeam :one
 SELECT COUNT(*) FROM template_build
 WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting')
