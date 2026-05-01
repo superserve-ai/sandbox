@@ -398,10 +398,10 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			http.StatusBadRequest)
 		return
 	}
-	// `superserve/` is reserved for curated templates owned by the system team.
-	if strings.HasPrefix(req.Name, "superserve/") && teamID != h.systemTeamID() {
+	// `/` is reserved for platform-curated templates (superserve/...).
+	if strings.Contains(req.Name, "/") && teamID != h.systemTeamID() {
 		respondErrorMsg(c, "bad_request",
-			"names starting with 'superserve/' are reserved",
+			"names cannot contain '/' (reserved for platform-curated templates)",
 			http.StatusBadRequest)
 		return
 	}
@@ -581,6 +581,37 @@ func (h *Handlers) GetTemplate(c *gin.Context) {
 		return
 	}
 
+	c.JSON(http.StatusOK, toTemplateResponse(tpl))
+}
+
+// GetTemplateByName resolves a template by its name (caller's team or
+// system team). Wildcard route so names containing `/` (system templates
+// like `superserve/python-3.11`) work without URL-encoding.
+func (h *Handlers) GetTemplateByName(c *gin.Context) {
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+	// gin's *catch-all captures with a leading `/`; strip it.
+	name := strings.TrimPrefix(c.Param("name"), "/")
+	if name == "" {
+		respondErrorMsg(c, "bad_request", "name is required", http.StatusBadRequest)
+		return
+	}
+	tpl, err := h.DB.GetTemplateByName(c.Request.Context(), db.GetTemplateByNameParams{
+		Name:     name,
+		TeamID:   teamID,
+		TeamID_2: h.systemTeamID(),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("name", name).Msg("DB GetTemplateByName failed")
+		respondError(c, ErrInternal)
+		return
+	}
 	c.JSON(http.StatusOK, toTemplateResponse(tpl))
 }
 

@@ -48,6 +48,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		// the POST /templates/:id/builds endpoint just enqueues a row.
 		api.GET("/templates", h.ListTemplates)
 		api.POST("/templates", h.CreateTemplate)
+		api.GET("/templates/names/*name", h.GetTemplateByName)
 		api.GET("/templates/:template_id", h.GetTemplate)
 		api.DELETE("/templates/:template_id", h.DeleteTemplate)
 		api.GET("/templates/:template_id/builds", h.ListTemplateBuilds)
