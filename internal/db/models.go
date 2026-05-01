@@ -226,6 +226,21 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type ProxyAudit struct {
+	ID             int64     `json:"id"`
+	Ts             time.Time `json:"ts"`
+	TeamID         uuid.UUID `json:"team_id"`
+	SandboxID      uuid.UUID `json:"sandbox_id"`
+	SecretID       uuid.UUID `json:"secret_id"`
+	Provider       string    `json:"provider"`
+	Method         string    `json:"method"`
+	Path           string    `json:"path"`
+	Status         int32     `json:"status"`
+	UpstreamStatus *int32    `json:"upstream_status"`
+	LatencyMs      *int32    `json:"latency_ms"`
+	ErrorCode      *string   `json:"error_code"`
+}
+
 type ReconcilerLog struct {
 	ID        int64       `json:"id"`
 	HostID    string      `json:"host_id"`
@@ -256,6 +271,26 @@ type Sandbox struct {
 	// User-supplied flat string→string tags attached at creation. Immutable. Filterable on list endpoints via jsonb @> containment. Always non-null; an absent value is the empty object {}, never NULL.
 	Metadata   []byte      `json:"metadata"`
 	TemplateID pgtype.UUID `json:"template_id"`
+}
+
+type SandboxSecret struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	SecretID  uuid.UUID `json:"secret_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+type Secret struct {
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	Name         string             `json:"name"`
+	Provider     string             `json:"provider"`
+	Ciphertext   []byte             `json:"ciphertext"`
+	EncryptedDek []byte             `json:"encrypted_dek"`
+	KekID        string             `json:"kek_id"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	LastUsedAt   pgtype.Timestamptz `json:"last_used_at"`
+	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
 }
 
 type Snapshot struct {
