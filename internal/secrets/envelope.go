@@ -1,9 +1,8 @@
-// Package secrets implements envelope encryption for the secrets proxy
-// (see docs/SECRETS_PROXY_PLAN.md). Each secret value is encrypted with a
-// fresh AES-256-GCM data encryption key (DEK); the DEK is wrapped by a
-// Cloud KMS key encryption key (KEK). At rest we store ciphertext +
-// wrapped DEK + KEK resource name. Plaintext only ever lives in process
-// memory at decrypt time.
+// Package secrets implements envelope encryption and JWT minting for
+// stored credentials. Each value is encrypted with a fresh AES-256-GCM
+// data encryption key (DEK); the DEK is wrapped by a Cloud KMS key
+// encryption key (KEK). Plaintext only lives in process memory at
+// decrypt time.
 package secrets
 
 import (

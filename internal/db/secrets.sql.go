@@ -26,9 +26,6 @@ type AddSandboxSecretParams struct {
 // ---------------------------------------------------------------------------
 // sandbox_secret join table
 // ---------------------------------------------------------------------------
-// Record that a sandbox references a secret under a given env-var name.
-// Called inside the sandbox-create transaction so partial state isn't
-// visible if the create fails.
 func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) error {
 	_, err := q.db.Exec(ctx, addSandboxSecret, arg.SandboxID, arg.SecretID, arg.EnvKey)
 	return err
@@ -49,10 +46,8 @@ type CreateSecretParams struct {
 	KekID        string    `json:"kek_id"`
 }
 
-// Insert a team-level secret. Caller has already encrypted the value with
-// envelope encryption (per-row DEK, KEK-wrapped DEK). The plaintext never
-// reaches the DB. Returns the row so the handler can echo metadata
-// (everything except the value).
+// Caller has already encrypted the value (per-row DEK, KEK-wrapped). The
+// plaintext never reaches the DB.
 func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, createSecret,
 		arg.TeamID,
@@ -89,8 +84,6 @@ type GetSecretByIDParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Fetch a secret by id, scoped to team. Used by audit-log lookups so a
-// crash-restart on the proxy can rebuild bindings from stable ids.
 func (q *Queries) GetSecretByID(ctx context.Context, arg GetSecretByIDParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, getSecretByID, arg.ID, arg.TeamID)
 	var i Secret
@@ -120,8 +113,6 @@ type GetSecretByNameParams struct {
 	Name   string    `json:"name"`
 }
 
-// Resolve a secret name to its row for the caller's team. Used at sandbox
-// create time. Returns 0 rows if the secret doesn't exist or was deleted.
 func (q *Queries) GetSecretByName(ctx context.Context, arg GetSecretByNameParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, getSecretByName, arg.TeamID, arg.Name)
 	var i Secret
@@ -165,8 +156,6 @@ type InsertProxyAuditParams struct {
 // ---------------------------------------------------------------------------
 // proxy_audit
 // ---------------------------------------------------------------------------
-// Append-only audit row written async by the proxy (off the request path).
-// Cost columns absent in MVP — see SECRETS_PROXY_PLAN.md decision 15.
 func (q *Queries) InsertProxyAudit(ctx context.Context, arg InsertProxyAuditParams) error {
 	_, err := q.db.Exec(ctx, insertProxyAudit,
 		arg.TeamID,
@@ -197,9 +186,8 @@ type ListAuditForSandboxParams struct {
 	Limit     int32     `json:"limit"`
 }
 
-// Customer-facing read. Pagination via id (descending) since rows are
-// monotonic; client passes the last id from the previous page.
-// Pass 0 for $3 to get the most recent rows.
+// Pass 0 for $2 to get the most recent rows; otherwise rows older than
+// that id, descending. id is monotonic so it doubles as a cursor.
 func (q *Queries) ListAuditForSandbox(ctx context.Context, arg ListAuditForSandboxParams) ([]ProxyAudit, error) {
 	rows, err := q.db.Query(ctx, listAuditForSandbox, arg.SandboxID, arg.Column2, arg.Limit)
 	if err != nil {
@@ -248,9 +236,6 @@ type ListSandboxSecretsRow struct {
 	SecretID uuid.UUID `json:"secret_id"`
 }
 
-// Bindings for one sandbox. Used at sandbox-create response time and by
-// the JWT refresh loop, which needs to know which secrets to re-mint
-// tokens for.
 func (q *Queries) ListSandboxSecrets(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretsRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxSecrets, sandboxID)
 	if err != nil {
@@ -290,10 +275,9 @@ type ListSandboxesForSecretRow struct {
 	HostID string    `json:"host_id"`
 }
 
-// Drives the eager rotation sweep. Joins through to sandbox so we can
-// skip rows whose sandbox has already been destroyed (the cascade may
-// not have caught up if the rotation lands mid-tear-down). Returns
-// (host_id, sandbox_id) so the control plane can group calls per VMD.
+// Joins through sandbox so callers can skip already-destroyed rows
+// (cascade may lag a concurrent destroy). Returns host_id so callers
+// can group operations by host.
 func (q *Queries) ListSandboxesForSecret(ctx context.Context, secretID uuid.UUID) ([]ListSandboxesForSecretRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesForSecret, secretID)
 	if err != nil {
@@ -320,8 +304,6 @@ WHERE team_id = $1 AND deleted_at IS NULL
 ORDER BY created_at DESC
 `
 
-// List a team's active secrets. Returns metadata only — handlers strip
-// ciphertext/encrypted_dek before responding to the customer.
 func (q *Queries) ListSecretsForTeam(ctx context.Context, teamID uuid.UUID) ([]Secret, error) {
 	rows, err := q.db.Query(ctx, listSecretsForTeam, teamID)
 	if err != nil {
@@ -366,9 +348,6 @@ type SoftDeleteSecretParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Mark a secret deleted. Active sandboxes referencing it via
-// sandbox_secret keep working until the proxy revokes them out-of-band.
-// Returns the row so the handler knows whether anything was deleted.
 func (q *Queries) SoftDeleteSecret(ctx context.Context, arg SoftDeleteSecretParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, softDeleteSecret, arg.ID, arg.TeamID)
 	var i Secret
@@ -400,7 +379,6 @@ type SoftDeleteSecretByNameParams struct {
 	Name   string    `json:"name"`
 }
 
-// Convenience for the DELETE /secrets/:name handler.
 func (q *Queries) SoftDeleteSecretByName(ctx context.Context, arg SoftDeleteSecretByNameParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, softDeleteSecretByName, arg.TeamID, arg.Name)
 	var i Secret
@@ -426,8 +404,6 @@ SET last_used_at = now()
 WHERE id = $1
 `
 
-// Bumped by the audit-log writer (or a periodic sweep) so the dashboard
-// can show "last used N ago." Best-effort, never on the hot path.
 func (q *Queries) TouchSecretLastUsed(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, touchSecretLastUsed, id)
 	return err
@@ -451,9 +427,8 @@ type UpdateSecretValueParams struct {
 	KekID        string    `json:"kek_id"`
 }
 
-// Rotate a secret's value. Caller has already re-encrypted with a fresh
-// DEK (rotation always rewraps). updated_at is bumped so the control
-// plane's rotation sweep can identify recently-changed rows.
+// Caller has already re-encrypted with a fresh DEK; rotation always
+// rewraps so old ciphertext can't be replayed against new metadata.
 func (q *Queries) UpdateSecretValue(ctx context.Context, arg UpdateSecretValueParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, updateSecretValue,
 		arg.ID,

@@ -1,17 +1,7 @@
--- Secrets proxy storage (see docs/SECRETS_PROXY_PLAN.md).
---
--- `secret` holds team-level credentials encrypted at rest with envelope
--- encryption: per-row AES-256-GCM data key wrapped by a Cloud KMS KEK.
--- Plaintext is only ever decrypted at sandbox-create time and held in
--- secretsproxy memory on the VMD host — never written back to disk and
+-- Team-level credentials encrypted at rest with envelope encryption:
+-- a per-row AES-256-GCM data key wraps the value; the data key itself
+-- is wrapped by a Cloud KMS KEK. Plaintext is never persisted and
 -- never returned by any read endpoint.
---
--- `sandbox_secret` is the join between live sandboxes and the secrets
--- they reference. Used by the rotation sweep and the future per-secret
--- usage endpoint. Cascade on sandbox delete keeps it in sync without an
--- explicit cleanup path.
---
--- `proxy_audit` is the append-only log of every proxy forward attempt.
 
 CREATE TABLE secret (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -19,14 +9,11 @@ CREATE TABLE secret (
     name            text NOT NULL,
     provider        text NOT NULL,
     -- nonce(12) || aes-256-gcm(value, dek) || tag(16) packed together,
-    -- matching the convention used by crypto/cipher.AEAD.
+    -- matching crypto/cipher.AEAD output with the nonce prefixed.
     ciphertext      bytea NOT NULL,
-    -- DEK wrapped by the Cloud KMS KEK. KMS embeds the key version it
-    -- used to wrap, so decrypt round-trips correctly across rotation.
+    -- DEK wrapped by the KMS KEK named in kek_id. Stored per row so
+    -- KEK rotation or migration can decrypt rows wrapped by either key.
     encrypted_dek   bytea NOT NULL,
-    -- KMS resource name (projects/.../locations/.../keyRings/.../cryptoKeys/...).
-    -- Stored per row for ops clarity and to support multi-region or
-    -- per-environment KEKs without a global config table.
     kek_id          text NOT NULL,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),

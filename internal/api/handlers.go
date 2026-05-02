@@ -22,6 +22,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -57,6 +58,9 @@ type Handlers struct {
 	Config    *config.Config
 	Hosts     HostRegistry // when set, routes VMD calls via host_id
 	Scheduler Scheduler    // when set, picks host on create
+	// Encryptor wraps the secret-vault envelope encryption (Cloud KMS). Required
+	// for /secrets endpoints; left nil in unit tests that don't exercise them.
+	Encryptor secrets.Encryptor
 }
 
 // NewHandlers creates a new Handlers instance.
