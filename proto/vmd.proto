@@ -201,6 +201,21 @@ message SandboxNetworkEgressConfig {
 }
 
 // ---------------------------------------------------------------------------
+// SecretBinding — sandbox <-> stored credential
+// ---------------------------------------------------------------------------
+
+// SecretBinding ties one stored credential to one sandbox. Real plaintext
+// is pushed to a host-local cache; the agent inside the sandbox sees only
+// the signed token, wrapped in the provider's native key shape.
+message SecretBinding {
+  string secret_id = 1;       // UUID of the secret row.
+  string provider = 2;        // e.g. "anthropic"
+  string env_key = 3;         // env var name in the sandbox (e.g. "ANTHROPIC_API_KEY")
+  string real_value = 4;      // plaintext credential — never logged.
+  string token = 5;           // signed token the agent will see.
+}
+
+// ---------------------------------------------------------------------------
 // DestroyVM
 // ---------------------------------------------------------------------------
 
@@ -239,6 +254,10 @@ message ResumeVMRequest {
   string mem_file_path = 3;
   SandboxNetworkConfig sandbox_network = 4;  // Reapply egress rules after resume.
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
+  // Bindings between this sandbox and stored credentials. Real values are
+  // pushed to a host-local proxy; the agent inside the sandbox sees a
+  // signed token wrapped in the provider-native key shape.
+  repeated SecretBinding secret_bindings = 6;
 }
 
 message ResumeVMResponse {
@@ -279,6 +298,8 @@ message RestoreSnapshotRequest {
   // Per-sandbox env vars merged on top of the template's baked defaults
   // (captured in the snapshot). Caller keys override template keys.
   map<string, string> env_vars = 7;
+  // Bindings between this sandbox and stored credentials. See SecretBinding.
+  repeated SecretBinding secret_bindings = 8;
 }
 
 message RestoreSnapshotResponse {

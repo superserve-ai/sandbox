@@ -49,14 +49,14 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (st
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, envVars map[string]string, _ []vmdclient.SecretBinding) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
 		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string, _ map[string]string, _ []vmdclient.SecretBinding) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err

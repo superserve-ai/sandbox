@@ -288,7 +288,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil)
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
@@ -296,7 +296,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -1113,7 +1113,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and boots a new VM from them statelessly. Caller env vars are merged
 	// on top of the template's baked defaults by vmd (boxd resumes with
 	// template context, then the restore RPC posts these on top).
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars, nil)
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).

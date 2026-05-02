@@ -180,6 +180,25 @@ type grpcVMDClient struct {
 	client vmdpb.VMDaemonClient
 }
 
+// toProtoBindings copies vmdclient.SecretBinding values into proto form.
+// Returns nil for an empty input so the proto field stays absent.
+func toProtoBindings(in []vmdclient.SecretBinding) []*vmdpb.SecretBinding {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*vmdpb.SecretBinding, len(in))
+	for i, b := range in {
+		out[i] = &vmdpb.SecretBinding{
+			SecretId:  b.SecretID,
+			Provider:  b.Provider,
+			EnvKey:    b.EnvKey,
+			RealValue: b.RealValue,
+			Token:     b.Token,
+		}
+	}
+	return out
+}
+
 func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
 	return &grpcVMDClient{
 		conn:   conn,
@@ -209,12 +228,13 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 	return resp.SnapshotPath, resp.MemFilePath, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string, bindings []vmdclient.SecretBinding) (string, uint32, uint32, error) {
 	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		EnvVars:      envVars,
+		VmId:           vmID,
+		SnapshotPath:   snapshotPath,
+		MemFilePath:    memPath,
+		EnvVars:        envVars,
+		SecretBindings: toProtoBindings(bindings),
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
@@ -231,12 +251,13 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. Used as
 // a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
 // map to a crash but the snapshot files are still on disk).
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string, bindings []vmdclient.SecretBinding) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		EnvVars:      envVars,
+		VmId:           vmID,
+		SnapshotPath:   snapshotPath,
+		MemFilePath:    memPath,
+		EnvVars:        envVars,
+		SecretBindings: toProtoBindings(bindings),
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
