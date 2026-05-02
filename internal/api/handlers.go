@@ -1016,9 +1016,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Resolve secret refs up front so we can fail fast on missing
 	// secrets or egress conflicts before any infra work runs.
-	secretBindings, sandboxSecretRows, err := h.resolveSecretBindings(c.Request.Context(), teamID, sandboxID, req.Secrets, req.Network)
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+	secretBindings, sandboxSecretRows, secretsErr := h.resolveSecretBindings(c.Request.Context(), teamID, sandboxID, req.Secrets, req.Network)
+	if secretsErr != nil {
+		respondError(c, secretsErr)
 		return
 	}
 
@@ -1698,16 +1698,18 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 // Returns nil on success, or an error suitable for a 400 Bad Request.
 func bindJSONStrict(c *gin.Context, v any) error {
 	if c.Request.Body == nil {
-		return fmt.Errorf("request body is empty")
+		return errors.New("request body is required")
 	}
 	dec := json.NewDecoder(c.Request.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		return err
+		// std lib prefixes most errors with "json: "; strip it so the
+		// 400 response shows the useful part directly.
+		return errors.New(strings.TrimPrefix(err.Error(), "json: "))
 	}
 	// Reject trailing garbage / multiple JSON objects.
 	if dec.More() {
-		return fmt.Errorf("unexpected trailing data after JSON object")
+		return errors.New("unexpected trailing data after JSON object")
 	}
 	return nil
 }

@@ -470,6 +470,79 @@ func TestGetSandboxAudit_SandboxNotFound(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// resolveSecretBindings — exercise the AppError mapping directly.
+// ---------------------------------------------------------------------------
+
+func TestResolveSecretBindings_SecretNotFound(t *testing.T) {
+	teamID := uuid.New()
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.CommandTag{}, nil },
+	}
+	signer, _ := secrets.NewSigner(make([]byte, 32), "v1", "i", "a", time.Hour)
+	h := &Handlers{DB: db.New(mock), Encryptor: &fakeEnc{}, Signer: signer}
+
+	_, _, appErr := h.resolveSecretBindings(context.Background(), teamID, uuid.New(),
+		map[string]string{"ANTHROPIC_API_KEY": "MISSING"}, nil)
+	if appErr == nil {
+		t.Fatal("expected AppError")
+	}
+	if appErr.Code != "secret_not_found" {
+		t.Errorf("code=%q, want secret_not_found", appErr.Code)
+	}
+	if appErr.HTTPStatus != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", appErr.HTTPStatus)
+	}
+	if !strings.Contains(appErr.Message, "MISSING") {
+		t.Errorf("message=%q does not name the missing secret", appErr.Message)
+	}
+}
+
+func TestResolveSecretBindings_EgressBlocked(t *testing.T) {
+	teamID := uuid.New()
+	row := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "X", Provider: "anthropic"}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return secretRow(row) },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.CommandTag{}, nil },
+	}
+	signer, _ := secrets.NewSigner(make([]byte, 32), "v1", "i", "a", time.Hour)
+	h := &Handlers{DB: db.New(mock), Encryptor: &fakeEnc{}, Signer: signer}
+
+	netCfg := &networkConfigRequest{AllowOut: []string{"api.openai.com"}} // missing anthropic
+	_, _, appErr := h.resolveSecretBindings(context.Background(), teamID, uuid.New(),
+		map[string]string{"ANTHROPIC_API_KEY": "X"}, netCfg)
+	if appErr == nil || appErr.Code != "secret_blocked_by_egress" || appErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("got %+v, want secret_blocked_by_egress / 400", appErr)
+	}
+	if !strings.Contains(appErr.Message, "api.anthropic.com") {
+		t.Errorf("message=%q does not mention the upstream", appErr.Message)
+	}
+}
+
+func TestResolveSecretBindings_NotConfigured(t *testing.T) {
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.CommandTag{}, nil },
+	}
+	h := &Handlers{DB: db.New(mock)} // no Encryptor / Signer
+	_, _, appErr := h.resolveSecretBindings(context.Background(), uuid.New(), uuid.New(),
+		map[string]string{"K": "X"}, nil)
+	if appErr == nil || appErr.Code != "not_configured" || appErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("got %+v, want not_configured / 503", appErr)
+	}
+}
+
+func TestValidateProvider_ListsSupported(t *testing.T) {
+	err := validateProvider("openai")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "anthropic") {
+		t.Errorf("error %q does not list supported providers", err)
+	}
+}
+
 func TestGetSandboxAudit_BadLimit(t *testing.T) {
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: uuid.New(), TeamID: teamID, Status: db.SandboxStatusActive}

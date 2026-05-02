@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -48,20 +49,22 @@ func validateSecretsRefs(refs map[string]string) error {
 }
 
 // resolveSecretBindings decrypts each referenced secret and mints a
-// sandbox-bound token, returning the bindings to send to vmd plus the
-// rows that get written to sandbox_secret in the same transaction.
+// sandbox-bound token. Returns *AppError so the caller can map
+// user-input failures to 400 and server-side failures to 500.
 func (h *Handlers) resolveSecretBindings(
 	ctx context.Context,
 	teamID, sandboxID uuid.UUID,
 	refs map[string]string,
 	netCfg *networkConfigRequest,
-) ([]vmdclient.SecretBinding, []db.AddSandboxSecretParams, error) {
+) ([]vmdclient.SecretBinding, []db.AddSandboxSecretParams, *AppError) {
 	if len(refs) == 0 {
 		return nil, nil, nil
 	}
 	if h.Encryptor == nil || h.Signer == nil {
 		log.Error().Msg("sandbox references secrets but Encryptor/Signer not configured")
-		return nil, nil, errors.New("server is not configured for secret-backed sandboxes")
+		return nil, nil, NewAppError("not_configured",
+			"This deployment does not support stored secrets. Contact support.",
+			http.StatusServiceUnavailable)
 	}
 
 	bindings := make([]vmdclient.SecretBinding, 0, len(refs))
@@ -73,13 +76,17 @@ func (h *Handlers) resolveSecretBindings(
 		})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, nil, fmt.Errorf("secrets[%s]: secret %q not found", envKey, secretName)
+				return nil, nil, NewAppError("secret_not_found",
+					fmt.Sprintf("secrets[%s] references %q, which does not exist for this team", envKey, secretName),
+					http.StatusBadRequest)
 			}
 			log.Error().Err(err).Str("name", secretName).Msg("DB GetSecretByName during sandbox create")
-			return nil, nil, errors.New("internal error resolving secrets")
+			return nil, nil, ErrInternal
 		}
 		if err := upstreamAllowedByEgress(row.Provider, netCfg); err != nil {
-			return nil, nil, fmt.Errorf("secrets[%s]: %w", envKey, err)
+			return nil, nil, NewAppError("secret_blocked_by_egress",
+				fmt.Sprintf("secrets[%s]: %s", envKey, err.Error()),
+				http.StatusBadRequest)
 		}
 
 		plaintext, err := h.Encryptor.Decrypt(ctx, secrets.Encrypted{
@@ -89,13 +96,13 @@ func (h *Handlers) resolveSecretBindings(
 		})
 		if err != nil {
 			log.Error().Err(err).Str("name", secretName).Msg("KMS decrypt during sandbox create")
-			return nil, nil, errors.New("internal error decrypting secret")
+			return nil, nil, ErrInternal
 		}
 
 		token, err := h.Signer.Mint(time.Now(), sandboxID, row.ID, teamID)
 		if err != nil {
 			log.Error().Err(err).Msg("mint proxy token")
-			return nil, nil, errors.New("internal error issuing token")
+			return nil, nil, ErrInternal
 		}
 
 		bindings = append(bindings, vmdclient.SecretBinding{
@@ -239,7 +246,12 @@ func validateProvider(provider string) error {
 		return errors.New("provider is required")
 	}
 	if !supportedProviders[provider] {
-		return fmt.Errorf("unsupported provider %q", provider)
+		supported := make([]string, 0, len(supportedProviders))
+		for p := range supportedProviders {
+			supported = append(supported, p)
+		}
+		sort.Strings(supported)
+		return fmt.Errorf("unsupported provider %q (supported: %s)", provider, strings.Join(supported, ", "))
 	}
 	return nil
 }
@@ -268,7 +280,7 @@ func (h *Handlers) CreateSecret(c *gin.Context) {
 
 	var req createSecretRequest
 	if err := bindJSONStrict(c, &req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
@@ -376,7 +388,7 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 
 	var req updateSecretRequest
 	if err := bindJSONStrict(c, &req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := validateSecretValue(req.Value); err != nil {
