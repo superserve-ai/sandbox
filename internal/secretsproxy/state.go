@@ -107,6 +107,26 @@ func (s *State) UpdateEgress(sandboxID string, egress api.EgressRules) bool {
 	return true
 }
 
+// PropagateSecret updates the real value for every sandbox that holds a
+// binding for secretID. realValue == "" removes the binding entirely
+// (used on revocation).
+func (s *State) PropagateSecret(secretID, realValue string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.bySandbox {
+		b, ok := st.secretsByID[secretID]
+		if !ok {
+			continue
+		}
+		if realValue == "" {
+			delete(st.secretsByID, secretID)
+			continue
+		}
+		b.RealValue = realValue
+		st.secretsByID[secretID] = b
+	}
+}
+
 // LookupBySourceIP is the request hot-path lookup. Returns a snapshot of
 // the sandbox state suitable for read-only use; the caller does not need
 // to hold any locks.

@@ -441,6 +441,10 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 		return
 	}
 
+	// Push the new value to every host running a sandbox that holds a
+	// binding for this secret. Async so the API call returns quickly.
+	go h.propagateSecretToHosts(context.WithoutCancel(c.Request.Context()), updated.ID, req.Value)
+
 	c.JSON(http.StatusOK, toSecretResponse(updated))
 }
 
@@ -455,7 +459,7 @@ func (h *Handlers) DeleteSecret(c *gin.Context) {
 		return
 	}
 
-	_, err = h.DB.SoftDeleteSecretByName(c.Request.Context(), db.SoftDeleteSecretByNameParams{
+	row, err := h.DB.SoftDeleteSecretByName(c.Request.Context(), db.SoftDeleteSecretByNameParams{
 		TeamID: teamID, Name: name,
 	})
 	if err != nil {
@@ -468,7 +472,42 @@ func (h *Handlers) DeleteSecret(c *gin.Context) {
 		return
 	}
 
+	// Empty real value = revoke. Run async so the API call returns
+	// immediately; the in-flight calls already in transit upstream may
+	// still succeed but no new ones can use the deleted secret.
+	go h.propagateSecretToHosts(context.WithoutCancel(c.Request.Context()), row.ID, "")
+
 	c.Status(http.StatusNoContent)
+}
+
+// propagateSecretToHosts groups live sandbox bindings by host and pushes
+// the new (or empty) value to each host's vmd. Best-effort — failures
+// are logged so ops can retry; on the next sandbox-create the proxy
+// gets the latest value automatically anyway.
+func (h *Handlers) propagateSecretToHosts(ctx context.Context, secretID uuid.UUID, realValue string) {
+	if h.Hosts == nil {
+		// No host registry means we can't fan out per-host; skip.
+		return
+	}
+	rows, err := h.DB.ListSandboxesForSecret(ctx, secretID)
+	if err != nil {
+		log.Error().Err(err).Str("secret_id", secretID.String()).Msg("propagate: list sandboxes")
+		return
+	}
+	hosts := map[string]struct{}{}
+	for _, r := range rows {
+		hosts[r.HostID] = struct{}{}
+	}
+	for hostID := range hosts {
+		client, herr := h.Hosts.ClientFor(ctx, hostID)
+		if herr != nil {
+			log.Error().Err(herr).Str("host_id", hostID).Msg("propagate: resolve host client")
+			continue
+		}
+		if perr := client.PropagateSecret(ctx, secretID.String(), realValue); perr != nil {
+			log.Error().Err(perr).Str("host_id", hostID).Msg("propagate: vmd PropagateSecret")
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

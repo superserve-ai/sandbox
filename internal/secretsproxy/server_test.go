@@ -269,6 +269,59 @@ func TestServer_StreamingForward(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// PropagateSecret — rotation and revocation across the in-memory state.
+// ---------------------------------------------------------------------------
+
+func TestState_PropagateSecret_Rotation(t *testing.T) {
+	st := NewState()
+	secretID := uuid.NewString()
+	st.Register(api.RegisterRequest{
+		SandboxID: uuid.NewString(),
+		SourceIP:  "10.11.0.1",
+		Bindings: []api.SecretBinding{
+			{SecretID: secretID, Provider: "anthropic", EnvKey: "K", RealValue: "old"},
+		},
+	})
+	st.Register(api.RegisterRequest{
+		SandboxID: uuid.NewString(),
+		SourceIP:  "10.11.0.2",
+		Bindings: []api.SecretBinding{
+			{SecretID: secretID, Provider: "anthropic", EnvKey: "K", RealValue: "old"},
+		},
+	})
+
+	st.PropagateSecret(secretID, "new")
+
+	for _, ip := range []string{"10.11.0.1", "10.11.0.2"} {
+		sb, ok := st.LookupBySourceIP(ip)
+		if !ok {
+			t.Fatalf("sandbox at %s missing", ip)
+		}
+		if sb.Bindings[secretID].RealValue != "new" {
+			t.Errorf("ip=%s real value=%q, want new", ip, sb.Bindings[secretID].RealValue)
+		}
+	}
+}
+
+func TestState_PropagateSecret_Revoke(t *testing.T) {
+	st := NewState()
+	secretID := uuid.NewString()
+	st.Register(api.RegisterRequest{
+		SandboxID: uuid.NewString(),
+		SourceIP:  "10.11.0.5",
+		Bindings: []api.SecretBinding{
+			{SecretID: secretID, Provider: "anthropic", EnvKey: "K", RealValue: "v"},
+		},
+	})
+	st.PropagateSecret(secretID, "")
+
+	sb, _ := st.LookupBySourceIP("10.11.0.5")
+	if _, present := sb.Bindings[secretID]; present {
+		t.Error("revoke did not remove binding")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Egress logic, isolated.
 // ---------------------------------------------------------------------------
 

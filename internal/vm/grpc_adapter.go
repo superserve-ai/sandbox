@@ -24,6 +24,7 @@ type SecretsProxyClient interface {
 	Unregister(ctx context.Context, sandboxID string) error
 	UpdateBindings(ctx context.Context, sandboxID string, req api.UpdateBindingsRequest) error
 	UpdateEgress(ctx context.Context, sandboxID string, req api.UpdateEgressRequest) error
+	PropagateSecret(ctx context.Context, req api.PropagateSecretRequest) error
 }
 
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
@@ -165,6 +166,28 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			MemoryMib: inst.Config.MemoryMiB,
 		},
 	}, nil
+}
+
+// PropagateSecret forwards the rotation/revocation to the local secrets
+// proxy, which in turn updates every sandbox on this host that holds a
+// binding for the given secret.
+func (a *GRPCAdapter) PropagateSecret(ctx context.Context, req *vmdpb.PropagateSecretRequest) (*vmdpb.PropagateSecretResponse, error) {
+	if a.proxy == nil {
+		// No proxy on this host; nothing to do. Treat as success so the
+		// control plane sweep doesn't block on hosts that aren't running
+		// secret-backed sandboxes.
+		return &vmdpb.PropagateSecretResponse{}, nil
+	}
+	if req.GetSecretId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "secret_id required")
+	}
+	if err := a.proxy.PropagateSecret(ctx, api.PropagateSecretRequest{
+		SecretID:  req.GetSecretId(),
+		RealValue: req.GetRealValue(),
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "propagate to proxy: %v", err)
+	}
+	return &vmdpb.PropagateSecretResponse{}, nil
 }
 
 // applySecretBindings registers the bindings with the local secrets proxy

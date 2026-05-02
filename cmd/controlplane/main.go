@@ -180,6 +180,17 @@ type grpcVMDClient struct {
 	client vmdpb.VMDaemonClient
 }
 
+func (c *grpcVMDClient) PropagateSecret(ctx context.Context, secretID, realValue string) error {
+	_, err := c.client.PropagateSecret(ctx, &vmdpb.PropagateSecretRequest{
+		SecretId:  secretID,
+		RealValue: realValue,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC PropagateSecret: %w", err)
+	}
+	return nil
+}
+
 // toProtoBindings copies vmdclient.SecretBinding values into proto form.
 // Returns nil for an empty input so the proto field stays absent.
 func toProtoBindings(in []vmdclient.SecretBinding) []*vmdpb.SecretBinding {

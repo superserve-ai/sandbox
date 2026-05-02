@@ -30,6 +30,7 @@ func (cs *ControlServer) Handler() http.Handler {
 	r.POST("/sandboxes/:id/unregister", cs.unregister)
 	r.POST("/sandboxes/:id/bindings", cs.updateBindings)
 	r.POST("/sandboxes/:id/egress", cs.updateEgress)
+	r.POST("/secrets/propagate", cs.propagateSecret)
 	return r
 }
 
@@ -79,6 +80,20 @@ func (cs *ControlServer) updateEgress(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not registered"})
 		return
 	}
+	c.Status(http.StatusNoContent)
+}
+
+func (cs *ControlServer) propagateSecret(c *gin.Context) {
+	var req api.PropagateSecretRequest
+	if err := decodeJSON(c.Request, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.SecretID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "secret_id required"})
+		return
+	}
+	cs.state.PropagateSecret(req.SecretID, req.RealValue)
 	c.Status(http.StatusNoContent)
 }
 

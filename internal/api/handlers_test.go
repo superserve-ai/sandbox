@@ -100,6 +100,7 @@ func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
 	return nil
 }
+func (s *stubVMD) PropagateSecret(_ context.Context, _, _ string) error { return nil }
 
 // ---------------------------------------------------------------------------
 // Mock DBTX — drives db.Queries without a real database

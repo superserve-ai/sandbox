@@ -59,6 +59,10 @@ type Client interface {
 	// ctx is cancelled. Returns nil on clean close, an error on transport
 	// failure or gRPC NotFound (which callers surface as SSE 404).
 	StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(BuildLogEvent) error) error
+
+	// PropagateSecret pushes a rotation (or revocation when realValue is
+	// empty) for one stored secret to this host's local secrets proxy.
+	PropagateSecret(ctx context.Context, secretID, realValue string) error
 }
 
 // BuildTemplateInput mirrors vmdpb.BuildTemplateRequest at the client layer

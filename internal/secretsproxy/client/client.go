@@ -64,6 +64,12 @@ func (c *Client) UpdateEgress(ctx context.Context, sandboxID string, req api.Upd
 	return c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/egress", req)
 }
 
+// PropagateSecret pushes a new real value (or revocation) for the given
+// secret to every sandbox on this host that holds a binding for it.
+func (c *Client) PropagateSecret(ctx context.Context, req api.PropagateSecretRequest) error {
+	return c.do(ctx, http.MethodPost, "/secrets/propagate", req)
+}
+
 // Health pings the proxy. Returns nil on 200.
 func (c *Client) Health(ctx context.Context) error {
 	return c.do(ctx, http.MethodGet, "/health", nil)

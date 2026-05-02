@@ -41,3 +41,11 @@ type UpdateBindingsRequest struct {
 type UpdateEgressRequest struct {
 	Egress EgressRules `json:"egress"`
 }
+
+// PropagateSecretRequest pushes a new real value (or a revocation) for
+// every sandbox on this host that holds a binding for SecretID. Empty
+// RealValue means revoke.
+type PropagateSecretRequest struct {
+	SecretID  string `json:"secret_id"`
+	RealValue string `json:"real_value,omitempty"`
+}
