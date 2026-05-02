@@ -3,14 +3,17 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	kms "cloud.google.com/go/kms/apiv1"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -24,10 +27,21 @@ import (
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/supervisor"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
+
+// decodeKeyMaterial accepts either a literal byte string or a
+// "base64:..."-prefixed encoded blob. Production wires the value via
+// Secret Manager so the env var holds an opaque token.
+func decodeKeyMaterial(v string) ([]byte, error) {
+	if strings.HasPrefix(v, "base64:") {
+		return base64.StdEncoding.DecodeString(strings.TrimPrefix(v, "base64:"))
+	}
+	return []byte(v), nil
+}
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -78,6 +92,37 @@ func run() error {
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
+
+	// Wire envelope-encryption and JWT-signing for the secrets feature.
+	// Both are optional — if either is unconfigured, /secrets endpoints
+	// return 500 and POST /sandboxes rejects requests that reference
+	// stored secrets. The platform stays functional for sandbox flows
+	// that don't use credentials.
+	if cfg.KMSKeyResource != "" {
+		kmsClient, kerr := kms.NewKeyManagementClient(ctx)
+		if kerr != nil {
+			log.Warn().Err(kerr).Msg("Cloud KMS init failed — /secrets endpoints will not work")
+		} else {
+			handlers.Encryptor = secrets.NewKMSEncryptor(kmsClient, cfg.KMSKeyResource)
+			log.Info().Str("kek", cfg.KMSKeyResource).Msg("envelope encryption enabled")
+		}
+	}
+	if cfg.SecretsProxyJWTKey != "" {
+		key, kerr := decodeKeyMaterial(cfg.SecretsProxyJWTKey)
+		if kerr != nil {
+			log.Warn().Err(kerr).Msg("invalid SECRETSPROXY_JWT_KEY; rotation paths will fail")
+		} else {
+			signer, serr := secrets.NewSigner(key,
+				cfg.SecretsProxyJWTKid, cfg.SecretsProxyJWTIssuer, cfg.SecretsProxyJWTAudience,
+				cfg.SecretsProxyJWTTTL)
+			if serr != nil {
+				log.Warn().Err(serr).Msg("init signer failed")
+			} else {
+				handlers.Signer = signer
+				log.Info().Str("kid", cfg.SecretsProxyJWTKid).Msg("proxy token signer ready")
+			}
+		}
+	}
 
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
 	// Interceptors below fire onDead on codes.Unavailable so the registry
