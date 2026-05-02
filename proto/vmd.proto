@@ -63,9 +63,8 @@ service VMDaemon {
   // status. Used by the control plane to drive /builds/:id/logs SSE.
   rpc StreamBuildLogs(StreamBuildLogsRequest) returns (stream BuildLogEvent);
 
-  // PropagateSecret pushes a new credential value (or revocation) for one
-  // stored secret to every sandbox on this host that holds a binding for
-  // it. Used by the control plane on rotation and on delete.
+  // PropagateSecret applies a new value (or empty=revoke) for one
+  // secret to every sandbox on this host that uses it.
   rpc PropagateSecret(PropagateSecretRequest) returns (PropagateSecretResponse);
 }
 
@@ -209,20 +208,17 @@ message SandboxNetworkEgressConfig {
 // SecretBinding — sandbox <-> stored credential
 // ---------------------------------------------------------------------------
 
-// SecretBinding ties one stored credential to one sandbox. Real plaintext
-// is pushed to a host-local cache; the agent inside the sandbox sees only
-// the signed token, wrapped in the provider's native key shape.
+// SecretBinding ties one stored credential to one sandbox.
 message SecretBinding {
-  string secret_id = 1;       // UUID of the secret row.
+  string secret_id = 1;
   string provider = 2;        // e.g. "anthropic"
-  string env_key = 3;         // env var name in the sandbox (e.g. "ANTHROPIC_API_KEY")
-  string real_value = 4;      // plaintext credential — never logged.
-  string token = 5;           // signed token the agent will see.
+  string env_key = 3;         // env var name visible inside the sandbox.
+  string real_value = 4;      // never logged.
+  string token = 5;           // what the agent's env will hold.
 }
 
-// PropagateSecretRequest carries a new real value (or a revocation when
-// real_value is empty) for one stored secret. The daemon updates every
-// running sandbox on this host that holds a binding for secret_id.
+// PropagateSecretRequest pushes a new value (or a revocation when
+// real_value is empty) for one secret.
 message PropagateSecretRequest {
   string secret_id = 1;
   string real_value = 2;
@@ -269,11 +265,8 @@ message ResumeVMRequest {
   string mem_file_path = 3;
   SandboxNetworkConfig sandbox_network = 4;  // Reapply egress rules after resume.
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
-  // Bindings between this sandbox and stored credentials. Real values are
-  // pushed to a host-local proxy; the agent inside the sandbox sees a
-  // signed token wrapped in the provider-native key shape.
   repeated SecretBinding secret_bindings = 6;
-  string team_id = 7;  // Owning team — recorded in proxy state and audit rows.
+  string team_id = 7;
 }
 
 message ResumeVMResponse {
@@ -314,9 +307,8 @@ message RestoreSnapshotRequest {
   // Per-sandbox env vars merged on top of the template's baked defaults
   // (captured in the snapshot). Caller keys override template keys.
   map<string, string> env_vars = 7;
-  // Bindings between this sandbox and stored credentials. See SecretBinding.
   repeated SecretBinding secret_bindings = 8;
-  string team_id = 9;  // Owning team — recorded in proxy state and audit rows.
+  string team_id = 9;
 }
 
 message RestoreSnapshotResponse {

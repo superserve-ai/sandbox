@@ -58,12 +58,11 @@ type Handlers struct {
 	Config    *config.Config
 	Hosts     HostRegistry // when set, routes VMD calls via host_id
 	Scheduler Scheduler    // when set, picks host on create
-	// Encryptor wraps the secret-vault envelope encryption (Cloud KMS). Required
-	// for /secrets endpoints; left nil in unit tests that don't exercise them.
+	// Encryptor and Signer are required by /secrets and by sandbox-create
+	// paths that reference stored secrets. Left nil in unit tests that
+	// don't exercise those paths.
 	Encryptor secrets.Encryptor
-	// Signer mints proxy tokens. Required for sandbox-create paths that
-	// reference stored secrets; left nil in tests that don't.
-	Signer *secrets.Signer
+	Signer    *secrets.Signer
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -670,10 +669,8 @@ type createSandboxRequest struct {
 	// pause/resume via snapshot.
 	EnvVars map[string]string `json:"env_vars,omitempty"`
 
-	// Secrets binds stored credentials to env-var names visible inside
-	// the sandbox. Keys are the env-var names the agent will see; values
-	// are names of secrets previously stored via POST /secrets. The
-	// agent receives a short-lived token; the real value is held off-VM.
+	// Secrets maps env-var name → name of a secret stored via POST /secrets.
+	// The real value is never injected into the sandbox.
 	Secrets map[string]string `json:"secrets,omitempty"`
 }
 
@@ -1017,10 +1014,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// VMD's ~100-200ms create latency, shaving that much off the p50.
 	sandboxID := uuid.New()
 
-	// Resolve secret bindings up front so we can fail fast on missing
-	// secrets or egress conflicts (before any infra work). KMS decrypt
-	// and JWT mint happen here; real values stay in this goroutine until
-	// they're sent to vmd.
+	// Resolve secret refs up front so we can fail fast on missing
+	// secrets or egress conflicts before any infra work runs.
 	secretBindings, sandboxSecretRows, err := h.resolveSecretBindings(c.Request.Context(), teamID, sandboxID, req.Secrets, req.Network)
 	if err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
@@ -1069,8 +1064,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TemplateID:     pgtype.UUID{Valid: false},
 		})
 	}
-	// addSandboxSecretRows persists the sandbox-secret join rows in the
-	// same tx as the sandbox row, so a failed create leaves no orphans.
+	// addSandboxSecretRows runs in the same tx as the sandbox insert.
 	addSandboxSecretRows := func(q *db.Queries) error {
 		for _, r := range sandboxSecretRows {
 			r.SandboxID = sandboxID

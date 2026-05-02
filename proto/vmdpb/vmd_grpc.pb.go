@@ -85,9 +85,8 @@ type VMDaemonClient interface {
 	// events as they arrive. Closes when the build reaches a terminal
 	// status. Used by the control plane to drive /builds/:id/logs SSE.
 	StreamBuildLogs(ctx context.Context, in *StreamBuildLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BuildLogEvent], error)
-	// PropagateSecret pushes a new credential value (or revocation) for one
-	// stored secret to every sandbox on this host that holds a binding for
-	// it. Used by the control plane on rotation and on delete.
+	// PropagateSecret applies a new value (or empty=revoke) for one
+	// secret to every sandbox on this host that uses it.
 	PropagateSecret(ctx context.Context, in *PropagateSecretRequest, opts ...grpc.CallOption) (*PropagateSecretResponse, error)
 }
 
@@ -325,9 +324,8 @@ type VMDaemonServer interface {
 	// events as they arrive. Closes when the build reaches a terminal
 	// status. Used by the control plane to drive /builds/:id/logs SSE.
 	StreamBuildLogs(*StreamBuildLogsRequest, grpc.ServerStreamingServer[BuildLogEvent]) error
-	// PropagateSecret pushes a new credential value (or revocation) for one
-	// stored secret to every sandbox on this host that holds a binding for
-	// it. Used by the control plane on rotation and on delete.
+	// PropagateSecret applies a new value (or empty=revoke) for one
+	// secret to every sandbox on this host that uses it.
 	PropagateSecret(context.Context, *PropagateSecretRequest) (*PropagateSecretResponse, error)
 	mustEmbedUnimplementedVMDaemonServer()
 }

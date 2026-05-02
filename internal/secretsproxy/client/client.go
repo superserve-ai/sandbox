@@ -1,13 +1,11 @@
-// Package client is the vmd-side wrapper around the secretsproxy
-// control IPC. Each VMD host runs a co-located proxy; vmd dials the
-// Unix socket that proxy creates at startup.
+// Package client is a thin HTTP-over-unix-socket wrapper used by vmd
+// to talk to the local secrets proxy.
 package client
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -102,6 +100,3 @@ func (c *Client) do(ctx context.Context, method, path string, body any) error {
 	}
 	return nil
 }
-
-// Compile-time assertion: errors.Is is available.
-var _ = errors.Is

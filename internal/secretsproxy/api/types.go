@@ -1,9 +1,7 @@
-// Package api defines the IPC contract between vmd and secretsproxy.
-// Both processes import these types so the wire format stays consistent.
+// Package api is the JSON wire format shared by both ends of the
+// secrets-proxy control IPC.
 package api
 
-// SecretBinding pairs a stored credential id with its plaintext and the
-// env-var name the agent will see. RealValue is never logged.
 type SecretBinding struct {
 	SecretID  string `json:"secret_id"`
 	Provider  string `json:"provider"`
@@ -11,17 +9,13 @@ type SecretBinding struct {
 	RealValue string `json:"real_value"`
 }
 
-// EgressRules mirrors the customer's allow/deny lists. The proxy applies
-// them when deciding whether to forward upstream — same semantics as the
-// existing L4 egress proxy.
 type EgressRules struct {
 	AllowOut []string `json:"allow_out,omitempty"`
 	DenyOut  []string `json:"deny_out,omitempty"`
 }
 
-// RegisterRequest is sent by vmd when a sandbox starts. SourceIP is the
-// post-SNAT host-side IP that incoming connections will appear as; it
-// keys the sandbox lookup on the proxy hot path.
+// RegisterRequest installs (or replaces) a sandbox's state. SourceIP is
+// the post-SNAT address incoming connections will report.
 type RegisterRequest struct {
 	SandboxID string          `json:"sandbox_id"`
 	TeamID    string          `json:"team_id"`
@@ -30,21 +24,16 @@ type RegisterRequest struct {
 	Egress    EgressRules     `json:"egress"`
 }
 
-// UpdateBindingsRequest replaces a sandbox's current bindings. Used both
-// for rotation (push the freshly-decrypted real value) and for revocation
-// (caller passes a binding list that omits the revoked secret_id).
 type UpdateBindingsRequest struct {
 	Bindings []SecretBinding `json:"bindings"`
 }
 
-// UpdateEgressRequest replaces a sandbox's egress rules.
 type UpdateEgressRequest struct {
 	Egress EgressRules `json:"egress"`
 }
 
-// PropagateSecretRequest pushes a new real value (or a revocation) for
-// every sandbox on this host that holds a binding for SecretID. Empty
-// RealValue means revoke.
+// PropagateSecretRequest pushes a new value (empty=revoke) for one
+// secret across every binding that references it on this host.
 type PropagateSecretRequest struct {
 	SecretID  string `json:"secret_id"`
 	RealValue string `json:"real_value,omitempty"`

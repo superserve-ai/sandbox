@@ -1077,16 +1077,14 @@ func (x *SandboxNetworkEgressConfig) GetAllowedDomains() []string {
 	return nil
 }
 
-// SecretBinding ties one stored credential to one sandbox. Real plaintext
-// is pushed to a host-local cache; the agent inside the sandbox sees only
-// the signed token, wrapped in the provider's native key shape.
+// SecretBinding ties one stored credential to one sandbox.
 type SecretBinding struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	SecretId      string                 `protobuf:"bytes,1,opt,name=secret_id,json=secretId,proto3" json:"secret_id,omitempty"`    // UUID of the secret row.
+	SecretId      string                 `protobuf:"bytes,1,opt,name=secret_id,json=secretId,proto3" json:"secret_id,omitempty"`
 	Provider      string                 `protobuf:"bytes,2,opt,name=provider,proto3" json:"provider,omitempty"`                    // e.g. "anthropic"
-	EnvKey        string                 `protobuf:"bytes,3,opt,name=env_key,json=envKey,proto3" json:"env_key,omitempty"`          // env var name in the sandbox (e.g. "ANTHROPIC_API_KEY")
-	RealValue     string                 `protobuf:"bytes,4,opt,name=real_value,json=realValue,proto3" json:"real_value,omitempty"` // plaintext credential — never logged.
-	Token         string                 `protobuf:"bytes,5,opt,name=token,proto3" json:"token,omitempty"`                          // signed token the agent will see.
+	EnvKey        string                 `protobuf:"bytes,3,opt,name=env_key,json=envKey,proto3" json:"env_key,omitempty"`          // env var name visible inside the sandbox.
+	RealValue     string                 `protobuf:"bytes,4,opt,name=real_value,json=realValue,proto3" json:"real_value,omitempty"` // never logged.
+	Token         string                 `protobuf:"bytes,5,opt,name=token,proto3" json:"token,omitempty"`                          // what the agent's env will hold.
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1156,9 +1154,8 @@ func (x *SecretBinding) GetToken() string {
 	return ""
 }
 
-// PropagateSecretRequest carries a new real value (or a revocation when
-// real_value is empty) for one stored secret. The daemon updates every
-// running sandbox on this host that holds a binding for secret_id.
+// PropagateSecretRequest pushes a new value (or a revocation when
+// real_value is empty) for one secret.
 type PropagateSecretRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SecretId      string                 `protobuf:"bytes,1,opt,name=secret_id,json=secretId,proto3" json:"secret_id,omitempty"`
@@ -1470,11 +1467,8 @@ type ResumeVMRequest struct {
 	MemFilePath    string                 `protobuf:"bytes,3,opt,name=mem_file_path,json=memFilePath,proto3" json:"mem_file_path,omitempty"`
 	SandboxNetwork *SandboxNetworkConfig  `protobuf:"bytes,4,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"`                                                      // Reapply egress rules after resume.
 	EnvVars        map[string]string      `protobuf:"bytes,5,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Re-inject env vars after resume.
-	// Bindings between this sandbox and stored credentials. Real values are
-	// pushed to a host-local proxy; the agent inside the sandbox sees a
-	// signed token wrapped in the provider-native key shape.
-	SecretBindings []*SecretBinding `protobuf:"bytes,6,rep,name=secret_bindings,json=secretBindings,proto3" json:"secret_bindings,omitempty"`
-	TeamId         string           `protobuf:"bytes,7,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"` // Owning team — recorded in proxy state and audit rows.
+	SecretBindings []*SecretBinding       `protobuf:"bytes,6,rep,name=secret_bindings,json=secretBindings,proto3" json:"secret_bindings,omitempty"`
+	TeamId         string                 `protobuf:"bytes,7,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1764,10 +1758,9 @@ type RestoreSnapshotRequest struct {
 	NetworkConfig  *NetworkConfig         `protobuf:"bytes,6,opt,name=network_config,json=networkConfig,proto3" json:"network_config,omitempty"`
 	// Per-sandbox env vars merged on top of the template's baked defaults
 	// (captured in the snapshot). Caller keys override template keys.
-	EnvVars map[string]string `protobuf:"bytes,7,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Bindings between this sandbox and stored credentials. See SecretBinding.
-	SecretBindings []*SecretBinding `protobuf:"bytes,8,rep,name=secret_bindings,json=secretBindings,proto3" json:"secret_bindings,omitempty"`
-	TeamId         string           `protobuf:"bytes,9,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"` // Owning team — recorded in proxy state and audit rows.
+	EnvVars        map[string]string `protobuf:"bytes,7,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	SecretBindings []*SecretBinding  `protobuf:"bytes,8,rep,name=secret_bindings,json=secretBindings,proto3" json:"secret_bindings,omitempty"`
+	TeamId         string            `protobuf:"bytes,9,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }

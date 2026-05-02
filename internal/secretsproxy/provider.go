@@ -23,8 +23,7 @@ func (s ServiceConfig) SetKey(req *http.Request, real string) {
 	req.Header.Set(s.KeyHeader, fmt.Sprintf(s.KeyFormat, real))
 }
 
-// AnthropicConfig is the Phase 1 upstream. Anthropic auth uses the
-// `x-api-key` header (no Bearer prefix).
+// AnthropicConfig — auth is `x-api-key: <key>` (no Bearer prefix).
 var AnthropicConfig = ServiceConfig{
 	Name:       "anthropic",
 	PathPrefix: "/anthropic",

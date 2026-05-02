@@ -39,19 +39,12 @@ type Config struct {
 	// Must be a valid UUID matching an existing team row.
 	SystemTeamID string
 
-	// KMSKeyResource is the full Cloud KMS key resource name used as the
-	// envelope-encryption KEK for stored secrets. Empty disables the
-	// /secrets endpoints. Format:
-	//   projects/<project>/locations/<region>/keyRings/<ring>/cryptoKeys/<key>
+	// KMSKeyResource: full Cloud KMS key name. Empty disables /secrets.
+	// Format: projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>.
 	KMSKeyResource string
 
-	// SecretsProxyJWTKey is the symmetric HMAC key used to sign tokens
-	// the agent sees. Either raw bytes or "base64:<encoded>". Production
-	// loads it from Secret Manager into this env var.
-	SecretsProxyJWTKey string
-	// SecretsProxyJWTKid identifies the signing key version. Always
-	// emitted in the JWT header so a future rotation can roll forward
-	// without breaking in-flight tokens.
+	// SecretsProxyJWTKey: HMAC signing key. Raw bytes or "base64:<...>".
+	SecretsProxyJWTKey      string
 	SecretsProxyJWTKid      string
 	SecretsProxyJWTIssuer   string
 	SecretsProxyJWTAudience string

@@ -20,21 +20,15 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// providerUpstreamHost maps a provider name to the host the proxy will
-// forward to. Used at sandbox-create time to reject configurations that
-// reference a secret whose upstream is blocked by the customer's egress
-// rules — better a 400 now than a 403 mid-flight from inside the VM.
+// providerUpstreamHost is the host each provider's traffic forwards to.
+// Used to reject sandbox creates that reference a secret blocked by the
+// caller's egress rules.
 var providerUpstreamHost = map[string]string{
 	"anthropic": "api.anthropic.com",
 }
 
-// envKeyRE: classic env-var name conventions. Same shape secretNameRE
-// uses but separated so we can evolve them independently.
 var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// validateSecretsRefs validates the user-supplied secrets map: env-var
-// keys are well-formed and secret names are well-formed. Doesn't hit the
-// DB; that happens during binding resolution.
 func validateSecretsRefs(refs map[string]string) error {
 	if len(refs) == 0 {
 		return nil
@@ -53,10 +47,9 @@ func validateSecretsRefs(refs map[string]string) error {
 	return nil
 }
 
-// resolveSecretBindings turns the user-supplied secrets map into the
-// runtime bindings needed by vmd plus the rows that get written to
-// sandbox_secret. Decrypts each value (KMS round-trip) and mints a
-// sandbox-bound token. On any error returns a user-facing message.
+// resolveSecretBindings decrypts each referenced secret and mints a
+// sandbox-bound token, returning the bindings to send to vmd plus the
+// rows that get written to sandbox_secret in the same transaction.
 func (h *Handlers) resolveSecretBindings(
 	ctx context.Context,
 	teamID, sandboxID uuid.UUID,
@@ -120,16 +113,11 @@ func (h *Handlers) resolveSecretBindings(
 	return bindings, rows, nil
 }
 
-// upstreamAllowedByEgress checks that a provider's upstream host is
-// reachable under the sandbox's egress rules. Returns an explanatory
-// error suitable for a 400 response.
+// upstreamAllowedByEgress returns an error if the provider's upstream
+// would be blocked by the sandbox's egress rules.
 func upstreamAllowedByEgress(provider string, netCfg *networkConfigRequest) error {
 	host, ok := providerUpstreamHost[provider]
 	if !ok {
-		// Unknown provider — let it through; the proxy will refuse later
-		// if it can't route. This shouldn't happen for the providers we
-		// allow at create time, but keep the check open in case the set
-		// drifts.
 		return nil
 	}
 	if netCfg == nil {
@@ -155,9 +143,8 @@ func upstreamAllowedByEgress(provider string, netCfg *networkConfigRequest) erro
 	return fmt.Errorf("provider %q upstream %s is not in allow_out", provider, host)
 }
 
-// wrapTokenForProvider gives the SDK a key with the right shape so it
-// accepts the env value without complaint. Anthropic only checks the
-// `sk-ant-` prefix — wrapping our JWT keeps the client library happy.
+// wrapTokenForProvider matches the SDK's expected key prefix so the
+// client accepts our token from env. Anthropic checks for `sk-ant-`.
 func wrapTokenForProvider(provider, jwt string) string {
 	switch provider {
 	case "anthropic":
@@ -181,8 +168,7 @@ type updateSecretRequest struct {
 	Value string `json:"value"`
 }
 
-// secretResponse is the customer-facing view. Never includes ciphertext or
-// the wrapped DEK — those are server-side internals.
+// secretResponse is the customer-facing view. Excludes ciphertext / DEK.
 type secretResponse struct {
 	ID         uuid.UUID `json:"id"`
 	Name       string    `json:"name"`
@@ -216,16 +202,10 @@ const (
 	maxSecretValueLen = 8 * 1024 // 8 KB; matches env_vars value cap
 )
 
-// secretNameRE — same shape as env-var name conventions: a leading letter
-// (upper or lower) or underscore, followed by letters / digits / `_` / `-`.
-// We don't allow the slashes or dots that template names accept because
-// secret names map to a user-visible identifier in CLIs/dashboards and we
-// want them to remain shell-safe and unambiguous.
+// secretNameRE — leading letter or underscore, then letters / digits /
+// `_` / `-`. Shell- and URL-safe.
 var secretNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
-// supportedProviders gates the customer-facing field at create time.
-// Customers can't invent providers — we'd have no upstream to forward
-// to.
 var supportedProviders = map[string]bool{
 	"anthropic": true,
 }
@@ -380,8 +360,6 @@ func (h *Handlers) GetSecret(c *gin.Context) {
 	c.JSON(http.StatusOK, toSecretResponse(row))
 }
 
-// PatchSecret rotates the secret's value. Re-encrypts with a fresh DEK
-// and updates the row.
 func (h *Handlers) PatchSecret(c *gin.Context) {
 	if !h.requireEncryptor(c) {
 		return
@@ -406,8 +384,7 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 		return
 	}
 
-	// Look up so we can target by id (UpdateSecretValue is by id) and so a
-	// missing row returns 404 cleanly.
+	// Look up first so a missing row returns 404 cleanly.
 	existing, err := h.DB.GetSecretByName(c.Request.Context(), db.GetSecretByNameParams{
 		TeamID: teamID, Name: name,
 	})
@@ -441,8 +418,6 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 		return
 	}
 
-	// Push the new value to every host running a sandbox that holds a
-	// binding for this secret. Async so the API call returns quickly.
 	go h.propagateSecretToHosts(context.WithoutCancel(c.Request.Context()), updated.ID, req.Value)
 
 	c.JSON(http.StatusOK, toSecretResponse(updated))
@@ -472,21 +447,16 @@ func (h *Handlers) DeleteSecret(c *gin.Context) {
 		return
 	}
 
-	// Empty real value = revoke. Run async so the API call returns
-	// immediately; the in-flight calls already in transit upstream may
-	// still succeed but no new ones can use the deleted secret.
+	// Empty value = revoke.
 	go h.propagateSecretToHosts(context.WithoutCancel(c.Request.Context()), row.ID, "")
 
 	c.Status(http.StatusNoContent)
 }
 
-// propagateSecretToHosts groups live sandbox bindings by host and pushes
-// the new (or empty) value to each host's vmd. Best-effort — failures
-// are logged so ops can retry; on the next sandbox-create the proxy
-// gets the latest value automatically anyway.
+// propagateSecretToHosts fans out a new (or empty=revoke) value to every
+// host that has a sandbox bound to the secret. Best-effort.
 func (h *Handlers) propagateSecretToHosts(ctx context.Context, secretID uuid.UUID, realValue string) {
 	if h.Hosts == nil {
-		// No host registry means we can't fan out per-host; skip.
 		return
 	}
 	rows, err := h.DB.ListSandboxesForSecret(ctx, secretID)
@@ -533,10 +503,8 @@ type proxyAuditResponse struct {
 	ErrorCode      *string `json:"error_code,omitempty"`
 }
 
-// GetSandboxAudit returns paginated audit rows for a sandbox. Pagination
-// uses the descending row id as a cursor: pass `?before=<id>` to fetch
-// the next page. Team scoping comes from the sandbox lookup — a customer
-// can't read another team's rows by guessing UUIDs.
+// GetSandboxAudit returns audit rows for a sandbox, paginated by row id
+// descending. Pass `?before=<id>` for the next page.
 func (h *Handlers) GetSandboxAudit(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {

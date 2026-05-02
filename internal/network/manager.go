@@ -58,8 +58,8 @@ type VMNetInfo struct {
 	TAPDevice   string    // TAP device inside namespace (always "tap0").
 	VMIP        string    // VM's internal IP (always VMInternalIP).
 	GatewayIP   string    // Gateway inside namespace (always VMGatewayIP).
-	HostIP      string    // Host-side IP to reach this VM (post-SNAT source IP).
-	HostVethIP  string    // Host-side veth IP — the namespace's default gateway and the address sandboxes use to reach host services.
+	HostIP      string    // Host-side IP to reach this VM; also the post-SNAT source seen by host services.
+	HostVethIP  string    // Host-side veth IP; the namespace's default gateway.
 	MACAddress  string
 	Firewall    *Firewall // nftables firewall for this VM (inside namespace).
 }

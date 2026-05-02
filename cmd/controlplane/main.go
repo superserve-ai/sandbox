@@ -33,9 +33,7 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
-// decodeKeyMaterial accepts either a literal byte string or a
-// "base64:..."-prefixed encoded blob. Production wires the value via
-// Secret Manager so the env var holds an opaque token.
+// decodeKeyMaterial accepts a raw string or a "base64:..." blob.
 func decodeKeyMaterial(v string) ([]byte, error) {
 	if strings.HasPrefix(v, "base64:") {
 		return base64.StdEncoding.DecodeString(strings.TrimPrefix(v, "base64:"))
@@ -93,34 +91,27 @@ func run() error {
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
 
-	// Wire envelope-encryption and JWT-signing for the secrets feature.
-	// Both are optional — if either is unconfigured, /secrets endpoints
-	// return 500 and POST /sandboxes rejects requests that reference
-	// stored secrets. The platform stays functional for sandbox flows
-	// that don't use credentials.
+	// Optional wiring: both envelope encryption and proxy-token signing
+	// are off when the corresponding env var is unset. Other endpoints
+	// remain unaffected.
 	if cfg.KMSKeyResource != "" {
 		kmsClient, kerr := kms.NewKeyManagementClient(ctx)
 		if kerr != nil {
-			log.Warn().Err(kerr).Msg("Cloud KMS init failed — /secrets endpoints will not work")
+			log.Warn().Err(kerr).Msg("KMS init failed")
 		} else {
 			handlers.Encryptor = secrets.NewKMSEncryptor(kmsClient, cfg.KMSKeyResource)
-			log.Info().Str("kek", cfg.KMSKeyResource).Msg("envelope encryption enabled")
 		}
 	}
 	if cfg.SecretsProxyJWTKey != "" {
 		key, kerr := decodeKeyMaterial(cfg.SecretsProxyJWTKey)
 		if kerr != nil {
-			log.Warn().Err(kerr).Msg("invalid SECRETSPROXY_JWT_KEY; rotation paths will fail")
+			log.Warn().Err(kerr).Msg("invalid SECRETSPROXY_JWT_KEY")
+		} else if signer, serr := secrets.NewSigner(key,
+			cfg.SecretsProxyJWTKid, cfg.SecretsProxyJWTIssuer, cfg.SecretsProxyJWTAudience,
+			cfg.SecretsProxyJWTTTL); serr != nil {
+			log.Warn().Err(serr).Msg("init signer failed")
 		} else {
-			signer, serr := secrets.NewSigner(key,
-				cfg.SecretsProxyJWTKid, cfg.SecretsProxyJWTIssuer, cfg.SecretsProxyJWTAudience,
-				cfg.SecretsProxyJWTTTL)
-			if serr != nil {
-				log.Warn().Err(serr).Msg("init signer failed")
-			} else {
-				handlers.Signer = signer
-				log.Info().Str("kid", cfg.SecretsProxyJWTKid).Msg("proxy token signer ready")
-			}
+			handlers.Signer = signer
 		}
 	}
 

@@ -5,8 +5,8 @@ package vmdclient
 
 import "context"
 
-// SecretBinding ties a stored credential to one sandbox. Mirrors
-// vmdpb.SecretBinding so callers don't import the proto package directly.
+// SecretBinding mirrors vmdpb.SecretBinding so callers don't import
+// the proto package directly.
 type SecretBinding struct {
 	SecretID  string
 	Provider  string
@@ -60,8 +60,7 @@ type Client interface {
 	// failure or gRPC NotFound (which callers surface as SSE 404).
 	StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(BuildLogEvent) error) error
 
-	// PropagateSecret pushes a rotation (or revocation when realValue is
-	// empty) for one stored secret to this host's local secrets proxy.
+	// PropagateSecret pushes a new value (empty=revoke) for one secret.
 	PropagateSecret(ctx context.Context, secretID, realValue string) error
 }
 

@@ -62,7 +62,7 @@ func run(listenAddr, socketPath string) error {
 
 	queries, dbCleanup, err := openDB(ctx)
 	if err != nil {
-		log.Warn().Err(err).Msg("DB connection unavailable; audit log writes will be skipped")
+		log.Warn().Err(err).Msg("DB connection unavailable; audit writes skipped")
 		queries = nil
 	}
 	if dbCleanup != nil {
@@ -87,12 +87,10 @@ func run(listenAddr, socketPath string) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// Forward listener (TCP).
 	tcpLn, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
-	// Control listener (Unix socket).
 	_ = os.Remove(socketPath)
 	unixLn, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -123,9 +121,8 @@ func run(listenAddr, socketPath string) error {
 	return nil
 }
 
-// loadJWTKey reads the HMAC signing key. SECRETSPROXY_JWT_KEY holds the
-// raw bytes (or a base64url-encoded blob); production wires it from
-// Secret Manager → env var at process start.
+// loadJWTKey reads SECRETSPROXY_JWT_KEY: raw bytes, or "base64:..."
+// for binary keys.
 func loadJWTKey() ([]byte, error) {
 	v := os.Getenv("SECRETSPROXY_JWT_KEY")
 	if v == "" {

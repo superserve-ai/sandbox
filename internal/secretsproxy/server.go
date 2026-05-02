@@ -17,10 +17,9 @@ import (
 	"github.com/superserve-ai/sandbox/internal/secretsproxy/api"
 )
 
-// Server is the HTTP listener that sandboxes call. Source IP identifies
-// the sandbox; path prefix identifies the provider; the auth header
-// carries a signed token whose claims authorize a specific (sandbox,
-// secret) swap.
+// Server is the HTTP listener sandboxes hit. Source IP identifies the
+// sandbox; path prefix identifies the provider; the auth header carries
+// a signed token authorizing a specific (sandbox, secret) swap.
 type Server struct {
 	state    *State
 	verifier *secrets.Signer
@@ -29,9 +28,7 @@ type Server struct {
 	upstream *http.Client
 }
 
-// NewServer wires the request router. upstream is used for forwarded
-// requests; in production it has connection pooling and a moderate
-// per-request timeout.
+// NewServer constructs the request handler.
 func NewServer(state *State, verifier *secrets.Signer, provs *Registry, audit *AuditWriter) *Server {
 	return &Server{
 		state:    state,
@@ -45,15 +42,12 @@ func NewServer(state *State, verifier *secrets.Signer, provs *Registry, audit *A
 				IdleConnTimeout:     90 * time.Second,
 				ForceAttemptHTTP2:   true,
 			},
-			// Per-request timeout is set on the outgoing request; the
-			// client itself doesn't enforce one because long SSE streams
-			// from upstream are valid.
+			// No client timeout — SSE streams from upstream may be long-lived.
 		},
 	}
 }
 
-// Handler returns the http.Handler for the forward path. Mount on
-// 0.0.0.0:9090 (or wherever sandboxes are routed to).
+// Handler returns the forward-path http.Handler.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(s.serve)
 }
@@ -62,30 +56,24 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	srcIP := remoteHost(r.RemoteAddr)
 
-	// 1. Identify sandbox by source IP.
 	sb, ok := s.state.LookupBySourceIP(srcIP)
 	if !ok {
 		writeProxyError(w, http.StatusForbidden, "unknown_sandbox", "source IP not registered")
 		return
 	}
 
-	// 2. Identify provider by path prefix.
 	cfg, upstreamPath, ok := s.provs.MatchPath(r.URL.Path)
 	if !ok {
 		writeProxyError(w, http.StatusNotFound, "unknown_provider", "no provider for path "+r.URL.Path)
 		return
 	}
 
-	// 3. Extract and verify token.
-	tokRaw := extractToken(r, cfg)
-	claims, err := s.verifier.Verify(time.Now(), tokRaw)
+	claims, err := s.verifier.Verify(time.Now(), extractToken(r, cfg))
 	if err != nil {
 		writeProxyError(w, http.StatusUnauthorized, "invalid_token", "token verification failed")
 		s.recordAudit(sb, uuid.Nil, cfg, r, http.StatusUnauthorized, nil, time.Since(start), "invalid_token")
 		return
 	}
-
-	// 4. Bind the JWT to the source-IP sandbox.
 	if claims.Subject != sb.SandboxID {
 		writeProxyError(w, http.StatusForbidden, "token_sandbox_mismatch",
 			"token does not match this sandbox")
@@ -95,7 +83,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Look up the real value for this secret.
 	binding, ok := sb.Bindings[claims.SecretID]
 	if !ok {
 		writeProxyError(w, http.StatusServiceUnavailable, "secret_revoked",
@@ -104,16 +91,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if binding.Provider != cfg.Name {
-		// Token was issued for a different provider's secret; reject so
-		// a customer can't use an Anthropic credential against an
-		// OpenAI-shaped path or vice versa.
+		// Reject cross-provider use so a token issued for one provider's
+		// secret can't authenticate against another's path.
 		writeProxyError(w, http.StatusForbidden, "provider_mismatch",
 			"secret provider does not match request path")
 		s.recordAudit(sb, parseUUID(claims.SecretID), cfg, r, http.StatusForbidden, nil, time.Since(start), "provider_mismatch")
 		return
 	}
 
-	// 6. Egress check on the upstream URL.
 	upstreamURL, err := url.Parse(cfg.Upstream + upstreamPath)
 	if err != nil {
 		writeProxyError(w, http.StatusInternalServerError, "bad_upstream", err.Error())
@@ -129,7 +114,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 7. Build outbound request with the real key swapped in.
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
 	if err != nil {
 		writeProxyError(w, http.StatusInternalServerError, "build_request", err.Error())
@@ -146,8 +130,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// 8. Stream response back without buffering. Flush after each chunk
-	// so SSE / chunked-transfer streaming reaches the agent promptly.
+	// Flush after each chunk so SSE reaches the caller promptly.
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -161,15 +144,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.recordAudit(sb, parseUUID(claims.SecretID), cfg, r, resp.StatusCode, &upstreamStatus, time.Since(start), "")
 }
 
-// extractToken pulls the signed token out of the request's auth header,
-// honoring the provider's KeyFormat. If the header isn't present or
-// doesn't match the format, returns "" and Verify will reject.
+// extractToken returns the token from the provider's auth header,
+// stripping any literal prefix the format requires (e.g. "Bearer ").
 func extractToken(r *http.Request, cfg ServiceConfig) string {
 	raw := r.Header.Get(cfg.KeyHeader)
 	if raw == "" {
 		return ""
 	}
-	// Strip a literal prefix like "Bearer " when the format requires it.
 	prefix := strings.TrimSuffix(cfg.KeyFormat, "%s")
 	if prefix != "" && strings.HasPrefix(raw, prefix) {
 		return strings.TrimPrefix(raw, prefix)
@@ -177,9 +158,8 @@ func extractToken(r *http.Request, cfg ServiceConfig) string {
 	return raw
 }
 
-// copyForwardableHeaders replicates the inbound headers into the outbound
-// request, dropping any auth header (we're injecting our own) and any
-// Forwarded-by hop headers.
+// copyForwardableHeaders copies inbound headers to the outbound request,
+// dropping the existing auth header (replaced) and hop-by-hop headers.
 func copyForwardableHeaders(in, out http.Header, keyHeader string) {
 	stripped := map[string]struct{}{
 		strings.ToLower(keyHeader): {},
@@ -209,8 +189,7 @@ func copyForwardableHeaders(in, out http.Header, keyHeader string) {
 	out.Set("User-Agent", "superserve-secretsproxy/1.0")
 }
 
-// streamBody copies upstream into the client connection, flushing after
-// each read so streaming responses don't stall in the proxy buffer.
+// streamBody copies body to w, flushing after each read.
 func streamBody(w io.Writer, body io.Reader, flusher http.Flusher) {
 	buf := make([]byte, 4096)
 	for {
@@ -232,22 +211,18 @@ func streamBody(w io.Writer, body io.Reader, flusher http.Flusher) {
 	}
 }
 
-// egressAllowed applies the customer's egress rules to a target URL.
-// Mirrors internal/network.EgressProxy semantics: deny first, then allow,
-// implicit deny when allow list is non-empty and nothing matches.
+// egressAllowed applies the rules to a target URL. Deny first, then
+// allow; implicit deny when AllowOut is set and nothing matches.
 func egressAllowed(rules api.EgressRules, target *url.URL) bool {
 	if len(rules.AllowOut) == 0 && len(rules.DenyOut) == 0 {
 		return true
 	}
 	host := target.Hostname()
-
-	// Deny CIDRs / IPs evaluated first.
 	for _, entry := range rules.DenyOut {
 		if matchEgressEntry(entry, host) {
 			return false
 		}
 	}
-	// Allow CIDRs / domains.
 	if len(rules.AllowOut) == 0 {
 		return true
 	}
@@ -259,9 +234,7 @@ func egressAllowed(rules api.EgressRules, target *url.URL) bool {
 	return false
 }
 
-// matchEgressEntry tests whether a host matches an egress rule entry.
-// Supports exact host match, *.suffix wildcard, and CIDRs (where the
-// host has been resolved to an IP — for now we only do hostname match).
+// matchEgressEntry: exact match or *.suffix wildcard.
 func matchEgressEntry(entry, host string) bool {
 	if entry == host {
 		return true
@@ -272,10 +245,6 @@ func matchEgressEntry(entry, host string) bool {
 			return true
 		}
 	}
-	// CIDR matching against a hostname doesn't make sense at this layer
-	// (we don't resolve here; resolution happens in the upstream dial).
-	// Treat CIDR entries as host-string matches for now — they'll match
-	// only if the customer literally put a hostname in the wrong field.
 	return false
 }
 

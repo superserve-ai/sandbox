@@ -18,52 +18,36 @@ import (
 	"cloud.google.com/go/kms/apiv1/kmspb"
 )
 
-// Encrypted is the at-rest form of a secret. The three fields map 1:1 to
-// the secret table's ciphertext / encrypted_dek / kek_id columns.
+// Encrypted is the at-rest form of a secret.
 type Encrypted struct {
-	// Ciphertext is nonce(12) || aes-256-gcm(plaintext, dek) || tag(16),
-	// matching crypto/cipher.AEAD.Seal output with the nonce prefixed.
+	// Ciphertext: nonce(12) || aes-256-gcm(plaintext, dek) || tag(16).
 	Ciphertext []byte
-	// EncryptedDEK is the per-row data key wrapped by the KEK. KMS
-	// embeds the key version that wrapped it, so decrypt round-trips
-	// across KEK rotation.
+	// EncryptedDEK is the per-row data key wrapped by the KEK named in KEKID.
 	EncryptedDEK []byte
-	// KEKID is the KMS resource name (projects/.../cryptoKeys/...) used
-	// to wrap the DEK. Stored per row so a future KEK migration can
-	// decrypt rows wrapped by either KEK.
+	// KEKID is the KMS resource name used to wrap the DEK.
 	KEKID string
 }
 
-// Encryptor is the interface used by the rest of the codebase. The only
-// production implementation is KMSEncryptor; tests substitute a fake.
 type Encryptor interface {
 	Encrypt(ctx context.Context, plaintext []byte) (Encrypted, error)
 	Decrypt(ctx context.Context, enc Encrypted) ([]byte, error)
 }
 
-// dekSize is the AES-256 key size. Must match aes.BlockSize math: a
-// 256-bit key uses a 16-byte block, GCM uses a 12-byte nonce. Changing
-// this constant requires a migration since old rows would have shorter
-// DEKs, so we hardcode and assert on decrypt.
 const dekSize = 32
 
-// KMSEncryptor wraps DEKs with Cloud KMS. One instance per process is
-// enough — the underlying KMS client maintains its own connection pool.
 type KMSEncryptor struct {
 	client *kms.KeyManagementClient
 	kekID  string
 }
 
-// NewKMSEncryptor returns an Encryptor that wraps DEKs with the given
-// KEK. kekID is the full resource name:
+// NewKMSEncryptor returns an Encryptor that wraps DEKs with kekID:
 // projects/<project>/locations/<region>/keyRings/<ring>/cryptoKeys/<key>.
 func NewKMSEncryptor(client *kms.KeyManagementClient, kekID string) *KMSEncryptor {
 	return &KMSEncryptor{client: client, kekID: kekID}
 }
 
-// Encrypt generates a fresh DEK, AES-GCM-encrypts plaintext under it, and
-// wraps the DEK with the configured KEK. The DEK never leaves this
-// function — it's discarded as soon as Encrypt returns.
+// Encrypt generates a fresh DEK, AES-GCM-seals plaintext under it, and
+// wraps the DEK with the configured KEK.
 func (e *KMSEncryptor) Encrypt(ctx context.Context, plaintext []byte) (Encrypted, error) {
 	dek := make([]byte, dekSize)
 	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
@@ -90,9 +74,8 @@ func (e *KMSEncryptor) Encrypt(ctx context.Context, plaintext []byte) (Encrypted
 	}, nil
 }
 
-// Decrypt unwraps the DEK with the KEK named on the row (which may
-// differ from this process's configured KEK in cross-environment
-// migration scenarios), then AES-GCM-decrypts the ciphertext.
+// Decrypt uses enc.KEKID (which may differ from the configured kekID
+// after a KEK migration) to unwrap the DEK, then opens the ciphertext.
 func (e *KMSEncryptor) Decrypt(ctx context.Context, enc Encrypted) ([]byte, error) {
 	if enc.KEKID == "" {
 		return nil, errors.New("encrypted: missing kek_id")
@@ -111,9 +94,7 @@ func (e *KMSEncryptor) Decrypt(ctx context.Context, enc Encrypted) ([]byte, erro
 	return aesGCMOpen(dek, enc.Ciphertext)
 }
 
-// aesGCMSeal encrypts plaintext with a 256-bit key using AES-GCM and
-// returns nonce || ciphertext || tag. The nonce is a fresh 12 random
-// bytes, safe because the DEK is one-time per row.
+// aesGCMSeal returns nonce || ciphertext || tag.
 func aesGCMSeal(key, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {

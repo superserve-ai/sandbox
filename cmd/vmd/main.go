@@ -53,9 +53,7 @@ type Config struct {
 	// heartbeat is disabled.
 	ControlPlaneURL string
 
-	// SecretsProxySocket is the unix-socket path of the local secrets
-	// proxy. When unset, sandboxes that reference stored secrets fail at
-	// boot.
+	// SecretsProxySocket: unix-socket path. Empty disables the integration.
 	SecretsProxySocket string
 }
 
@@ -394,7 +392,6 @@ func main() {
 	adapter := vm.NewGRPCAdapter(mgr)
 	if cfg.SecretsProxySocket != "" {
 		adapter = adapter.WithSecretsProxy(secretsproxyclient.New(cfg.SecretsProxySocket))
-		log.Info().Str("socket", cfg.SecretsProxySocket).Msg("secrets proxy IPC enabled")
 	}
 	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
 	lc.start("grpc server", func() error {

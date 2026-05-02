@@ -16,9 +16,8 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
-// SecretsProxyClient is the subset of internal/secretsproxy/client.Client
-// used by the gRPC adapter. Defined here so the adapter can take an
-// interface without a circular import.
+// SecretsProxyClient is implemented by internal/secretsproxy/client. The
+// interface lives here so this package can take it without a cycle.
 type SecretsProxyClient interface {
 	Register(ctx context.Context, req api.RegisterRequest) error
 	Unregister(ctx context.Context, sandboxID string) error
@@ -30,11 +29,8 @@ type SecretsProxyClient interface {
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
 type GRPCAdapter struct {
 	vmdpb.UnimplementedVMDaemonServer
-	mgr *Manager
-	// proxy is optional. When nil, secret bindings on incoming requests
-	// fail loudly — vmd should not silently boot a sandbox whose agent
-	// expects a working credential swap.
-	proxy SecretsProxyClient
+	mgr   *Manager
+	proxy SecretsProxyClient // optional; required only when requests carry secret_bindings
 }
 
 // NewGRPCAdapter creates a new adapter that bridges the proto interface to the Manager.
@@ -42,8 +38,7 @@ func NewGRPCAdapter(mgr *Manager) *GRPCAdapter {
 	return &GRPCAdapter{mgr: mgr}
 }
 
-// WithSecretsProxy attaches a secrets-proxy client. Must be called before
-// the gRPC server starts serving requests.
+// WithSecretsProxy attaches the proxy client. Call before serving.
 func (a *GRPCAdapter) WithSecretsProxy(c SecretsProxyClient) *GRPCAdapter {
 	a.proxy = c
 	return a
@@ -168,14 +163,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	}, nil
 }
 
-// PropagateSecret forwards the rotation/revocation to the local secrets
-// proxy, which in turn updates every sandbox on this host that holds a
-// binding for the given secret.
 func (a *GRPCAdapter) PropagateSecret(ctx context.Context, req *vmdpb.PropagateSecretRequest) (*vmdpb.PropagateSecretResponse, error) {
 	if a.proxy == nil {
-		// No proxy on this host; nothing to do. Treat as success so the
-		// control plane sweep doesn't block on hosts that aren't running
-		// secret-backed sandboxes.
 		return &vmdpb.PropagateSecretResponse{}, nil
 	}
 	if req.GetSecretId() == "" {
@@ -190,21 +179,16 @@ func (a *GRPCAdapter) PropagateSecret(ctx context.Context, req *vmdpb.PropagateS
 	return &vmdpb.PropagateSecretResponse{}, nil
 }
 
-// applySecretBindings registers the bindings with the local secrets proxy
-// and returns an env-var map merged with the caller-supplied env_vars
-// plus per-binding entries that point the agent's SDK at the proxy:
-//
-//	<env_key>=<token>
-//	<provider>_BASE_URL=http://<host-veth-ip>:9090/<provider>
-//
-// On no bindings the returned map is the input env (or nil if also empty).
-// On any error the call must abort the boot (caller tears down the VM).
+// applySecretBindings registers the bindings and returns the env map to
+// post to boxd: original env_vars plus, for each binding,
+// <env_key>=<token> and <provider>_BASE_URL=http://<host-veth-ip>:9090/<provider>.
+// Returns an error on any failure; caller must tear the VM down.
 func (a *GRPCAdapter) applySecretBindings(ctx context.Context, inst *VMInstance, teamID string, bindings []*vmdpb.SecretBinding, envIn map[string]string) (map[string]string, error) {
 	if len(bindings) == 0 {
 		return envIn, nil
 	}
 	if a.proxy == nil {
-		return nil, fmt.Errorf("sandbox requires secret bindings but no secrets proxy is configured on this host")
+		return nil, fmt.Errorf("secret bindings present but proxy not configured")
 	}
 
 	netInfo := a.mgr.netMgr.GetVMNetInfo(inst.ID)
@@ -246,9 +230,7 @@ func (a *GRPCAdapter) applySecretBindings(ctx context.Context, inst *VMInstance,
 	return out, nil
 }
 
-// providerBaseURLKey is the env-var name that points an SDK at our
-// proxy. Anthropic and OpenAI both honor a *_BASE_URL env var with the
-// uppercased provider name as a prefix.
+// providerBaseURLKey is the env var each provider's SDK reads.
 func providerBaseURLKey(provider string) string {
 	switch provider {
 	case "anthropic":

@@ -43,7 +43,7 @@ type Firewall struct {
 	vethPeer   string // namespace-side veth (e.g. "eth0")
 	vmIP       string // VM internal IP (169.254.0.21)
 	hostIP     string // host-side IP for this sandbox
-	hostVethIP string // host-side veth IP — let through so sandboxes can reach host services
+	hostVethIP string // host-side veth IP — added to predefinedAllowSet
 	gatewayIP  string // orchestrator IP allowed through firewall
 
 	// TCP proxy ports for domain-based filtering.
@@ -55,7 +55,7 @@ type FirewallConfig struct {
 	VethPeer       string // namespace-side veth name
 	VMIP           string
 	HostIP         string
-	HostVethIP     string // host-side veth IP; populated so sandboxes can reach host-local services through the predefined-allow set.
+	HostVethIP     string // host-side veth IP; added to predefinedAllowSet
 	GatewayIP      string // IP always allowed (orchestrator/gateway)
 }
 
@@ -386,11 +386,9 @@ func (fw *Firewall) ReplaceUserRules(allowedCIDRs, deniedCIDRs []string) error {
 		return fmt.Errorf("populate predefined deny set: %w", err)
 	}
 
-	// 2. Predefined allow set → gateway/orchestrator IP plus the
-	// host-side veth IP. The host-veth address is in 10.12.0.0/16 which
-	// the predefined deny set blocks (it covers all of 10.0.0.0/8); we
-	// punch a per-sandbox hole here so sandboxes can reach host-local
-	// services like the secrets proxy.
+	// 2. Predefined allow set → orchestrator gateway plus the host-side
+	// veth IP. Without the latter, traffic to 10.12.x.y would be killed
+	// by the deny set (it covers 10.0.0.0/8).
 	fw.conn.FlushSet(fw.predefinedAllowSet)
 	allowed := []string{fw.gatewayIP + "/32"}
 	if fw.hostVethIP != "" {

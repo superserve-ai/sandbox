@@ -798,11 +798,9 @@ paths:
     get:
       operationId: getSandboxAudit
       tags: [Sandboxes]
-      summary: List recent secret-proxied calls for a sandbox
+      summary: List recent outbound API calls made via stored secrets
       description: |
-        One row per outbound API call routed through the platform's
-        managed credential injection. Use `before=<id>` to paginate
-        backwards.
+        Returns one row per call. Use `before=<id>` to paginate.
       security:
         - apiKey: []
       parameters:

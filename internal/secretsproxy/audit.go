@@ -10,9 +10,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// auditEvent is one row to be persisted. The proxy hot path enqueues
-// these on a buffered channel so disk/DB latency never blocks request
-// handling.
+// auditEvent is one row to be persisted.
 type auditEvent struct {
 	TeamID         uuid.UUID
 	SandboxID      uuid.UUID
@@ -26,20 +24,15 @@ type auditEvent struct {
 	ErrorCode      *string
 }
 
-// AuditWriter buffers audit events and writes them to the proxy_audit
-// table on a worker goroutine. Drops events on full queue rather than
-// blocking the request path; the dropped count is logged so ops can
-// notice if the queue is undersized.
+// AuditWriter writes audit events to proxy_audit on a worker goroutine.
+// Full queue drops the event rather than blocking the caller.
 type AuditWriter struct {
 	db    *db.Queries
 	queue chan auditEvent
 	done  chan struct{}
 }
 
-const (
-	auditQueueSize = 4096
-	auditFlushOnce = 64 // soft batch — single insert per row in MVP, batching is Phase 2.
-)
+const auditQueueSize = 4096
 
 func NewAuditWriter(queries *db.Queries) *AuditWriter {
 	return &AuditWriter{
@@ -85,8 +78,7 @@ func (a *AuditWriter) write(ctx context.Context, ev auditEvent) {
 	}
 }
 
-// Enqueue tries to push an event onto the queue. Drops if full so the
-// hot path never blocks on DB latency.
+// Enqueue offers an event to the worker. Drops on full queue.
 func (a *AuditWriter) Enqueue(ev auditEvent) {
 	select {
 	case a.queue <- ev:

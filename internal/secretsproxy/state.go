@@ -6,25 +6,19 @@ import (
 	"github.com/superserve-ai/sandbox/internal/secretsproxy/api"
 )
 
-// sandboxState is the in-memory record for one live sandbox.
 type sandboxState struct {
-	SandboxID string
-	TeamID    string
-	SourceIP  string
-	// secretsByID maps secret_id -> binding for fast lookup once a JWT is
-	// validated. The provider field is preserved so the audit log can
-	// record it without an extra lookup.
+	SandboxID   string
+	TeamID      string
+	SourceIP    string
 	secretsByID map[string]api.SecretBinding
 	egress      api.EgressRules
 }
 
-// State is the proxy's authoritative in-memory view of which sandboxes
-// exist on this host and what credentials they're allowed to swap.
-// Populated by vmd over the control socket; never persisted.
+// State is the in-memory view of registered sandboxes. Indexed by both
+// sandbox_id and source IP so register/update and request lookup are
+// O(1). Never persisted.
 type State struct {
-	mu sync.RWMutex
-	// Indexed both ways so the request hot path (source IP -> sandbox)
-	// is O(1) and the control path (sandbox_id -> sandbox) is too.
+	mu        sync.RWMutex
 	bySandbox map[string]*sandboxState
 	bySource  map[string]*sandboxState
 }
@@ -36,16 +30,12 @@ func NewState() *State {
 	}
 }
 
-// Register installs or replaces a sandbox's bindings + egress rules.
-// Idempotent: re-registering the same sandbox overwrites the previous
-// state, which is what we want when vmd is recovering from a proxy
-// restart.
+// Register installs or replaces a sandbox's state. Idempotent.
 func (s *State) Register(req api.RegisterRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If this sandbox already exists with a different SourceIP, clear
-	// the old entry from bySource before inserting the new one.
+	// Reusing a sandbox_id with a new SourceIP — drop the old reverse-map entry.
 	if prev, ok := s.bySandbox[req.SandboxID]; ok && prev.SourceIP != req.SourceIP {
 		delete(s.bySource, prev.SourceIP)
 	}
@@ -108,8 +98,7 @@ func (s *State) UpdateEgress(sandboxID string, egress api.EgressRules) bool {
 }
 
 // PropagateSecret updates the real value for every sandbox that holds a
-// binding for secretID. realValue == "" removes the binding entirely
-// (used on revocation).
+// binding for secretID. realValue == "" removes the binding (revoke).
 func (s *State) PropagateSecret(secretID, realValue string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,9 +116,7 @@ func (s *State) PropagateSecret(secretID, realValue string) {
 	}
 }
 
-// LookupBySourceIP is the request hot-path lookup. Returns a snapshot of
-// the sandbox state suitable for read-only use; the caller does not need
-// to hold any locks.
+// LookupBySourceIP returns a read-only snapshot for the request handler.
 func (s *State) LookupBySourceIP(srcIP string) (Sandbox, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -146,9 +133,9 @@ func (s *State) LookupBySourceIP(srcIP string) (Sandbox, bool) {
 	}, true
 }
 
-// Sandbox is the read-only snapshot returned by LookupBySourceIP. Maps
-// are returned as references but the request handler treats them as
-// read-only; State only ever swaps the whole map under the lock.
+// Sandbox is the read-only snapshot returned by LookupBySourceIP. The
+// caller must not mutate Bindings; State only ever replaces the whole
+// map atomically under the lock.
 type Sandbox struct {
 	SandboxID string
 	TeamID    string

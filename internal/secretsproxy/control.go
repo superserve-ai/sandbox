@@ -10,8 +10,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/secretsproxy/api"
 )
 
-// ControlServer exposes the IPC vmd uses to register/update sandbox state.
-// Mount on a Unix socket — file-mode permissions are the auth boundary.
+// ControlServer serves the control IPC. Mount on a unix socket; file
+// mode is the auth boundary.
 type ControlServer struct {
 	state *State
 }
@@ -20,7 +20,6 @@ func NewControlServer(state *State) *ControlServer {
 	return &ControlServer{state: state}
 }
 
-// Handler returns the http.Handler for the control endpoints.
 func (cs *ControlServer) Handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
