@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,7 +16,156 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/secrets"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
+
+// providerUpstreamHost maps a provider name to the host the proxy will
+// forward to. Used at sandbox-create time to reject configurations that
+// reference a secret whose upstream is blocked by the customer's egress
+// rules — better a 400 now than a 403 mid-flight from inside the VM.
+var providerUpstreamHost = map[string]string{
+	"anthropic": "api.anthropic.com",
+}
+
+// envKeyRE: classic env-var name conventions. Same shape secretNameRE
+// uses but separated so we can evolve them independently.
+var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validateSecretsRefs validates the user-supplied secrets map: env-var
+// keys are well-formed and secret names are well-formed. Doesn't hit the
+// DB; that happens during binding resolution.
+func validateSecretsRefs(refs map[string]string) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	if len(refs) > envVarsMaxKeys {
+		return fmt.Errorf("secrets has %d entries, max is %d", len(refs), envVarsMaxKeys)
+	}
+	for envKey, secretName := range refs {
+		if !envKeyRE.MatchString(envKey) {
+			return fmt.Errorf("secrets key %q is not a valid env-var name", envKey)
+		}
+		if err := validateSecretName(secretName); err != nil {
+			return fmt.Errorf("secrets[%s]: %w", envKey, err)
+		}
+	}
+	return nil
+}
+
+// resolveSecretBindings turns the user-supplied secrets map into the
+// runtime bindings needed by vmd plus the rows that get written to
+// sandbox_secret. Decrypts each value (KMS round-trip) and mints a
+// sandbox-bound token. On any error returns a user-facing message.
+func (h *Handlers) resolveSecretBindings(
+	ctx context.Context,
+	teamID, sandboxID uuid.UUID,
+	refs map[string]string,
+	netCfg *networkConfigRequest,
+) ([]vmdclient.SecretBinding, []db.AddSandboxSecretParams, error) {
+	if len(refs) == 0 {
+		return nil, nil, nil
+	}
+	if h.Encryptor == nil || h.Signer == nil {
+		log.Error().Msg("sandbox references secrets but Encryptor/Signer not configured")
+		return nil, nil, errors.New("server is not configured for secret-backed sandboxes")
+	}
+
+	bindings := make([]vmdclient.SecretBinding, 0, len(refs))
+	rows := make([]db.AddSandboxSecretParams, 0, len(refs))
+
+	for envKey, secretName := range refs {
+		row, err := h.DB.GetSecretByName(ctx, db.GetSecretByNameParams{
+			TeamID: teamID, Name: secretName,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil, fmt.Errorf("secrets[%s]: secret %q not found", envKey, secretName)
+			}
+			log.Error().Err(err).Str("name", secretName).Msg("DB GetSecretByName during sandbox create")
+			return nil, nil, errors.New("internal error resolving secrets")
+		}
+		if err := upstreamAllowedByEgress(row.Provider, netCfg); err != nil {
+			return nil, nil, fmt.Errorf("secrets[%s]: %w", envKey, err)
+		}
+
+		plaintext, err := h.Encryptor.Decrypt(ctx, secrets.Encrypted{
+			Ciphertext:   row.Ciphertext,
+			EncryptedDEK: row.EncryptedDek,
+			KEKID:        row.KekID,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("name", secretName).Msg("KMS decrypt during sandbox create")
+			return nil, nil, errors.New("internal error decrypting secret")
+		}
+
+		token, err := h.Signer.Mint(time.Now(), sandboxID, row.ID, teamID)
+		if err != nil {
+			log.Error().Err(err).Msg("mint proxy token")
+			return nil, nil, errors.New("internal error issuing token")
+		}
+
+		bindings = append(bindings, vmdclient.SecretBinding{
+			SecretID:  row.ID.String(),
+			Provider:  row.Provider,
+			EnvKey:    envKey,
+			RealValue: string(plaintext),
+			Token:     wrapTokenForProvider(row.Provider, token),
+		})
+		rows = append(rows, db.AddSandboxSecretParams{
+			SecretID: row.ID,
+			EnvKey:   envKey,
+		})
+	}
+	return bindings, rows, nil
+}
+
+// upstreamAllowedByEgress checks that a provider's upstream host is
+// reachable under the sandbox's egress rules. Returns an explanatory
+// error suitable for a 400 response.
+func upstreamAllowedByEgress(provider string, netCfg *networkConfigRequest) error {
+	host, ok := providerUpstreamHost[provider]
+	if !ok {
+		// Unknown provider — let it through; the proxy will refuse later
+		// if it can't route. This shouldn't happen for the providers we
+		// allow at create time, but keep the check open in case the set
+		// drifts.
+		return nil
+	}
+	if netCfg == nil {
+		return nil
+	}
+	for _, denied := range netCfg.DenyOut {
+		if strings.EqualFold(denied, host) {
+			return fmt.Errorf("provider %q upstream %s is blocked by deny_out", provider, host)
+		}
+	}
+	if len(netCfg.AllowOut) == 0 {
+		return nil
+	}
+	for _, allowed := range netCfg.AllowOut {
+		if strings.EqualFold(allowed, host) {
+			return nil
+		}
+		if strings.HasPrefix(allowed, "*.") &&
+			strings.HasSuffix(strings.ToLower(host), strings.ToLower(allowed[1:])) {
+			return nil
+		}
+	}
+	return fmt.Errorf("provider %q upstream %s is not in allow_out", provider, host)
+}
+
+// wrapTokenForProvider gives the SDK a key with the right shape so it
+// accepts the env value without complaint. Anthropic only checks the
+// `sk-ant-` prefix — wrapping our JWT keeps the client library happy.
+func wrapTokenForProvider(provider, jwt string) string {
+	switch provider {
+	case "anthropic":
+		return "sk-ant-proxy-" + jwt
+	default:
+		return jwt
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Request / response shapes

@@ -951,9 +951,22 @@ components:
             defaults set by the template's `env` build steps — caller keys
             win on conflict. Survive pause/resume.
           example:
-            OPENAI_API_KEY: sk-...
+            DATABASE_URL: postgres://...
             DEBUG: "1"
             run_id: 7f3c-21
+        secrets:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Bind stored credentials to env-var names. Keys are env-var
+            names the agent will see; values are the names of secrets
+            previously created via `POST /secrets`. The agent receives a
+            short-lived token that authenticates against the upstream
+            provider through the platform; the real credential never
+            enters the sandbox.
+          example:
+            ANTHROPIC_API_KEY: ANTHROPIC_PROD
         network:
           $ref: "#/components/schemas/NetworkConfig"
 

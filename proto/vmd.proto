@@ -258,6 +258,7 @@ message ResumeVMRequest {
   // pushed to a host-local proxy; the agent inside the sandbox sees a
   // signed token wrapped in the provider-native key shape.
   repeated SecretBinding secret_bindings = 6;
+  string team_id = 7;  // Owning team — recorded in proxy state and audit rows.
 }
 
 message ResumeVMResponse {
@@ -300,6 +301,7 @@ message RestoreSnapshotRequest {
   map<string, string> env_vars = 7;
   // Bindings between this sandbox and stored credentials. See SecretBinding.
   repeated SecretBinding secret_bindings = 8;
+  string team_id = 9;  // Owning team — recorded in proxy state and audit rows.
 }
 
 message RestoreSnapshotResponse {

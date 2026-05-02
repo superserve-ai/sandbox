@@ -82,7 +82,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, err
 	}
 
-	envWithSecrets, err := a.applySecretBindings(ctx, inst, "" /* teamID unknown on resume; binding update on rotation carries it */, req.GetSecretBindings(), req.GetEnvVars())
+	envWithSecrets, err := a.applySecretBindings(ctx, inst, req.GetTeamId(), req.GetSecretBindings(), req.GetEnvVars())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "secret bindings: %v", err)
 	}
@@ -141,7 +141,7 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, err
 	}
 
-	envWithSecrets, bindingErr := a.applySecretBindings(ctx, inst, "", req.GetSecretBindings(), req.GetEnvVars())
+	envWithSecrets, bindingErr := a.applySecretBindings(ctx, inst, req.GetTeamId(), req.GetSecretBindings(), req.GetEnvVars())
 	if bindingErr != nil {
 		_ = a.mgr.DestroyVM(ctx, inst.ID, true)
 		return nil, status.Errorf(codes.Internal, "secret bindings: %v", bindingErr)

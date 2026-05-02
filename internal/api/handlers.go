@@ -61,6 +61,9 @@ type Handlers struct {
 	// Encryptor wraps the secret-vault envelope encryption (Cloud KMS). Required
 	// for /secrets endpoints; left nil in unit tests that don't exercise them.
 	Encryptor secrets.Encryptor
+	// Signer mints proxy tokens. Required for sandbox-create paths that
+	// reference stored secrets; left nil in tests that don't.
+	Signer *secrets.Signer
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -288,7 +291,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil)
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil, "")
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
@@ -296,7 +299,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil, "")
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -666,6 +669,12 @@ type createSandboxRequest struct {
 	// they live in boxd's memory for the sandbox's lifetime and survive
 	// pause/resume via snapshot.
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+
+	// Secrets binds stored credentials to env-var names visible inside
+	// the sandbox. Keys are the env-var names the agent will see; values
+	// are names of secrets previously stored via POST /secrets. The
+	// agent receives a short-lived token; the real value is held off-VM.
+	Secrets map[string]string `json:"secrets,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -910,6 +919,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateSecretsRefs(req.Secrets); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Marshal once into the canonical jsonb shape. Empty / nil maps are
 	// stored as the empty object so the column is never NULL.
 	metadataJSON, err := json.Marshal(req.Metadata)
@@ -1004,6 +1017,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// VMD's ~100-200ms create latency, shaving that much off the p50.
 	sandboxID := uuid.New()
 
+	// Resolve secret bindings up front so we can fail fast on missing
+	// secrets or egress conflicts (before any infra work). KMS decrypt
+	// and JWT mint happen here; real values stay in this goroutine until
+	// they're sent to vmd.
+	secretBindings, sandboxSecretRows, err := h.resolveSecretBindings(c.Request.Context(), teamID, sandboxID, req.Secrets, req.Network)
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	insertCtx := context.WithoutCancel(c.Request.Context())
 	type insertResult struct {
 		sandbox db.Sandbox
@@ -1046,11 +1069,25 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TemplateID:     pgtype.UUID{Valid: false},
 		})
 	}
+	// addSandboxSecretRows persists the sandbox-secret join rows in the
+	// same tx as the sandbox row, so a failed create leaves no orphans.
+	addSandboxSecretRows := func(q *db.Queries) error {
+		for _, r := range sandboxSecretRows {
+			r.SandboxID = sandboxID
+			if err := q.AddSandboxSecret(insertCtx, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	go func() {
 		// Test path: when no Pool is wired (unit tests with a mock DBTX),
 		// skip the count check and just do the INSERT.
 		if h.Pool == nil {
 			sb, err := runInsert(h.DB)
+			if err == nil {
+				err = addSandboxSecretRows(h.DB)
+			}
 			insertCh <- insertResult{sandbox: sb, err: err}
 			return
 		}
@@ -1094,6 +1131,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 		sb, insertErr := runInsert(q)
 		if insertErr == nil {
+			insertErr = addSandboxSecretRows(q)
+		}
+		if insertErr == nil {
 			insertErr = tx.Commit(insertCtx)
 		}
 		insertCh <- insertResult{sandbox: sb, err: insertErr}
@@ -1113,7 +1153,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and boots a new VM from them statelessly. Caller env vars are merged
 	// on top of the template's baked defaults by vmd (boxd resumes with
 	// template context, then the restore RPC posts these on top).
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars, nil)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars, secretBindings, teamID.String())
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).

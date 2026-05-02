@@ -1383,6 +1383,7 @@ type ResumeVMRequest struct {
 	// pushed to a host-local proxy; the agent inside the sandbox sees a
 	// signed token wrapped in the provider-native key shape.
 	SecretBindings []*SecretBinding `protobuf:"bytes,6,rep,name=secret_bindings,json=secretBindings,proto3" json:"secret_bindings,omitempty"`
+	TeamId         string           `protobuf:"bytes,7,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"` // Owning team — recorded in proxy state and audit rows.
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1457,6 +1458,13 @@ func (x *ResumeVMRequest) GetSecretBindings() []*SecretBinding {
 		return x.SecretBindings
 	}
 	return nil
+}
+
+func (x *ResumeVMRequest) GetTeamId() string {
+	if x != nil {
+		return x.TeamId
+	}
+	return ""
 }
 
 type ResumeVMResponse struct {
@@ -1668,6 +1676,7 @@ type RestoreSnapshotRequest struct {
 	EnvVars map[string]string `protobuf:"bytes,7,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Bindings between this sandbox and stored credentials. See SecretBinding.
 	SecretBindings []*SecretBinding `protobuf:"bytes,8,rep,name=secret_bindings,json=secretBindings,proto3" json:"secret_bindings,omitempty"`
+	TeamId         string           `protobuf:"bytes,9,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"` // Owning team — recorded in proxy state and audit rows.
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1756,6 +1765,13 @@ func (x *RestoreSnapshotRequest) GetSecretBindings() []*SecretBinding {
 		return x.SecretBindings
 	}
 	return nil
+}
+
+func (x *RestoreSnapshotRequest) GetTeamId() string {
+	if x != nil {
+		return x.TeamId
+	}
+	return ""
 }
 
 type RestoreSnapshotResponse struct {
@@ -2662,14 +2678,15 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0fPauseVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
-	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\"\x94\x03\n" +
+	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\"\xad\x03\n" +
 	"\x0fResumeVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12P\n" +
 	"\x0fsandbox_network\x18\x04 \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x12J\n" +
 	"\benv_vars\x18\x05 \x03(\v2/.superserve.vmd.v1.ResumeVMRequest.EnvVarsEntryR\aenvVars\x12I\n" +
-	"\x0fsecret_bindings\x18\x06 \x03(\v2 .superserve.vmd.v1.SecretBindingR\x0esecretBindings\x1a:\n" +
+	"\x0fsecret_bindings\x18\x06 \x03(\v2 .superserve.vmd.v1.SecretBindingR\x0esecretBindings\x12\x17\n" +
+	"\ateam_id\x18\a \x01(\tR\x06teamId\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc5\x01\n" +
@@ -2688,7 +2705,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\x88\x04\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xa1\x04\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -2697,7 +2714,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12G\n" +
 	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12Q\n" +
 	"\benv_vars\x18\a \x03(\v26.superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntryR\aenvVars\x12I\n" +
-	"\x0fsecret_bindings\x18\b \x03(\v2 .superserve.vmd.v1.SecretBindingR\x0esecretBindings\x1a:\n" +
+	"\x0fsecret_bindings\x18\b \x03(\v2 .superserve.vmd.v1.SecretBindingR\x0esecretBindings\x12\x17\n" +
+	"\ateam_id\x18\t \x01(\tR\x06teamId\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcc\x01\n" +
