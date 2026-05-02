@@ -2,21 +2,38 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/secretsproxy/api"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
+
+// SecretsProxyClient is the subset of internal/secretsproxy/client.Client
+// used by the gRPC adapter. Defined here so the adapter can take an
+// interface without a circular import.
+type SecretsProxyClient interface {
+	Register(ctx context.Context, req api.RegisterRequest) error
+	Unregister(ctx context.Context, sandboxID string) error
+	UpdateBindings(ctx context.Context, sandboxID string, req api.UpdateBindingsRequest) error
+	UpdateEgress(ctx context.Context, sandboxID string, req api.UpdateEgressRequest) error
+}
 
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
 type GRPCAdapter struct {
 	vmdpb.UnimplementedVMDaemonServer
 	mgr *Manager
+	// proxy is optional. When nil, secret bindings on incoming requests
+	// fail loudly — vmd should not silently boot a sandbox whose agent
+	// expects a working credential swap.
+	proxy SecretsProxyClient
 }
 
 // NewGRPCAdapter creates a new adapter that bridges the proto interface to the Manager.
@@ -24,10 +41,22 @@ func NewGRPCAdapter(mgr *Manager) *GRPCAdapter {
 	return &GRPCAdapter{mgr: mgr}
 }
 
+// WithSecretsProxy attaches a secrets-proxy client. Must be called before
+// the gRPC server starts serving requests.
+func (a *GRPCAdapter) WithSecretsProxy(c SecretsProxyClient) *GRPCAdapter {
+	a.proxy = c
+	return a
+}
+
 func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest) (*vmdpb.DestroyVMResponse, error) {
 	err := a.mgr.DestroyVM(ctx, req.GetVmId(), req.GetForce())
 	if err != nil {
 		return nil, err
+	}
+	if a.proxy != nil {
+		if uerr := a.proxy.Unregister(ctx, req.GetVmId()); uerr != nil {
+			log.Warn().Err(uerr).Str("vm_id", req.GetVmId()).Msg("secrets proxy unregister failed")
+		}
 	}
 	return &vmdpb.DestroyVMResponse{
 		VmId:      req.GetVmId(),
@@ -53,7 +82,12 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, err
 	}
 
-	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); err != nil {
+	envWithSecrets, err := a.applySecretBindings(ctx, inst, "" /* teamID unknown on resume; binding update on rotation carries it */, req.GetSecretBindings(), req.GetEnvVars())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "secret bindings: %v", err)
+	}
+
+	if err := postBoxdInit(ctx, inst.IP, envWithSecrets, vmHostname(inst.ID)); err != nil {
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
@@ -107,8 +141,14 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, err
 	}
 
+	envWithSecrets, bindingErr := a.applySecretBindings(ctx, inst, "", req.GetSecretBindings(), req.GetEnvVars())
+	if bindingErr != nil {
+		_ = a.mgr.DestroyVM(ctx, inst.ID, true)
+		return nil, status.Errorf(codes.Internal, "secret bindings: %v", bindingErr)
+	}
+
 	// Apply caller env vars and the per-sandbox hostname.
-	if initErr := postBoxdInit(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); initErr != nil {
+	if initErr := postBoxdInit(ctx, inst.IP, envWithSecrets, vmHostname(inst.ID)); initErr != nil {
 		// Tear the VM down — a sandbox whose env vars weren't applied
 		// would silently serve stale/missing secrets to the user.
 		_ = a.mgr.DestroyVM(ctx, inst.ID, true)
@@ -125,6 +165,78 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			MemoryMib: inst.Config.MemoryMiB,
 		},
 	}, nil
+}
+
+// applySecretBindings registers the bindings with the local secrets proxy
+// and returns an env-var map merged with the caller-supplied env_vars
+// plus per-binding entries that point the agent's SDK at the proxy:
+//
+//	<env_key>=<token>
+//	<provider>_BASE_URL=http://<host-veth-ip>:9090/<provider>
+//
+// On no bindings the returned map is the input env (or nil if also empty).
+// On any error the call must abort the boot (caller tears down the VM).
+func (a *GRPCAdapter) applySecretBindings(ctx context.Context, inst *VMInstance, teamID string, bindings []*vmdpb.SecretBinding, envIn map[string]string) (map[string]string, error) {
+	if len(bindings) == 0 {
+		return envIn, nil
+	}
+	if a.proxy == nil {
+		return nil, fmt.Errorf("sandbox requires secret bindings but no secrets proxy is configured on this host")
+	}
+
+	netInfo := a.mgr.netMgr.GetVMNetInfo(inst.ID)
+	if netInfo == nil {
+		return nil, fmt.Errorf("network info missing for vm %s", inst.ID)
+	}
+	if netInfo.HostIP == "" || netInfo.HostVethIP == "" {
+		return nil, fmt.Errorf("network info incomplete for vm %s (HostIP=%q, HostVethIP=%q)", inst.ID, netInfo.HostIP, netInfo.HostVethIP)
+	}
+
+	apiBindings := make([]api.SecretBinding, 0, len(bindings))
+	for _, b := range bindings {
+		apiBindings = append(apiBindings, api.SecretBinding{
+			SecretID:  b.GetSecretId(),
+			Provider:  b.GetProvider(),
+			EnvKey:    b.GetEnvKey(),
+			RealValue: b.GetRealValue(),
+		})
+	}
+
+	if err := a.proxy.Register(ctx, api.RegisterRequest{
+		SandboxID: inst.ID,
+		TeamID:    teamID,
+		SourceIP:  netInfo.HostIP,
+		Bindings:  apiBindings,
+	}); err != nil {
+		return nil, fmt.Errorf("register with secrets proxy: %w", err)
+	}
+
+	out := make(map[string]string, len(envIn)+len(bindings)*2)
+	for k, v := range envIn {
+		out[k] = v
+	}
+	for _, b := range bindings {
+		out[b.GetEnvKey()] = b.GetToken()
+		out[providerBaseURLKey(b.GetProvider())] = fmt.Sprintf("http://%s:9090/%s", netInfo.HostVethIP, b.GetProvider())
+	}
+	log.Debug().Str("vm_id", inst.ID).Int("bindings", len(bindings)).Msg("registered secret bindings")
+	return out, nil
+}
+
+// providerBaseURLKey is the env-var name that points an SDK at our
+// proxy. Anthropic and OpenAI both honor a *_BASE_URL env var with the
+// uppercased provider name as a prefix.
+func providerBaseURLKey(provider string) string {
+	switch provider {
+	case "anthropic":
+		return "ANTHROPIC_BASE_URL"
+	case "openai":
+		return "OPENAI_BASE_URL"
+	case "google":
+		return "GOOGLE_API_BASE"
+	default:
+		return "BASE_URL_" + provider
+	}
 }
 
 // DeleteSnapshot unlinks the vmstate + memory files for a previous snapshot.

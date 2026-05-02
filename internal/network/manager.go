@@ -54,13 +54,14 @@ type Config struct {
 
 // VMNetInfo holds the network resources for a single VM.
 type VMNetInfo struct {
-	Namespace  string    // Network namespace name.
-	TAPDevice  string    // TAP device inside namespace (always "tap0").
-	VMIP       string    // VM's internal IP (always VMInternalIP).
-	GatewayIP  string    // Gateway inside namespace (always VMGatewayIP).
-	HostIP     string    // Host-side IP to reach this VM.
-	MACAddress string
-	Firewall   *Firewall // nftables firewall for this VM (inside namespace).
+	Namespace   string    // Network namespace name.
+	TAPDevice   string    // TAP device inside namespace (always "tap0").
+	VMIP        string    // VM's internal IP (always VMInternalIP).
+	GatewayIP   string    // Gateway inside namespace (always VMGatewayIP).
+	HostIP      string    // Host-side IP to reach this VM (post-SNAT source IP).
+	HostVethIP  string    // Host-side veth IP — the namespace's default gateway and the address sandboxes use to reach host services.
+	MACAddress  string
+	Firewall    *Firewall // nftables firewall for this VM (inside namespace).
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +326,7 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 			VethPeer:       vpeerName,
 			VMIP:           VMInternalIP,
 			HostIP:         hostIP,
+			HostVethIP:     vethIP,
 			GatewayIP:      VMGatewayIP,
 		})
 		return fwErr
@@ -345,6 +347,7 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		VMIP:       VMInternalIP,
 		GatewayIP:  VMGatewayIP,
 		HostIP:     hostIP,
+		HostVethIP: vethIP,
 		MACAddress: mac,
 		Firewall:   fw,
 	}

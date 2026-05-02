@@ -20,6 +20,7 @@ import (
 
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
+	secretsproxyclient "github.com/superserve-ai/sandbox/internal/secretsproxy/client"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -51,6 +52,11 @@ type Config struct {
 	// the heartbeat goroutine to POST liveness. Optional — if unset,
 	// heartbeat is disabled.
 	ControlPlaneURL string
+
+	// SecretsProxySocket is the unix-socket path of the local secrets
+	// proxy. When unset, sandboxes that reference stored secrets fail at
+	// boot.
+	SecretsProxySocket string
 }
 
 func loadConfig() (Config, error) {
@@ -70,9 +76,10 @@ func loadConfig() (Config, error) {
 		HostInterface:      envOrDefault("HOST_INTERFACE", "eth0"),
 		TemplateBuilderBin: envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
 		BoxdBinaryPath:     envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
-		HostID:          envOrDefault("HOST_ID", "default"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
+		HostID:             envOrDefault("HOST_ID", "default"),
+		DatabaseURL:        os.Getenv("DATABASE_URL"),
+		ControlPlaneURL:    os.Getenv("CONTROL_PLANE_URL"),
+		SecretsProxySocket: os.Getenv("SECRETSPROXY_SOCKET"),
 	}
 
 	if cfg.KernelPath == "" {
@@ -384,7 +391,12 @@ func main() {
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(64 << 20), // 64 MiB
 	)
-	vmdpb.RegisterVMDaemonServer(grpcServer, vm.NewGRPCAdapter(mgr))
+	adapter := vm.NewGRPCAdapter(mgr)
+	if cfg.SecretsProxySocket != "" {
+		adapter = adapter.WithSecretsProxy(secretsproxyclient.New(cfg.SecretsProxySocket))
+		log.Info().Str("socket", cfg.SecretsProxySocket).Msg("secrets proxy IPC enabled")
+	}
+	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
 	lc.start("grpc server", func() error {
 		log.Info().Int("port", cfg.GRPCPort).Msg("gRPC server listening")
 		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {

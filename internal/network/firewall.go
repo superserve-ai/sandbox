@@ -43,6 +43,7 @@ type Firewall struct {
 	vethPeer   string // namespace-side veth (e.g. "eth0")
 	vmIP       string // VM internal IP (169.254.0.21)
 	hostIP     string // host-side IP for this sandbox
+	hostVethIP string // host-side veth IP — let through so sandboxes can reach host services
 	gatewayIP  string // orchestrator IP allowed through firewall
 
 	// TCP proxy ports for domain-based filtering.
@@ -54,6 +55,7 @@ type FirewallConfig struct {
 	VethPeer       string // namespace-side veth name
 	VMIP           string
 	HostIP         string
+	HostVethIP     string // host-side veth IP; populated so sandboxes can reach host-local services through the predefined-allow set.
 	GatewayIP      string // IP always allowed (orchestrator/gateway)
 }
 
@@ -176,6 +178,7 @@ func NewFirewall(cfg FirewallConfig) (*Firewall, error) {
 		vethPeer:           cfg.VethPeer,
 		vmIP:               cfg.VMIP,
 		hostIP:             cfg.HostIP,
+		hostVethIP:         cfg.HostVethIP,
 		gatewayIP:          cfg.GatewayIP,
 	}
 
@@ -383,11 +386,19 @@ func (fw *Firewall) ReplaceUserRules(allowedCIDRs, deniedCIDRs []string) error {
 		return fmt.Errorf("populate predefined deny set: %w", err)
 	}
 
-	// 2. Predefined allow set → gateway/orchestrator IP.
+	// 2. Predefined allow set → gateway/orchestrator IP plus the
+	// host-side veth IP. The host-veth address is in 10.12.0.0/16 which
+	// the predefined deny set blocks (it covers all of 10.0.0.0/8); we
+	// punch a per-sandbox hole here so sandboxes can reach host-local
+	// services like the secrets proxy.
 	fw.conn.FlushSet(fw.predefinedAllowSet)
-	allowElems, err := cidrsToElements([]string{fw.gatewayIP + "/32"})
+	allowed := []string{fw.gatewayIP + "/32"}
+	if fw.hostVethIP != "" {
+		allowed = append(allowed, fw.hostVethIP+"/32")
+	}
+	allowElems, err := cidrsToElements(allowed)
 	if err != nil {
-		return fmt.Errorf("parse gateway CIDR: %w", err)
+		return fmt.Errorf("parse predefined allow CIDRs: %w", err)
 	}
 	if err := fw.conn.SetAddElements(fw.predefinedAllowSet, allowElems); err != nil {
 		return fmt.Errorf("populate predefined allow set: %w", err)
