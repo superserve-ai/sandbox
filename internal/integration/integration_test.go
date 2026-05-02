@@ -166,10 +166,10 @@ func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { r
 func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ map[string]string, _ []vmdclient.SecretBinding, _ string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _ string, _ map[string]string, _ []vmdclient.SecretBinding, _ string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
@@ -196,6 +196,7 @@ func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
 	return nil
 }
+func (s *stubVMD) PropagateSecret(_ context.Context, _, _ string) error { return nil }
 
 // seedTeamAndKey inserts a team + API key and returns (teamID, rawKey).
 func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
