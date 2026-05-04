@@ -34,6 +34,7 @@ const (
 	VMDaemon_GetBuildStatus_FullMethodName          = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
 	VMDaemon_CancelBuild_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CancelBuild"
 	VMDaemon_StreamBuildLogs_FullMethodName         = "/superserve.vmd.v1.VMDaemon/StreamBuildLogs"
+	VMDaemon_PropagateSecret_FullMethodName         = "/superserve.vmd.v1.VMDaemon/PropagateSecret"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -84,6 +85,9 @@ type VMDaemonClient interface {
 	// events as they arrive. Closes when the build reaches a terminal
 	// status. Used by the control plane to drive /builds/:id/logs SSE.
 	StreamBuildLogs(ctx context.Context, in *StreamBuildLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BuildLogEvent], error)
+	// PropagateSecret applies a new value (or empty=revoke) for one
+	// secret to every sandbox on this host that uses it.
+	PropagateSecret(ctx context.Context, in *PropagateSecretRequest, opts ...grpc.CallOption) (*PropagateSecretResponse, error)
 }
 
 type vMDaemonClient struct {
@@ -262,6 +266,16 @@ func (c *vMDaemonClient) StreamBuildLogs(ctx context.Context, in *StreamBuildLog
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VMDaemon_StreamBuildLogsClient = grpc.ServerStreamingClient[BuildLogEvent]
 
+func (c *vMDaemonClient) PropagateSecret(ctx context.Context, in *PropagateSecretRequest, opts ...grpc.CallOption) (*PropagateSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PropagateSecretResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_PropagateSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VMDaemonServer is the server API for VMDaemon service.
 // All implementations must embed UnimplementedVMDaemonServer
 // for forward compatibility.
@@ -310,6 +324,9 @@ type VMDaemonServer interface {
 	// events as they arrive. Closes when the build reaches a terminal
 	// status. Used by the control plane to drive /builds/:id/logs SSE.
 	StreamBuildLogs(*StreamBuildLogsRequest, grpc.ServerStreamingServer[BuildLogEvent]) error
+	// PropagateSecret applies a new value (or empty=revoke) for one
+	// secret to every sandbox on this host that uses it.
+	PropagateSecret(context.Context, *PropagateSecretRequest) (*PropagateSecretResponse, error)
 	mustEmbedUnimplementedVMDaemonServer()
 }
 
@@ -364,6 +381,9 @@ func (UnimplementedVMDaemonServer) CancelBuild(context.Context, *CancelBuildRequ
 }
 func (UnimplementedVMDaemonServer) StreamBuildLogs(*StreamBuildLogsRequest, grpc.ServerStreamingServer[BuildLogEvent]) error {
 	return status.Error(codes.Unimplemented, "method StreamBuildLogs not implemented")
+}
+func (UnimplementedVMDaemonServer) PropagateSecret(context.Context, *PropagateSecretRequest) (*PropagateSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PropagateSecret not implemented")
 }
 func (UnimplementedVMDaemonServer) mustEmbedUnimplementedVMDaemonServer() {}
 func (UnimplementedVMDaemonServer) testEmbeddedByValue()                  {}
@@ -642,6 +662,24 @@ func _VMDaemon_StreamBuildLogs_Handler(srv interface{}, stream grpc.ServerStream
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VMDaemon_StreamBuildLogsServer = grpc.ServerStreamingServer[BuildLogEvent]
 
+func _VMDaemon_PropagateSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PropagateSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).PropagateSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_PropagateSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).PropagateSecret(ctx, req.(*PropagateSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VMDaemon_ServiceDesc is the grpc.ServiceDesc for VMDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -700,6 +738,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CancelBuild",
 			Handler:    _VMDaemon_CancelBuild_Handler,
+		},
+		{
+			MethodName: "PropagateSecret",
+			Handler:    _VMDaemon_PropagateSecret_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

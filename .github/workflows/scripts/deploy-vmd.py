@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Deploy the vmd, boxd, and template-builder binaries to every compute
-instance tagged with the configured label, in parallel.
+"""Deploy the vmd, boxd, template-builder, and secretsproxy binaries to
+every compute instance tagged with the configured label, in parallel.
 
 Env vars:
   GCP_PROJECT          required — project containing vmd hosts
@@ -69,8 +69,10 @@ def main() -> int:
         scp("bin/vmd", f"/tmp/vmd-{sha}")
         scp("bin/boxd", f"/tmp/boxd-{sha}")
         scp("bin/template-builder", f"/tmp/template-builder-{sha}")
+        scp("bin/secretsproxy", f"/tmp/secretsproxy-{sha}")
 
         scp("deploy/superserve-vmd.service", "/tmp/superserve-vmd.service")
+        scp("deploy/superserve-secretsproxy.service", "/tmp/superserve-secretsproxy.service")
         scp("deploy/firecracker@.service", "/tmp/firecracker@.service")
         scp("deploy/firecracker-netns@.service", "/tmp/firecracker-netns@.service")
         scp("deploy/sandboxes.slice", "/tmp/sandboxes.slice")
@@ -80,14 +82,17 @@ def main() -> int:
         inject_script = textwrap.dedent(f"""
             set -euo pipefail
 
-            # Install vmd + template-builder binaries.
+            # Install vmd + template-builder + secretsproxy binaries.
             sudo mv /tmp/vmd-{sha} {install_dir}/vmd
             sudo chmod +x {install_dir}/vmd
             sudo mv /tmp/template-builder-{sha} {install_dir}/template-builder
             sudo chmod +x {install_dir}/template-builder
+            sudo mv /tmp/secretsproxy-{sha} {install_dir}/secretsproxy
+            sudo chmod +x {install_dir}/secretsproxy
 
             # Install systemd units.
             sudo mv /tmp/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
+            sudo mv /tmp/superserve-secretsproxy.service /etc/systemd/system/superserve-secretsproxy.service
             sudo mv /tmp/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo mv /tmp/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo mv /tmp/sandboxes.slice /etc/systemd/system/sandboxes.slice
@@ -140,6 +145,26 @@ def main() -> int:
             else
                 echo "boxd unchanged ($CUR_HASH) — skipping install + rootfs rebuild"
                 rm -f /tmp/boxd-{sha}
+            fi
+
+            # Restart the secrets proxy first so its unix socket is up
+            # before vmd reconnects. The unit is enabled here on first
+            # install; subsequent runs are no-ops. When the proxy env file
+            # is missing the unit fails-to-start; treat that as opt-out
+            # rather than a deploy failure (vmd works without it).
+            sudo systemctl enable superserve-secretsproxy >/dev/null 2>&1 || true
+            if [ -f /etc/sandbox/secretsproxy.env ]; then
+                sudo systemctl restart superserve-secretsproxy
+                sleep 2
+                sudo systemctl is-active --quiet superserve-secretsproxy || (
+                    echo "ERROR: superserve-secretsproxy failed to become active after restart" >&2
+                    sudo systemctl status --no-pager superserve-secretsproxy >&2 || true
+                    sudo journalctl -u superserve-secretsproxy --no-pager -n 40 >&2 || true
+                    exit 1
+                )
+                echo "secretsproxy active"
+            else
+                echo "secretsproxy env file missing — leaving unit stopped (sandboxes that reference secrets will fail at boot)"
             fi
 
             sudo systemctl restart {service}

@@ -134,7 +134,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/SandboxResponse"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: |
+            Invalid request. `error.code` cases include:
+            - `bad_request` — generic validation failure.
+            - `secret_not_found` — `secrets[<env>]` references a name that
+              does not exist for this team.
+            - `secret_blocked_by_egress` — the referenced secret's upstream
+              host is not allowed by the sandbox's `network.allow_out` /
+              `network.deny_out`. Add it to `allow_out` or remove the
+              secret reference.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
@@ -659,6 +671,185 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /secrets:
+    get:
+      operationId: listSecrets
+      tags: [Secrets]
+      summary: List your team's secrets
+      description: |
+        Returns metadata for every secret stored at the team level. Values
+        are never returned by any endpoint after creation.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: List of secrets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SecretResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: createSecret
+      tags: [Secrets]
+      summary: Store a secret
+      description: |
+        Stores a secret at the team level. The value is encrypted at rest
+        and never returned again — keep your own copy if you may need it
+        later. Names must be unique per team; the same name can be reused
+        after deletion.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSecretRequest"
+      responses:
+        "201":
+          description: Secret created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: A secret with that name already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /secrets/{name}:
+    parameters:
+      - $ref: "#/components/parameters/SecretName"
+    get:
+      operationId: getSecret
+      tags: [Secrets]
+      summary: Get a secret's metadata
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Secret metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      operationId: rotateSecret
+      tags: [Secrets]
+      summary: Rotate a secret's value
+      description: |
+        Replaces the stored value. Sandboxes already running with this
+        secret pick up the new value automatically; no per-sandbox action
+        is required.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSecretRequest"
+      responses:
+        "200":
+          description: Secret rotated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteSecret
+      tags: [Secrets]
+      summary: Delete a secret
+      description: |
+        Removes the secret. Sandboxes referencing it stop being able to
+        use it shortly after; in-flight calls already in transit may
+        succeed.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Secret deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/audit:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    get:
+      operationId: getSandboxAudit
+      tags: [Sandboxes]
+      summary: List recent outbound API calls made via stored secrets
+      description: |
+        Returns one row per call. Use `before=<id>` to paginate.
+      security:
+        - apiKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: before
+          in: query
+          required: false
+          description: Return rows with id < this value, newest first.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: Audit rows, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProxyAuditEntry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 components:
   securitySchemes:
     apiKey:
@@ -693,6 +884,14 @@ components:
         type: string
         format: uuid
       description: The unique identifier of the template build.
+
+    SecretName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Secret name (e.g. `ANTHROPIC_PROD`).
 
   schemas:
     CreateSandboxRequest:
@@ -762,9 +961,22 @@ components:
             defaults set by the template's `env` build steps — caller keys
             win on conflict. Survive pause/resume.
           example:
-            OPENAI_API_KEY: sk-...
+            DATABASE_URL: postgres://...
             DEBUG: "1"
             run_id: 7f3c-21
+        secrets:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Bind stored credentials to env-var names. Keys are env-var
+            names the agent will see; values are the names of secrets
+            previously created via `POST /secrets`. The agent receives a
+            short-lived token that authenticates against the upstream
+            provider through the platform; the real credential never
+            enters the sandbox.
+          example:
+            ANTHROPIC_API_KEY: ANTHROPIC_PROD
         network:
           $ref: "#/components/schemas/NetworkConfig"
 
@@ -1203,6 +1415,97 @@ components:
           enum: [ready, failed, cancelled]
           description: Terminal status, present on the final event.
 
+    CreateSecretRequest:
+      type: object
+      required: [name, provider, value]
+      properties:
+        name:
+          type: string
+          maxLength: 128
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]*$"
+          description: |
+            Identifier you'll reference from sandbox configs. Letters,
+            digits, `_`, and `-`; must start with a letter or underscore.
+          example: ANTHROPIC_PROD
+        provider:
+          type: string
+          enum: [anthropic]
+          description: Upstream this credential authenticates against.
+        value:
+          type: string
+          maxLength: 8192
+          description: |
+            The credential. Encrypted at rest and never returned by any
+            endpoint after this call.
+
+    UpdateSecretRequest:
+      type: object
+      required: [value]
+      properties:
+        value:
+          type: string
+          maxLength: 8192
+          description: The new credential.
+
+    SecretResponse:
+      type: object
+      description: Metadata about a stored secret. Never includes the value.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        provider:
+          type: string
+          enum: [anthropic]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          description: Most recent use, if any.
+
+    ProxyAuditEntry:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Use this as `before=<id>` to paginate.
+        ts:
+          type: string
+          format: date-time
+        sandbox_id:
+          type: string
+          format: uuid
+        secret_id:
+          type: string
+          format: uuid
+        provider:
+          type: string
+        method:
+          type: string
+        path:
+          type: string
+        status:
+          type: integer
+          description: HTTP status returned to the sandbox.
+        upstream_status:
+          type: integer
+          description: HTTP status from the upstream provider, if reached.
+        latency_ms:
+          type: integer
+        error_code:
+          type: string
+          description: |
+            Stable code for non-2xx outcomes
+            (e.g. `egress_blocked`, `jwt_expired`, `secret_revoked`).
+
     Error:
       type: object
       description: |
@@ -1210,7 +1513,8 @@ components:
         (e.g. `bad_request`, `not_found`, `conflict`, `rate_limited`,
         `too_many_builds`, `too_many_templates`, `too_many_sandboxes`,
         `image_pull_failed`, `step_failed`, `snapshot_failed`,
-        `start_cmd_failed`, `ready_cmd_failed`, `build_failed`).
+        `start_cmd_failed`, `ready_cmd_failed`, `build_failed`,
+        `secret_not_found`, `secret_blocked_by_egress`).
         `error.message` is human-readable and may change between releases;
         clients should branch on `code`, not `message`.
       properties:

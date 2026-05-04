@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -36,6 +38,17 @@ type Config struct {
 	// "no system team configured" and users see only their own templates.
 	// Must be a valid UUID matching an existing team row.
 	SystemTeamID string
+
+	// KMSKeyResource: full Cloud KMS key name. Empty disables /secrets.
+	// Format: projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>.
+	KMSKeyResource string
+
+	// SecretsProxyJWTKey: HMAC signing key. Raw bytes or "base64:<...>".
+	SecretsProxyJWTKey      string
+	SecretsProxyJWTKid      string
+	SecretsProxyJWTIssuer   string
+	SecretsProxyJWTAudience string
+	SecretsProxyJWTTTL      time.Duration
 }
 
 // Load reads configuration from environment variables.
@@ -54,15 +67,35 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Port:                   envOrDefault("API_PORT", "8080"),
-		VMDAddress:             envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
-		DatabaseURL:            dbURL,
-		SandboxAccessTokenSeed: seed,
-		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
-		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
-		SystemTeamID:           os.Getenv("SYSTEM_TEAM_ID"),
+		Port:                    envOrDefault("API_PORT", "8080"),
+		VMDAddress:              envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
+		DatabaseURL:             dbURL,
+		SandboxAccessTokenSeed:  seed,
+		EdgeProxyDomain:         envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
+		DefaultHostID:           envOrDefault("DEFAULT_HOST_ID", "default"),
+		SystemTeamID:            os.Getenv("SYSTEM_TEAM_ID"),
+		KMSKeyResource:          os.Getenv("KMS_KEY_RESOURCE"),
+		SecretsProxyJWTKey:      os.Getenv("SECRETSPROXY_JWT_KEY"),
+		SecretsProxyJWTKid:      envOrDefault("SECRETSPROXY_JWT_KID", "v1"),
+		SecretsProxyJWTIssuer:   envOrDefault("SECRETSPROXY_JWT_ISSUER", "superserve-control-plane"),
+		SecretsProxyJWTAudience: envOrDefault("SECRETSPROXY_JWT_AUDIENCE", "secretsproxy"),
+		SecretsProxyJWTTTL:      parseDurationOrDefault("SECRETSPROXY_JWT_TTL", time.Hour),
 	}
 	return cfg, nil
+}
+
+func parseDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second
+	}
+	return fallback
 }
 
 func loadSeed(envValue string, allowEphemeral bool) ([]byte, error) {

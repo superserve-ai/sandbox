@@ -5,17 +5,27 @@ package vmdclient
 
 import "context"
 
+// SecretBinding mirrors vmdpb.SecretBinding so callers don't import
+// the proto package directly.
+type SecretBinding struct {
+	SecretID  string
+	Provider  string
+	EnvKey    string
+	RealValue string
+	Token     string
+}
+
 // Client defines the subset of the VM daemon gRPC interface used by the
 // control plane. Implementations: grpcVMDClient in cmd/controlplane,
 // stubVMD in tests.
 type Client interface {
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string, bindings []SecretBinding, teamID string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk).
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string, bindings []SecretBinding, teamID string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// DeleteSnapshot removes the on-disk vmstate + memory files for a
 	// previous snapshot. Idempotent: missing files return nil. Used by the
 	// control plane to garbage-collect the previous snapshot after a new
@@ -49,6 +59,9 @@ type Client interface {
 	// ctx is cancelled. Returns nil on clean close, an error on transport
 	// failure or gRPC NotFound (which callers surface as SSE 404).
 	StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(BuildLogEvent) error) error
+
+	// PropagateSecret pushes a new value (empty=revoke) for one secret.
+	PropagateSecret(ctx context.Context, secretID, realValue string) error
 }
 
 // BuildTemplateInput mirrors vmdpb.BuildTemplateRequest at the client layer

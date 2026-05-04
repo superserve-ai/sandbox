@@ -3,14 +3,17 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	kms "cloud.google.com/go/kms/apiv1"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -24,10 +27,19 @@ import (
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/supervisor"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
+
+// decodeKeyMaterial accepts a raw string or a "base64:..." blob.
+func decodeKeyMaterial(v string) ([]byte, error) {
+	if strings.HasPrefix(v, "base64:") {
+		return base64.StdEncoding.DecodeString(strings.TrimPrefix(v, "base64:"))
+	}
+	return []byte(v), nil
+}
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -78,6 +90,30 @@ func run() error {
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
+
+	// Optional wiring: both envelope encryption and proxy-token signing
+	// are off when the corresponding env var is unset. Other endpoints
+	// remain unaffected.
+	if cfg.KMSKeyResource != "" {
+		kmsClient, kerr := kms.NewKeyManagementClient(ctx)
+		if kerr != nil {
+			log.Warn().Err(kerr).Msg("KMS init failed")
+		} else {
+			handlers.Encryptor = secrets.NewKMSEncryptor(kmsClient, cfg.KMSKeyResource)
+		}
+	}
+	if cfg.SecretsProxyJWTKey != "" {
+		key, kerr := decodeKeyMaterial(cfg.SecretsProxyJWTKey)
+		if kerr != nil {
+			log.Warn().Err(kerr).Msg("invalid SECRETSPROXY_JWT_KEY")
+		} else if signer, serr := secrets.NewSigner(key,
+			cfg.SecretsProxyJWTKid, cfg.SecretsProxyJWTIssuer, cfg.SecretsProxyJWTAudience,
+			cfg.SecretsProxyJWTTTL); serr != nil {
+			log.Warn().Err(serr).Msg("init signer failed")
+		} else {
+			handlers.Signer = signer
+		}
+	}
 
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
 	// Interceptors below fire onDead on codes.Unavailable so the registry
@@ -180,6 +216,36 @@ type grpcVMDClient struct {
 	client vmdpb.VMDaemonClient
 }
 
+func (c *grpcVMDClient) PropagateSecret(ctx context.Context, secretID, realValue string) error {
+	_, err := c.client.PropagateSecret(ctx, &vmdpb.PropagateSecretRequest{
+		SecretId:  secretID,
+		RealValue: realValue,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC PropagateSecret: %w", err)
+	}
+	return nil
+}
+
+// toProtoBindings copies vmdclient.SecretBinding values into proto form.
+// Returns nil for an empty input so the proto field stays absent.
+func toProtoBindings(in []vmdclient.SecretBinding) []*vmdpb.SecretBinding {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*vmdpb.SecretBinding, len(in))
+	for i, b := range in {
+		out[i] = &vmdpb.SecretBinding{
+			SecretId:  b.SecretID,
+			Provider:  b.Provider,
+			EnvKey:    b.EnvKey,
+			RealValue: b.RealValue,
+			Token:     b.Token,
+		}
+	}
+	return out
+}
+
 func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
 	return &grpcVMDClient{
 		conn:   conn,
@@ -209,12 +275,14 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 	return resp.SnapshotPath, resp.MemFilePath, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string, bindings []vmdclient.SecretBinding, teamID string) (string, uint32, uint32, error) {
 	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		EnvVars:      envVars,
+		VmId:           vmID,
+		SnapshotPath:   snapshotPath,
+		MemFilePath:    memPath,
+		EnvVars:        envVars,
+		SecretBindings: toProtoBindings(bindings),
+		TeamId:         teamID,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
@@ -231,12 +299,14 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. Used as
 // a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
 // map to a crash but the snapshot files are still on disk).
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string, bindings []vmdclient.SecretBinding, teamID string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		EnvVars:      envVars,
+		VmId:           vmID,
+		SnapshotPath:   snapshotPath,
+		MemFilePath:    memPath,
+		EnvVars:        envVars,
+		SecretBindings: toProtoBindings(bindings),
+		TeamId:         teamID,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)

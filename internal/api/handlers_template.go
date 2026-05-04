@@ -375,7 +375,7 @@ func isUniqueViolation(err error) bool {
 func (h *Handlers) CreateTemplate(c *gin.Context) {
 	var req createTemplateRequest
 	if err := bindJSONStrict(c, &req); err != nil {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("Validation failed: %v", err), http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 

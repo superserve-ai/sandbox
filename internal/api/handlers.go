@@ -22,6 +22,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -57,6 +58,11 @@ type Handlers struct {
 	Config    *config.Config
 	Hosts     HostRegistry // when set, routes VMD calls via host_id
 	Scheduler Scheduler    // when set, picks host on create
+	// Encryptor and Signer are required by /secrets and by sandbox-create
+	// paths that reference stored secrets. Left nil in unit tests that
+	// don't exercise those paths.
+	Encryptor secrets.Encryptor
+	Signer    *secrets.Signer
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -282,17 +288,21 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	secretBindings, secretsErr := h.resolveSecretBindingsForResume(c.Request.Context(), teamID, sandboxID)
+	if secretsErr != nil {
+		revertToPaused()
+		respondError(c, secretsErr)
+		return false
+	}
+
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, secretBindings, teamID.String())
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
-			// RestoreSnapshot takes an optional envVars map; we pass nil here
-			// because resume is supposed to preserve whatever envs the sandbox
-			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, secretBindings, teamID.String())
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -662,6 +672,10 @@ type createSandboxRequest struct {
 	// they live in boxd's memory for the sandbox's lifetime and survive
 	// pause/resume via snapshot.
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+
+	// Secrets maps env-var name → name of a secret stored via POST /secrets.
+	// The real value is never injected into the sandbox.
+	Secrets map[string]string `json:"secrets,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -906,6 +920,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateSecretsRefs(req.Secrets); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Marshal once into the canonical jsonb shape. Empty / nil maps are
 	// stored as the empty object so the column is never NULL.
 	metadataJSON, err := json.Marshal(req.Metadata)
@@ -1000,6 +1018,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// VMD's ~100-200ms create latency, shaving that much off the p50.
 	sandboxID := uuid.New()
 
+	// Resolve secret refs up front so we can fail fast on missing
+	// secrets or egress conflicts before any infra work runs.
+	secretBindings, sandboxSecretRows, secretsErr := h.resolveSecretBindings(c.Request.Context(), teamID, sandboxID, req.Secrets, req.Network)
+	if secretsErr != nil {
+		respondError(c, secretsErr)
+		return
+	}
+
 	insertCtx := context.WithoutCancel(c.Request.Context())
 	type insertResult struct {
 		sandbox db.Sandbox
@@ -1042,11 +1068,24 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TemplateID:     pgtype.UUID{Valid: false},
 		})
 	}
+	// addSandboxSecretRows runs in the same tx as the sandbox insert.
+	addSandboxSecretRows := func(q *db.Queries) error {
+		for _, r := range sandboxSecretRows {
+			r.SandboxID = sandboxID
+			if err := q.AddSandboxSecret(insertCtx, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	go func() {
 		// Test path: when no Pool is wired (unit tests with a mock DBTX),
 		// skip the count check and just do the INSERT.
 		if h.Pool == nil {
 			sb, err := runInsert(h.DB)
+			if err == nil {
+				err = addSandboxSecretRows(h.DB)
+			}
 			insertCh <- insertResult{sandbox: sb, err: err}
 			return
 		}
@@ -1090,6 +1129,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 		sb, insertErr := runInsert(q)
 		if insertErr == nil {
+			insertErr = addSandboxSecretRows(q)
+		}
+		if insertErr == nil {
 			insertErr = tx.Commit(insertCtx)
 		}
 		insertCh <- insertResult{sandbox: sb, err: insertErr}
@@ -1109,7 +1151,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and boots a new VM from them statelessly. Caller env vars are merged
 	// on top of the template's baked defaults by vmd (boxd resumes with
 	// template context, then the restore RPC posts these on top).
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars, secretBindings, teamID.String())
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
@@ -1660,16 +1702,18 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 // Returns nil on success, or an error suitable for a 400 Bad Request.
 func bindJSONStrict(c *gin.Context, v any) error {
 	if c.Request.Body == nil {
-		return fmt.Errorf("request body is empty")
+		return errors.New("request body is required")
 	}
 	dec := json.NewDecoder(c.Request.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		return err
+		// std lib prefixes most errors with "json: "; strip it so the
+		// 400 response shows the useful part directly.
+		return errors.New(strings.TrimPrefix(err.Error(), "json: "))
 	}
 	// Reject trailing garbage / multiple JSON objects.
 	if dec.More() {
-		return fmt.Errorf("unexpected trailing data after JSON object")
+		return errors.New("unexpected trailing data after JSON object")
 	}
 	return nil
 }

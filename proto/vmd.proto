@@ -62,6 +62,10 @@ service VMDaemon {
   // events as they arrive. Closes when the build reaches a terminal
   // status. Used by the control plane to drive /builds/:id/logs SSE.
   rpc StreamBuildLogs(StreamBuildLogsRequest) returns (stream BuildLogEvent);
+
+  // PropagateSecret applies a new value (or empty=revoke) for one
+  // secret to every sandbox on this host that uses it.
+  rpc PropagateSecret(PropagateSecretRequest) returns (PropagateSecretResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +205,28 @@ message SandboxNetworkEgressConfig {
 }
 
 // ---------------------------------------------------------------------------
+// SecretBinding — sandbox <-> stored credential
+// ---------------------------------------------------------------------------
+
+// SecretBinding ties one stored credential to one sandbox.
+message SecretBinding {
+  string secret_id = 1;
+  string provider = 2;        // e.g. "anthropic"
+  string env_key = 3;         // env var name visible inside the sandbox.
+  string real_value = 4;      // never logged.
+  string token = 5;           // what the agent's env will hold.
+}
+
+// PropagateSecretRequest pushes a new value (or a revocation when
+// real_value is empty) for one secret.
+message PropagateSecretRequest {
+  string secret_id = 1;
+  string real_value = 2;
+}
+
+message PropagateSecretResponse {}
+
+// ---------------------------------------------------------------------------
 // DestroyVM
 // ---------------------------------------------------------------------------
 
@@ -239,6 +265,8 @@ message ResumeVMRequest {
   string mem_file_path = 3;
   SandboxNetworkConfig sandbox_network = 4;  // Reapply egress rules after resume.
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
+  repeated SecretBinding secret_bindings = 6;
+  string team_id = 7;
 }
 
 message ResumeVMResponse {
@@ -279,6 +307,8 @@ message RestoreSnapshotRequest {
   // Per-sandbox env vars merged on top of the template's baked defaults
   // (captured in the snapshot). Caller keys override template keys.
   map<string, string> env_vars = 7;
+  repeated SecretBinding secret_bindings = 8;
+  string team_id = 9;
 }
 
 message RestoreSnapshotResponse {

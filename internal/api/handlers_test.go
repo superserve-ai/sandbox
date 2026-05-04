@@ -49,14 +49,14 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (st
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, envVars map[string]string, _ []vmdclient.SecretBinding, _ string) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
 		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string, _ map[string]string, _ []vmdclient.SecretBinding, _ string) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -100,6 +100,7 @@ func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
 	return nil
 }
+func (s *stubVMD) PropagateSecret(_ context.Context, _, _ string) error { return nil }
 
 // ---------------------------------------------------------------------------
 // Mock DBTX — drives db.Queries without a real database
@@ -113,6 +114,7 @@ func (r *mockRow) Scan(dest ...any) error { return r.scanFn(dest...) }
 
 type mockDBTX struct {
 	queryRowFn func(ctx context.Context, sql string, args ...any) pgx.Row
+	queryFn    func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
@@ -124,9 +126,25 @@ func (m *mockDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	return m.execFn(ctx, sql, args...)
 }
 
-func (m *mockDBTX) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, fmt.Errorf("Query not expected")
+// Query defaults to an empty result; tests that need rows set queryFn.
+func (m *mockDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if m.queryFn != nil {
+		return m.queryFn(ctx, sql, args...)
+	}
+	return &emptyRows{}, nil
 }
+
+type emptyRows struct{}
+
+func (*emptyRows) Close()                                       {}
+func (*emptyRows) Err() error                                   { return nil }
+func (*emptyRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (*emptyRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (*emptyRows) Next() bool                                   { return false }
+func (*emptyRows) Scan(...any) error                            { return nil }
+func (*emptyRows) Values() ([]any, error)                       { return nil, nil }
+func (*emptyRows) RawValues() [][]byte                          { return nil }
+func (*emptyRows) Conn() *pgx.Conn                              { return nil }
 
 // ---------------------------------------------------------------------------
 // Row helpers
