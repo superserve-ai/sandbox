@@ -269,6 +269,84 @@ func TestServer_StreamingForward(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// scanForMarker — chunk-boundary detection of the SSE error marker.
+// ---------------------------------------------------------------------------
+
+func TestScanForMarker_FullChunk(t *testing.T) {
+	progress, hit := scanForMarker([]byte("event: error\ndata: {}"), sseStreamErrorMarker, 0)
+	if !hit || progress != 0 {
+		t.Fatalf("hit=%v progress=%d", hit, progress)
+	}
+}
+
+func TestScanForMarker_NoMatch(t *testing.T) {
+	progress, hit := scanForMarker([]byte("event: message_delta\ndata: {}"), sseStreamErrorMarker, 0)
+	if hit {
+		t.Fatal("false positive on non-error event")
+	}
+	if progress != 0 {
+		t.Errorf("progress=%d, want 0 on no match", progress)
+	}
+}
+
+func TestScanForMarker_AcrossBoundary(t *testing.T) {
+	// Split the marker between two chunks to verify state carries.
+	marker := string(sseStreamErrorMarker)
+	cut := len(marker) / 2
+	first := []byte("noise " + marker[:cut])
+	second := []byte(marker[cut:] + " trailing")
+
+	progress, hit := scanForMarker(first, sseStreamErrorMarker, 0)
+	if hit {
+		t.Fatal("matched on first half alone")
+	}
+	if progress == 0 {
+		t.Fatal("progress not preserved across boundary")
+	}
+	_, hit = scanForMarker(second, sseStreamErrorMarker, progress)
+	if !hit {
+		t.Fatal("did not match across boundary")
+	}
+}
+
+func TestScanForMarker_FalseStartThenMatch(t *testing.T) {
+	// First "e" is a false start; the real match comes later.
+	chunk := []byte("e\nevent: error\n")
+	_, hit := scanForMarker(chunk, sseStreamErrorMarker, 0)
+	if !hit {
+		t.Fatal("missed real match after a false start")
+	}
+}
+
+func TestServer_StreamingErrorMarkedInAudit(t *testing.T) {
+	f := newFixture(t)
+	f.upstream.Close()
+	f.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		w.Write([]byte("event: message_start\ndata: {}\n\n"))
+		flusher.Flush()
+		w.Write([]byte("event: error\ndata: {\"type\":\"error\"}\n\n"))
+		flusher.Flush()
+	}))
+	t.Cleanup(f.upstream.Close)
+	cfg := AnthropicConfig
+	cfg.Upstream = f.upstream.URL
+	f.server = NewServer(f.state, f.signer, NewRegistry(cfg), nil)
+
+	srcIP := "10.11.99.1"
+	tok := f.sandboxAndToken(t, uuid.New(), uuid.New(), uuid.New(), srcIP, "real")
+	w := f.doRequest(t, http.MethodPost, "/anthropic/v1/messages", "", srcIP, tok)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "event: error") {
+		t.Fatalf("response body did not pass through error chunk: %q", w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // PropagateSecret — rotation and revocation across the in-memory state.
 // ---------------------------------------------------------------------------
 

@@ -138,10 +138,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
-	streamBody(w, resp.Body, flusher)
+	sawStreamErr := streamBody(w, resp.Body, flusher)
 
 	upstreamStatus := int32(resp.StatusCode)
-	s.recordAudit(sb, parseUUID(claims.SecretID), cfg, r, resp.StatusCode, &upstreamStatus, time.Since(start), "")
+	errCode := ""
+	if sawStreamErr {
+		// HTTP 200 but body carried `event: error`.
+		errCode = "upstream_stream_error"
+	}
+	s.recordAudit(sb, parseUUID(claims.SecretID), cfg, r, resp.StatusCode, &upstreamStatus, time.Since(start), errCode)
 }
 
 // extractToken returns the token from the provider's auth header,
@@ -189,27 +194,58 @@ func copyForwardableHeaders(in, out http.Header, keyHeader string) {
 	out.Set("User-Agent", "superserve-secretsproxy/1.0")
 }
 
-// streamBody copies body to w, flushing after each read.
-func streamBody(w io.Writer, body io.Reader, flusher http.Flusher) {
+// SSE event line indicating a mid-stream failure after a 200.
+var sseStreamErrorMarker = []byte("event: error")
+
+// streamBody copies body to w, flushing per read. Returns true if
+// sseStreamErrorMarker was seen anywhere in the stream.
+func streamBody(w io.Writer, body io.Reader, flusher http.Flusher) bool {
 	buf := make([]byte, 4096)
+	matched := 0
+	sawError := false
 	for {
 		n, rerr := body.Read(buf)
 		if n > 0 {
+			// Forward first; the scan must not delay the byte stream.
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				return sawError
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
+			if !sawError {
+				matched, sawError = scanForMarker(buf[:n], sseStreamErrorMarker, matched)
+			}
 		}
 		if errors.Is(rerr, io.EOF) {
-			return
+			return sawError
 		}
 		if rerr != nil {
-			return
+			return sawError
 		}
 	}
 }
+
+// scanForMarker continues a partial match across chunk boundaries.
+// `matched` is bytes matched so far; returns updated progress + done.
+func scanForMarker(chunk, marker []byte, matched int) (int, bool) {
+	for _, b := range chunk {
+		if b == marker[matched] {
+			matched++
+			if matched == len(marker) {
+				return 0, true
+			}
+			continue
+		}
+		if b == marker[0] {
+			matched = 1
+		} else {
+			matched = 0
+		}
+	}
+	return matched, false
+}
+
 
 // egressAllowed applies the rules to a target URL. Deny first, then
 // allow; implicit deny when AllowOut is set and nothing matches.
