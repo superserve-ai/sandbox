@@ -6,6 +6,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/rs/zerolog/log"
 )
 
 // tiniBinary is a static linux/amd64 build of tini v0.19.0 — a minimal
@@ -117,7 +120,135 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string) (int64, error) {
 		return 0, fmt.Errorf("write /etc/resolv.conf: %w", err)
 	}
 
+	// Public Canonical apt mirrors silently drop GCE egress; rewrite to the
+	// in-region GCE mirror so apt-get inside the build VM doesn't hang.
+	if err := rewriteAptSources(rootfsDir); err != nil {
+		return 0, fmt.Errorf("rewrite apt sources: %w", err)
+	}
+
 	return binSize, nil
+}
+
+const gceUbuntuMirrorHost = "us-central1.gce.archive.ubuntu.com"
+
+var canonicalUbuntuMirrors = []string{
+	"archive.ubuntu.com",
+	"security.ubuntu.com",
+}
+
+const aptRewriteHeader = `# Rewritten by Superserve template builder.
+# Public Canonical mirrors (archive.ubuntu.com / security.ubuntu.com) are
+# rate-limited from GCE egress and frequently unreachable; the regional
+# mirror at us-central1.gce.archive.ubuntu.com serves the same archive
+# contents and is reachable in <50 ms. See:
+#   https://discuss.google.dev/t/gce-ubuntu-mirror-slowness/102707
+`
+
+// rewriteAptSources rewrites http:// references to canonicalUbuntuMirrors in
+// /etc/apt/sources.list and /etc/apt/sources.list.d/{*.list,*.sources} to
+// point at the GCE regional mirror. No-op when /etc/apt is absent or when no
+// file references a canonical hostname.
+func rewriteAptSources(rootfsDir string) error {
+	aptDir := filepath.Join(rootfsDir, "etc/apt")
+	if _, err := os.Stat(aptDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat %s: %w", aptDir, err)
+	}
+
+	files, err := findAptSourceFiles(aptDir)
+	if err != nil {
+		return fmt.Errorf("scan apt source files: %w", err)
+	}
+	var rewritten []string
+	for _, path := range files {
+		changed, err := rewriteAptFile(path)
+		if err != nil {
+			return fmt.Errorf("rewrite %s: %w", path, err)
+		}
+		if changed {
+			if rel, relErr := filepath.Rel(rootfsDir, path); relErr == nil {
+				rewritten = append(rewritten, "/"+rel)
+			} else {
+				rewritten = append(rewritten, path)
+			}
+		}
+	}
+	if len(rewritten) > 0 {
+		log.Info().
+			Str("component", "builder").
+			Str("mirror", gceUbuntuMirrorHost).
+			Strs("files", rewritten).
+			Msg("rewrote apt sources to GCE regional mirror")
+	}
+	return nil
+}
+
+func findAptSourceFiles(aptDir string) ([]string, error) {
+	var files []string
+
+	mainList := filepath.Join(aptDir, "sources.list")
+	if _, err := os.Stat(mainList); err == nil {
+		files = append(files, mainList)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	listDir := filepath.Join(aptDir, "sources.list.d")
+	entries, err := os.ReadDir(listDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return files, nil
+		}
+		return nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".list") || strings.HasSuffix(name, ".sources") {
+			files = append(files, filepath.Join(listDir, name))
+		}
+	}
+	return files, nil
+}
+
+// rewriteAptFile rewrites one apt sources file in place. Returns changed=true
+// only when the file matched a canonical hostname and was overwritten.
+// Idempotent: re-running on an already-rewritten file is a no-op.
+func rewriteAptFile(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	contents := string(data)
+
+	needsRewrite := false
+	for _, host := range canonicalUbuntuMirrors {
+		if strings.Contains(contents, "http://"+host) {
+			needsRewrite = true
+			break
+		}
+	}
+	if !needsRewrite {
+		return false, nil
+	}
+
+	rewritten := contents
+	for _, host := range canonicalUbuntuMirrors {
+		rewritten = strings.ReplaceAll(rewritten, "http://"+host, "http://"+gceUbuntuMirrorHost)
+	}
+
+	if !strings.HasPrefix(rewritten, aptRewriteHeader) {
+		rewritten = aptRewriteHeader + rewritten
+	}
+
+	if err := os.WriteFile(path, []byte(rewritten), 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // resolvConf is the minimal DNS config baked into every template rootfs.
