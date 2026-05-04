@@ -65,6 +65,12 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	// Drop proxy state so a recycled source IP isn't misattributed.
+	if a.proxy != nil {
+		if uerr := a.proxy.Unregister(ctx, req.GetVmId()); uerr != nil {
+			log.Warn().Err(uerr).Str("vm_id", req.GetVmId()).Msg("secrets proxy unregister on pause failed")
+		}
+	}
 	return &vmdpb.PauseVMResponse{
 		VmId:        req.GetVmId(),
 		SnapshotPath: snapshotPath,

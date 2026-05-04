@@ -520,6 +520,99 @@ func TestResolveSecretBindings_EgressBlocked(t *testing.T) {
 	}
 }
 
+// secretRows is a pgx.Rows stub for ListSandboxSecrets.
+type secretRows struct {
+	rows    []db.ListSandboxSecretsRow
+	pos     int
+	scanned bool
+}
+
+func (r *secretRows) Close()                                       {}
+func (r *secretRows) Err() error                                   { return nil }
+func (r *secretRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *secretRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *secretRows) Next() bool {
+	if r.pos >= len(r.rows) {
+		return false
+	}
+	r.pos++
+	r.scanned = false
+	return true
+}
+func (r *secretRows) Values() ([]any, error) { return nil, nil }
+func (r *secretRows) RawValues() [][]byte    { return nil }
+func (r *secretRows) Conn() *pgx.Conn        { return nil }
+func (r *secretRows) Scan(dest ...any) error {
+	row := r.rows[r.pos-1]
+	*dest[0].(*uuid.UUID) = row.ID
+	*dest[1].(*uuid.UUID) = row.TeamID
+	*dest[2].(*string) = row.Name
+	*dest[3].(*string) = row.Provider
+	*dest[4].(*[]byte) = row.Ciphertext
+	*dest[5].(*[]byte) = row.EncryptedDek
+	*dest[6].(*string) = row.KekID
+	*dest[7].(*time.Time) = row.CreatedAt
+	*dest[8].(*time.Time) = row.UpdatedAt
+	*dest[9].(*pgtype.Timestamptz) = row.LastUsedAt
+	*dest[10].(*pgtype.Timestamptz) = row.DeletedAt
+	*dest[11].(*string) = row.EnvKey
+	return nil
+}
+
+func TestResolveSecretBindingsForResume_RemintsTokens(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+	row := db.ListSandboxSecretsRow{
+		ID: uuid.New(), TeamID: teamID, Name: "ANTHROPIC_PROD",
+		Provider: "anthropic", Ciphertext: []byte("ct"), EncryptedDek: []byte("dek"),
+		KekID: "kek", CreatedAt: time.Now(), UpdatedAt: time.Now(), EnvKey: "ANTHROPIC_API_KEY",
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) {
+			return &secretRows{rows: []db.ListSandboxSecretsRow{row}}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.CommandTag{}, nil
+		},
+	}
+	signer, _ := secrets.NewSigner(make([]byte, 32), "v1", "i", "a", time.Hour)
+	h := &Handlers{DB: db.New(mock), Encryptor: &fakeEnc{}, Signer: signer}
+
+	bindings, appErr := h.resolveSecretBindingsForResume(context.Background(), teamID, sandboxID)
+	if appErr != nil {
+		t.Fatalf("unexpected AppError: %+v", appErr)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("got %d bindings, want 1", len(bindings))
+	}
+	b := bindings[0]
+	if b.EnvKey != "ANTHROPIC_API_KEY" {
+		t.Errorf("env_key=%q", b.EnvKey)
+	}
+	if b.Provider != "anthropic" {
+		t.Errorf("provider=%q", b.Provider)
+	}
+	if !strings.HasPrefix(b.Token, "sk-ant-proxy-") {
+		t.Errorf("token=%q does not have provider prefix", b.Token)
+	}
+	if b.RealValue != "ct" {
+		t.Errorf("real_value=%q, want fakeEnc echo of \"ct\"", b.RealValue)
+	}
+}
+
+func TestResolveSecretBindingsForResume_NoBindings_NoOp(t *testing.T) {
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.CommandTag{}, nil },
+	}
+	h := &Handlers{DB: db.New(mock)} // no Encryptor / Signer wired
+	bindings, appErr := h.resolveSecretBindingsForResume(context.Background(), uuid.New(), uuid.New())
+	if appErr != nil || bindings != nil {
+		t.Fatalf("got %v / %+v, want nil/nil", bindings, appErr)
+	}
+}
+
 func TestResolveSecretBindings_NotConfigured(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },

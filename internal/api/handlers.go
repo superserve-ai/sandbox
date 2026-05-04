@@ -288,17 +288,21 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	secretBindings, secretsErr := h.resolveSecretBindingsForResume(c.Request.Context(), teamID, sandboxID)
+	if secretsErr != nil {
+		revertToPaused()
+		respondError(c, secretsErr)
+		return false
+	}
+
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil, "")
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, secretBindings, teamID.String())
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
-			// RestoreSnapshot takes an optional envVars map; we pass nil here
-			// because resume is supposed to preserve whatever envs the sandbox
-			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, nil, "")
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil, secretBindings, teamID.String())
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()

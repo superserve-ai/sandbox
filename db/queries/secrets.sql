@@ -55,7 +55,8 @@ INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
 VALUES ($1, $2, $3);
 
 -- name: ListSandboxSecrets :many
-SELECT s.id, s.name, s.provider, ss.env_key, ss.secret_id
+-- Full secret rows plus the env_key each is bound under for this sandbox.
+SELECT s.*, ss.env_key
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL;

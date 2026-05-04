@@ -120,6 +120,57 @@ func (h *Handlers) resolveSecretBindings(
 	return bindings, rows, nil
 }
 
+// resolveSecretBindingsForResume rebuilds bindings from sandbox_secret,
+// decrypting each value and minting a fresh token. Returns (nil, nil)
+// when the sandbox has no bindings. Soft-deleted secrets are dropped
+// by the underlying join.
+func (h *Handlers) resolveSecretBindingsForResume(
+	ctx context.Context,
+	teamID, sandboxID uuid.UUID,
+) ([]vmdclient.SecretBinding, *AppError) {
+	rows, err := h.DB.ListSandboxSecrets(ctx, sandboxID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListSandboxSecrets")
+		return nil, ErrInternal
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	if h.Encryptor == nil || h.Signer == nil {
+		log.Error().Str("sandbox_id", sandboxID.String()).
+			Msg("sandbox has secret bindings but Encryptor/Signer not configured")
+		return nil, NewAppError("not_configured",
+			"This deployment does not support stored secrets. Contact support.",
+			http.StatusServiceUnavailable)
+	}
+
+	out := make([]vmdclient.SecretBinding, 0, len(rows))
+	for _, r := range rows {
+		plaintext, err := h.Encryptor.Decrypt(ctx, secrets.Encrypted{
+			Ciphertext:   r.Ciphertext,
+			EncryptedDEK: r.EncryptedDek,
+			KEKID:        r.KekID,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("name", r.Name).Msg("KMS decrypt during resume")
+			return nil, ErrInternal
+		}
+		token, err := h.Signer.Mint(time.Now(), sandboxID, r.ID, teamID)
+		if err != nil {
+			log.Error().Err(err).Msg("mint proxy token on resume")
+			return nil, ErrInternal
+		}
+		out = append(out, vmdclient.SecretBinding{
+			SecretID:  r.ID.String(),
+			Provider:  r.Provider,
+			EnvKey:    r.EnvKey,
+			RealValue: string(plaintext),
+			Token:     wrapTokenForProvider(r.Provider, token),
+		})
+	}
+	return out, nil
+}
+
 // upstreamAllowedByEgress returns an error if the provider's upstream
 // would be blocked by the sandbox's egress rules.
 func upstreamAllowedByEgress(provider string, netCfg *networkConfigRequest) error {

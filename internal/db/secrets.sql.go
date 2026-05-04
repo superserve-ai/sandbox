@@ -7,8 +7,10 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const addSandboxSecret = `-- name: AddSandboxSecret :exec
@@ -222,20 +224,30 @@ func (q *Queries) ListAuditForSandbox(ctx context.Context, arg ListAuditForSandb
 }
 
 const listSandboxSecrets = `-- name: ListSandboxSecrets :many
-SELECT s.id, s.name, s.provider, ss.env_key, ss.secret_id
+SELECT s.id, s.team_id, s.name, s.provider, s.ciphertext, s.encrypted_dek, s.kek_id, s.created_at, s.updated_at, s.last_used_at, s.deleted_at, ss.env_key
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
 `
 
 type ListSandboxSecretsRow struct {
-	ID       uuid.UUID `json:"id"`
-	Name     string    `json:"name"`
-	Provider string    `json:"provider"`
-	EnvKey   string    `json:"env_key"`
-	SecretID uuid.UUID `json:"secret_id"`
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	Name         string             `json:"name"`
+	Provider     string             `json:"provider"`
+	Ciphertext   []byte             `json:"ciphertext"`
+	EncryptedDek []byte             `json:"encrypted_dek"`
+	KekID        string             `json:"kek_id"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	LastUsedAt   pgtype.Timestamptz `json:"last_used_at"`
+	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
+	EnvKey       string             `json:"env_key"`
 }
 
+// Returns full secret rows plus the env_key each one is bound under for
+// this sandbox. Callers (resume, rotation refresh) use this to re-mint
+// tokens and re-decrypt values without N+1 lookups.
 func (q *Queries) ListSandboxSecrets(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretsRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxSecrets, sandboxID)
 	if err != nil {
@@ -247,10 +259,17 @@ func (q *Queries) ListSandboxSecrets(ctx context.Context, sandboxID uuid.UUID) (
 		var i ListSandboxSecretsRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.TeamID,
 			&i.Name,
 			&i.Provider,
+			&i.Ciphertext,
+			&i.EncryptedDek,
+			&i.KekID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastUsedAt,
+			&i.DeletedAt,
 			&i.EnvKey,
-			&i.SecretID,
 		); err != nil {
 			return nil, err
 		}
