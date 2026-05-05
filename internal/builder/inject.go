@@ -120,8 +120,12 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string, logger *zerolog.Logger) 
 		return 0, fmt.Errorf("write /etc/resolv.conf: %w", err)
 	}
 
-	// Public Canonical apt mirrors silently drop GCE egress; rewrite to the
-	// in-region GCE mirror so apt-get inside the build VM doesn't hang.
+	// Public Canonical apt mirrors are intermittently throttled / unreachable
+	// during the May 2026 archive outages, which produces partial .deb
+	// downloads and dpkg failures inside build VMs. Rewrite to
+	// nova.clouds.archive.ubuntu.com (Canonical's cloud-targeted mirror,
+	// which has a separate sync path and has stayed reachable through the
+	// event) so apt-get works.
 	if err := rewriteAptSources(rootfsDir, logger); err != nil {
 		return 0, fmt.Errorf("rewrite apt sources: %w", err)
 	}
@@ -129,13 +133,14 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string, logger *zerolog.Logger) 
 	return binSize, nil
 }
 
-// TODO(multi-region): make this a builder config field if we ever run
-// build VMs outside us-central1.
-const gceUbuntuMirrorHost = "us-central1.gce.archive.ubuntu.com"
+// Replacement mirror for canonicalUbuntuMirrors. nova.clouds is Canonical's
+// cloud-targeted mirror; it has a separate upstream sync path from the public
+// archive and was the only Ubuntu mirror to stay at 100% uptime through the
+// May 2026 archive.ubuntu.com / security.ubuntu.com outages.
+const ubuntuMirrorHost = "nova.clouds.archive.ubuntu.com"
 
-// Ubuntu-only. deb.debian.org is currently unaffected by the same outage;
-// if it ever needs equivalent handling, the GCE Debian path is via
-// mirror.gcr.io, not gce.archive.ubuntu.com.
+// Ubuntu-only. deb.debian.org is on a separate mirror network and currently
+// unaffected.
 var canonicalUbuntuMirrors = []string{
 	"archive.ubuntu.com",
 	"security.ubuntu.com",
@@ -143,16 +148,17 @@ var canonicalUbuntuMirrors = []string{
 
 const aptRewriteHeader = `# Rewritten by Superserve template builder.
 # Public Canonical mirrors (archive.ubuntu.com / security.ubuntu.com) are
-# rate-limited from GCE egress and frequently unreachable; the regional
-# mirror at us-central1.gce.archive.ubuntu.com serves the same archive
-# contents and is reachable in <50 ms. See:
-#   https://discuss.google.dev/t/gce-ubuntu-mirror-slowness/102707
+# intermittently throttled and serve partial responses during the ongoing
+# archive outages, which surfaces as dpkg errors on truncated .deb files.
+# nova.clouds.archive.ubuntu.com is Canonical's cloud-targeted mirror and
+# serves the same archive contents over a separate, healthy sync path.
 `
 
-// rewriteAptSources rewrites http:// references to canonicalUbuntuMirrors in
-// /etc/apt/sources.list and /etc/apt/sources.list.d/{*.list,*.sources} to
-// point at the GCE regional mirror. No-op when /etc/apt is absent or when no
-// file references a canonical hostname.
+// rewriteAptSources rewrites http:// and https:// references to
+// canonicalUbuntuMirrors in /etc/apt/sources.list and
+// /etc/apt/sources.list.d/{*.list,*.sources} to point at ubuntuMirrorHost.
+// No-op when /etc/apt is absent or when no file references a canonical
+// hostname.
 func rewriteAptSources(rootfsDir string, logger *zerolog.Logger) error {
 	aptDir := filepath.Join(rootfsDir, "etc/apt")
 	if _, err := os.Stat(aptDir); err != nil {
@@ -182,9 +188,9 @@ func rewriteAptSources(rootfsDir string, logger *zerolog.Logger) error {
 	}
 	if len(rewritten) > 0 && logger != nil {
 		logger.Info().
-			Str("mirror", gceUbuntuMirrorHost).
+			Str("mirror", ubuntuMirrorHost).
 			Strs("files", rewritten).
-			Msg("rewrote apt sources to GCE regional mirror")
+			Msg("rewrote apt sources to alternate Ubuntu mirror")
 	}
 	return nil
 }
@@ -229,9 +235,10 @@ func rewriteAptFile(path string) (bool, error) {
 	}
 	contents := string(data)
 
-	// The GCE mirror is HTTP-only, so https:// references get downgraded.
-	// apt verifies package signatures via Signed-By: independent of transport,
-	// so HTTP is fine for authenticity.
+	// We rewrite over both schemes and emit http:// — apt verifies package
+	// signatures via Signed-By: independent of transport, so HTTP is fine for
+	// authenticity, and HTTP-only matches the default Ubuntu sources.list
+	// convention.
 	schemes := []string{"http://", "https://"}
 
 	needsRewrite := false
@@ -253,7 +260,7 @@ func rewriteAptFile(path string) (bool, error) {
 	rewritten := contents
 	for _, host := range canonicalUbuntuMirrors {
 		for _, scheme := range schemes {
-			rewritten = strings.ReplaceAll(rewritten, scheme+host, "http://"+gceUbuntuMirrorHost)
+			rewritten = strings.ReplaceAll(rewritten, scheme+host, "http://"+ubuntuMirrorHost)
 		}
 	}
 

@@ -8,8 +8,8 @@ import (
 )
 
 // TestRewriteAptSources covers the apt-source rewrite path: canonical hosts
-// get redirected to the GCE regional mirror over both http:// and https://
-// (downgraded to http://), unrelated URLs are left alone, the rewrite is
+// get redirected to the replacement mirror over both http:// and https://
+// (emitted as http://), unrelated URLs are left alone, the rewrite is
 // idempotent, and the function is a no-op on non-Ubuntu rootfs trees.
 func TestRewriteAptSources(t *testing.T) {
 	t.Run("rewrites archive and security hosts in classic sources.list", func(t *testing.T) {
@@ -26,18 +26,18 @@ func TestRewriteAptSources(t *testing.T) {
 		if !strings.HasPrefix(got, aptRewriteHeader) {
 			t.Errorf("expected file to begin with rewrite header; got:\n%s", got)
 		}
-		// Match on protocol+host so we don't false-positive on the GCE
-		// mirror's own hostname (which contains "archive.ubuntu.com" as
-		// a substring).
+		// Match on protocol+host so we don't false-positive on the
+		// replacement mirror's own hostname (which contains
+		// "archive.ubuntu.com" as a substring).
 		body := strings.TrimPrefix(got, aptRewriteHeader)
 		for _, stale := range []string{"http://archive.ubuntu.com", "http://security.ubuntu.com"} {
 			if strings.Contains(body, stale) {
 				t.Errorf("stale URL %q still present after rewrite:\n%s", stale, body)
 			}
 		}
-		if strings.Count(body, gceUbuntuMirrorHost) != 2 {
-			t.Errorf("expected GCE mirror hostname in 2 deb lines, got %d:\n%s",
-				strings.Count(body, gceUbuntuMirrorHost), body)
+		if strings.Count(body, ubuntuMirrorHost) != 2 {
+			t.Errorf("expected replacement mirror hostname in 2 deb lines, got %d:\n%s",
+				strings.Count(body, ubuntuMirrorHost), body)
 		}
 	})
 
@@ -54,7 +54,7 @@ func TestRewriteAptSources(t *testing.T) {
 		}
 
 		got := readTestFile(t, filepath.Join(root, "etc/apt/sources.list.d/ubuntu.sources"))
-		if !strings.Contains(got, "URIs: http://"+gceUbuntuMirrorHost+"/ubuntu/") {
+		if !strings.Contains(got, "URIs: http://"+ubuntuMirrorHost+"/ubuntu/") {
 			t.Errorf("URIs line not rewritten:\n%s", got)
 		}
 	})
@@ -77,7 +77,7 @@ func TestRewriteAptSources(t *testing.T) {
 		}
 	})
 
-	t.Run("rewrites https:// canonical sources to http:// GCE mirror", func(t *testing.T) {
+	t.Run("rewrites https:// canonical sources to http:// replacement mirror", func(t *testing.T) {
 		root := t.TempDir()
 		writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"),
 			"deb https://archive.ubuntu.com/ubuntu noble main\n"+
@@ -97,9 +97,9 @@ func TestRewriteAptSources(t *testing.T) {
 				t.Errorf("stale URL %q still present after rewrite:\n%s", stale, body)
 			}
 		}
-		if strings.Count(body, "http://"+gceUbuntuMirrorHost) != 2 {
+		if strings.Count(body, "http://"+ubuntuMirrorHost) != 2 {
 			t.Errorf("expected http://%s twice in body (HTTPS downgraded), got %d:\n%s",
-				gceUbuntuMirrorHost, strings.Count(body, "http://"+gceUbuntuMirrorHost), body)
+				ubuntuMirrorHost, strings.Count(body, "http://"+ubuntuMirrorHost), body)
 		}
 	})
 
