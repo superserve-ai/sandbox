@@ -82,7 +82,7 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 	}
 	logger.Info().Str("digest", digest).Msg("image flattened")
 
-	boxdBytes, err := injectGuestAgent(scratch, b.cfg.BoxdBinaryPath)
+	boxdBytes, err := injectGuestAgent(scratch, b.cfg.BoxdBinaryPath, &logger)
 	if err != nil {
 		return BuildRootfsResult{}, fmt.Errorf("inject boxd: %w", err)
 	}
