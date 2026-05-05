@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,6 +31,57 @@ func TestTemplateMagicDir_MatchesTemplateRunDir(t *testing.T) {
 	}
 	if got, want := TemplateMagicRootfsPath(cfg.RunDir), filepath.Join(mgr.templateRunDir(), "rootfs.ext4"); got != want {
 		t.Errorf("TemplateMagicRootfsPath = %q, want %q", got, want)
+	}
+}
+
+func TestTemplateRootfsForSnapshot_RejectsNonTemplatePaths(t *testing.T) {
+	// Caller must error out, not silently fall back to BaseRootfsPath.
+	for _, p := range []string{"", ".", "/", "/var/lib/sandbox/snapshots/foo"} {
+		if _, err := templateRootfsForSnapshot("/var/lib/sandbox/rundir", p); err == nil {
+			t.Errorf("expected error for non-template snapshot path %q", p)
+		}
+	}
+}
+
+// TestResolveRestoreDisk_NonTemplate_NoExistingRootfs_Errors is the
+// integration-shaped test the PR review asked for: drive the actual disk
+// resolution path with a non-template snapshot AND no per-VM rootfs on
+// disk, and assert it errors instead of silently using BaseRootfsPath.
+func TestResolveRestoreDisk_NonTemplate_NoExistingRootfs_Errors(t *testing.T) {
+	runDir := t.TempDir()
+	mgr := &Manager{cfg: ManagerConfig{
+		RunDir:          runDir,
+		BaseRootfsPath:  "/should/not/be/used.ext4",
+	}}
+
+	_, err := mgr.resolveRestoreDisk(context.Background(), "vm-abc", "/snapshots/not-a-template/vmstate.snap")
+	if err == nil {
+		t.Fatalf("expected error for non-template snapshot with no per-VM rootfs; got nil")
+	}
+}
+
+// TestResolveRestoreDisk_SandboxResume_UsesExistingPerVMRootfs covers the
+// vmd-cold-restart path: snapshot path isn't a template path, but the
+// per-VM rootfs already exists from when the sandbox was first created.
+// Resolution should reuse that file (no copy, no error).
+func TestResolveRestoreDisk_SandboxResume_UsesExistingPerVMRootfs(t *testing.T) {
+	runDir := t.TempDir()
+	vmID := "vm-abc"
+	existing := filepath.Join(runDir, vmID, "rootfs.ext4")
+	if err := os.MkdirAll(filepath.Dir(existing), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(existing, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	mgr := &Manager{cfg: ManagerConfig{RunDir: runDir}}
+	got, err := mgr.resolveRestoreDisk(context.Background(), vmID, "/snapshots/sb-1/snap-1/vmstate.snap")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != existing {
+		t.Errorf("got %q, want %q", got, existing)
 	}
 }
 

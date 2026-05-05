@@ -177,9 +177,9 @@ type buildConfig struct {
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
 	buildVMID := "build-" + cfg.templateID
-	rootfsDir := filepath.Join(cfg.runDir, "templates", cfg.templateID)
+	rootfsDir := filepath.Join(cfg.runDir, vm.TemplatesDirName, cfg.templateID)
 	rootfsPath := filepath.Join(rootfsDir, "rootfs.ext4")
-	snapDir := filepath.Join(cfg.snapshotDir, "templates", cfg.templateID)
+	snapDir := filepath.Join(cfg.snapshotDir, vm.TemplatesDirName, cfg.templateID)
 
 	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir rootfs dir: %w", err)
@@ -336,6 +336,11 @@ func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.Fire
 		templateDir, perVMRootfs, rootfsLink, fcBin, socketPath, cfg.VMID,
 	)
 	cmd := exec.Command("ip", "netns", "exec", netNS, "unshare", "-m", "--", "sh", "-c", script)
+	// Surface shell errors from the mount/symlink prelude — without this,
+	// a failure before exec'ing firecracker shows up as an opaque
+	// wait-for-socket timeout. Inherits up to vmd's journald via the
+	// outer template-builder subprocess.
+	cmd.Stderr = os.Stderr
 	// Pdeathsig: kernel kills firecracker if we die for any reason
 	// (including SIGKILL), so orphans can't hold TAP/netns.
 	cmd.SysProcAttr = &syscall.SysProcAttr{

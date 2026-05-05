@@ -32,6 +32,10 @@ import (
 // — so every Firecracker process sees its own files at the same fixed path.
 const templateDirName = "template"
 
+// TemplatesDirName is the layout directory under RunDir / SnapshotDir that
+// holds per-template artifacts (rootfs at build time, snapshot files).
+const TemplatesDirName = "templates"
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -191,19 +195,49 @@ func TemplateMagicRootfsPath(runDir string) string {
 	return filepath.Join(TemplateMagicDir(runDir), "rootfs.ext4")
 }
 
+// resolveRestoreDisk picks the disk file for a restored VM when the caller
+// didn't supply one. Two legitimate cases:
+//
+//   - Template restore (snapshot path looks like .../templates/<id>/...) —
+//     copy the template's rootfs to a fresh per-VM file.
+//   - Sandbox resume after vmd cold restart — the per-VM rootfs already
+//     exists at <runDir>/<vmID>/rootfs.ext4 from when the sandbox was first
+//     created; reuse it.
+//
+// Anything else is an error: silently falling back to BaseRootfsPath would
+// put the wrong disk under the snapshot's memory view.
+func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (string, error) {
+	if src, srcErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath); srcErr == nil {
+		dst, err := m.copyRootfs(ctx, vmID, src)
+		if err != nil {
+			return "", fmt.Errorf("copy rootfs for restore: %w", err)
+		}
+		return dst, nil
+	} else {
+		existing := filepath.Join(m.cfg.RunDir, vmID, "rootfs.ext4")
+		if _, statErr := os.Stat(existing); statErr != nil {
+			return "", fmt.Errorf(
+				"resolve rootfs for vm %s: snapshot %q is not a template snapshot (%v) and per-VM rootfs %q is missing (%v)",
+				vmID, snapshotPath, srcErr, existing, statErr,
+			)
+		}
+		return existing, nil
+	}
+}
+
 // templateRootfsForSnapshot maps .../templates/<id>/<file>.snap →
 // <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
 // without needing controlplane to pass it.
 func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
 	parent := filepath.Dir(snapshotPath)            // .../templates/<templateID>
 	templateID := filepath.Base(parent)             // <templateID>
-	if filepath.Base(filepath.Dir(parent)) != "templates" {
+	if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
 		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
 	}
 	if templateID == "" || templateID == "." || templateID == string(filepath.Separator) {
 		return "", fmt.Errorf("snapshot path %q has an empty template id segment", snapshotPath)
 	}
-	return filepath.Join(runDir, "templates", templateID, "rootfs.ext4"), nil
+	return filepath.Join(runDir, TemplatesDirName, templateID, "rootfs.ext4"), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -672,21 +706,12 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.Unlock()
 
 	if diskPath == "" {
-		// Per-VM copy must come from the template's rootfs so disk content
-		// matches the snapshot's memory state; BaseRootfsPath is a fallback
-		// for non-template paths.
-		src, srcErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath)
-		if srcErr != nil {
-			log.Warn().Err(srcErr).Str("snapshot_path", snapshotPath).Msg("falling back to BaseRootfsPath")
-			src = m.cfg.BaseRootfsPath
-		}
 		var err error
-		diskPath, err = m.copyRootfs(ctx, vmID, src)
+		diskPath, err = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 		if err != nil {
 			m.setStatus(vmID, StatusError)
-			return nil, fmt.Errorf("copy rootfs for restore: %w", err)
+			return nil, err
 		}
-		log.Debug().Str("disk_path", diskPath).Str("src", src).Msg("created rootfs copy for restored VM")
 	}
 
 	var tapDevice, macAddr, hostIP, nsName string

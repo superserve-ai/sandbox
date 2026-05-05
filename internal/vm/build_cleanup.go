@@ -30,7 +30,7 @@ import (
 // directories are logged but don't abort the sweep — one bad dir shouldn't
 // block vmd startup.
 func (m *Manager) CleanupOrphanBuilds() int {
-	snapshotsRoot := filepath.Join(m.cfg.SnapshotDir, "templates")
+	snapshotsRoot := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
 	entries, err := os.ReadDir(snapshotsRoot)
 	if err != nil {
 		// Directory doesn't exist → no orphans to clean. First-time vmd
@@ -72,7 +72,7 @@ func (m *Manager) CleanupOrphanBuilds() int {
 
 		// Remove the corresponding rundir (rootfs.ext4). A future user-build
 		// for the same template_id will re-create it.
-		rundir := filepath.Join(m.cfg.RunDir, "templates", templateID)
+		rundir := filepath.Join(m.cfg.RunDir, TemplatesDirName, templateID)
 		if err := os.RemoveAll(rundir); err != nil {
 			m.log.Warn().Err(err).Str("dir", rundir).Msg("remove orphan rundir")
 		}
@@ -99,8 +99,8 @@ func (m *Manager) DeleteTemplateArtifacts(templateID string) error {
 	if templateID == "" {
 		return fmt.Errorf("template_id is required")
 	}
-	snapshotDir := filepath.Join(m.cfg.SnapshotDir, "templates", templateID)
-	rundir := filepath.Join(m.cfg.RunDir, "templates", templateID)
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID)
+	rundir := filepath.Join(m.cfg.RunDir, TemplatesDirName, templateID)
 	if err := os.RemoveAll(snapshotDir); err != nil {
 		return fmt.Errorf("remove %s: %w", snapshotDir, err)
 	}
