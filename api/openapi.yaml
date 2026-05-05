@@ -456,6 +456,37 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /templates/names/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Template name (e.g. `my-python-env` or `superserve/python-3.11`).
+
+    get:
+      operationId: getTemplateByName
+      tags: [Templates]
+      summary: Get a template by name
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Template details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /templates/{template_id}:
     parameters:
       - $ref: "#/components/parameters/TemplateId"
@@ -1051,14 +1082,11 @@ components:
           type: string
           minLength: 1
           maxLength: 128
-          pattern: "^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$"
+          pattern: "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$"
           description: >
-            Human-readable name, unique per team. Used as the
-            `from_template` value when creating sandboxes. Lowercase
-            letters, digits, and `.` `_` `/` `-` only; must start and
-            end with a letter or digit. Names starting with `superserve/`
-            are reserved for curated system templates and rejected for
-            team-owned templates.
+            Unique name for this template within your team. Used as the
+            `from_template` value when creating sandboxes. Lowercase letters,
+            digits, and `.` `_` `-`; must start and end with a letter or digit.
           example: my-python-env
         vcpu:
           type: integer

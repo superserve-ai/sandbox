@@ -1432,13 +1432,14 @@ func TestIntegration_CreateTemplate_NameCharSet(t *testing.T) {
 	}{
 		{"foo", true, "lowercase ok"},
 		{"my-python-env", true, "hyphens ok"},
-		{"a/b/c", true, "slashes ok"},
 		{"foo.bar", true, "dot ok"},
 		{"f", true, "single char ok"},
 		{"Foo", false, "capitals rejected"},
 		{"foo bar", false, "space rejected"},
 		{"-foo", false, "leading hyphen rejected"},
 		{"foo-", false, "trailing hyphen rejected"},
+		{"a/b/c", false, "slash rejected (customer)"},
+		{"acme/foo", false, "slash rejected (customer)"},
 		{"/foo", false, "leading slash rejected"},
 		{"foo/", false, "trailing slash rejected"},
 		{"foo!", false, "punctuation rejected"},
@@ -1482,5 +1483,52 @@ func TestIntegration_CreateTemplate_DuplicateLiveNameReturns409(t *testing.T) {
 	w := do(r, "POST", "/templates", apiKey, body)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestIntegration_GetTemplateByName_OwnAndSystem covers the by-name lookup:
+// caller's team templates resolve, system templates resolve (slash names
+// handled by wildcard route), and unknown names 404.
+func TestIntegration_GetTemplateByName_OwnAndSystem(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// Seed the caller's own template.
+	const ownName = "my-thing"
+	own, err := testQueries.CreateTemplate(ctx, db.CreateTemplateParams{
+		TeamID:    teamID,
+		Name:      ownName,
+		BuildSpec: []byte(`{"from":"debian:12-slim","steps":[]}`),
+		Vcpu:      1, MemoryMib: 1024, DiskMib: 4096,
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Own template by name → 200, returns the seeded row.
+	w := do(r, "GET", "/templates/names/"+ownName, apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("own by-name: expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	resp := mustJSON(t, w)
+	if resp["id"] != own.ID.String() {
+		t.Errorf("own by-name id mismatch: got %v want %s", resp["id"], own.ID)
+	}
+
+	// System template by name (wildcard route handles the slash).
+	w = do(r, "GET", "/templates/names/superserve/base", apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("system by-name: expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	resp = mustJSON(t, w)
+	if resp["name"] != "superserve/base" {
+		t.Errorf("system by-name name mismatch: got %v want superserve/base", resp["name"])
+	}
+
+	// Unknown name → 404.
+	w = do(r, "GET", "/templates/names/nope-not-here", apiKey, "")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("unknown by-name: expected 404, got %d", w.Code)
 	}
 }
