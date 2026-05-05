@@ -225,11 +225,13 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	_ = os.Remove(socketPath)
 
+	// Bake the magic path into the snapshot so vmd's per-VM symlink
+	// actually intercepts it on restore.
 	fcCfg := vm.FirecrackerConfig{
 		SocketPath: socketPath,
 		KernelPath: cfg.kernelPath,
 		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on",
-		RootfsPath: perVMRootfs,
+		RootfsPath: vm.TemplateMagicRootfsPath(cfg.runDir),
 		VCPUCount:  int(cfg.vcpu),
 		MemSizeMiB: int(cfg.memoryMiB),
 		TAPDevice:  network.TAPName,
@@ -239,7 +241,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		GatewayIP:  network.VMGatewayIP,
 	}
 
-	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace)
+	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace, cfg.runDir, perVMRootfs)
 	if err != nil {
 		return fmt.Errorf("start firecracker: %w", err)
 	}
@@ -324,9 +326,16 @@ func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID str
 // Firecracker launch
 // ---------------------------------------------------------------------------
 
-func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS string) (int, error) {
-	cmd := exec.Command("ip", "netns", "exec", netNS,
-		fcBin, "--api-sock", socketPath, "--id", cfg.VMID)
+func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS, runDir, perVMRootfs string) (int, error) {
+	// Mirror vmd's restore-side trick at build time so the snapshot
+	// references the same magic path on both sides.
+	templateDir := vm.TemplateMagicDir(runDir)
+	rootfsLink := vm.TemplateMagicRootfsPath(runDir)
+	script := fmt.Sprintf(
+		"mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && exec %q --api-sock %q --id %q",
+		templateDir, perVMRootfs, rootfsLink, fcBin, socketPath, cfg.VMID,
+	)
+	cmd := exec.Command("ip", "netns", "exec", netNS, "unshare", "-m", "--", "sh", "-c", script)
 	// Pdeathsig: kernel kills firecracker if we die for any reason
 	// (including SIGKILL), so orphans can't hold TAP/netns.
 	cmd.SysProcAttr = &syscall.SysProcAttr{

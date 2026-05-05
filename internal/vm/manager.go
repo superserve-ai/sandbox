@@ -180,6 +180,32 @@ func (m *Manager) templateRunDir() string {
 	return filepath.Join(m.cfg.RunDir, templateDirName)
 }
 
+// TemplateMagicDir is the per-process tmpfs mountpoint both build and
+// restore use; divergence here re-introduces the shared-rootfs bug.
+func TemplateMagicDir(runDir string) string {
+	return filepath.Join(runDir, templateDirName)
+}
+
+// TemplateMagicRootfsPath is the `path_on_host` baked into every snapshot.
+func TemplateMagicRootfsPath(runDir string) string {
+	return filepath.Join(TemplateMagicDir(runDir), "rootfs.ext4")
+}
+
+// templateRootfsForSnapshot maps .../templates/<id>/<file>.snap →
+// <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
+// without needing controlplane to pass it.
+func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
+	parent := filepath.Dir(snapshotPath)            // .../templates/<templateID>
+	templateID := filepath.Base(parent)             // <templateID>
+	if filepath.Base(filepath.Dir(parent)) != "templates" {
+		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
+	}
+	if templateID == "" || templateID == "." || templateID == string(filepath.Separator) {
+		return "", fmt.Errorf("snapshot path %q has an empty template id segment", snapshotPath)
+	}
+	return filepath.Join(runDir, "templates", templateID, "rootfs.ext4"), nil
+}
+
 // ---------------------------------------------------------------------------
 // Cold boot — only used by the template build pipeline
 // ---------------------------------------------------------------------------
@@ -646,13 +672,21 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.Unlock()
 
 	if diskPath == "" {
+		// Per-VM copy must come from the template's rootfs so disk content
+		// matches the snapshot's memory state; BaseRootfsPath is a fallback
+		// for non-template paths.
+		src, srcErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath)
+		if srcErr != nil {
+			log.Warn().Err(srcErr).Str("snapshot_path", snapshotPath).Msg("falling back to BaseRootfsPath")
+			src = m.cfg.BaseRootfsPath
+		}
 		var err error
-		diskPath, err = m.copyRootfs(ctx, vmID, m.cfg.BaseRootfsPath)
+		diskPath, err = m.copyRootfs(ctx, vmID, src)
 		if err != nil {
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("copy rootfs for restore: %w", err)
 		}
-		log.Debug().Str("disk_path", diskPath).Msg("created rootfs copy for restored VM")
+		log.Debug().Str("disk_path", diskPath).Str("src", src).Msg("created rootfs copy for restored VM")
 	}
 
 	var tapDevice, macAddr, hostIP, nsName string

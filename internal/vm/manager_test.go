@@ -17,6 +17,70 @@ func TestTemplateRunDir(t *testing.T) {
 	}
 }
 
+func TestTemplateMagicDir_MatchesTemplateRunDir(t *testing.T) {
+	// The exported helper used by cmd/template-builder must agree with vmd's
+	// internal templateRunDir — divergence here silently re-introduces the
+	// shared-rootfs bug because the build side and restore side would target
+	// different paths.
+	cfg := ManagerConfig{RunDir: "/var/lib/sandbox/rundir"}
+	mgr := &Manager{cfg: cfg}
+
+	if got, want := TemplateMagicDir(cfg.RunDir), mgr.templateRunDir(); got != want {
+		t.Errorf("TemplateMagicDir = %q, templateRunDir = %q — must match", got, want)
+	}
+	if got, want := TemplateMagicRootfsPath(cfg.RunDir), filepath.Join(mgr.templateRunDir(), "rootfs.ext4"); got != want {
+		t.Errorf("TemplateMagicRootfsPath = %q, want %q", got, want)
+	}
+}
+
+func TestTemplateRootfsForSnapshot(t *testing.T) {
+	runDir := "/var/lib/sandbox/rundir"
+	cases := []struct {
+		name     string
+		snapPath string
+		want     string
+		wantErr  bool
+	}{
+		{
+			name:     "well-formed template snapshot path",
+			snapPath: "/var/lib/sandbox/snapshots/templates/abcd-1234/vmstate.snap",
+			want:     "/var/lib/sandbox/rundir/templates/abcd-1234/rootfs.ext4",
+		},
+		{
+			name:     "mem.snap also resolves to the same template",
+			snapPath: "/var/lib/sandbox/snapshots/templates/abcd-1234/mem.snap",
+			want:     "/var/lib/sandbox/rundir/templates/abcd-1234/rootfs.ext4",
+		},
+		{
+			name:     "non-template snapshot path is rejected (re-pause / sandbox snapshots)",
+			snapPath: "/var/lib/sandbox/snapshots/sandbox-1/snap-123/vmstate.snap",
+			wantErr:  true,
+		},
+		{
+			name:     "missing templates segment is rejected",
+			snapPath: "/var/lib/sandbox/snapshots/abcd-1234/vmstate.snap",
+			wantErr:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := templateRootfsForSnapshot(runDir, tc.snapPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %q, got %q", tc.snapPath, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTemplateDirNameIsFixed(t *testing.T) {
 	if templateDirName != "template" {
 		t.Errorf("templateDirName = %q, want %q", templateDirName, "template")
