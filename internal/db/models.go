@@ -307,6 +307,8 @@ type Template struct {
 	UpdatedAt    time.Time          `json:"updated_at"`
 	BuiltAt      pgtype.Timestamptz `json:"built_at"`
 	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
+	BasePath     *string            `json:"base_path"`
+	DeltaPath    *string            `json:"delta_path"`
 }
 
 type TemplateBuild struct {

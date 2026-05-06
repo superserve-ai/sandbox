@@ -98,6 +98,12 @@ type VMConfig struct {
 	KernelPath  string
 	KernelArgs  string
 	RootfsPath  string
+	// Non-empty BasePath switches the VM into overlay mode: RootfsPath
+	// becomes a sparse per-VM file backed by this shared read-only base.
+	BasePath string
+	// DeltaDir hydrates a fresh per-VM overlay from <dir>/rootfs.delta on
+	// restore. Empty for in-place resume of an already-populated overlay.
+	DeltaDir string
 }
 
 // ManagerConfig holds paths and settings for the VM manager.
@@ -190,9 +196,20 @@ func TemplateMagicDir(runDir string) string {
 	return filepath.Join(runDir, templateDirName)
 }
 
-// TemplateMagicRootfsPath is the `path_on_host` baked into every snapshot.
+// TemplateMagicRootfsPath is the `path_on_host` baked into legacy snapshots.
 func TemplateMagicRootfsPath(runDir string) string {
 	return filepath.Join(TemplateMagicDir(runDir), "rootfs.ext4")
+}
+
+// TemplateMagicBasePath is the `base_path` baked into overlay-mode snapshots.
+func TemplateMagicBasePath(runDir string) string {
+	return filepath.Join(TemplateMagicDir(runDir), "base.ext4")
+}
+
+// TemplateMagicOverlayPath is the `path_on_host` baked into overlay-mode
+// snapshots — symlinked per-VM at restore time.
+func TemplateMagicOverlayPath(runDir string) string {
+	return filepath.Join(TemplateMagicDir(runDir), "overlay.ext4")
 }
 
 // resolveRestoreDisk picks the disk file for a restored VM when the caller
@@ -452,7 +469,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
-	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath); err != nil {
+	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, ""); err != nil {
 		return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 	}
 
@@ -529,19 +546,23 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// references).
 	rootfsPath := inst.DiskPath
 	if rootfsPath == "" {
-		rootfsPath = filepath.Join(m.cfg.RunDir, rundirKey, "rootfs.ext4")
+		fname := "rootfs.ext4"
+		if inst.Config.BasePath != "" {
+			fname = "overlay.ext4"
+		}
+		rootfsPath = filepath.Join(m.cfg.RunDir, rundirKey, fname)
 	}
 
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
-	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Namespace)
+	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	if err := RestoreSnapshot(socketPath, snapshotPath, memPath); err != nil {
+	if err := RestoreSnapshot(socketPath, snapshotPath, memPath, ""); err != nil {
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
@@ -577,7 +598,7 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
-	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath); err != nil {
+	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, ""); err != nil {
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
 
@@ -622,6 +643,11 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", p, err)
 		}
+	}
+
+	// Side-car (overlay-mode only); best-effort, missing is fine.
+	if snapshotPath != "" {
+		_ = os.Remove(snapshotPath + ".overlay")
 	}
 
 	// Best-effort: if the parent directory is now empty, clean it up. Only
@@ -707,7 +733,24 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	if diskPath == "" {
 		var err error
-		diskPath, err = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+		switch {
+		case resourceLimits.BasePath != "" && resourceLimits.DeltaDir != "":
+			// Creating a sandbox from a template — fresh empty overlay,
+			// fc hydrates it from the template's rootfs.delta.
+			diskPath, err = m.createOverlay(vmID)
+		case resourceLimits.BasePath != "":
+			// Restoring an existing sandbox's own snapshot (e.g.
+			// controlplane fallback after vmd lost its map). Reuse the
+			// existing per-VM overlay so we don't clobber its writes.
+			existing := filepath.Join(m.cfg.RunDir, vmID, "overlay.ext4")
+			if _, statErr := os.Stat(existing); statErr != nil {
+				err = fmt.Errorf("overlay-mode restore for vm %s: per-VM overlay missing at %q: %v", vmID, existing, statErr)
+			} else {
+				diskPath = existing
+			}
+		default:
+			diskPath, err = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+		}
 		if err != nil {
 			m.setStatus(vmID, StatusError)
 			return nil, err
@@ -754,7 +797,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.SocketPath = socketPath
 	inst.mu.Unlock()
 
-	pid, startErr := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, nsName)
+	pid, startErr := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
 	if startErr != nil {
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
@@ -769,11 +812,18 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	log.Info().Msg("restoring snapshot")
 
+	// In-place resume reuses the existing overlay file as-is; sandbox
+	// create from a template uses DeltaDir to hydrate a fresh overlay.
+	deltaDir := resourceLimits.DeltaDir
+	if inPlace {
+		deltaDir = ""
+	}
+
 	var restoreErr error
 	if inPlace {
-		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath)
+		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, deltaDir)
 	} else {
-		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice)
+		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, deltaDir)
 	}
 	if restoreErr != nil {
 		if !inPlace {
@@ -1174,7 +1224,8 @@ func (m *Manager) removeVM(vmID string) {
 	m.deleteState(vmID)
 }
 
-// copyRootfs creates a per-VM rootfs by copying the source image.
+// copyRootfs creates a per-VM rootfs by copying the source image. Legacy
+// non-overlay path; overlay mode uses createOverlay instead.
 func (m *Manager) copyRootfs(ctx context.Context, dirName, srcRootfs string) (string, error) {
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
@@ -1188,6 +1239,24 @@ func (m *Manager) copyRootfs(ctx context.Context, dirName, srcRootfs string) (st
 	}
 
 	return diskPath, nil
+}
+
+// createOverlay creates an empty per-VM overlay file. Firecracker auto-sizes
+// it to match the base on first open, so we don't size it here.
+func (m *Manager) createOverlay(dirName string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	overlayPath := filepath.Join(vmDir, "overlay.ext4")
+	f, err := os.Create(overlayPath)
+	if err != nil {
+		return "", fmt.Errorf("create overlay: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("close overlay: %w", err)
+	}
+	return overlayPath, nil
 }
 
 func (m *Manager) cleanupRunDir(dirName string) {
@@ -1238,20 +1307,31 @@ func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath
 
 // startFirecrackerViaSystemd writes the start script and launches Firecracker
 // as a standalone systemd unit. The VM survives VMD restarts because systemd
-// owns the process, not VMD.
-func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, netNS string) (int, error) {
+// owns the process, not VMD. Non-empty basePath switches the start script to
+// the dual-symlink overlay layout.
+func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
 	}
 	_ = os.Remove(socketPath)
 
 	templateDir := m.templateRunDir()
-	rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
 
-	// Write the start script that the systemd unit's ExecStart calls.
+	var setupCmds string
+	if basePath != "" {
+		baseLink := filepath.Join(templateDir, "base.ext4")
+		overlayLink := filepath.Join(templateDir, "overlay.ext4")
+		setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q",
+			templateDir, basePath, baseLink, perVMRootfs, overlayLink)
+	} else {
+		rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
+		setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q",
+			templateDir, perVMRootfs, rootfsLink)
+	}
+
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	scriptContent := fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s unshare -m -- sh -c 'mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && exec %q --api-sock %q --id %q'\n",
-		netNS, templateDir, perVMRootfs, rootfsLink, m.cfg.FirecrackerBin, socketPath, vmID)
+	scriptContent := fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s unshare -m -- sh -c '%s && exec %q --api-sock %q --id %q'\n",
+		netNS, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
 		return 0, fmt.Errorf("write start script: %w", err)
 	}

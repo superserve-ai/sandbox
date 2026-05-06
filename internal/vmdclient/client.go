@@ -14,8 +14,9 @@ type Client interface {
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
-	// in-memory map but the snapshot files are still on disk).
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// in-memory map but the snapshot files are still on disk). basePath +
+	// deltaDir are populated for overlay-mode templates, empty for legacy.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// DeleteSnapshot removes the on-disk vmstate + memory files for a
 	// previous snapshot. Idempotent: missing files return nil. Used by the
 	// control plane to garbage-collect the previous snapshot after a new
@@ -102,6 +103,8 @@ type BuildStatusResult struct {
 	SnapshotPath   string // populated on ready
 	MemFilePath    string // populated on ready
 	RootfsPath     string // populated on ready
+	BasePath       string // populated on ready, overlay-mode templates only
+	DeltaPath      string // populated on ready, overlay-mode templates only
 	ResolvedDigest string // populated on ready
 	SizeBytes      int64  // populated on ready
 	ErrorMessage   string // populated on failed/cancelled

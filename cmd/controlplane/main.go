@@ -231,11 +231,13 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. Used as
 // a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
 // map to a crash but the snapshot files are still on disk).
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir string, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
+		BasePath:     basePath,
+		DeltaDir:     deltaDir,
 		EnvVars:      envVars,
 	})
 	if err != nil {
@@ -393,6 +395,8 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		SnapshotPath:   resp.GetSnapshotPath(),
 		MemFilePath:    resp.GetMemFilePath(),
 		RootfsPath:     resp.GetRootfsPath(),
+		BasePath:       resp.GetBasePath(),
+		DeltaPath:      resp.GetDeltaPath(),
 		ResolvedDigest: resp.GetResolvedDigest(),
 		SizeBytes:      resp.GetSizeBytes(),
 		ErrorMessage:   resp.GetErrorMessage(),

@@ -379,12 +379,21 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		snapPath := res.SnapshotPath
 		memPath := res.MemFilePath
 		size := res.SizeBytes
+		var basePathArg, deltaPathArg *string
+		if res.BasePath != "" {
+			basePathArg = &res.BasePath
+		}
+		if res.DeltaPath != "" {
+			deltaPathArg = &res.DeltaPath
+		}
 		_, err := s.q.FinalizeBuild(finCtx, db.FinalizeBuildParams{
 			ID:           row.ID,
 			RootfsPath:   &rootfs,
 			SnapshotPath: &snapPath,
 			MemPath:      &memPath,
 			SizeBytes:    &size,
+			BasePath:     basePathArg,
+			DeltaPath:    deltaPathArg,
 		})
 		cancel()
 		if err != nil {
