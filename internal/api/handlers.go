@@ -274,6 +274,19 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	snapshotPath := snapshot.Path
 	memPath := resolveMemPath(snapshot)
 
+	// Overlay-mode sandboxes need basePath for the mount-namespace symlink;
+	// no deltaDir on resume since the overlay already has the paused state.
+	var resumeBasePath string
+	if sandbox.TemplateID.Valid {
+		tpl, tplErr := h.DB.GetTemplateForOwner(c.Request.Context(), db.GetTemplateForOwnerParams{
+			ID:     sandbox.TemplateID.Bytes,
+			TeamID: teamID,
+		})
+		if tplErr == nil && tpl.BasePath != nil {
+			resumeBasePath = *tpl.BasePath
+		}
+	}
+
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
@@ -292,7 +305,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -936,7 +949,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// If from_template is provided, resolve to the template's snapshot paths
 	// and reuse the existing snapshot-restore code path.
-	var snapshotPath, snapshotMemPath string
+	var snapshotPath, snapshotMemPath, basePath, deltaDir string
 	var templateID pgtype.UUID
 	// Template resources — only populated when the create uses from_template.
 	// vmd.RestoreSnapshot doesn't return ResourceLimits on older builds (proto
@@ -963,6 +976,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		snapshotPath = *tpl.SnapshotPath
 		snapshotMemPath = *tpl.MemPath
+		if tpl.BasePath != nil {
+			basePath = *tpl.BasePath
+		}
+		if tpl.DeltaPath != nil {
+			deltaDir = filepath.Dir(*tpl.DeltaPath)
+		}
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
 		templateVcpu = uint32(tpl.Vcpu)
 		templateMemMiB = uint32(tpl.MemoryMib)
@@ -1109,7 +1128,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and boots a new VM from them statelessly. Caller env vars are merged
 	// on top of the template's baked defaults by vmd (boxd resumes with
 	// template context, then the restore RPC posts these on top).
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, req.EnvVars)
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).

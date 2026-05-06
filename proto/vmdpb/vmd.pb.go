@@ -511,6 +511,9 @@ type GetBuildStatusResponse struct {
 	RootfsPath     string `protobuf:"bytes,4,opt,name=rootfs_path,json=rootfsPath,proto3" json:"rootfs_path,omitempty"`
 	ResolvedDigest string `protobuf:"bytes,5,opt,name=resolved_digest,json=resolvedDigest,proto3" json:"resolved_digest,omitempty"`
 	SizeBytes      int64  `protobuf:"varint,6,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	// Overlay-mode artifacts (empty for legacy single-rootfs builds).
+	BasePath  string `protobuf:"bytes,11,opt,name=base_path,json=basePath,proto3" json:"base_path,omitempty"`
+	DeltaPath string `protobuf:"bytes,12,opt,name=delta_path,json=deltaPath,proto3" json:"delta_path,omitempty"`
 	// Populated on failed / cancelled.
 	ErrorMessage  string `protobuf:"bytes,7,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	StartedAtUnix int64  `protobuf:"varint,8,opt,name=started_at_unix,json=startedAtUnix,proto3" json:"started_at_unix,omitempty"`
@@ -593,6 +596,20 @@ func (x *GetBuildStatusResponse) GetSizeBytes() int64 {
 		return x.SizeBytes
 	}
 	return 0
+}
+
+func (x *GetBuildStatusResponse) GetBasePath() string {
+	if x != nil {
+		return x.BasePath
+	}
+	return ""
+}
+
+func (x *GetBuildStatusResponse) GetDeltaPath() string {
+	if x != nil {
+		return x.DeltaPath
+	}
+	return ""
 }
 
 func (x *GetBuildStatusResponse) GetErrorMessage() string {
@@ -1570,12 +1587,19 @@ type RestoreSnapshotRequest struct {
 	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
 	SnapshotPath   string                 `protobuf:"bytes,2,opt,name=snapshot_path,json=snapshotPath,proto3" json:"snapshot_path,omitempty"`
 	MemFilePath    string                 `protobuf:"bytes,3,opt,name=mem_file_path,json=memFilePath,proto3" json:"mem_file_path,omitempty"`
-	OverlayPath    string                 `protobuf:"bytes,4,opt,name=overlay_path,json=overlayPath,proto3" json:"overlay_path,omitempty"` // COW overlay for the restored rootfs.
+	OverlayPath    string                 `protobuf:"bytes,4,opt,name=overlay_path,json=overlayPath,proto3" json:"overlay_path,omitempty"` // Per-VM writable overlay file (sparse).
 	ResourceLimits *ResourceLimits        `protobuf:"bytes,5,opt,name=resource_limits,json=resourceLimits,proto3" json:"resource_limits,omitempty"`
 	NetworkConfig  *NetworkConfig         `protobuf:"bytes,6,opt,name=network_config,json=networkConfig,proto3" json:"network_config,omitempty"`
 	// Per-sandbox env vars merged on top of the template's baked defaults
 	// (captured in the snapshot). Caller keys override template keys.
-	EnvVars       map[string]string `protobuf:"bytes,7,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	EnvVars map[string]string `protobuf:"bytes,7,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Read-only base image shared across all VMs from this template. Empty for
+	// legacy (non-overlay) sandboxes that still use a full per-VM rootfs copy.
+	BasePath string `protobuf:"bytes,8,opt,name=base_path,json=basePath,proto3" json:"base_path,omitempty"`
+	// Directory containing rootfs.delta for fast clone-from-template. When
+	// empty, the per-VM overlay starts empty (used for pause/resume of a
+	// single sandbox, where the overlay file is already populated).
+	DeltaDir      string `protobuf:"bytes,9,opt,name=delta_dir,json=deltaDir,proto3" json:"delta_dir,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1657,6 +1681,20 @@ func (x *RestoreSnapshotRequest) GetEnvVars() map[string]string {
 		return x.EnvVars
 	}
 	return nil
+}
+
+func (x *RestoreSnapshotRequest) GetBasePath() string {
+	if x != nil {
+		return x.BasePath
+	}
+	return ""
+}
+
+func (x *RestoreSnapshotRequest) GetDeltaDir() string {
+	if x != nil {
+		return x.DeltaDir
+	}
+	return ""
 }
 
 type RestoreSnapshotResponse struct {
@@ -2495,7 +2533,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x15BuildTemplateResponse\x12\x1e\n" +
 	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"7\n" +
 	"\x15GetBuildStatusRequest\x12\x1e\n" +
-	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xf0\x02\n" +
+	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xac\x03\n" +
 	"\x16GetBuildStatusResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -2504,7 +2542,10 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"rootfsPath\x12'\n" +
 	"\x0fresolved_digest\x18\x05 \x01(\tR\x0eresolvedDigest\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x06 \x01(\x03R\tsizeBytes\x12#\n" +
+	"size_bytes\x18\x06 \x01(\x03R\tsizeBytes\x12\x1b\n" +
+	"\tbase_path\x18\v \x01(\tR\bbasePath\x12\x1d\n" +
+	"\n" +
+	"delta_path\x18\f \x01(\tR\tdeltaPath\x12#\n" +
 	"\rerror_message\x18\a \x01(\tR\ferrorMessage\x12&\n" +
 	"\x0fstarted_at_unix\x18\b \x01(\x03R\rstartedAtUnix\x12\"\n" +
 	"\rended_at_unix\x18\t \x01(\x03R\vendedAtUnix\x12\x1b\n" +
@@ -2581,7 +2622,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xbd\x03\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xf7\x03\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -2589,7 +2630,9 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\foverlay_path\x18\x04 \x01(\tR\voverlayPath\x12J\n" +
 	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12G\n" +
 	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12Q\n" +
-	"\benv_vars\x18\a \x03(\v26.superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntryR\aenvVars\x1a:\n" +
+	"\benv_vars\x18\a \x03(\v26.superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntryR\aenvVars\x12\x1b\n" +
+	"\tbase_path\x18\b \x01(\tR\bbasePath\x12\x1b\n" +
+	"\tdelta_dir\x18\t \x01(\tR\bdeltaDir\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcc\x01\n" +

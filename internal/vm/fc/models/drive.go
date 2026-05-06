@@ -18,6 +18,9 @@ import (
 // swagger:model Drive
 type Drive struct {
 
+	// Read-only base image path for overlay mode. Required when io_engine is "Overlay". The path_on_host field becomes the overlay file path.
+	BasePath string `json:"base_path,omitempty"`
+
 	// Represents the caching strategy for the block device.
 	// Enum: ["Unsafe","Writeback"]
 	CacheType *string `json:"cache_type,omitempty"`
@@ -26,8 +29,8 @@ type Drive struct {
 	// Required: true
 	DriveID *string `json:"drive_id"`
 
-	// Type of the IO engine used by the device. "Async" is supported on host kernels newer than 5.10.51. This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
-	// Enum: ["Sync","Async"]
+	// Type of the IO engine used by the device. "Async" is supported on host kernels newer than 5.10.51. "Overlay" enables copy-on-write with dirty bitmap tracking for fast snapshots (requires base_path). This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
+	// Enum: ["Sync","Async","Overlay"]
 	IoEngine *string `json:"io_engine,omitempty"`
 
 	// Is block read only. This field is required for virtio-block config and should be omitted for vhost-user-block configuration.
@@ -135,7 +138,7 @@ var driveTypeIoEnginePropEnum []any
 
 func init() {
 	var res []string
-	if err := json.Unmarshal([]byte(`["Sync","Async"]`), &res); err != nil {
+	if err := json.Unmarshal([]byte(`["Sync","Async","Overlay"]`), &res); err != nil {
 		panic(err)
 	}
 	for _, v := range res {
@@ -150,6 +153,9 @@ const (
 
 	// DriveIoEngineAsync captures enum value "Async"
 	DriveIoEngineAsync string = "Async"
+
+	// DriveIoEngineOverlay captures enum value "Overlay"
+	DriveIoEngineOverlay string = "Overlay"
 )
 
 // prop value enum

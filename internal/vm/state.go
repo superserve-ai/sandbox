@@ -37,6 +37,10 @@ type VMRecord struct {
 	Metadata     map[string]string `json:"metadata,omitempty"`
 	VCPU         uint32            `json:"vcpu"`
 	MemoryMiB    uint32            `json:"memory_mib"`
+	// Persisted so overlay-mode sandboxes can be resumed correctly after a
+	// vmd restart (the start script needs basePath to wire up the
+	// dual-symlink mount namespace).
+	BasePath string `json:"base_path,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -155,6 +159,7 @@ func toRecord(inst *VMInstance) VMRecord {
 		Metadata:     inst.Metadata,
 		VCPU:         inst.Config.VCPU,
 		MemoryMiB:    inst.Config.MemoryMiB,
+		BasePath:     inst.Config.BasePath,
 	}
 }
 
@@ -179,6 +184,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
 			MemoryMiB: rec.MemoryMiB,
+			BasePath:  rec.BasePath,
 		},
 	}
 }

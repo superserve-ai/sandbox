@@ -91,6 +91,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			DiskSizeMiB: rl.GetDiskSizeMib(),
 		}
 	}
+	vmCfg.BasePath = req.GetBasePath()
+	vmCfg.DeltaDir = req.GetDeltaDir()
 
 	var netCfg *network.Config
 	if nc := req.GetNetworkConfig(); nc != nil {
@@ -327,6 +329,8 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 		resp.SnapshotPath = snap.Result.SnapshotPath
 		resp.MemFilePath = snap.Result.MemFilePath
 		resp.RootfsPath = snap.Result.RootfsPath
+		resp.BasePath = snap.Result.BasePath
+		resp.DeltaPath = snap.Result.DeltaPath
 		resp.ResolvedDigest = snap.Result.ResolvedDigest
 		resp.SizeBytes = snap.Result.SizeBytes
 	}

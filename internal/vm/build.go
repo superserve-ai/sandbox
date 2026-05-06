@@ -39,6 +39,8 @@ type BuildTemplateResult struct {
 	SnapshotPath   string
 	MemFilePath    string
 	RootfsPath     string
+	BasePath       string // overlay-mode templates only
+	DeltaPath      string // overlay-mode templates only
 	ResolvedDigest string // sha256:... of the resolved base image
 	SizeBytes      int64  // on-disk rootfs size
 }
@@ -225,6 +227,8 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		SnapshotPath   string `json:"snapshot_path"`
 		MemPath        string `json:"mem_path"`
 		RootfsPath     string `json:"rootfs_path"`
+		BasePath       string `json:"base_path"`
+		DeltaPath      string `json:"delta_path"`
 		ResolvedDigest string `json:"resolved_digest"`
 		SizeBytes      int64  `json:"size_bytes"`
 	}
@@ -235,6 +239,8 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		SnapshotPath:   meta.SnapshotPath,
 		MemFilePath:    meta.MemPath,
 		RootfsPath:     meta.RootfsPath,
+		BasePath:       meta.BasePath,
+		DeltaPath:      meta.DeltaPath,
 		ResolvedDigest: meta.ResolvedDigest,
 		SizeBytes:      meta.SizeBytes,
 	}, nil
