@@ -227,8 +227,9 @@ type restorePlan struct {
 	deltaDir string
 }
 
-// planRestore picks the disk action + delta_dir for a restore. Disk and
-// delta_dir branch off the same inPlace signal so they can't disagree.
+// planRestore picks the disk action + delta_dir for a restore. createOverlay
+// requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
+// we'd be cloning over an existing per-VM file, so fall back to reuse.
 func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
 	if inPlace {
@@ -237,7 +238,7 @@ func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
 		p.deltaDir = ""
 	}
 	switch {
-	case basePath != "" && !inPlace:
+	case basePath != "" && deltaDir != "" && !inPlace:
 		p.action = restoreCreateOverlay
 	case basePath != "":
 		p.action = restoreReuseOverlay

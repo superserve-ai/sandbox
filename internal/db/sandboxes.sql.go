@@ -257,9 +257,8 @@ type CreateSandboxParams struct {
 // the VMD CreateVM call — both need the same sandbox_id and generating
 // it client-side lets them run concurrently instead of strictly serially.
 // template_id is optional (NULL when sandbox is not derived from a template).
-// snapshot_path / mem_path / base_path / delta_path snapshot the template
-// build's artifact paths at create time so a later template rebuild can't
-// corrupt this sandbox by overwriting base.ext4 in place.
+// snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
+// specific build's artifacts so a later template rebuild can't corrupt it.
 func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, createSandbox,
 		arg.ID,
