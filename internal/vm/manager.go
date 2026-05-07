@@ -785,7 +785,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if _, err := os.Stat(snapshotPath + ".overlay"); err == nil {
 			m.setStatus(vmID, StatusError)
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"snapshot %q is overlay-mode but base_path was not provided (template may have been deleted)", snapshotPath)
+				"snapshot %q is overlay-mode but no base_path was provided to restore", snapshotPath)
 		}
 	}
 
