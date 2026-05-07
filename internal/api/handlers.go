@@ -1460,8 +1460,13 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		return
 	}
 
+	// Cap the request goroutine if boxd ever wedges past its own timeout.
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(),
+		time.Duration(req.TimeoutS+15)*time.Second)
+	defer vmdCancel()
+
 	start := time.Now()
-	stdout, stderr, exitCode, err := vmd.ExecCommand(c.Request.Context(), sandbox.ID.String(),
+	stdout, stderr, exitCode, err := vmd.ExecCommand(vmdCtx, sandbox.ID.String(),
 		req.Command, req.Args, req.Env, req.WorkingDir, uint32(req.TimeoutS))
 	durationMs := int32(time.Since(start).Milliseconds())
 	if err != nil {
