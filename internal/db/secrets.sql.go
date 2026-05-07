@@ -245,9 +245,7 @@ type ListSandboxSecretsRow struct {
 	EnvKey       string             `json:"env_key"`
 }
 
-// Returns full secret rows plus the env_key each one is bound under for
-// this sandbox. Callers (resume, rotation refresh) use this to re-mint
-// tokens and re-decrypt values without N+1 lookups.
+// Full secret rows plus the env_key each is bound under for this sandbox.
 func (q *Queries) ListSandboxSecrets(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretsRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxSecrets, sandboxID)
 	if err != nil {
