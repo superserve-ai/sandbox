@@ -226,8 +226,9 @@ WHERE template.id = build_done.template_id
 RETURNING template.*;
 
 -- name: FailBuild :one
--- Atomic terminal-failure transition. Same shape as FinalizeBuild; sets
--- error_message on the template so users see a useful message.
+-- Build row always flips to failed; template flips only if it never reached
+-- 'ready' — a failed rebuild shouldn't brick a template whose previous
+-- build's artifacts are still on disk and usable.
 WITH build_done AS (
   UPDATE template_build
   SET status = 'failed',
@@ -236,14 +237,20 @@ WITH build_done AS (
       error_message = $2
   WHERE template_build.id = $1 AND status IN ('pending', 'building', 'snapshotting')
   RETURNING template_id
+),
+tpl_update AS (
+  UPDATE template
+  SET status = 'failed',
+      error_message = $2,
+      updated_at = now()
+  FROM build_done
+  WHERE template.id = build_done.template_id
+    AND template.status IN ('pending', 'building')
+  RETURNING template.id
 )
-UPDATE template
-SET status = 'failed',
-    error_message = $2,
-    updated_at = now()
-FROM build_done
-WHERE template.id = build_done.template_id
-RETURNING template.*;
+SELECT t.*
+FROM template t
+JOIN build_done bd ON bd.template_id = t.id;
 
 -- name: CancelBuild :execrows
 -- User-initiated cancellation. Atomically transitions template_build →

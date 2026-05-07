@@ -290,14 +290,20 @@ WITH build_done AS (
       error_message = $2
   WHERE template_build.id = $1 AND status IN ('pending', 'building', 'snapshotting')
   RETURNING template_id
+),
+tpl_update AS (
+  UPDATE template
+  SET status = 'failed',
+      error_message = $2,
+      updated_at = now()
+  FROM build_done
+  WHERE template.id = build_done.template_id
+    AND template.status IN ('pending', 'building')
+  RETURNING template.id
 )
-UPDATE template
-SET status = 'failed',
-    error_message = $2,
-    updated_at = now()
-FROM build_done
-WHERE template.id = build_done.template_id
-RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at, template.base_path, template.delta_path
+SELECT t.id, t.team_id, t.name, t.status, t.build_spec, t.vcpu, t.memory_mib, t.disk_mib, t.rootfs_path, t.snapshot_path, t.mem_path, t.size_bytes, t.error_message, t.created_at, t.updated_at, t.built_at, t.deleted_at, t.base_path, t.delta_path
+FROM template t
+JOIN build_done bd ON bd.template_id = t.id
 `
 
 type FailBuildParams struct {
@@ -305,8 +311,9 @@ type FailBuildParams struct {
 	ErrorMessage *string   `json:"error_message"`
 }
 
-// Atomic terminal-failure transition. Same shape as FinalizeBuild; sets
-// error_message on the template so users see a useful message.
+// Build row always flips to failed; template flips only if it never reached
+// 'ready' — a failed rebuild shouldn't brick a template whose previous
+// build's artifacts are still on disk and usable.
 func (q *Queries) FailBuild(ctx context.Context, arg FailBuildParams) (Template, error) {
 	row := q.db.QueryRow(ctx, failBuild, arg.ID, arg.ErrorMessage)
 	var i Template
