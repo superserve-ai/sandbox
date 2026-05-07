@@ -156,7 +156,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// the source of truth; no in-memory registration needed because the
 	// sandbox create path reads snapshot paths from the control plane DB
 	// and calls RestoreSnapshot with those paths directly.
-	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, req.TemplateID)
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, req.TemplateID, buildVMID)
 	result, err := readBuildMetaJSON(snapshotDir)
 	if err != nil {
 		return nil, fmt.Errorf("read build meta: %w", err)

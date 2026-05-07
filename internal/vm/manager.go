@@ -734,14 +734,13 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if diskPath == "" {
 		var err error
 		switch {
-		case resourceLimits.BasePath != "" && resourceLimits.DeltaDir != "":
-			// Creating a sandbox from a template — fresh empty overlay,
-			// fc hydrates it from the template's rootfs.delta.
+		case resourceLimits.BasePath != "" && !inPlace:
+			// New sandbox from a template — fresh empty overlay; fc
+			// hydrates it from the template's rootfs.delta on restore.
 			diskPath, err = m.createOverlay(vmID)
 		case resourceLimits.BasePath != "":
-			// Restoring an existing sandbox's own snapshot (e.g.
-			// controlplane fallback after vmd lost its map). Reuse the
-			// existing per-VM overlay so we don't clobber its writes.
+			// Existing sandbox's own snapshot (controlplane fallback).
+			// Reuse the per-VM overlay so its writes aren't clobbered.
 			existing := filepath.Join(m.cfg.RunDir, vmID, "overlay.ext4")
 			if _, statErr := os.Stat(existing); statErr != nil {
 				err = fmt.Errorf("overlay-mode restore for vm %s: per-VM overlay missing at %q: %v", vmID, existing, statErr)
@@ -812,8 +811,8 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	log.Info().Msg("restoring snapshot")
 
-	// In-place resume reuses the existing overlay file as-is; sandbox
-	// create from a template uses DeltaDir to hydrate a fresh overlay.
+	// fc's delta-apply truncates the overlay; force empty on inPlace so a
+	// caller passing DeltaDir by mistake can't clobber the per-VM file.
 	deltaDir := resourceLimits.DeltaDir
 	if inPlace {
 		deltaDir = ""

@@ -177,9 +177,10 @@ type buildConfig struct {
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
 	buildVMID := "build-" + cfg.templateID
-	rootfsDir := filepath.Join(cfg.runDir, vm.TemplatesDirName, cfg.templateID)
+	// Per-build subdir — rebuilds don't disturb existing sandboxes.
+	rootfsDir := filepath.Join(cfg.runDir, vm.TemplatesDirName, cfg.templateID, cfg.buildID)
 	basePath := filepath.Join(rootfsDir, "base.ext4")
-	snapDir := filepath.Join(cfg.snapshotDir, vm.TemplatesDirName, cfg.templateID)
+	snapDir := filepath.Join(cfg.snapshotDir, vm.TemplatesDirName, cfg.templateID, cfg.buildID)
 	deltaPath := filepath.Join(snapDir, "rootfs.delta")
 
 	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {

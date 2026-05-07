@@ -161,6 +161,19 @@ func (a *GRPCAdapter) DeleteTemplateArtifacts(ctx context.Context, req *vmdpb.De
 	return &vmdpb.DeleteTemplateArtifactsResponse{Deleted: true}, nil
 }
 
+// DeleteBuildArtifacts removes a single build's subdir under a template.
+func (a *GRPCAdapter) DeleteBuildArtifacts(ctx context.Context, req *vmdpb.DeleteBuildArtifactsRequest) (*vmdpb.DeleteBuildArtifactsResponse, error) {
+	tplID := req.GetTemplateId()
+	buildID := req.GetBuildId()
+	if tplID == "" || buildID == "" {
+		return nil, status.Error(codes.InvalidArgument, "template_id and build_id must be set")
+	}
+	if err := a.mgr.DeleteBuildArtifacts(tplID, buildID); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteBuildArtifactsResponse{Deleted: true}, nil
+}
+
 func (a *GRPCAdapter) ExecCommand(req *vmdpb.ExecCommandRequest, stream grpc.ServerStreamingServer[vmdpb.ExecCommandResponse]) error {
 	if req.GetCommand() == "" {
 		return status.Error(codes.InvalidArgument, "command is required")

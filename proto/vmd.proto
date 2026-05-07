@@ -31,6 +31,10 @@ service VMDaemon {
   // rootfs. Idempotent.
   rpc DeleteTemplateArtifacts(DeleteTemplateArtifactsRequest) returns (DeleteTemplateArtifactsResponse);
 
+  // DeleteBuildArtifacts removes one build's subdir under a template.
+  // Idempotent — missing dirs are not an error.
+  rpc DeleteBuildArtifacts(DeleteBuildArtifactsRequest) returns (DeleteBuildArtifactsResponse);
+
   // ExecCommand runs a command inside a VM and streams stdout/stderr back.
   rpc ExecCommand(ExecCommandRequest) returns (stream ExecCommandResponse);
 
@@ -329,6 +333,15 @@ message DeleteTemplateArtifactsRequest {
 }
 
 message DeleteTemplateArtifactsResponse {
+  bool deleted = 1;
+}
+
+message DeleteBuildArtifactsRequest {
+  string template_id = 1;
+  string build_id = 2;  // typically "build-<template_build_uuid>"
+}
+
+message DeleteBuildArtifactsResponse {
   bool deleted = 1;
 }
 

@@ -266,6 +266,17 @@ func (c *grpcVMDClient) DeleteSnapshot(ctx context.Context, vmID, snapshotPath, 
 	return nil
 }
 
+func (c *grpcVMDClient) DeleteBuildArtifacts(ctx context.Context, templateID, buildID string) error {
+	_, err := c.client.DeleteBuildArtifacts(ctx, &vmdpb.DeleteBuildArtifactsRequest{
+		TemplateId: templateID,
+		BuildId:    buildID,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC DeleteBuildArtifacts: %w", err)
+	}
+	return nil
+}
+
 func (c *grpcVMDClient) DeleteTemplateArtifacts(ctx context.Context, templateID string) error {
 	_, err := c.client.DeleteTemplateArtifacts(ctx, &vmdpb.DeleteTemplateArtifactsRequest{
 		TemplateId: templateID,

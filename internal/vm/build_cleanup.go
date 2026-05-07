@@ -110,6 +110,22 @@ func (m *Manager) DeleteTemplateArtifacts(templateID string) error {
 	return nil
 }
 
+// DeleteBuildArtifacts removes a single build's subdir. Idempotent.
+func (m *Manager) DeleteBuildArtifacts(templateID, buildID string) error {
+	if templateID == "" || buildID == "" {
+		return fmt.Errorf("template_id and build_id are required")
+	}
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID, buildID)
+	rundir := filepath.Join(m.cfg.RunDir, TemplatesDirName, templateID, buildID)
+	if err := os.RemoveAll(snapshotDir); err != nil {
+		return fmt.Errorf("remove %s: %w", snapshotDir, err)
+	}
+	if err := os.RemoveAll(rundir); err != nil {
+		return fmt.Errorf("remove %s: %w", rundir, err)
+	}
+	return nil
+}
+
 // killOrphanFirecracker SIGKILLs firecracker processes whose cmdline has
 // `--id <buildVMID>` (build VMs reparented to init after a vmd crash).
 func killOrphanFirecracker(buildVMID string) int {

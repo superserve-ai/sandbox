@@ -25,6 +25,8 @@ type Client interface {
 	// DeleteTemplateArtifacts removes a template's snapshot dir + rootfs
 	// dir on the host. Idempotent.
 	DeleteTemplateArtifacts(ctx context.Context, templateID string) error
+	// DeleteBuildArtifacts removes a single build's subdir. Idempotent.
+	DeleteBuildArtifacts(ctx context.Context, templateID, buildID string) error
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
