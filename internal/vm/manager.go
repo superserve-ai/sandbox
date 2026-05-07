@@ -160,6 +160,14 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 	if maxRestores <= 0 {
 		maxRestores = 100
 	}
+	// Magic mount target — every per-VM start script mounts tmpfs over it.
+	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
+	// at startup so an aggressive ops cleanup can't break sandbox/build paths.
+	if cfg.RunDir != "" {
+		if err := os.MkdirAll(filepath.Join(cfg.RunDir, templateDirName), 0o755); err != nil {
+			return nil, fmt.Errorf("mkdir template magic dir: %w", err)
+		}
+	}
 	return &Manager{
 		cfg:        cfg,
 		netMgr:     netMgr,
