@@ -7,6 +7,64 @@ import (
 	"testing"
 )
 
+// TestPlanRestore pins the restore-decision behavior across the four input
+// shapes. Earlier code had two switches keying off different signals; a
+// stale combination could clobber the per-VM overlay.
+func TestPlanRestore(t *testing.T) {
+	tests := []struct {
+		name       string
+		basePath   string
+		deltaDir   string
+		inPlace    bool
+		wantAction restoreDiskAction
+		wantDelta  string
+	}{
+		{
+			name:       "create-from-template: fresh overlay, hydrate from delta",
+			basePath:   "/run/templates/t/b/base.ext4",
+			deltaDir:   "/snap/templates/t/b",
+			inPlace:    false,
+			wantAction: restoreCreateOverlay,
+			wantDelta:  "/snap/templates/t/b",
+		},
+		{
+			name:       "controlplane fallback: reuse existing overlay, no delta",
+			basePath:   "/run/templates/t/b/base.ext4",
+			deltaDir:   "",
+			inPlace:    false,
+			wantAction: restoreReuseOverlay,
+			wantDelta:  "",
+		},
+		{
+			name:       "in-place resume: reuse, force-empty delta even if caller passes one",
+			basePath:   "/run/templates/t/b/base.ext4",
+			deltaDir:   "/snap/templates/t/b",
+			inPlace:    true,
+			wantAction: restoreReuseOverlay,
+			wantDelta:  "",
+		},
+		{
+			name:       "legacy: no overlay fields → resolve disk the old way",
+			basePath:   "",
+			deltaDir:   "",
+			inPlace:    false,
+			wantAction: restoreLegacyResolve,
+			wantDelta:  "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace)
+			if got.action != tc.wantAction {
+				t.Errorf("action = %v, want %v", got.action, tc.wantAction)
+			}
+			if got.deltaDir != tc.wantDelta {
+				t.Errorf("deltaDir = %q, want %q", got.deltaDir, tc.wantDelta)
+			}
+		})
+	}
+}
+
 func TestTemplateRunDir(t *testing.T) {
 	cfg := ManagerConfig{RunDir: "/var/lib/sandbox/rundir"}
 	mgr := &Manager{cfg: cfg}

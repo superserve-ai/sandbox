@@ -1587,7 +1587,6 @@ type RestoreSnapshotRequest struct {
 	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
 	SnapshotPath   string                 `protobuf:"bytes,2,opt,name=snapshot_path,json=snapshotPath,proto3" json:"snapshot_path,omitempty"`
 	MemFilePath    string                 `protobuf:"bytes,3,opt,name=mem_file_path,json=memFilePath,proto3" json:"mem_file_path,omitempty"`
-	OverlayPath    string                 `protobuf:"bytes,4,opt,name=overlay_path,json=overlayPath,proto3" json:"overlay_path,omitempty"` // Per-VM writable overlay file (sparse).
 	ResourceLimits *ResourceLimits        `protobuf:"bytes,5,opt,name=resource_limits,json=resourceLimits,proto3" json:"resource_limits,omitempty"`
 	NetworkConfig  *NetworkConfig         `protobuf:"bytes,6,opt,name=network_config,json=networkConfig,proto3" json:"network_config,omitempty"`
 	// Per-sandbox env vars merged on top of the template's baked defaults
@@ -1651,13 +1650,6 @@ func (x *RestoreSnapshotRequest) GetSnapshotPath() string {
 func (x *RestoreSnapshotRequest) GetMemFilePath() string {
 	if x != nil {
 		return x.MemFilePath
-	}
-	return ""
-}
-
-func (x *RestoreSnapshotRequest) GetOverlayPath() string {
-	if x != nil {
-		return x.OverlayPath
 	}
 	return ""
 }
@@ -2718,12 +2710,11 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xf7\x03\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xe8\x03\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
-	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12!\n" +
-	"\foverlay_path\x18\x04 \x01(\tR\voverlayPath\x12J\n" +
+	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12J\n" +
 	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12G\n" +
 	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12Q\n" +
 	"\benv_vars\x18\a \x03(\v26.superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntryR\aenvVars\x12\x1b\n" +
@@ -2731,7 +2722,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\tdelta_dir\x18\t \x01(\tR\bdeltaDir\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcc\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"\xcc\x01\n" +
 	"\x17RestoreSnapshotResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +

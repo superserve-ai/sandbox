@@ -280,7 +280,8 @@ message RestoreSnapshotRequest {
   string vm_id = 1;
   string snapshot_path = 2;
   string mem_file_path = 3;
-  string overlay_path = 4;         // Per-VM writable overlay file (sparse).
+  reserved 4;                      // was overlay_path; vmd computes internally.
+  reserved "overlay_path";
   ResourceLimits resource_limits = 5;
   NetworkConfig network_config = 6;
   // Per-sandbox env vars merged on top of the template's baked defaults

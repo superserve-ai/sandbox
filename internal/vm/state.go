@@ -39,7 +39,9 @@ type VMRecord struct {
 	MemoryMiB    uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
-	// dual-symlink mount namespace).
+	// dual-symlink mount namespace). DeltaDir is intentionally NOT
+	// persisted — it's only relevant at create-from-template; a resumed
+	// sandbox reuses its existing overlay file in place.
 	BasePath string `json:"base_path,omitempty"`
 }
 

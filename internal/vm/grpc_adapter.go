@@ -104,7 +104,7 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		}
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), req.GetOverlayPath(), vmCfg, netCfg)
+	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg)
 	if err != nil {
 		return nil, err
 	}

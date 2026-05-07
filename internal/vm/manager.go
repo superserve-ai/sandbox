@@ -212,6 +212,41 @@ func TemplateMagicOverlayPath(runDir string) string {
 	return filepath.Join(TemplateMagicDir(runDir), "overlay.ext4")
 }
 
+// restoreDiskAction is the disk-resolution mode picked by planRestore.
+type restoreDiskAction int
+
+const (
+	restoreCreateOverlay  restoreDiskAction = iota // overlay clone of a template
+	restoreReuseOverlay                            // existing per-VM overlay (resume)
+	restoreLegacyResolve                           // legacy non-overlay path
+)
+
+// restorePlan is planRestore's output — pure decision, no I/O.
+type restorePlan struct {
+	action   restoreDiskAction
+	deltaDir string
+}
+
+// planRestore picks the disk action + delta_dir for a restore. Disk and
+// delta_dir branch off the same inPlace signal so they can't disagree.
+func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
+	p := restorePlan{deltaDir: deltaDir}
+	if inPlace {
+		// fc's delta-apply truncates the overlay; force empty to stop a
+		// caller mistake from clobbering per-VM state.
+		p.deltaDir = ""
+	}
+	switch {
+	case basePath != "" && !inPlace:
+		p.action = restoreCreateOverlay
+	case basePath != "":
+		p.action = restoreReuseOverlay
+	default:
+		p.action = restoreLegacyResolve
+	}
+	return p
+}
+
 // resolveRestoreDisk picks the disk file for a restored VM when the caller
 // didn't supply one. Two legitimate cases:
 //
@@ -645,9 +680,13 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		}
 	}
 
-	// Side-car (overlay-mode only); best-effort, missing is fine.
+	// Side-car (overlay-mode only). Missing is expected for legacy;
+	// any other error is logged — leftover side-cars caused fork bugs.
 	if snapshotPath != "" {
-		_ = os.Remove(snapshotPath + ".overlay")
+		sidecar := snapshotPath + ".overlay"
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Str("path", sidecar).Msg("remove overlay side-car")
+		}
 	}
 
 	// Best-effort: if the parent directory is now empty, clean it up. Only
@@ -690,7 +729,7 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 }
 
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
-func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath, diskPath string,
+func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
@@ -731,29 +770,35 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.vms[vmID] = inst
 	m.mu.Unlock()
 
-	if diskPath == "" {
-		var err error
-		switch {
-		case resourceLimits.BasePath != "" && !inPlace:
-			// New sandbox from a template — fresh empty overlay; fc
-			// hydrates it from the template's rootfs.delta on restore.
-			diskPath, err = m.createOverlay(vmID)
-		case resourceLimits.BasePath != "":
-			// Existing sandbox's own snapshot (controlplane fallback).
-			// Reuse the per-VM overlay so its writes aren't clobbered.
-			existing := filepath.Join(m.cfg.RunDir, vmID, "overlay.ext4")
-			if _, statErr := os.Stat(existing); statErr != nil {
-				err = fmt.Errorf("overlay-mode restore for vm %s: per-VM overlay missing at %q: %v", vmID, existing, statErr)
-			} else {
-				diskPath = existing
-			}
-		default:
-			diskPath, err = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
-		}
-		if err != nil {
+	// Side-car == overlay-mode marker. Fail clean if BasePath is missing
+	// rather than fall through and risk opening an unrelated rootfs.
+	if resourceLimits.BasePath == "" && snapshotPath != "" {
+		if _, err := os.Stat(snapshotPath + ".overlay"); err == nil {
 			m.setStatus(vmID, StatusError)
-			return nil, err
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q is overlay-mode but base_path was not provided (template may have been deleted)", snapshotPath)
 		}
+	}
+
+	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
+	var diskPath string
+	var diskErr error
+	switch plan.action {
+	case restoreCreateOverlay:
+		diskPath, diskErr = m.createOverlay(vmID, resourceLimits.BasePath)
+	case restoreReuseOverlay:
+		existing := filepath.Join(m.cfg.RunDir, vmID, "overlay.ext4")
+		if _, statErr := os.Stat(existing); statErr != nil {
+			diskErr = fmt.Errorf("overlay-mode restore for vm %s: per-VM overlay missing at %q: %v", vmID, existing, statErr)
+		} else {
+			diskPath = existing
+		}
+	case restoreLegacyResolve:
+		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+	}
+	if diskErr != nil {
+		m.setStatus(vmID, StatusError)
+		return nil, diskErr
 	}
 
 	var tapDevice, macAddr, hostIP, nsName string
@@ -811,18 +856,11 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	log.Info().Msg("restoring snapshot")
 
-	// fc's delta-apply truncates the overlay; force empty on inPlace so a
-	// caller passing DeltaDir by mistake can't clobber the per-VM file.
-	deltaDir := resourceLimits.DeltaDir
-	if inPlace {
-		deltaDir = ""
-	}
-
 	var restoreErr error
 	if inPlace {
-		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, deltaDir)
+		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
 	} else {
-		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, deltaDir)
+		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
 	}
 	if restoreErr != nil {
 		if !inPlace {
@@ -1240,9 +1278,16 @@ func (m *Manager) copyRootfs(ctx context.Context, dirName, srcRootfs string) (st
 	return diskPath, nil
 }
 
-// createOverlay creates an empty per-VM overlay file. Firecracker auto-sizes
-// it to match the base on first open, so we don't size it here.
-func (m *Manager) createOverlay(dirName string) (string, error) {
+// createOverlay creates a sparse per-VM overlay file pre-sized to the base
+// — explicit size avoids relying on fc's open-time set_len contract.
+func (m *Manager) createOverlay(dirName, basePath string) (string, error) {
+	if basePath == "" {
+		return "", fmt.Errorf("createOverlay: basePath required")
+	}
+	baseInfo, err := os.Stat(basePath)
+	if err != nil {
+		return "", fmt.Errorf("stat base %q: %w", basePath, err)
+	}
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir vm dir: %w", err)
@@ -1251,6 +1296,10 @@ func (m *Manager) createOverlay(dirName string) (string, error) {
 	f, err := os.Create(overlayPath)
 	if err != nil {
 		return "", fmt.Errorf("create overlay: %w", err)
+	}
+	if err := f.Truncate(baseInfo.Size()); err != nil {
+		f.Close()
+		return "", fmt.Errorf("size overlay to base: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		return "", fmt.Errorf("close overlay: %w", err)

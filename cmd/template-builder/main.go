@@ -206,7 +206,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitUser("system", "Image ready")
 
 	// Empty overlay — Firecracker auto-sizes to base on first open.
-	perVMOverlay, err := createBuildOverlay(cfg.runDir, buildVMID)
+	perVMOverlay, err := createBuildOverlay(cfg.runDir, buildVMID, basePath)
 	if err != nil {
 		return fmt.Errorf("create overlay: %w", err)
 	}
@@ -740,7 +740,14 @@ func pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec, bc b
 // Rootfs copy
 // ---------------------------------------------------------------------------
 
-func createBuildOverlay(runDir, vmID string) (string, error) {
+func createBuildOverlay(runDir, vmID, basePath string) (string, error) {
+	if basePath == "" {
+		return "", fmt.Errorf("createBuildOverlay: basePath required")
+	}
+	baseInfo, err := os.Stat(basePath)
+	if err != nil {
+		return "", fmt.Errorf("stat base %q: %w", basePath, err)
+	}
 	dstDir := filepath.Join(runDir, vmID)
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir: %w", err)
@@ -749,6 +756,10 @@ func createBuildOverlay(runDir, vmID string) (string, error) {
 	f, err := os.Create(dst)
 	if err != nil {
 		return "", fmt.Errorf("create overlay: %w", err)
+	}
+	if err := f.Truncate(baseInfo.Size()); err != nil {
+		f.Close()
+		return "", fmt.Errorf("size overlay to base: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		return "", fmt.Errorf("close overlay: %w", err)
