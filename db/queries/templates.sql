@@ -46,6 +46,12 @@ WHERE id = $1
 SELECT * FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
+-- name: GetTemplateBasePath :one
+-- Team-blind read for the post-destroy GC: the sandbox's team may not own
+-- the template (system templates), so we can't use GetTemplateForOwner.
+SELECT base_path FROM template
+WHERE id = $1 AND deleted_at IS NULL;
+
 -- name: GetTemplateByName :one
 -- Resolve name to a template visible to the caller. Names are unique per
 -- team, so the same name can exist in both the caller's team and the system

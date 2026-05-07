@@ -489,6 +489,20 @@ func (q *Queries) GetTemplate(ctx context.Context, arg GetTemplateParams) (Templ
 	return i, err
 }
 
+const getTemplateBasePath = `-- name: GetTemplateBasePath :one
+SELECT base_path FROM template
+WHERE id = $1 AND deleted_at IS NULL
+`
+
+// Team-blind read for the post-destroy GC: the sandbox's team may not own
+// the template (system templates), so we can't use GetTemplateForOwner.
+func (q *Queries) GetTemplateBasePath(ctx context.Context, id uuid.UUID) (*string, error) {
+	row := q.db.QueryRow(ctx, getTemplateBasePath, id)
+	var base_path *string
+	err := row.Scan(&base_path)
+	return base_path, err
+}
+
 const getTemplateBuild = `-- name: GetTemplateBuild :one
 SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
 WHERE id = $1 AND template_id = $2 AND team_id = $3

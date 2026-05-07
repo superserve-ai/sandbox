@@ -625,11 +625,14 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, sandbox db.Sandbo
 	if refs > 0 {
 		return
 	}
-	tpl, err := h.DB.GetTemplateForOwner(gcCtx, db.GetTemplateForOwnerParams{
-		ID:     sandbox.TemplateID.Bytes,
-		TeamID: sandbox.TeamID,
-	})
-	if err == nil && tpl.BasePath != nil && *tpl.BasePath == basePath {
+	// Team-blind: sandbox's team may not own the template (system templates),
+	// so GetTemplateForOwner would falsely report "not in use" → over-delete.
+	tplBase, err := h.DB.GetTemplateBasePath(gcCtx, sandbox.TemplateID.Bytes)
+	if err != nil {
+		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: GetTemplateBasePath")
+		return
+	}
+	if tplBase != nil && *tplBase == basePath {
 		return
 	}
 

@@ -142,6 +142,10 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 30 * time.Second
 
+	// Build VM's working dir (per-build overlay file + fc socket). Cleaned
+	// up here because template-builder's own defer can't run on SIGKILL.
+	defer os.RemoveAll(filepath.Join(m.cfg.RunDir, buildVMID))
+
 	if err := cmd.Run(); err != nil {
 		// Prefer the structured reason the subprocess emitted on its way
 		// out ("image_pull_failed: ...", "step_failed: ...", etc.) over
