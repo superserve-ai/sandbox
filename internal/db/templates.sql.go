@@ -678,9 +678,8 @@ type ListAllTemplateBasePathsRow struct {
 	BasePath *string   `json:"base_path"`
 }
 
-// Current base_path of every non-deleted template. Reconciler uses this
-// alongside ListLiveTemplateBuilds in case a row's status flipped between
-// the two queries (defensive double-cover).
+// Reconciler input: current base_path per template. Belt-and-suspenders
+// with ListLiveTemplateBuilds in case a row flipped between queries.
 func (q *Queries) ListAllTemplateBasePaths(ctx context.Context) ([]ListAllTemplateBasePathsRow, error) {
 	rows, err := q.db.Query(ctx, listAllTemplateBasePaths)
 	if err != nil {
@@ -759,9 +758,8 @@ type ListLiveTemplateBuildsRow struct {
 	BuildID    uuid.UUID `json:"build_id"`
 }
 
-// Builds whose on-disk artifacts must be preserved by the orphan-builds
-// reconciler: anything in flight (could be writing files) plus everything
-// that's currently 'ready' (sandboxes may still be created from it).
+// Reconciler input: in-flight or ready builds. Their on-disk artifacts
+// must be preserved; in-flight may still be writing.
 func (q *Queries) ListLiveTemplateBuilds(ctx context.Context) ([]ListLiveTemplateBuildsRow, error) {
 	rows, err := q.db.Query(ctx, listLiveTemplateBuilds)
 	if err != nil {

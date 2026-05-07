@@ -523,9 +523,8 @@ SELECT DISTINCT base_path FROM sandbox
 WHERE base_path IS NOT NULL AND destroyed_at IS NULL
 `
 
-// All distinct base_path values held by non-destroyed sandboxes. The orphan
-// reconciler treats these as live regardless of the underlying template's
-// current build, so pinned-paused sandboxes can survive any rebuild churn.
+// Reconciler input: distinct base_path values held by non-destroyed
+// sandboxes. Their builds must survive even if the template moved on.
 func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 	rows, err := q.db.Query(ctx, listPinnedBuildPaths)
 	if err != nil {
