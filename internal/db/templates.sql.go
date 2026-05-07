@@ -668,6 +668,39 @@ func (q *Queries) ListActiveBuilds(ctx context.Context) ([]TemplateBuild, error)
 	return items, nil
 }
 
+const listAllTemplateBasePaths = `-- name: ListAllTemplateBasePaths :many
+SELECT id, base_path FROM template
+WHERE deleted_at IS NULL AND base_path IS NOT NULL
+`
+
+type ListAllTemplateBasePathsRow struct {
+	ID       uuid.UUID `json:"id"`
+	BasePath *string   `json:"base_path"`
+}
+
+// Current base_path of every non-deleted template. Reconciler uses this
+// alongside ListLiveTemplateBuilds in case a row's status flipped between
+// the two queries (defensive double-cover).
+func (q *Queries) ListAllTemplateBasePaths(ctx context.Context) ([]ListAllTemplateBasePathsRow, error) {
+	rows, err := q.db.Query(ctx, listAllTemplateBasePaths)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllTemplateBasePathsRow{}
+	for rows.Next() {
+		var i ListAllTemplateBasePathsRow
+		if err := rows.Scan(&i.ID, &i.BasePath); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listBuildsForTemplate = `-- name: ListBuildsForTemplate :many
 SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
 WHERE template_id = $1 AND team_id = $2
@@ -705,6 +738,40 @@ func (q *Queries) ListBuildsForTemplate(ctx context.Context, arg ListBuildsForTe
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLiveTemplateBuilds = `-- name: ListLiveTemplateBuilds :many
+SELECT template_id, id AS build_id
+FROM template_build
+WHERE status IN ('pending', 'building', 'snapshotting', 'ready')
+`
+
+type ListLiveTemplateBuildsRow struct {
+	TemplateID uuid.UUID `json:"template_id"`
+	BuildID    uuid.UUID `json:"build_id"`
+}
+
+// Builds whose on-disk artifacts must be preserved by the orphan-builds
+// reconciler: anything in flight (could be writing files) plus everything
+// that's currently 'ready' (sandboxes may still be created from it).
+func (q *Queries) ListLiveTemplateBuilds(ctx context.Context) ([]ListLiveTemplateBuildsRow, error) {
+	rows, err := q.db.Query(ctx, listLiveTemplateBuilds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLiveTemplateBuildsRow{}
+	for rows.Next() {
+		var i ListLiveTemplateBuildsRow
+		if err := rows.Scan(&i.TemplateID, &i.BuildID); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

@@ -36,6 +36,12 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 SELECT COUNT(*)::bigint FROM sandbox
 WHERE base_path = $1 AND destroyed_at IS NULL;
 
+-- name: ListPinnedBuildPaths :many
+-- Reconciler input: distinct base_path values held by non-destroyed
+-- sandboxes. Their builds must survive even if the template moved on.
+SELECT DISTINCT base_path FROM sandbox
+WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
+
 -- name: CountActiveSandboxesForTeam :one
 -- Active = consumes host resources. Excludes failed (VM is gone) and
 -- destroyed (row is dead). Includes starting/active/pausing/paused/resuming.

@@ -27,6 +27,9 @@ type Client interface {
 	DeleteTemplateArtifacts(ctx context.Context, templateID string) error
 	// DeleteBuildArtifacts removes a single build's subdir. Idempotent.
 	DeleteBuildArtifacts(ctx context.Context, templateID, buildID string) error
+	// ListBuildArtifacts returns all per-build dirs on this host's snapshot
+	// storage. Used by the controlplane reconciler.
+	ListBuildArtifacts(ctx context.Context) ([]BuildArtifactEntry, error)
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
@@ -85,6 +88,14 @@ type BuildEnvOp struct {
 type BuildUserOp struct {
 	Name string
 	Sudo bool
+}
+
+// BuildArtifactEntry mirrors vmdpb.BuildArtifactEntry — one per-build dir
+// on a host's snapshot storage.
+type BuildArtifactEntry struct {
+	TemplateID string
+	BuildID    string
+	MTimeUnix  int64
 }
 
 // BuildLogEvent is one decoded event from StreamBuildLogs. Finished=true

@@ -518,6 +518,34 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	return network_config, err
 }
 
+const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
+SELECT DISTINCT base_path FROM sandbox
+WHERE base_path IS NOT NULL AND destroyed_at IS NULL
+`
+
+// All distinct base_path values held by non-destroyed sandboxes. The orphan
+// reconciler treats these as live regardless of the underlying template's
+// current build, so pinned-paused sandboxes can survive any rebuild churn.
+func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
+	rows, err := q.db.Query(ctx, listPinnedBuildPaths)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*string{}
+	for rows.Next() {
+		var base_path *string
+		if err := rows.Scan(&base_path); err != nil {
+			return nil, err
+		}
+		items = append(items, base_path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
 SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, snap.path AS snapshot_path
 FROM sandbox s

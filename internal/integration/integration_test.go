@@ -186,6 +186,9 @@ func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []st
 func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error { return nil }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
+func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {
+	return nil, nil
+}
 
 func (s *stubVMD) BuildTemplate(_ context.Context, _ vmdclient.BuildTemplateInput) (string, error) {
 	return "build-stub", nil

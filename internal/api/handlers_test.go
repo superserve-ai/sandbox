@@ -71,6 +71,9 @@ func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath 
 }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
+func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {
+	return nil, nil
+}
 func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	if s.execFn != nil {
 		return s.execFn(ctx, id, command, args, env, workingDir, timeoutS)

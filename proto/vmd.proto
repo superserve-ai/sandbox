@@ -35,6 +35,11 @@ service VMDaemon {
   // Idempotent — missing dirs are not an error.
   rpc DeleteBuildArtifacts(DeleteBuildArtifactsRequest) returns (DeleteBuildArtifactsResponse);
 
+  // ListBuildArtifacts enumerates per-build dirs on this host's snapshot
+  // storage. Used by the controlplane reconciler to identify orphans by
+  // diff against the DB-defined live set.
+  rpc ListBuildArtifacts(ListBuildArtifactsRequest) returns (ListBuildArtifactsResponse);
+
   // ExecCommand runs a command inside a VM and streams stdout/stderr back.
   rpc ExecCommand(ExecCommandRequest) returns (stream ExecCommandResponse);
 
@@ -344,6 +349,19 @@ message DeleteBuildArtifactsRequest {
 
 message DeleteBuildArtifactsResponse {
   bool deleted = 1;
+}
+
+message ListBuildArtifactsRequest {}
+
+message BuildArtifactEntry {
+  string template_id = 1;
+  string build_id = 2;     // typically "build-<template_build_uuid>"
+  int64  mtime_unix = 3;   // dir mtime; reconciler uses this to skip dirs
+                           // newer than its DB snapshot timestamp.
+}
+
+message ListBuildArtifactsResponse {
+  repeated BuildArtifactEntry entries = 1;
 }
 
 // ---------------------------------------------------------------------------

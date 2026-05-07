@@ -27,6 +27,7 @@ const (
 	VMDaemon_DeleteSnapshot_FullMethodName          = "/superserve.vmd.v1.VMDaemon/DeleteSnapshot"
 	VMDaemon_DeleteTemplateArtifacts_FullMethodName = "/superserve.vmd.v1.VMDaemon/DeleteTemplateArtifacts"
 	VMDaemon_DeleteBuildArtifacts_FullMethodName    = "/superserve.vmd.v1.VMDaemon/DeleteBuildArtifacts"
+	VMDaemon_ListBuildArtifacts_FullMethodName      = "/superserve.vmd.v1.VMDaemon/ListBuildArtifacts"
 	VMDaemon_ExecCommand_FullMethodName             = "/superserve.vmd.v1.VMDaemon/ExecCommand"
 	VMDaemon_GetVMInfo_FullMethodName               = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
 	VMDaemon_SetupNetwork_FullMethodName            = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
@@ -64,6 +65,10 @@ type VMDaemonClient interface {
 	// DeleteBuildArtifacts removes one build's subdir under a template.
 	// Idempotent — missing dirs are not an error.
 	DeleteBuildArtifacts(ctx context.Context, in *DeleteBuildArtifactsRequest, opts ...grpc.CallOption) (*DeleteBuildArtifactsResponse, error)
+	// ListBuildArtifacts enumerates per-build dirs on this host's snapshot
+	// storage. Used by the controlplane reconciler to identify orphans by
+	// diff against the DB-defined live set.
+	ListBuildArtifacts(ctx context.Context, in *ListBuildArtifactsRequest, opts ...grpc.CallOption) (*ListBuildArtifactsResponse, error)
 	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
 	ExecCommand(ctx context.Context, in *ExecCommandRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecCommandResponse], error)
 	// GetVMInfo returns the current status and metadata of a VM.
@@ -172,6 +177,16 @@ func (c *vMDaemonClient) DeleteBuildArtifacts(ctx context.Context, in *DeleteBui
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DeleteBuildArtifactsResponse)
 	err := c.cc.Invoke(ctx, VMDaemon_DeleteBuildArtifacts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) ListBuildArtifacts(ctx context.Context, in *ListBuildArtifactsRequest, opts ...grpc.CallOption) (*ListBuildArtifactsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListBuildArtifactsResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_ListBuildArtifacts_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -303,6 +318,10 @@ type VMDaemonServer interface {
 	// DeleteBuildArtifacts removes one build's subdir under a template.
 	// Idempotent — missing dirs are not an error.
 	DeleteBuildArtifacts(context.Context, *DeleteBuildArtifactsRequest) (*DeleteBuildArtifactsResponse, error)
+	// ListBuildArtifacts enumerates per-build dirs on this host's snapshot
+	// storage. Used by the controlplane reconciler to identify orphans by
+	// diff against the DB-defined live set.
+	ListBuildArtifacts(context.Context, *ListBuildArtifactsRequest) (*ListBuildArtifactsResponse, error)
 	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
 	ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error
 	// GetVMInfo returns the current status and metadata of a VM.
@@ -360,6 +379,9 @@ func (UnimplementedVMDaemonServer) DeleteTemplateArtifacts(context.Context, *Del
 }
 func (UnimplementedVMDaemonServer) DeleteBuildArtifacts(context.Context, *DeleteBuildArtifactsRequest) (*DeleteBuildArtifactsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteBuildArtifacts not implemented")
+}
+func (UnimplementedVMDaemonServer) ListBuildArtifacts(context.Context, *ListBuildArtifactsRequest) (*ListBuildArtifactsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListBuildArtifacts not implemented")
 }
 func (UnimplementedVMDaemonServer) ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error {
 	return status.Error(codes.Unimplemented, "method ExecCommand not implemented")
@@ -550,6 +572,24 @@ func _VMDaemon_DeleteBuildArtifacts_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_ListBuildArtifacts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBuildArtifactsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).ListBuildArtifacts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_ListBuildArtifacts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).ListBuildArtifacts(ctx, req.(*ListBuildArtifactsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VMDaemon_ExecCommand_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(ExecCommandRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -718,6 +758,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteBuildArtifacts",
 			Handler:    _VMDaemon_DeleteBuildArtifacts_Handler,
+		},
+		{
+			MethodName: "ListBuildArtifacts",
+			Handler:    _VMDaemon_ListBuildArtifacts_Handler,
 		},
 		{
 			MethodName: "GetVMInfo",

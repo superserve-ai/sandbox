@@ -266,6 +266,22 @@ func (c *grpcVMDClient) DeleteSnapshot(ctx context.Context, vmID, snapshotPath, 
 	return nil
 }
 
+func (c *grpcVMDClient) ListBuildArtifacts(ctx context.Context) ([]vmdclient.BuildArtifactEntry, error) {
+	resp, err := c.client.ListBuildArtifacts(ctx, &vmdpb.ListBuildArtifactsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC ListBuildArtifacts: %w", err)
+	}
+	out := make([]vmdclient.BuildArtifactEntry, 0, len(resp.GetEntries()))
+	for _, e := range resp.GetEntries() {
+		out = append(out, vmdclient.BuildArtifactEntry{
+			TemplateID: e.GetTemplateId(),
+			BuildID:    e.GetBuildId(),
+			MTimeUnix:  e.GetMtimeUnix(),
+		})
+	}
+	return out, nil
+}
+
 func (c *grpcVMDClient) DeleteBuildArtifacts(ctx context.Context, templateID, buildID string) error {
 	_, err := c.client.DeleteBuildArtifacts(ctx, &vmdpb.DeleteBuildArtifactsRequest{
 		TemplateId: templateID,

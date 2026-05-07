@@ -161,6 +161,24 @@ func (a *GRPCAdapter) DeleteTemplateArtifacts(ctx context.Context, req *vmdpb.De
 	return &vmdpb.DeleteTemplateArtifactsResponse{Deleted: true}, nil
 }
 
+// ListBuildArtifacts returns every per-build dir on the host's snapshot
+// storage. The controlplane reconciler uses this to find orphans.
+func (a *GRPCAdapter) ListBuildArtifacts(ctx context.Context, req *vmdpb.ListBuildArtifactsRequest) (*vmdpb.ListBuildArtifactsResponse, error) {
+	entries, err := a.mgr.ListBuildArtifacts()
+	if err != nil {
+		return nil, err
+	}
+	resp := &vmdpb.ListBuildArtifactsResponse{Entries: make([]*vmdpb.BuildArtifactEntry, 0, len(entries))}
+	for _, e := range entries {
+		resp.Entries = append(resp.Entries, &vmdpb.BuildArtifactEntry{
+			TemplateId: e.TemplateID,
+			BuildId:    e.BuildID,
+			MtimeUnix:  e.MTime.Unix(),
+		})
+	}
+	return resp, nil
+}
+
 // DeleteBuildArtifacts removes a single build's subdir under a template.
 func (a *GRPCAdapter) DeleteBuildArtifacts(ctx context.Context, req *vmdpb.DeleteBuildArtifactsRequest) (*vmdpb.DeleteBuildArtifactsResponse, error) {
 	tplID := req.GetTemplateId()
