@@ -2,6 +2,7 @@ package secretsproxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
@@ -488,6 +490,14 @@ func TestState_PropagateSecret_Revoke(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestEgressAllowed(t *testing.T) {
+	// Static resolver: pretend api.anthropic.com lives at 5.6.7.8.
+	resolved := map[string][]netip.Addr{
+		"api.anthropic.com": {netip.MustParseAddr("5.6.7.8")},
+	}
+	resolve := func(_ context.Context, host string) []netip.Addr {
+		return resolved[host]
+	}
+
 	cases := []struct {
 		name   string
 		rules  api.EgressRules
@@ -500,11 +510,15 @@ func TestEgressAllowed(t *testing.T) {
 		{"deny wins", api.EgressRules{AllowOut: []string{"api.anthropic.com"}, DenyOut: []string{"api.anthropic.com"}}, "api.anthropic.com", false},
 		{"wildcard suffix", api.EgressRules{AllowOut: []string{"*.anthropic.com"}}, "api.anthropic.com", true},
 		{"wildcard miss", api.EgressRules{AllowOut: []string{"*.openai.com"}}, "api.anthropic.com", false},
+		{"allow CIDR matches resolved IP", api.EgressRules{AllowOut: []string{"5.6.7.0/24"}}, "api.anthropic.com", true},
+		{"allow CIDR misses resolved IP", api.EgressRules{AllowOut: []string{"9.9.9.0/24"}}, "api.anthropic.com", false},
+		{"allow exact IP matches resolved", api.EgressRules{AllowOut: []string{"5.6.7.8"}}, "api.anthropic.com", true},
+		{"deny CIDR overrides allow domain", api.EgressRules{AllowOut: []string{"api.anthropic.com"}, DenyOut: []string{"5.6.7.0/24"}}, "api.anthropic.com", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			u := mustURL(t, "https://"+tc.host)
-			if got := egressAllowed(tc.rules, u); got != tc.expect {
+			if got := egressAllowed(context.Background(), tc.rules, u, resolve); got != tc.expect {
 				t.Errorf("got %v, want %v", got, tc.expect)
 			}
 		})

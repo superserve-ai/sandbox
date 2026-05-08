@@ -1,13 +1,16 @@
 package secretsproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +29,7 @@ type Server struct {
 	provs    *Registry
 	audit    *AuditWriter
 	upstream *http.Client
+	dns      *dnsCache
 }
 
 // NewServer constructs the request handler.
@@ -35,6 +39,7 @@ func NewServer(state *State, verifier *secrets.Signer, provs *Registry, audit *A
 		verifier: verifier,
 		provs:    provs,
 		audit:    audit,
+		dns:      &dnsCache{ttl: 30 * time.Second, entries: map[string]dnsCacheEntry{}},
 		upstream: &http.Client{
 			Transport: &http.Transport{
 				MaxIdleConns:        128,
@@ -45,6 +50,35 @@ func NewServer(state *State, verifier *secrets.Signer, provs *Registry, audit *A
 			// No client timeout — SSE streams from upstream may be long-lived.
 		},
 	}
+}
+
+// dnsCache memoizes A-record lookups for the egress check.
+type dnsCache struct {
+	ttl     time.Duration
+	mu      sync.RWMutex
+	entries map[string]dnsCacheEntry
+}
+
+type dnsCacheEntry struct {
+	ips     []netip.Addr
+	expires time.Time
+}
+
+func (c *dnsCache) Lookup(ctx context.Context, host string) []netip.Addr {
+	c.mu.RLock()
+	e, ok := c.entries[host]
+	c.mu.RUnlock()
+	if ok && time.Now().Before(e.expires) {
+		return e.ips
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil
+	}
+	c.mu.Lock()
+	c.entries[host] = dnsCacheEntry{ips: addrs, expires: time.Now().Add(c.ttl)}
+	c.mu.Unlock()
+	return addrs
 }
 
 // Handler returns the forward-path http.Handler.
@@ -107,7 +141,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" {
 		upstreamURL.RawQuery = r.URL.RawQuery
 	}
-	if !egressAllowed(sb.Egress, upstreamURL) {
+	if !egressAllowed(r.Context(), sb.Egress, upstreamURL, s.dns.Lookup) {
 		writeProxyError(w, http.StatusForbidden, "egress_blocked",
 			fmt.Sprintf("%s is not allowed by this sandbox's egress policy", upstreamURL.Host))
 		s.recordAudit(sb, parseUUID(claims.SecretID), cfg, r, http.StatusForbidden, nil, time.Since(start), "egress_blocked")
@@ -254,15 +288,22 @@ func scanForMarker(chunk, marker []byte, matched int) (int, bool) {
 }
 
 
-// egressAllowed applies the rules to a target URL. Deny first, then
-// allow; implicit deny when AllowOut is set and nothing matches.
-func egressAllowed(rules api.EgressRules, target *url.URL) bool {
+// egressAllowed applies the rules to a target URL. Hostname / *.suffix
+// entries match the URL's host; IP / CIDR entries match its resolved
+// A records. Deny first, then allow; implicit deny when AllowOut is set.
+func egressAllowed(ctx context.Context, rules api.EgressRules, target *url.URL, resolve func(context.Context, string) []netip.Addr) bool {
 	if len(rules.AllowOut) == 0 && len(rules.DenyOut) == 0 {
 		return true
 	}
 	host := target.Hostname()
+
+	var ips []netip.Addr
+	if anyIPOrCIDR(rules.DenyOut) || anyIPOrCIDR(rules.AllowOut) {
+		ips = resolve(ctx, host)
+	}
+
 	for _, entry := range rules.DenyOut {
-		if matchEgressEntry(entry, host) {
+		if matchEgressEntry(entry, host, ips) {
 			return false
 		}
 	}
@@ -270,21 +311,49 @@ func egressAllowed(rules api.EgressRules, target *url.URL) bool {
 		return true
 	}
 	for _, entry := range rules.AllowOut {
-		if matchEgressEntry(entry, host) {
+		if matchEgressEntry(entry, host, ips) {
 			return true
 		}
 	}
 	return false
 }
 
-// matchEgressEntry: exact match or *.suffix wildcard.
-func matchEgressEntry(entry, host string) bool {
+// matchEgressEntry: exact host, *.suffix wildcard, IP, or CIDR.
+func matchEgressEntry(entry, host string, ips []netip.Addr) bool {
 	if entry == host {
 		return true
 	}
 	if strings.HasPrefix(entry, "*.") {
 		suffix := entry[1:]
 		if strings.HasSuffix(strings.ToLower(host), strings.ToLower(suffix)) {
+			return true
+		}
+	}
+	if prefix, err := netip.ParsePrefix(entry); err == nil {
+		for _, ip := range ips {
+			if prefix.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if addr, err := netip.ParseAddr(entry); err == nil {
+		for _, ip := range ips {
+			if addr == ip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anyIPOrCIDR is the predicate that decides whether to resolve.
+func anyIPOrCIDR(entries []string) bool {
+	for _, e := range entries {
+		if _, err := netip.ParsePrefix(e); err == nil {
+			return true
+		}
+		if _, err := netip.ParseAddr(e); err == nil {
 			return true
 		}
 	}
