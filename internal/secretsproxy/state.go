@@ -1,7 +1,15 @@
 package secretsproxy
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sync"
+
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/secretsproxy/api"
 )
@@ -16,17 +24,147 @@ type sandboxState struct {
 
 // State is the in-memory view of registered sandboxes. Indexed by both
 // sandbox_id and source IP so register/update and request lookup are
-// O(1). Never persisted.
+// O(1). Optionally persisted to a tmpfs file so a proxy restart
+// recovers state without re-bootstrapping every sandbox.
 type State struct {
-	mu        sync.RWMutex
-	bySandbox map[string]*sandboxState
-	bySource  map[string]*sandboxState
+	mu          sync.RWMutex
+	bySandbox   map[string]*sandboxState
+	bySource    map[string]*sandboxState
+	persistPath string // empty = in-memory only
 }
 
 func NewState() *State {
 	return &State{
 		bySandbox: make(map[string]*sandboxState),
 		bySource:  make(map[string]*sandboxState),
+	}
+}
+
+// SetPersistPath enables persistence after construction.
+func (s *State) SetPersistPath(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persistPath = path
+}
+
+// NewStateWithFile creates a State that persists to path. Missing file
+// → cold start. Corrupt file → returns the parse error.
+func NewStateWithFile(path string) (*State, error) {
+	s := NewState()
+	s.persistPath = path
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// persistedSandbox is the JSON-encodable shape on disk.
+type persistedSandbox struct {
+	SandboxID string                       `json:"sandbox_id"`
+	TeamID    string                       `json:"team_id"`
+	SourceIP  string                       `json:"source_ip"`
+	Bindings  map[string]api.SecretBinding `json:"bindings"`
+	Egress    api.EgressRules              `json:"egress"`
+}
+
+type persistedFile struct {
+	Version   int                `json:"version"`
+	Sandboxes []persistedSandbox `json:"sandboxes"`
+}
+
+const stateFileVersion = 1
+
+// load reads the state file into memory. Caller has not yet exposed the
+// state to writers, so no lock is taken.
+func (s *State) load() error {
+	data, err := os.ReadFile(s.persistPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read state file: %w", err)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	var pf persistedFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		return fmt.Errorf("parse state file: %w", err)
+	}
+	if pf.Version != stateFileVersion {
+		return fmt.Errorf("state file version %d not supported", pf.Version)
+	}
+	for _, p := range pf.Sandboxes {
+		st := &sandboxState{
+			SandboxID:   p.SandboxID,
+			TeamID:      p.TeamID,
+			SourceIP:    p.SourceIP,
+			secretsByID: p.Bindings,
+			egress:      p.Egress,
+		}
+		if st.secretsByID == nil {
+			st.secretsByID = map[string]api.SecretBinding{}
+		}
+		s.bySandbox[p.SandboxID] = st
+		s.bySource[p.SourceIP] = st
+	}
+	log.Info().Int("count", len(pf.Sandboxes)).Str("path", s.persistPath).
+		Msg("restored state from file")
+	return nil
+}
+
+// persist writes the current bySandbox map to disk via temp-file +
+// atomic rename. Caller must hold s.mu (write lock). Errors are logged
+// but never fatal — the in-memory map remains the source of truth.
+func (s *State) persist() {
+	if s.persistPath == "" {
+		return
+	}
+	pf := persistedFile{
+		Version:   stateFileVersion,
+		Sandboxes: make([]persistedSandbox, 0, len(s.bySandbox)),
+	}
+	for _, st := range s.bySandbox {
+		pf.Sandboxes = append(pf.Sandboxes, persistedSandbox{
+			SandboxID: st.SandboxID,
+			TeamID:    st.TeamID,
+			SourceIP:  st.SourceIP,
+			Bindings:  st.secretsByID,
+			Egress:    st.egress,
+		})
+	}
+	data, err := json.Marshal(&pf)
+	if err != nil {
+		log.Error().Err(err).Msg("persist: marshal")
+		return
+	}
+	dir := filepath.Dir(s.persistPath)
+	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		log.Error().Err(err).Msg("persist: create temp")
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		log.Error().Err(err).Msg("persist: write")
+		return
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		log.Error().Err(err).Msg("persist: chmod")
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		log.Error().Err(err).Msg("persist: close")
+		return
+	}
+	if err := os.Rename(tmpName, s.persistPath); err != nil {
+		os.Remove(tmpName)
+		log.Error().Err(err).Msg("persist: rename")
 	}
 }
 
@@ -52,6 +190,7 @@ func (s *State) Register(req api.RegisterRequest) {
 	}
 	s.bySandbox[req.SandboxID] = st
 	s.bySource[req.SourceIP] = st
+	s.persist()
 }
 
 // Unregister drops both indexes for a sandbox. Idempotent.
@@ -65,6 +204,7 @@ func (s *State) Unregister(sandboxID string) {
 	}
 	delete(s.bySandbox, sandboxID)
 	delete(s.bySource, st.SourceIP)
+	s.persist()
 }
 
 // UpdateBindings replaces a sandbox's binding set. Returns false if the
@@ -81,6 +221,7 @@ func (s *State) UpdateBindings(sandboxID string, bindings []api.SecretBinding) b
 	for _, b := range bindings {
 		st.secretsByID[b.SecretID] = b
 	}
+	s.persist()
 	return true
 }
 
@@ -94,6 +235,7 @@ func (s *State) UpdateEgress(sandboxID string, egress api.EgressRules) bool {
 		return false
 	}
 	st.egress = egress
+	s.persist()
 	return true
 }
 
@@ -106,6 +248,7 @@ func (s *State) UpdateEgress(sandboxID string, egress api.EgressRules) bool {
 func (s *State) PropagateSecret(secretID, realValue string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	touched := false
 	for _, st := range s.bySandbox {
 		if _, ok := st.secretsByID[secretID]; !ok {
 			continue
@@ -121,6 +264,10 @@ func (s *State) PropagateSecret(secretID, realValue string) {
 			next[k] = v
 		}
 		st.secretsByID = next
+		touched = true
+	}
+	if touched {
+		s.persist()
 	}
 }
 

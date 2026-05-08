@@ -69,7 +69,22 @@ func run(listenAddr, socketPath string) error {
 		defer dbCleanup()
 	}
 
-	state := secretsproxy.NewState()
+	statePath := envOr("SECRETSPROXY_STATE_PATH", "/run/secretsproxy/state.json")
+	var state *secretsproxy.State
+	if statePath == "" {
+		state = secretsproxy.NewState()
+	} else {
+		s, lerr := secretsproxy.NewStateWithFile(statePath)
+		if lerr != nil {
+			// Corrupt or unreadable file: cold-start rather than refusing
+			// to boot. The file will be overwritten on the next mutation.
+			log.Warn().Err(lerr).Str("path", statePath).Msg("state file unreadable; starting empty")
+			state = secretsproxy.NewState()
+			state.SetPersistPath(statePath)
+		} else {
+			state = s
+		}
+	}
 	registry := secretsproxy.NewRegistry(secretsproxy.AnthropicConfig, secretsproxy.OpenAIConfig)
 	audit := secretsproxy.NewAuditWriter(queries)
 	go audit.Run(ctx)

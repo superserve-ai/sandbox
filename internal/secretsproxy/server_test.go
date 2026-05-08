@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -548,6 +549,94 @@ func TestState_PropagateSecret_Revoke(t *testing.T) {
 	sb, _ := st.LookupBySourceIP("10.11.0.5")
 	if _, present := sb.Bindings[secretID]; present {
 		t.Error("revoke did not remove binding")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Persistence — tmpfs state file.
+// ---------------------------------------------------------------------------
+
+func TestState_Persist_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/state.json"
+
+	src, err := NewStateWithFile(path)
+	if err != nil {
+		t.Fatalf("NewStateWithFile: %v", err)
+	}
+	sandboxID := uuid.NewString()
+	secretID := uuid.NewString()
+	src.Register(api.RegisterRequest{
+		SandboxID: sandboxID,
+		TeamID:    uuid.NewString(),
+		SourceIP:  "10.11.0.42",
+		Bindings: []api.SecretBinding{
+			{SecretID: secretID, Provider: "anthropic", EnvKey: "K", RealValue: "real"},
+		},
+		Egress: api.EgressRules{AllowOut: []string{"api.anthropic.com"}},
+	})
+
+	// New State pointed at the same file should see the registration.
+	dst, err := NewStateWithFile(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	sb, ok := dst.LookupBySourceIP("10.11.0.42")
+	if !ok {
+		t.Fatal("reloaded state missing sandbox")
+	}
+	if sb.SandboxID != sandboxID {
+		t.Errorf("sandbox_id=%q, want %q", sb.SandboxID, sandboxID)
+	}
+	if sb.Bindings[secretID].RealValue != "real" {
+		t.Errorf("real value lost across reload")
+	}
+	if len(sb.Egress.AllowOut) != 1 || sb.Egress.AllowOut[0] != "api.anthropic.com" {
+		t.Errorf("egress lost: %+v", sb.Egress)
+	}
+}
+
+func TestState_Persist_MissingFileIsColdStart(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/never-existed.json"
+	st, err := NewStateWithFile(path)
+	if err != nil {
+		t.Fatalf("expected nil error on missing file, got %v", err)
+	}
+	if _, ok := st.LookupBySourceIP("anything"); ok {
+		t.Fatal("expected empty state")
+	}
+}
+
+func TestState_Persist_CorruptFileReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/corrupt.json"
+	if err := os.WriteFile(path, []byte("{this is not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStateWithFile(path); err == nil {
+		t.Fatal("expected error on corrupt file")
+	}
+}
+
+func TestState_Persist_RevocationPersisted(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/state.json"
+	st, _ := NewStateWithFile(path)
+	secretID := uuid.NewString()
+	st.Register(api.RegisterRequest{
+		SandboxID: uuid.NewString(),
+		SourceIP:  "10.11.0.43",
+		Bindings: []api.SecretBinding{
+			{SecretID: secretID, Provider: "anthropic", EnvKey: "K", RealValue: "old"},
+		},
+	})
+	st.PropagateSecret(secretID, "") // revoke
+
+	reloaded, _ := NewStateWithFile(path)
+	sb, _ := reloaded.LookupBySourceIP("10.11.0.43")
+	if _, present := sb.Bindings[secretID]; present {
+		t.Error("revoke did not persist")
 	}
 }
 
