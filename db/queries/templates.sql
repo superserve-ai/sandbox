@@ -239,16 +239,20 @@ WHERE template.id = build_done.template_id
 RETURNING template.*;
 
 -- name: FailBuild :one
--- Build row always flips to failed; template flips only if it never reached
--- 'ready' — a failed rebuild shouldn't brick a template whose previous
--- build's artifacts are still on disk and usable.
-WITH build_done AS (
+-- Build row flips to failed if not already terminal; template flips only if
+-- it never reached 'ready'. Always returns the template so a re-call on an
+-- already-terminal build is a clean no-op, not ErrNoRows.
+WITH target_build AS (
+  SELECT template_id FROM template_build WHERE template_build.id = $1
+),
+build_done AS (
   UPDATE template_build
   SET status = 'failed',
       finalized_at = now(),
       updated_at = now(),
       error_message = $2
-  WHERE template_build.id = $1 AND status IN ('pending', 'building', 'snapshotting')
+  WHERE template_build.id = $1
+    AND template_build.status IN ('pending', 'building', 'snapshotting')
   RETURNING template_id
 ),
 tpl_update AS (
@@ -262,8 +266,8 @@ tpl_update AS (
   RETURNING template.id
 )
 SELECT t.*
-FROM template t
-JOIN build_done bd ON bd.template_id = t.id;
+FROM target_build tb
+JOIN template t ON t.id = tb.template_id;
 
 -- name: CancelBuild :execrows
 -- User-initiated cancellation. Atomically transitions template_build →

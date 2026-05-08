@@ -134,6 +134,10 @@ func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
 		DriveID: driveID,
 		Body:    drive,
 	}); err != nil {
+		// Name the missing fork instead of leaking firecracker's opaque io_engine error.
+		if cfg.BasePath != "" && strings.Contains(err.Error(), "io_engine") {
+			return fmt.Errorf("attach drive rootfs: overlay-mode requires the firecracker fork (feat/block-overlay-cow-v1.15) on this host: %w", err)
+		}
 		return fmt.Errorf("attach drive rootfs: %w", err)
 	}
 

@@ -415,11 +415,15 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		s.failBuild(ctx, row.ID, res.ErrorMessage)
 		// Reap the half-written artifact dir so a failed build doesn't
 		// leak disk. Best-effort; nothing else trips on this dir staying.
-		gcCtx, gcCancel := context.WithTimeout(ctx, 10*time.Second)
-		if gcErr := vmd.DeleteBuildArtifacts(gcCtx, row.TemplateID.String(), *row.VmdBuildVmID); gcErr != nil {
-			rowLog.Warn().Err(gcErr).Msg("cleanup failed-build artifacts")
+		if row.VmdBuildVmID == nil {
+			rowLog.Warn().Msg("cleanup failed-build artifacts: row has no build VM id")
+		} else {
+			gcCtx, gcCancel := context.WithTimeout(ctx, 10*time.Second)
+			if gcErr := vmd.DeleteBuildArtifacts(gcCtx, row.TemplateID.String(), *row.VmdBuildVmID); gcErr != nil {
+				rowLog.Warn().Err(gcErr).Msg("cleanup failed-build artifacts")
+			}
+			gcCancel()
 		}
-		gcCancel()
 		rowLog.Info().Str("status", res.Status).Str("error", res.ErrorMessage).Msg("build terminal")
 		s.logBuildCompleted(ctx, row, "error", res.ErrorMessage, "")
 	}

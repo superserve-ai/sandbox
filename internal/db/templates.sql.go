@@ -282,13 +282,17 @@ func (q *Queries) CreateTemplateWithBuild(ctx context.Context, arg CreateTemplat
 }
 
 const failBuild = `-- name: FailBuild :one
-WITH build_done AS (
+WITH target_build AS (
+  SELECT template_id FROM template_build WHERE template_build.id = $1
+),
+build_done AS (
   UPDATE template_build
   SET status = 'failed',
       finalized_at = now(),
       updated_at = now(),
       error_message = $2
-  WHERE template_build.id = $1 AND status IN ('pending', 'building', 'snapshotting')
+  WHERE template_build.id = $1
+    AND template_build.status IN ('pending', 'building', 'snapshotting')
   RETURNING template_id
 ),
 tpl_update AS (
@@ -302,8 +306,8 @@ tpl_update AS (
   RETURNING template.id
 )
 SELECT t.id, t.team_id, t.name, t.status, t.build_spec, t.vcpu, t.memory_mib, t.disk_mib, t.rootfs_path, t.snapshot_path, t.mem_path, t.size_bytes, t.error_message, t.created_at, t.updated_at, t.built_at, t.deleted_at, t.base_path, t.delta_path
-FROM template t
-JOIN build_done bd ON bd.template_id = t.id
+FROM target_build tb
+JOIN template t ON t.id = tb.template_id
 `
 
 type FailBuildParams struct {
@@ -311,9 +315,9 @@ type FailBuildParams struct {
 	ErrorMessage *string   `json:"error_message"`
 }
 
-// Build row always flips to failed; template flips only if it never reached
-// 'ready' — a failed rebuild shouldn't brick a template whose previous
-// build's artifacts are still on disk and usable.
+// Build row flips to failed if not already terminal; template flips only if
+// it never reached 'ready'. Always returns the template so a re-call on an
+// already-terminal build is a clean no-op, not ErrNoRows.
 func (q *Queries) FailBuild(ctx context.Context, arg FailBuildParams) (Template, error) {
 	row := q.db.QueryRow(ctx, failBuild, arg.ID, arg.ErrorMessage)
 	var i Template
