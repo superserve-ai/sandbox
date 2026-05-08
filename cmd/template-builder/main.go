@@ -275,6 +275,15 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
 		bc.user, bc.workdir, len(bc.env))
 
+	// Push pending guest writes through virtio-block before snapshot —
+	// otherwise dirty pages only live in mem.snap and resumed sandboxes
+	// corrupt files when the kernel evicts them.
+	emitInternal("system", "syncing guest filesystem")
+	syncCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
+	if err := runShellCmd(ctx, netInfo.HostIP, "sync && sync", syncCtx); err != nil {
+		return fmt.Errorf("guest sync: %w", err)
+	}
+
 	// block_delta_dir → emits rootfs.delta so sandboxes can be created
 	// from this template's snapshot.
 	emitUser("system", "Saving template")
@@ -285,8 +294,40 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	emitInternal("system", "snapshot captured")
 
+	// Flush host page cache for each artifact so a sandbox cp'ing them
+	// later doesn't see sparse holes from still-dirty pages.
+	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath); err != nil {
+		return fmt.Errorf("fsync build artifacts: %w", err)
+	}
+	emitInternal("system", "artifacts fsynced")
+
 	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, br)
 
+	return nil
+}
+
+// fsyncBuildArtifacts fsyncs each path and then the parent dir. Empty paths skipped.
+func fsyncBuildArtifacts(snapDir string, paths ...string) error {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		f, err := os.OpenFile(p, os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", p, err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("sync %s: %w", p, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close %s: %w", p, err)
+		}
+	}
+	if d, err := os.Open(snapDir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 
