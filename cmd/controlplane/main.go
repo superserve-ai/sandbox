@@ -91,9 +91,7 @@ func run() error {
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
 
-	// Optional wiring: both envelope encryption and proxy-token signing
-	// are off when the corresponding env var is unset. Other endpoints
-	// remain unaffected.
+	// Optional wiring; off when the corresponding env var is unset.
 	if cfg.KMSKeyResource != "" {
 		kmsClient, kerr := kms.NewKeyManagementClient(ctx)
 		if kerr != nil {

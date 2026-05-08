@@ -108,14 +108,68 @@ func (f *testFixture) doRequest(t *testing.T, method, path, body, srcIP, authHea
 // Tests
 // ---------------------------------------------------------------------------
 
+// TestServer_OpenAIPath verifies the OpenAI provider config: path
+// `/openai/...`, header `Authorization: Bearer <key>`.
+func TestServer_OpenAIPath(t *testing.T) {
+	f := newFixture(t)
+	f.upstream.Close()
+	f.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.upstreamHits++
+		f.lastKey = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(f.upstream.Close)
+	cfg := OpenAIConfig
+	cfg.Upstream = f.upstream.URL
+	f.server = NewServer(f.state, f.signer, NewRegistry(cfg), nil)
+
+	srcIP := "10.11.0.20"
+	realKey := "sk-real-openai-12345"
+	sandboxID := uuid.New()
+	secretID := uuid.New()
+	f.state.Register(api.RegisterRequest{
+		SandboxID: sandboxID.String(),
+		TeamID:    uuid.NewString(),
+		SourceIP:  srcIP,
+		Bindings: []api.SecretBinding{{
+			SecretID:  secretID.String(),
+			Provider:  "openai",
+			EnvKey:    "OPENAI_API_KEY",
+			RealValue: realKey,
+		}},
+	})
+	tok, _ := f.signer.Mint(time.Now(), sandboxID, secretID, uuid.New())
+	wrapped := "sk-proxy-" + tok
+
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4"}`))
+	req.RemoteAddr = net.JoinHostPort(srcIP, "12345")
+	req.Header.Set("Authorization", "Bearer "+wrapped)
+	w := httptest.NewRecorder()
+	f.server.serve(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if f.upstreamHits != 1 {
+		t.Fatalf("upstream hits=%d", f.upstreamHits)
+	}
+	if f.lastKey != "Bearer "+realKey {
+		t.Errorf("upstream Authorization=%q, want Bearer %s", f.lastKey, realKey)
+	}
+}
+
 func TestServer_HappyPath(t *testing.T) {
 	f := newFixture(t)
 	srcIP := "10.11.0.1"
 	realKey := "sk-ant-real-12345"
 	sandboxID := uuid.New()
 	tok := f.sandboxAndToken(t, sandboxID, uuid.New(), uuid.New(), srcIP, realKey)
+	// Send the wrapped form the agent's env actually contains.
+	wrapped := AnthropicConfig.WrapPrefix + tok
 
-	w := f.doRequest(t, http.MethodPost, "/anthropic/v1/messages", `{"hi":1}`, srcIP, tok)
+	w := f.doRequest(t, http.MethodPost, "/anthropic/v1/messages", `{"hi":1}`, srcIP, wrapped)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())

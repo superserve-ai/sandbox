@@ -70,7 +70,7 @@ func run(listenAddr, socketPath string) error {
 	}
 
 	state := secretsproxy.NewState()
-	registry := secretsproxy.NewRegistry(secretsproxy.AnthropicConfig)
+	registry := secretsproxy.NewRegistry(secretsproxy.AnthropicConfig, secretsproxy.OpenAIConfig)
 	audit := secretsproxy.NewAuditWriter(queries)
 	go audit.Run(ctx)
 

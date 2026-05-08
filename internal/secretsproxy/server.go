@@ -150,16 +150,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.recordAudit(sb, parseUUID(claims.SecretID), cfg, r, resp.StatusCode, &upstreamStatus, time.Since(start), errCode)
 }
 
-// extractToken returns the token from the provider's auth header,
-// stripping any literal prefix the format requires (e.g. "Bearer ").
+// extractToken returns the JWT from the provider's auth header,
+// stripping the format prefix and WrapPrefix.
 func extractToken(r *http.Request, cfg ServiceConfig) string {
 	raw := r.Header.Get(cfg.KeyHeader)
 	if raw == "" {
 		return ""
 	}
-	prefix := strings.TrimSuffix(cfg.KeyFormat, "%s")
-	if prefix != "" && strings.HasPrefix(raw, prefix) {
-		return strings.TrimPrefix(raw, prefix)
+	if hp := strings.TrimSuffix(cfg.KeyFormat, "%s"); hp != "" && strings.HasPrefix(raw, hp) {
+		raw = strings.TrimPrefix(raw, hp)
+	}
+	if cfg.WrapPrefix != "" && strings.HasPrefix(raw, cfg.WrapPrefix) {
+		raw = strings.TrimPrefix(raw, cfg.WrapPrefix)
 	}
 	return raw
 }

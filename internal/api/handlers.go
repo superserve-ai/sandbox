@@ -58,9 +58,7 @@ type Handlers struct {
 	Config    *config.Config
 	Hosts     HostRegistry // when set, routes VMD calls via host_id
 	Scheduler Scheduler    // when set, picks host on create
-	// Encryptor and Signer are required by /secrets and by sandbox-create
-	// paths that reference stored secrets. Left nil in unit tests that
-	// don't exercise those paths.
+	// Required by /secrets and by sandbox-create with secret refs.
 	Encryptor secrets.Encryptor
 	Signer    *secrets.Signer
 }

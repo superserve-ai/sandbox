@@ -15,6 +15,9 @@ type ServiceConfig struct {
 	Upstream   string // e.g. "https://api.anthropic.com"
 	KeyHeader  string // e.g. "x-api-key" or "Authorization"
 	KeyFormat  string // e.g. "%s" or "Bearer %s"
+	// WrapPrefix prepended to the JWT in the agent's env; stripped here
+	// before verify.
+	WrapPrefix string
 }
 
 // SetKey writes the real key into the outgoing request using the
@@ -30,6 +33,17 @@ var AnthropicConfig = ServiceConfig{
 	Upstream:   "https://api.anthropic.com",
 	KeyHeader:  "x-api-key",
 	KeyFormat:  "%s",
+	WrapPrefix: "sk-ant-proxy-",
+}
+
+// OpenAIConfig — auth is `Authorization: Bearer <key>`.
+var OpenAIConfig = ServiceConfig{
+	Name:       "openai",
+	PathPrefix: "/openai",
+	Upstream:   "https://api.openai.com",
+	KeyHeader:  "Authorization",
+	KeyFormat:  "Bearer %s",
+	WrapPrefix: "sk-proxy-",
 }
 
 // Registry resolves provider configs by name and by request path.

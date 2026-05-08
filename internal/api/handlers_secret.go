@@ -22,11 +22,10 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// providerUpstreamHost is the host each provider's traffic forwards to.
-// Used to reject sandbox creates that reference a secret blocked by the
-// caller's egress rules.
+// Provider → upstream host, for the egress-vs-secret check at create.
 var providerUpstreamHost = map[string]string{
 	"anthropic": "api.anthropic.com",
+	"openai":    "api.openai.com",
 }
 
 var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -50,8 +49,7 @@ func validateSecretsRefs(refs map[string]string) error {
 }
 
 // resolveSecretBindings decrypts each referenced secret and mints a
-// sandbox-bound token. Returns *AppError so the caller can map
-// user-input failures to 400 and server-side failures to 500.
+// sandbox-bound token. Errors are typed AppError to keep 400/500 distinct.
 func (h *Handlers) resolveSecretBindings(
 	ctx context.Context,
 	teamID, sandboxID uuid.UUID,
@@ -122,9 +120,7 @@ func (h *Handlers) resolveSecretBindings(
 }
 
 // resolveSecretBindingsForResume rebuilds bindings from sandbox_secret,
-// decrypting each value and minting a fresh token. Returns (nil, nil)
-// when the sandbox has no bindings. Soft-deleted secrets are dropped
-// by the underlying join.
+// decrypting each value and minting a fresh token.
 func (h *Handlers) resolveSecretBindingsForResume(
 	ctx context.Context,
 	teamID, sandboxID uuid.UUID,
@@ -202,15 +198,18 @@ func upstreamAllowedByEgress(provider string, netCfg *networkConfigRequest) erro
 	return fmt.Errorf("provider %q upstream %s is not in allow_out", provider, host)
 }
 
-// wrapTokenForProvider matches the SDK's expected key prefix so the
-// client accepts our token from env. Anthropic checks for `sk-ant-`.
+// providerWrapPrefix duplicates ServiceConfig.WrapPrefix to avoid an
+// import cycle.
+var providerWrapPrefix = map[string]string{
+	"anthropic": "sk-ant-proxy-",
+	"openai":    "sk-proxy-",
+}
+
 func wrapTokenForProvider(provider, jwt string) string {
-	switch provider {
-	case "anthropic":
-		return "sk-ant-proxy-" + jwt
-	default:
-		return jwt
+	if p, ok := providerWrapPrefix[provider]; ok {
+		return p + jwt
 	}
+	return jwt
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +266,7 @@ var secretNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
 var supportedProviders = map[string]bool{
 	"anthropic": true,
+	"openai":    true,
 }
 
 func validateSecretName(name string) error {

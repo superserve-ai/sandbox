@@ -186,7 +186,7 @@ func TestCreateSecret_BadProvider(t *testing.T) {
 	}
 	h := &Handlers{DB: db.New(mock), Encryptor: &fakeEnc{}}
 	w := httptest.NewRecorder()
-	body := `{"name":"FOO","provider":"openai","value":"x"}`
+	body := `{"name":"FOO","provider":"google","value":"x"}`
 	setupSecretRouter(h, teamID.String()).ServeHTTP(w, jsonReq(http.MethodPost, "/secrets", body))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status=%d, body=%s", w.Code, w.Body.String())
@@ -627,12 +627,14 @@ func TestResolveSecretBindings_NotConfigured(t *testing.T) {
 }
 
 func TestValidateProvider_ListsSupported(t *testing.T) {
-	err := validateProvider("openai")
+	err := validateProvider("nonsense")
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "anthropic") {
-		t.Errorf("error %q does not list supported providers", err)
+	for _, want := range []string{"anthropic", "openai"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not list %q", err, want)
+		}
 	}
 }
 

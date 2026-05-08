@@ -1429,7 +1429,7 @@ components:
           example: ANTHROPIC_PROD
         provider:
           type: string
-          enum: [anthropic]
+          enum: [anthropic, openai]
           description: Upstream this credential authenticates against.
         value:
           type: string
@@ -1458,7 +1458,7 @@ components:
           type: string
         provider:
           type: string
-          enum: [anthropic]
+          enum: [anthropic, openai]
         created_at:
           type: string
           format: date-time
