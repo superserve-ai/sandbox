@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -379,6 +380,35 @@ func TestState_PropagateSecret_Rotation(t *testing.T) {
 			t.Errorf("ip=%s real value=%q, want new", ip, sb.Bindings[secretID].RealValue)
 		}
 	}
+}
+
+// Concurrent reader + writer; must be safe under -race.
+func TestState_PropagateSecret_RaceWithReader(t *testing.T) {
+	st := NewState()
+	secretID := uuid.NewString()
+	st.Register(api.RegisterRequest{
+		SandboxID: uuid.NewString(),
+		SourceIP:  "10.11.0.1",
+		Bindings: []api.SecretBinding{
+			{SecretID: secretID, Provider: "anthropic", EnvKey: "K", RealValue: "v0"},
+		},
+	})
+	done := make(chan struct{}, 2)
+	go func() {
+		for i := 0; i < 200; i++ {
+			st.PropagateSecret(secretID, fmt.Sprintf("v%d", i))
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		for i := 0; i < 200; i++ {
+			sb, _ := st.LookupBySourceIP("10.11.0.1")
+			_ = sb.Bindings[secretID]
+		}
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
 }
 
 func TestState_PropagateSecret_Revoke(t *testing.T) {

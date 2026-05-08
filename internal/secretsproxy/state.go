@@ -99,20 +99,28 @@ func (s *State) UpdateEgress(sandboxID string, egress api.EgressRules) bool {
 
 // PropagateSecret updates the real value for every sandbox that holds a
 // binding for secretID. realValue == "" removes the binding (revoke).
+//
+// Builds a new map per affected sandbox rather than mutating in place so
+// readers holding a reference from LookupBySourceIP can finish without
+// racing on the underlying map.
 func (s *State) PropagateSecret(secretID, realValue string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, st := range s.bySandbox {
-		b, ok := st.secretsByID[secretID]
-		if !ok {
+		if _, ok := st.secretsByID[secretID]; !ok {
 			continue
 		}
-		if realValue == "" {
-			delete(st.secretsByID, secretID)
-			continue
+		next := make(map[string]api.SecretBinding, len(st.secretsByID))
+		for k, v := range st.secretsByID {
+			if k == secretID {
+				if realValue == "" {
+					continue // revoke: drop the binding
+				}
+				v.RealValue = realValue
+			}
+			next[k] = v
 		}
-		b.RealValue = realValue
-		st.secretsByID[secretID] = b
+		st.secretsByID = next
 	}
 }
 
