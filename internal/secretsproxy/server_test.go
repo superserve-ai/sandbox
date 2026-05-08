@@ -217,6 +217,72 @@ func TestServer_InvalidToken(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status=%d", w.Code)
 	}
+	if got := errorCodeFrom(t, w); got != "invalid_token" {
+		t.Errorf("error code = %q, want invalid_token", got)
+	}
+}
+
+func TestServer_TokenExpired(t *testing.T) {
+	f := newFixture(t)
+	srcIP := "10.11.0.30"
+	sandboxID, secretID, teamID := uuid.New(), uuid.New(), uuid.New()
+	f.state.Register(api.RegisterRequest{
+		SandboxID: sandboxID.String(), TeamID: teamID.String(), SourceIP: srcIP,
+		Bindings: []api.SecretBinding{{
+			SecretID: secretID.String(), Provider: "anthropic", EnvKey: "K", RealValue: "x",
+		}},
+	})
+	// Mint with a past clock so exp is already in the past.
+	tok, err := f.signer.Mint(time.Now().Add(-2*time.Hour), sandboxID, secretID, teamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := f.doRequest(t, http.MethodPost, "/anthropic/v1/messages", "", srcIP, AnthropicConfig.WrapPrefix+tok)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := errorCodeFrom(t, w); got != "token_expired" {
+		t.Errorf("error code = %q, want token_expired", got)
+	}
+}
+
+func TestServer_BadSignature(t *testing.T) {
+	f := newFixture(t)
+	// Sign with a different key so signature verification fails.
+	otherKey := make([]byte, 32)
+	rand.Read(otherKey)
+	otherSigner, _ := secrets.NewSigner(otherKey, "v1", "test-iss", "secretsproxy", time.Hour)
+
+	srcIP := "10.11.0.31"
+	sandboxID, secretID, teamID := uuid.New(), uuid.New(), uuid.New()
+	f.state.Register(api.RegisterRequest{
+		SandboxID: sandboxID.String(), TeamID: teamID.String(), SourceIP: srcIP,
+		Bindings: []api.SecretBinding{{
+			SecretID: secretID.String(), Provider: "anthropic", EnvKey: "K", RealValue: "x",
+		}},
+	})
+	tok, _ := otherSigner.Mint(time.Now(), sandboxID, secretID, teamID)
+	w := f.doRequest(t, http.MethodPost, "/anthropic/v1/messages", "", srcIP, AnthropicConfig.WrapPrefix+tok)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := errorCodeFrom(t, w); got != "invalid_signature" {
+		t.Errorf("error code = %q, want invalid_signature", got)
+	}
+}
+
+// errorCodeFrom pulls error.code from the proxy's JSON error response.
+func errorCodeFrom(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, w.Body.String())
+	}
+	return body.Error.Code
 }
 
 func TestServer_TokenSandboxMismatch(t *testing.T) {

@@ -74,6 +74,18 @@ func (s *Signer) Mint(now time.Time, sandboxID, secretID, teamID uuid.UUID) (str
 	return tok.SignedString(s.key)
 }
 
+// IsExpired reports whether err is a JWT-expired error.
+func IsExpired(err error) bool {
+	return errors.Is(err, jwt.ErrTokenExpired)
+}
+
+// IsBadSignature reports whether err is a JWT signature/key error.
+func IsBadSignature(err error) bool {
+	return errors.Is(err, jwt.ErrTokenSignatureInvalid) ||
+		errors.Is(err, jwt.ErrTokenUnverifiable) ||
+		errors.Is(err, jwt.ErrInvalidKey)
+}
+
 // Verify parses and validates a token. Algorithm is pinned to HS256;
 // issuer, audience, and expiry are required.
 func (s *Signer) Verify(now time.Time, token string) (*Claims, error) {

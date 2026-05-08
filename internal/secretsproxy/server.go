@@ -104,8 +104,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 
 	claims, err := s.verifier.Verify(time.Now(), extractToken(r, cfg))
 	if err != nil {
-		writeProxyError(w, http.StatusUnauthorized, "invalid_token", "token verification failed")
-		s.recordAudit(sb, uuid.Nil, cfg, r, http.StatusUnauthorized, nil, time.Since(start), "invalid_token")
+		code, msg := classifyTokenError(err)
+		writeProxyError(w, http.StatusUnauthorized, code, msg)
+		s.recordAudit(sb, uuid.Nil, cfg, r, http.StatusUnauthorized, nil, time.Since(start), code)
 		return
 	}
 	if claims.Subject != sb.SandboxID {
@@ -374,6 +375,20 @@ func parseUUID(s string) uuid.UUID {
 		return uuid.Nil
 	}
 	return id
+}
+
+// classifyTokenError maps a JWT verify error to a public error code and
+// message.
+func classifyTokenError(err error) (code, msg string) {
+	switch {
+	case secrets.IsExpired(err):
+		return "token_expired",
+			"Sandbox secret token expired. Recreate the sandbox to continue."
+	case secrets.IsBadSignature(err):
+		return "invalid_signature", "Token signature did not validate."
+	default:
+		return "invalid_token", "Token verification failed."
+	}
 }
 
 func writeProxyError(w http.ResponseWriter, status int, code, message string) {
