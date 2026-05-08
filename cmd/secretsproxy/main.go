@@ -91,14 +91,24 @@ func run(listenAddr, socketPath string) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
+	cleanup := func() { _ = tcpLn.Close() }
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+
 	_ = os.Remove(socketPath)
 	unixLn, err := net.Listen("unix", socketPath)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", socketPath, err)
 	}
+	cleanup = func() { _ = tcpLn.Close(); _ = unixLn.Close() }
+
 	if err := os.Chmod(socketPath, 0o660); err != nil {
 		return fmt.Errorf("chmod socket: %w", err)
 	}
+	cleanup = nil // listeners now owned by the http.Servers below
 
 	log.Info().Str("listen", listenAddr).Str("socket", socketPath).Msg("secretsproxy ready")
 

@@ -114,7 +114,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
+	bodyReader := http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), bodyReader)
 	if err != nil {
 		writeProxyError(w, http.StatusInternalServerError, "build_request", err.Error())
 		return
@@ -193,6 +194,10 @@ func copyForwardableHeaders(in, out http.Header, keyHeader string) {
 	}
 	out.Set("User-Agent", "superserve-secretsproxy/1.0")
 }
+
+// Hard cap on inbound bodies. Provider limits are typically lower (e.g.
+// 20–32 MiB); this is the abuse ceiling, not the per-provider quota.
+const maxRequestBodyBytes = 50 * 1024 * 1024
 
 // SSE event line indicating a mid-stream failure after a 200.
 var sseStreamErrorMarker = []byte("event: error")

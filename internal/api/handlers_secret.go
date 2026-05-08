@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -481,7 +482,8 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 		return
 	}
 
-	go h.propagateSecretToHosts(context.WithoutCancel(c.Request.Context()), updated.ID, req.Value)
+	// context.Background so a client disconnect doesn't abort fanout.
+	go h.propagateSecretToHosts(context.Background(), updated.ID, req.Value)
 
 	c.JSON(http.StatusOK, toSecretResponse(updated))
 }
@@ -511,13 +513,13 @@ func (h *Handlers) DeleteSecret(c *gin.Context) {
 	}
 
 	// Empty value = revoke.
-	go h.propagateSecretToHosts(context.WithoutCancel(c.Request.Context()), row.ID, "")
+	go h.propagateSecretToHosts(context.Background(), row.ID, "")
 
 	c.Status(http.StatusNoContent)
 }
 
-// propagateSecretToHosts fans out a new (or empty=revoke) value to every
-// host that has a sandbox bound to the secret. Best-effort.
+// propagateSecretToHosts fans out the new (or empty=revoke) value to
+// each host. Parallel, one retry, errors logged.
 func (h *Handlers) propagateSecretToHosts(ctx context.Context, secretID uuid.UUID, realValue string) {
 	if h.Hosts == nil {
 		return
@@ -531,16 +533,31 @@ func (h *Handlers) propagateSecretToHosts(ctx context.Context, secretID uuid.UUI
 	for _, r := range rows {
 		hosts[r.HostID] = struct{}{}
 	}
+
+	var wg sync.WaitGroup
 	for hostID := range hosts {
-		client, herr := h.Hosts.ClientFor(ctx, hostID)
-		if herr != nil {
-			log.Error().Err(herr).Str("host_id", hostID).Msg("propagate: resolve host client")
-			continue
-		}
-		if perr := client.PropagateSecret(ctx, secretID.String(), realValue); perr != nil {
-			log.Error().Err(perr).Str("host_id", hostID).Msg("propagate: vmd PropagateSecret")
-		}
+		wg.Add(1)
+		go func(hostID string) {
+			defer wg.Done()
+			client, herr := h.Hosts.ClientFor(ctx, hostID)
+			if herr != nil {
+				log.Error().Err(herr).Str("host_id", hostID).Msg("propagate: resolve host client")
+				return
+			}
+			perr := client.PropagateSecret(ctx, secretID.String(), realValue)
+			if perr == nil {
+				return
+			}
+			// One retry on transient failure (network blip, vmd restart).
+			time.Sleep(500 * time.Millisecond)
+			if perr2 := client.PropagateSecret(ctx, secretID.String(), realValue); perr2 != nil {
+				log.Error().Err(perr2).Str("host_id", hostID).
+					AnErr("first_attempt", perr).
+					Msg("propagate: vmd PropagateSecret failed after retry")
+			}
+		}(hostID)
 	}
+	wg.Wait()
 }
 
 // ---------------------------------------------------------------------------
