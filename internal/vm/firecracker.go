@@ -20,8 +20,14 @@ import (
 // retry won't help, the snapshot must be retaken from a healthy source.
 var ErrTornSnapshot = errors.New("torn snapshot (overlay side-car empty)")
 
+// tornSnapshotMarker is the exact substring the forked Firecracker embeds in
+// its error when it detects a 0-byte side-car on snapshot load. Kept as a
+// named constant so a fork message change breaks the build here, not silently
+// at runtime.
+const tornSnapshotMarker = "(torn snapshot save)"
+
 func isTornSnapshotErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "(torn snapshot save)")
+	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
 }
 
 // ---------------------------------------------------------------------------

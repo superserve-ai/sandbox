@@ -324,9 +324,17 @@ func fsyncBuildArtifacts(snapDir string, paths ...string) error {
 			return fmt.Errorf("close %s: %w", p, err)
 		}
 	}
-	if d, err := os.Open(snapDir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+	if d, err := os.Open(snapDir); err != nil {
+		return fmt.Errorf("open dir %s: %w", snapDir, err)
+	} else {
+		syncErr := d.Sync()
+		closeErr := d.Close()
+		if syncErr != nil {
+			return fmt.Errorf("sync dir %s: %w", snapDir, syncErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close dir %s: %w", snapDir, closeErr)
+		}
 	}
 	return nil
 }
