@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,6 +15,14 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vm/fc/client/operations"
 	"github.com/superserve-ai/sandbox/internal/vm/fc/models"
 )
+
+// ErrTornSnapshot is the firecracker fork's 0-byte side-car sentinel —
+// retry won't help, the snapshot must be retaken from a healthy source.
+var ErrTornSnapshot = errors.New("torn snapshot (overlay side-car empty)")
+
+func isTornSnapshotErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "(torn snapshot save)")
+}
 
 // ---------------------------------------------------------------------------
 // Firecracker config (our internal type, not a Firecracker API type)
@@ -277,6 +286,9 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) er
 			BlockDeltaDir:    blockDeltaDir,
 		},
 	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot: %w: %v", ErrTornSnapshot, err)
+		}
 		return fmt.Errorf("load snapshot: %w", err)
 	}
 	return nil
@@ -301,6 +313,9 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 			BlockDeltaDir: blockDeltaDir,
 		},
 	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot: %w: %v", ErrTornSnapshot, err)
+		}
 		return fmt.Errorf("load snapshot: %w", err)
 	}
 	return nil

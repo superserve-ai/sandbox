@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -877,6 +878,11 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
+		if errors.Is(restoreErr, ErrTornSnapshot) {
+			return nil, status.Errorf(codes.DataLoss,
+				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
+				snapshotPath, restoreErr)
+		}
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
