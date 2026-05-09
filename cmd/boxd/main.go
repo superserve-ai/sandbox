@@ -479,11 +479,15 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	<-done
 	_ = cmd.Wait()
 
+	status := ""
+	if cmd.ProcessState != nil {
+		status = cmd.ProcessState.String()
+	}
 	return stream.Send(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_End{End: &pb.EndEvent{
 			ExitCode: finalExitCode(cmd.ProcessState, timedOut.Load()),
 			Exited:   cmd.ProcessState != nil && cmd.ProcessState.Exited(),
-			Status:   cmd.ProcessState.String(),
+			Status:   status,
 		}},
 	})
 }
@@ -587,11 +591,15 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 		return sendErr
 	}
 
+	status := ""
+	if cmd.ProcessState != nil {
+		status = cmd.ProcessState.String()
+	}
 	return stream.Send(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_End{End: &pb.EndEvent{
 			ExitCode: finalExitCode(cmd.ProcessState, timedOut.Load()),
 			Exited:   cmd.ProcessState != nil && cmd.ProcessState.Exited(),
-			Status:   cmd.ProcessState.String(),
+			Status:   status,
 		}},
 	})
 }
