@@ -46,7 +46,7 @@ const beginPause = `-- name: BeginPause :one
 UPDATE sandbox
 SET status = 'pausing', updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
 `
 
 type BeginPauseParams struct {
@@ -82,6 +82,10 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox
 		&i.TimeoutSeconds,
 		&i.Metadata,
 		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
 	)
 	return i, err
 }
@@ -90,7 +94,7 @@ const beginResume = `-- name: BeginResume :one
 UPDATE sandbox
 SET status = 'resuming', updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
 `
 
 type BeginResumeParams struct {
@@ -123,6 +127,10 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 		&i.TimeoutSeconds,
 		&i.Metadata,
 		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
 	)
 	return i, err
 }
@@ -190,6 +198,20 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 	return items, nil
 }
 
+const countActiveSandboxesAtBasePath = `-- name: CountActiveSandboxesAtBasePath :one
+SELECT COUNT(*)::bigint FROM sandbox
+WHERE base_path = $1 AND destroyed_at IS NULL
+`
+
+// Count of non-destroyed sandboxes still referencing this base_path. Used at
+// destroy time to decide whether the per-build artifact dir is safe to GC.
+func (q *Queries) CountActiveSandboxesAtBasePath(ctx context.Context, basePath *string) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveSandboxesAtBasePath, basePath)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countActiveSandboxesForTeam = `-- name: CountActiveSandboxesForTeam :one
 SELECT COUNT(*)::bigint FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL AND status != 'failed'
@@ -205,9 +227,9 @@ func (q *Queries) CountActiveSandboxesForTeam(ctx context.Context, teamID uuid.U
 }
 
 const createSandbox = `-- name: CreateSandbox :one
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
 `
 
 type CreateSandboxParams struct {
@@ -224,6 +246,10 @@ type CreateSandboxParams struct {
 	TimeoutSeconds *int32        `json:"timeout_seconds"`
 	Metadata       []byte        `json:"metadata"`
 	TemplateID     pgtype.UUID   `json:"template_id"`
+	SnapshotPath   *string       `json:"snapshot_path"`
+	MemPath        *string       `json:"mem_path"`
+	BasePath       *string       `json:"base_path"`
+	DeltaPath      *string       `json:"delta_path"`
 }
 
 // ID is supplied by the caller (generated in Go via uuid.New()) rather
@@ -231,6 +257,8 @@ type CreateSandboxParams struct {
 // the VMD CreateVM call — both need the same sandbox_id and generating
 // it client-side lets them run concurrently instead of strictly serially.
 // template_id is optional (NULL when sandbox is not derived from a template).
+// snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
+// specific build's artifacts so a later template rebuild can't corrupt it.
 func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, createSandbox,
 		arg.ID,
@@ -246,6 +274,10 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		arg.TimeoutSeconds,
 		arg.Metadata,
 		arg.TemplateID,
+		arg.SnapshotPath,
+		arg.MemPath,
+		arg.BasePath,
+		arg.DeltaPath,
 	)
 	var i Sandbox
 	err := row.Scan(
@@ -266,6 +298,10 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		&i.TimeoutSeconds,
 		&i.Metadata,
 		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
 	)
 	return i, err
 }
@@ -278,9 +314,9 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id FROM tpl
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19 FROM tpl
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
 `
 
 type CreateSandboxFromTemplateParams struct {
@@ -299,6 +335,10 @@ type CreateSandboxFromTemplateParams struct {
 	ID_2           uuid.UUID     `json:"id_2"`
 	TeamID_2       uuid.UUID     `json:"team_id_2"`
 	TeamID_3       uuid.UUID     `json:"team_id_3"`
+	SnapshotPath   *string       `json:"snapshot_path"`
+	MemPath        *string       `json:"mem_path"`
+	BasePath       *string       `json:"base_path"`
+	DeltaPath      *string       `json:"delta_path"`
 }
 
 // CreateSandbox variant that holds FOR KEY SHARE on the template row
@@ -322,6 +362,10 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		arg.ID_2,
 		arg.TeamID_2,
 		arg.TeamID_3,
+		arg.SnapshotPath,
+		arg.MemPath,
+		arg.BasePath,
+		arg.DeltaPath,
 	)
 	var i Sandbox
 	err := row.Scan(
@@ -342,6 +386,10 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		&i.TimeoutSeconds,
 		&i.Metadata,
 		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
 	)
 	return i, err
 }
@@ -415,7 +463,7 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -445,6 +493,10 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.TimeoutSeconds,
 		&i.Metadata,
 		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
 	)
 	return i, err
 }
@@ -466,8 +518,35 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	return network_config, err
 }
 
+const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
+SELECT DISTINCT base_path FROM sandbox
+WHERE base_path IS NOT NULL AND destroyed_at IS NULL
+`
+
+// Reconciler input: distinct base_path values held by non-destroyed
+// sandboxes. Their builds must survive even if the template moved on.
+func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
+	rows, err := q.db.Query(ctx, listPinnedBuildPaths)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*string{}
+	for rows.Next() {
+		var base_path *string
+		if err := rows.Scan(&base_path); err != nil {
+			return nil, err
+		}
+		items = append(items, base_path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, snap.path AS snapshot_path
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, snap.path AS snapshot_path
 FROM sandbox s
 LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL
@@ -507,6 +586,10 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 			&i.Sandbox.TimeoutSeconds,
 			&i.Sandbox.Metadata,
 			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
 			&i.SnapshotPath,
 		); err != nil {
 			return nil, err
@@ -520,7 +603,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByTeam = `-- name: ListSandboxesByTeam :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
 ORDER BY created_at DESC
 `
@@ -552,6 +635,10 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.TimeoutSeconds,
 			&i.Metadata,
 			&i.TemplateID,
+			&i.SnapshotPath,
+			&i.MemPath,
+			&i.BasePath,
+			&i.DeltaPath,
 		); err != nil {
 			return nil, err
 		}
@@ -564,7 +651,7 @@ func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]
 }
 
 const listSandboxesByTeamWithFilter = `-- name: ListSandboxesByTeamWithFilter :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
@@ -607,6 +694,10 @@ func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSan
 			&i.TimeoutSeconds,
 			&i.Metadata,
 			&i.TemplateID,
+			&i.SnapshotPath,
+			&i.MemPath,
+			&i.BasePath,
+			&i.DeltaPath,
 		); err != nil {
 			return nil, err
 		}

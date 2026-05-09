@@ -91,6 +91,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			DiskSizeMiB: rl.GetDiskSizeMib(),
 		}
 	}
+	vmCfg.BasePath = req.GetBasePath()
+	vmCfg.DeltaDir = req.GetDeltaDir()
 
 	var netCfg *network.Config
 	if nc := req.GetNetworkConfig(); nc != nil {
@@ -102,7 +104,7 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		}
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), req.GetOverlayPath(), vmCfg, netCfg)
+	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +159,37 @@ func (a *GRPCAdapter) DeleteTemplateArtifacts(ctx context.Context, req *vmdpb.De
 		return nil, err
 	}
 	return &vmdpb.DeleteTemplateArtifactsResponse{Deleted: true}, nil
+}
+
+// ListBuildArtifacts returns every per-build dir on the host's snapshot
+// storage. The controlplane reconciler uses this to find orphans.
+func (a *GRPCAdapter) ListBuildArtifacts(ctx context.Context, req *vmdpb.ListBuildArtifactsRequest) (*vmdpb.ListBuildArtifactsResponse, error) {
+	entries, err := a.mgr.ListBuildArtifacts()
+	if err != nil {
+		return nil, err
+	}
+	resp := &vmdpb.ListBuildArtifactsResponse{Entries: make([]*vmdpb.BuildArtifactEntry, 0, len(entries))}
+	for _, e := range entries {
+		resp.Entries = append(resp.Entries, &vmdpb.BuildArtifactEntry{
+			TemplateId: e.TemplateID,
+			BuildId:    e.BuildID,
+			MtimeUnix:  e.MTime.Unix(),
+		})
+	}
+	return resp, nil
+}
+
+// DeleteBuildArtifacts removes a single build's subdir under a template.
+func (a *GRPCAdapter) DeleteBuildArtifacts(ctx context.Context, req *vmdpb.DeleteBuildArtifactsRequest) (*vmdpb.DeleteBuildArtifactsResponse, error) {
+	tplID := req.GetTemplateId()
+	buildID := req.GetBuildId()
+	if tplID == "" || buildID == "" {
+		return nil, status.Error(codes.InvalidArgument, "template_id and build_id must be set")
+	}
+	if err := a.mgr.DeleteBuildArtifacts(tplID, buildID); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteBuildArtifactsResponse{Deleted: true}, nil
 }
 
 func (a *GRPCAdapter) ExecCommand(req *vmdpb.ExecCommandRequest, stream grpc.ServerStreamingServer[vmdpb.ExecCommandResponse]) error {
@@ -327,6 +360,8 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 		resp.SnapshotPath = snap.Result.SnapshotPath
 		resp.MemFilePath = snap.Result.MemFilePath
 		resp.RootfsPath = snap.Result.RootfsPath
+		resp.BasePath = snap.Result.BasePath
+		resp.DeltaPath = snap.Result.DeltaPath
 		resp.ResolvedDigest = snap.Result.ResolvedDigest
 		resp.SizeBytes = snap.Result.SizeBytes
 	}

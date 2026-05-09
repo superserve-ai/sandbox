@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,25 +16,41 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vm/fc/models"
 )
 
+// ErrTornSnapshot is the firecracker fork's 0-byte side-car sentinel —
+// retry won't help, the snapshot must be retaken from a healthy source.
+var ErrTornSnapshot = errors.New("torn snapshot (overlay side-car empty)")
+
+// tornSnapshotMarker is the exact substring the forked Firecracker embeds in
+// its error when it detects a 0-byte side-car on snapshot load. Kept as a
+// named constant so a fork message change breaks the build here, not silently
+// at runtime.
+const tornSnapshotMarker = "(torn snapshot save)"
+
+func isTornSnapshotErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
+}
+
 // ---------------------------------------------------------------------------
 // Firecracker config (our internal type, not a Firecracker API type)
 // ---------------------------------------------------------------------------
 
 // FirecrackerConfig holds the inputs needed to configure a Firecracker VM.
 type FirecrackerConfig struct {
-	SocketPath     string
-	KernelPath     string
-	KernelArgs     string
-	RootfsPath     string
-	BaseRootfsPath string // Read-only base image for overlay mode (empty = no overlay)
-	VCPUCount      int
-	MemSizeMiB     int
-	TAPDevice      string
-	MACAddress     string
-	VMID           string
-	VsockPath      string
-	VMIP           string
-	GatewayIP      string
+	SocketPath string
+	KernelPath string
+	KernelArgs string
+	RootfsPath string
+	// Non-empty BasePath triggers overlay mode: RootfsPath becomes a
+	// sparse per-VM overlay backed by this shared read-only base.
+	BasePath   string
+	VCPUCount  int
+	MemSizeMiB int
+	TAPDevice  string
+	MACAddress string
+	VMID       string
+	VsockPath  string
+	VMIP       string
+	GatewayIP  string
 }
 
 // ---------------------------------------------------------------------------
@@ -117,16 +134,25 @@ func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
 
 	// 3. Attach rootfs drive.
 	driveID := "rootfs"
+	drive := &models.Drive{
+		DriveID:      &driveID,
+		PathOnHost:   cfg.RootfsPath,
+		IsRootDevice: boolPtr(true),
+		IsReadOnly:   false,
+	}
+	if cfg.BasePath != "" {
+		drive.IoEngine = strPtr("Overlay")
+		drive.BasePath = cfg.BasePath
+	}
 	if _, err := fc.Operations.PutGuestDriveByID(&operations.PutGuestDriveByIDParams{
 		Context: ctx,
 		DriveID: driveID,
-		Body: &models.Drive{
-			DriveID:      &driveID,
-			PathOnHost:   cfg.RootfsPath,
-			IsRootDevice: boolPtr(true),
-			IsReadOnly:   false,
-		},
+		Body:    drive,
 	}); err != nil {
+		// Name the missing fork instead of leaking firecracker's opaque io_engine error.
+		if cfg.BasePath != "" && strings.Contains(err.Error(), "io_engine") {
+			return fmt.Errorf("attach drive rootfs: overlay-mode requires the firecracker fork (feat/block-overlay-cow-v1.15) on this host: %w", err)
+		}
 		return fmt.Errorf("attach drive rootfs: %w", err)
 	}
 
@@ -204,8 +230,10 @@ func StartInstance(socketPath string) error {
 // Snapshot operations
 // ---------------------------------------------------------------------------
 
-// CreateSnapshot pauses the VM and creates a full snapshot.
-func CreateSnapshot(socketPath, snapshotPath, memPath string) error {
+// CreateSnapshot pauses the VM and creates a full snapshot. Non-empty
+// blockDeltaDir tells the forked engine to also emit <drive_id>.delta files
+// containing dirty blocks — required to create sandboxes from this template.
+func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
@@ -221,9 +249,10 @@ func CreateSnapshot(socketPath, snapshotPath, memPath string) error {
 	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
 		Context: ctx,
 		Body: &models.SnapshotCreateParams{
-			SnapshotPath: &snapshotPath,
-			MemFilePath:  &memPath,
-			SnapshotType: models.SnapshotCreateParamsSnapshotTypeFull,
+			SnapshotPath:  &snapshotPath,
+			MemFilePath:   &memPath,
+			SnapshotType:  models.SnapshotCreateParamsSnapshotTypeFull,
+			BlockDeltaDir: blockDeltaDir,
 		},
 	}); err != nil {
 		return fmt.Errorf("create snapshot: %w", err)
@@ -245,8 +274,10 @@ func UnpauseVM(socketPath string) error {
 	return nil
 }
 
-// RestoreSnapshot loads a snapshot and resumes the VM.
-func RestoreSnapshot(socketPath, snapshotPath, memPath string) error {
+// RestoreSnapshot loads a snapshot and resumes the VM. Non-empty blockDeltaDir
+// hydrates a fresh per-VM overlay from <dir>/<drive_id>.delta — pass empty
+// for in-place resume (existing overlay already carries state).
+func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) error {
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
@@ -258,16 +289,20 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath string) error {
 			},
 			ResumeVM:         true,
 			NetworkOverrides: []*models.NetworkOverride{}, // Empty, not nil — Firecracker rejects null.
+			BlockDeltaDir:    blockDeltaDir,
 		},
 	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot: %w: %v", ErrTornSnapshot, err)
+		}
 		return fmt.Errorf("load snapshot: %w", err)
 	}
 	return nil
 }
 
 // RestoreSnapshotWithOverrides loads a snapshot, overrides the network TAP
-// device, and resumes the VM.
-func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, tapDevice string) error {
+// device, and resumes the VM. See RestoreSnapshot for blockDeltaDir semantics.
+func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string) error {
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
@@ -281,8 +316,12 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},
+			BlockDeltaDir: blockDeltaDir,
 		},
 	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot: %w: %v", ErrTornSnapshot, err)
+		}
 		return fmt.Errorf("load snapshot: %w", err)
 	}
 	return nil

@@ -18,6 +18,9 @@ import (
 // swagger:model SnapshotLoadParams
 type SnapshotLoadParams struct {
 
+	// Directory containing block device delta files for cloning. Each overlay device looks for {drive_id}.delta in this directory and applies it to a fresh overlay on restore.
+	BlockDeltaDir string `json:"block_delta_dir,omitempty"`
+
 	// (Deprecated) Enable dirty page tracking to improve space efficiency of diff snapshots
 	EnableDiffSnapshots bool `json:"enable_diff_snapshots,omitempty"`
 

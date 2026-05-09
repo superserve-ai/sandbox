@@ -7,91 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 )
-
-// CleanupOrphanBuilds scans the on-disk templates/ subtree for directories
-// that represent incomplete builds and reclaims them. Called once from vmd
-// startup before the gRPC server comes up.
-//
-// A completed build leaves a build.meta.json sidecar next to the snapshot
-// (written by writeBuildMeta). Directories without that marker — either
-// from a vmd crash mid-build, or from an explicit CancelBuild — are
-// considered orphans and removed wholesale:
-//
-//	${SnapshotDir}/templates/<id>/   — removed if no build.meta.json
-//	${RunDir}/templates/<id>/        — removed in lockstep
-//
-// Any systemd unit named build-<id> that's still running is also stopped.
-// Stateless across vmd restarts: a template that existed in-memory but had
-// no disk footprint (shouldn't happen normally) won't leave disk residue to
-// clean up, so this sweep is safe to run unconditionally.
-//
-// Returns the number of orphans reclaimed. Errors encountered on individual
-// directories are logged but don't abort the sweep — one bad dir shouldn't
-// block vmd startup.
-func (m *Manager) CleanupOrphanBuilds() int {
-	snapshotsRoot := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
-	entries, err := os.ReadDir(snapshotsRoot)
-	if err != nil {
-		// Directory doesn't exist → no orphans to clean. First-time vmd
-		// startup hits this; not an error.
-		return 0
-	}
-
-	reclaimed := 0
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		templateID := entry.Name()
-		snapshotDir := filepath.Join(snapshotsRoot, templateID)
-
-		if m.isCompleteBuild(snapshotDir) {
-			// Finished build. Leave it — CreateVM needs these files when a
-			// sandbox is created from this template.
-			continue
-		}
-
-		m.log.Warn().
-			Str("template_id", templateID).
-			Str("snapshot_dir", snapshotDir).
-			Msg("orphan build directory (no build.meta.json); reclaiming")
-
-		// Kill any firecracker reparented to init by a vmd crash before
-		// we RemoveAll the files it's still mmap'ing.
-		buildVMID := "build-" + templateID
-		if killed := killOrphanFirecracker(buildVMID); killed > 0 {
-			m.log.Info().Int("killed", killed).Str("build_vm_id", buildVMID).Msg("killed orphan firecracker processes")
-		}
-
-		// Remove the snapshot directory (vmstate + memory + any partial meta).
-		if err := os.RemoveAll(snapshotDir); err != nil {
-			m.log.Warn().Err(err).Str("dir", snapshotDir).Msg("remove orphan snapshot dir")
-			continue
-		}
-
-		// Remove the corresponding rundir (rootfs.ext4). A future user-build
-		// for the same template_id will re-create it.
-		rundir := filepath.Join(m.cfg.RunDir, TemplatesDirName, templateID)
-		if err := os.RemoveAll(rundir); err != nil {
-			m.log.Warn().Err(err).Str("dir", rundir).Msg("remove orphan rundir")
-		}
-
-		reclaimed++
-	}
-
-	if reclaimed > 0 {
-		m.log.Info().Int("reclaimed", reclaimed).Msg("orphan template builds cleaned up")
-	}
-	return reclaimed
-}
-
-// isCompleteBuild returns true when the snapshot directory has the sidecar
-// meta file that writeBuildMeta produces on successful completion.
-func (m *Manager) isCompleteBuild(snapshotDir string) bool {
-	_, err := os.Stat(filepath.Join(snapshotDir, "build.meta.json"))
-	return err == nil
-}
 
 // DeleteTemplateArtifacts removes a template's snapshot dir and rootfs dir.
 // Idempotent — missing dirs are not an error.
@@ -101,6 +18,68 @@ func (m *Manager) DeleteTemplateArtifacts(templateID string) error {
 	}
 	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID)
 	rundir := filepath.Join(m.cfg.RunDir, TemplatesDirName, templateID)
+	if err := os.RemoveAll(snapshotDir); err != nil {
+		return fmt.Errorf("remove %s: %w", snapshotDir, err)
+	}
+	if err := os.RemoveAll(rundir); err != nil {
+		return fmt.Errorf("remove %s: %w", rundir, err)
+	}
+	return nil
+}
+
+// BuildArtifactEntry is a single per-build dir on this host.
+type BuildArtifactEntry struct {
+	TemplateID string
+	BuildID    string
+	MTime      time.Time
+}
+
+// ListBuildArtifacts enumerates per-build dirs for the controlplane
+// reconciler.
+func (m *Manager) ListBuildArtifacts() ([]BuildArtifactEntry, error) {
+	root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
+	templates, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", root, err)
+	}
+	out := []BuildArtifactEntry{}
+	for _, t := range templates {
+		if !t.IsDir() {
+			continue
+		}
+		tplDir := filepath.Join(root, t.Name())
+		builds, err := os.ReadDir(tplDir)
+		if err != nil {
+			continue
+		}
+		for _, b := range builds {
+			if !b.IsDir() {
+				continue
+			}
+			info, err := b.Info()
+			if err != nil {
+				continue
+			}
+			out = append(out, BuildArtifactEntry{
+				TemplateID: t.Name(),
+				BuildID:    b.Name(),
+				MTime:      info.ModTime(),
+			})
+		}
+	}
+	return out, nil
+}
+
+// DeleteBuildArtifacts removes a single build's subdir. Idempotent.
+func (m *Manager) DeleteBuildArtifacts(templateID, buildID string) error {
+	if templateID == "" || buildID == "" {
+		return fmt.Errorf("template_id and build_id are required")
+	}
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID, buildID)
+	rundir := filepath.Join(m.cfg.RunDir, TemplatesDirName, templateID, buildID)
 	if err := os.RemoveAll(snapshotDir); err != nil {
 		return fmt.Errorf("remove %s: %w", snapshotDir, err)
 	}

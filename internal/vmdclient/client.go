@@ -14,8 +14,9 @@ type Client interface {
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
-	// in-memory map but the snapshot files are still on disk).
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// in-memory map but the snapshot files are still on disk). basePath +
+	// deltaDir are populated for overlay-mode templates, empty for legacy.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// DeleteSnapshot removes the on-disk vmstate + memory files for a
 	// previous snapshot. Idempotent: missing files return nil. Used by the
 	// control plane to garbage-collect the previous snapshot after a new
@@ -24,6 +25,11 @@ type Client interface {
 	// DeleteTemplateArtifacts removes a template's snapshot dir + rootfs
 	// dir on the host. Idempotent.
 	DeleteTemplateArtifacts(ctx context.Context, templateID string) error
+	// DeleteBuildArtifacts removes a single build's subdir. Idempotent.
+	DeleteBuildArtifacts(ctx context.Context, templateID, buildID string) error
+	// ListBuildArtifacts returns all per-build dirs on this host's snapshot
+	// storage. Used by the controlplane reconciler.
+	ListBuildArtifacts(ctx context.Context) ([]BuildArtifactEntry, error)
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
@@ -84,6 +90,14 @@ type BuildUserOp struct {
 	Sudo bool
 }
 
+// BuildArtifactEntry mirrors vmdpb.BuildArtifactEntry — one per-build dir
+// on a host's snapshot storage.
+type BuildArtifactEntry struct {
+	TemplateID string
+	BuildID    string
+	MTimeUnix  int64
+}
+
 // BuildLogEvent is one decoded event from StreamBuildLogs. Finished=true
 // signals the build reached a terminal status and the stream has closed.
 type BuildLogEvent struct {
@@ -102,6 +116,8 @@ type BuildStatusResult struct {
 	SnapshotPath   string // populated on ready
 	MemFilePath    string // populated on ready
 	RootfsPath     string // populated on ready
+	BasePath       string // populated on ready, overlay-mode templates only
+	DeltaPath      string // populated on ready, overlay-mode templates only
 	ResolvedDigest string // populated on ready
 	SizeBytes      int64  // populated on ready
 	ErrorMessage   string // populated on failed/cancelled

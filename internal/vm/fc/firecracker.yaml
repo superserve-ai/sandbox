@@ -1220,10 +1220,16 @@ definitions:
         type: string
         description:
           Type of the IO engine used by the device. "Async" is supported on
-          host kernels newer than 5.10.51.
+          host kernels newer than 5.10.51. "Overlay" enables copy-on-write
+          with dirty bitmap tracking for fast snapshots (requires base_path).
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
-        enum: ["Sync", "Async"]
+        enum: ["Sync", "Async", "Overlay"]
         default: "Sync"
+      base_path:
+        type: string
+        description:
+          Read-only base image path for overlay mode. Required when io_engine
+          is "Overlay". The path_on_host field becomes the overlay file path.
 
       # VhostUserBlock specific parameters
       socket:
@@ -1572,6 +1578,12 @@ definitions:
         description:
           Type of snapshot to create. It is optional and by default, a full
           snapshot is created.
+      block_delta_dir:
+        type: string
+        description:
+          Directory for block device delta files. When set, overlay block
+          devices write delta files (containing only dirty blocks) into this
+          directory, named {drive_id}.delta.
 
   NetworkOverride:
     type: object
@@ -1631,6 +1643,12 @@ definitions:
         description: Network host device names to override
         items:
           $ref: "#/definitions/NetworkOverride"
+      block_delta_dir:
+        type: string
+        description:
+          Directory containing block device delta files for cloning. Each
+          overlay device looks for {drive_id}.delta in this directory and
+          applies it to a fresh overlay on restore.
 
 
   TokenBucket:

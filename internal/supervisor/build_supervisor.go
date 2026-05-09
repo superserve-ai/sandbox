@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,6 +61,10 @@ type BuildSupervisorConfig struct {
 	// ReapBatchSize caps how many stale rows ReapStaleBuilds touches per
 	// tick. Mirrors BatchSize's bounding rationale.
 	ReapBatchSize int32
+
+	// ReconcileInterval is the period for the orphan-builds reconciler.
+	// 0 disables it (used by tests).
+	ReconcileInterval time.Duration
 }
 
 // DefaultBuildSupervisorConfig returns sensible defaults.
@@ -72,6 +77,7 @@ func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 		PendingTimeout:            2 * time.Minute,
 		BuildTimeout:              30 * time.Minute,
 		ReapBatchSize:             20,
+		ReconcileInterval:         5 * time.Minute,
 	}
 }
 
@@ -103,6 +109,9 @@ func NewBuildSupervisor(cfg BuildSupervisorConfig, q *db.Queries, resolve Resolv
 // dispatch by up to Interval seconds.
 func (s *BuildSupervisor) Start(ctx context.Context) {
 	go s.loop(ctx)
+	if s.cfg.ReconcileInterval > 0 {
+		go s.reconcileLoop(ctx)
+	}
 }
 
 func (s *BuildSupervisor) loop(ctx context.Context) {
@@ -379,12 +388,21 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		snapPath := res.SnapshotPath
 		memPath := res.MemFilePath
 		size := res.SizeBytes
+		var basePathArg, deltaPathArg *string
+		if res.BasePath != "" {
+			basePathArg = &res.BasePath
+		}
+		if res.DeltaPath != "" {
+			deltaPathArg = &res.DeltaPath
+		}
 		_, err := s.q.FinalizeBuild(finCtx, db.FinalizeBuildParams{
 			ID:           row.ID,
 			RootfsPath:   &rootfs,
 			SnapshotPath: &snapPath,
 			MemPath:      &memPath,
 			SizeBytes:    &size,
+			BasePath:     basePathArg,
+			DeltaPath:    deltaPathArg,
 		})
 		cancel()
 		if err != nil {
@@ -395,6 +413,17 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		s.logBuildCompleted(ctx, row, "success", "", res.ResolvedDigest)
 	case "failed", "cancelled":
 		s.failBuild(ctx, row.ID, res.ErrorMessage)
+		// Reap the half-written artifact dir so a failed build doesn't
+		// leak disk. Best-effort; nothing else trips on this dir staying.
+		if row.VmdBuildVmID == nil {
+			rowLog.Warn().Msg("cleanup failed-build artifacts: row has no build VM id")
+		} else {
+			gcCtx, gcCancel := context.WithTimeout(ctx, 10*time.Second)
+			if gcErr := vmd.DeleteBuildArtifacts(gcCtx, row.TemplateID.String(), *row.VmdBuildVmID); gcErr != nil {
+				rowLog.Warn().Err(gcErr).Msg("cleanup failed-build artifacts")
+			}
+			gcCancel()
+		}
 		rowLog.Info().Str("status", res.Status).Str("error", res.ErrorMessage).Msg("build terminal")
 		s.logBuildCompleted(ctx, row, "error", res.ErrorMessage, "")
 	}
@@ -473,6 +502,141 @@ func specStepsToVMD(steps []builder.BuildStep) []vmdclient.BuildStep {
 			vs.User = &vmdclient.BuildUserOp{Name: s.User.Name, Sudo: s.User.Sudo}
 		}
 		out = append(out, vs)
+	}
+	return out
+}
+
+// reconcileLoop runs the orphan-builds reconciler on its own cadence,
+// decoupled from per-build dispatch.
+func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
+	t := time.NewTicker(s.cfg.ReconcileInterval)
+	defer t.Stop()
+	s.reconcileOrphanBuilds(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.reconcileOrphanBuilds(ctx)
+		}
+	}
+}
+
+// reconcileOrphanBuilds diffs vmd's disk against the DB live set; the
+// snapshot-time guard prevents racing with builds started mid-run.
+func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
+	snapshotTime := time.Now()
+	live, err := s.collectLiveBuildKeys(ctx)
+	if err != nil {
+		s.log.Warn().Err(err).Msg("reconcile: collect live set")
+		return
+	}
+
+	vmd, err := s.resolve(ctx, s.cfg.HostID)
+	if err != nil {
+		s.log.Warn().Err(err).Str("host_id", s.cfg.HostID).Msg("reconcile: resolve vmd")
+		return
+	}
+	onDisk, err := vmd.ListBuildArtifacts(ctx)
+	if err != nil {
+		s.log.Warn().Err(err).Msg("reconcile: ListBuildArtifacts")
+		return
+	}
+
+	toDelete := reconcileDecision(onDisk, live, snapshotTime)
+	deleted := 0
+	for _, e := range toDelete {
+		if err := vmd.DeleteBuildArtifacts(ctx, e.TemplateID, e.BuildID); err != nil {
+			s.log.Warn().Err(err).Str("template_id", e.TemplateID).Str("build_id", e.BuildID).Msg("reconcile: DeleteBuildArtifacts")
+			continue
+		}
+		deleted++
+	}
+	s.log.Debug().Int("on_disk", len(onDisk)).Int("live", len(live)).Int("deleted", deleted).Msg("orphan reconcile complete")
+}
+
+// collectLiveBuildKeys returns "<templateID>/<buildID>" keys for every
+// build that must be preserved: in-flight, ready, or pinned by a sandbox
+// or template.base_path.
+func (s *BuildSupervisor) collectLiveBuildKeys(ctx context.Context) (map[string]struct{}, error) {
+	live := map[string]struct{}{}
+
+	builds, err := s.q.ListLiveTemplateBuilds(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ListLiveTemplateBuilds: %w", err)
+	}
+	for _, b := range builds {
+		// On-disk subdir name is "build-<template_build_uuid>" (set by the
+		// supervisor's TryDispatchBuild when stamping vmd_build_vm_id).
+		live[b.TemplateID.String()+"/build-"+b.BuildID.String()] = struct{}{}
+	}
+
+	pinned, err := s.q.ListPinnedBuildPaths(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ListPinnedBuildPaths: %w", err)
+	}
+	for _, p := range pinned {
+		if p == nil {
+			continue
+		}
+		if k, ok := buildKeyFromPath(*p); ok {
+			live[k] = struct{}{}
+		}
+	}
+
+	tplPaths, err := s.q.ListAllTemplateBasePaths(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ListAllTemplateBasePaths: %w", err)
+	}
+	for _, t := range tplPaths {
+		if t.BasePath == nil {
+			continue
+		}
+		if k, ok := buildKeyFromPath(*t.BasePath); ok {
+			live[k] = struct{}{}
+		}
+	}
+	return live, nil
+}
+
+// buildKeyFromPath extracts "<templateID>/<buildID>" from a base_path of
+// the form ".../<templateID>/<buildID>/base.ext4". Skips legacy paths.
+func buildKeyFromPath(p string) (string, bool) {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) < 3 {
+		return "", false
+	}
+	buildID := parts[len(parts)-2]
+	templateID := parts[len(parts)-3]
+	if templateID == "" || buildID == "" {
+		return "", false
+	}
+	if !strings.HasPrefix(buildID, "build-") {
+		// Legacy non-overlay layout puts rootfs.ext4 at .../<templateID>/rootfs.ext4
+		// — those don't have a buildID segment. Skip; not relevant to overlay GC.
+		return "", false
+	}
+	return templateID + "/" + buildID, true
+}
+
+// reconcileDecision picks orphans from the on-disk listing — pure
+// function so the policy is unit-testable without DB / RPC plumbing.
+func reconcileDecision(
+	onDisk []vmdclient.BuildArtifactEntry,
+	live map[string]struct{},
+	snapshotTime time.Time,
+) []vmdclient.BuildArtifactEntry {
+	var out []vmdclient.BuildArtifactEntry
+	for _, e := range onDisk {
+		// Newer than the DB snapshot → grace period; might belong to a
+		// build started after we sampled. Next pass will re-evaluate.
+		if time.Unix(e.MTimeUnix, 0).After(snapshotTime) {
+			continue
+		}
+		if _, alive := live[e.TemplateID+"/"+e.BuildID]; alive {
+			continue
+		}
+		out = append(out, e)
 	}
 	return out
 }

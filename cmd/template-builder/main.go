@@ -177,9 +177,11 @@ type buildConfig struct {
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
 	buildVMID := "build-" + cfg.templateID
-	rootfsDir := filepath.Join(cfg.runDir, vm.TemplatesDirName, cfg.templateID)
-	rootfsPath := filepath.Join(rootfsDir, "rootfs.ext4")
-	snapDir := filepath.Join(cfg.snapshotDir, vm.TemplatesDirName, cfg.templateID)
+	// Per-build subdir — rebuilds don't disturb existing sandboxes.
+	rootfsDir := filepath.Join(cfg.runDir, vm.TemplatesDirName, cfg.templateID, cfg.buildID)
+	basePath := filepath.Join(rootfsDir, "base.ext4")
+	snapDir := filepath.Join(cfg.snapshotDir, vm.TemplatesDirName, cfg.templateID, cfg.buildID)
+	deltaPath := filepath.Join(snapDir, "rootfs.delta")
 
 	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir rootfs dir: %w", err)
@@ -188,7 +190,6 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("mkdir snapshot dir: %w", err)
 	}
 
-	// Phase 1: produce rootfs.ext4 from OCI image
 	emitUser("system", "Pulling image %s", cfg.spec.From)
 	b, err := builder.NewBuilder(builder.Config{
 		BoxdBinaryPath:           cfg.boxdBin,
@@ -197,20 +198,20 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
 	}
-	br, err := b.BuildRootfs(ctx, cfg.spec, rootfsPath, cfg.diskMiB)
+	br, err := b.BuildRootfs(ctx, cfg.spec, basePath, cfg.diskMiB)
 	if err != nil {
 		return fmt.Errorf("build rootfs: %w", err)
 	}
-	emitInternal("system", "rootfs produced: %s (%d bytes)", br.ResolvedDigest, br.SizeBytes)
+	emitInternal("system", "base produced: %s (%d bytes)", br.ResolvedDigest, br.SizeBytes)
 	emitUser("system", "Image ready")
 
-	// Phase 2: copy rootfs for the build VM
-	perVMRootfs, err := copyRootfs(cfg.runDir, buildVMID, rootfsPath)
+	// Empty overlay — Firecracker auto-sizes to base on first open.
+	perVMOverlay, err := createBuildOverlay(cfg.runDir, buildVMID, basePath)
 	if err != nil {
-		return fmt.Errorf("copy rootfs: %w", err)
+		return fmt.Errorf("create overlay: %w", err)
 	}
 
-	// Phase 3: set up network (single slot, no pool, no egress proxy)
+	// Single slot, no pool, no egress proxy — build VMs don't need them.
 	netMgr, netInfo, cleanup, err := setupNetwork(ctx, cfg.hostIface, cfg.slotIndex, buildVMID)
 	if err != nil {
 		return fmt.Errorf("setup network: %w", err)
@@ -218,20 +219,20 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	defer cleanup()
 	_ = netMgr // kept for defer scope
 
-	// Phase 4: start Firecracker in the network namespace
 	socketPath := filepath.Join(cfg.runDir, buildVMID, "firecracker.sock")
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir socket dir: %w", err)
 	}
 	_ = os.Remove(socketPath)
 
-	// Bake the magic path into the snapshot so vmd's per-VM symlink
-	// actually intercepts it on restore.
+	// Bake magic paths into the snapshot so vmd's per-VM symlinks intercept
+	// them on restore. BasePath triggers overlay mode in ConfigureMachine.
 	fcCfg := vm.FirecrackerConfig{
 		SocketPath: socketPath,
 		KernelPath: cfg.kernelPath,
 		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on",
-		RootfsPath: vm.TemplateMagicRootfsPath(cfg.runDir),
+		RootfsPath: vm.TemplateMagicOverlayPath(cfg.runDir),
+		BasePath:   vm.TemplateMagicBasePath(cfg.runDir),
 		VCPUCount:  int(cfg.vcpu),
 		MemSizeMiB: int(cfg.memoryMiB),
 		TAPDevice:  network.TAPName,
@@ -241,13 +242,12 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		GatewayIP:  network.VMGatewayIP,
 	}
 
-	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace, cfg.runDir, perVMRootfs)
+	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace, cfg.runDir, perVMOverlay, basePath)
 	if err != nil {
 		return fmt.Errorf("start firecracker: %w", err)
 	}
 	defer killProcess(pid)
 
-	// Phase 5: wait for boxd
 	emitInternal("system", "waiting for boxd")
 	if err := waitForBoxd(ctx, netInfo.HostIP, 30*time.Second); err != nil {
 		return fmt.Errorf("boxd not ready: %w", err)
@@ -255,13 +255,11 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitInternal("system", "boxd ready")
 	emitUser("system", "Starting build environment")
 
-	// Phase 6: execute build steps
 	bc, err := executeBuildSteps(ctx, netInfo.HostIP, cfg.spec)
 	if err != nil {
 		return fmt.Errorf("build steps: %w", err)
 	}
 
-	// Phase 7: start_cmd + ready_cmd
 	if err := runStartCmd(ctx, netInfo.HostIP, cfg.spec, bc); err != nil {
 		return fmt.Errorf("start_cmd: %w", err)
 	}
@@ -269,28 +267,75 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("ready_cmd: %w", err)
 	}
 
-	// Phase 8: bake the accumulated context into boxd's memory so the
-	// defaults travel in the snapshot. Env vars set via `env` steps plus
-	// the final user/workdir become the template's runtime defaults for
-	// every future sandbox restored from this snapshot.
+	// Bake env / user / workdir into boxd so they travel in the snapshot
+	// as the template's runtime defaults for every future sandbox.
 	if err := postBoxdInit(ctx, netInfo.HostIP, userEnv(bc.env), bc.user, bc.workdir); err != nil {
 		return fmt.Errorf("bake context into boxd: %w", err)
 	}
 	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
 		bc.user, bc.workdir, len(bc.env))
 
-	// Phase 9: snapshot
+	// Push pending guest writes through virtio-block before snapshot —
+	// otherwise dirty pages only live in mem.snap and resumed sandboxes
+	// corrupt files when the kernel evicts them.
+	emitInternal("system", "syncing guest filesystem")
+	syncCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
+	if err := runShellCmd(ctx, netInfo.HostIP, "sync && sync", syncCtx); err != nil {
+		return fmt.Errorf("guest sync: %w", err)
+	}
+
+	// block_delta_dir → emits rootfs.delta so sandboxes can be created
+	// from this template's snapshot.
 	emitUser("system", "Saving template")
 	snapPath := filepath.Join(snapDir, "vmstate.snap")
 	memPath := filepath.Join(snapDir, "mem.snap")
-	if err := vm.CreateSnapshot(socketPath, snapPath, memPath); err != nil {
+	if err := vm.CreateSnapshot(socketPath, snapPath, memPath, snapDir); err != nil {
 		return fmt.Errorf("snapshot: %w", err)
 	}
 	emitInternal("system", "snapshot captured")
 
-	// Phase 9: write build metadata
-	writeBuildMeta(snapDir, snapPath, memPath, rootfsPath, br)
+	// Flush host page cache for each artifact so a sandbox cp'ing them
+	// later doesn't see sparse holes from still-dirty pages.
+	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath); err != nil {
+		return fmt.Errorf("fsync build artifacts: %w", err)
+	}
+	emitInternal("system", "artifacts fsynced")
 
+	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, br)
+
+	return nil
+}
+
+// fsyncBuildArtifacts fsyncs each path and then the parent dir. Empty paths skipped.
+func fsyncBuildArtifacts(snapDir string, paths ...string) error {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		f, err := os.OpenFile(p, os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", p, err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("sync %s: %w", p, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close %s: %w", p, err)
+		}
+	}
+	if d, err := os.Open(snapDir); err != nil {
+		return fmt.Errorf("open dir %s: %w", snapDir, err)
+	} else {
+		syncErr := d.Sync()
+		closeErr := d.Close()
+		if syncErr != nil {
+			return fmt.Errorf("sync dir %s: %w", snapDir, syncErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close dir %s: %w", snapDir, closeErr)
+		}
+	}
 	return nil
 }
 
@@ -326,14 +371,15 @@ func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID str
 // Firecracker launch
 // ---------------------------------------------------------------------------
 
-func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS, runDir, perVMRootfs string) (int, error) {
-	// Mirror vmd's restore-side trick at build time so the snapshot
-	// references the same magic path on both sides.
+func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS, runDir, perVMOverlay, basePath string) (int, error) {
+	// Same magic-path setup as vmd's restore — symlinked paths must match
+	// on both sides so the snapshot's baked drive paths resolve.
 	templateDir := vm.TemplateMagicDir(runDir)
-	rootfsLink := vm.TemplateMagicRootfsPath(runDir)
+	baseLink := vm.TemplateMagicBasePath(runDir)
+	overlayLink := vm.TemplateMagicOverlayPath(runDir)
 	script := fmt.Sprintf(
-		"mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && exec %q --api-sock %q --id %q",
-		templateDir, perVMRootfs, rootfsLink, fcBin, socketPath, cfg.VMID,
+		"mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q && exec %q --api-sock %q --id %q",
+		templateDir, basePath, baseLink, perVMOverlay, overlayLink, fcBin, socketPath, cfg.VMID,
 	)
 	cmd := exec.Command("ip", "netns", "exec", netNS, "unshare", "-m", "--", "sh", "-c", script)
 	// Surface shell errors from the mount/symlink prelude — without this,
@@ -743,15 +789,29 @@ func pollReadyCmd(ctx context.Context, vmIP string, spec builder.BuildSpec, bc b
 // Rootfs copy
 // ---------------------------------------------------------------------------
 
-func copyRootfs(runDir, vmID, srcPath string) (string, error) {
+func createBuildOverlay(runDir, vmID, basePath string) (string, error) {
+	if basePath == "" {
+		return "", fmt.Errorf("createBuildOverlay: basePath required")
+	}
+	baseInfo, err := os.Stat(basePath)
+	if err != nil {
+		return "", fmt.Errorf("stat base %q: %w", basePath, err)
+	}
 	dstDir := filepath.Join(runDir, vmID)
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir: %w", err)
 	}
-	dst := filepath.Join(dstDir, "rootfs.ext4")
-	cmd := exec.Command("cp", "--reflink=auto", srcPath, dst)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("cp rootfs: %s: %w", string(out), err)
+	dst := filepath.Join(dstDir, "overlay.ext4")
+	f, err := os.Create(dst)
+	if err != nil {
+		return "", fmt.Errorf("create overlay: %w", err)
+	}
+	if err := f.Truncate(baseInfo.Size()); err != nil {
+		f.Close()
+		return "", fmt.Errorf("size overlay to base: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("close overlay: %w", err)
 	}
 	return dst, nil
 }
@@ -760,18 +820,24 @@ func copyRootfs(runDir, vmID, srcPath string) (string, error) {
 // Build metadata
 // ---------------------------------------------------------------------------
 
-func writeBuildMeta(dir, snapPath, memPath, rootfsPath string, br builder.BuildRootfsResult) {
+func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br builder.BuildRootfsResult) {
+	// rootfs_path stays in the schema for backwards compat with existing
+	// readers; supervisors that understand overlay use base_path/delta_path.
 	meta := struct {
 		SnapshotPath   string `json:"snapshot_path"`
 		MemPath        string `json:"mem_path"`
 		RootfsPath     string `json:"rootfs_path"`
+		BasePath       string `json:"base_path"`
+		DeltaPath      string `json:"delta_path"`
 		ResolvedDigest string `json:"resolved_digest"`
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
 	}{
 		SnapshotPath:   snapPath,
 		MemPath:        memPath,
-		RootfsPath:     rootfsPath,
+		RootfsPath:     basePath,
+		BasePath:       basePath,
+		DeltaPath:      deltaPath,
 		ResolvedDigest: br.ResolvedDigest,
 		SizeBytes:      br.SizeBytes,
 		BuiltAt:        time.Now().UTC().Format(time.RFC3339),

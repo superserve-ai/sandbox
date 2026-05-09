@@ -4,8 +4,10 @@
 -- the VMD CreateVM call — both need the same sandbox_id and generating
 -- it client-side lets them run concurrently instead of strictly serially.
 -- template_id is optional (NULL when sandbox is not derived from a template).
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+-- snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
+-- specific build's artifacts so a later template rebuild can't corrupt it.
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 RETURNING *;
 
 -- name: CreateSandboxFromTemplate :one
@@ -20,13 +22,25 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id FROM tpl
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19 FROM tpl
 RETURNING *;
 
 -- name: GetSandbox :one
 SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
+
+-- name: CountActiveSandboxesAtBasePath :one
+-- Count of non-destroyed sandboxes still referencing this base_path. Used at
+-- destroy time to decide whether the per-build artifact dir is safe to GC.
+SELECT COUNT(*)::bigint FROM sandbox
+WHERE base_path = $1 AND destroyed_at IS NULL;
+
+-- name: ListPinnedBuildPaths :many
+-- Reconciler input: distinct base_path values held by non-destroyed
+-- sandboxes. Their builds must survive even if the template moved on.
+SELECT DISTINCT base_path FROM sandbox
+WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
 
 -- name: CountActiveSandboxesForTeam :one
 -- Active = consumes host resources. Excludes failed (VM is gone) and

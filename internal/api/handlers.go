@@ -274,6 +274,22 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	snapshotPath := snapshot.Path
 	memPath := resolveMemPath(snapshot)
 
+	// Overlay-mode sandboxes need basePath for the mount-namespace symlink.
+	// Read sandbox.base_path first (pinned at create) so a template rebuild
+	// can't shift base.ext4 under us; fall back to template for legacy rows.
+	var resumeBasePath string
+	if sandbox.BasePath != nil {
+		resumeBasePath = *sandbox.BasePath
+	} else if sandbox.TemplateID.Valid {
+		tpl, tplErr := h.DB.GetTemplateForOwner(c.Request.Context(), db.GetTemplateForOwnerParams{
+			ID:     sandbox.TemplateID.Bytes,
+			TeamID: teamID,
+		})
+		if tplErr == nil && tpl.BasePath != nil {
+			resumeBasePath = *tpl.BasePath
+		}
+	}
+
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
@@ -292,7 +308,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -575,10 +591,58 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// unreachable.
 	h.cleanupSandboxSnapshots(c.Request.Context(), sandboxID, sandbox.HostID)
 
+	// Best-effort GC of the per-build artifact dir if this sandbox was the
+	// last reference and the template has since moved to a newer build.
+	h.gcOldBuildArtifacts(c.Request.Context(), sandbox)
+
 	// Async activity log.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
+}
+
+// gcOldBuildArtifacts deletes the per-build dir if this sandbox was the
+// last reference and the template has moved on. Best-effort.
+func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, sandbox db.Sandbox) {
+	if sandbox.BasePath == nil || !sandbox.TemplateID.Valid {
+		return
+	}
+	basePath := *sandbox.BasePath
+	buildID := filepath.Base(filepath.Dir(basePath))
+	if buildID == "" || buildID == "." || buildID == string(filepath.Separator) {
+		return
+	}
+	templateID := uuid.UUID(sandbox.TemplateID.Bytes).String()
+
+	gcCtx, cancel := context.WithTimeout(reqCtx, 10*time.Second)
+	defer cancel()
+
+	refs, err := h.DB.CountActiveSandboxesAtBasePath(gcCtx, &basePath)
+	if err != nil {
+		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: CountActiveSandboxesAtBasePath")
+		return
+	}
+	if refs > 0 {
+		return
+	}
+	// Team-blind: sandbox's team may not own the template (system templates),
+	// so GetTemplateForOwner would falsely report "not in use" → over-delete.
+	tplBase, err := h.DB.GetTemplateBasePath(gcCtx, sandbox.TemplateID.Bytes)
+	if err != nil {
+		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: GetTemplateBasePath")
+		return
+	}
+	if tplBase != nil && *tplBase == basePath {
+		return
+	}
+
+	vmd, err := h.vmdForHost(gcCtx, sandbox.HostID)
+	if err != nil {
+		return
+	}
+	if err := vmd.DeleteBuildArtifacts(gcCtx, templateID, buildID); err != nil {
+		log.Warn().Err(err).Str("template_id", templateID).Str("build_id", buildID).Msg("gc: DeleteBuildArtifacts")
+	}
 }
 
 // cleanupSandboxSnapshots deletes the on-disk snapshot files via vmd and
@@ -936,7 +1000,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// If from_template is provided, resolve to the template's snapshot paths
 	// and reuse the existing snapshot-restore code path.
-	var snapshotPath, snapshotMemPath string
+	var snapshotPath, snapshotMemPath, basePath, deltaPath, deltaDir string
 	var templateID pgtype.UUID
 	// Template resources — only populated when the create uses from_template.
 	// vmd.RestoreSnapshot doesn't return ResourceLimits on older builds (proto
@@ -963,6 +1027,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		snapshotPath = *tpl.SnapshotPath
 		snapshotMemPath = *tpl.MemPath
+		if tpl.BasePath != nil {
+			basePath = *tpl.BasePath
+		}
+		if tpl.DeltaPath != nil {
+			deltaPath = *tpl.DeltaPath
+			deltaDir = filepath.Dir(deltaPath)
+		}
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
 		templateVcpu = uint32(tpl.Vcpu)
 		templateMemMiB = uint32(tpl.MemoryMib)
@@ -1014,6 +1085,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			// row, serializing with SoftDeleteTemplateIfUnused's FOR UPDATE
 			// so a concurrent template delete is either blocked (we win,
 			// INSERT succeeds) or completes before us (we lose, 0 rows back).
+			// Pin artifact paths so a later rebuild can't shift them.
 			return q.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
 				ID:             sandboxID,
 				TeamID:         teamID,
@@ -1027,6 +1099,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				ID_2:           uuid.UUID(templateID.Bytes),
 				TeamID_2:       teamID,
 				TeamID_3:       h.systemTeamID(),
+				SnapshotPath:   nullableStr(snapshotPath),
+				MemPath:        nullableStr(snapshotMemPath),
+				BasePath:       nullableStr(basePath),
+				DeltaPath:      nullableStr(deltaPath),
 			})
 		}
 		return q.CreateSandbox(insertCtx, db.CreateSandboxParams{
@@ -1040,6 +1116,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TimeoutSeconds: req.TimeoutSeconds,
 			Metadata:       metadataJSON,
 			TemplateID:     pgtype.UUID{Valid: false},
+			SnapshotPath:   nil,
+			MemPath:        nil,
+			BasePath:       nil,
+			DeltaPath:      nil,
 		})
 	}
 	go func() {
@@ -1109,7 +1189,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and boots a new VM from them statelessly. Caller env vars are merged
 	// on top of the template's baked defaults by vmd (boxd resumes with
 	// template context, then the restore RPC posts these on top).
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, req.EnvVars)
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
@@ -1672,6 +1752,15 @@ func bindJSONStrict(c *gin.Context, v any) error {
 		return fmt.Errorf("unexpected trailing data after JSON object")
 	}
 	return nil
+}
+
+// nullableStr maps "" → nil and any other string → &s. Used for nullable
+// text columns so we don't store empty strings in the DB.
+func nullableStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // isIPOrCIDR returns true if s is a valid IP address or CIDR prefix.

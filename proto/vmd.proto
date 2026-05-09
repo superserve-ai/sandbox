@@ -31,6 +31,15 @@ service VMDaemon {
   // rootfs. Idempotent.
   rpc DeleteTemplateArtifacts(DeleteTemplateArtifactsRequest) returns (DeleteTemplateArtifactsResponse);
 
+  // DeleteBuildArtifacts removes one build's subdir under a template.
+  // Idempotent — missing dirs are not an error.
+  rpc DeleteBuildArtifacts(DeleteBuildArtifactsRequest) returns (DeleteBuildArtifactsResponse);
+
+  // ListBuildArtifacts enumerates per-build dirs on this host's snapshot
+  // storage. Used by the controlplane reconciler to identify orphans by
+  // diff against the DB-defined live set.
+  rpc ListBuildArtifacts(ListBuildArtifactsRequest) returns (ListBuildArtifactsResponse);
+
   // ExecCommand runs a command inside a VM and streams stdout/stderr back.
   rpc ExecCommand(ExecCommandRequest) returns (stream ExecCommandResponse);
 
@@ -130,6 +139,9 @@ message GetBuildStatusResponse {
   string rootfs_path = 4;
   string resolved_digest = 5;
   int64 size_bytes = 6;
+  // Overlay-mode artifacts (empty for legacy single-rootfs builds).
+  string base_path = 11;
+  string delta_path = 12;
 
   // Populated on failed / cancelled.
   string error_message = 7;
@@ -273,12 +285,20 @@ message RestoreSnapshotRequest {
   string vm_id = 1;
   string snapshot_path = 2;
   string mem_file_path = 3;
-  string overlay_path = 4;         // COW overlay for the restored rootfs.
+  reserved 4;                      // was overlay_path; vmd computes internally.
+  reserved "overlay_path";
   ResourceLimits resource_limits = 5;
   NetworkConfig network_config = 6;
   // Per-sandbox env vars merged on top of the template's baked defaults
   // (captured in the snapshot). Caller keys override template keys.
   map<string, string> env_vars = 7;
+  // Read-only base image shared across all VMs from this template. Empty for
+  // legacy (non-overlay) sandboxes that still use a full per-VM rootfs copy.
+  string base_path = 8;
+  // Directory containing rootfs.delta for fast clone-from-template. When
+  // empty, the per-VM overlay starts empty (used for pause/resume of a
+  // single sandbox, where the overlay file is already populated).
+  string delta_dir = 9;
 }
 
 message RestoreSnapshotResponse {
@@ -320,6 +340,28 @@ message DeleteTemplateArtifactsRequest {
 
 message DeleteTemplateArtifactsResponse {
   bool deleted = 1;
+}
+
+message DeleteBuildArtifactsRequest {
+  string template_id = 1;
+  string build_id = 2;  // typically "build-<template_build_uuid>"
+}
+
+message DeleteBuildArtifactsResponse {
+  bool deleted = 1;
+}
+
+message ListBuildArtifactsRequest {}
+
+message BuildArtifactEntry {
+  string template_id = 1;
+  string build_id = 2;     // typically "build-<template_build_uuid>"
+  int64  mtime_unix = 3;   // dir mtime; reconciler uses this to skip dirs
+                           // newer than its DB snapshot timestamp.
+}
+
+message ListBuildArtifactsResponse {
+  repeated BuildArtifactEntry entries = 1;
 }
 
 // ---------------------------------------------------------------------------

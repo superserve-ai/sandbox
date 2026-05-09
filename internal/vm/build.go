@@ -39,6 +39,8 @@ type BuildTemplateResult struct {
 	SnapshotPath   string
 	MemFilePath    string
 	RootfsPath     string
+	BasePath       string // overlay-mode templates only
+	DeltaPath      string // overlay-mode templates only
 	ResolvedDigest string // sha256:... of the resolved base image
 	SizeBytes      int64  // on-disk rootfs size
 }
@@ -140,6 +142,11 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 30 * time.Second
 
+	// Build VM's working dir. template-builder names it "build-<templateID>"
+	// (not vmd's buildVMID), so we clean that exact path. Done here because
+	// template-builder's own defer can't run on SIGKILL.
+	defer os.RemoveAll(filepath.Join(m.cfg.RunDir, "build-"+req.TemplateID))
+
 	if err := cmd.Run(); err != nil {
 		// Prefer the structured reason the subprocess emitted on its way
 		// out ("image_pull_failed: ...", "step_failed: ...", etc.) over
@@ -154,7 +161,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// the source of truth; no in-memory registration needed because the
 	// sandbox create path reads snapshot paths from the control plane DB
 	// and calls RestoreSnapshot with those paths directly.
-	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, req.TemplateID)
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, req.TemplateID, buildVMID)
 	result, err := readBuildMetaJSON(snapshotDir)
 	if err != nil {
 		return nil, fmt.Errorf("read build meta: %w", err)
@@ -225,6 +232,8 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		SnapshotPath   string `json:"snapshot_path"`
 		MemPath        string `json:"mem_path"`
 		RootfsPath     string `json:"rootfs_path"`
+		BasePath       string `json:"base_path"`
+		DeltaPath      string `json:"delta_path"`
 		ResolvedDigest string `json:"resolved_digest"`
 		SizeBytes      int64  `json:"size_bytes"`
 	}
@@ -235,6 +244,8 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		SnapshotPath:   meta.SnapshotPath,
 		MemFilePath:    meta.MemPath,
 		RootfsPath:     meta.RootfsPath,
+		BasePath:       meta.BasePath,
+		DeltaPath:      meta.DeltaPath,
 		ResolvedDigest: meta.ResolvedDigest,
 		SizeBytes:      meta.SizeBytes,
 	}, nil

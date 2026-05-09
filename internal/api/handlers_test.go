@@ -56,7 +56,7 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -70,6 +70,10 @@ func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath 
 	return nil
 }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
+func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {
+	return nil, nil
+}
 func (s *stubVMD) ExecCommand(ctx context.Context, id, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
 	if s.execFn != nil {
 		return s.execFn(ctx, id, command, args, env, workingDir, timeoutS)

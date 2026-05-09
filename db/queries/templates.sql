@@ -46,6 +46,25 @@ WHERE id = $1
 SELECT * FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
+-- name: GetTemplateBasePath :one
+-- Team-blind read for the post-destroy GC: the sandbox's team may not own
+-- the template (system templates), so we can't use GetTemplateForOwner.
+SELECT base_path FROM template
+WHERE id = $1 AND deleted_at IS NULL;
+
+-- name: ListLiveTemplateBuilds :many
+-- Reconciler input: in-flight or ready builds. Their on-disk artifacts
+-- must be preserved; in-flight may still be writing.
+SELECT template_id, id AS build_id
+FROM template_build
+WHERE status IN ('pending', 'building', 'snapshotting', 'ready');
+
+-- name: ListAllTemplateBasePaths :many
+-- Reconciler input: current base_path per template. Belt-and-suspenders
+-- with ListLiveTemplateBuilds in case a row flipped between queries.
+SELECT id, base_path FROM template
+WHERE deleted_at IS NULL AND base_path IS NOT NULL;
+
 -- name: GetTemplateByName :one
 -- Resolve name to a template visible to the caller. Names are unique per
 -- team, so the same name can exist in both the caller's team and the system
@@ -210,6 +229,8 @@ SET status = 'ready',
     snapshot_path = $3,
     mem_path = $4,
     size_bytes = $5,
+    base_path = $6,
+    delta_path = $7,
     built_at = now(),
     updated_at = now(),
     error_message = NULL
@@ -218,24 +239,35 @@ WHERE template.id = build_done.template_id
 RETURNING template.*;
 
 -- name: FailBuild :one
--- Atomic terminal-failure transition. Same shape as FinalizeBuild; sets
--- error_message on the template so users see a useful message.
-WITH build_done AS (
+-- Build row flips to failed if not already terminal; template flips only if
+-- it never reached 'ready'. Always returns the template so a re-call on an
+-- already-terminal build is a clean no-op, not ErrNoRows.
+WITH target_build AS (
+  SELECT template_id FROM template_build WHERE template_build.id = $1
+),
+build_done AS (
   UPDATE template_build
   SET status = 'failed',
       finalized_at = now(),
       updated_at = now(),
       error_message = $2
-  WHERE template_build.id = $1 AND status IN ('pending', 'building', 'snapshotting')
+  WHERE template_build.id = $1
+    AND template_build.status IN ('pending', 'building', 'snapshotting')
   RETURNING template_id
+),
+tpl_update AS (
+  UPDATE template
+  SET status = 'failed',
+      error_message = $2,
+      updated_at = now()
+  FROM build_done
+  WHERE template.id = build_done.template_id
+    AND template.status IN ('pending', 'building')
+  RETURNING template.id
 )
-UPDATE template
-SET status = 'failed',
-    error_message = $2,
-    updated_at = now()
-FROM build_done
-WHERE template.id = build_done.template_id
-RETURNING template.*;
+SELECT t.*
+FROM target_build tb
+JOIN template t ON t.id = tb.template_id;
 
 -- name: CancelBuild :execrows
 -- User-initiated cancellation. Atomically transitions template_build →
