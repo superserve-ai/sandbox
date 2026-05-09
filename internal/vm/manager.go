@@ -608,6 +608,11 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	if err := RestoreSnapshot(socketPath, snapshotPath, memPath, ""); err != nil {
+		if errors.Is(err, ErrTornSnapshot) {
+			return nil, status.Errorf(codes.DataLoss,
+				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
+				snapshotPath, err)
+		}
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
