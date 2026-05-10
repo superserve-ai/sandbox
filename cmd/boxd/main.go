@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -356,11 +357,18 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 		}
 	}
 
-	timeout := time.Duration(msg.GetTimeoutMs()) * time.Millisecond
-	var cancel context.CancelFunc
-	if timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+	// cmdCtx must be separate from the stream context so the timeout kills
+	// only the child process — the stream stays alive to deliver the End
+	// event with the timeout exit code.
+	cmdCtx, cmdCancel := context.WithCancel(ctx)
+	defer cmdCancel()
+	var timedOut atomic.Bool
+	if timeoutMs := msg.GetTimeoutMs(); timeoutMs > 0 {
+		timer := time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
+			timedOut.Store(true)
+			cmdCancel()
+		})
+		defer timer.Stop()
 	}
 
 	// Resolve bare command names against the CHILD's PATH, not boxd's own.
@@ -380,7 +388,7 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 		resolvedCmd = p
 	}
 
-	cmd := exec.CommandContext(ctx, resolvedCmd, args...)
+	cmd := exec.CommandContext(cmdCtx, resolvedCmd, args...)
 	cmd.Dir = cwd
 	cmd.Env = childEnv
 	if cred != nil {
@@ -389,12 +397,35 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 
 	isPTY := msg.GetPty() != nil
 	if isPTY {
-		return s.startPTY(ctx, cmd, msg, stream)
+		return s.startPTY(ctx, cmd, msg, stream, &timedOut)
 	}
-	return s.startPipes(ctx, cmd, stream)
+	return s.startPipes(ctx, cmd, stream, &timedOut)
 }
 
-func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.StartRequest, stream *connect.ServerStream[pb.ProcessEvent]) error {
+// timeoutExitCode matches GNU coreutils `timeout(1)`.
+const timeoutExitCode int32 = 124
+
+// finalExitCode maps a finished cmd's state into the exit code the caller
+// sees: 124 on timeout, 128+signal on signal-kill (default 137 for SIGKILL
+// when WaitStatus is unavailable), pass-through otherwise.
+func finalExitCode(ps *os.ProcessState, timedOut bool) int32 {
+	if timedOut {
+		return timeoutExitCode
+	}
+	if ps == nil {
+		return 0
+	}
+	code := int32(ps.ExitCode())
+	if code != -1 {
+		return code
+	}
+	if status, ok := ps.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return int32(128 + status.Signal())
+	}
+	return 137
+}
+
+func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.StartRequest, stream *connect.ServerStream[pb.ProcessEvent], timedOut *atomic.Bool) error {
 	cols := uint16(msg.GetPty().GetSize().GetCols())
 	rows := uint16(msg.GetPty().GetSize().GetRows())
 	if cols == 0 {
@@ -446,32 +477,22 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	}()
 
 	<-done
-	waitErr := cmd.Wait()
+	_ = cmd.Wait()
 
-	exitCode := int32(0)
-	errMsg := ""
+	status := ""
 	if cmd.ProcessState != nil {
-		exitCode = int32(cmd.ProcessState.ExitCode())
-		// Signal-killed processes report ExitCode -1. Map to 128+signal convention.
-		if exitCode == -1 && waitErr != nil {
-			exitCode = 137 // default to SIGKILL
-			if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-				exitCode = int32(128 + status.Signal())
-			}
-		}
+		status = cmd.ProcessState.String()
 	}
-
 	return stream.Send(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_End{End: &pb.EndEvent{
-			ExitCode: exitCode,
+			ExitCode: finalExitCode(cmd.ProcessState, timedOut.Load()),
 			Exited:   cmd.ProcessState != nil && cmd.ProcessState.Exited(),
-			Status:   cmd.ProcessState.String(),
-			Error:    errMsg,
+			Status:   status,
 		}},
 	})
 }
 
-func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *connect.ServerStream[pb.ProcessEvent]) error {
+func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *connect.ServerStream[pb.ProcessEvent], timedOut *atomic.Bool) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)
@@ -561,7 +582,7 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 	}()
 
 	wg.Wait()
-	cmd.Wait()
+	_ = cmd.Wait()
 
 	// Flush data events to the stream before sending End. Closing the
 	// mux drains it, closes the consumer channel, and unblocks sendDone.
@@ -570,16 +591,15 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 		return sendErr
 	}
 
-	exitCode := int32(0)
+	status := ""
 	if cmd.ProcessState != nil {
-		exitCode = int32(cmd.ProcessState.ExitCode())
+		status = cmd.ProcessState.String()
 	}
-
 	return stream.Send(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_End{End: &pb.EndEvent{
-			ExitCode: exitCode,
+			ExitCode: finalExitCode(cmd.ProcessState, timedOut.Load()),
 			Exited:   cmd.ProcessState != nil && cmd.ProcessState.Exited(),
-			Status:   cmd.ProcessState.String(),
+			Status:   status,
 		}},
 	})
 }
