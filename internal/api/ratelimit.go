@@ -41,8 +41,8 @@ func DefaultIPRateLimitConfig() RateLimitConfig {
 // own bucket regardless of how many requests share an IP.
 func DefaultTeamRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
-		Rate:            20,
-		Burst:           40,
+		Rate:            50,
+		Burst:           150,
 		CleanupInterval: 5 * time.Minute,
 		MaxAge:          10 * time.Minute,
 	}
