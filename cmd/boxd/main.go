@@ -396,10 +396,23 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 	}
 
 	isPTY := msg.GetPty() != nil
-	if isPTY {
-		return s.startPTY(ctx, cmd, msg, stream, &timedOut)
+	if !isPTY {
+		// Kill the whole pgid on timeout — killing the shell alone leaves
+		// orphaned children (e.g. `sleep` under `sh -c`) running.
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
+		}
+		cmd.SysProcAttr.Setpgid = true
+		cmd.Cancel = func() error {
+			if cmd.Process == nil {
+				return nil
+			}
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		cmd.WaitDelay = time.Second
+		return s.startPipes(ctx, cmd, stream, &timedOut)
 	}
-	return s.startPipes(ctx, cmd, stream, &timedOut)
+	return s.startPTY(ctx, cmd, msg, stream, &timedOut)
 }
 
 // timeoutExitCode matches GNU coreutils `timeout(1)`.
