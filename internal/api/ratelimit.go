@@ -26,11 +26,13 @@ type RateLimitConfig struct {
 
 // DefaultIPRateLimitConfig is the global per-IP limit applied before auth.
 // It exists mainly to blunt unauthenticated floods; legitimate customers hit
-// the per-team limit long before this.
+// the per-team limit long before this. Burst is kept comfortably above the
+// per-team burst so the IP bucket never shadows the team bucket for an
+// authenticated client (e.g. CI runners where many requests share one IP).
 func DefaultIPRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
-		Rate:            50,
-		Burst:           100,
+		Rate:            100,
+		Burst:           200,
 		CleanupInterval: 5 * time.Minute,
 		MaxAge:          10 * time.Minute,
 	}
@@ -41,8 +43,8 @@ func DefaultIPRateLimitConfig() RateLimitConfig {
 // own bucket regardless of how many requests share an IP.
 func DefaultTeamRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
-		Rate:            20,
-		Burst:           40,
+		Rate:            50,
+		Burst:           150,
 		CleanupInterval: 5 * time.Minute,
 		MaxAge:          10 * time.Minute,
 	}
