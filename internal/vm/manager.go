@@ -1077,7 +1077,8 @@ func (m *Manager) ExecCommand(ctx context.Context, vmID, command string, timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	// +15s grace so boxd's End event isn't raced by ctx cancel at `timeout`.
+	ctx, cancel := context.WithTimeout(ctx, timeout+15*time.Second)
 	defer cancel()
 
 	result, err := httpExec(ctx, vmIP, command, timeout, opts)
@@ -1110,7 +1111,8 @@ func (m *Manager) ExecCommandStream(ctx context.Context, vmID, command string, t
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	// +15s grace, same reason as ExecCommand.
+	ctx, cancel := context.WithTimeout(ctx, timeout+15*time.Second)
 	defer cancel()
 
 	if err := httpExecStream(ctx, vmIP, command, timeout, opts, onChunk); err != nil {
