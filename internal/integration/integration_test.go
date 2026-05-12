@@ -228,6 +228,43 @@ func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
 	return team.ID, rawKey
 }
 
+// seedTeamKeyAndProfile is like seedTeamAndKey but also seeds a profile row
+// and sets api_key.created_by to it. Returns (teamID, rawKey, profileID).
+func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+
+	team, err := testQueries.CreateTeam(ctx, "team-"+uuid.New().String()[:8])
+	if err != nil {
+		t.Fatalf("seedTeamKeyAndProfile: create team: %v", err)
+	}
+
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO profile (id, email) VALUES ($1, $2)`,
+		profileID, fmt.Sprintf("test-%s@example.com", profileID.String()[:8]),
+	); err != nil {
+		t.Fatalf("seedTeamKeyAndProfile: insert profile: %v", err)
+	}
+
+	rawKey := "sk-test-" + uuid.New().String()
+	hash := sha256.Sum256([]byte(rawKey))
+	keyHash := hex.EncodeToString(hash[:])
+
+	_, err = testQueries.CreateAPIKeyV2(ctx, db.CreateAPIKeyV2Params{
+		TeamID:    team.ID,
+		KeyHash:   keyHash,
+		Name:      "test-key",
+		Scopes:    []string{},
+		CreatedBy: pgtype.UUID{Bytes: profileID, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("seedTeamKeyAndProfile: create api key: %v", err)
+	}
+
+	return team.ID, rawKey, profileID
+}
+
 // newRouter builds a router scoped to the current test. Using t.Context()
 // ensures the rate limiter's cleanup goroutine exits when the test ends,
 // preventing goroutine leaks across hundreds of test invocations.
@@ -888,6 +925,78 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 	}
 	if !found {
 		t.Error("no 'sandbox/paused' activity record after pause")
+	}
+}
+
+func TestIntegration_ActivityLog_ActorAttributedToKeyCreator(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey, profileID := seedTeamKeyAndProfile(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"actor-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	time.Sleep(100 * time.Millisecond)
+	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
+		Limit:     20,
+	})
+	if err != nil {
+		t.Fatalf("list activities: %v", err)
+	}
+
+	var found bool
+	for _, a := range activities {
+		if a.Category == "sandbox" && a.Action == "started" {
+			found = true
+			if !a.ActorID.Valid {
+				t.Errorf("actor_id = NULL, want %s", profileID)
+			} else if uuid.UUID(a.ActorID.Bytes) != profileID {
+				t.Errorf("actor_id = %s, want %s", uuid.UUID(a.ActorID.Bytes), profileID)
+			}
+		}
+	}
+	if !found {
+		t.Error("no 'sandbox/started' activity record after create")
+	}
+}
+
+func TestIntegration_ActivityLog_ActorNullWhenKeyHasNoCreator(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"null-actor-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	time.Sleep(100 * time.Millisecond)
+	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
+		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
+		Limit:     20,
+	})
+	if err != nil {
+		t.Fatalf("list activities: %v", err)
+	}
+
+	var found bool
+	for _, a := range activities {
+		if a.Category == "sandbox" && a.Action == "started" {
+			found = true
+			if a.ActorID.Valid {
+				t.Errorf("actor_id = %s, want NULL", uuid.UUID(a.ActorID.Bytes))
+			}
+		}
+	}
+	if !found {
+		t.Error("no 'sandbox/started' activity record after create")
 	}
 }
 
