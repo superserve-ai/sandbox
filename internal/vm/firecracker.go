@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	httptransport "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
@@ -340,9 +341,12 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // uffdSocketPath must be a bound Unix socket; the caller is responsible for
 // starting the handler goroutine before invoking this function.
 func RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, ifaceID, tapDevice, blockDeltaDir string) error {
+	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
-		Context: context.Background(),
+		Context: ctx,
 		Body: &models.SnapshotLoadParams{
 			SnapshotPath: &snapshotPath,
 			MemBackend: &models.MemoryBackend{

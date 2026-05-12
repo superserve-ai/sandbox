@@ -19,7 +19,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const defaultFaultWorkers = 4096
+// defaultFaultWorkers caps concurrent in-flight UFFDIO_COPY ioctls per
+// VM. Bounded so handler teardown via g.Wait doesn't stall on a wedged
+// worker.
+const defaultFaultWorkers = 256
 
 // uffdClosed is the sentinel value of Handler.uffdFd before the fd is
 // received and after it has been closed.
@@ -93,6 +96,9 @@ type Handler struct {
 	mappings []GuestRegionMapping
 	pageSize uint64
 
+	// handshakeDone carries the AcceptHandshake outcome to WaitHandshake.
+	handshakeDone chan error
+
 	closed atomic.Bool
 }
 
@@ -101,8 +107,9 @@ func New(cfg Config) *Handler {
 		cfg.FaultWorkers = defaultFaultWorkers
 	}
 	h := &Handler{
-		cfg: cfg,
-		log: cfg.Logger.With().Str("component", "uffd").Logger(),
+		cfg:           cfg,
+		log:           cfg.Logger.With().Str("component", "uffd").Logger(),
+		handshakeDone: make(chan error, 1),
 	}
 	h.uffdFd.Store(uffdClosed)
 	return h
@@ -143,15 +150,40 @@ func (h *Handler) Start() error {
 // AcceptHandshake blocks on the UDS listener until Firecracker connects
 // and sends the UFFD fd + region mappings. ctx supplies the handshake
 // deadline — kept separate from Serve's lifetime ctx so a slow handshake
-// under burst doesn't share fate with the page-fault loop.
+// under burst doesn't share fate with the page-fault loop. The outcome
+// is published to WaitHandshake.
 func (h *Handler) AcceptHandshake(ctx context.Context) error {
 	if h.listener == nil || h.source == nil {
-		return errors.New("AcceptHandshake called before Start (or after Close)")
+		err := errors.New("AcceptHandshake called before Start (or after Close)")
+		h.publishHandshake(err)
+		return err
 	}
 	if err := h.acceptAndReceive(ctx); err != nil {
-		return fmt.Errorf("receive handshake: %w", err)
+		err = fmt.Errorf("receive handshake: %w", err)
+		h.publishHandshake(err)
+		return err
 	}
+	h.publishHandshake(nil)
 	return nil
+}
+
+func (h *Handler) publishHandshake(err error) {
+	select {
+	case h.handshakeDone <- err:
+	default:
+	}
+}
+
+// WaitHandshake returns the AcceptHandshake outcome, blocking until it
+// completes or ctx is cancelled. Idempotent.
+func (h *Handler) WaitHandshake(ctx context.Context) error {
+	select {
+	case err := <-h.handshakeDone:
+		h.publishHandshake(err)
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Serve runs the page-fault loop (and prefetcher, if enabled) until ctx
@@ -203,14 +235,23 @@ func (h *Handler) closeFd() {
 }
 
 func (h *Handler) acceptAndReceive(ctx context.Context) error {
-	// ctx with no deadline → 30s default, matching the gRPC deadline on
-	// the caller side. The listener deadline is the only way to make
-	// AcceptUnix interruptible.
+	// SetDeadline is the only way to make AcceptUnix interruptible; the
+	// watchdog below sets it to the past on ctx cancel.
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = h.listener.SetDeadline(deadline)
 	} else {
 		_ = h.listener.SetDeadline(time.Now().Add(30 * time.Second))
 	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = h.listener.SetDeadline(time.Now())
+		case <-stop:
+		}
+	}()
 
 	conn, err := h.listener.AcceptUnix()
 	if err != nil {
@@ -233,18 +274,25 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("parse cmsg: %w", err)
 	}
+	// Firecracker sends exactly one fd; cap defensively.
 	uffdFd := -1
 	for _, cm := range cmsgs {
 		fds, err := unix.ParseUnixRights(&cm)
 		if err != nil {
 			continue
 		}
-		for _, fd := range fds {
-			if uffdFd == -1 {
-				uffdFd = fd
-			} else {
+		if len(fds) > 1 {
+			for _, fd := range fds {
 				_ = unix.Close(fd)
 			}
+			return fmt.Errorf("expected 1 fd in SCM_RIGHTS, got %d", len(fds))
+		}
+		if len(fds) == 1 {
+			if uffdFd != -1 {
+				_ = unix.Close(fds[0])
+				return errors.New("multiple SCM_RIGHTS messages; expected one")
+			}
+			uffdFd = fds[0]
 		}
 	}
 	if uffdFd == -1 {

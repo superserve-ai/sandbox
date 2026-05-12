@@ -946,6 +946,25 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
+	// LoadSnapshot doesn't ack the UFFD handshake — Firecracker can
+	// return success while our handler silently failed, which would
+	// leave the guest hanging on first page fault.
+	if useUffd {
+		inst.mu.RLock()
+		uffdH := inst.uffdHandler
+		inst.mu.RUnlock()
+		if uffdH != nil {
+			if hsErr := uffdH.WaitHandshake(ctx); hsErr != nil {
+				m.stopUnitDuringRestoreError(vmID)
+				m.cancelUffdHandler(inst)
+				m.netMgr.CleanupVM(vmID)
+				m.cleanupRunDir(vmID)
+				m.setStatus(vmID, StatusError)
+				return nil, fmt.Errorf("uffd handshake: %w", hsErr)
+			}
+		}
+	}
+
 	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
 		m.stopUnitDuringRestoreError(vmID)
 		m.cancelUffdHandler(inst)

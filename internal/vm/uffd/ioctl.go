@@ -14,10 +14,10 @@ import (
 	"unsafe"
 )
 
-// Hardcoded from <linux/userfaultfd.h>; verified against Linux 6.8 (our
-// prod target). _IO[RW] encoding: (dir << 30) | (sizeof << 16) | (type
-// << 8) | nr, with type = 0xAA. Pinned by TestIoctlNumbers so a struct
-// resize can't silently break the kernel ABI.
+// From <linux/userfaultfd.h>, verified against Linux 6.8. _IO[RW]
+// encoding: (dir << 30) | (sizeof << 16) | (type << 8) | nr, with
+// type = 0xAA. Pinned by TestIoctlNumbers so a struct resize can't
+// silently break the kernel ABI.
 const (
 	UFFDIO_COPY       uintptr = 0xC028AA03
 	UFFDIO_ZEROPAGE   uintptr = 0xC020AA04

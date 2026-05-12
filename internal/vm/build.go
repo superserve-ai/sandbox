@@ -168,9 +168,10 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	}
 
 	// Best-effort: a missing access.log just means sandboxes fall back
-	// to sequential prefetch.
+	// to sequential prefetch. The "build-" prefix must remain so isBuildVM
+	// skips persistence + reconciler for this throwaway VM.
 	if m.cfg.UffdEnabled && m.cfg.UffdPrefetchEnabled {
-		recordingVMID := "record-" + buildVMID
+		recordingVMID := "build-record-" + req.TemplateID
 		accessLogPath := filepath.Join(snapshotDir, "access.log")
 		recCfg := VMConfig{
 			VCPU:      req.VCPU,
