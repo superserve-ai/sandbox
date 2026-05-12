@@ -522,8 +522,9 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	}
 	c.JSON(http.StatusAccepted, respBody)
 
-	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, "template", "created", "success", nil)
-	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, "template", "build_started", "success",
+	actorID := actorIDFromContext(c)
+	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, actorID, "template", "created", "success", nil)
+	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, actorID, "template", "build_started", "success",
 		buildMetadata(row.BuildID))
 }
 
@@ -673,7 +674,7 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 	}
 
 	c.Status(http.StatusNoContent)
-	h.logTemplateActivity(c.Request.Context(), tplID, teamID, "template", "deleted", "success", nil)
+	h.logTemplateActivity(c.Request.Context(), tplID, teamID, actorIDFromContext(c), "template", "deleted", "success", nil)
 
 	// Drop the on-disk snapshot + rootfs. Safe because SoftDeleteTemplateIfUnused
 	// blocks while any build is in flight, so no template-builder is
@@ -773,7 +774,7 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, toBuildResponse(build))
-	h.logTemplateActivity(c.Request.Context(), tplID, teamID, "template", "build_started", "success",
+	h.logTemplateActivity(c.Request.Context(), tplID, teamID, actorIDFromContext(c), "template", "build_started", "success",
 		buildMetadata(build.ID))
 }
 
@@ -879,7 +880,7 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
-	h.logTemplateActivity(c.Request.Context(), tplID, teamID, "template", "build_cancelled", "success",
+	h.logTemplateActivity(c.Request.Context(), tplID, teamID, actorIDFromContext(c), "template", "build_cancelled", "success",
 		buildMetadata(buildID))
 }
 

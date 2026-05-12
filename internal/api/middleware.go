@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -29,10 +31,11 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		keyHash := hex.EncodeToString(hash[:])
 
 		var id, teamID string
+		var createdBy pgtype.UUID
 		err := pool.QueryRow(c.Request.Context(),
-			"SELECT id, team_id FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
+			"SELECT id, team_id, created_by FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
 			keyHash,
-		).Scan(&id, &teamID)
+		).Scan(&id, &teamID, &createdBy)
 		if err != nil {
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
 			c.Abort()
@@ -51,6 +54,9 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 
 		c.Set("api_key_id", id)
 		c.Set("team_id", teamID)
+		if createdBy.Valid {
+			c.Set("actor_id", uuid.UUID(createdBy.Bytes))
+		}
 		c.Next()
 	}
 }
