@@ -220,6 +220,12 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 		return errors.New("no UFFD fd received in SCM_RIGHTS")
 	}
 
+	// Firecracker creates UFFD with O_NONBLOCK; clear it so unix.Read
+	// blocks (cancellation closes the fd → EBADF wakes the read).
+	if flags, err := unix.FcntlInt(uintptr(uffdFd), unix.F_GETFL, 0); err == nil {
+		_, _ = unix.FcntlInt(uintptr(uffdFd), unix.F_SETFL, flags&^unix.O_NONBLOCK)
+	}
+
 	var mappings []GuestRegionMapping
 	if err := json.Unmarshal(body[:n], &mappings); err != nil {
 		_ = unix.Close(uffdFd)
@@ -279,9 +285,8 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 			if errors.Is(err, syscall.EINTR) {
 				continue
 			}
-			// EBADF: closed by our cancellation goroutine.
-			// EAGAIN: transient.
-			if errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EAGAIN) {
+			// EBADF: cancellation goroutine closed the fd. Exit cleanly.
+			if errors.Is(err, syscall.EBADF) {
 				return g.Wait()
 			}
 			return fmt.Errorf("read uffd_msg: %w", err)
