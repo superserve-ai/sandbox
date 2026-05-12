@@ -249,6 +249,7 @@ func main() {
 	// ---- VM manager ----
 	maxRestores, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_RESTORES", "100"))
 	uffdPrefetchEnabled := envOrDefault("VMD_UFFD_PREFETCH_ENABLED", "true") != "false"
+	uffdRecordMaxSeconds, _ := strconv.Atoi(envOrDefault("VMD_UFFD_RECORD_MAX_SECONDS", "10"))
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:        cfg.FirecrackerBin,
@@ -262,6 +263,7 @@ func main() {
 		HostInterface:         cfg.HostInterface,
 		MaxConcurrentRestores: maxRestores,
 		UffdPrefetchEnabled:   uffdPrefetchEnabled,
+		UffdRecordMaxSeconds:  uffdRecordMaxSeconds,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

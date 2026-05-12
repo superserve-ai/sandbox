@@ -92,6 +92,8 @@ type VMInstance struct {
 	// uffdCancel cancels the per-VM UFFD handler goroutine. nil for VMs
 	// not using UFFD (cold boots, template builds, in-place resumes).
 	uffdCancel context.CancelFunc
+	// uffdHandler is the per-VM UFFD handler; nil for non-UFFD VMs.
+	uffdHandler *uffd.Handler
 
 	mu sync.RWMutex
 }
@@ -133,6 +135,10 @@ type ManagerConfig struct {
 	// and pre-copies pages into guest memory so the first exec doesn't
 	// stall on cold pages.
 	UffdPrefetchEnabled bool
+
+	// UffdRecordMaxSeconds caps how long RecordAccessPattern waits for the
+	// guest's fault rate to settle before giving up. 0 → 10s default.
+	UffdRecordMaxSeconds int
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1424,7 @@ func (m *Manager) startUffdHandler(inst *VMInstance, uffdSocketPath, memSnapPath
 	uffdCtx, uffdCancel := context.WithCancel(context.Background())
 	inst.mu.Lock()
 	inst.uffdCancel = uffdCancel
+	inst.uffdHandler = h
 	inst.mu.Unlock()
 
 	vmID := inst.ID
@@ -1435,12 +1442,18 @@ func (m *Manager) startUffdHandler(inst *VMInstance, uffdSocketPath, memSnapPath
 	return nil
 }
 
+const (
+	recordTickInterval = 100 * time.Millisecond
+	recordMinDuration  = 500 * time.Millisecond
+	recordQuietTicks   = 3
+	recordDefaultMax   = 10 * time.Second
+)
+
 // RecordAccessPattern restores the snapshot under UFFD-recording mode,
-// lets the guest run for settleDuration, then destroys and writes the
-// observed page-access order to outputPath. Called by the template
-// build pipeline; produces the access.log the prefetcher consumes.
+// waits for the guest's page-fault rate to settle, and writes the
+// observed page-access order to outputPath.
 func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, memPath, outputPath string,
-	resourceLimits VMConfig, netCfg *network.Config, settleDuration time.Duration,
+	resourceLimits VMConfig, netCfg *network.Config,
 ) error {
 	if _, err := os.Stat(outputPath); err == nil {
 		m.log.Info().Str("path", outputPath).Msg("access log already exists, skipping recording")
@@ -1456,19 +1469,88 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		_ = m.DestroyVM(context.Background(), inst.ID, true)
 	}()
 
-	timer := time.NewTimer(settleDuration)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-ctx.Done():
+	inst.mu.RLock()
+	handler := inst.uffdHandler
+	inst.mu.RUnlock()
+	if handler == nil {
+		return errors.New("UFFD handler missing after restore-for-recording")
+	}
+
+	maxDuration := recordDefaultMax
+	if m.cfg.UffdRecordMaxSeconds > 0 {
+		maxDuration = time.Duration(m.cfg.UffdRecordMaxSeconds) * time.Second
+	}
+
+	settled, elapsed, totalFaults := m.waitFaultsSettle(ctx, handler, maxDuration)
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ctx.Err()
+	}
+
+	pages := recorder.Len()
+	mkEvent := func() *zerolog.Event {
+		ev := m.log.Info()
+		if !settled {
+			ev = m.log.Warn()
+		}
+		return ev.Str("template_vm", vmID).Bool("settled", settled).
+			Dur("elapsed", elapsed).Uint64("total_faults", totalFaults).Int("pages", pages)
+	}
+
+	if pages == 0 {
+		// Missing access.log → sequential prefetch fallback, which is a
+		// cleaner signal than a zero-byte log.
+		mkEvent().Msg("access pattern recording produced no pages; access.log not written")
+		return nil
 	}
 
 	if err := recorder.Flush(outputPath, false); err != nil {
 		return fmt.Errorf("flush access log: %w", err)
 	}
-	m.log.Info().Str("path", outputPath).Int("pages", recorder.Len()).Msg("access pattern recorded")
+	mkEvent().Str("path", outputPath).Msg("access pattern recorded")
 	return nil
+}
+
+// waitFaultsSettle returns settled=true once the guest has produced
+// activity then stayed quiet for recordQuietTicks past
+// recordMinDuration. settled=false means maxDuration or ctx tripped.
+func (m *Manager) waitFaultsSettle(ctx context.Context, h *uffd.Handler, maxDuration time.Duration) (settled bool, elapsed time.Duration, totalFaults uint64) {
+	start := time.Now()
+	ticker := time.NewTicker(recordTickInterval)
+	defer ticker.Stop()
+	deadline := time.NewTimer(maxDuration)
+	defer deadline.Stop()
+
+	var lastFaults uint64
+	seenActivity := false
+	quietCount := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false, time.Since(start), h.Stats().FaultsServed.Load()
+		case <-deadline.C:
+			return false, time.Since(start), h.Stats().FaultsServed.Load()
+		case <-ticker.C:
+			cur := h.Stats().FaultsServed.Load()
+			delta := cur - lastFaults
+			lastFaults = cur
+			if delta > 0 {
+				seenActivity = true
+				quietCount = 0
+				continue
+			}
+			if !seenActivity {
+				continue
+			}
+			if time.Since(start) < recordMinDuration {
+				continue
+			}
+			quietCount++
+			if quietCount >= recordQuietTicks {
+				return true, time.Since(start), cur
+			}
+		}
+	}
 }
 
 // cancelUffdHandler is idempotent and a no-op for non-UFFD VMs.

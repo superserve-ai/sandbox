@@ -178,7 +178,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 			BasePath:  result.BasePath,
 			DeltaDir:  snapshotDir,
 		}
-		if recErr := m.RecordAccessPattern(ctx, recordingVMID, result.SnapshotPath, result.MemFilePath, accessLogPath, recCfg, nil, 2*time.Second); recErr != nil {
+		if recErr := m.RecordAccessPattern(ctx, recordingVMID, result.SnapshotPath, result.MemFilePath, accessLogPath, recCfg, nil); recErr != nil {
 			log.Warn().Err(recErr).Msg("access-pattern recording failed (sandbox will fall back to sequential prefetch)")
 		}
 	}

@@ -5,6 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/vm/uffd"
 )
 
 // TestPlanRestore pins the restore-decision behavior across the four input
@@ -372,5 +377,99 @@ func TestDeleteSnapshotFiles_NoSnapshotDirConfigured_Rejected(t *testing.T) {
 	mgr := &Manager{cfg: ManagerConfig{}}
 	if err := mgr.DeleteSnapshotFiles("vm-abc", "/tmp/anything", ""); err == nil {
 		t.Error("expected rejection when SnapshotDir is unconfigured")
+	}
+}
+
+func newTestManager() *Manager {
+	return &Manager{log: zerolog.Nop()}
+}
+
+func TestWaitFaultsSettle_Converges(t *testing.T) {
+	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				h.Stats().FaultsServed.Add(100)
+			}
+		}
+	}()
+	time.AfterFunc(150*time.Millisecond, func() { close(stop) })
+
+	mgr := newTestManager()
+	settled, elapsed, total := mgr.waitFaultsSettle(context.Background(), h, 5*time.Second)
+	if !settled {
+		t.Errorf("expected settled=true, got false (elapsed=%v total=%d)", elapsed, total)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("settle took too long: %v", elapsed)
+	}
+	if total == 0 {
+		t.Error("expected non-zero total faults")
+	}
+}
+
+func TestWaitFaultsSettle_NoActivityHitsCeiling(t *testing.T) {
+	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
+	mgr := newTestManager()
+	settled, elapsed, total := mgr.waitFaultsSettle(context.Background(), h, 300*time.Millisecond)
+	if settled {
+		t.Errorf("expected settled=false (no activity), got true")
+	}
+	if total != 0 {
+		t.Errorf("expected zero total faults, got %d", total)
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("ceiling hit too early: %v", elapsed)
+	}
+}
+
+func TestWaitFaultsSettle_NeverQuietHitsCeiling(t *testing.T) {
+	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		ticker := time.NewTicker(30 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				h.Stats().FaultsServed.Add(1)
+			}
+		}
+	}()
+
+	mgr := newTestManager()
+	settled, elapsed, total := mgr.waitFaultsSettle(context.Background(), h, 400*time.Millisecond)
+	if settled {
+		t.Errorf("expected settled=false (continuous activity), got true")
+	}
+	if total == 0 {
+		t.Error("expected non-zero total faults")
+	}
+	if elapsed < 350*time.Millisecond {
+		t.Errorf("ceiling tripped too early: %v", elapsed)
+	}
+}
+
+func TestWaitFaultsSettle_CtxCancel(t *testing.T) {
+	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+
+	mgr := newTestManager()
+	settled, elapsed, _ := mgr.waitFaultsSettle(ctx, h, 30*time.Second)
+	if settled {
+		t.Errorf("expected settled=false on cancel")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("cancel did not propagate promptly: %v", elapsed)
 	}
 }
