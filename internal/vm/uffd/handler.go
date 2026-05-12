@@ -39,17 +39,34 @@ type Config struct {
 	SocketPath   string
 	MemSnapPath  string
 	FaultWorkers int // 0 -> defaultFaultWorkers
-	Logger       zerolog.Logger
+
+	// AccessLogPath, when set and present on disk, supplies a recorded
+	// page-access order from template build time. The prefetcher replays
+	// it. Missing file → sequential fallback.
+	AccessLogPath string
+
+	// PrefetchEnabled controls whether the prefetcher runs at all.
+	PrefetchEnabled bool
+
+	// OnPageFault, if non-nil, is invoked for each PageFault event with
+	// the backing-file offset of the page about to be served. Used by
+	// template-builder to record access patterns. Must be fast (called
+	// on the fault hot path).
+	OnPageFault func(offset uint64)
+
+	Logger zerolog.Logger
 }
 
 type Stats struct {
-	FaultsServed  atomic.Uint64
-	BytesServed   atomic.Uint64
-	CopyErrors    atomic.Uint64
-	UnknownEvents atomic.Uint64
-	RemoveEvents  atomic.Uint64
-	EagainRetries atomic.Uint64
-	Eexist        atomic.Uint64
+	FaultsServed     atomic.Uint64
+	BytesServed      atomic.Uint64
+	CopyErrors       atomic.Uint64
+	UnknownEvents    atomic.Uint64
+	RemoveEvents     atomic.Uint64
+	EagainRetries    atomic.Uint64
+	Eexist           atomic.Uint64
+	PrefetchedPages  atomic.Uint64
+	PrefetchSkipped  atomic.Uint64 // EEXIST during prefetch (page already faulted by guest)
 }
 
 // Handler binds a UDS, receives a userfaultfd fd from Firecracker, then
@@ -121,6 +138,9 @@ func (h *Handler) Run(ctx context.Context) error {
 	}
 	if err := h.acceptAndReceive(ctx); err != nil {
 		return fmt.Errorf("receive handshake: %w", err)
+	}
+	if h.cfg.PrefetchEnabled {
+		go h.runPrefetch(ctx)
 	}
 	return h.serveLoop(ctx)
 }
@@ -304,6 +324,9 @@ func (h *Handler) servePagefault(g *errgroup.Group, fd uintptr, faultAddr, pageS
 		}
 
 		offset := region.Offset + (pageAddr - region.BaseHostVirtAddr)
+		if h.cfg.OnPageFault != nil {
+			h.cfg.OnPageFault(offset)
+		}
 		srcPtr, err := h.source.PagePointer(offset, pageSize)
 		if err != nil {
 			h.stats.CopyErrors.Add(1)
