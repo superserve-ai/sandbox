@@ -99,7 +99,7 @@ const asyncTimeout = 5 * time.Second
 // context.WithoutCancel so the goroutine is not killed when the HTTP response
 // completes, but the trace/span context is kept so the async write appears in
 // the same request trace as the synchronous work.
-func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
+func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID uuid.UUID, actorID *uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
@@ -108,6 +108,7 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 			SandboxID:    pgtype.UUID{Bytes: sandboxID, Valid: true},
 			ResourceType: "sandbox",
 			TeamID:       teamID,
+			ActorID:      actorUUID(actorID),
 			Category:     category,
 			Action:       action,
 			Status:       &status,
@@ -123,7 +124,7 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 
 // logTemplateActivity writes a template-scoped activity record. Same async
 // semantics as logSandboxActivity.
-func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamID uuid.UUID, category, action, status string, metadata []byte) {
+func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamID uuid.UUID, actorID *uuid.UUID, category, action, status string, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
@@ -132,6 +133,7 @@ func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamI
 			TemplateID:   pgtype.UUID{Bytes: templateID, Valid: true},
 			ResourceType: "template",
 			TeamID:       teamID,
+			ActorID:      actorUUID(actorID),
 			Category:     category,
 			Action:       action,
 			Status:       &status,
@@ -141,6 +143,13 @@ func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamI
 			log.Error().Err(err).Str("template_id", templateID.String()).Msgf("async %s/%s activity log failed", category, action)
 		}
 	}()
+}
+
+func actorUUID(actorID *uuid.UUID) pgtype.UUID {
+	if actorID == nil {
+		return pgtype.UUID{}
+	}
+	return pgtype.UUID{Bytes: *actorID, Valid: true}
 }
 
 // loadActiveSandbox fetches a sandbox by ID, verifies team ownership, and
@@ -381,7 +390,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
-	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	return true
 }
 
@@ -473,6 +482,18 @@ func teamIDFromContext(c *gin.Context) (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 	return id, nil
+}
+
+func actorIDFromContext(c *gin.Context) *uuid.UUID {
+	raw, ok := c.Get("actor_id")
+	if !ok {
+		return nil
+	}
+	id, ok := raw.(uuid.UUID)
+	if !ok {
+		return nil
+	}
+	return &id
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +617,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	h.gcOldBuildArtifacts(c.Request.Context(), sandbox)
 
 	// Async activity log.
-	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -1354,7 +1375,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			"template_id":   fromTemplateID,
 		})
 	}
-	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
@@ -1497,7 +1518,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	}
 
 	// Async observability.
-	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -1579,7 +1600,7 @@ func (h *Handlers) ExecSandbox(c *gin.Context) {
 		"exit_code":   exitCode,
 		"duration_ms": durationMs,
 	})
-	h.logSandboxActivity(c.Request.Context(), sandbox.ID, sandbox.TeamID, "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, sandbox.TeamID, actorIDFromContext(c), "exec", "executed", "success", &sandbox.Name, &durationMs, metadata)
 
 	c.JSON(http.StatusOK, gin.H{
 		"stdout":    stdout,
@@ -1715,7 +1736,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
 		}
 
-		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "network", "updated", "success", &sandbox.Name, nil, networkConfig)
+		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 	}
 
 	if body.Metadata != nil {
@@ -1735,7 +1756,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			return
 		}
 
-		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
+		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
 	}
 
 	c.Status(http.StatusNoContent)
