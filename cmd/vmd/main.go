@@ -248,6 +248,7 @@ func main() {
 
 	// ---- VM manager ----
 	maxRestores, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_RESTORES", "100"))
+	uffdEnabled := envOrDefault("VMD_UFFD_ENABLED", "true") != "false"
 	uffdPrefetchEnabled := envOrDefault("VMD_UFFD_PREFETCH_ENABLED", "true") != "false"
 	uffdRecordMaxSeconds, _ := strconv.Atoi(envOrDefault("VMD_UFFD_RECORD_MAX_SECONDS", "10"))
 
@@ -262,6 +263,7 @@ func main() {
 		BoxdBinaryPath:        cfg.BoxdBinaryPath,
 		HostInterface:         cfg.HostInterface,
 		MaxConcurrentRestores: maxRestores,
+		UffdEnabled:           uffdEnabled,
 		UffdPrefetchEnabled:   uffdPrefetchEnabled,
 		UffdRecordMaxSeconds:  uffdRecordMaxSeconds,
 	}, netMgr, log)

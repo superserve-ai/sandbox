@@ -140,16 +140,24 @@ func (h *Handler) Start() error {
 }
 
 
-// Run accepts the connection from Firecracker, receives the UFFD fd
-// plus JSON mappings, then services page faults until ctx is cancelled
-// or the UFFD fd closes. Caller must call Close on return.
-func (h *Handler) Run(ctx context.Context) error {
+// AcceptHandshake blocks on the UDS listener until Firecracker connects
+// and sends the UFFD fd + region mappings. ctx supplies the handshake
+// deadline — kept separate from Serve's lifetime ctx so a slow handshake
+// under burst doesn't share fate with the page-fault loop.
+func (h *Handler) AcceptHandshake(ctx context.Context) error {
 	if h.listener == nil || h.source == nil {
-		return errors.New("Run called before Start (or after Close)")
+		return errors.New("AcceptHandshake called before Start (or after Close)")
 	}
 	if err := h.acceptAndReceive(ctx); err != nil {
 		return fmt.Errorf("receive handshake: %w", err)
 	}
+	return nil
+}
+
+// Serve runs the page-fault loop (and prefetcher, if enabled) until ctx
+// is cancelled or the UFFD fd is closed. AcceptHandshake must have
+// returned nil first.
+func (h *Handler) Serve(ctx context.Context) error {
 	if h.cfg.PrefetchEnabled {
 		go h.runPrefetch(ctx)
 	}

@@ -130,10 +130,16 @@ type ManagerConfig struct {
 	// file I/O, netns setup, and Firecracker boots. 0 → default 100.
 	MaxConcurrentRestores int
 
+	// UffdEnabled gates the UFFD lazy-restore path. false → fresh
+	// restores fall back to the File memory backend (synchronous CRC64),
+	// same as in-place resume. Default true; flip to false as an ops
+	// circuit breaker without redeploying.
+	UffdEnabled bool
+
 	// UffdPrefetchEnabled turns on background prefetch in the UFFD
 	// handler. When true, the handler walks mem.snap after the handshake
 	// and pre-copies pages into guest memory so the first exec doesn't
-	// stall on cold pages.
+	// stall on cold pages. Ignored when UffdEnabled is false.
 	UffdPrefetchEnabled bool
 
 	// UffdRecordMaxSeconds caps how long RecordAccessPattern waits for the
@@ -884,12 +890,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.SocketPath = socketPath
 	inst.mu.Unlock()
 
-	// inPlace (pause/resume) keeps the File backend; fresh restores use UFFD.
-	if !inPlace {
-		if err := m.startUffdHandler(inst, uffdSocketPath, memPath, recorder); err != nil {
-			if !inPlace {
-				m.netMgr.CleanupVM(vmID)
-			}
+	// inPlace resume always uses File backend; UffdEnabled=false is the
+	// ops circuit breaker that forces fresh restores onto File too.
+	useUffd := !inPlace && m.cfg.UffdEnabled
+	if useUffd {
+		if err := m.startUffdHandler(ctx, inst, uffdSocketPath, memPath, recorder); err != nil {
+			m.netMgr.CleanupVM(vmID)
 			m.cleanupRunDir(vmID)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start uffd handler: %w", err)
@@ -913,10 +919,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	log.Info().Msg("restoring snapshot")
 
 	var restoreErr error
-	if inPlace {
-		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
-	} else {
+	switch {
+	case useUffd:
 		restoreErr = RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, "eth0", tapDevice, plan.deltaDir)
+	case inPlace:
+		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
+	default:
+		// UFFD disabled but fresh restore — File backend with network overrides.
+		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
 	}
 	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before other
@@ -1397,13 +1407,11 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 }
 
 // startUffdHandler binds the per-VM UFFD socket, opens mem.snap, and
-// spawns the fault-serving goroutine. Stores the cancel func on inst so
-// destroy/error paths can tear it down.
-//
-// recorder, when non-nil, hooks into OnPageFault for template-build
-// recording. Prefetch is disabled in recording mode — recording captures
-// guest demand order, which prefetch would scramble.
-func (m *Manager) startUffdHandler(inst *VMInstance, uffdSocketPath, memSnapPath string, recorder *uffd.Recorder) error {
+// launches the handler goroutine. reqCtx is the caller's request ctx;
+// its deadline applies to the handshake. The serve loop uses an
+// independent ctx so it outlives the request. recorder, when non-nil,
+// hooks OnPageFault for template-build recording.
+func (m *Manager) startUffdHandler(reqCtx context.Context, inst *VMInstance, uffdSocketPath, memSnapPath string, recorder *uffd.Recorder) error {
 	accessLogPath := filepath.Join(filepath.Dir(memSnapPath), "access.log")
 	cfg := uffd.Config{
 		SocketPath:    uffdSocketPath,
@@ -1421,9 +1429,9 @@ func (m *Manager) startUffdHandler(inst *VMInstance, uffdSocketPath, memSnapPath
 	if err := h.Start(); err != nil {
 		return err
 	}
-	uffdCtx, uffdCancel := context.WithCancel(context.Background())
+	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
 	inst.mu.Lock()
-	inst.uffdCancel = uffdCancel
+	inst.uffdCancel = lifetimeCancel
 	inst.uffdHandler = h
 	inst.mu.Unlock()
 
@@ -1435,7 +1443,13 @@ func (m *Manager) startUffdHandler(inst *VMInstance, uffdSocketPath, memSnapPath
 			}
 		}()
 		defer h.Close()
-		if err := h.Run(uffdCtx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := h.AcceptHandshake(reqCtx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				m.log.Error().Err(err).Str("vm_id", vmID).Msg("uffd handshake failed")
+			}
+			return
+		}
+		if err := h.Serve(lifetimeCtx); err != nil && !errors.Is(err, context.Canceled) {
 			m.log.Error().Err(err).Str("vm_id", vmID).Msg("uffd handler exited with error")
 		}
 	}()
