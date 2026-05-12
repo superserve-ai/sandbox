@@ -255,13 +255,16 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Drift 3: systemd has a unit, DB says the sandbox is deleted or has
-	// no row at all. This is an orphan — stop the unit + clean up.
+	// Drift 3: systemd unit active, DB says deleted/failed/missing.
+	// `failed` catches restores whose forward-path cleanup didn't run
+	// (e.g., gRPC ctx fired mid-LoadSnapshot and our work continued
+	// after the caller gave up).
 	if dbSandboxes != nil {
 		for id := range active {
 			sb, known := dbSandboxes[id]
 			deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
-			if known && !deleted {
+			failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
+			if known && !deleted && !failed {
 				continue
 			}
 			if !r.gracePeriodElapsed("orphan:"+id, now) {
@@ -276,6 +279,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if deleted {
 				reason = "systemd unit for soft-deleted sandbox"
 				kind = "systemd_active_db_deleted"
+			} else if failed {
+				reason = "systemd unit for failed sandbox"
+				kind = "systemd_active_db_failed"
 			}
 			log.Warn().Str("vm_id", id).Str("drift", kind).Msg("orphan systemd unit — stopping")
 			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {

@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/vm/uffd"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -87,6 +88,10 @@ type VMInstance struct {
 	MemFilePath  string
 	CreatedAt    time.Time
 	Metadata     map[string]string
+
+	// uffdCancel cancels the per-VM UFFD handler goroutine. nil for VMs
+	// not using UFFD (cold boots, template builds, in-place resumes).
+	uffdCancel context.CancelFunc
 
 	mu sync.RWMutex
 }
@@ -440,6 +445,8 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
+
+	m.cancelUffdHandler(inst)
 
 	// Stop the systemd unit if one exists — this is the path for sandbox
 	// VMs launched via startFirecrackerViaSystemd.
@@ -843,6 +850,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
+	uffdSocketPath := filepath.Join(vmDir, "uffd.sock")
 
 	// Publish all the network/disk/socket fields before starting
 	// Firecracker so the in-memory view is consistent for concurrent
@@ -856,8 +864,21 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.SocketPath = socketPath
 	inst.mu.Unlock()
 
+	// inPlace (pause/resume) keeps the File backend; fresh restores use UFFD.
+	if !inPlace {
+		if err := m.startUffdHandler(inst, uffdSocketPath, memPath); err != nil {
+			if !inPlace {
+				m.netMgr.CleanupVM(vmID)
+			}
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("start uffd handler: %w", err)
+		}
+	}
+
 	pid, startErr := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
 	if startErr != nil {
+		m.cancelUffdHandler(inst)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -875,9 +896,13 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if inPlace {
 		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
 	} else {
-		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
+		restoreErr = RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, "eth0", tapDevice, plan.deltaDir)
 	}
 	if restoreErr != nil {
+		// Firecracker is already running; stop the unit before other
+		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
+		m.stopUnitDuringRestoreError(vmID)
+		m.cancelUffdHandler(inst)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -892,6 +917,8 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
+		m.stopUnitDuringRestoreError(vmID)
+		m.cancelUffdHandler(inst)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -1333,6 +1360,62 @@ func (m *Manager) cleanupRunDir(dirName string) {
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.RemoveAll(vmDir); err != nil {
 		m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to remove rundir")
+	}
+}
+
+// stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
+// aborts after Firecracker started. Uses a fresh context because the
+// caller's gRPC ctx is often already cancelled (deadline exceeded under
+// load). Without this, the firecracker process leaks.
+func (m *Manager) stopUnitDuringRestoreError(vmID string) {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := stopUnit(cleanupCtx, systemdUnitName(vmID)); err != nil {
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("systemctl stop failed during restore error cleanup")
+	}
+	removeUnitDropIn(vmID)
+}
+
+// startUffdHandler binds the per-VM UFFD socket, opens mem.snap, and
+// spawns the fault-serving goroutine. Stores the cancel func on inst so
+// destroy/error paths can tear it down.
+func (m *Manager) startUffdHandler(inst *VMInstance, uffdSocketPath, memSnapPath string) error {
+	h := uffd.New(uffd.Config{
+		SocketPath:  uffdSocketPath,
+		MemSnapPath: memSnapPath,
+		Logger:      m.log.With().Str("vm_id", inst.ID).Logger(),
+	})
+	if err := h.Start(); err != nil {
+		return err
+	}
+	uffdCtx, uffdCancel := context.WithCancel(context.Background())
+	inst.mu.Lock()
+	inst.uffdCancel = uffdCancel
+	inst.mu.Unlock()
+
+	vmID := inst.ID
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.log.Error().Interface("panic", r).Str("vm_id", vmID).Msg("uffd handler panicked")
+			}
+		}()
+		defer h.Close()
+		if err := h.Run(uffdCtx); err != nil && !errors.Is(err, context.Canceled) {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("uffd handler exited with error")
+		}
+	}()
+	return nil
+}
+
+// cancelUffdHandler is idempotent and a no-op for non-UFFD VMs.
+func (m *Manager) cancelUffdHandler(inst *VMInstance) {
+	inst.mu.Lock()
+	cancel := inst.uffdCancel
+	inst.uffdCancel = nil
+	inst.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 

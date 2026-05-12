@@ -326,3 +326,40 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 	}
 	return nil
 }
+
+// RestoreSnapshotUffdWithOverrides is the UFFD-backend variant of
+// RestoreSnapshotWithOverrides. Instead of pointing Firecracker at the
+// mem.snap file (File backend, which synchronously reads and CRC64-verifies
+// the entire snapshot before returning), it points Firecracker at a Unix
+// domain socket served by our in-process UFFD handler.
+//
+// LoadSnapshot returns in milliseconds because pages are not read upfront.
+// As the guest touches pages, the kernel forwards faults to our handler,
+// which serves them from a memory-mapped mem.snap.
+//
+// uffdSocketPath must be a bound Unix socket; the caller is responsible for
+// starting the handler goroutine before invoking this function.
+func RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, ifaceID, tapDevice, blockDeltaDir string) error {
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
+		Context: context.Background(),
+		Body: &models.SnapshotLoadParams{
+			SnapshotPath: &snapshotPath,
+			MemBackend: &models.MemoryBackend{
+				BackendType: strPtr(models.MemoryBackendBackendTypeUffd),
+				BackendPath: &uffdSocketPath,
+			},
+			ResumeVM: true,
+			NetworkOverrides: []*models.NetworkOverride{
+				{IfaceID: &ifaceID, HostDevName: &tapDevice},
+			},
+			BlockDeltaDir: blockDeltaDir,
+		},
+	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot (uffd): %w: %v", ErrTornSnapshot, err)
+		}
+		return fmt.Errorf("load snapshot (uffd): %w", err)
+	}
+	return nil
+}

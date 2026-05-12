@@ -1,0 +1,358 @@
+package uffd
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
+)
+
+const defaultFaultWorkers = 4096
+
+// GuestRegionMapping is the JSON Firecracker sends over the UDS alongside
+// the userfaultfd fd. Field tags must match
+// GuestRegionUffdMapping in src/vmm/src/persist.rs of our firecracker fork.
+type GuestRegionMapping struct {
+	BaseHostVirtAddr uint64 `json:"base_host_virt_addr"`
+	Size             uint64 `json:"size"`
+	Offset           uint64 `json:"offset"`
+	PageSize         uint64 `json:"page_size"`
+	PageSizeKib      uint64 `json:"page_size_kib,omitempty"`
+}
+
+func (r *GuestRegionMapping) contains(faultAddr uint64) bool {
+	return faultAddr >= r.BaseHostVirtAddr && faultAddr < r.BaseHostVirtAddr+r.Size
+}
+
+type Config struct {
+	SocketPath   string
+	MemSnapPath  string
+	FaultWorkers int // 0 -> defaultFaultWorkers
+	Logger       zerolog.Logger
+}
+
+type Stats struct {
+	FaultsServed  atomic.Uint64
+	BytesServed   atomic.Uint64
+	CopyErrors    atomic.Uint64
+	UnknownEvents atomic.Uint64
+	RemoveEvents  atomic.Uint64
+	EagainRetries atomic.Uint64
+	Eexist        atomic.Uint64
+}
+
+// Handler binds a UDS, receives a userfaultfd fd from Firecracker, then
+// serves page faults from mem.snap for the life of the VM. One handler
+// per VM.
+type Handler struct {
+	cfg      Config
+	log      zerolog.Logger
+	stats    Stats
+	source   *Source
+	listener *net.UnixListener
+	uffdFd   uintptr // dup'd from SCM_RIGHTS; -1 if not yet received
+	mappings []GuestRegionMapping
+	pageSize uint64
+
+	// closed is signaled when Close has been called.
+	closed atomic.Bool
+}
+
+func New(cfg Config) *Handler {
+	if cfg.FaultWorkers <= 0 {
+		cfg.FaultWorkers = defaultFaultWorkers
+	}
+	return &Handler{
+		cfg:    cfg,
+		log:    cfg.Logger.With().Str("component", "uffd").Logger(),
+		uffdFd: ^uintptr(0),
+	}
+}
+
+func (h *Handler) Stats() *Stats { return &h.stats }
+
+// Start binds the Unix socket and mmaps mem.snap. After it returns,
+// Firecracker's LoadSnapshot can be invoked safely.
+func (h *Handler) Start() error {
+	// UFFD handler runs BEFORE startFirecrackerViaSystemd, which is
+	// where the per-VM rundir is normally created.
+	if err := os.MkdirAll(filepath.Dir(h.cfg.SocketPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir socket dir: %w", err)
+	}
+	_ = os.Remove(h.cfg.SocketPath)
+
+	src, err := OpenSource(h.cfg.MemSnapPath)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: h.cfg.SocketPath, Net: "unix"})
+	if err != nil {
+		_ = src.Close()
+		return fmt.Errorf("listen %s: %w", h.cfg.SocketPath, err)
+	}
+	if err := os.Chmod(h.cfg.SocketPath, 0o600); err != nil {
+		h.log.Warn().Err(err).Msg("chmod socket failed")
+	}
+
+	h.source = src
+	h.listener = listener
+	return nil
+}
+
+
+// Run accepts the connection from Firecracker, receives the UFFD fd
+// plus JSON mappings, then services page faults until ctx is cancelled
+// or the UFFD fd closes. Caller must call Close on return.
+func (h *Handler) Run(ctx context.Context) error {
+	if h.listener == nil || h.source == nil {
+		return errors.New("Run called before Start (or after Close)")
+	}
+	if err := h.acceptAndReceive(ctx); err != nil {
+		return fmt.Errorf("receive handshake: %w", err)
+	}
+	return h.serveLoop(ctx)
+}
+
+func (h *Handler) Close() error {
+	if !h.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	var firstErr error
+	if h.listener != nil {
+		if err := h.listener.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close listener: %w", err)
+		}
+	}
+	if h.cfg.SocketPath != "" {
+		_ = os.Remove(h.cfg.SocketPath)
+	}
+	if h.uffdFd != ^uintptr(0) {
+		_ = unix.Close(int(h.uffdFd))
+		h.uffdFd = ^uintptr(0)
+	}
+	if h.source != nil {
+		if err := h.source.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close source: %w", err)
+		}
+		h.source = nil
+	}
+	return firstErr
+}
+
+func (h *Handler) acceptAndReceive(ctx context.Context) error {
+	// ctx with no deadline → 30s default, matching the gRPC deadline on
+	// the caller side. The listener deadline is the only way to make
+	// AcceptUnix interruptible.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = h.listener.SetDeadline(deadline)
+	} else {
+		_ = h.listener.SetDeadline(time.Now().Add(30 * time.Second))
+	}
+
+	conn, err := h.listener.AcceptUnix()
+	if err != nil {
+		return fmt.Errorf("accept: %w", err)
+	}
+	defer conn.Close()
+
+	body := make([]byte, 4096)
+	oob := make([]byte, unix.CmsgSpace(4))
+
+	n, oobn, _, _, err := conn.ReadMsgUnix(body, oob)
+	if err != nil {
+		return fmt.Errorf("recvmsg: %w", err)
+	}
+	if n == 0 {
+		return errors.New("empty message from firecracker")
+	}
+
+	cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return fmt.Errorf("parse cmsg: %w", err)
+	}
+	uffdFd := -1
+	for _, cm := range cmsgs {
+		fds, err := unix.ParseUnixRights(&cm)
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			if uffdFd == -1 {
+				uffdFd = fd
+			} else {
+				_ = unix.Close(fd)
+			}
+		}
+	}
+	if uffdFd == -1 {
+		return errors.New("no UFFD fd received in SCM_RIGHTS")
+	}
+
+	var mappings []GuestRegionMapping
+	if err := json.Unmarshal(body[:n], &mappings); err != nil {
+		_ = unix.Close(uffdFd)
+		return fmt.Errorf("unmarshal mappings: %w (body=%q)", err, string(body[:n]))
+	}
+	if len(mappings) == 0 {
+		_ = unix.Close(uffdFd)
+		return errors.New("firecracker sent zero mappings")
+	}
+	pageSize := mappings[0].PageSize
+	if pageSize == 0 {
+		pageSize = mappings[0].PageSizeKib
+	}
+	if pageSize == 0 {
+		_ = unix.Close(uffdFd)
+		return fmt.Errorf("invalid page size in mappings: %+v", mappings[0])
+	}
+
+	h.uffdFd = uintptr(uffdFd)
+	h.mappings = mappings
+	h.pageSize = pageSize
+
+	h.log.Info().
+		Int("regions", len(mappings)).
+		Uint64("page_size", pageSize).
+		Int("uffd_fd", uffdFd).
+		Msg("uffd handshake complete")
+
+	return nil
+}
+
+func (h *Handler) serveLoop(ctx context.Context) error {
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(h.cfg.FaultWorkers)
+
+	// Closing the UFFD fd is the only way to wake a blocking read on it,
+	// so bridge context cancellation to a close here.
+	go func() {
+		<-gctx.Done()
+		if h.uffdFd != ^uintptr(0) {
+			_ = unix.Close(int(h.uffdFd))
+			h.uffdFd = ^uintptr(0)
+		}
+	}()
+
+	var msgBuf [32]byte
+	for {
+		if err := gctx.Err(); err != nil {
+			return g.Wait()
+		}
+		fd := h.uffdFd
+		if fd == ^uintptr(0) {
+			return g.Wait()
+		}
+		n, err := unix.Read(int(fd), msgBuf[:])
+		if err != nil {
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			// EBADF: closed by our cancellation goroutine.
+			// EAGAIN: transient.
+			if errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EAGAIN) {
+				return g.Wait()
+			}
+			return fmt.Errorf("read uffd_msg: %w", err)
+		}
+		if n == 0 {
+			return g.Wait() // Firecracker exited.
+		}
+		if n < int(unsafe.Sizeof(uffdMsg{})) {
+			h.log.Warn().Int("bytes", n).Msg("short uffd_msg read; skipping")
+			continue
+		}
+		msg := *(*uffdMsg)(unsafe.Pointer(&msgBuf[0]))
+		switch msg.Event {
+		case UFFD_EVENT_PAGEFAULT:
+			pf := msg.asPageFault()
+			fdCopy := fd
+			pageSize := h.pageSize
+			h.servePagefault(g, fdCopy, pf.Address, pageSize)
+		case UFFD_EVENT_REMOVE:
+			h.stats.RemoveEvents.Add(1)
+			rm := msg.asRemove()
+			h.handleRemove(fd, rm.Start, rm.End)
+		default:
+			h.stats.UnknownEvents.Add(1)
+			h.log.Debug().Uint8("event", msg.Event).Msg("ignoring unknown uffd event")
+		}
+	}
+}
+
+// servePagefault dispatches a single fault to the worker pool. The pool
+// blocks if all FaultWorkers slots are busy — natural backpressure.
+func (h *Handler) servePagefault(g *errgroup.Group, fd uintptr, faultAddr, pageSize uint64) {
+	g.Go(func() error {
+		pageAddr := faultAddr &^ (pageSize - 1)
+
+		region := h.findRegion(pageAddr)
+		if region == nil {
+			h.log.Error().Uint64("addr", faultAddr).Msg("page fault address outside all regions; killing handler")
+			return fmt.Errorf("address %#x outside guest regions", faultAddr)
+		}
+
+		offset := region.Offset + (pageAddr - region.BaseHostVirtAddr)
+		srcPtr, err := h.source.PagePointer(offset, pageSize)
+		if err != nil {
+			h.stats.CopyErrors.Add(1)
+			return fmt.Errorf("source page lookup: %w", err)
+		}
+
+		_, copyErr := ioctlCopy(fd, pageAddr, srcPtr, pageSize, 0)
+		if copyErr != nil {
+			// EEXIST: another fault on the same page raced ahead of us;
+			// it's already mapped. Benign.
+			if errors.Is(copyErr, syscall.EEXIST) {
+				h.stats.Eexist.Add(1)
+				return nil
+			}
+			// EAGAIN: a REMOVE event is pending in the kernel queue;
+			// all ioctls return EAGAIN until it's drained. The kernel
+			// re-fires the fault after we handle the REMOVE.
+			if errors.Is(copyErr, syscall.EAGAIN) {
+				h.stats.EagainRetries.Add(1)
+				return nil
+			}
+			h.stats.CopyErrors.Add(1)
+			return fmt.Errorf("UFFDIO_COPY at %#x: %w", pageAddr, copyErr)
+		}
+		h.stats.FaultsServed.Add(1)
+		h.stats.BytesServed.Add(pageSize)
+		return nil
+	})
+}
+
+// handleRemove responds to balloon-device removals by zeroing the range.
+// Without this, subsequent faults on these pages would resolve to stale
+// mem.snap contents instead of zero pages.
+func (h *Handler) handleRemove(fd uintptr, start, end uint64) {
+	if end <= start {
+		return
+	}
+	length := end - start
+	if err := ioctlZeropage(fd, start, length); err != nil {
+		h.log.Warn().Err(err).Uint64("start", start).Uint64("end", end).Msg("UFFDIO_ZEROPAGE failed")
+	}
+}
+
+func (h *Handler) findRegion(faultAddr uint64) *GuestRegionMapping {
+	for i := range h.mappings {
+		if h.mappings[i].contains(faultAddr) {
+			return &h.mappings[i]
+		}
+	}
+	return nil
+}
+
