@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -19,6 +20,10 @@ import (
 )
 
 const defaultFaultWorkers = 4096
+
+// uffdClosed is the sentinel value of Handler.uffdFd before the fd is
+// received and after it has been closed.
+const uffdClosed = ^uintptr(0)
 
 // GuestRegionMapping is the JSON Firecracker sends over the UDS alongside
 // the userfaultfd fd. Field tags must match
@@ -78,11 +83,16 @@ type Handler struct {
 	stats    Stats
 	source   *Source
 	listener *net.UnixListener
-	uffdFd   uintptr // dup'd from SCM_RIGHTS; -1 if not yet received
+
+	// fdMu (RLock per ioctl, Lock around close) prevents an ioctl from
+	// racing with close + kernel fd-reuse. uffdFd is atomic so the
+	// lock-free serveLoop read is sound under Go's memory model.
+	fdMu   sync.RWMutex
+	uffdFd atomic.Uintptr // uffdClosed when not held
+
 	mappings []GuestRegionMapping
 	pageSize uint64
 
-	// closed is signaled when Close has been called.
 	closed atomic.Bool
 }
 
@@ -90,11 +100,12 @@ func New(cfg Config) *Handler {
 	if cfg.FaultWorkers <= 0 {
 		cfg.FaultWorkers = defaultFaultWorkers
 	}
-	return &Handler{
-		cfg:    cfg,
-		log:    cfg.Logger.With().Str("component", "uffd").Logger(),
-		uffdFd: ^uintptr(0),
+	h := &Handler{
+		cfg: cfg,
+		log: cfg.Logger.With().Str("component", "uffd").Logger(),
 	}
+	h.uffdFd.Store(uffdClosed)
+	return h
 }
 
 func (h *Handler) Stats() *Stats { return &h.stats }
@@ -158,10 +169,7 @@ func (h *Handler) Close() error {
 	if h.cfg.SocketPath != "" {
 		_ = os.Remove(h.cfg.SocketPath)
 	}
-	if h.uffdFd != ^uintptr(0) {
-		_ = unix.Close(int(h.uffdFd))
-		h.uffdFd = ^uintptr(0)
-	}
+	h.closeFd()
 	if h.source != nil {
 		if err := h.source.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("close source: %w", err)
@@ -169,6 +177,21 @@ func (h *Handler) Close() error {
 		h.source = nil
 	}
 	return firstErr
+}
+
+// closeFd closes the userfaultfd under the write lock so no in-flight
+// ioctl can be operating on the fd when the kernel frees the slot
+// (preventing fd-number reuse from redirecting a worker's ioctl to an
+// unrelated open). Idempotent.
+func (h *Handler) closeFd() {
+	h.fdMu.Lock()
+	defer h.fdMu.Unlock()
+	fd := h.uffdFd.Load()
+	if fd == uffdClosed {
+		return
+	}
+	_ = unix.Close(int(fd))
+	h.uffdFd.Store(uffdClosed)
 }
 
 func (h *Handler) acceptAndReceive(ctx context.Context) error {
@@ -244,7 +267,7 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 		return fmt.Errorf("invalid page size in mappings: %+v", mappings[0])
 	}
 
-	h.uffdFd = uintptr(uffdFd)
+	h.uffdFd.Store(uintptr(uffdFd))
 	h.mappings = mappings
 	h.pageSize = pageSize
 
@@ -265,10 +288,7 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 	// so bridge context cancellation to a close here.
 	go func() {
 		<-gctx.Done()
-		if h.uffdFd != ^uintptr(0) {
-			_ = unix.Close(int(h.uffdFd))
-			h.uffdFd = ^uintptr(0)
-		}
+		h.closeFd()
 	}()
 
 	var msgBuf [32]byte
@@ -276,8 +296,8 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 		if err := gctx.Err(); err != nil {
 			return g.Wait()
 		}
-		fd := h.uffdFd
-		if fd == ^uintptr(0) {
+		fd := h.uffdFd.Load()
+		if fd == uffdClosed {
 			return g.Wait()
 		}
 		n, err := unix.Read(int(fd), msgBuf[:])
@@ -302,13 +322,11 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 		switch msg.Event {
 		case UFFD_EVENT_PAGEFAULT:
 			pf := msg.asPageFault()
-			fdCopy := fd
-			pageSize := h.pageSize
-			h.servePagefault(g, fdCopy, pf.Address, pageSize)
+			h.servePagefault(g, pf.Address, h.pageSize)
 		case UFFD_EVENT_REMOVE:
 			h.stats.RemoveEvents.Add(1)
 			rm := msg.asRemove()
-			h.handleRemove(fd, rm.Start, rm.End)
+			h.handleRemove(rm.Start, rm.End)
 		default:
 			h.stats.UnknownEvents.Add(1)
 			h.log.Debug().Uint8("event", msg.Event).Msg("ignoring unknown uffd event")
@@ -318,7 +336,7 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 
 // servePagefault dispatches a single fault to the worker pool. The pool
 // blocks if all FaultWorkers slots are busy — natural backpressure.
-func (h *Handler) servePagefault(g *errgroup.Group, fd uintptr, faultAddr, pageSize uint64) {
+func (h *Handler) servePagefault(g *errgroup.Group, faultAddr, pageSize uint64) {
 	g.Go(func() error {
 		pageAddr := faultAddr &^ (pageSize - 1)
 
@@ -338,7 +356,14 @@ func (h *Handler) servePagefault(g *errgroup.Group, fd uintptr, faultAddr, pageS
 			return fmt.Errorf("source page lookup: %w", err)
 		}
 
+		h.fdMu.RLock()
+		fd := h.uffdFd.Load()
+		if fd == uffdClosed {
+			h.fdMu.RUnlock()
+			return nil
+		}
 		_, copyErr := ioctlCopy(fd, pageAddr, srcPtr, pageSize, 0)
+		h.fdMu.RUnlock()
 		if copyErr != nil {
 			// EEXIST: another fault on the same page raced ahead of us;
 			// it's already mapped. Benign.
@@ -365,12 +390,20 @@ func (h *Handler) servePagefault(g *errgroup.Group, fd uintptr, faultAddr, pageS
 // handleRemove responds to balloon-device removals by zeroing the range.
 // Without this, subsequent faults on these pages would resolve to stale
 // mem.snap contents instead of zero pages.
-func (h *Handler) handleRemove(fd uintptr, start, end uint64) {
+func (h *Handler) handleRemove(start, end uint64) {
 	if end <= start {
 		return
 	}
 	length := end - start
-	if err := ioctlZeropage(fd, start, length); err != nil {
+	h.fdMu.RLock()
+	fd := h.uffdFd.Load()
+	if fd == uffdClosed {
+		h.fdMu.RUnlock()
+		return
+	}
+	err := ioctlZeropage(fd, start, length)
+	h.fdMu.RUnlock()
+	if err != nil {
 		h.log.Warn().Err(err).Uint64("start", start).Uint64("end", end).Msg("UFFDIO_ZEROPAGE failed")
 	}
 }

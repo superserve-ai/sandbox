@@ -27,8 +27,7 @@ func (h *Handler) runPrefetch(ctx context.Context) {
 		h.log.Warn().Msg("prefetch: no page size, skipping")
 		return
 	}
-	fd := h.uffdFd
-	if fd == ^uintptr(0) {
+	if h.uffdFd.Load() == uffdClosed {
 		return
 	}
 
@@ -39,46 +38,56 @@ func (h *Handler) runPrefetch(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		fd := h.uffdFd
-		if fd == ^uintptr(0) {
-			return
-		}
-		if err := h.prefetchOne(fd, off, pageSize); err != nil {
+		stop, err := h.prefetchOne(off, pageSize)
+		if err != nil {
 			// Abort on first non-benign error; on-demand fault serving
 			// is unaffected.
 			h.log.Warn().Err(err).Uint64("offset", off).Msg("prefetch aborted")
+			return
+		}
+		if stop {
 			return
 		}
 	}
 	h.log.Debug().Uint64("served", h.stats.PrefetchedPages.Load()).Msg("prefetch complete")
 }
 
-func (h *Handler) prefetchOne(fd uintptr, offset, pageSize uint64) error {
+// prefetchOne returns stop=true when the fd has been closed under us,
+// signaling the caller to exit the prefetch loop.
+func (h *Handler) prefetchOne(offset, pageSize uint64) (stop bool, err error) {
 	region := h.regionForOffset(offset)
 	if region == nil {
-		return nil
+		return false, nil
 	}
 	dst := region.BaseHostVirtAddr + (offset - region.Offset)
-	srcPtr, err := h.source.PagePointer(offset, pageSize)
-	if err != nil {
-		return err
+	srcPtr, perr := h.source.PagePointer(offset, pageSize)
+	if perr != nil {
+		return false, perr
+	}
+
+	h.fdMu.RLock()
+	fd := h.uffdFd.Load()
+	if fd == uffdClosed {
+		h.fdMu.RUnlock()
+		return true, nil
 	}
 	_, copyErr := ioctlCopy(fd, dst, srcPtr, pageSize, 0)
+	h.fdMu.RUnlock()
 	if copyErr != nil {
 		if errors.Is(copyErr, syscall.EEXIST) {
 			h.stats.PrefetchSkipped.Add(1)
-			return nil
+			return false, nil
 		}
 		if errors.Is(copyErr, syscall.EAGAIN) {
 			// REMOVE pending in queue; main fault loop will drain it.
 			// Guest will re-fault this page later if it needs it.
 			h.stats.PrefetchSkipped.Add(1)
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("prefetch UFFDIO_COPY at %#x: %w", dst, copyErr)
+		return false, fmt.Errorf("prefetch UFFDIO_COPY at %#x: %w", dst, copyErr)
 	}
 	h.stats.PrefetchedPages.Add(1)
-	return nil
+	return false, nil
 }
 
 func (h *Handler) regionForOffset(offset uint64) *GuestRegionMapping {
