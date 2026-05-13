@@ -1,0 +1,107 @@
+-- team.active_sandbox_count mirrors `count(*) from sandbox where
+-- destroyed_at is null and status != 'failed'`. Triggers maintain it
+-- in sync; the INSERT trigger raises SQLSTATE 'SS001' on quota exceed.
+
+ALTER TABLE team
+  ADD COLUMN active_sandbox_count integer NOT NULL DEFAULT 0;
+
+-- Backfill from existing data. Table is small in prod; one statement is fine.
+UPDATE team t
+SET active_sandbox_count = sub.cnt
+FROM (
+  SELECT team_id, COUNT(*)::int AS cnt
+  FROM sandbox
+  WHERE destroyed_at IS NULL AND status != 'failed'
+  GROUP BY team_id
+) sub
+WHERE t.id = sub.team_id;
+
+-- System team gets a sentinel max so the trigger's uniform check is a
+-- no-op for it. UUID matches SYSTEM_TEAM_ID env in the controlplane.
+UPDATE team
+SET max_sandboxes = 2147483647
+WHERE id = '258e290e-d30d-4d2a-b751-07da118248c0'
+  AND (max_sandboxes IS NULL OR max_sandboxes < 1000);
+
+CREATE OR REPLACE FUNCTION sandbox_quota_on_insert() RETURNS trigger
+    LANGUAGE plpgsql
+AS $$
+DECLARE
+  new_count integer;
+  effective_max integer;
+BEGIN
+  IF NEW.destroyed_at IS NOT NULL OR NEW.status = 'failed' THEN
+    RETURN NEW;
+  END IF;
+
+  UPDATE team
+  SET active_sandbox_count = active_sandbox_count + 1
+  WHERE id = NEW.team_id
+  RETURNING active_sandbox_count, COALESCE(max_sandboxes, 50)
+  INTO new_count, effective_max;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'team % does not exist', NEW.team_id;
+  END IF;
+
+  IF new_count > effective_max THEN
+    RAISE EXCEPTION 'sandbox quota exceeded (count=%, max=%)', new_count, effective_max
+      USING ERRCODE = 'SS001';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_sandbox_quota_on_insert
+  BEFORE INSERT ON sandbox
+  FOR EACH ROW
+  EXECUTE FUNCTION sandbox_quota_on_insert();
+
+CREATE OR REPLACE FUNCTION sandbox_quota_on_update() RETURNS trigger
+    LANGUAGE plpgsql
+AS $$
+DECLARE
+  was_active boolean;
+  is_active boolean;
+BEGIN
+  was_active := (OLD.destroyed_at IS NULL AND OLD.status != 'failed');
+  is_active := (NEW.destroyed_at IS NULL AND NEW.status != 'failed');
+
+  IF was_active AND NOT is_active THEN
+    UPDATE team
+    SET active_sandbox_count = GREATEST(active_sandbox_count - 1, 0)
+    WHERE id = NEW.team_id;
+  ELSIF NOT was_active AND is_active THEN
+    UPDATE team
+    SET active_sandbox_count = active_sandbox_count + 1
+    WHERE id = NEW.team_id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_sandbox_quota_on_update
+  AFTER UPDATE ON sandbox
+  FOR EACH ROW
+  WHEN (OLD.destroyed_at IS DISTINCT FROM NEW.destroyed_at OR OLD.status IS DISTINCT FROM NEW.status)
+  EXECUTE FUNCTION sandbox_quota_on_update();
+
+CREATE OR REPLACE FUNCTION sandbox_quota_on_delete() RETURNS trigger
+    LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF OLD.destroyed_at IS NULL AND OLD.status != 'failed' THEN
+    UPDATE team
+    SET active_sandbox_count = GREATEST(active_sandbox_count - 1, 0)
+    WHERE id = OLD.team_id;
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_sandbox_quota_on_delete
+  AFTER DELETE ON sandbox
+  FOR EACH ROW
+  EXECUTE FUNCTION sandbox_quota_on_delete();
