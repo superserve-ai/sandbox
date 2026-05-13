@@ -371,8 +371,11 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 			if errors.Is(err, syscall.EINTR) {
 				continue
 			}
-			// EBADF: cancellation goroutine closed the fd. Exit cleanly.
-			if errors.Is(err, syscall.EBADF) {
+			// EBADF: cancellation goroutine closed the fd. EINVAL: kernel
+			// returned "invalid argument", typically because Firecracker
+			// exited and unmapped its VMAs before we drained the queue.
+			// Both mean "nothing more to read here" — exit cleanly.
+			if errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL) {
 				return g.Wait()
 			}
 			return fmt.Errorf("read uffd_msg: %w", err)
