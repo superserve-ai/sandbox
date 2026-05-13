@@ -122,11 +122,5 @@ func ioctlZeropage(uffdFd uintptr, start uint64, length uint64) error {
 	return nil
 }
 
-func ioctlUnregister(uffdFd uintptr, start uint64, length uint64) error {
-	r := uffdioRange{Start: start, Len: length}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uffdFd, UFFDIO_UNREGISTER, uintptr(unsafe.Pointer(&r)))
-	if errno != 0 {
-		return fmt.Errorf("UFFDIO_UNREGISTER: %w", errno)
-	}
-	return nil
-}
+// No UFFDIO_UNREGISTER wrapper: closing the fd auto-unregisters all
+// regions. Constant is pinned by TestIoctlNumbers for ABI docs.

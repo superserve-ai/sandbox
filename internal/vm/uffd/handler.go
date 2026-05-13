@@ -99,6 +99,9 @@ type Handler struct {
 	// handshakeDone carries the AcceptHandshake outcome to WaitHandshake.
 	handshakeDone chan error
 
+	// prefetchWg lets Close wait for the prefetch goroutine before munmap.
+	prefetchWg sync.WaitGroup
+
 	closed atomic.Bool
 }
 
@@ -191,7 +194,11 @@ func (h *Handler) WaitHandshake(ctx context.Context) error {
 // returned nil first.
 func (h *Handler) Serve(ctx context.Context) error {
 	if h.cfg.PrefetchEnabled {
-		go h.runPrefetch(ctx)
+		h.prefetchWg.Add(1)
+		go func() {
+			defer h.prefetchWg.Done()
+			h.runPrefetch(ctx)
+		}()
 	}
 	return h.serveLoop(ctx)
 }
@@ -210,6 +217,9 @@ func (h *Handler) Close() error {
 		_ = os.Remove(h.cfg.SocketPath)
 	}
 	h.closeFd()
+	// Drain prefetch before munmap. Fault workers are already joined by
+	// serveLoop's g.Wait; only the bare prefetch goroutine needs this.
+	h.prefetchWg.Wait()
 	if h.source != nil {
 		if err := h.source.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("close source: %w", err)
@@ -460,6 +470,12 @@ func (h *Handler) handleRemove(start, end uint64) {
 	err := ioctlZeropage(fd, start, length)
 	h.fdMu.RUnlock()
 	if err != nil {
+		// EAGAIN: another REMOVE event is queued ahead of us — the next
+		// REMOVE will cover this range, so skipping the zero is correct.
+		if errors.Is(err, syscall.EAGAIN) {
+			h.stats.EagainRetries.Add(1)
+			return
+		}
 		h.log.Warn().Err(err).Uint64("start", start).Uint64("end", end).Msg("UFFDIO_ZEROPAGE failed")
 	}
 }
