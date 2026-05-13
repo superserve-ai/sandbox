@@ -9,6 +9,11 @@ Env vars:
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
   SHA                  required — commit SHA (only first 8 chars used)
 
+All deploy artifacts (binaries + systemd units + scripts) are packed
+into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
+opens a fresh IAP tunnel (~10-15s setup), so bundling cuts per-host
+deploy time roughly in half.
+
 Binaries are always uploaded. The remote script hash-compares boxd
 against the currently-installed copy and only installs + rebuilds the
 rootfs when the hash differs, keeping no-op redeploys cheap and
@@ -22,12 +27,51 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+def run_or_die(cmd, context):
+    """Run a subprocess, surface stderr on failure. Logs reach the
+    GitHub Actions UI directly — no need to inspect the runner.
+    GH redacts repo secrets automatically; nothing in our command
+    args is sensitive beyond what's already in the workflow YAML.
+    """
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        stderr = (r.stderr or "").strip()
+        stdout = (r.stdout or "").strip()
+        raise RuntimeError(
+            f"{context} failed (exit={r.returncode}): {' '.join(cmd[:4])}…\n"
+            f"--- stderr ---\n{stderr or '(empty)'}\n"
+            f"--- stdout ---\n{stdout or '(empty)'}"
+        )
+    return r
+
+
+# Files included in the deploy bundle. Paths are relative to the repo
+# root; they're preserved inside the tarball and reused on the host
+# after extraction.
+BUNDLE_FILES = [
+    "bin/vmd",
+    "bin/boxd",
+    "bin/template-builder",
+    "deploy/superserve-vmd.service",
+    "deploy/firecracker@.service",
+    "deploy/firecracker-netns@.service",
+    "deploy/sandboxes.slice",
+    "scripts/fc-cleanup",
+]
+
+
 def main() -> int:
     project = os.environ["GCP_PROJECT"]
     label = os.environ.get("VMD_LABEL", "component=vmd")
     service = os.environ.get("VMD_SERVICE", "superserve-vmd")
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
+
+    # Build the deploy bundle once. Same artifact ships to every host;
+    # building per-host would waste CI runner CPU.
+    bundle_local = f"deploy-bundle-{sha}.tar.gz"
+    run_or_die(["tar", "czf", bundle_local] + BUNDLE_FILES, "bundle build")
+    print(f"Built {bundle_local} ({os.path.getsize(bundle_local)} bytes)")
 
     result = subprocess.run(
         [
@@ -52,62 +96,57 @@ def main() -> int:
 
     print(f"Deploying VMD to {len(instances)} instance(s)")
 
+    bundle_remote = f"/tmp/deploy-bundle-{sha}.tar.gz"
+    extract_dir = f"/tmp/deploy-{sha}"
+
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
 
-        def scp(src, dst):
-            subprocess.run(
-                [
-                    "gcloud", "compute", "scp", src, f"{name}:{dst}",
-                    f"--zone={zone}", f"--project={project}",
-                    "--quiet", "--tunnel-through-iap",
-                ],
-                check=True, capture_output=True,
-            )
-
-        scp("bin/vmd", f"/tmp/vmd-{sha}")
-        scp("bin/boxd", f"/tmp/boxd-{sha}")
-        scp("bin/template-builder", f"/tmp/template-builder-{sha}")
-
-        scp("deploy/superserve-vmd.service", "/tmp/superserve-vmd.service")
-        scp("deploy/firecracker@.service", "/tmp/firecracker@.service")
-        scp("deploy/firecracker-netns@.service", "/tmp/firecracker-netns@.service")
-        scp("deploy/sandboxes.slice", "/tmp/sandboxes.slice")
-        scp("scripts/fc-cleanup", "/tmp/fc-cleanup")
-        print(f"[{tag}] files uploaded")
+        # Single SCP — one IAP tunnel for the whole bundle.
+        run_or_die(
+            [
+                "gcloud", "compute", "scp", bundle_local, f"{name}:{bundle_remote}",
+                f"--zone={zone}", f"--project={project}",
+                "--quiet", "--tunnel-through-iap",
+            ],
+            f"[{tag}] scp bundle",
+        )
+        print(f"[{tag}] bundle uploaded")
 
         inject_script = textwrap.dedent(f"""
             set -euo pipefail
 
+            # Extract the deploy bundle into a sha-scoped staging dir so
+            # parallel deploys (or aborted retries) don't collide.
+            sudo rm -rf {extract_dir}
+            mkdir -p {extract_dir}
+            tar xzf {bundle_remote} -C {extract_dir}
+
             # Install vmd + template-builder binaries.
-            sudo mv /tmp/vmd-{sha} {install_dir}/vmd
-            sudo chmod +x {install_dir}/vmd
-            sudo mv /tmp/template-builder-{sha} {install_dir}/template-builder
-            sudo chmod +x {install_dir}/template-builder
+            sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
+            sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
 
             # Install systemd units.
-            sudo mv /tmp/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
-            sudo mv /tmp/firecracker@.service /etc/systemd/system/firecracker@.service
-            sudo mv /tmp/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
-            sudo mv /tmp/sandboxes.slice /etc/systemd/system/sandboxes.slice
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
+            sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
+            sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
+            sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
             sudo systemctl daemon-reload
 
-            sudo mv /tmp/fc-cleanup {install_dir}/fc-cleanup
-            sudo chmod +x {install_dir}/fc-cleanup
+            sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 
             # Inject boxd + rebuild rootfs only when the new binary differs
             # from what's already installed. `-trimpath -ldflags '-s -w'`
             # makes Go builds reproducible, so hashes only differ when
             # source actually changed. Skipping preserves the rootfs hash,
             # which keeps vmd's template cache valid.
-            NEW_HASH=$(sha256sum /tmp/boxd-{sha} | awk '{{print $1}}')
+            NEW_HASH=$(sha256sum {extract_dir}/bin/boxd | awk '{{print $1}}')
             CUR_HASH=$(sha256sum {install_dir}/boxd 2>/dev/null | awk '{{print $1}}' || echo none)
 
             if [ "$NEW_HASH" != "$CUR_HASH" ]; then
                 echo "boxd changed ($CUR_HASH -> $NEW_HASH) — installing + rebuilding rootfs"
-                sudo install -m 0755 /tmp/boxd-{sha} {install_dir}/boxd
-                rm -f /tmp/boxd-{sha}
+                sudo install -m 0755 {extract_dir}/bin/boxd {install_dir}/boxd
 
                 ROOTFS=""
                 for env_file in /etc/sandbox/vmd.env; do
@@ -139,8 +178,10 @@ def main() -> int:
                 fi
             else
                 echo "boxd unchanged ($CUR_HASH) — skipping install + rootfs rebuild"
-                rm -f /tmp/boxd-{sha}
             fi
+
+            sudo rm -rf {extract_dir}
+            rm -f {bundle_remote}
 
             sudo systemctl restart {service}
             sleep 3
