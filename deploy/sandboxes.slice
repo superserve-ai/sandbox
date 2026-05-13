@@ -7,7 +7,10 @@ CPUAccounting=yes
 MemoryAccounting=yes
 IOAccounting=yes
 
-# Safety ceiling: sandboxes cannot consume the entire host.
-# Per-sandbox limits are set via drop-in files on each unit.
+# Memory ceiling: percentage is of total host RAM (correct semantics).
 MemoryMax=95%
-CPUQuota=90%
+
+# No CPUQuota: systemd interprets N% as N% of ONE CPU, not the host. A
+# prior CPUQuota=90% capped all sandboxes to 0.9 CPU total, serializing
+# burst creates. CPU fairness left to the kernel scheduler; per-VM vCPU
+# counts are enforced by Firecracker.
