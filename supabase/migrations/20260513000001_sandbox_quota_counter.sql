@@ -2,6 +2,10 @@
 -- destroyed_at is null and status != 'failed'`. Triggers maintain it
 -- in sync; the INSERT trigger raises SQLSTATE 'SS001' on quota exceed.
 
+-- Hold EXCLUSIVE on sandbox so concurrent INSERTs can't land between
+-- the backfill SELECT and the trigger creation. Reads stay allowed.
+LOCK TABLE sandbox IN EXCLUSIVE MODE;
+
 ALTER TABLE team
   ADD COLUMN active_sandbox_count integer NOT NULL DEFAULT 0;
 
