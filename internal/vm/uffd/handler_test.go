@@ -1,9 +1,14 @@
 package uffd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 	"unsafe"
+
+	"github.com/rs/zerolog"
 )
 
 // firecracker-produced JSON from src/vmm/src/persist.rs:725-768. Verified
@@ -101,5 +106,53 @@ func TestUffdMsgSize(t *testing.T) {
 	want := uintptr(32)
 	if got := unsafe.Sizeof(msg); got != want {
 		t.Errorf("sizeof(uffdMsg) = %d, want %d", got, want)
+	}
+}
+
+func TestHandler_CloseIdempotent(t *testing.T) {
+	h := New(Config{Logger: zerolog.Nop()})
+	if err := h.Close(); err != nil {
+		t.Errorf("first Close: %v", err)
+	}
+	// Second call must be a no-op — closed CAS guards against double-Munmap
+	// and double-close of listener/fd.
+	if err := h.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+}
+
+func TestHandler_WaitHandshake_Success(t *testing.T) {
+	h := New(Config{Logger: zerolog.Nop()})
+	h.publishHandshake(nil)
+	if err := h.WaitHandshake(context.Background()); err != nil {
+		t.Errorf("WaitHandshake: %v", err)
+	}
+	// Idempotent: re-publish lets a second caller see the same outcome.
+	if err := h.WaitHandshake(context.Background()); err != nil {
+		t.Errorf("second WaitHandshake: %v", err)
+	}
+}
+
+func TestHandler_WaitHandshake_Error(t *testing.T) {
+	h := New(Config{Logger: zerolog.Nop()})
+	want := errors.New("boom")
+	h.publishHandshake(want)
+	got := h.WaitHandshake(context.Background())
+	if !errors.Is(got, want) {
+		t.Errorf("WaitHandshake = %v, want %v", got, want)
+	}
+}
+
+func TestHandler_WaitHandshake_CtxCancel(t *testing.T) {
+	h := New(Config{Logger: zerolog.Nop()})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err := h.WaitHandshake(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("WaitHandshake = %v, want context.Canceled", err)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Errorf("cancel didn't propagate promptly: %v", time.Since(start))
 	}
 }
