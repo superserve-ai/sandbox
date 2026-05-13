@@ -193,8 +193,39 @@ func NewFirewall(cfg FirewallConfig) (*Firewall, error) {
 	return fw, nil
 }
 
-// Close tears down the nftables connection. The kernel automatically
-// removes the table and all rules when the lasting connection closes.
+// AttachFirewall binds a Firewall handle to nftables state already in
+// the kernel for this namespace (e.g., from a prior vmd lifetime). Must
+// be called from within the target namespace. Unlike NewFirewall it
+// does NOT install rules — struct refs are bound to existing kernel
+// objects by Name+Table, so ReplaceUserRules operates on them in place.
+func AttachFirewall(cfg FirewallConfig) (*Firewall, error) {
+	conn, err := nftables.New(nftables.AsLasting())
+	if err != nil {
+		return nil, fmt.Errorf("new nftables conn: %w", err)
+	}
+	table := &nftables.Table{Name: tableName, Family: nftables.TableFamilyINet}
+	return &Firewall{
+		conn:               conn,
+		table:              table,
+		filterChain:        &nftables.Chain{Name: "preroute_filter", Table: table},
+		natChain:           &nftables.Chain{Name: "preroute_nat", Table: table},
+		postChain:          &nftables.Chain{Name: "postroute_nat", Table: table},
+		fwdChain:           &nftables.Chain{Name: "forward_mangle", Table: table},
+		predefinedDenySet:  &nftables.Set{Table: table, Name: "predefined_deny", KeyType: nftables.TypeIPAddr, Interval: true},
+		predefinedAllowSet: &nftables.Set{Table: table, Name: "predefined_allow", KeyType: nftables.TypeIPAddr, Interval: true},
+		userDenySet:        &nftables.Set{Table: table, Name: "user_deny", KeyType: nftables.TypeIPAddr, Interval: true},
+		userAllowSet:       &nftables.Set{Table: table, Name: "user_allow", KeyType: nftables.TypeIPAddr, Interval: true},
+		tapIface:           cfg.TAPInterface,
+		vethPeer:           cfg.VethPeer,
+		vmIP:               cfg.VMIP,
+		hostIP:             cfg.HostIP,
+		gatewayIP:          cfg.GatewayIP,
+	}, nil
+}
+
+// Close tears down the nftables connection. Kernel-level table and
+// rules persist across the close — they're owned by the kernel, not
+// by this netlink handle. AttachFirewall can re-bind to them later.
 func (fw *Firewall) Close() error {
 	if fw.conn == nil {
 		return nil

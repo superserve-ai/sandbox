@@ -389,15 +389,13 @@ func (m *Manager) CleanupVM(vmID string) {
 		m.egressProxy.RemoveRules(info.HostIP)
 	}
 
-	// Try to recycle the slot into the pool instead of tearing it down.
-	// The namespace, veth, TAP, and base nftables stay configured —
-	// only the vmID-specific host firewall and egress rules were removed
-	// above. The next Claim re-adds them for the new vmID.
-	if m.pool != nil {
-		// Reset user-defined firewall rules to defaults before recycling.
-		if info.Firewall != nil {
-			_ = info.Firewall.ReplaceUserRules(nil, nil)
-		}
+	// Recycle the slot into the pool — namespace, veth, TAP, and base
+	// nftables stay configured; the next Claim re-adds vmID-specific
+	// rules. Skipped when info.Firewall is nil (reattached VM whose
+	// in-ns handle couldn't be rebound) — pooling would let the next
+	// Claim silently lose per-VM egress filtering.
+	if m.pool != nil && info.Firewall != nil {
+		_ = info.Firewall.ReplaceUserRules(nil, nil)
 		m.pool.Return(&preallocSlot{idx: idx, info: info, vethName: vethName})
 		return
 	}
@@ -424,6 +422,84 @@ func (m *Manager) CleanupVM(vmID string) {
 	_ = run(ctx, "ip", "netns", "del", info.Namespace)
 
 	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+}
+
+// ReattachVM rebinds vmd's view of an already-running VM's network state
+// at startup. After this call: the slot is marked in-use (no SetupVM
+// collisions), devices[vmID] is populated (CleanupVM can tear it down),
+// host-level firewall rules are present + tracked, and the in-namespace
+// nftables Firewall handle is reattached so the customer's subsequent
+// UpdateFirewallRules calls apply to the existing kernel state.
+func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
+	idx, ok := slotFromNamespace(namespace)
+	if !ok {
+		return fmt.Errorf("reattach %s: cannot parse slot from namespace %q", vmID, namespace)
+	}
+	vethName := fmt.Sprintf("veth-%d", idx)
+	hostCIDR := fmt.Sprintf("%s/32", hostIP)
+
+	// Rebind in-namespace nftables handle. Non-fatal on failure: kernel
+	// rules already enforce traffic; only future updates would be lost.
+	fwCfg := FirewallConfig{
+		TAPInterface: TAPName,
+		VethPeer:     "eth0",
+		VMIP:         VMInternalIP,
+		HostIP:       hostIP,
+		GatewayIP:    VMGatewayIP,
+	}
+	var fw *Firewall
+	if err := nsExecGo(namespace, func() error {
+		f, err := AttachFirewall(fwCfg)
+		if err != nil {
+			return err
+		}
+		fw = f
+		return nil
+	}); err != nil {
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
+	}
+
+	m.mu.Lock()
+	// Bump nextSlot past this idx so new VMs don't collide. Gap slots
+	// below nextSlot are wasted until bitmap allocation lands.
+	if idx >= m.nextSlot {
+		m.nextSlot = idx + 1
+	}
+	m.devices[vmID] = &VMNetInfo{
+		Namespace:  namespace,
+		TAPDevice:  TAPName,
+		VMIP:       VMInternalIP,
+		GatewayIP:  VMGatewayIP,
+		HostIP:     hostIP,
+		MACAddress: macAddress,
+		Firewall:   fw, // nil if AttachFirewall failed; CleanupVM tolerates it
+	}
+	m.mu.Unlock()
+
+	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
+		return fmt.Errorf("reattach %s: restore host firewall: %w", vmID, err)
+	}
+	m.log.Info().Str("vm_id", vmID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
+	return nil
+}
+
+// slotFromNamespace parses "ns-N" → N (digits only). Returns (0, false)
+// on malformed input. Strict: trailing non-digit characters are rejected
+// to avoid silently mapping "ns-2-something" to slot 2.
+func slotFromNamespace(namespace string) (int, bool) {
+	const prefix = "ns-"
+	if len(namespace) <= len(prefix) || namespace[:len(prefix)] != prefix {
+		return 0, false
+	}
+	digits := namespace[len(prefix):]
+	idx := 0
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		idx = idx*10 + int(c-'0')
+	}
+	return idx, true
 }
 
 // SweepOrphanNamespaces removes host namespaces and veth interfaces
