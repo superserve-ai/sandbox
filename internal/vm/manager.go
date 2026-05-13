@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/vm/uffd"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -88,6 +89,12 @@ type VMInstance struct {
 	CreatedAt    time.Time
 	Metadata     map[string]string
 
+	// uffdCancel cancels the per-VM UFFD handler goroutine. nil for VMs
+	// not using UFFD (cold boots, template builds, in-place resumes).
+	uffdCancel context.CancelFunc
+	// uffdHandler is the per-VM UFFD handler; nil for non-UFFD VMs.
+	uffdHandler *uffd.Handler
+
 	mu sync.RWMutex
 }
 
@@ -122,6 +129,22 @@ type ManagerConfig struct {
 	// prevent a spike of concurrent sandbox creates from saturating host
 	// file I/O, netns setup, and Firecracker boots. 0 → default 100.
 	MaxConcurrentRestores int
+
+	// UffdEnabled gates the UFFD lazy-restore path. false → fresh
+	// restores fall back to the File memory backend (synchronous CRC64),
+	// same as in-place resume. Default true; flip to false as an ops
+	// circuit breaker without redeploying.
+	UffdEnabled bool
+
+	// UffdPrefetchEnabled turns on background prefetch in the UFFD
+	// handler. When true, the handler walks mem.snap after the handshake
+	// and pre-copies pages into guest memory so the first exec doesn't
+	// stall on cold pages. Ignored when UffdEnabled is false.
+	UffdPrefetchEnabled bool
+
+	// UffdRecordMaxSeconds caps how long RecordAccessPattern waits for the
+	// guest's fault rate to settle before giving up. 0 → 10s default.
+	UffdRecordMaxSeconds int
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +464,8 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
+	m.cancelUffdHandler(inst)
+
 	// Stop the systemd unit if one exists — this is the path for sandbox
 	// VMs launched via startFirecrackerViaSystemd.
 	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
@@ -747,6 +772,14 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config,
 ) (*VMInstance, error) {
+	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, nil)
+}
+
+// restoreVMSnapshot is the implementation. The recorder argument is
+// non-nil only for template-build access-pattern recording.
+func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
+	resourceLimits VMConfig, netCfg *network.Config, recorder *uffd.Recorder,
+) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
 	// Bound concurrent restores so a burst of sandbox creates doesn't
@@ -843,6 +876,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
+	uffdSocketPath := filepath.Join(vmDir, "uffd.sock")
 
 	// Publish all the network/disk/socket fields before starting
 	// Firecracker so the in-memory view is consistent for concurrent
@@ -856,8 +890,21 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.SocketPath = socketPath
 	inst.mu.Unlock()
 
+	// inPlace resume always uses File backend; UffdEnabled=false is the
+	// ops circuit breaker that forces fresh restores onto File too.
+	useUffd := !inPlace && m.cfg.UffdEnabled
+	if useUffd {
+		if err := m.startUffdHandler(ctx, inst, uffdSocketPath, memPath, recorder); err != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("start uffd handler: %w", err)
+		}
+	}
+
 	pid, startErr := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
 	if startErr != nil {
+		m.cancelUffdHandler(inst)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -872,12 +919,20 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	log.Info().Msg("restoring snapshot")
 
 	var restoreErr error
-	if inPlace {
+	switch {
+	case useUffd:
+		restoreErr = RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, "eth0", tapDevice, plan.deltaDir)
+	case inPlace:
 		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
-	} else {
+	default:
+		// UFFD disabled but fresh restore — File backend with network overrides.
 		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
 	}
 	if restoreErr != nil {
+		// Firecracker is already running; stop the unit before other
+		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
+		m.stopUnitDuringRestoreError(vmID)
+		m.cancelUffdHandler(inst)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -891,7 +946,28 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
+	// LoadSnapshot doesn't ack the UFFD handshake — Firecracker can
+	// return success while our handler silently failed, which would
+	// leave the guest hanging on first page fault.
+	if useUffd {
+		inst.mu.RLock()
+		uffdH := inst.uffdHandler
+		inst.mu.RUnlock()
+		if uffdH != nil {
+			if hsErr := uffdH.WaitHandshake(ctx); hsErr != nil {
+				m.stopUnitDuringRestoreError(vmID)
+				m.cancelUffdHandler(inst)
+				m.netMgr.CleanupVM(vmID)
+				m.cleanupRunDir(vmID)
+				m.setStatus(vmID, StatusError)
+				return nil, fmt.Errorf("uffd handshake: %w", hsErr)
+			}
+		}
+	}
+
 	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
+		m.stopUnitDuringRestoreError(vmID)
+		m.cancelUffdHandler(inst)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -1333,6 +1409,191 @@ func (m *Manager) cleanupRunDir(dirName string) {
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.RemoveAll(vmDir); err != nil {
 		m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to remove rundir")
+	}
+}
+
+// stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
+// aborts after Firecracker started. Uses a fresh context because the
+// caller's gRPC ctx is often already cancelled (deadline exceeded under
+// load). Without this, the firecracker process leaks.
+func (m *Manager) stopUnitDuringRestoreError(vmID string) {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := stopUnit(cleanupCtx, systemdUnitName(vmID)); err != nil {
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("systemctl stop failed during restore error cleanup")
+	}
+	removeUnitDropIn(vmID)
+}
+
+// startUffdHandler binds the per-VM UFFD socket, opens mem.snap, and
+// launches the handler goroutine. reqCtx is the caller's request ctx;
+// its deadline applies to the handshake. The serve loop uses an
+// independent ctx so it outlives the request. recorder, when non-nil,
+// hooks OnPageFault for template-build recording.
+func (m *Manager) startUffdHandler(reqCtx context.Context, inst *VMInstance, uffdSocketPath, memSnapPath string, recorder *uffd.Recorder) error {
+	accessLogPath := filepath.Join(filepath.Dir(memSnapPath), "access.log")
+	cfg := uffd.Config{
+		SocketPath:    uffdSocketPath,
+		MemSnapPath:   memSnapPath,
+		AccessLogPath: accessLogPath,
+		Logger:        m.log.With().Str("vm_id", inst.ID).Logger(),
+	}
+	if recorder != nil {
+		cfg.OnPageFault = recorder.Record
+		cfg.PrefetchEnabled = false
+	} else {
+		cfg.PrefetchEnabled = m.cfg.UffdPrefetchEnabled
+	}
+	h := uffd.New(cfg)
+	if err := h.Start(); err != nil {
+		return err
+	}
+	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
+	inst.mu.Lock()
+	inst.uffdCancel = lifetimeCancel
+	inst.uffdHandler = h
+	inst.mu.Unlock()
+
+	vmID := inst.ID
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.log.Error().Interface("panic", r).Str("vm_id", vmID).Msg("uffd handler panicked")
+			}
+		}()
+		defer h.Close()
+		if err := h.AcceptHandshake(reqCtx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				m.log.Error().Err(err).Str("vm_id", vmID).Msg("uffd handshake failed")
+			}
+			return
+		}
+		if err := h.Serve(lifetimeCtx); err != nil && !errors.Is(err, context.Canceled) {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("uffd handler exited with error")
+		}
+	}()
+	return nil
+}
+
+const (
+	recordTickInterval = 100 * time.Millisecond
+	recordMinDuration  = 500 * time.Millisecond
+	recordQuietTicks   = 3
+	recordDefaultMax   = 10 * time.Second
+)
+
+// RecordAccessPattern restores the snapshot under UFFD-recording mode,
+// waits for the guest's page-fault rate to settle, and writes the
+// observed page-access order to outputPath.
+func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, memPath, outputPath string,
+	resourceLimits VMConfig, netCfg *network.Config,
+) error {
+	if _, err := os.Stat(outputPath); err == nil {
+		m.log.Info().Str("path", outputPath).Msg("access log already exists, skipping recording")
+		return nil
+	}
+
+	recorder := uffd.NewRecorder()
+	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, recorder)
+	if err != nil {
+		return fmt.Errorf("restore for recording: %w", err)
+	}
+	defer func() {
+		_ = m.DestroyVM(context.Background(), inst.ID, true)
+	}()
+
+	inst.mu.RLock()
+	handler := inst.uffdHandler
+	inst.mu.RUnlock()
+	if handler == nil {
+		return errors.New("UFFD handler missing after restore-for-recording")
+	}
+
+	maxDuration := recordDefaultMax
+	if m.cfg.UffdRecordMaxSeconds > 0 {
+		maxDuration = time.Duration(m.cfg.UffdRecordMaxSeconds) * time.Second
+	}
+
+	settled, elapsed, totalFaults := m.waitFaultsSettle(ctx, handler, maxDuration)
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return ctx.Err()
+	}
+
+	pages := recorder.Len()
+	mkEvent := func() *zerolog.Event {
+		ev := m.log.Info()
+		if !settled {
+			ev = m.log.Warn()
+		}
+		return ev.Str("template_vm", vmID).Bool("settled", settled).
+			Dur("elapsed", elapsed).Uint64("total_faults", totalFaults).Int("pages", pages)
+	}
+
+	if pages == 0 {
+		// Missing access.log → sequential prefetch fallback, which is a
+		// cleaner signal than a zero-byte log.
+		mkEvent().Msg("access pattern recording produced no pages; access.log not written")
+		return nil
+	}
+
+	if err := recorder.Flush(outputPath, false); err != nil {
+		return fmt.Errorf("flush access log: %w", err)
+	}
+	mkEvent().Str("path", outputPath).Msg("access pattern recorded")
+	return nil
+}
+
+// waitFaultsSettle returns settled=true once the guest has produced
+// activity then stayed quiet for recordQuietTicks past
+// recordMinDuration. settled=false means maxDuration or ctx tripped.
+func (m *Manager) waitFaultsSettle(ctx context.Context, h *uffd.Handler, maxDuration time.Duration) (settled bool, elapsed time.Duration, totalFaults uint64) {
+	start := time.Now()
+	ticker := time.NewTicker(recordTickInterval)
+	defer ticker.Stop()
+	deadline := time.NewTimer(maxDuration)
+	defer deadline.Stop()
+
+	var lastFaults uint64
+	seenActivity := false
+	quietCount := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false, time.Since(start), h.Stats().FaultsServed.Load()
+		case <-deadline.C:
+			return false, time.Since(start), h.Stats().FaultsServed.Load()
+		case <-ticker.C:
+			cur := h.Stats().FaultsServed.Load()
+			delta := cur - lastFaults
+			lastFaults = cur
+			if delta > 0 {
+				seenActivity = true
+				quietCount = 0
+				continue
+			}
+			if !seenActivity {
+				continue
+			}
+			if time.Since(start) < recordMinDuration {
+				continue
+			}
+			quietCount++
+			if quietCount >= recordQuietTicks {
+				return true, time.Since(start), cur
+			}
+		}
+	}
+}
+
+// cancelUffdHandler is idempotent and a no-op for non-UFFD VMs.
+func (m *Manager) cancelUffdHandler(inst *VMInstance) {
+	inst.mu.Lock()
+	cancel := inst.uffdCancel
+	inst.uffdCancel = nil
+	inst.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
