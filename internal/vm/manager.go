@@ -1090,6 +1090,15 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.vms[rec.ID] = inst
 		m.mu.Unlock()
 
+		// Restore network manager state for this VM: slot tracking,
+		// devices map, host firewall rules (re-installed via idempotent
+		// AddVM in case the kernel rules were lost).
+		if inst.Namespace != "" && inst.IP != "" {
+			if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
+				log.Error().Err(err).Msg("reattach: restore network state failed")
+			}
+		}
+
 		m.persistState(inst)
 		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
 		reattached++

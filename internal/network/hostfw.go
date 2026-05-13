@@ -40,11 +40,10 @@ type vmRule struct {
 	prepend bool // insert at top of chain instead of appending
 }
 
-// NewHostFirewall initializes the host firewall. On first call it adds
-// a static MSS clamp rule. On restart, existing per-VM rules from the
-// previous process are already in the kernel (iptables rules persist)
-// and will be cleaned up when RemoveVM is called — or leaked harmlessly
-// if the VM was already destroyed.
+// NewHostFirewall initializes the host firewall. Adds a static MSS clamp
+// rule (idempotent via AppendUnique). Per-VM rules from prior lifetimes
+// remain in the kernel; ReattachAll re-invokes AddVM for each surviving
+// VM to repopulate the in-memory tracking map (AddVM is idempotent).
 func NewHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log zerolog.Logger) (*HostFirewall, error) {
 	ipt, err := iptables.New()
 	if err != nil {
@@ -157,20 +156,13 @@ func (hfw *HostFirewall) RemoveVM(vmID string) error {
 	return firstErr
 }
 
-// Close removes all VM rules we've tracked during this vmd lifetime.
-// Rules from prior lifetimes (if any) are left in the kernel — they
-// match veths/IPs that no longer exist and are effectively dead.
+// Close drops the in-memory tracking map. Kernel-level iptables rules
+// remain — they're kernel state, not process state. The next vmd
+// lifetime rebuilds the map via ReattachAll → AddVM (idempotent).
 func (hfw *HostFirewall) Close() error {
 	hfw.mu.Lock()
 	defer hfw.mu.Unlock()
-
-	for vmID, rules := range hfw.vmRules {
-		for _, r := range rules {
-			_ = hfw.ipt.DeleteIfExists(r.table, r.chain, r.args...)
-		}
-		delete(hfw.vmRules, vmID)
-	}
-
+	hfw.vmRules = make(map[string][]vmRule)
 	return nil
 }
 
