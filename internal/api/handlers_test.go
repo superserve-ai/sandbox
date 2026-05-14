@@ -1399,6 +1399,53 @@ func TestCreateSandbox_MissingTeamID(t *testing.T) {
 	}
 }
 
+func TestCreateSandbox_QuotaExceeded(t *testing.T) {
+	teamID := uuid.New()
+	vmd := &stubVMD{}
+
+	// SS001 is what the sandbox_quota_on_insert trigger raises on over-quota.
+	var destroyCalled bool
+	vmd.destroyFn = func(_ context.Context, _ string, _ bool) error {
+		destroyCalled = true
+		return nil
+	}
+
+	quotaErr := &pgconn.PgError{Code: "SS001", Message: "sandbox quota exceeded"}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return errorRow(quotaErr)
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			// GetTeam lookup in respondQuotaExceeded falls back to the
+			// code default when this errs.
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"x"}`))
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusTooManyRequests, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["code"] != "too_many_sandboxes" {
+		t.Errorf("error code = %v, want too_many_sandboxes", errObj["code"])
+	}
+	if !destroyCalled {
+		t.Error("orphan VM was not destroyed after quota rejection")
+	}
+}
+
 func TestCreateSandbox_VMDError(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()

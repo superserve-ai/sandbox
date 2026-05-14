@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -61,6 +62,8 @@ func run() error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 	log.Info().Msg("connected to database")
+
+	reconcileSystemTeamQuota(ctx, dbPool, cfg.SystemTeamID)
 
 	// Connect to VMD via gRPC.
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
@@ -169,6 +172,26 @@ func run() error {
 
 	log.Info().Msg("controlplane stopped")
 	return nil
+}
+
+// reconcileSystemTeamQuota lifts the system team's max_sandboxes above any
+// realistic cap so the sandbox_quota_on_insert trigger never rejects it.
+func reconcileSystemTeamQuota(ctx context.Context, pool *pgxpool.Pool, systemTeamID string) {
+	if systemTeamID == "" {
+		return
+	}
+	tag, err := pool.Exec(ctx,
+		`UPDATE team SET max_sandboxes = $1
+		 WHERE id = $2 AND (max_sandboxes IS NULL OR max_sandboxes < $1)`,
+		math.MaxInt32, systemTeamID,
+	)
+	if err != nil {
+		log.Warn().Err(err).Str("system_team_id", systemTeamID).
+			Msg("reconcile system team quota failed — system team may be capped at default")
+		return
+	}
+	log.Info().Str("system_team_id", systemTeamID).Int64("rows", tag.RowsAffected()).
+		Msg("system team quota reconciled")
 }
 
 // ---------------------------------------------------------------------------

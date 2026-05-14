@@ -283,7 +283,8 @@ type Team struct {
 	MaxTemplateMemoryMib *int32    `json:"max_template_memory_mib"`
 	MaxTemplateDiskMib   *int32    `json:"max_template_disk_mib"`
 	MaxTemplates         *int32    `json:"max_templates"`
-	MaxSandboxes         *int32    `json:"max_sandboxes"`
+	MaxSandboxes         int32     `json:"max_sandboxes"`
+	ActiveSandboxCount   int32     `json:"active_sandbox_count"`
 }
 
 type TeamMember struct {

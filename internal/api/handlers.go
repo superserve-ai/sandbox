@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
@@ -28,16 +29,23 @@ import (
 // VMDClient is the interface for talking to a VM daemon.
 type VMDClient = vmdclient.Client
 
-// sandboxQuotaError is the sentinel returned from CreateSandbox's INSERT
-// goroutine when the per-team count cap is reached. Carries the cap so
-// the handler can include it in the user-facing error.
-type sandboxQuotaError struct{ limit int64 }
+// SQLSTATE raised by the sandbox_quota_on_insert trigger.
+const sandboxQuotaErrCode = "SS001"
 
-func (e sandboxQuotaError) Error() string {
-	return fmt.Sprintf("sandbox quota exceeded (limit=%d)", e.limit)
+func isSandboxQuotaErr(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sandboxQuotaErrCode
 }
 
-func errSandboxQuotaExceeded(limit int64) error { return sandboxQuotaError{limit: limit} }
+// respondQuotaExceeded best-effort fetches the team's cap for the message;
+// falls back to a generic phrasing if GetTeam errs.
+func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
+	msg := "team has reached its sandbox limit; delete some or contact support@superserve.ai for higher"
+	if team, err := h.DB.GetTeam(c.Request.Context(), teamID); err == nil {
+		msg = fmt.Sprintf("team has reached the limit of %d sandboxes; delete some or contact support@superserve.ai for higher", team.MaxSandboxes)
+	}
+	respondErrorMsg(c, "too_many_sandboxes", msg, http.StatusTooManyRequests)
+}
 
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
@@ -1144,56 +1152,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		})
 	}
 	go func() {
-		// Test path: when no Pool is wired (unit tests with a mock DBTX),
-		// skip the count check and just do the INSERT.
-		if h.Pool == nil {
-			sb, err := runInsert(h.DB)
-			insertCh <- insertResult{sandbox: sb, err: err}
-			return
-		}
-
-		// Wrap count + insert in a tx with the per-team advisory lock so
-		// concurrent submits can't both pass at limit-1.
-		tx, err := h.Pool.BeginTx(insertCtx, pgx.TxOptions{})
-		if err != nil {
-			insertCh <- insertResult{err: err}
-			return
-		}
-		defer tx.Rollback(insertCtx)
-
-		if _, err := tx.Exec(insertCtx, "SELECT pg_advisory_xact_lock(hashtext($1))", teamID.String()); err != nil {
-			insertCh <- insertResult{err: err}
-			return
-		}
-		q := h.DB.WithTx(tx)
-
-		// Per-team sandbox count cap. System team is exempt.
-		if teamID != h.systemTeamID() {
-			team, err := q.GetTeam(insertCtx, teamID)
-			if err != nil {
-				insertCh <- insertResult{err: err}
-				return
-			}
-			count, err := q.CountActiveSandboxesForTeam(insertCtx, teamID)
-			if err != nil {
-				insertCh <- insertResult{err: err}
-				return
-			}
-			effMaxSandboxes := int64(defaultMaxSandboxes)
-			if team.MaxSandboxes != nil {
-				effMaxSandboxes = int64(*team.MaxSandboxes)
-			}
-			if count >= effMaxSandboxes {
-				insertCh <- insertResult{err: errSandboxQuotaExceeded(effMaxSandboxes)}
-				return
-			}
-		}
-
-		sb, insertErr := runInsert(q)
-		if insertErr == nil {
-			insertErr = tx.Commit(insertCtx)
-		}
-		insertCh <- insertResult{sandbox: sb, err: insertErr}
+		// Quota is enforced by the sandbox_quota_on_insert trigger.
+		sb, err := runInsert(h.DB)
+		insertCh <- insertResult{sandbox: sb, err: err}
 	}()
 
 	// Boot the VM synchronously — the client gets a response only after
@@ -1221,9 +1182,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
 	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
 
-	// Per-team sandbox count cap; surfaced from the goroutine via sentinel.
-	var quotaErr sandboxQuotaError
-	quotaExceeded := errors.As(dbErr, &quotaErr)
+	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
+	quotaExceeded := isSandboxQuotaErr(dbErr)
 
 	switch {
 	case dbErr != nil && vmdErr != nil:
@@ -1234,9 +1194,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return
 		}
 		if quotaExceeded {
-			respondErrorMsg(c, "too_many_sandboxes",
-				fmt.Sprintf("team has reached the limit of %d sandboxes; delete some or contact support@superserve.ai for higher", quotaErr.limit),
-				http.StatusTooManyRequests)
+			h.respondQuotaExceeded(c, teamID)
 			return
 		}
 		respondError(c, ErrInternal)
@@ -1254,9 +1212,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return
 		}
 		if quotaExceeded {
-			respondErrorMsg(c, "too_many_sandboxes",
-				fmt.Sprintf("team has reached the limit of %d sandboxes; delete some or contact support@superserve.ai for higher", quotaErr.limit),
-				http.StatusTooManyRequests)
+			h.respondQuotaExceeded(c, teamID)
 			return
 		}
 		respondError(c, ErrInternal)

@@ -42,12 +42,6 @@ WHERE base_path = $1 AND destroyed_at IS NULL;
 SELECT DISTINCT base_path FROM sandbox
 WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
 
--- name: CountActiveSandboxesForTeam :one
--- Active = consumes host resources. Excludes failed (VM is gone) and
--- destroyed (row is dead). Includes starting/active/pausing/paused/resuming.
-SELECT COUNT(*)::bigint FROM sandbox
-WHERE team_id = $1 AND destroyed_at IS NULL AND status != 'failed';
-
 -- name: ListSandboxesByTeam :many
 SELECT * FROM sandbox
 WHERE team_id = $1 AND destroyed_at IS NULL
