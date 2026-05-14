@@ -38,15 +38,13 @@ func isSandboxQuotaErr(err error) bool {
 }
 
 // respondQuotaExceeded best-effort fetches the team's cap for the message;
-// falls back to defaultMaxSandboxes if GetTeam errs.
+// falls back to a generic phrasing if GetTeam errs.
 func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
-	limit := int64(defaultMaxSandboxes)
-	if team, err := h.DB.GetTeam(c.Request.Context(), teamID); err == nil && team.MaxSandboxes != nil {
-		limit = int64(*team.MaxSandboxes)
+	msg := "team has reached its sandbox limit; delete some or contact support@superserve.ai for higher"
+	if team, err := h.DB.GetTeam(c.Request.Context(), teamID); err == nil {
+		msg = fmt.Sprintf("team has reached the limit of %d sandboxes; delete some or contact support@superserve.ai for higher", team.MaxSandboxes)
 	}
-	respondErrorMsg(c, "too_many_sandboxes",
-		fmt.Sprintf("team has reached the limit of %d sandboxes; delete some or contact support@superserve.ai for higher", limit),
-		http.StatusTooManyRequests)
+	respondErrorMsg(c, "too_many_sandboxes", msg, http.StatusTooManyRequests)
 }
 
 // Scheduler selects a host for new sandboxes.

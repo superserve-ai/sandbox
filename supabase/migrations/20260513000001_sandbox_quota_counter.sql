@@ -20,12 +20,12 @@ FROM (
 ) sub
 WHERE t.id = sub.team_id;
 
--- System team gets a sentinel max so the trigger's uniform check is a
--- no-op for it. UUID matches SYSTEM_TEAM_ID env in the controlplane.
-UPDATE team
-SET max_sandboxes = 2147483647
-WHERE id = '258e290e-d30d-4d2a-b751-07da118248c0'
-  AND (max_sandboxes IS NULL OR max_sandboxes < 1000);
+-- Make max_sandboxes the single source of truth (was COALESCEd in two places).
+UPDATE team SET max_sandboxes = 50 WHERE max_sandboxes IS NULL;
+ALTER TABLE team ALTER COLUMN max_sandboxes SET DEFAULT 50;
+ALTER TABLE team ALTER COLUMN max_sandboxes SET NOT NULL;
+
+-- System team's quota exemption is reconciled by the controlplane on startup.
 
 CREATE OR REPLACE FUNCTION sandbox_quota_on_insert() RETURNS trigger
     LANGUAGE plpgsql
@@ -41,7 +41,7 @@ BEGIN
   UPDATE team
   SET active_sandbox_count = active_sandbox_count + 1
   WHERE id = NEW.team_id
-  RETURNING active_sandbox_count, COALESCE(max_sandboxes, 50)
+  RETURNING active_sandbox_count, max_sandboxes
   INTO new_count, effective_max;
 
   IF NOT FOUND THEN

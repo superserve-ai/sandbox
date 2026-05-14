@@ -102,7 +102,6 @@ const (
 	defaultMaxMemoryMib = 2048
 	defaultMaxDiskMib   = 8192
 	defaultMaxTemplates = 10
-	defaultMaxSandboxes = 50
 
 	defaultVcpu     = 1
 	defaultMemoryMi = 1024
