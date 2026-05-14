@@ -2,6 +2,10 @@
 -- destroyed_at is null and status != 'failed'`. Triggers maintain it
 -- in sync; the INSERT trigger raises SQLSTATE 'SS001' on quota exceed.
 
+-- Wrap as a single tx so LOCK TABLE works under `supabase db push`
+-- (it runs statements autocommit otherwise).
+BEGIN;
+
 -- Hold EXCLUSIVE on sandbox so concurrent INSERTs can't land between
 -- the backfill SELECT and the trigger creation. Reads stay allowed.
 LOCK TABLE sandbox IN EXCLUSIVE MODE;
@@ -109,3 +113,5 @@ CREATE TRIGGER trg_sandbox_quota_on_delete
   AFTER DELETE ON sandbox
   FOR EACH ROW
   EXECUTE FUNCTION sandbox_quota_on_delete();
+
+COMMIT;
