@@ -61,6 +61,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). We use the Developer Certificate of Orig
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+OCVSAL 1.0 — see [LICENSE](LICENSE).
 
 Built on [Firecracker](https://github.com/firecracker-microvm/firecracker) (Apache 2.0).
