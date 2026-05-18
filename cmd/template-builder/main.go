@@ -23,6 +23,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/templatedelta"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
@@ -293,6 +294,13 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("snapshot: %w", err)
 	}
 	emitInternal("system", "snapshot captured")
+
+	// Bake the delta's dirty blocks into base.ext4 so per-sandbox restores
+	// don't replay them. Cuts per-create disk writes from ~delta-size to ~0.
+	if err := templatedelta.FlattenInto(basePath, deltaPath); err != nil {
+		return fmt.Errorf("flatten delta into base: %w", err)
+	}
+	emitInternal("system", "delta flattened into base")
 
 	// Flush host page cache for each artifact so a sandbox cp'ing them
 	// later doesn't see sparse holes from still-dirty pages.
