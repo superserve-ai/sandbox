@@ -41,13 +41,14 @@ func main() {
 	snapshotDir := flag.String("snapshot-dir", "", "base path for snapshot output")
 	kernelPath := flag.String("kernel", "", "path to vmlinux")
 	fcBin := flag.String("firecracker", "", "path to firecracker binary")
+	snapshotEditorBin := flag.String("snapshot-editor", "", "path to snapshot-editor binary")
 	boxdBin := flag.String("boxd", "", "path to boxd binary")
 	hostIface := flag.String("host-interface", "ens4", "host network interface")
 	slotIndex := flag.Int("slot-index", 200, "network slot index (must not collide with vmd)")
 	timeout := flag.Duration("timeout", 15*time.Minute, "build timeout")
 	flag.Parse()
 
-	if *templateID == "" || *specJSON == "" || *runDir == "" || *snapshotDir == "" || *kernelPath == "" || *fcBin == "" || *boxdBin == "" {
+	if *templateID == "" || *specJSON == "" || *runDir == "" || *snapshotDir == "" || *kernelPath == "" || *fcBin == "" || *snapshotEditorBin == "" || *boxdBin == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -77,9 +78,10 @@ func main() {
 		diskMiB:    uint32(*disk),
 		runDir:     *runDir,
 		snapshotDir: *snapshotDir,
-		kernelPath: *kernelPath,
-		fcBin:      *fcBin,
-		boxdBin:    *boxdBin,
+		kernelPath:        *kernelPath,
+		fcBin:             *fcBin,
+		snapshotEditorBin: *snapshotEditorBin,
+		boxdBin:           *boxdBin,
 		hostIface:  *hostIface,
 		slotIndex:  *slotIndex,
 	})
@@ -160,19 +162,20 @@ func classifyBuildError(err error) (code, userMsg string) {
 }
 
 type buildConfig struct {
-	templateID  string
-	buildID     string
-	spec        builder.BuildSpec
-	vcpu        uint32
-	memoryMiB   uint32
-	diskMiB     uint32
-	runDir      string
-	snapshotDir string
-	kernelPath  string
-	fcBin       string
-	boxdBin     string
-	hostIface   string
-	slotIndex   int
+	templateID        string
+	buildID           string
+	spec              builder.BuildSpec
+	vcpu              uint32
+	memoryMiB         uint32
+	diskMiB           uint32
+	runDir            string
+	snapshotDir       string
+	kernelPath        string
+	fcBin             string
+	snapshotEditorBin string
+	boxdBin           string
+	hostIface         string
+	slotIndex         int
 }
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
@@ -293,6 +296,17 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("snapshot: %w", err)
 	}
 	emitInternal("system", "snapshot captured")
+
+	// Bake delta into base + zero side-car so per-sandbox restores skip apply_delta.
+	flattenCmd := exec.CommandContext(ctx, cfg.snapshotEditorBin, "flatten", "run",
+		"--base-path", basePath,
+		"--delta-path", deltaPath,
+		"--sidecar-path", snapPath+".overlay",
+	)
+	if out, err := flattenCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("snapshot-editor flatten: %w (%s)", err, out)
+	}
+	emitInternal("system", "delta flattened into base")
 
 	// Flush host page cache for each artifact so a sandbox cp'ing them
 	// later doesn't see sparse holes from still-dirty pages.

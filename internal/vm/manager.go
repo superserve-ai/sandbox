@@ -123,6 +123,7 @@ type ManagerConfig struct {
 	SnapshotDir        string
 	RunDir             string
 	TemplateBuilderBin string // Path to template-builder binary.
+	SnapshotEditorBin  string // Path to snapshot-editor binary (passed to template-builder).
 	BoxdBinaryPath     string // Path to boxd binary (passed to template-builder).
 	HostInterface      string // Host network interface (e.g. "ens4").
 	// MaxConcurrentRestores caps parallel RestoreVMSnapshot operations to

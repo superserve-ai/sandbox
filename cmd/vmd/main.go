@@ -35,6 +35,7 @@ type Config struct {
 	GRPCPort           int
 	HostInterface      string
 	TemplateBuilderBin string
+	SnapshotEditorBin  string
 	BoxdBinaryPath     string
 
 	// HostID identifies this bare-metal host in the `host` table. Used by
@@ -69,6 +70,7 @@ func loadConfig() (Config, error) {
 		GRPCPort:       port,
 		HostInterface:      envOrDefault("HOST_INTERFACE", "eth0"),
 		TemplateBuilderBin: envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
+		SnapshotEditorBin:  envOrDefault("SNAPSHOT_EDITOR_BIN", "/usr/local/bin/snapshot-editor"),
 		BoxdBinaryPath:     envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
 		HostID:          envOrDefault("HOST_ID", "default"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
@@ -260,6 +262,7 @@ func main() {
 		SnapshotDir:           cfg.SnapshotDir,
 		RunDir:                cfg.RunDir,
 		TemplateBuilderBin:    cfg.TemplateBuilderBin,
+		SnapshotEditorBin:     cfg.SnapshotEditorBin,
 		BoxdBinaryPath:        cfg.BoxdBinaryPath,
 		HostInterface:         cfg.HostInterface,
 		MaxConcurrentRestores: maxRestores,

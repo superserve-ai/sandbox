@@ -126,6 +126,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		"--snapshot-dir", m.cfg.SnapshotDir,
 		"--kernel", m.cfg.KernelPath,
 		"--firecracker", m.cfg.FirecrackerBin,
+		"--snapshot-editor", m.cfg.SnapshotEditorBin,
 		"--boxd", m.cfg.BoxdBinaryPath,
 		"--host-interface", m.cfg.HostInterface,
 		"--slot-index", fmt.Sprint(slotIndex),
