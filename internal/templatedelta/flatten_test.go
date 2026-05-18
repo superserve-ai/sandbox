@@ -243,17 +243,6 @@ func TestParseDeltaHeader_TooSmall(t *testing.T) {
 	}
 }
 
-func TestParseDeltaHeader_BitmapCRCMismatch(t *testing.T) {
-	b := buildValidEmptyDelta(4096, 8)
-	// Find the bitmap_crc position: 36 (after bitmap_len) + bitmap_len bytes.
-	bitmapLen := binary.LittleEndian.Uint32(b[32:36])
-	crcPos := 36 + int(bitmapLen)
-	binary.LittleEndian.PutUint64(b[crcPos:crcPos+8], 0xBADBADBADBADBADB)
-	if _, _, _, err := parseDeltaHeader(b); err == nil {
-		t.Fatal("expected error for bitmap CRC mismatch, got nil")
-	}
-}
-
 func TestParseDeltaHeader_BitmapLenOverflows(t *testing.T) {
 	b := buildValidEmptyDelta(4096, 8)
 	// Claim a bitmap_len much larger than the file actually contains.

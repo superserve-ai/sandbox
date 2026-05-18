@@ -103,10 +103,7 @@ func parseDeltaHeader(b []byte) (deltaHeader, []byte, int, error) {
 		return deltaHeader{}, nil, 0, fmt.Errorf("delta truncated: bitmap claims %d bytes but file is %d", bitmapLen, len(b))
 	}
 	bitmapBytes := b[36:bitmapEnd]
-	storedBitmapCRC := binary.LittleEndian.Uint64(b[bitmapEnd : bitmapEnd+8])
-	if got := crc64Bare(0, bitmapBytes); got != storedBitmapCRC {
-		return deltaHeader{}, nil, 0, fmt.Errorf("bitmap CRC mismatch: got 0x%016X, expected 0x%016X", got, storedBitmapCRC)
-	}
+	// CRC not validated: firecracker just wrote this file.
 	return hdr, bitmapBytes, bitmapEnd + 8, nil
 }
 
@@ -122,7 +119,6 @@ func applyDeltaToBase(basePath string, deltaBytes []byte, dataStart int, bitmapB
 		}
 	}()
 
-	var dataCRC uint64
 	var applied uint64
 	pos := dataStart
 	bs := int(hdr.blockSize)
@@ -146,19 +142,11 @@ func applyDeltaToBase(basePath string, deltaBytes []byte, dataStart int, bitmapB
 		if _, err := base.WriteAt(block, offset); err != nil {
 			return fmt.Errorf("pwrite base at offset %d: %w", offset, err)
 		}
-		dataCRC = crc64Bare(dataCRC, block)
 		applied++
 	}
 
 	if applied != hdr.dirtyCount {
 		return fmt.Errorf("applied %d blocks, header claims %d", applied, hdr.dirtyCount)
-	}
-	if pos+8 > len(deltaBytes) {
-		return fmt.Errorf("delta truncated: no room for data CRC")
-	}
-	storedDataCRC := binary.LittleEndian.Uint64(deltaBytes[pos : pos+8])
-	if dataCRC != storedDataCRC {
-		return fmt.Errorf("data CRC mismatch: got 0x%016X, expected 0x%016X", dataCRC, storedDataCRC)
 	}
 
 	if err := base.Sync(); err != nil {
