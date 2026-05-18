@@ -27,13 +27,23 @@ import (
 //     for each dirty block in ascending index order: [u8; block_size]
 //     data_crc     u64 LE   (running crc64 over all block bytes, init=0)
 //
-// CRC: CRC-64-ISO (polynomial 0xD800000000000000). Go's crc64.ISO matches
-// the Rust crc64 v2.0.0 crate's POLY64REV.
-
 const (
 	deltaMagic   uint64 = 0x4F564C5944454C54
 	deltaVersion uint32 = 1
 )
+
+var crc64Tab = crc64.MakeTable(crc64.ISO)
+
+// crc64Bare is CRC-64-ISO with no seed/result complement. Matches the Rust
+// crc64 v2.0.0 crate; stdlib crc64.Update can't be used as-is because it
+// complements at start and end.
+func crc64Bare(seed uint64, data []byte) uint64 {
+	crc := seed
+	for _, b := range data {
+		crc = crc64Tab[byte(crc)^b] ^ (crc >> 8)
+	}
+	return crc
+}
 
 // FlattenInto applies every dirty block from `deltaPath` to `basePath` and
 // rewrites `deltaPath` to an empty-form delta (same header, dirty_count=0,
@@ -94,8 +104,7 @@ func parseDeltaHeader(b []byte) (deltaHeader, []byte, int, error) {
 	}
 	bitmapBytes := b[36:bitmapEnd]
 	storedBitmapCRC := binary.LittleEndian.Uint64(b[bitmapEnd : bitmapEnd+8])
-	tab := crc64.MakeTable(crc64.ISO)
-	if got := crc64.Checksum(bitmapBytes, tab); got != storedBitmapCRC {
+	if got := crc64Bare(0, bitmapBytes); got != storedBitmapCRC {
 		return deltaHeader{}, nil, 0, fmt.Errorf("bitmap CRC mismatch: got 0x%016X, expected 0x%016X", got, storedBitmapCRC)
 	}
 	return hdr, bitmapBytes, bitmapEnd + 8, nil
@@ -113,7 +122,6 @@ func applyDeltaToBase(basePath string, deltaBytes []byte, dataStart int, bitmapB
 		}
 	}()
 
-	tab := crc64.MakeTable(crc64.ISO)
 	var dataCRC uint64
 	var applied uint64
 	pos := dataStart
@@ -138,7 +146,7 @@ func applyDeltaToBase(basePath string, deltaBytes []byte, dataStart int, bitmapB
 		if _, err := base.WriteAt(block, offset); err != nil {
 			return fmt.Errorf("pwrite base at offset %d: %w", offset, err)
 		}
-		dataCRC = crc64.Update(dataCRC, tab, block)
+		dataCRC = crc64Bare(dataCRC, block)
 		applied++
 	}
 
@@ -164,8 +172,7 @@ func applyDeltaToBase(basePath string, deltaBytes []byte, dataStart int, bitmapB
 // a crash mid-write can't leave a torn delta on disk.
 func writeEmptyDelta(path string, blockSize uint32, totalBlocks uint64, bitmapLen uint32) error {
 	bitmap := make([]byte, bitmapLen)
-	tab := crc64.MakeTable(crc64.ISO)
-	bitmapCRC := crc64.Checksum(bitmap, tab)
+	bitmapCRC := crc64Bare(0, bitmap)
 
 	buf := make([]byte, 0, 32+4+int(bitmapLen)+8+8)
 	var u32 [4]byte

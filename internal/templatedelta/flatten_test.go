@@ -3,7 +3,6 @@ package templatedelta
 import (
 	"bytes"
 	"encoding/binary"
-	"hash/crc64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +14,6 @@ import (
 // FlattenInto without needing the actual firecracker binary.
 func writeRustEquivalentDelta(t *testing.T, path string, blockSize uint32, totalBlocks uint64, dirty map[uint64][]byte) {
 	t.Helper()
-	tab := crc64.MakeTable(crc64.ISO)
 
 	bitmapWords := (totalBlocks + 63) / 64
 	bitmapLen := uint32(bitmapWords * 8)
@@ -23,7 +21,7 @@ func writeRustEquivalentDelta(t *testing.T, path string, blockSize uint32, total
 	for i := range dirty {
 		bitmap[i/8] |= 1 << (i % 8)
 	}
-	bitmapCRC := crc64.Checksum(bitmap, tab)
+	bitmapCRC := crc64Bare(0, bitmap)
 
 	var buf bytes.Buffer
 	put64 := func(v uint64) {
@@ -57,7 +55,7 @@ func writeRustEquivalentDelta(t *testing.T, path string, blockSize uint32, total
 			t.Fatalf("test bug: block %d has %d bytes, expected %d", i, len(block), blockSize)
 		}
 		buf.Write(block)
-		dataCRC = crc64.Update(dataCRC, tab, block)
+		dataCRC = crc64Bare(dataCRC, block)
 	}
 	put64(dataCRC)
 
@@ -196,6 +194,22 @@ func TestFlattenDeltaIntoBase_RoundTripIdempotent(t *testing.T) {
 	}
 }
 
+// Cross-language CRC compatibility is validated end-to-end by the
+// template-builder running against firecracker; these are just the
+// trivial invariants.
+func TestCRC64Bare_TrivialInvariants(t *testing.T) {
+	if got := crc64Bare(0, nil); got != 0 {
+		t.Errorf("empty data with seed 0: got 0x%X, want 0", got)
+	}
+	if got := crc64Bare(0xDEADBEEFDEADBEEF, nil); got != 0xDEADBEEFDEADBEEF {
+		t.Errorf("empty data: seed should be returned unchanged, got 0x%X", got)
+	}
+	// table[0] = 0 for any reflected CRC polynomial.
+	if got := crc64Bare(0, []byte{0x00}); got != 0 {
+		t.Errorf("single zero byte with seed 0: got 0x%X, want 0", got)
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -255,8 +269,7 @@ func buildValidEmptyDelta(blockSize uint32, totalBlocks uint64) []byte {
 	bitmapWords := (totalBlocks + 63) / 64
 	bitmapLen := uint32(bitmapWords * 8)
 	bitmap := make([]byte, bitmapLen)
-	tab := crc64.MakeTable(crc64.ISO)
-	bitmapCRC := crc64.Checksum(bitmap, tab)
+	bitmapCRC := crc64Bare(0, bitmap)
 
 	var buf bytes.Buffer
 	put64 := func(v uint64) {
