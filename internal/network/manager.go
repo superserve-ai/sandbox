@@ -488,14 +488,16 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 	m.mu.Lock()
 	existing, hasDevice := m.devices[vmID]
 	m.mu.Unlock()
-	if hasDevice && nsExists(namespace) {
-		return existing, nil
-	}
 
 	var info *VMNetInfo
 	var vethName string
 
-	if !nsExists(namespace) {
+	switch {
+	case hasDevice && nsExists(namespace):
+		// Preserve Firewall handle for future UpdateFirewallRules; AddVM below is idempotent.
+		info = existing
+		vethName = fmt.Sprintf("veth-%d", idx)
+	case !nsExists(namespace):
 		m.log.Warn().Str("vm_id", vmID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
 		built, builtVeth, err := m.setupSlot(ctx, idx)
 		if err != nil {
@@ -506,7 +508,7 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		}
 		info = built
 		vethName = builtVeth
-	} else {
+	default:
 		// Firewall handle stays nil; UpdateFirewallRules creates a fresh one.
 		info = &VMNetInfo{
 			Namespace:  namespace,

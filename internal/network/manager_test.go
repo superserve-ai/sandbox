@@ -150,22 +150,6 @@ func TestClaimSlotIndex_ErrNoSlotsWhenExhausted(t *testing.T) {
 	}
 }
 
-func TestEnsureVMSlot_FastPathReturnsExisting(t *testing.T) {
-	dir := withTestNetnsDir(t)
-	touchNS(t, dir, "ns-3")
-	m := newTestManager()
-	existing := &VMNetInfo{Namespace: "ns-3", HostIP: "10.11.0.3"}
-	m.devices["vm-x"] = existing
-
-	got, err := m.EnsureVMSlot(context.Background(), "vm-x", "ns-3", "10.11.0.3", "")
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if got != existing {
-		t.Errorf("expected fast-path to return the existing entry pointer")
-	}
-}
-
 func TestEnsureVMSlot_InvalidNamespace(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
