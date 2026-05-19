@@ -123,7 +123,7 @@ func TestClaimSlotIndex_SkipsPhantomFromNextSlot(t *testing.T) {
 
 func TestClaimSlotIndex_SkipsPhantomFromFreeSlots(t *testing.T) {
 	dir := withTestNetnsDir(t)
-	touchNS(t, dir, "ns-5") // 5 is a phantom in kernel
+	touchNS(t, dir, "ns-7") // 7 is top-of-stack (LIFO), phantom in kernel
 	m := newTestManager()
 	m.freeSlots = []int{5, 7}
 
@@ -131,8 +131,8 @@ func TestClaimSlotIndex_SkipsPhantomFromFreeSlots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if idx != 7 {
-		t.Errorf("idx = %d, want 7 (5 skipped as phantom)", idx)
+	if idx != 5 {
+		t.Errorf("idx = %d, want 5 (7 skipped as phantom, fell back to 5)", idx)
 	}
 	if len(m.freeSlots) != 0 {
 		t.Errorf("freeSlots = %v, want [] (both popped)", m.freeSlots)
