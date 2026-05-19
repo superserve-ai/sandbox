@@ -249,6 +249,9 @@ const (
 // containing dirty blocks — required to create sandboxes from this template.
 // mode=SnapshotFlatten bakes those deltas into base.ext4 (see SnapshotMode).
 func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
+	if mode == SnapshotFlatten && blockDeltaDir == "" {
+		return fmt.Errorf("SnapshotFlatten requires non-empty blockDeltaDir")
+	}
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
