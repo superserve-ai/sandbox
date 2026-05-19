@@ -447,6 +447,13 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
 	}
 
+	// Do the fallible step before recording success: a future retry would
+	// see m.devices[vmID] populated and short-circuit, never re-attempting
+	// the firewall.
+	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
+		return fmt.Errorf("reattach %s: restore host firewall: %w", vmID, err)
+	}
+
 	m.mu.Lock()
 	// Bump nextSlot past this idx so new VMs don't collide. Gap slots
 	// below nextSlot are wasted until bitmap allocation lands.
@@ -464,9 +471,6 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	}
 	m.mu.Unlock()
 
-	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
-		return fmt.Errorf("reattach %s: restore host firewall: %w", vmID, err)
-	}
 	m.log.Info().Str("vm_id", vmID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
 	return nil
 }
@@ -514,17 +518,21 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		vethName = fmt.Sprintf("veth-%d", idx)
 	}
 
+	// Do the fallible step before recording success: if AddVM fails and
+	// we'd already set m.devices[vmID], the next retry would short-circuit
+	// on the fast path (hasDevice && nsExists) and never re-attempt the
+	// firewall — leaving the VM running with no host rules.
+	hostCIDR := fmt.Sprintf("%s/32", hostIP)
+	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
+		return nil, fmt.Errorf("ensure %s: restore host firewall: %w", vmID, err)
+	}
+
 	m.mu.Lock()
 	if idx >= m.nextSlot {
 		m.nextSlot = idx + 1
 	}
 	m.devices[vmID] = info
 	m.mu.Unlock()
-
-	hostCIDR := fmt.Sprintf("%s/32", hostIP)
-	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
-		return nil, fmt.Errorf("ensure %s: restore host firewall: %w", vmID, err)
-	}
 
 	return info, nil
 }
