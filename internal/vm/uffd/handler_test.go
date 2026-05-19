@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -154,5 +156,32 @@ func TestHandler_WaitHandshake_CtxCancel(t *testing.T) {
 	}
 	if time.Since(start) > 100*time.Millisecond {
 		t.Errorf("cancel didn't propagate promptly: %v", time.Since(start))
+	}
+}
+
+// TestServeLoop_EINVALReturnsCleanly verifies that EINVAL from the read of
+// the uffd fd (which happens when firecracker unmaps its VMAs before we
+// drain the queue) makes serveLoop return nil rather than propagate an
+// error to the caller.
+func TestServeLoop_EINVALReturnsCleanly(t *testing.T) {
+	// Pipe stand-in for the uffd fd — closeFd (triggered when serveLoop
+	// returns and cancels gctx) will close it, so it must be real.
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer wPipe.Close()
+
+	h := New(Config{
+		FaultWorkers: 1,
+		Logger:       zerolog.Nop(),
+	})
+	h.uffdFd.Store(uintptr(rPipe.Fd()))
+	h.readFn = func(fd int, p []byte) (int, error) {
+		return 0, syscall.EINVAL
+	}
+
+	if err := h.serveLoop(context.Background()); err != nil {
+		t.Errorf("serveLoop returned %v, want nil on EINVAL", err)
 	}
 }
