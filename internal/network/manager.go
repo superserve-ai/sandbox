@@ -499,6 +499,9 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		vethName = fmt.Sprintf("veth-%d", idx)
 	case !nsExists(namespace):
 		m.log.Warn().Str("vm_id", vmID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
+		// ip netns delete only tears down the inside-ns side; the host-side
+		// veth-N can survive and collide with setupSlot's fresh veth creation.
+		m.cleanupFull(namespace, fmt.Sprintf("veth-%d", idx))
 		built, builtVeth, err := m.setupSlot(ctx, idx)
 		if err != nil {
 			return nil, fmt.Errorf("ensure %s: rebuild slot %d: %w", vmID, idx, err)
