@@ -190,26 +190,14 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		m.log.Debug().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
 	}
 
-	m.mu.Lock()
-	var idx int
-	if len(m.freeSlots) > 0 {
-		idx = m.freeSlots[len(m.freeSlots)-1]
-		m.freeSlots = m.freeSlots[:len(m.freeSlots)-1]
-	} else {
-		if m.nextSlot > MaxSlots {
-			m.mu.Unlock()
-			return nil, ErrNoSlots
-		}
-		idx = m.nextSlot
-		m.nextSlot++
+	idx, err := m.claimSlotIndex()
+	if err != nil {
+		return nil, err
 	}
-	m.mu.Unlock()
 
 	info, vethName, err := m.setupSlot(ctx, idx)
 	if err != nil {
-		m.mu.Lock()
-		m.freeSlots = append(m.freeSlots, idx)
-		m.mu.Unlock()
+		// idx stays consumed — reusing a colliding idx would loop.
 		return nil, err
 	}
 
@@ -483,6 +471,64 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	return nil
 }
 
+// EnsureVMSlot guarantees the kernel network state for vmID is present and
+// tracked. Idempotent.
+//
+// IP and MAC are deterministic from the slot index parsed out of namespace,
+// so a rebuild preserves the VM's network identity. Per-customer egress
+// rules are NOT restored here; the caller reapplies them.
+func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, macAddress string) (*VMNetInfo, error) {
+	idx, ok := slotFromNamespace(namespace)
+	if !ok {
+		return nil, fmt.Errorf("ensure %s: cannot parse slot from namespace %q", vmID, namespace)
+	}
+
+	m.mu.Lock()
+	existing, hasDevice := m.devices[vmID]
+	m.mu.Unlock()
+	if hasDevice && nsExists(namespace) {
+		return existing, nil
+	}
+
+	var info *VMNetInfo
+	var vethName string
+
+	if !nsExists(namespace) {
+		m.log.Warn().Str("vm_id", vmID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
+		built, builtVeth, err := m.setupSlot(ctx, idx)
+		if err != nil {
+			return nil, fmt.Errorf("ensure %s: rebuild slot %d: %w", vmID, idx, err)
+		}
+		info = built
+		vethName = builtVeth
+	} else {
+		// Firewall handle stays nil; UpdateFirewallRules creates a fresh one.
+		info = &VMNetInfo{
+			Namespace:  namespace,
+			TAPDevice:  TAPName,
+			VMIP:       VMInternalIP,
+			GatewayIP:  VMGatewayIP,
+			HostIP:     hostIP,
+			MACAddress: macAddress,
+		}
+		vethName = fmt.Sprintf("veth-%d", idx)
+	}
+
+	m.mu.Lock()
+	if idx >= m.nextSlot {
+		m.nextSlot = idx + 1
+	}
+	m.devices[vmID] = info
+	m.mu.Unlock()
+
+	hostCIDR := fmt.Sprintf("%s/32", hostIP)
+	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
+		return nil, fmt.Errorf("ensure %s: restore host firewall: %w", vmID, err)
+	}
+
+	return info, nil
+}
+
 // slotFromNamespace parses "ns-N" → N (digits only). Returns (0, false)
 // on malformed input. Strict: trailing non-digit characters are rejected
 // to avoid silently mapping "ns-2-something" to slot 2.
@@ -500,6 +546,37 @@ func slotFromNamespace(namespace string) (int, bool) {
 		idx = idx*10 + int(c-'0')
 	}
 	return idx, true
+}
+
+// claimSlotIndex picks a slot idx free in both freeSlots and the kernel.
+// Skips indices whose netns already exists (paused VM from a past lifetime,
+// etc.). Race window after the nsExists check remains; callers must still
+// handle setupSlot returning "already exists".
+func (m *Manager) claimSlotIndex() (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for {
+		var idx int
+		if len(m.freeSlots) > 0 {
+			idx = m.freeSlots[len(m.freeSlots)-1]
+			m.freeSlots = m.freeSlots[:len(m.freeSlots)-1]
+		} else {
+			if m.nextSlot > MaxSlots {
+				return 0, ErrNoSlots
+			}
+			idx = m.nextSlot
+			m.nextSlot++
+		}
+
+		if nsExists(fmt.Sprintf("ns-%d", idx)) {
+			// Discard; returning idx to freeSlots would loop on next call.
+			m.log.Warn().Int("slot", idx).Msg("allocator: skipping idx — kernel ns already exists")
+			continue
+		}
+
+		return idx, nil
+	}
 }
 
 // SweepOrphanNamespaces removes host namespaces and veth interfaces
