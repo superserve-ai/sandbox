@@ -20,6 +20,9 @@ type SnapshotCreateParams struct {
 	// Directory for block device delta files. When set, overlay block devices write delta files (containing only dirty blocks) into this directory, named {drive_id}.delta.
 	BlockDeltaDir string `json:"block_delta_dir,omitempty"`
 
+	// If true, bake each overlay's dirty blocks into its base.ext4 and zero the side-car bitmap. Only safe at template-creation time. Requires block_delta_dir.
+	Flatten bool `json:"flatten,omitempty"`
+
 	// Path to the file that will contain the guest memory.
 	// Required: true
 	MemFilePath *string `json:"mem_file_path"`

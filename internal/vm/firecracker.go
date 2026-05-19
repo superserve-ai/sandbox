@@ -234,7 +234,9 @@ func StartInstance(socketPath string) error {
 // CreateSnapshot pauses the VM and creates a full snapshot. Non-empty
 // blockDeltaDir tells the forked engine to also emit <drive_id>.delta files
 // containing dirty blocks — required to create sandboxes from this template.
-func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) error {
+// flatten=true bakes those deltas into base.ext4 and zeros the side-car
+// bitmap; only safe when the base isn't shared with other live VMs.
+func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, flatten bool) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
@@ -254,6 +256,7 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) err
 			MemFilePath:   &memPath,
 			SnapshotType:  models.SnapshotCreateParamsSnapshotTypeFull,
 			BlockDeltaDir: blockDeltaDir,
+			Flatten:       flatten,
 		},
 	}); err != nil {
 		return fmt.Errorf("create snapshot: %w", err)
