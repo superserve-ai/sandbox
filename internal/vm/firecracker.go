@@ -231,12 +231,24 @@ func StartInstance(socketPath string) error {
 // Snapshot operations
 // ---------------------------------------------------------------------------
 
+// SnapshotMode controls per-disk flatten behavior at snapshot creation.
+type SnapshotMode int
+
+const (
+	// SnapshotNormal: leave overlay deltas as-is. Sandboxes restored from
+	// this snapshot replay the delta into a per-VM overlay on create.
+	SnapshotNormal SnapshotMode = iota
+	// SnapshotFlatten: bake each overlay's dirty blocks into base.ext4 and
+	// zero the side-car bitmap. Sandboxes restored from this snapshot skip
+	// apply_delta. Only safe when the base isn't shared with other live VMs.
+	SnapshotFlatten
+)
+
 // CreateSnapshot pauses the VM and creates a full snapshot. Non-empty
 // blockDeltaDir tells the forked engine to also emit <drive_id>.delta files
 // containing dirty blocks — required to create sandboxes from this template.
-// flatten=true bakes those deltas into base.ext4 and zeros the side-car
-// bitmap; only safe when the base isn't shared with other live VMs.
-func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, flatten bool) error {
+// mode=SnapshotFlatten bakes those deltas into base.ext4 (see SnapshotMode).
+func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
@@ -256,7 +268,7 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, fla
 			MemFilePath:   &memPath,
 			SnapshotType:  models.SnapshotCreateParamsSnapshotTypeFull,
 			BlockDeltaDir: blockDeltaDir,
-			Flatten:       flatten,
+			Flatten:       mode == SnapshotFlatten,
 		},
 	}); err != nil {
 		return fmt.Errorf("create snapshot: %w", err)
