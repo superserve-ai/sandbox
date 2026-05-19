@@ -103,6 +103,9 @@ type Handler struct {
 	prefetchWg sync.WaitGroup
 
 	closed atomic.Bool
+
+	// readFn defaults to unix.Read; tests override to inject error paths.
+	readFn func(fd int, p []byte) (n int, err error)
 }
 
 func New(cfg Config) *Handler {
@@ -113,6 +116,7 @@ func New(cfg Config) *Handler {
 		cfg:           cfg,
 		log:           cfg.Logger.With().Str("component", "uffd").Logger(),
 		handshakeDone: make(chan error, 1),
+		readFn:        unix.Read,
 	}
 	h.uffdFd.Store(uffdClosed)
 	return h
@@ -366,13 +370,19 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 		if fd == uffdClosed {
 			return g.Wait()
 		}
-		n, err := unix.Read(int(fd), msgBuf[:])
+		n, err := h.readFn(int(fd), msgBuf[:])
 		if err != nil {
 			if errors.Is(err, syscall.EINTR) {
 				continue
 			}
-			// EBADF: cancellation goroutine closed the fd. Exit cleanly.
-			if errors.Is(err, syscall.EBADF) {
+			// EBADF: cancellation goroutine closed the fd. EINVAL: kernel
+			// returned "invalid argument", typically because Firecracker
+			// exited and unmapped its VMAs before we drained the queue.
+			// Both mean "nothing more to read here" — exit cleanly.
+			if errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL) {
+				if errors.Is(err, syscall.EINVAL) {
+					h.log.Debug().Msg("uffd serveLoop exiting cleanly on EINVAL — firecracker likely unmapped VMAs")
+				}
 				return g.Wait()
 			}
 			return fmt.Errorf("read uffd_msg: %w", err)
