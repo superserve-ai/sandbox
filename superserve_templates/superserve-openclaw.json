@@ -1,0 +1,17 @@
+{
+  "name": "superserve/openclaw",
+  "vcpu": 2,
+  "memory_mib": 2048,
+  "disk_mib": 8192,
+  "build_spec": {
+    "from": "ubuntu:24.04",
+    "steps": [
+      {
+        "run": "apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates tmux && rm -rf /var/lib/apt/lists/*"
+      },
+      {
+        "run": "curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard --version 2026.5.18"
+      }
+    ]
+  }
+}
