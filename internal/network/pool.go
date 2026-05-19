@@ -106,6 +106,7 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			}
 		}
 
+		// Race: ns can vanish between this check and AddVM; fc startup catches it.
 		if !nsExists(slot.info.Namespace) {
 			p.log.Warn().
 				Str("vm_id", vmID).

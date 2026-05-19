@@ -447,9 +447,7 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
 	}
 
-	// Do the fallible step before recording success: a future retry would
-	// see m.devices[vmID] populated and short-circuit, never re-attempting
-	// the firewall.
+	// AddVM before devices insert — a retry can't re-attempt it once devices is set.
 	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
 		return fmt.Errorf("reattach %s: restore host firewall: %w", vmID, err)
 	}
@@ -503,6 +501,9 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		if err != nil {
 			return nil, fmt.Errorf("ensure %s: rebuild slot %d: %w", vmID, idx, err)
 		}
+		if macAddress != "" && built.MACAddress != macAddress {
+			m.log.Warn().Str("vm_id", vmID).Str("expected", macAddress).Str("got", built.MACAddress).Msg("rebuilt MAC differs from stored — deterministic mapping may have drifted")
+		}
 		info = built
 		vethName = builtVeth
 	} else {
@@ -518,10 +519,7 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		vethName = fmt.Sprintf("veth-%d", idx)
 	}
 
-	// Do the fallible step before recording success: if AddVM fails and
-	// we'd already set m.devices[vmID], the next retry would short-circuit
-	// on the fast path (hasDevice && nsExists) and never re-attempt the
-	// firewall — leaving the VM running with no host rules.
+	// AddVM before devices insert — a retry short-circuits on the fast path otherwise.
 	hostCIDR := fmt.Sprintf("%s/32", hostIP)
 	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
 		return nil, fmt.Errorf("ensure %s: restore host firewall: %w", vmID, err)
@@ -530,6 +528,12 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 	m.mu.Lock()
 	if idx >= m.nextSlot {
 		m.nextSlot = idx + 1
+	}
+	for i, s := range m.freeSlots {
+		if s == idx {
+			m.freeSlots = append(m.freeSlots[:i], m.freeSlots[i+1:]...)
+			break
+		}
 	}
 	m.devices[vmID] = info
 	m.mu.Unlock()
@@ -592,10 +596,10 @@ func (m *Manager) claimSlotIndex() (int, error) {
 // still in the ns first so slot recycling can't collide with a
 // vmd-crash-orphaned firecracker still holding veth/TAP peers.
 func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
-	entries, err := os.ReadDir("/run/netns")
+	entries, err := os.ReadDir(netnsDir)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			m.log.Warn().Err(err).Msg("sweep: list /run/netns failed")
+			m.log.Warn().Err(err).Msg("sweep: list netns dir failed")
 		}
 		return 0
 	}
@@ -648,7 +652,7 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 // killProcessesInNs SIGKILLs every process whose net namespace matches
 // /run/netns/<name>. Returns the number of pids signalled.
 func killProcessesInNs(name string) int {
-	nsPath := "/run/netns/" + name
+	nsPath := netnsDir + "/" + name
 	nsStat, err := os.Stat(nsPath)
 	if err != nil {
 		return 0
@@ -714,8 +718,11 @@ func (m *Manager) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []s
 // Helpers
 // ---------------------------------------------------------------------------
 
+// netnsDir is overridden by tests.
+var netnsDir = "/run/netns"
+
 func nsExists(nsName string) bool {
-	_, err := os.Stat("/run/netns/" + nsName)
+	_, err := os.Stat(netnsDir + "/" + nsName)
 	return err == nil
 }
 
