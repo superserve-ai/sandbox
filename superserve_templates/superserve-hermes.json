@@ -10,7 +10,7 @@
         "run": "apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates tmux xz-utils && rm -rf /var/lib/apt/lists/*"
       },
       {
-        "run": "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
+        "run": "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/v2026.5.16/scripts/install.sh | bash"
       }
     ]
   }
