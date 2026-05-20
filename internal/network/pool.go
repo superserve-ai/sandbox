@@ -87,34 +87,50 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 // Prefers recycled slots (zero setup cost) over fresh ones (one nftables
 // call). Returns nil if both pools are empty — caller falls back to
 // on-demand SetupVM.
+//
+// Validates each slot's kernel netns is still present; phantoms are
+// discarded and their idx returned to the allocator via cleanup.
 func (p *Pool) Claim(vmID string) *VMNetInfo {
-	var slot *preallocSlot
+	for {
+		var slot *preallocSlot
 
-	// Prefer recycled slots — they already have host firewall rules
-	// from the previous owner, which get replaced below.
-	select {
-	case slot = <-p.recycled:
-	default:
+		// Prefer recycled slots — they already have host firewall rules
+		// from the previous owner, which get replaced below.
 		select {
-		case slot = <-p.fresh:
+		case slot = <-p.recycled:
 		default:
+			select {
+			case slot = <-p.fresh:
+			default:
+				return nil
+			}
+		}
+
+		// Race: ns can vanish between this check and AddVM; fc startup catches it.
+		if !nsExists(slot.info.Namespace) {
+			p.log.Warn().
+				Str("vm_id", vmID).
+				Str("namespace", slot.info.Namespace).
+				Int("slot", slot.idx).
+				Msg("pool: discarded phantom slot (kernel netns missing)")
+			p.cleanup(slot)
+			continue
+		}
+
+		// Add host-level firewall rules (requires vmID).
+		hostCIDR := slot.info.HostIP + "/32"
+		if err := p.mgr.hostFW.AddVM(vmID, slot.vethName, hostCIDR); err != nil {
+			p.log.Error().Err(err).Str("vm_id", vmID).Msg("claim: AddVM firewall failed")
+			p.cleanup(slot)
 			return nil
 		}
+
+		p.mgr.mu.Lock()
+		p.mgr.devices[vmID] = slot.info
+		p.mgr.mu.Unlock()
+
+		return slot.info
 	}
-
-	// Add host-level firewall rules (requires vmID).
-	hostCIDR := slot.info.HostIP + "/32"
-	if err := p.mgr.hostFW.AddVM(vmID, slot.vethName, hostCIDR); err != nil {
-		p.log.Error().Err(err).Str("vm_id", vmID).Msg("claim: AddVM firewall failed")
-		p.cleanup(slot)
-		return nil
-	}
-
-	p.mgr.mu.Lock()
-	p.mgr.devices[vmID] = slot.info
-	p.mgr.mu.Unlock()
-
-	return slot.info
 }
 
 // Return puts a slot back into the recycled pool after a sandbox is
@@ -204,30 +220,16 @@ func (p *Pool) mustAllocate(ctx context.Context) *preallocSlot {
 }
 
 func (p *Pool) allocate(ctx context.Context) (*preallocSlot, error) {
-	// Grab a slot index from the manager's free list.
-	p.mgr.mu.Lock()
-	var idx int
-	if len(p.mgr.freeSlots) > 0 {
-		idx = p.mgr.freeSlots[len(p.mgr.freeSlots)-1]
-		p.mgr.freeSlots = p.mgr.freeSlots[:len(p.mgr.freeSlots)-1]
-	} else {
-		if p.mgr.nextSlot > MaxSlots {
-			p.mgr.mu.Unlock()
-			return nil, ErrNoSlots
-		}
-		idx = p.mgr.nextSlot
-		p.mgr.nextSlot++
+	idx, err := p.mgr.claimSlotIndex()
+	if err != nil {
+		return nil, err
 	}
-	p.mgr.mu.Unlock()
 
 	// Run the full network setup (namespace, veth, TAP, nftables).
 	// This is the expensive part we're moving off the hot path.
 	info, vethName, err := p.mgr.setupSlot(ctx, idx)
 	if err != nil {
-		// Don't return the index to freeSlots — the namespace may be in
-		// use by a running sandbox from a previous VMD lifetime. Returning
-		// it would cause an infinite retry loop. The index is consumed;
-		// the next allocate will use nextSlot or a different free index.
+		// idx stays consumed — reusing a colliding idx would loop.
 		return nil, err
 	}
 

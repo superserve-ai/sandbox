@@ -10,6 +10,13 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// hostFirewallAPI is the Manager's view of *HostFirewall, stubbed by tests.
+type hostFirewallAPI interface {
+	AddVM(vmID, vethName, hostCIDR string) error
+	RemoveVM(vmID string) error
+	Close() error
+}
+
 // HostFirewall manages host-level iptables rules for VM internet access.
 // Appends per-VM rules to the kernel's built-in chains:
 //   - filter/FORWARD: allow traffic between each VM's veth and the host interface

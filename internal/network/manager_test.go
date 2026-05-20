@@ -1,6 +1,70 @@
 package network
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/rs/zerolog"
+)
+
+func withTestNetnsDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	old := netnsDir
+	netnsDir = dir
+	t.Cleanup(func() { netnsDir = old })
+	return dir
+}
+
+func touchNS(t *testing.T, dir, name string) {
+	t.Helper()
+	f, err := os.Create(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("create fake netns %s: %v", name, err)
+	}
+	_ = f.Close()
+}
+
+// hostFW is nil — tests must not exercise paths that touch it.
+func newTestManager() *Manager {
+	return &Manager{
+		log:      zerolog.Nop(),
+		devices:  make(map[string]*VMNetInfo),
+		nextSlot: 1,
+	}
+}
+
+// stubHostFW records AddVM/RemoveVM calls so tests can assert on them.
+type stubHostFW struct {
+	added   []string // "vmID|veth|cidr"
+	removed []string
+	addErr  error
+}
+
+func (s *stubHostFW) AddVM(vmID, vethName, hostCIDR string) error {
+	if s.addErr != nil {
+		return s.addErr
+	}
+	s.added = append(s.added, vmID+"|"+vethName+"|"+hostCIDR)
+	return nil
+}
+
+func (s *stubHostFW) RemoveVM(vmID string) error {
+	s.removed = append(s.removed, vmID)
+	return nil
+}
+
+func (s *stubHostFW) Close() error { return nil }
+
+func newTestManagerWithStubFW() (*Manager, *stubHostFW) {
+	fw := &stubHostFW{}
+	m := newTestManager()
+	m.hostFW = fw
+	return m, fw
+}
 
 func TestSlotFromNamespace(t *testing.T) {
 	cases := []struct {
@@ -29,5 +93,158 @@ func TestSlotFromNamespace(t *testing.T) {
 				t.Errorf("slotFromNamespace(%q) = (%d, %v), want (%d, %v)", tc.in, idx, ok, tc.wantIdx, tc.wantOK)
 			}
 		})
+	}
+}
+
+func TestClaimSlotIndex_FreshNextSlot(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+
+	idx, err := m.claimSlotIndex()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if idx != 1 {
+		t.Errorf("idx = %d, want 1", idx)
+	}
+	if m.nextSlot != 2 {
+		t.Errorf("nextSlot = %d, want 2", m.nextSlot)
+	}
+}
+
+func TestClaimSlotIndex_PrefersFreeSlotsLIFO(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.freeSlots = []int{5, 7}
+
+	idx, err := m.claimSlotIndex()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if idx != 7 {
+		t.Errorf("idx = %d, want 7 (LIFO pop)", idx)
+	}
+	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
+		t.Errorf("freeSlots = %v, want [5]", m.freeSlots)
+	}
+	if m.nextSlot != 1 {
+		t.Errorf("nextSlot bumped to %d when popping from freeSlots", m.nextSlot)
+	}
+}
+
+func TestClaimSlotIndex_SkipsPhantomFromNextSlot(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	touchNS(t, dir, "ns-2")
+	m := newTestManager()
+
+	idx, err := m.claimSlotIndex()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if idx != 3 {
+		t.Errorf("idx = %d, want 3 (1 and 2 are phantoms)", idx)
+	}
+	if m.nextSlot != 4 {
+		t.Errorf("nextSlot = %d, want 4 (advanced past phantoms)", m.nextSlot)
+	}
+}
+
+func TestClaimSlotIndex_SkipsPhantomFromFreeSlots(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-7") // 7 is top-of-stack (LIFO), phantom in kernel
+	m := newTestManager()
+	m.freeSlots = []int{5, 7}
+
+	idx, err := m.claimSlotIndex()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if idx != 5 {
+		t.Errorf("idx = %d, want 5 (7 skipped as phantom, fell back to 5)", idx)
+	}
+	if len(m.freeSlots) != 0 {
+		t.Errorf("freeSlots = %v, want [] (both popped)", m.freeSlots)
+	}
+}
+
+func TestClaimSlotIndex_ErrNoSlotsWhenExhausted(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.nextSlot = MaxSlots + 1
+
+	_, err := m.claimSlotIndex()
+	if !errors.Is(err, ErrNoSlots) {
+		t.Errorf("err = %v, want ErrNoSlots", err)
+	}
+}
+
+func TestEnsureVMSlot_HealthyVMReplaysFirewall(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-3")
+	m, fw := newTestManagerWithStubFW()
+	existing := &VMNetInfo{Namespace: "ns-3", HostIP: "10.11.0.3"}
+	m.devices["vm-x"] = existing
+
+	got, err := m.EnsureVMSlot(context.Background(), "vm-x", "ns-3", "10.11.0.3", "")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got != existing {
+		t.Errorf("expected same VMNetInfo pointer back (Firewall handle preserved)")
+	}
+	if len(fw.added) != 1 || fw.added[0] != "vm-x|veth-3|10.11.0.3/32" {
+		t.Errorf("AddVM calls = %v, want one call with veth-3 + 10.11.0.3/32", fw.added)
+	}
+}
+
+func TestEnsureVMSlot_ReconstructWhenDeviceMapEmpty(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-7")
+	m, fw := newTestManagerWithStubFW()
+
+	got, err := m.EnsureVMSlot(context.Background(), "vm-y", "ns-7", "10.11.0.7", "AA:FC:00:00:00:07")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got.Namespace != "ns-7" || got.HostIP != "10.11.0.7" || got.MACAddress != "AA:FC:00:00:00:07" {
+		t.Errorf("reconstructed info wrong: %+v", got)
+	}
+	if got.Firewall != nil {
+		t.Errorf("Firewall handle should be nil; UpdateFirewallRules creates a fresh one")
+	}
+	if m.devices["vm-y"] != got {
+		t.Errorf("vm-y not registered in devices map after reconstruct")
+	}
+	if m.nextSlot < 8 {
+		t.Errorf("nextSlot = %d, want >= 8 (advanced past idx 7)", m.nextSlot)
+	}
+	if len(fw.added) != 1 || fw.added[0] != "vm-y|veth-7|10.11.0.7/32" {
+		t.Errorf("AddVM calls = %v, want one call with veth-7", fw.added)
+	}
+}
+
+func TestEnsureVMSlot_AddVMFailureSkipsDeviceInsert(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-4")
+	m, fw := newTestManagerWithStubFW()
+	fw.addErr = errors.New("simulated iptables failure")
+
+	_, err := m.EnsureVMSlot(context.Background(), "vm-z", "ns-4", "10.11.0.4", "")
+	if err == nil {
+		t.Fatal("expected error from AddVM failure")
+	}
+	if _, present := m.devices["vm-z"]; present {
+		t.Errorf("devices map should not contain vm-z after AddVM failure (retry must re-attempt)")
+	}
+}
+
+func TestEnsureVMSlot_InvalidNamespace(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+
+	_, err := m.EnsureVMSlot(context.Background(), "vm-x", "garbage", "10.11.0.3", "")
+	if err == nil {
+		t.Fatalf("expected error for invalid namespace, got nil")
 	}
 }
