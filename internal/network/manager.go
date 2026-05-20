@@ -85,7 +85,7 @@ type Manager struct {
 	nextSlot  int   // next new slot (used when freeSlots is empty)
 
 	// Host-level nftables firewall (FORWARD + MASQUERADE + MSS clamping).
-	hostFW *HostFirewall
+	hostFW hostFirewallAPI
 
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
