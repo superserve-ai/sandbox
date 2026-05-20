@@ -384,6 +384,9 @@ type FinalizeBuildParams struct {
 // the snapshot paths populated. Mirrors the FinalizePause CTE pattern in
 // sandboxes.sql: one roundtrip, no torn states. Returns the template row
 // so the caller can log the outcome.
+//
+// INVARIANT: status='ready' and template.base_path must become visible
+// together — the reconciler GCs build dirs not referenced by base_path.
 func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (Template, error) {
 	row := q.db.QueryRow(ctx, finalizeBuild,
 		arg.ID,
@@ -682,8 +685,8 @@ type ListAllTemplateBasePathsRow struct {
 	BasePath *string   `json:"base_path"`
 }
 
-// Reconciler input: current base_path per template. Belt-and-suspenders
-// with ListLiveTemplateBuilds in case a row flipped between queries.
+// Reconciler input: authoritative pointer to each template's current build.
+// FinalizeBuild updates this atomically with the status flip to 'ready'.
 func (q *Queries) ListAllTemplateBasePaths(ctx context.Context) ([]ListAllTemplateBasePathsRow, error) {
 	rows, err := q.db.Query(ctx, listAllTemplateBasePaths)
 	if err != nil {
@@ -751,28 +754,29 @@ func (q *Queries) ListBuildsForTemplate(ctx context.Context, arg ListBuildsForTe
 	return items, nil
 }
 
-const listLiveTemplateBuilds = `-- name: ListLiveTemplateBuilds :many
+const listInFlightBuilds = `-- name: ListInFlightBuilds :many
 SELECT template_id, id AS build_id
 FROM template_build
-WHERE status IN ('pending', 'building', 'snapshotting', 'ready')
+WHERE status IN ('pending', 'building', 'snapshotting')
 `
 
-type ListLiveTemplateBuildsRow struct {
+type ListInFlightBuildsRow struct {
 	TemplateID uuid.UUID `json:"template_id"`
 	BuildID    uuid.UUID `json:"build_id"`
 }
 
-// Reconciler input: in-flight or ready builds. Their on-disk artifacts
-// must be preserved; in-flight may still be writing.
-func (q *Queries) ListLiveTemplateBuilds(ctx context.Context) ([]ListLiveTemplateBuildsRow, error) {
-	rows, err := q.db.Query(ctx, listLiveTemplateBuilds)
+// Reconciler input: builds whose artifact dirs may still be actively
+// written. Completed builds (status='ready') are pinned by
+// template.base_path / sandbox.base_path instead.
+func (q *Queries) ListInFlightBuilds(ctx context.Context) ([]ListInFlightBuildsRow, error) {
+	rows, err := q.db.Query(ctx, listInFlightBuilds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ListLiveTemplateBuildsRow{}
+	items := []ListInFlightBuildsRow{}
 	for rows.Next() {
-		var i ListLiveTemplateBuildsRow
+		var i ListInFlightBuildsRow
 		if err := rows.Scan(&i.TemplateID, &i.BuildID); err != nil {
 			return nil, err
 		}

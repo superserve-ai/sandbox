@@ -1,8 +1,14 @@
 package supervisor
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
@@ -56,6 +62,16 @@ func TestReconcileDecision(t *testing.T) {
 			live:      []string{tplA + "/" + bldX},
 			wantDelta: []string{tplA + "/" + bldY},
 		},
+		{
+			name: "superseded ready build reclaimed",
+			onDisk: []vmdclient.BuildArtifactEntry{
+				{TemplateID: tplA, BuildID: bldX, MTimeUnix: old}, // current
+				{TemplateID: tplA, BuildID: bldY, MTimeUnix: old}, // superseded
+				{TemplateID: tplA, BuildID: bldZ, MTimeUnix: old}, // older
+			},
+			live:      []string{tplA + "/" + bldX},
+			wantDelta: []string{tplA + "/" + bldY, tplA + "/" + bldZ},
+		},
 	}
 
 	for _, tc := range tests {
@@ -76,6 +92,73 @@ func TestReconcileDecision(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fakeDeleter struct {
+	calls  []string
+	failOn map[string]bool
+}
+
+func (f *fakeDeleter) DeleteBuildArtifacts(_ context.Context, tplID, buildID string) error {
+	key := tplID + "/" + buildID
+	f.calls = append(f.calls, key)
+	if f.failOn[key] {
+		return errors.New("simulated")
+	}
+	return nil
+}
+
+func TestApplyDeletions(t *testing.T) {
+	mkEntries := func(n int) []vmdclient.BuildArtifactEntry {
+		out := make([]vmdclient.BuildArtifactEntry, n)
+		for i := range out {
+			out[i] = vmdclient.BuildArtifactEntry{
+				TemplateID: "tpl",
+				BuildID:    fmt.Sprintf("build-%03d", i),
+			}
+		}
+		return out
+	}
+	log := zerolog.New(io.Discard)
+
+	t.Run("caps at budget", func(t *testing.T) {
+		f := &fakeDeleter{}
+		attempted, deleted := applyDeletions(context.Background(), log, f, mkEntries(60), 50)
+		if attempted != 50 || deleted != 50 || len(f.calls) != 50 {
+			t.Errorf("attempted=%d deleted=%d calls=%d, want 50/50/50", attempted, deleted, len(f.calls))
+		}
+	})
+
+	t.Run("under budget processes all", func(t *testing.T) {
+		f := &fakeDeleter{}
+		attempted, deleted := applyDeletions(context.Background(), log, f, mkEntries(7), 50)
+		if attempted != 7 || deleted != 7 {
+			t.Errorf("attempted=%d deleted=%d, want 7/7", attempted, deleted)
+		}
+	})
+
+	t.Run("zero budget is unbounded", func(t *testing.T) {
+		f := &fakeDeleter{}
+		attempted, deleted := applyDeletions(context.Background(), log, f, mkEntries(120), 0)
+		if attempted != 120 || deleted != 120 {
+			t.Errorf("attempted=%d deleted=%d, want 120/120", attempted, deleted)
+		}
+	})
+
+	t.Run("failures count against budget", func(t *testing.T) {
+		f := &fakeDeleter{failOn: map[string]bool{
+			"tpl/build-000": true,
+			"tpl/build-001": true,
+			"tpl/build-002": true,
+		}}
+		attempted, deleted := applyDeletions(context.Background(), log, f, mkEntries(60), 50)
+		if attempted != 50 {
+			t.Errorf("attempted=%d, want 50 (failures still consume budget)", attempted)
+		}
+		if deleted != 47 {
+			t.Errorf("deleted=%d, want 47", deleted)
+		}
+	})
 }
 
 func TestBuildKeyFromPath(t *testing.T) {
