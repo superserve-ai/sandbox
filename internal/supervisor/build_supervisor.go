@@ -65,6 +65,10 @@ type BuildSupervisorConfig struct {
 	// ReconcileInterval is the period for the orphan-builds reconciler.
 	// 0 disables it (used by tests).
 	ReconcileInterval time.Duration
+
+	// MaxDeletesPerReconcile bounds per-tick deletion I/O; the remainder
+	// is picked up next tick. 0 means unbounded (used by tests).
+	MaxDeletesPerReconcile int
 }
 
 // DefaultBuildSupervisorConfig returns sensible defaults.
@@ -78,6 +82,7 @@ func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 		BuildTimeout:              30 * time.Minute,
 		ReapBatchSize:             20,
 		ReconcileInterval:         5 * time.Minute,
+		MaxDeletesPerReconcile:    50,
 	}
 }
 
@@ -522,10 +527,6 @@ func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// maxDeletesPerReconcile bounds per-tick deletion I/O so a backlog of
-// orphans is spread across ticks; the remainder is picked up next tick.
-const maxDeletesPerReconcile = 50
-
 // reconcileOrphanBuilds diffs vmd's disk against the DB live set; the
 // snapshot-time guard prevents racing with builds started mid-run.
 func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
@@ -548,24 +549,7 @@ func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
 	}
 
 	toDelete := reconcileDecision(onDisk, live, snapshotTime)
-	attempted := 0
-	deleted := 0
-	for _, e := range toDelete {
-		if attempted >= maxDeletesPerReconcile {
-			break
-		}
-		attempted++
-		if err := vmd.DeleteBuildArtifacts(ctx, e.TemplateID, e.BuildID); err != nil {
-			s.log.Warn().Err(err).Str("template_id", e.TemplateID).Str("build_id", e.BuildID).Msg("reconcile: DeleteBuildArtifacts")
-			continue
-		}
-		s.log.Info().
-			Str("template_id", e.TemplateID).
-			Str("build_id", e.BuildID).
-			Time("mtime", time.Unix(e.MTimeUnix, 0)).
-			Msg("reconcile: gc orphan build dir")
-		deleted++
-	}
+	attempted, deleted := applyDeletions(ctx, s.log, vmd, toDelete, s.cfg.MaxDeletesPerReconcile)
 	s.log.Info().
 		Int("on_disk", len(onDisk)).
 		Int("live", len(live)).
@@ -573,6 +557,33 @@ func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
 		Int("deleted", deleted).
 		Int("deferred", len(toDelete)-attempted).
 		Msg("orphan reconcile complete")
+}
+
+// buildArtifactDeleter is the subset of vmdclient.Client applyDeletions needs.
+type buildArtifactDeleter interface {
+	DeleteBuildArtifacts(ctx context.Context, templateID, buildID string) error
+}
+
+// applyDeletions issues delete calls up to budget (0 == unbounded).
+// Failed deletes consume budget so a stuck dir can't dominate throughput.
+func applyDeletions(ctx context.Context, log zerolog.Logger, vmd buildArtifactDeleter, toDelete []vmdclient.BuildArtifactEntry, budget int) (attempted, deleted int) {
+	for _, e := range toDelete {
+		if budget > 0 && attempted >= budget {
+			break
+		}
+		attempted++
+		if err := vmd.DeleteBuildArtifacts(ctx, e.TemplateID, e.BuildID); err != nil {
+			log.Warn().Err(err).Str("template_id", e.TemplateID).Str("build_id", e.BuildID).Msg("reconcile: DeleteBuildArtifacts")
+			continue
+		}
+		log.Debug().
+			Str("template_id", e.TemplateID).
+			Str("build_id", e.BuildID).
+			Time("mtime", time.Unix(e.MTimeUnix, 0)).
+			Msg("reconcile: gc orphan build dir")
+		deleted++
+	}
+	return attempted, deleted
 }
 
 // collectLiveBuildKeys returns "<templateID>/<buildID>" keys for build

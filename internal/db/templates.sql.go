@@ -384,6 +384,9 @@ type FinalizeBuildParams struct {
 // the snapshot paths populated. Mirrors the FinalizePause CTE pattern in
 // sandboxes.sql: one roundtrip, no torn states. Returns the template row
 // so the caller can log the outcome.
+//
+// INVARIANT: status='ready' and template.base_path must become visible
+// together — the reconciler GCs build dirs not referenced by base_path.
 func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (Template, error) {
 	row := q.db.QueryRow(ctx, finalizeBuild,
 		arg.ID,

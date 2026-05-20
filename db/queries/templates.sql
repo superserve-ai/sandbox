@@ -216,6 +216,9 @@ WHERE id = $1 AND status IN ('pending', 'building', 'snapshotting');
 -- the snapshot paths populated. Mirrors the FinalizePause CTE pattern in
 -- sandboxes.sql: one roundtrip, no torn states. Returns the template row
 -- so the caller can log the outcome.
+--
+-- INVARIANT: status='ready' and template.base_path must become visible
+-- together — the reconciler GCs build dirs not referenced by base_path.
 WITH build_done AS (
   UPDATE template_build
   SET status = 'ready',
