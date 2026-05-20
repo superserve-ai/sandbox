@@ -539,7 +539,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
-	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, ""); err != nil {
+	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 		return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 	}
 
@@ -679,7 +679,7 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
-	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, ""); err != nil {
+	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
 

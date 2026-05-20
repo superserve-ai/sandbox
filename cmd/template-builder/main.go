@@ -289,7 +289,8 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitUser("system", "Saving template")
 	snapPath := filepath.Join(snapDir, "vmstate.snap")
 	memPath := filepath.Join(snapDir, "mem.snap")
-	if err := vm.CreateSnapshot(socketPath, snapPath, memPath, snapDir); err != nil {
+	// Flatten: per-sandbox restores skip apply_delta. Safe here — base isn't shared yet.
+	if err := vm.CreateSnapshot(socketPath, snapPath, memPath, snapDir, vm.SnapshotFlatten); err != nil {
 		return fmt.Errorf("snapshot: %w", err)
 	}
 	emitInternal("system", "snapshot captured")
