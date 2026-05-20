@@ -56,6 +56,16 @@ func TestReconcileDecision(t *testing.T) {
 			live:      []string{tplA + "/" + bldX},
 			wantDelta: []string{tplA + "/" + bldY},
 		},
+		{
+			name: "superseded ready build reclaimed",
+			onDisk: []vmdclient.BuildArtifactEntry{
+				{TemplateID: tplA, BuildID: bldX, MTimeUnix: old}, // current
+				{TemplateID: tplA, BuildID: bldY, MTimeUnix: old}, // superseded
+				{TemplateID: tplA, BuildID: bldZ, MTimeUnix: old}, // older
+			},
+			live:      []string{tplA + "/" + bldX},
+			wantDelta: []string{tplA + "/" + bldY, tplA + "/" + bldZ},
+		},
 	}
 
 	for _, tc := range tests {

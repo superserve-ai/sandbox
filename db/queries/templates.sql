@@ -52,16 +52,17 @@ WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 SELECT base_path FROM template
 WHERE id = $1 AND deleted_at IS NULL;
 
--- name: ListLiveTemplateBuilds :many
--- Reconciler input: in-flight or ready builds. Their on-disk artifacts
--- must be preserved; in-flight may still be writing.
+-- name: ListInFlightBuilds :many
+-- Reconciler input: builds whose artifact dirs may still be actively
+-- written. Completed builds (status='ready') are pinned by
+-- template.base_path / sandbox.base_path instead.
 SELECT template_id, id AS build_id
 FROM template_build
-WHERE status IN ('pending', 'building', 'snapshotting', 'ready');
+WHERE status IN ('pending', 'building', 'snapshotting');
 
 -- name: ListAllTemplateBasePaths :many
--- Reconciler input: current base_path per template. Belt-and-suspenders
--- with ListLiveTemplateBuilds in case a row flipped between queries.
+-- Reconciler input: authoritative pointer to each template's current build.
+-- FinalizeBuild updates this atomically with the status flip to 'ready'.
 SELECT id, base_path FROM template
 WHERE deleted_at IS NULL AND base_path IS NOT NULL;
 

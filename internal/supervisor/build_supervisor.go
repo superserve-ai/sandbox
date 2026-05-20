@@ -522,6 +522,10 @@ func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
 	}
 }
 
+// maxDeletesPerReconcile bounds per-tick deletion I/O so a backlog of
+// orphans is spread across ticks; the remainder is picked up next tick.
+const maxDeletesPerReconcile = 50
+
 // reconcileOrphanBuilds diffs vmd's disk against the DB live set; the
 // snapshot-time guard prevents racing with builds started mid-run.
 func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
@@ -544,26 +548,43 @@ func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
 	}
 
 	toDelete := reconcileDecision(onDisk, live, snapshotTime)
+	attempted := 0
 	deleted := 0
 	for _, e := range toDelete {
+		if attempted >= maxDeletesPerReconcile {
+			break
+		}
+		attempted++
 		if err := vmd.DeleteBuildArtifacts(ctx, e.TemplateID, e.BuildID); err != nil {
 			s.log.Warn().Err(err).Str("template_id", e.TemplateID).Str("build_id", e.BuildID).Msg("reconcile: DeleteBuildArtifacts")
 			continue
 		}
+		s.log.Info().
+			Str("template_id", e.TemplateID).
+			Str("build_id", e.BuildID).
+			Time("mtime", time.Unix(e.MTimeUnix, 0)).
+			Msg("reconcile: gc orphan build dir")
 		deleted++
 	}
-	s.log.Debug().Int("on_disk", len(onDisk)).Int("live", len(live)).Int("deleted", deleted).Msg("orphan reconcile complete")
+	s.log.Info().
+		Int("on_disk", len(onDisk)).
+		Int("live", len(live)).
+		Int("attempted", attempted).
+		Int("deleted", deleted).
+		Int("deferred", len(toDelete)-attempted).
+		Msg("orphan reconcile complete")
 }
 
-// collectLiveBuildKeys returns "<templateID>/<buildID>" keys for every
-// build that must be preserved: in-flight, ready, or pinned by a sandbox
-// or template.base_path.
+// collectLiveBuildKeys returns "<templateID>/<buildID>" keys for build
+// dirs that must be preserved: in-flight + each template's current
+// base_path + sandbox pins to prior builds. status='ready' is not a
+// signal here — see ListInFlightBuilds.
 func (s *BuildSupervisor) collectLiveBuildKeys(ctx context.Context) (map[string]struct{}, error) {
 	live := map[string]struct{}{}
 
-	builds, err := s.q.ListLiveTemplateBuilds(ctx)
+	builds, err := s.q.ListInFlightBuilds(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("ListLiveTemplateBuilds: %w", err)
+		return nil, fmt.Errorf("ListInFlightBuilds: %w", err)
 	}
 	for _, b := range builds {
 		// On-disk subdir name is "build-<template_build_uuid>" (set by the
