@@ -13,17 +13,54 @@ import (
 )
 
 // TestCreateSnapshot_FlattenFieldInJSONBody asserts that the Go-side enum
-// (SnapshotNormal/SnapshotFlatten) maps to the correct `flatten` field in
-// the JSON body sent to firecracker. Guards against a future go-swagger
-// model regen accidentally dropping the json:"flatten,omitempty" tag.
+// (SnapshotNormal/SnapshotFlatten) serializes the `flatten` field correctly
+// in the JSON body sent to firecracker. The SnapshotNormal cases use the
+// substring check (not unmarshal) so an accidentally-dropped `omitempty`
+// would surface as `"flatten": false` appearing in the body — unmarshal
+// alone would silently accept that as the zero value.
 func TestCreateSnapshot_FlattenFieldInJSONBody(t *testing.T) {
 	cases := []struct {
-		name        string
-		mode        SnapshotMode
-		wantFlatten bool
+		name          string
+		mode          SnapshotMode
+		blockDeltaDir string
+		assertBody    func(t *testing.T, body []byte)
 	}{
-		{"normal_mode_omits_flatten_or_sends_false", SnapshotNormal, false},
-		{"flatten_mode_sends_true", SnapshotFlatten, true},
+		{
+			name:          "normal_mode_with_empty_delta_dir_omits_flatten",
+			mode:          SnapshotNormal,
+			blockDeltaDir: "",
+			assertBody: func(t *testing.T, body []byte) {
+				if strings.Contains(string(body), "flatten") {
+					t.Errorf("flatten field must be omitted for SnapshotNormal; body=%s", string(body))
+				}
+			},
+		},
+		{
+			name:          "normal_mode_with_delta_dir_omits_flatten",
+			mode:          SnapshotNormal,
+			blockDeltaDir: "/tmp/delta",
+			assertBody: func(t *testing.T, body []byte) {
+				if strings.Contains(string(body), "flatten") {
+					t.Errorf("flatten field must be omitted for SnapshotNormal; body=%s", string(body))
+				}
+			},
+		},
+		{
+			name:          "flatten_mode_sends_true",
+			mode:          SnapshotFlatten,
+			blockDeltaDir: "/tmp/delta",
+			assertBody: func(t *testing.T, body []byte) {
+				var decoded struct {
+					Flatten bool `json:"flatten"`
+				}
+				if err := json.Unmarshal(body, &decoded); err != nil {
+					t.Fatalf("unmarshal body: %v (body=%s)", err, string(body))
+				}
+				if !decoded.Flatten {
+					t.Errorf("flatten=%v, want true (body=%s)", decoded.Flatten, string(body))
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -61,7 +98,7 @@ func TestCreateSnapshot_FlattenFieldInJSONBody(t *testing.T) {
 			defer srv.Close()
 			waitForUnixSocket(t, socketPath)
 
-			if err := CreateSnapshot(socketPath, "/tmp/snap", "/tmp/mem", "/tmp/delta", tc.mode); err != nil {
+			if err := CreateSnapshot(socketPath, "/tmp/snap", "/tmp/mem", tc.blockDeltaDir, tc.mode); err != nil {
 				t.Fatalf("CreateSnapshot: %v", err)
 			}
 
@@ -71,16 +108,7 @@ func TestCreateSnapshot_FlattenFieldInJSONBody(t *testing.T) {
 			if body == nil {
 				t.Fatal("snapshot/create handler never invoked")
 			}
-
-			var decoded struct {
-				Flatten bool `json:"flatten"`
-			}
-			if err := json.Unmarshal(body, &decoded); err != nil {
-				t.Fatalf("unmarshal body: %v (body=%s)", err, string(body))
-			}
-			if decoded.Flatten != tc.wantFlatten {
-				t.Errorf("flatten=%v, want %v (body=%s)", decoded.Flatten, tc.wantFlatten, string(body))
-			}
+			tc.assertBody(t, body)
 		})
 	}
 }
