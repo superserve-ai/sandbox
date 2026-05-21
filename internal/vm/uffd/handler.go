@@ -418,7 +418,12 @@ func (h *Handler) servePagefault(g *errgroup.Group, faultAddr, pageSize uint64) 
 
 		region := h.findRegion(pageAddr)
 		if region == nil {
-			h.log.Error().Uint64("addr", faultAddr).Msg("page fault address outside all regions; killing handler")
+			h.log.Error().
+				Str("fault_addr", fmt.Sprintf("%#x", faultAddr)).
+				Str("page_addr", fmt.Sprintf("%#x", pageAddr)).
+				Uint64("page_size", pageSize).
+				Interface("mappings", h.mappings).
+				Msg("page fault address outside all regions; killing handler")
 			return fmt.Errorf("address %#x outside guest regions", faultAddr)
 		}
 
