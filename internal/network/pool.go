@@ -66,15 +66,18 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	}
 
 	// Fill initial batch synchronously so the pool is warm on first create.
+	// Transient slot failures don't abort — the refill loop catches up.
+	filled := 0
 	for i := 0; i < newSize; i++ {
 		slot, err := p.allocate(ctx)
 		if err != nil {
-			p.log.Error().Err(err).Int("filled", i).Msg("initial pool fill incomplete")
-			break
+			p.log.Warn().Err(err).Int("attempt", i+1).Msg("initial pool slot failed; continuing")
+			continue
 		}
 		p.fresh <- slot
+		filled++
 	}
-	p.log.Info().Int("fresh", len(p.fresh)).Int("recycle_cap", recycleSize).Msg("network pool ready")
+	p.log.Info().Int("fresh", filled).Int("target", newSize).Int("recycle_cap", recycleSize).Msg("network pool ready")
 
 	p.wg.Add(1)
 	go p.refillLoop(ctx)

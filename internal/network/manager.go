@@ -187,7 +187,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		if info := m.pool.Claim(vmID); info != nil {
 			return info, nil
 		}
-		m.log.Debug().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
+		m.log.Info().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
 	}
 
 	idx, err := m.claimSlotIndex()

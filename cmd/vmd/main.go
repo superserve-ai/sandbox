@@ -307,10 +307,10 @@ func main() {
 
 	// ---- Pre-allocate network slots ----
 	// Keeps a buffer of ready-to-use network namespaces so sandbox creation
-	// grabs one in microseconds instead of running ~11 shell commands.
-	netPoolNew, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_NEW_SIZE", "128"))
+	// grabs one in microseconds instead of running ~18 shell commands.
+	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "128"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize: netPoolNew,
+		NewSize: netPoolFresh,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 
