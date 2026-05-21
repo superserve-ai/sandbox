@@ -30,6 +30,22 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
+// vmdRetryServiceConfig retries on UNAVAILABLE only — gRPC guarantees
+// such requests never reached the server, so create RPCs can't
+// double-execute. Other codes lack this guarantee.
+const vmdRetryServiceConfig = `{
+  "methodConfig": [{
+    "name": [{"service": "superserve.vmd.v1.VMDaemon"}],
+    "retryPolicy": {
+      "maxAttempts": 5,
+      "initialBackoff": "0.2s",
+      "maxBackoff": "2s",
+      "backoffMultiplier": 2.0,
+      "retryableStatusCodes": ["UNAVAILABLE"]
+    }
+  }]
+}`
+
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
@@ -68,6 +84,7 @@ func run() error {
 	// Connect to VMD via gRPC.
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(vmdRetryServiceConfig),
 	)
 	if err != nil {
 		return fmt.Errorf("dial VMD gRPC: %w", err)
@@ -86,8 +103,10 @@ func run() error {
 	// Interceptors below fire onDead on codes.Unavailable so the registry
 	// drops stale cached clients.
 	dialVMD := func(addr string, onDead func()) (vmdclient.Client, error) {
+		// Retry runs inside the invoker; the dead-host interceptor sees the post-retry outcome only.
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultServiceConfig(vmdRetryServiceConfig),
 			grpc.WithUnaryInterceptor(deadHostUnaryInterceptor(onDead)),
 			grpc.WithStreamInterceptor(deadHostStreamInterceptor(onDead)),
 		)

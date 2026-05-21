@@ -182,12 +182,12 @@ func (m *Manager) SetProxyPorts(http, tls, other uint16) {
 // The host reaches the VM at hostIP:<port>. NAT inside the namespace
 // translates to 169.254.0.21:<port>. No guest IP reconfig needed.
 func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNetInfo, error) {
-	// Try the pre-allocated pool first (microseconds instead of ~10-30ms).
+	// Try the pre-allocated pool first; fall back to on-demand setup.
 	if m.pool != nil {
 		if info := m.pool.Claim(vmID); info != nil {
 			return info, nil
 		}
-		m.log.Debug().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
+		m.log.Info().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
 	}
 
 	idx, err := m.claimSlotIndex()
