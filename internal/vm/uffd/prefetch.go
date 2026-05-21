@@ -65,19 +65,10 @@ func (h *Handler) prefetchOne(offset, pageSize uint64) (stop bool, err error) {
 		return false, perr
 	}
 
-	f := h.file.Load()
-	if f == nil {
-		return true, nil
-	}
-	sc, err := f.SyscallConn()
-	if err != nil {
-		return true, nil
-	}
 	var copyErr error
-	ctrlErr := sc.Control(func(fd uintptr) {
+	if !h.withFd(func(fd uintptr) {
 		_, copyErr = ioctlCopy(fd, dst, srcPtr, pageSize, 0)
-	})
-	if ctrlErr != nil {
+	}) {
 		return true, nil
 	}
 	if copyErr != nil {

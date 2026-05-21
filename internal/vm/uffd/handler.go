@@ -238,6 +238,23 @@ func (h *Handler) closeFd() {
 	}
 }
 
+// withFd runs fn with the UFFD fd held alive via SyscallConn().Control().
+// Returns false if the file is gone.
+func (h *Handler) withFd(fn func(fd uintptr)) bool {
+	f := h.file.Load()
+	if f == nil {
+		return false
+	}
+	sc, err := f.SyscallConn()
+	if err != nil {
+		return false
+	}
+	if err := sc.Control(fn); err != nil {
+		return false
+	}
+	return true
+}
+
 func (h *Handler) acceptAndReceive(ctx context.Context) error {
 	// SetDeadline is the only way to make AcceptUnix interruptible; the
 	// watchdog below sets it to the past on ctx cancel.
@@ -369,20 +386,11 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 		if err := gctx.Err(); err != nil {
 			return g.Wait()
 		}
-		f := h.file.Load()
-		if f == nil {
-			return g.Wait()
-		}
-		sc, err := f.SyscallConn()
-		if err != nil {
-			return g.Wait()
-		}
-
 		var n int
 		var readErr error
 		var pollErr error
 		var revents int16
-		ctrlErr := sc.Control(func(fd uintptr) {
+		if !h.withFd(func(fd uintptr) {
 			pollFds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 			_, pollErr = unix.Poll(pollFds, pollTimeoutMs)
 			if pollErr != nil {
@@ -392,10 +400,7 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 			if revents&unix.POLLIN != 0 {
 				n, readErr = h.readFn(int(fd), msgBuf[:])
 			}
-		})
-		if ctrlErr != nil {
-			// File closed between Load and Control (or during Control's
-			// incref). Treat as clean exit.
+		}) {
 			return g.Wait()
 		}
 		if pollErr != nil {
@@ -482,19 +487,10 @@ func (h *Handler) servePagefault(g *errgroup.Group, faultAddr, pageSize uint64) 
 			return fmt.Errorf("source page lookup: %w", err)
 		}
 
-		f := h.file.Load()
-		if f == nil {
-			return nil
-		}
-		sc, err := f.SyscallConn()
-		if err != nil {
-			return nil
-		}
 		var copyErr error
-		ctrlErr := sc.Control(func(fd uintptr) {
+		if !h.withFd(func(fd uintptr) {
 			_, copyErr = ioctlCopy(fd, pageAddr, srcPtr, pageSize, 0)
-		})
-		if ctrlErr != nil {
+		}) {
 			return nil
 		}
 		if copyErr != nil {
@@ -528,19 +524,10 @@ func (h *Handler) handleRemove(start, end uint64) {
 		return
 	}
 	length := end - start
-	f := h.file.Load()
-	if f == nil {
-		return
-	}
-	sc, scErr := f.SyscallConn()
-	if scErr != nil {
-		return
-	}
 	var err error
-	ctrlErr := sc.Control(func(fd uintptr) {
+	if !h.withFd(func(fd uintptr) {
 		err = ioctlZeropage(fd, start, length)
-	})
-	if ctrlErr != nil {
+	}) {
 		return
 	}
 	if err != nil {
