@@ -30,9 +30,9 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
-// vmdRetryServiceConfig retries vmd RPCs on UNAVAILABLE. Retry only
-// fires before the server sends a response, so create RPCs can't
-// double-execute.
+// vmdRetryServiceConfig retries on UNAVAILABLE only — gRPC guarantees
+// such requests never reached the server, so create RPCs can't
+// double-execute. Other codes lack this guarantee.
 const vmdRetryServiceConfig = `{
   "methodConfig": [{
     "name": [{"service": "superserve.vmd.v1.VMDaemon"}],
@@ -103,6 +103,7 @@ func run() error {
 	// Interceptors below fire onDead on codes.Unavailable so the registry
 	// drops stale cached clients.
 	dialVMD := func(addr string, onDead func()) (vmdclient.Client, error) {
+		// Retry runs inside the invoker; the dead-host interceptor sees the post-retry outcome only.
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithDefaultServiceConfig(vmdRetryServiceConfig),

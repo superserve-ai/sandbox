@@ -20,8 +20,8 @@ type PoolConfig struct {
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
-// firewall rules so that SetupVM can claim a ready slot in microseconds
-// instead of running ~11 shell commands on the hot path (~10-30ms).
+// firewall rules so that SetupVM can claim a ready slot off the hot path
+// instead of building one inline.
 //
 // The pool is optional — if not started, SetupVM falls back to on-demand
 // setup (the original behavior). Call StartPool after NewManager to enable.
