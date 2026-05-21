@@ -66,16 +66,15 @@ type Config struct {
 }
 
 type Stats struct {
-	FaultsServed       atomic.Uint64
-	BytesServed        atomic.Uint64
-	CopyErrors         atomic.Uint64
-	UnknownEvents      atomic.Uint64
-	RemoveEvents       atomic.Uint64
-	IoctlEagainRetries atomic.Uint64 // UFFDIO_COPY/ZEROPAGE returned EAGAIN; kernel will redeliver
-	ReadEagainRetries  atomic.Uint64 // serveLoop's read returned EAGAIN despite poll signalling readable
-	Eexist             atomic.Uint64
-	PrefetchedPages    atomic.Uint64
-	PrefetchSkipped    atomic.Uint64 // EEXIST during prefetch (page already faulted by guest)
+	FaultsServed     atomic.Uint64
+	BytesServed      atomic.Uint64
+	CopyErrors       atomic.Uint64
+	UnknownEvents    atomic.Uint64
+	RemoveEvents     atomic.Uint64
+	EagainRetries    atomic.Uint64
+	Eexist           atomic.Uint64
+	PrefetchedPages  atomic.Uint64
+	PrefetchSkipped  atomic.Uint64 // EEXIST during prefetch (page already faulted by guest)
 }
 
 // Handler binds a UDS, receives a userfaultfd fd from Firecracker, then
@@ -355,7 +354,7 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(h.cfg.FaultWorkers)
 
-	// Closing the UFFD fd is the way to wake a blocking poll on it,
+	// Closing the UFFD fd is the only way to wake a blocking read on it,
 	// so bridge context cancellation to a close here.
 	go func() {
 		<-gctx.Done()
@@ -363,10 +362,6 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 	}()
 
 	var msgBuf [32]byte
-	pollFds := []unix.PollFd{{Events: unix.POLLIN}}
-	// pollTimeoutMs caps cancellation latency. Tightening it doesn't help
-	// throughput — real events wake poll immediately.
-	const pollTimeoutMs = 100
 	for {
 		if err := gctx.Err(); err != nil {
 			return g.Wait()
@@ -374,29 +369,6 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 		fd := h.uffdFd.Load()
 		if fd == uffdClosed {
 			return g.Wait()
-		}
-		pollFds[0].Fd = int32(fd)
-		pollFds[0].Revents = 0
-		nReady, pollErr := unix.Poll(pollFds, pollTimeoutMs)
-		if pollErr != nil {
-			if errors.Is(pollErr, syscall.EINTR) {
-				continue
-			}
-			if errors.Is(pollErr, syscall.EBADF) {
-				return g.Wait()
-			}
-			return fmt.Errorf("poll uffd: %w", pollErr)
-		}
-		if nReady == 0 {
-			continue
-		}
-		revents := pollFds[0].Revents
-		if revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
-			h.log.Debug().Int16("revents", revents).Msg("uffd serveLoop exiting on poll revents")
-			return g.Wait()
-		}
-		if revents&unix.POLLIN == 0 {
-			continue
 		}
 		n, err := h.readFn(int(fd), msgBuf[:])
 		if err != nil {
@@ -412,12 +384,6 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 					h.log.Debug().Msg("uffd serveLoop exiting cleanly on EINVAL — firecracker likely unmapped VMAs")
 				}
 				return g.Wait()
-			}
-			// EAGAIN despite a positive poll(POLLIN) signal — should not
-			// happen, but loop back rather than crash the handler.
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				h.stats.ReadEagainRetries.Add(1)
-				continue
 			}
 			return fmt.Errorf("read uffd_msg: %w", err)
 		}
@@ -452,12 +418,7 @@ func (h *Handler) servePagefault(g *errgroup.Group, faultAddr, pageSize uint64) 
 
 		region := h.findRegion(pageAddr)
 		if region == nil {
-			h.log.Error().
-				Str("fault_addr", fmt.Sprintf("%#x", faultAddr)).
-				Str("page_addr", fmt.Sprintf("%#x", pageAddr)).
-				Uint64("page_size", pageSize).
-				Interface("mappings", h.mappings).
-				Msg("page fault address outside all regions; killing handler")
+			h.log.Error().Uint64("addr", faultAddr).Msg("page fault address outside all regions; killing handler")
 			return fmt.Errorf("address %#x outside guest regions", faultAddr)
 		}
 
@@ -490,7 +451,7 @@ func (h *Handler) servePagefault(g *errgroup.Group, faultAddr, pageSize uint64) 
 			// all ioctls return EAGAIN until it's drained. The kernel
 			// re-fires the fault after we handle the REMOVE.
 			if errors.Is(copyErr, syscall.EAGAIN) {
-				h.stats.IoctlEagainRetries.Add(1)
+				h.stats.EagainRetries.Add(1)
 				return nil
 			}
 			h.stats.CopyErrors.Add(1)
@@ -522,7 +483,7 @@ func (h *Handler) handleRemove(start, end uint64) {
 		// EAGAIN: another REMOVE event is queued ahead of us — the next
 		// REMOVE will cover this range, so skipping the zero is correct.
 		if errors.Is(err, syscall.EAGAIN) {
-			h.stats.IoctlEagainRetries.Add(1)
+			h.stats.EagainRetries.Add(1)
 			return
 		}
 		h.log.Warn().Err(err).Uint64("start", start).Uint64("end", end).Msg("UFFDIO_ZEROPAGE failed")
