@@ -24,9 +24,6 @@ import (
 // worker.
 const defaultFaultWorkers = 256
 
-// uffdClosed is the sentinel value of Handler.uffdFd before the fd is
-// received and after it has been closed.
-const uffdClosed = ^uintptr(0)
 
 // GuestRegionMapping is the JSON Firecracker sends over the UDS alongside
 // the userfaultfd fd. Field tags must match
@@ -87,11 +84,12 @@ type Handler struct {
 	source   *Source
 	listener *net.UnixListener
 
-	// fdMu (RLock per ioctl, Lock around close) prevents an ioctl from
-	// racing with close + kernel fd-reuse. uffdFd is atomic so the
-	// lock-free serveLoop read is sound under Go's memory model.
-	fdMu   sync.RWMutex
-	uffdFd atomic.Uintptr // uffdClosed when not held
+	// file owns the UFFD fd. All syscalls go through SyscallConn().Control(),
+	// which holds an internal refcount during the callback. file.Close()
+	// blocks until in-flight Control callbacks return, so the kernel-side
+	// fd cannot be reused by another open while any handler op is still
+	// touching it.
+	file atomic.Pointer[os.File]
 
 	mappings []GuestRegionMapping
 	pageSize uint64
@@ -118,7 +116,6 @@ func New(cfg Config) *Handler {
 		handshakeDone: make(chan error, 1),
 		readFn:        unix.Read,
 	}
-	h.uffdFd.Store(uffdClosed)
 	return h
 }
 
@@ -233,19 +230,29 @@ func (h *Handler) Close() error {
 	return firstErr
 }
 
-// closeFd closes the userfaultfd under the write lock so no in-flight
-// ioctl can be operating on the fd when the kernel frees the slot
-// (preventing fd-number reuse from redirecting a worker's ioctl to an
-// unrelated open). Idempotent.
+// closeFd drops the UFFD file. file.Close() blocks until in-flight
+// SyscallConn callbacks return. Idempotent via atomic swap.
 func (h *Handler) closeFd() {
-	h.fdMu.Lock()
-	defer h.fdMu.Unlock()
-	fd := h.uffdFd.Load()
-	if fd == uffdClosed {
-		return
+	if f := h.file.Swap(nil); f != nil {
+		_ = f.Close()
 	}
-	_ = unix.Close(int(fd))
-	h.uffdFd.Store(uffdClosed)
+}
+
+// withFd runs fn with the UFFD fd held alive via SyscallConn().Control().
+// Returns false if the file is gone.
+func (h *Handler) withFd(fn func(fd uintptr)) bool {
+	f := h.file.Load()
+	if f == nil {
+		return false
+	}
+	sc, err := f.SyscallConn()
+	if err != nil {
+		return false
+	}
+	if err := sc.Control(fn); err != nil {
+		return false
+	}
+	return true
 }
 
 func (h *Handler) acceptAndReceive(ctx context.Context) error {
@@ -313,11 +320,8 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 		return errors.New("no UFFD fd received in SCM_RIGHTS")
 	}
 
-	// Firecracker creates UFFD with O_NONBLOCK; clear it so unix.Read
-	// blocks (cancellation closes the fd → EBADF wakes the read).
-	if flags, err := unix.FcntlInt(uintptr(uffdFd), unix.F_GETFL, 0); err == nil {
-		_, _ = unix.FcntlInt(uintptr(uffdFd), unix.F_SETFL, flags&^unix.O_NONBLOCK)
-	}
+	// Keep the fd non-blocking (firecracker's default). serveLoop drives
+	// readiness with poll() inside a SyscallConn callback.
 
 	var mappings []GuestRegionMapping
 	if err := json.Unmarshal(body[:n], &mappings); err != nil {
@@ -337,7 +341,15 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 		return fmt.Errorf("invalid page size in mappings: %+v", mappings[0])
 	}
 
-	h.uffdFd.Store(uintptr(uffdFd))
+	file := os.NewFile(uintptr(uffdFd), fmt.Sprintf("uffd-%d", uffdFd))
+	if file == nil {
+		_ = unix.Close(uffdFd)
+		return fmt.Errorf("os.NewFile returned nil for fd %d", uffdFd)
+	}
+	// Defensive: if a prior file is somehow still installed, close it.
+	if old := h.file.Swap(file); old != nil {
+		_ = old.Close()
+	}
 	h.mappings = mappings
 	h.pageSize = pageSize
 
@@ -351,12 +363,19 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 	return nil
 }
 
+// pollTimeoutMs bounds how long each poll waits before the loop checks
+// ctx, and also bounds how long closeFd may block on the in-flight
+// Control callback. Real events wake poll immediately, so this knob
+// doesn't affect throughput.
+const pollTimeoutMs = 100
+
 func (h *Handler) serveLoop(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(h.cfg.FaultWorkers)
 
-	// Closing the UFFD fd is the only way to wake a blocking read on it,
-	// so bridge context cancellation to a close here.
+	// Bridge context cancellation to closeFd. file.Close() blocks until
+	// in-flight Control callbacks return; the short poll timeout below
+	// caps that wait to pollTimeoutMs.
 	go func() {
 		<-gctx.Done()
 		h.closeFd()
@@ -367,29 +386,59 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 		if err := gctx.Err(); err != nil {
 			return g.Wait()
 		}
-		fd := h.uffdFd.Load()
-		if fd == uffdClosed {
+		var n int
+		var readErr error
+		var pollErr error
+		var revents int16
+		if !h.withFd(func(fd uintptr) {
+			pollFds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+			_, pollErr = unix.Poll(pollFds, pollTimeoutMs)
+			if pollErr != nil {
+				return
+			}
+			revents = pollFds[0].Revents
+			if revents&unix.POLLIN != 0 {
+				n, readErr = h.readFn(int(fd), msgBuf[:])
+			}
+		}) {
 			return g.Wait()
 		}
-		n, err := h.readFn(int(fd), msgBuf[:])
-		if err != nil {
-			if errors.Is(err, syscall.EINTR) {
+		if pollErr != nil {
+			if errors.Is(pollErr, syscall.EINTR) {
 				continue
 			}
-			// EBADF: cancellation goroutine closed the fd. EINVAL: kernel
-			// returned "invalid argument", typically because Firecracker
-			// exited and unmapped its VMAs before we drained the queue.
-			// Both mean "nothing more to read here" — exit cleanly.
-			if errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL) {
-				if errors.Is(err, syscall.EINVAL) {
+			return fmt.Errorf("poll uffd: %w", pollErr)
+		}
+		if revents&unix.POLLIN == 0 {
+			if revents&(unix.POLLHUP|unix.POLLNVAL) != 0 {
+				return g.Wait()
+			}
+			if revents&unix.POLLERR != 0 {
+				h.log.Debug().Int16("revents", revents).Msg("uffd poll returned POLLERR without POLLIN")
+			}
+			continue
+		}
+		if readErr != nil {
+			if errors.Is(readErr, syscall.EINTR) {
+				continue
+			}
+			// EBADF means the fd is gone; EINVAL means firecracker
+			// unmapped its VMAs. Either is a clean exit.
+			if errors.Is(readErr, syscall.EBADF) || errors.Is(readErr, syscall.EINVAL) {
+				if errors.Is(readErr, syscall.EINVAL) {
 					h.log.Debug().Msg("uffd serveLoop exiting cleanly on EINVAL — firecracker likely unmapped VMAs")
 				}
 				return g.Wait()
 			}
-			return fmt.Errorf("read uffd_msg: %w", err)
+			// EAGAIN despite POLLIN — defensive, retry.
+			if errors.Is(readErr, syscall.EAGAIN) || errors.Is(readErr, syscall.EWOULDBLOCK) {
+				h.stats.EagainRetries.Add(1)
+				continue
+			}
+			return fmt.Errorf("read uffd_msg: %w", readErr)
 		}
 		if n == 0 {
-			return g.Wait() // Firecracker exited.
+			return g.Wait()
 		}
 		if n < int(unsafe.Sizeof(uffdMsg{})) {
 			h.log.Warn().Int("bytes", n).Msg("short uffd_msg read; skipping")
@@ -438,14 +487,12 @@ func (h *Handler) servePagefault(g *errgroup.Group, faultAddr, pageSize uint64) 
 			return fmt.Errorf("source page lookup: %w", err)
 		}
 
-		h.fdMu.RLock()
-		fd := h.uffdFd.Load()
-		if fd == uffdClosed {
-			h.fdMu.RUnlock()
+		var copyErr error
+		if !h.withFd(func(fd uintptr) {
+			_, copyErr = ioctlCopy(fd, pageAddr, srcPtr, pageSize, 0)
+		}) {
 			return nil
 		}
-		_, copyErr := ioctlCopy(fd, pageAddr, srcPtr, pageSize, 0)
-		h.fdMu.RUnlock()
 		if copyErr != nil {
 			// EEXIST: another fault on the same page raced ahead of us;
 			// it's already mapped. Benign.
@@ -477,14 +524,12 @@ func (h *Handler) handleRemove(start, end uint64) {
 		return
 	}
 	length := end - start
-	h.fdMu.RLock()
-	fd := h.uffdFd.Load()
-	if fd == uffdClosed {
-		h.fdMu.RUnlock()
+	var err error
+	if !h.withFd(func(fd uintptr) {
+		err = ioctlZeropage(fd, start, length)
+	}) {
 		return
 	}
-	err := ioctlZeropage(fd, start, length)
-	h.fdMu.RUnlock()
 	if err != nil {
 		// EAGAIN: another REMOVE event is queued ahead of us — the next
 		// REMOVE will cover this range, so skipping the zero is correct.

@@ -27,7 +27,7 @@ func (h *Handler) runPrefetch(ctx context.Context) {
 		h.log.Warn().Msg("prefetch: no page size, skipping")
 		return
 	}
-	if h.uffdFd.Load() == uffdClosed {
+	if h.file.Load() == nil {
 		return
 	}
 
@@ -65,14 +65,12 @@ func (h *Handler) prefetchOne(offset, pageSize uint64) (stop bool, err error) {
 		return false, perr
 	}
 
-	h.fdMu.RLock()
-	fd := h.uffdFd.Load()
-	if fd == uffdClosed {
-		h.fdMu.RUnlock()
+	var copyErr error
+	if !h.withFd(func(fd uintptr) {
+		_, copyErr = ioctlCopy(fd, dst, srcPtr, pageSize, 0)
+	}) {
 		return true, nil
 	}
-	_, copyErr := ioctlCopy(fd, dst, srcPtr, pageSize, 0)
-	h.fdMu.RUnlock()
 	if copyErr != nil {
 		if errors.Is(copyErr, syscall.EEXIST) {
 			h.stats.PrefetchSkipped.Add(1)

@@ -164,8 +164,33 @@ func TestHandler_WaitHandshake_CtxCancel(t *testing.T) {
 // drain the queue) makes serveLoop return nil rather than propagate an
 // error to the caller.
 func TestServeLoop_EINVALReturnsCleanly(t *testing.T) {
-	// Pipe stand-in for the uffd fd — closeFd (triggered when serveLoop
-	// returns and cancels gctx) will close it, so it must be real.
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer wPipe.Close()
+	// Prime the pipe so poll signals readable; readFn returns EINVAL.
+	if _, err := wPipe.Write([]byte{0}); err != nil {
+		t.Fatalf("prime pipe: %v", err)
+	}
+
+	h := New(Config{
+		FaultWorkers: 1,
+		Logger:       zerolog.Nop(),
+	})
+	h.file.Store(rPipe)
+	h.readFn = func(fd int, p []byte) (int, error) {
+		return 0, syscall.EINVAL
+	}
+
+	if err := h.serveLoop(context.Background()); err != nil {
+		t.Errorf("serveLoop returned %v, want nil on EINVAL", err)
+	}
+}
+
+// TestServeLoop_CtxCancelExitsPromptly verifies cancellation latency is
+// bounded by the poll timeout (~pollTimeoutMs).
+func TestServeLoop_CtxCancelExitsPromptly(t *testing.T) {
 	rPipe, wPipe, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
@@ -176,12 +201,56 @@ func TestServeLoop_EINVALReturnsCleanly(t *testing.T) {
 		FaultWorkers: 1,
 		Logger:       zerolog.Nop(),
 	})
-	h.uffdFd.Store(uintptr(rPipe.Fd()))
-	h.readFn = func(fd int, p []byte) (int, error) {
-		return 0, syscall.EINVAL
-	}
+	h.file.Store(rPipe)
 
-	if err := h.serveLoop(context.Background()); err != nil {
-		t.Errorf("serveLoop returned %v, want nil on EINVAL", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := h.serveLoop(ctx); err != nil {
+		t.Errorf("serveLoop returned %v, want nil on cancel", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("serveLoop took %v to exit on cancel; want < 500ms", elapsed)
+	}
+}
+
+// TestCloseFd_WaitsForInFlightControl verifies that closeFd blocks until
+// any in-flight SyscallConn().Control callback returns.
+func TestCloseFd_WaitsForInFlightControl(t *testing.T) {
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer wPipe.Close()
+
+	h := New(Config{Logger: zerolog.Nop()})
+	h.file.Store(rPipe)
+
+	sc, err := rPipe.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn: %v", err)
+	}
+	inFlight := make(chan struct{})
+	released := make(chan struct{})
+	go func() {
+		_ = sc.Control(func(_ uintptr) {
+			close(inFlight)
+			time.Sleep(200 * time.Millisecond)
+			close(released)
+		})
+	}()
+	<-inFlight // proven in-flight, not assumed
+
+	// closeFd must wait for the Control callback to finish.
+	start := time.Now()
+	h.closeFd()
+	elapsed := time.Since(start)
+	select {
+	case <-released:
+	default:
+		t.Errorf("closeFd returned before Control callback released")
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("closeFd took %v; expected to wait for in-flight Control (~200ms)", elapsed)
 	}
 }
