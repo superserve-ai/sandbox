@@ -385,6 +385,17 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 				}
 				return g.Wait()
 			}
+			// EAGAIN: fd is non-blocking — back off briefly and retry.
+			// A real message, EBADF, or EINVAL will arrive soon.
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				h.stats.EagainRetries.Add(1)
+				select {
+				case <-gctx.Done():
+					return g.Wait()
+				case <-time.After(time.Millisecond):
+				}
+				continue
+			}
 			return fmt.Errorf("read uffd_msg: %w", err)
 		}
 		if n == 0 {
@@ -418,7 +429,12 @@ func (h *Handler) servePagefault(g *errgroup.Group, faultAddr, pageSize uint64) 
 
 		region := h.findRegion(pageAddr)
 		if region == nil {
-			h.log.Error().Uint64("addr", faultAddr).Msg("page fault address outside all regions; killing handler")
+			h.log.Error().
+				Str("fault_addr", fmt.Sprintf("%#x", faultAddr)).
+				Str("page_addr", fmt.Sprintf("%#x", pageAddr)).
+				Uint64("page_size", pageSize).
+				Interface("mappings", h.mappings).
+				Msg("page fault address outside all regions; killing handler")
 			return fmt.Errorf("address %#x outside guest regions", faultAddr)
 		}
 
