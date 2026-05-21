@@ -345,6 +345,7 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 		Int("regions", len(mappings)).
 		Uint64("page_size", pageSize).
 		Int("uffd_fd", uffdFd).
+		Interface("mappings", mappings).
 		Msg("uffd handshake complete")
 
 	return nil
