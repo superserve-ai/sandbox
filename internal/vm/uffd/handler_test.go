@@ -172,6 +172,11 @@ func TestServeLoop_EINVALReturnsCleanly(t *testing.T) {
 	}
 	defer wPipe.Close()
 
+	// Prime the pipe so poll signals readable; readFn returns EINVAL.
+	if _, err := wPipe.Write([]byte{0}); err != nil {
+		t.Fatalf("prime pipe: %v", err)
+	}
+
 	h := New(Config{
 		FaultWorkers: 1,
 		Logger:       zerolog.Nop(),
@@ -183,5 +188,87 @@ func TestServeLoop_EINVALReturnsCleanly(t *testing.T) {
 
 	if err := h.serveLoop(context.Background()); err != nil {
 		t.Errorf("serveLoop returned %v, want nil on EINVAL", err)
+	}
+}
+
+// TestServeLoop_EAGAINIncrementsCounterAndContinues verifies the EAGAIN
+// safety net in the read path: counter increments, loop continues.
+func TestServeLoop_EAGAINIncrementsCounterAndContinues(t *testing.T) {
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer wPipe.Close()
+	if _, err := wPipe.Write([]byte{0}); err != nil {
+		t.Fatalf("prime pipe: %v", err)
+	}
+
+	h := New(Config{
+		FaultWorkers: 1,
+		Logger:       zerolog.Nop(),
+	})
+	h.uffdFd.Store(uintptr(rPipe.Fd()))
+
+	var calls int
+	h.readFn = func(fd int, p []byte) (int, error) {
+		calls++
+		if calls == 1 {
+			return 0, syscall.EAGAIN
+		}
+		return 0, syscall.EINVAL
+	}
+
+	if err := h.serveLoop(context.Background()); err != nil {
+		t.Errorf("serveLoop returned %v, want nil", err)
+	}
+	if got := h.stats.ReadEagainRetries.Load(); got != 1 {
+		t.Errorf("ReadEagainRetries = %d, want 1", got)
+	}
+}
+
+// TestServeLoop_CtxCancelExitsPromptly verifies that gctx cancellation
+// makes serveLoop exit within the poll timeout, not after a real event.
+func TestServeLoop_CtxCancelExitsPromptly(t *testing.T) {
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer wPipe.Close()
+
+	h := New(Config{
+		FaultWorkers: 1,
+		Logger:       zerolog.Nop(),
+	})
+	h.uffdFd.Store(uintptr(rPipe.Fd()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := h.serveLoop(ctx); err != nil {
+		t.Errorf("serveLoop returned %v, want nil on cancel", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Errorf("serveLoop took %v to exit on cancel; want < 250ms", elapsed)
+	}
+}
+
+// TestServeLoop_POLLHUPExitsCleanly verifies that POLLHUP from poll
+// (the write end of the fd was closed) makes serveLoop return nil.
+func TestServeLoop_POLLHUPExitsCleanly(t *testing.T) {
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	// Close write end so poll(rPipe) returns POLLHUP.
+	wPipe.Close()
+
+	h := New(Config{
+		FaultWorkers: 1,
+		Logger:       zerolog.Nop(),
+	})
+	h.uffdFd.Store(uintptr(rPipe.Fd()))
+
+	if err := h.serveLoop(context.Background()); err != nil {
+		t.Errorf("serveLoop returned %v, want nil on POLLHUP", err)
 	}
 }
