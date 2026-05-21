@@ -364,6 +364,8 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 
 	var msgBuf [32]byte
 	pollFds := []unix.PollFd{{Events: unix.POLLIN}}
+	// pollTimeoutMs caps cancellation latency. Tightening it doesn't help
+	// throughput — real events wake poll immediately.
 	const pollTimeoutMs = 100
 	for {
 		if err := gctx.Err(); err != nil {

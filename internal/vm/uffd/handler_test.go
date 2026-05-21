@@ -247,7 +247,28 @@ func TestServeLoop_CtxCancelExitsPromptly(t *testing.T) {
 	if err := h.serveLoop(ctx); err != nil {
 		t.Errorf("serveLoop returned %v, want nil on cancel", err)
 	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Errorf("serveLoop took %v to exit on cancel; want < 500ms", elapsed)
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Errorf("serveLoop took %v to exit on cancel; want < 250ms", elapsed)
+	}
+}
+
+// TestServeLoop_POLLHUPExitsCleanly verifies that POLLHUP from poll
+// (the write end of the fd was closed) makes serveLoop return nil.
+func TestServeLoop_POLLHUPExitsCleanly(t *testing.T) {
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	// Close write end so poll(rPipe) returns POLLHUP.
+	wPipe.Close()
+
+	h := New(Config{
+		FaultWorkers: 1,
+		Logger:       zerolog.Nop(),
+	})
+	h.uffdFd.Store(uintptr(rPipe.Fd()))
+
+	if err := h.serveLoop(context.Background()); err != nil {
+		t.Errorf("serveLoop returned %v, want nil on POLLHUP", err)
 	}
 }
