@@ -329,7 +329,10 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 		_ = unix.Close(uffdFd)
 		return fmt.Errorf("os.NewFile returned nil for fd %d", uffdFd)
 	}
-	h.file.Store(file)
+	// Defensive: if a prior file is somehow still installed, close it.
+	if old := h.file.Swap(file); old != nil {
+		_ = old.Close()
+	}
 	h.mappings = mappings
 	h.pageSize = pageSize
 
@@ -344,8 +347,9 @@ func (h *Handler) acceptAndReceive(ctx context.Context) error {
 }
 
 // pollTimeoutMs bounds how long each poll waits before the loop checks
-// ctx. It's the maximum cancellation latency for serveLoop; real events
-// wake poll immediately, so this knob doesn't affect throughput.
+// ctx, and also bounds how long closeFd may block on the in-flight
+// Control callback. Real events wake poll immediately, so this knob
+// doesn't affect throughput.
 const pollTimeoutMs = 100
 
 func (h *Handler) serveLoop(ctx context.Context) error {
@@ -401,11 +405,11 @@ func (h *Handler) serveLoop(ctx context.Context) error {
 			return fmt.Errorf("poll uffd: %w", pollErr)
 		}
 		if revents&unix.POLLIN == 0 {
-			// POLLHUP/POLLNVAL or just a timeout — re-check ctx and the
-			// file pointer at the top of the loop. POLLERR doesn't exit
-			// here because UFFD can signal it transiently post-handshake.
 			if revents&(unix.POLLHUP|unix.POLLNVAL) != 0 {
 				return g.Wait()
+			}
+			if revents&unix.POLLERR != 0 {
+				h.log.Debug().Int16("revents", revents).Msg("uffd poll returned POLLERR without POLLIN")
 			}
 			continue
 		}

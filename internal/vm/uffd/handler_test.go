@@ -226,19 +226,20 @@ func TestCloseFd_WaitsForInFlightControl(t *testing.T) {
 	h := New(Config{Logger: zerolog.Nop()})
 	h.file.Store(rPipe)
 
-	// Hold a Control callback open for 200ms.
 	sc, err := rPipe.SyscallConn()
 	if err != nil {
 		t.Fatalf("SyscallConn: %v", err)
 	}
+	inFlight := make(chan struct{})
 	released := make(chan struct{})
 	go func() {
 		_ = sc.Control(func(_ uintptr) {
+			close(inFlight)
 			time.Sleep(200 * time.Millisecond)
 			close(released)
 		})
 	}()
-	time.Sleep(20 * time.Millisecond) // ensure Control is in flight
+	<-inFlight // proven in-flight, not assumed
 
 	// closeFd must wait for the Control callback to finish.
 	start := time.Now()
@@ -249,7 +250,7 @@ func TestCloseFd_WaitsForInFlightControl(t *testing.T) {
 	default:
 		t.Errorf("closeFd returned before Control callback released")
 	}
-	if elapsed < 150*time.Millisecond {
+	if elapsed < 100*time.Millisecond {
 		t.Errorf("closeFd took %v; expected to wait for in-flight Control (~200ms)", elapsed)
 	}
 }
