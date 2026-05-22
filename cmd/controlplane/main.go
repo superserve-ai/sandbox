@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -68,8 +69,18 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Connect to PostgreSQL.
-	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	// Connect to PostgreSQL. DB_MAX_CONNS overrides the pool size; unset
+	// uses the pgxpool default of max(4, NumCPU).
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("parse database url: %w", err)
+	}
+	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+			poolCfg.MaxConns = int32(n)
+		}
+	}
+	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}

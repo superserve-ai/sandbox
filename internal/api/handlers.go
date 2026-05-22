@@ -953,6 +953,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
+	tStart := time.Now()
 	var req createSandboxRequest
 	if err := bindJSONStrict(c, &req); err != nil {
 		respondErrorMsg(c, "bad_request", "Request body is not valid JSON or contains unknown fields.", http.StatusBadRequest)
@@ -1038,8 +1039,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// authoritative shape.
 	var templateVcpu, templateMemMiB uint32
 	var fromTemplateName, fromTemplateID string
+	var tLookupDone time.Time
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
+		tLookupDone = time.Now()
 		if err != nil {
 			return // error already responded
 		}
@@ -1151,9 +1154,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			DeltaPath:      nil,
 		})
 	}
+	var tInsertStart, tInsertEnd time.Time
 	go func() {
+		tInsertStart = time.Now()
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
 		sb, err := runInsert(h.DB)
+		tInsertEnd = time.Now()
 		insertCh <- insertResult{sandbox: sb, err: err}
 	}()
 
@@ -1171,11 +1177,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and boots a new VM from them statelessly. Caller env vars are merged
 	// on top of the template's baked defaults by vmd (boxd resumes with
 	// template context, then the restore RPC posts these on top).
+	tVmdStart := time.Now()
 	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, req.EnvVars)
+	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
 	insertRes := <-insertCh
+	tInsertReceive := time.Now()
 	sandbox := insertRes.sandbox
 	dbErr := insertRes.err
 
@@ -1323,6 +1332,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}()
 	}
 	wg.Wait()
+	tPostDone := time.Now()
 
 	var createdMeta []byte
 	if fromTemplateName != "" {
@@ -1338,6 +1348,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
+	log.Info().
+		Str("sandbox_id", sandbox.ID.String()).
+		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
+		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
+		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
+		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
+		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
+		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
+		Msg("CreateSandbox phases")
 	c.JSON(http.StatusCreated, resp)
 }
 
