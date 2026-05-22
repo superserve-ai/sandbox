@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/rs/zerolog"
@@ -28,7 +29,8 @@ type hostFirewallAPI interface {
 // Rules persist in the kernel across vmd restarts — leaked rules from
 // prior lifetimes match dead veths and are harmless.
 type HostFirewall struct {
-	mu sync.Mutex
+	mu  sync.Mutex
+	log zerolog.Logger
 
 	ipt       *iptables.IPTables
 	hostIface string
@@ -63,6 +65,7 @@ func NewHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log z
 		httpProxyPort: httpProxyPort,
 		tlsProxyPort:  tlsProxyPort,
 		vmRules:       make(map[string][]vmRule),
+		log:           log,
 	}
 
 	// Static MSS clamp: applies to all forwarded TCP SYN packets going
@@ -83,8 +86,17 @@ func NewHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log z
 
 // AddVM adds FORWARD + MASQUERADE rules for a VM's veth interface.
 func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error {
+	tEntry := time.Now()
 	hfw.mu.Lock()
 	defer hfw.mu.Unlock()
+	tLockAcquired := time.Now()
+	defer func() {
+		hfw.log.Info().
+			Str("vm_id", vmID).
+			Int64("hfw_lock_wait_ms", tLockAcquired.Sub(tEntry).Milliseconds()).
+			Int64("hfw_apply_ms", time.Since(tLockAcquired).Milliseconds()).
+			Msg("hostFW: AddVM complete")
+	}()
 
 	rules := []vmRule{}
 	// Drop UDP/443 so QUIC can't bypass the TCP-only REDIRECT + SNI

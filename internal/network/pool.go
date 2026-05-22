@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -94,6 +95,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 // Validates each slot's kernel netns is still present; phantoms are
 // discarded and their idx returned to the allocator via cleanup.
 func (p *Pool) Claim(vmID string) *VMNetInfo {
+	tEntry := time.Now()
 	for {
 		var slot *preallocSlot
 
@@ -108,6 +110,7 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 				return nil
 			}
 		}
+		tPopped := time.Now()
 
 		// Race: ns can vanish between this check and AddVM; fc startup catches it.
 		if !nsExists(slot.info.Namespace) {
@@ -119,6 +122,7 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			p.cleanup(slot)
 			continue
 		}
+		tNsChecked := time.Now()
 
 		// Add host-level firewall rules (requires vmID).
 		hostCIDR := slot.info.HostIP + "/32"
@@ -127,11 +131,21 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			p.cleanup(slot)
 			return nil
 		}
+		tHostFwDone := time.Now()
 
 		p.mgr.mu.Lock()
 		p.mgr.devices[vmID] = slot.info
 		p.mgr.mu.Unlock()
+		tDone := time.Now()
 
+		p.log.Info().
+			Str("vm_id", vmID).
+			Int64("claim_pop_ms", tPopped.Sub(tEntry).Milliseconds()).
+			Int64("claim_nscheck_ms", tNsChecked.Sub(tPopped).Milliseconds()).
+			Int64("claim_hostfw_ms", tHostFwDone.Sub(tNsChecked).Milliseconds()).
+			Int64("claim_devmap_ms", tDone.Sub(tHostFwDone).Milliseconds()).
+			Int64("claim_total_ms", tDone.Sub(tEntry).Milliseconds()).
+			Msg("pool: claim complete")
 		return slot.info
 	}
 }
