@@ -99,8 +99,6 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 	for {
 		var slot *preallocSlot
 
-		// Prefer recycled slots — they already have host firewall rules
-		// from the previous owner, which get replaced below.
 		select {
 		case slot = <-p.recycled:
 		default:
@@ -112,7 +110,7 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 		}
 		tPopped := time.Now()
 
-		// Race: ns can vanish between this check and AddVM; fc startup catches it.
+		// Race: ns can vanish between this check and devmap insert; fc startup catches it.
 		if !nsExists(slot.info.Namespace) {
 			p.log.Warn().
 				Str("vm_id", vmID).
@@ -124,15 +122,6 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 		}
 		tNsChecked := time.Now()
 
-		// Add host-level firewall rules (requires vmID).
-		hostCIDR := slot.info.HostIP + "/32"
-		if err := p.mgr.hostFW.AddVM(vmID, slot.vethName, hostCIDR); err != nil {
-			p.log.Error().Err(err).Str("vm_id", vmID).Msg("claim: AddVM firewall failed")
-			p.cleanup(slot)
-			return nil
-		}
-		tHostFwDone := time.Now()
-
 		p.mgr.mu.Lock()
 		p.mgr.devices[vmID] = slot.info
 		p.mgr.mu.Unlock()
@@ -142,8 +131,7 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			Str("vm_id", vmID).
 			Int64("claim_pop_ms", tPopped.Sub(tEntry).Milliseconds()).
 			Int64("claim_nscheck_ms", tNsChecked.Sub(tPopped).Milliseconds()).
-			Int64("claim_hostfw_ms", tHostFwDone.Sub(tNsChecked).Milliseconds()).
-			Int64("claim_devmap_ms", tDone.Sub(tHostFwDone).Milliseconds()).
+			Int64("claim_devmap_ms", tDone.Sub(tNsChecked).Milliseconds()).
 			Int64("claim_total_ms", tDone.Sub(tEntry).Milliseconds()).
 			Msg("pool: claim complete")
 		return slot.info

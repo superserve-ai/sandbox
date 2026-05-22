@@ -84,9 +84,6 @@ type Manager struct {
 	freeSlots []int // recycled slot indices
 	nextSlot  int   // next new slot (used when freeSlots is empty)
 
-	// Host-level nftables firewall (FORWARD + MASQUERADE + MSS clamping).
-	hostFW hostFirewallAPI
-
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
 
@@ -140,20 +137,16 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 		opt(mgr)
 	}
 
-	hostFW, err := NewHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, log.With().Str("component", "host_fw").Logger())
-	if err != nil {
-		return nil, fmt.Errorf("init host firewall: %w", err)
+	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, log.With().Str("component", "host_fw").Logger()); err != nil {
+		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
-	mgr.hostFW = hostFW
 
 	return mgr, nil
 }
 
-// Close tears down the host firewall. Should be called on VMD shutdown.
+// Close is retained for caller symmetry. Host iptables rules persist in the
+// kernel across vmd restarts; the next installHostFirewall reinstalls them.
 func (m *Manager) Close() error {
-	if m.hostFW != nil {
-		return m.hostFW.Close()
-	}
 	return nil
 }
 
@@ -195,17 +188,10 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		return nil, err
 	}
 
-	info, vethName, err := m.setupSlot(ctx, idx)
+	info, _, err := m.setupSlot(ctx, idx)
 	if err != nil {
 		// idx stays consumed — reusing a colliding idx would loop.
 		return nil, err
-	}
-
-	// Host-level nftables rules require the vmID.
-	hostCIDR := fmt.Sprintf("%s/32", info.HostIP)
-	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
-		m.cleanupFull(info.Namespace, vethName)
-		return nil, fmt.Errorf("add host firewall rules: %w", err)
 	}
 
 	m.mu.Lock()
@@ -221,12 +207,17 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	return info, nil
 }
 
+// hostIPForSlot returns the host-side IP for a given slot index. The full
+// range across all valid idx values must stay within hostfw.go's vmIPRange.
+func hostIPForSlot(idx int) string {
+	return fmt.Sprintf("10.11.%d.%d", idx/256, idx%256)
+}
+
 // setupSlot runs the expensive network setup (namespace, veth, TAP,
 // nftables, routing) for a single slot index. Used by both SetupVM
-// (on-demand) and Pool (pre-allocation). Does NOT add host-level
-// firewall rules — that requires a vmID and is done by the caller.
+// (on-demand) and Pool (pre-allocation).
 func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, error) {
-	hostIP := fmt.Sprintf("10.11.%d.%d", idx/256, idx%256)
+	hostIP := hostIPForSlot(idx)
 	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
 	vethIP := fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256)
 	nsName := fmt.Sprintf("ns-%d", idx)
@@ -367,11 +358,6 @@ func (m *Manager) CleanupVM(vmID string) {
 	fmt.Sscanf(info.Namespace, "ns-%d", &idx)
 	vethName := fmt.Sprintf("veth-%d", idx)
 
-	// Remove host-level nftables rules (vmID-specific).
-	if err := m.hostFW.RemoveVM(vmID); err != nil {
-		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error removing host firewall rules")
-	}
-
 	// Remove per-sandbox egress proxy rules.
 	if m.egressProxy != nil {
 		m.egressProxy.RemoveRules(info.HostIP)
@@ -415,16 +401,14 @@ func (m *Manager) CleanupVM(vmID string) {
 // ReattachVM rebinds vmd's view of an already-running VM's network state
 // at startup. After this call: the slot is marked in-use (no SetupVM
 // collisions), devices[vmID] is populated (CleanupVM can tear it down),
-// host-level firewall rules are present + tracked, and the in-namespace
-// nftables Firewall handle is reattached so the customer's subsequent
-// UpdateFirewallRules calls apply to the existing kernel state.
+// and the in-namespace nftables Firewall handle is reattached so the
+// customer's subsequent UpdateFirewallRules calls apply to the existing
+// kernel state.
 func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return fmt.Errorf("reattach %s: cannot parse slot from namespace %q", vmID, namespace)
 	}
-	vethName := fmt.Sprintf("veth-%d", idx)
-	hostCIDR := fmt.Sprintf("%s/32", hostIP)
 
 	// Rebind in-namespace nftables handle. Non-fatal on failure: kernel
 	// rules already enforce traffic; only future updates would be lost.
@@ -445,11 +429,6 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		return nil
 	}); err != nil {
 		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
-	}
-
-	// AddVM before devices insert — a retry can't re-attempt it once devices is set.
-	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
-		return fmt.Errorf("reattach %s: restore host firewall: %w", vmID, err)
 	}
 
 	m.mu.Lock()
@@ -490,19 +469,17 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 	m.mu.Unlock()
 
 	var info *VMNetInfo
-	var vethName string
 
 	switch {
 	case hasDevice && nsExists(namespace):
-		// Preserve Firewall handle for future UpdateFirewallRules; AddVM below is idempotent.
+		// Preserve Firewall handle for future UpdateFirewallRules.
 		info = existing
-		vethName = fmt.Sprintf("veth-%d", idx)
 	case !nsExists(namespace):
 		m.log.Warn().Str("vm_id", vmID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
 		// ip netns delete only tears down the inside-ns side; the host-side
 		// veth-N can survive and collide with setupSlot's fresh veth creation.
 		m.cleanupFull(namespace, fmt.Sprintf("veth-%d", idx))
-		built, builtVeth, err := m.setupSlot(ctx, idx)
+		built, _, err := m.setupSlot(ctx, idx)
 		if err != nil {
 			return nil, fmt.Errorf("ensure %s: rebuild slot %d: %w", vmID, idx, err)
 		}
@@ -510,7 +487,6 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 			m.log.Warn().Str("vm_id", vmID).Str("expected", macAddress).Str("got", built.MACAddress).Msg("rebuilt MAC differs from stored — deterministic mapping may have drifted")
 		}
 		info = built
-		vethName = builtVeth
 	default:
 		// Firewall handle stays nil; UpdateFirewallRules creates a fresh one.
 		info = &VMNetInfo{
@@ -521,13 +497,6 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 			HostIP:     hostIP,
 			MACAddress: macAddress,
 		}
-		vethName = fmt.Sprintf("veth-%d", idx)
-	}
-
-	// AddVM before devices insert — a retry short-circuits on the fast path otherwise.
-	hostCIDR := fmt.Sprintf("%s/32", hostIP)
-	if err := m.hostFW.AddVM(vmID, vethName, hostCIDR); err != nil {
-		return nil, fmt.Errorf("ensure %s: restore host firewall: %w", vmID, err)
 	}
 
 	m.mu.Lock()
