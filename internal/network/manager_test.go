@@ -28,42 +28,12 @@ func touchNS(t *testing.T, dir, name string) {
 	_ = f.Close()
 }
 
-// hostFW is nil — tests must not exercise paths that touch it.
 func newTestManager() *Manager {
 	return &Manager{
 		log:      zerolog.Nop(),
 		devices:  make(map[string]*VMNetInfo),
 		nextSlot: 1,
 	}
-}
-
-// stubHostFW records AddVM/RemoveVM calls so tests can assert on them.
-type stubHostFW struct {
-	added   []string // "vmID|veth|cidr"
-	removed []string
-	addErr  error
-}
-
-func (s *stubHostFW) AddVM(vmID, vethName, hostCIDR string) error {
-	if s.addErr != nil {
-		return s.addErr
-	}
-	s.added = append(s.added, vmID+"|"+vethName+"|"+hostCIDR)
-	return nil
-}
-
-func (s *stubHostFW) RemoveVM(vmID string) error {
-	s.removed = append(s.removed, vmID)
-	return nil
-}
-
-func (s *stubHostFW) Close() error { return nil }
-
-func newTestManagerWithStubFW() (*Manager, *stubHostFW) {
-	fw := &stubHostFW{}
-	m := newTestManager()
-	m.hostFW = fw
-	return m, fw
 }
 
 func TestSlotFromNamespace(t *testing.T) {
@@ -182,7 +152,7 @@ func TestClaimSlotIndex_ErrNoSlotsWhenExhausted(t *testing.T) {
 func TestEnsureVMSlot_HealthyVMReplaysFirewall(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-3")
-	m, fw := newTestManagerWithStubFW()
+	m := newTestManager()
 	existing := &VMNetInfo{Namespace: "ns-3", HostIP: "10.11.0.3"}
 	m.devices["vm-x"] = existing
 
@@ -193,15 +163,12 @@ func TestEnsureVMSlot_HealthyVMReplaysFirewall(t *testing.T) {
 	if got != existing {
 		t.Errorf("expected same VMNetInfo pointer back (Firewall handle preserved)")
 	}
-	if len(fw.added) != 1 || fw.added[0] != "vm-x|veth-3|10.11.0.3/32" {
-		t.Errorf("AddVM calls = %v, want one call with veth-3 + 10.11.0.3/32", fw.added)
-	}
 }
 
 func TestEnsureVMSlot_ReconstructWhenDeviceMapEmpty(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-7")
-	m, fw := newTestManagerWithStubFW()
+	m := newTestManager()
 
 	got, err := m.EnsureVMSlot(context.Background(), "vm-y", "ns-7", "10.11.0.7", "AA:FC:00:00:00:07")
 	if err != nil {
@@ -218,24 +185,6 @@ func TestEnsureVMSlot_ReconstructWhenDeviceMapEmpty(t *testing.T) {
 	}
 	if m.nextSlot < 8 {
 		t.Errorf("nextSlot = %d, want >= 8 (advanced past idx 7)", m.nextSlot)
-	}
-	if len(fw.added) != 1 || fw.added[0] != "vm-y|veth-7|10.11.0.7/32" {
-		t.Errorf("AddVM calls = %v, want one call with veth-7", fw.added)
-	}
-}
-
-func TestEnsureVMSlot_AddVMFailureSkipsDeviceInsert(t *testing.T) {
-	dir := withTestNetnsDir(t)
-	touchNS(t, dir, "ns-4")
-	m, fw := newTestManagerWithStubFW()
-	fw.addErr = errors.New("simulated iptables failure")
-
-	_, err := m.EnsureVMSlot(context.Background(), "vm-z", "ns-4", "10.11.0.4", "")
-	if err == nil {
-		t.Fatal("expected error from AddVM failure")
-	}
-	if _, present := m.devices["vm-z"]; present {
-		t.Errorf("devices map should not contain vm-z after AddVM failure (retry must re-attempt)")
 	}
 }
 

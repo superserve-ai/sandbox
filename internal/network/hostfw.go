@@ -1,46 +1,45 @@
 package network
 
+// hostfw.go installs the host-level iptables rules that route VM traffic.
+// Rules match by interface-prefix (veth+) and subnet (vmIPRange) and assume
+// vmd owns the host's filter/FORWARD, nat/PREROUTING, and nat/POSTROUTING
+// chains. On a cohabitated host (Docker, kubelet, ...) veth+ would catch
+// foreign interfaces; rules would need to move into vmd-owned custom chains.
+
 import (
 	"context"
 	"fmt"
+	"net"
 	"os/exec"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/rs/zerolog"
 )
 
-// hostFirewallAPI is the Manager's view of *HostFirewall, stubbed by tests.
-type hostFirewallAPI interface {
-	AddVM(vmID, vethName, hostCIDR string) error
-	RemoveVM(vmID string) error
-	Close() error
-}
-
-// vmIPRange must match Manager's host-IP allocation scheme.
+// vmIPRange must contain every host IP that hostIPForSlot can return.
 const vmIPRange = "10.11.0.0/16"
 
-// HostFirewall installs static iptables rules covering all VMs via the
-// veth+ interface prefix and vmIPRange subnet: FORWARD ACCEPT, MSS clamp,
-// POSTROUTING MASQUERADE, PREROUTING REDIRECT to the egress proxy, and a
-// UDP/443 DROP so QUIC can't bypass the SNI allowlist. Idempotent.
-type HostFirewall struct{}
+// installHostFirewall installs the static rules that route all VM traffic
+// through the host: UDP/443 DROP (kills QUIC bypass of the SNI allowlist),
+// MSS clamp, FORWARD ACCEPT between veth+ and the host iface, MASQUERADE
+// for vmIPRange to the host iface, and REDIRECT HTTP/HTTPS from veth+ to
+// the egress proxy. All operations are idempotent.
+func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log zerolog.Logger) error {
+	_, ipnet, err := net.ParseCIDR(vmIPRange)
+	if err != nil {
+		return fmt.Errorf("vmIPRange %s invalid: %w", vmIPRange, err)
+	}
+	if !ipnet.Contains(net.ParseIP(hostIPForSlot(0))) || !ipnet.Contains(net.ParseIP(hostIPForSlot(MaxSlots-1))) {
+		return fmt.Errorf("vmIPRange %s does not cover the full slot allocation range", vmIPRange)
+	}
 
-// NewHostFirewall installs the rules. Idempotent.
-func NewHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log zerolog.Logger) (*HostFirewall, error) {
 	ipt, err := iptables.New()
 	if err != nil {
-		return nil, fmt.Errorf("init iptables: %w", err)
+		return fmt.Errorf("init iptables: %w", err)
 	}
-	if err := installRules(ipt, hostIface, httpProxyPort, tlsProxyPort); err != nil {
-		return nil, err
-	}
-	log.Info().Str("host_iface", hostIface).Msg("host firewall ready (static prefix rules)")
-	return &HostFirewall{}, nil
-}
 
-func installRules(ipt *iptables.IPTables, hostIface string, httpProxyPort, tlsProxyPort uint16) error {
-	// UDP/443 DROP at position 1 so QUIC is dropped before the broad
-	// veth+ ACCEPT below terminates the chain walk.
+	// UDP/443 DROP must precede the veth+ ACCEPT below so QUIC traffic
+	// is dropped before the broad ACCEPT terminates the chain walk.
 	udpDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
 	exists, err := ipt.Exists("filter", "FORWARD", udpDrop...)
 	if err != nil {
@@ -82,14 +81,10 @@ func installRules(ipt *iptables.IPTables, hostIface string, httpProxyPort, tlsPr
 			return fmt.Errorf("add %s/%s rule: %w", r.table, r.chain, err)
 		}
 	}
+
+	log.Info().Str("host_iface", hostIface).Msg("host firewall ready (static prefix rules)")
 	return nil
 }
-
-// Per-VM hooks are no-ops — the static rules above cover every veth.
-
-func (hfw *HostFirewall) AddVM(vmID, vethName, hostCIDR string) error { return nil }
-func (hfw *HostFirewall) RemoveVM(vmID string) error                  { return nil }
-func (hfw *HostFirewall) Close() error                                { return nil }
 
 // enableIPForward enables IPv4 forwarding. Called once during Manager init.
 func enableIPForward(ctx context.Context) error {
