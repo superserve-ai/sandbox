@@ -787,6 +787,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	resourceLimits VMConfig, netCfg *network.Config, recorder *uffd.Recorder,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	tEntry := time.Now()
 
 	// Bound concurrent restores so a burst of sandbox creates doesn't
 	// saturate host file I/O, netns setup, tmpfs, and Firecracker boots.
@@ -798,6 +799,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	tSemAcquired := time.Now()
 
 	if vmID == "" {
 		vmID = uuid.New().String()
@@ -854,6 +856,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
 	}
+	tDiskReady := time.Now()
 
 	var tapDevice, macAddr, hostIP, nsName string
 
@@ -879,6 +882,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		hostIP = netInfo.HostIP
 		nsName = netInfo.Namespace
 	}
+	tNetReady := time.Now()
 
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
@@ -907,6 +911,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, fmt.Errorf("start uffd handler: %w", err)
 		}
 	}
+	tUffdReady := time.Now()
 
 	pid, startErr := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
 	if startErr != nil {
@@ -921,8 +926,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.mu.Unlock()
+	tFcReady := time.Now()
 
-	log.Info().Msg("restoring snapshot")
+	log.Info().
+		Int64("entry_to_sem_ms", tSemAcquired.Sub(tEntry).Milliseconds()).
+		Int64("sem_to_disk_ms", tDiskReady.Sub(tSemAcquired).Milliseconds()).
+		Int64("disk_to_net_ms", tNetReady.Sub(tDiskReady).Milliseconds()).
+		Int64("net_to_uffd_ms", tUffdReady.Sub(tNetReady).Milliseconds()).
+		Int64("uffd_to_fc_ms", tFcReady.Sub(tUffdReady).Milliseconds()).
+		Int64("entry_to_fc_ready_ms", tFcReady.Sub(tEntry).Milliseconds()).
+		Msg("restoring snapshot")
 
 	var restoreErr error
 	switch {
