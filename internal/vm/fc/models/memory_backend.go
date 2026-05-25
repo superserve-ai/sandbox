@@ -17,14 +17,20 @@ import (
 // swagger:model MemoryBackend
 type MemoryBackend struct {
 
-	// Based on 'backend_type' it is either 1) Path to the file that contains the guest memory to be loaded 2) Path to the UDS where a process is listening for a UFFD initialization control payload and open file descriptor that it can use to serve this process's guest memory page faults
+	// Based on 'backend_type' it is either 1) Path to the file that contains the guest memory to be loaded (File), 2) Path to the UDS where a process is listening for a UFFD initialization control payload and open file descriptor that it can use to serve this process's guest memory page faults (Uffd), or 3) Path to the snapshot memory file backing guest RAM (UffdInternal).
 	// Required: true
 	BackendPath *string `json:"backend_path"`
 
 	// backend type
 	// Required: true
-	// Enum: ["File","Uffd"]
+	// Enum: ["File","Uffd","UffdInternal"]
 	BackendType *string `json:"backend_type"`
+
+	// Optional path to a recorded page-access trace replayed as prefetch on restore. Only meaningful when backend_type is UffdInternal; ignored otherwise.
+	AccessLogPath string `json:"access_log_path,omitempty"`
+
+	// Optional path the in-process UFFD handler writes each served page offset to (template-build mode). Only meaningful when backend_type is UffdInternal; ignored otherwise. When present, prefetch is suppressed.
+	RecordTo string `json:"record_to,omitempty"`
 }
 
 // Validate validates this memory backend
@@ -58,7 +64,7 @@ var memoryBackendTypeBackendTypePropEnum []any
 
 func init() {
 	var res []string
-	if err := json.Unmarshal([]byte(`["File","Uffd"]`), &res); err != nil {
+	if err := json.Unmarshal([]byte(`["File","Uffd","UffdInternal"]`), &res); err != nil {
 		panic(err)
 	}
 	for _, v := range res {
@@ -73,6 +79,9 @@ const (
 
 	// MemoryBackendBackendTypeUffd captures enum value "Uffd"
 	MemoryBackendBackendTypeUffd string = "Uffd"
+
+	// MemoryBackendBackendTypeUffdInternal captures enum value "UffdInternal"
+	MemoryBackendBackendTypeUffdInternal string = "UffdInternal"
 )
 
 // prop value enum

@@ -1431,13 +1431,25 @@ definitions:
         enum:
           - File
           - Uffd
+          - UffdInternal
       backend_path:
         type: string
         description: Based on 'backend_type' it is either
-          1) Path to the file that contains the guest memory to be loaded
+          1) Path to the file that contains the guest memory to be loaded (File),
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
-          process's guest memory page faults
+          process's guest memory page faults (Uffd), or
+          3) Path to the snapshot memory file backing guest RAM (UffdInternal).
+      access_log_path:
+        type: string
+        description: Optional path to a recorded page-access trace replayed as
+          prefetch on restore. Only meaningful when backend_type is UffdInternal;
+          ignored otherwise.
+      record_to:
+        type: string
+        description: Optional path the in-process UFFD handler writes each served
+          page offset to (template-build mode). Only meaningful when backend_type
+          is UffdInternal; ignored otherwise. When present, prefetch is suppressed.
 
   Metrics:
     type: object
