@@ -172,7 +172,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// skips persistence + reconciler for this throwaway VM.
 	if m.cfg.UffdEnabled && m.cfg.UffdPrefetchEnabled {
 		recordingVMID := "build-record-" + req.TemplateID
-		accessLogPath := filepath.Join(snapshotDir, "access.log")
+		accessLogPath := filepath.Join(snapshotDir, accessLogFilename)
 		recCfg := VMConfig{
 			VCPU:      req.VCPU,
 			MemoryMiB: req.MemoryMiB,

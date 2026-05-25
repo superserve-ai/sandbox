@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -36,6 +37,12 @@ const templateDirName = "template"
 // TemplatesDirName is the layout directory under RunDir / SnapshotDir that
 // holds per-template artifacts (rootfs at build time, snapshot files).
 const TemplatesDirName = "templates"
+
+// accessLogFilename is the on-disk name of the recorded page-access trace that
+// lives alongside a template's snapshot files. RecordAccessPattern writes here
+// and restoreVMSnapshot reads from here as the prefetch input — both sites must
+// stay in sync, so the literal lives here only.
+const accessLogFilename = "access.log"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -923,9 +930,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	case useUffd:
 		// Skip prefetch trace when recording so the captured order reflects
 		// guest-driven access, not pages pulled in by the prefetcher.
+		// Firecracker enforces this same invariant on its side (record_to set
+		// ⇒ no prefetch regardless of access_log_path); this branch is the
+		// stat-avoidance optimisation that keeps us from probing the disk for
+		// a file we already know we won't pass through.
 		accessLogPath := ""
 		if recordToPath == "" && m.cfg.UffdPrefetchEnabled {
-			candidate := filepath.Join(filepath.Dir(memPath), "access.log")
+			candidate := filepath.Join(filepath.Dir(memPath), accessLogFilename)
 			if _, err := os.Stat(candidate); err == nil {
 				accessLogPath = candidate
 			}
@@ -1433,8 +1444,10 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 // The pre-flatten settle-on-fault-quiescence logic relied on reading
 // FaultsServed from the Go-side handler. The in-firecracker handler keeps the
 // same counters but does not yet expose them to vmd, so we currently use a
-// fixed warmup of UffdRecordMaxSeconds. Refining this back to settle-based is
-// a follow-up that depends on Firecracker surfacing per-VM UFFD metrics.
+// fixed warmup of UffdRecordMaxSeconds. Refining this back to settle-based —
+// along with restoring the lost `settled`, `elapsed`, and `total_faults`
+// signals in the post-recording log — depends on a follow-up that surfaces
+// per-VM UFFD metrics out of Firecracker.
 func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, memPath, outputPath string,
 	resourceLimits VMConfig, netCfg *network.Config,
 ) error {
@@ -1453,28 +1466,68 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		warmup = time.Duration(m.cfg.UffdRecordMaxSeconds) * time.Second
 	}
 
-	timer := time.NewTimer(warmup)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		_ = m.DestroyVM(context.Background(), inst.ID, true)
+	if recordWarmup(ctx, warmup) == warmupCancelled {
+		if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
+			m.log.Warn().Err(err).Str("template_vm", vmID).
+				Msg("destroy after cancelled recording warmup failed; reconciler will clean up")
+		}
 		return ctx.Err()
-	case <-timer.C:
 	}
 
 	if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
 		return fmt.Errorf("destroy recording VM: %w", err)
 	}
 
-	info, err := os.Stat(outputPath)
-	if err != nil {
+	pages, exists := inspectRecordedTrace(outputPath)
+	switch {
+	case !exists:
 		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
 			Msg("recorder produced no access log; restores will fall back to sequential prefetch")
-		return nil
+	case pages == 0:
+		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
+			Msg("recorder produced an empty access log; restores will fall back to sequential prefetch")
+	default:
+		m.log.Info().Str("template_vm", vmID).Str("path", outputPath).Int("pages", pages).
+			Msg("access pattern recorded")
 	}
-	m.log.Info().Str("template_vm", vmID).Str("path", outputPath).Int64("size_bytes", info.Size()).
-		Msg("access pattern recorded")
 	return nil
+}
+
+// warmupResult is the outcome of a recording warmup wait.
+type warmupResult int
+
+const (
+	warmupCompleted warmupResult = iota
+	warmupCancelled
+)
+
+// recordWarmup blocks until either the warmup window elapses or ctx is
+// cancelled. Extracted so the cancellation path is unit-testable without
+// having to mock the rest of the VM lifecycle.
+func recordWarmup(ctx context.Context, warmup time.Duration) warmupResult {
+	timer := time.NewTimer(warmup)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return warmupCancelled
+	case <-timer.C:
+		return warmupCompleted
+	}
+}
+
+// inspectRecordedTrace returns the number of recorded offsets in the trace
+// file at `path`. exists=false means the recorder never opened the file
+// (typically because the restore failed before the handler started).
+// pages=0 with exists=true means the file was opened but no faults arrived
+// before destroy.
+func inspectRecordedTrace(path string) (pages int, exists bool) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	// The recorder writes one decimal offset per line terminated with '\n'.
+	// Counting newlines is a faithful page count without requiring a parse.
+	return bytes.Count(content, []byte{'\n'}), true
 }
 
 // startFirecrackerColdBoot launches Firecracker inside a network namespace,

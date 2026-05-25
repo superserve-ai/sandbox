@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -379,5 +380,69 @@ func TestDeleteSnapshotFiles_NoSnapshotDirConfigured_Rejected(t *testing.T) {
 
 func newTestManager() *Manager {
 	return &Manager{log: zerolog.Nop()}
+}
+
+func TestRecordWarmup_CompletesWhenTimerFires(t *testing.T) {
+	start := time.Now()
+	got := recordWarmup(context.Background(), 20*time.Millisecond)
+	elapsed := time.Since(start)
+	if got != warmupCompleted {
+		t.Fatalf("got %v, want warmupCompleted", got)
+	}
+	if elapsed < 15*time.Millisecond {
+		t.Fatalf("returned too early: %v", elapsed)
+	}
+}
+
+func TestRecordWarmup_ReturnsCancelledWhenCtxFiresFirst(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(10*time.Millisecond, cancel)
+	start := time.Now()
+	got := recordWarmup(ctx, 5*time.Second)
+	elapsed := time.Since(start)
+	if got != warmupCancelled {
+		t.Fatalf("got %v, want warmupCancelled", got)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("cancellation did not propagate promptly: %v", elapsed)
+	}
+}
+
+func TestInspectRecordedTrace_MissingFile(t *testing.T) {
+	pages, exists := inspectRecordedTrace(filepath.Join(t.TempDir(), "does-not-exist.log"))
+	if exists {
+		t.Errorf("exists = true for missing file")
+	}
+	if pages != 0 {
+		t.Errorf("pages = %d for missing file, want 0", pages)
+	}
+}
+
+func TestInspectRecordedTrace_EmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.log")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pages, exists := inspectRecordedTrace(path)
+	if !exists {
+		t.Errorf("exists = false for empty file")
+	}
+	if pages != 0 {
+		t.Errorf("pages = %d for empty file, want 0", pages)
+	}
+}
+
+func TestInspectRecordedTrace_CountsLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace.log")
+	if err := os.WriteFile(path, []byte("0\n4096\n8192\n12288\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pages, exists := inspectRecordedTrace(path)
+	if !exists {
+		t.Errorf("exists = false for present file")
+	}
+	if pages != 4 {
+		t.Errorf("pages = %d, want 4", pages)
+	}
 }
 
