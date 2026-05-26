@@ -12,10 +12,8 @@ import (
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
-// writeRunError maps a runProcess() error onto an HTTP response code +
-// JSON body. CodeInvalidArgument (command not in PATH, invalid user)
-// becomes 400 to match the controlplane's behavior; everything else is
-// 500.
+// CodeInvalidArgument → 400 (command not in PATH, invalid user);
+// everything else → 500.
 func writeRunError(w http.ResponseWriter, err error) {
 	var ce *connect.Error
 	if errors.As(err, &ce) && ce.Code() == connect.CodeInvalidArgument {
@@ -25,9 +23,6 @@ func writeRunError(w http.ResponseWriter, err error) {
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
-// runErrorCode names the SSE error event code for a runProcess() error.
-// Matches the controlplane streaming.go convention (bad_request /
-// exec_failed) so SDK error parsing is identical across transports.
 func runErrorCode(err error) string {
 	var ce *connect.Error
 	if errors.As(err, &ce) && ce.Code() == connect.CodeInvalidArgument {
@@ -36,8 +31,8 @@ func runErrorCode(err error) string {
 	return "exec_failed"
 }
 
-// HTTP /exec request shape, mirrors the controlplane sandboxExecRequest
-// shape (handlers.go) so the SDK can target either with the same body.
+// execRequest shape mirrors the controlplane exec body so the SDK can
+// target either with the same payload.
 type execRequest struct {
 	Command    string            `json:"command"`
 	Args       []string          `json:"args,omitempty"`
@@ -46,17 +41,12 @@ type execRequest struct {
 	TimeoutS   int               `json:"timeout_s,omitempty"`
 }
 
-// HTTP /exec response shape, mirrors the controlplane ExecSandbox
-// response (handlers.go:1597).
 type execResponse struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	ExitCode int32  `json:"exit_code"`
 }
 
-// toStartRequest maps the HTTP-friendly shape onto the gRPC StartRequest.
-// Empty timeout becomes 30s (matches controlplane default in handlers.go
-// and streaming.go).
 func (r *execRequest) toStartRequest() *pb.StartRequest {
 	timeoutMs := uint32(r.TimeoutS) * 1000
 	if timeoutMs == 0 {
@@ -71,10 +61,8 @@ func (r *execRequest) toStartRequest() *pb.StartRequest {
 	}
 }
 
-// handleExec is the synchronous data-plane exec endpoint. Reads a JSON
-// body, runs the command to completion in-VM, and returns
-// {stdout, stderr, exit_code}. Same response shape as the controlplane's
-// POST /sandboxes/{id}/exec so SDK error/parsing code paths are shared.
+// handleExec runs the command to completion and returns the result in
+// one JSON body.
 func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -109,8 +97,6 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 			case *pb.DataEvent_Stderr:
 				stderr = append(stderr, out.Stderr...)
 			case *pb.DataEvent_PtyData:
-				// Synchronous /exec never sets pty; if a future caller does,
-				// route pty output to stdout so it's not silently lost.
 				stdout = append(stdout, out.PtyData...)
 			}
 		case *pb.ProcessEvent_End:
@@ -120,9 +106,6 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.runProcess(r.Context(), req.toStartRequest(), emit); err != nil {
-		// Same fail-loud surface as the gRPC handler: ConnectError carries
-		// a code we map to HTTP status. CodeInvalidArgument (e.g. command
-		// not in PATH) → 400 to match controlplane behavior.
 		writeRunError(w, err)
 		return
 	}
@@ -135,10 +118,7 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleExecStream is the SSE data-plane exec endpoint. Same input
-// shape as handleExec; emits incremental {timestamp, stdout?, stderr?,
-// exit_code?, finished?} events matching the controlplane's
-// POST /sandboxes/{id}/exec/stream shape (streaming.go).
+// handleExecStream streams stdout/stderr/end events as SSE.
 func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -168,10 +148,8 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	// Single writer to satisfy emit's documented single-consumer
-	// contract — runProcess multiplexes stdout/stderr already, so all
-	// emit calls happen serially from the goroutine that drains the
-	// internal channel.
+	// runProcess multiplexes stdout/stderr internally, so emit is called
+	// from a single goroutine — safe to write to w without locking.
 	emit := func(ev *pb.ProcessEvent) error {
 		payload := map[string]any{
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
@@ -190,9 +168,6 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 			payload["exit_code"] = x.End.ExitCode
 			payload["finished"] = true
 		case *pb.ProcessEvent_Start:
-			// Start events are internal-only; clients only care about
-			// data + end. Suppress to keep the SSE wire compact and
-			// match the controlplane's externally-observed shape.
 			return nil
 		}
 
@@ -208,8 +183,7 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := s.runProcess(r.Context(), req.toStartRequest(), emit); err != nil {
-		// Headers are already committed — surface the failure as a coded
-		// error event so the client can distinguish it from a normal exit.
+		// Headers are already committed — surface as a coded SSE event.
 		errEvent, _ := json.Marshal(map[string]any{
 			"error":    err.Error(),
 			"code":     runErrorCode(err),

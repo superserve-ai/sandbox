@@ -508,15 +508,9 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 // Sandbox lifecycle
 // ---------------------------------------------------------------------------
 
-// ActivateSandbox is the idempotent "make this sandbox usable" endpoint.
-// Resumes a paused sandbox, returns the current state + access token on
-// already-active sandboxes. The SDK calls this once per session before
-// hitting the data plane directly, so the data plane never has to know
-// about lifecycle state.
-//
-// Returns the full sandbox payload with access_token. Errors mirror
-// loadActiveOrResumeSandbox: 404 if missing, 409 for non-paused/non-active
-// states (e.g. pausing, resuming, failed).
+// ActivateSandbox returns the sandbox payload + a fresh access token,
+// transparently resuming the VM if it was paused. Idempotent on active
+// sandboxes. Transitional states (pausing, resuming, failed) → 409.
 func (h *Handlers) ActivateSandbox(c *gin.Context) {
 	sandbox := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {

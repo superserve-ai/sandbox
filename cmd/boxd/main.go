@@ -324,10 +324,8 @@ func resolveUser(name string) (*user.User, *syscall.Credential, error) {
 	return u, &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
 }
 
-// eventEmitter is the abstraction over "where do this process's events
-// go?" — set to stream.Send for the gRPC Start handler, or to a
-// JSON-accumulator/SSE-writer for the HTTP /exec and /exec/stream
-// handlers. Same execution logic, three transports.
+// eventEmitter abstracts the event sink so runProcess can serve the
+// gRPC Start handler, HTTP /exec, and /exec/stream from one path.
 type eventEmitter func(*pb.ProcessEvent) error
 
 func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
@@ -539,12 +537,10 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		return err
 	}
 
-	// Fan stdout + stderr through a multiplex so a single consumer owns
-	// emit. connect-go's ServerStream (one of emit's concrete targets)
-	// is not safe for concurrent use — direct Send from both readers
-	// races the HTTP/1.1 chunked writer and produces malformed frames
-	// ("bare LF", "invalid byte in chunk length") observed under load.
-	// The HTTP emitters have similar single-writer requirements.
+	// Fan stdout + stderr through a multiplex so emit is invoked from a
+	// single goroutine. ServerStream is not safe for concurrent Send
+	// (manifests as "bare LF" / "invalid byte in chunk length" under
+	// load), and the HTTP emitters share the same single-writer need.
 	mux := NewMultiplexedChannel[*pb.ProcessEvent](256)
 	consumer, _ := mux.Fork()
 

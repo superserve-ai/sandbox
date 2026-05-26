@@ -8,21 +8,12 @@ import (
 )
 
 const (
-	// execPath is the synchronous data-plane exec endpoint on the boxd
-	// host label: POST → run command to completion → JSON response.
-	// Shape matches the controlplane's /sandboxes/{id}/exec.
-	execPath = "/exec"
-
-	// execStreamPath is the SSE data-plane exec endpoint on the boxd
-	// host label: POST → stream stdout/stderr/end events as SSE.
-	// Shape matches the controlplane's /sandboxes/{id}/exec/stream.
+	execPath       = "/exec"
 	execStreamPath = "/exec/stream"
 )
 
-// WithExec enables the /exec and /exec/stream HTTP reverse proxy on
-// boxdPort. Requires WithAuth to have been called first. Off by default
-// — the SDK keeps using the controlplane /sandboxes/{id}/exec path
-// until both proxy and SDK have been upgraded.
+// WithExec enables /exec and /exec/stream on the boxd host label.
+// Requires WithAuth.
 func (h *Handler) WithExec() *Handler {
 	if h.seedKey == nil {
 		panic("proxy: WithExec requires WithAuth to be called first")
@@ -31,24 +22,14 @@ func (h *Handler) WithExec() *Handler {
 	return h
 }
 
-// serveExec handles POST /exec on the boxd host label. Auth + scrub +
-// reverse-proxy to boxd's HTTP /exec handler. Mirror of serveFiles
-// without the path-traversal check (no path query param here) and
-// without CORS (data-plane exec is not browser-facing today).
 func (h *Handler) serveExec(w http.ResponseWriter, r *http.Request, instanceID string) {
 	if !h.execEnabled {
-		// Started without WithExec — don't leak that the feature exists.
 		http.NotFound(w, r)
 		return
 	}
 	h.serveExecCommon(w, r, instanceID, false)
 }
 
-// serveExecStream handles POST /exec/stream on the boxd host label. Same
-// shape as serveExec but configures the reverse proxy for SSE: forces
-// flushing on every write so events aren't buffered en route, and never
-// retries on error mid-stream (headers have committed once the upstream
-// starts writing).
 func (h *Handler) serveExecStream(w http.ResponseWriter, r *http.Request, instanceID string) {
 	if !h.execEnabled {
 		http.NotFound(w, r)
@@ -90,9 +71,6 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = r.Host
-			// Same header scrub as serveFiles: drop forwarded-* + caller-
-			// supplied real-IP headers so boxd or any future middleware
-			// can't be fooled about who initiated the request.
 			req.Header["X-Forwarded-For"] = nil
 			for _, hdr := range []string{
 				"X-Forwarded-Host",
@@ -104,9 +82,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 			}
 		},
 		Transport: transport,
-		// FlushInterval -1 streams every chunk as it arrives. Required for
-		// /exec/stream so SSE events reach the client without buffering;
-		// harmless for synchronous /exec where the body is small.
+		// -1: stream each chunk as it arrives — required for SSE.
 		FlushInterval: -1,
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
 			h.log.Error().Err(proxyErr).
