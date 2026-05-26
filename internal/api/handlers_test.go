@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
@@ -250,6 +251,7 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	})
 	r.POST("/sandboxes", h.CreateSandbox)
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
+	r.POST("/sandboxes/:sandbox_id/activate", h.ActivateSandbox)
 	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 	r.POST("/sandboxes/:sandbox_id/exec", h.ExecSandbox)
@@ -511,6 +513,10 @@ func boolRow(value bool) *mockRow {
 
 func resumeRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/resume", nil)
+}
+
+func activateRequest(sandboxID string) *http.Request {
+	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/activate", nil)
 }
 
 func pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandbox {
@@ -866,6 +872,165 @@ func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&revertCalled); got != 1 {
 		t.Errorf("RevertResumeToPaused calls = %d, want 1", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ActivateSandbox tests — idempotent "make this sandbox usable" endpoint.
+// Reuses loadActiveOrResumeSandbox under the hood; the tests focus on the
+// edge case ResumeSandbox doesn't cover (already-active sandbox returns 200
+// with a token, no VMD call).
+// ---------------------------------------------------------------------------
+
+func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{
+		ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive,
+		VcpuCount: 2, MemoryMib: 1024,
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+	}
+	vmd := &stubVMD{}
+
+	h := &Handlers{
+		VMD:    vmd,
+		DB:     db.New(mock),
+		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if body["status"] != "active" {
+		t.Errorf("status = %q, want active", body["status"])
+	}
+	if body["id"] != sandboxID.String() {
+		t.Errorf("id = %q, want %q", body["id"], sandboxID)
+	}
+	if _, ok := body["access_token"].(string); !ok {
+		t.Error("expected access_token in response when SandboxAccessTokenSeed is set")
+	}
+	if body["vcpu_count"].(float64) != 2 {
+		t.Errorf("vcpu_count = %v, want 2", body["vcpu_count"])
+	}
+}
+
+func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", SizeBytes: 1024, Trigger: "pause",
+	}
+
+	var resumeCalled bool
+	vmd := &stubVMD{
+		destroyFn: func(context.Context, string, bool) error { return nil },
+		resumeFn: func(_ context.Context, id, _, _ string) (string, error) {
+			resumeCalled = true
+			return "10.0.0.5", nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{
+		VMD:    vmd,
+		DB:     db.New(mock),
+		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !resumeCalled {
+		t.Error("VMD.ResumeInstance was not called for paused sandbox")
+	}
+	body := parseJSON(t, w)
+	if body["status"] != "active" {
+		t.Errorf("status = %q, want active", body["status"])
+	}
+	if _, ok := body["access_token"].(string); !ok {
+		t.Error("expected access_token in response")
+	}
+}
+
+func TestActivateSandbox_NotFound(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestActivateSandbox_NonResumableStates_409(t *testing.T) {
+	cases := []db.SandboxStatus{
+		db.SandboxStatusFailed,
+		db.SandboxStatusPausing,
+		db.SandboxStatusResuming,
+		db.SandboxStatusStarting,
+	}
+	for _, status := range cases {
+		t.Run(string(status), func(t *testing.T) {
+			sandboxID := uuid.New()
+			teamID := uuid.New()
+			sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: status}
+
+			mock := &mockDBTX{
+				queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+			}
+			h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+
+			if w.Code != http.StatusConflict {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+			}
+		})
+	}
+}
+
+func TestActivateSandbox_InvalidUUID(t *testing.T) {
+	teamID := uuid.New()
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(&mockDBTX{})}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest("not-a-uuid"))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 

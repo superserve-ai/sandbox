@@ -87,10 +87,12 @@ func main() {
 	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
 	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
 
-	// Raw HTTP endpoints (file content transfer + health + init).
+	// Raw HTTP endpoints (file content transfer + health + init + exec).
 	mux.HandleFunc("/files", handleFiles)
 	mux.HandleFunc("/init", handleInit(ctx))
 	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/exec", procService.handleExec)
+	mux.HandleFunc("/exec/stream", procService.handleExecStream)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", httpPort)
 	log.Printf("boxd listening on %s (Connect RPC + HTTP)", addr)
@@ -322,9 +324,16 @@ func resolveUser(name string) (*user.User, *syscall.Credential, error) {
 	return u, &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
 }
 
-func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
-	msg := req.Msg
+// eventEmitter is runProcess's sink — shared by gRPC Start, /exec, and
+// /exec/stream. Contract: invoked from a single goroutine. Fanning out
+// would corrupt the response on both HTTP endpoints.
+type eventEmitter func(*pb.ProcessEvent) error
 
+func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
+	return s.runProcess(ctx, req.Msg, stream.Send)
+}
+
+func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, emit eventEmitter) error {
 	cmdName := msg.GetCmd()
 	if cmdName == "" {
 		cmdName = defaultShell
@@ -410,9 +419,9 @@ func (s *processService) Start(ctx context.Context, req *connect.Request[pb.Star
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		cmd.WaitDelay = time.Second
-		return s.startPipes(ctx, cmd, stream, &timedOut)
+		return s.startPipes(ctx, cmd, emit, &timedOut)
 	}
-	return s.startPTY(ctx, cmd, msg, stream, &timedOut)
+	return s.startPTY(ctx, cmd, msg, emit, &timedOut)
 }
 
 // timeoutExitCode matches GNU coreutils `timeout(1)`.
@@ -438,7 +447,7 @@ func finalExitCode(ps *os.ProcessState, timedOut bool) int32 {
 	return 137
 }
 
-func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.StartRequest, stream *connect.ServerStream[pb.ProcessEvent], timedOut *atomic.Bool) error {
+func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.StartRequest, emit eventEmitter, timedOut *atomic.Bool) error {
 	cols := uint16(msg.GetPty().GetSize().GetCols())
 	rows := uint16(msg.GetPty().GetSize().GetRows())
 	if cols == 0 {
@@ -461,7 +470,7 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	defer s.processes.Delete(pid)
 
 	// Send start event.
-	if err := stream.Send(&pb.ProcessEvent{
+	if err := emit(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_Start{Start: &pb.StartEvent{Pid: pid}},
 	}); err != nil {
 		return err
@@ -477,7 +486,7 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 			if n > 0 {
 				data := make([]byte, n)
 				copy(data, buf[:n])
-				_ = stream.Send(&pb.ProcessEvent{
+				_ = emit(&pb.ProcessEvent{
 					Event: &pb.ProcessEvent_Data{Data: &pb.DataEvent{
 						Output: &pb.DataEvent_PtyData{PtyData: data},
 					}},
@@ -496,7 +505,7 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	if cmd.ProcessState != nil {
 		status = cmd.ProcessState.String()
 	}
-	return stream.Send(&pb.ProcessEvent{
+	return emit(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_End{End: &pb.EndEvent{
 			ExitCode: finalExitCode(cmd.ProcessState, timedOut.Load()),
 			Exited:   cmd.ProcessState != nil && cmd.ProcessState.Exited(),
@@ -505,7 +514,7 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	})
 }
 
-func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *connect.ServerStream[pb.ProcessEvent], timedOut *atomic.Bool) error {
+func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eventEmitter, timedOut *atomic.Bool) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)
@@ -523,17 +532,16 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 	s.processes.Store(pid, &runningProcess{cmd: cmd})
 	defer s.processes.Delete(pid)
 
-	if err := stream.Send(&pb.ProcessEvent{
+	if err := emit(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_Start{Start: &pb.StartEvent{Pid: pid}},
 	}); err != nil {
 		return err
 	}
 
-	// Fan stdout + stderr through a multiplex so a single consumer owns
-	// stream.Send. connect-go's ServerStream is not safe for concurrent
-	// use — direct Send from both readers races the HTTP/1.1 chunked
-	// writer and produces malformed frames ("bare LF", "invalid byte in
-	// chunk length") observed under load.
+	// Fan stdout + stderr through a multiplex so emit is invoked from a
+	// single goroutine. ServerStream is not safe for concurrent Send
+	// (manifests as "bare LF" / "invalid byte in chunk length" under
+	// load), and the HTTP emitters share the same single-writer need.
 	mux := NewMultiplexedChannel[*pb.ProcessEvent](256)
 	consumer, _ := mux.Fork()
 
@@ -544,7 +552,7 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 			if firstErr != nil {
 				continue // keep draining so the mux can close cleanly
 			}
-			if err := stream.Send(ev); err != nil {
+			if err := emit(ev); err != nil {
 				firstErr = err
 			}
 		}
@@ -608,7 +616,7 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, stream *
 	if cmd.ProcessState != nil {
 		status = cmd.ProcessState.String()
 	}
-	return stream.Send(&pb.ProcessEvent{
+	return emit(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_End{End: &pb.EndEvent{
 			ExitCode: finalExitCode(cmd.ProcessState, timedOut.Load()),
 			Exited:   cmd.ProcessState != nil && cmd.ProcessState.Exited(),

@@ -7,6 +7,7 @@ Env vars:
   VMD_LABEL                  required — gcloud instances list label filter
   VMD_INSTALL_DIR            required — bin install dir on the host
   SHA                        required — commit SHA (only first 8 chars used)
+  PROXY_DOMAIN               required — host suffix the proxy serves (e.g. sandbox.superserve.ai)
   SANDBOX_ACCESS_TOKEN_SEED  optional — hex, >=32 bytes (>=64 hex chars)
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
@@ -26,6 +27,13 @@ def main() -> int:
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
 
+    proxy_domain = os.environ.get("PROXY_DOMAIN", "")
+    if not proxy_domain:
+        print("ERROR: PROXY_DOMAIN is required", file=sys.stderr)
+        return 1
+    if not re.fullmatch(r"[A-Za-z0-9.\-]+", proxy_domain):
+        print("ERROR: PROXY_DOMAIN contains disallowed characters", file=sys.stderr)
+        return 1
     access_seed = os.environ.get("SANDBOX_ACCESS_TOKEN_SEED", "")
     if access_seed and not re.fullmatch(r"[0-9a-fA-F]{64,}", access_seed):
         print("ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)", file=sys.stderr)
@@ -91,14 +99,13 @@ def main() -> int:
             sudo systemctl enable proxy
 
             sudo mkdir -p /etc/sandbox
-            if [ -n "{access_seed}" ]; then
-                sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
+            sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
+            PROXY_DOMAIN={proxy_domain}
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
             PROXYENV
-                sudo chmod 0600 /etc/sandbox/proxy.env
-            fi
+            sudo chmod 0600 /etc/sandbox/proxy.env
 
             sudo systemctl restart proxy
             sleep 3

@@ -62,6 +62,7 @@ jobs:
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
         run: |
           python3 .github/workflows/scripts/deploy-proxy.py
@@ -106,6 +107,7 @@ jobs:
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
         run: |
           python3 .github/workflows/scripts/deploy-proxy.py

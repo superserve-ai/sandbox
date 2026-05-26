@@ -293,6 +293,48 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/{sandbox_id}/activate:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    post:
+      operationId: activateSandbox
+      tags: [Sandboxes]
+      summary: Ensure the sandbox is active and return a fresh access token
+      description: |
+        Idempotent "make this sandbox usable" endpoint, intended as the
+        single round-trip the SDK makes before doing operations directly
+        against the per-sandbox data plane.
+
+        - If the sandbox is `active`: returns the current sandbox payload
+          including a fresh access token, no state change.
+        - If the sandbox is `paused`: resumes it (same code path as
+          `/resume`), then returns the sandbox payload with the new token.
+        - If the sandbox is in any other state (`pausing`, `resuming`,
+          `failed`, `starting`): returns 409 — caller should retry once
+          the state settles.
+        - If the sandbox does not exist or belongs to another team: 404.
+
+        Unlike `/resume`, this endpoint is idempotent: calling it on an
+        already-active sandbox is a no-op that returns the current token.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Sandbox is now active; payload includes access token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 
   /sandboxes/{sandbox_id}/exec:
     parameters:
@@ -848,7 +890,12 @@ components:
 
     ExecStreamEvent:
       type: object
-      description: A single SSE event payload emitted by the exec/stream endpoint.
+      description: |
+        A single SSE event payload emitted by the exec/stream endpoint.
+        `stdout`/`stderr` are JSON strings — see `ExecResult` for the UTF-8
+        caveat on binary output. The stream also emits SSE comment frames
+        (`: keepalive\n\n`) every 15s to keep proxies from closing idle
+        connections; parsers MUST ignore lines that don't start with `data: `.
       properties:
         timestamp:
           type: string
@@ -897,6 +944,10 @@ components:
 
     ExecResult:
       type: object
+      description: |
+        `stdout` and `stderr` are JSON strings, which require valid UTF-8.
+        Non-UTF-8 bytes are replaced with U+FFFD. To capture binary output,
+        redirect it to a file in the sandbox and download via the files API.
       properties:
         stdout:
           type: string

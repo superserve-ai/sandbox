@@ -64,6 +64,8 @@ func main() {
 		proxyHandler.WithAuth(seed)
 		proxyHandler.WithFiles()
 		log.Info().Msg("files endpoint enabled")
+		proxyHandler.WithExec()
+		log.Info().Msg("exec endpoint enabled")
 
 		if originsEnv != "" {
 			origins := splitCSV(originsEnv)

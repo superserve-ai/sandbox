@@ -508,6 +508,17 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 // Sandbox lifecycle
 // ---------------------------------------------------------------------------
 
+// ActivateSandbox returns the sandbox payload + a fresh access token,
+// transparently resuming the VM if it was paused. Idempotent on active
+// sandboxes. Transitional states (pausing, resuming, failed) → 409.
+func (h *Handlers) ActivateSandbox(c *gin.Context) {
+	sandbox := h.loadActiveOrResumeSandbox(c)
+	if sandbox == nil {
+		return
+	}
+	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(*sandbox))
+}
+
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
