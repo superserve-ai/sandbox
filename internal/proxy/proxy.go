@@ -71,6 +71,10 @@ type Handler struct {
 	// filesEnabled controls whether /files on boxdPort is served.
 	filesEnabled bool
 
+	// execEnabled controls whether /exec and /exec/stream on boxdPort are
+	// served. Set via WithExec; default off.
+	execEnabled bool
+
 	// allowedOrigins is the set of browser origins allowed for CORS on
 	// data-plane endpoints (/files). Shared with the terminal origin check.
 	allowedOrigins []string

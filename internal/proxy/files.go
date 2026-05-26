@@ -73,6 +73,10 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 			return
 		}
 		h.serveTerminal(w, r, instanceID)
+	case execPath:
+		h.serveExec(w, r, instanceID)
+	case execStreamPath:
+		h.serveExecStream(w, r, instanceID)
 	default:
 		http.NotFound(w, r)
 	}
