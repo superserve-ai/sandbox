@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,15 +13,17 @@ import (
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
-// CodeInvalidArgument → 400 (command not in PATH, invalid user);
-// everything else → 500.
+// var, not const, so tests can shorten it.
+var sseKeepaliveInterval = 15 * time.Second
+
+// CodeInvalidArgument → 400, everything else → 500.
 func writeRunError(w http.ResponseWriter, err error) {
 	var ce *connect.Error
 	if errors.As(err, &ce) && ce.Code() == connect.CodeInvalidArgument {
 		http.Error(w, ce.Message(), http.StatusBadRequest)
 		return
 	}
-	http.Error(w, "internal error", http.StatusInternalServerError)
+	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
 
 func runErrorCode(err error) string {
@@ -148,8 +151,27 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	// runProcess multiplexes stdout/stderr internally, so emit is called
-	// from a single goroutine — safe to write to w without locking.
+	// emit and the keepalive ticker both write to w; serialize them.
+	var writeMu sync.Mutex
+
+	keepaliveCtx, stopKeepalive := context.WithCancel(r.Context())
+	defer stopKeepalive()
+	go func() {
+		ticker := time.NewTicker(sseKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveCtx.Done():
+				return
+			case <-ticker.C:
+				writeMu.Lock()
+				_, _ = fmt.Fprint(w, ": keepalive\n\n")
+				flusher.Flush()
+				writeMu.Unlock()
+			}
+		}
+	}()
+
 	emit := func(ev *pb.ProcessEvent) error {
 		payload := map[string]any{
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
@@ -175,6 +197,8 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 		if err != nil {
 			return err
 		}
+		writeMu.Lock()
+		defer writeMu.Unlock()
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", raw); err != nil {
 			return err
 		}
@@ -183,13 +207,14 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := s.runProcess(r.Context(), req.toStartRequest(), emit); err != nil {
-		// Headers are already committed — surface as a coded SSE event.
 		errEvent, _ := json.Marshal(map[string]any{
 			"error":    err.Error(),
 			"code":     runErrorCode(err),
 			"finished": true,
 		})
+		writeMu.Lock()
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", errEvent)
 		flusher.Flush()
+		writeMu.Unlock()
 	}
 }

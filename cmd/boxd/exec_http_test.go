@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newProcessService() *processService {
@@ -188,6 +189,48 @@ func TestHandleExecStream_WrongMethod(t *testing.T) {
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+// Keepalive frame appears + emit still works; under -race, also catches
+// any future regression that drops writeMu.
+func TestHandleExecStream_KeepaliveFiresAndDoesNotRaceWithEmit(t *testing.T) {
+	prev := sseKeepaliveInterval
+	sseKeepaliveInterval = 20 * time.Millisecond
+	t.Cleanup(func() { sseKeepaliveInterval = prev })
+
+	s := newProcessService()
+	body := `{"command":"/bin/sh","args":["-c","printf one; sleep 0.1; printf two; exit 0"],"working_dir":"/tmp"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec/stream", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleExecStream(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	raw := w.Body.String()
+	if !strings.Contains(raw, ": keepalive") {
+		t.Errorf("no keepalive comment frame in body; got: %q", raw)
+	}
+
+	events := parseSSEEvents(t, w.Body.Bytes())
+	var stdout strings.Builder
+	var sawFinished bool
+	for _, ev := range events {
+		if v, ok := ev["stdout"].(string); ok {
+			stdout.WriteString(v)
+		}
+		if f, ok := ev["finished"].(bool); ok && f {
+			sawFinished = true
+		}
+	}
+	if stdout.String() != "onetwo" {
+		t.Errorf("stdout = %q, want %q", stdout.String(), "onetwo")
+	}
+	if !sawFinished {
+		t.Error("never saw finished=true event")
 	}
 }
 

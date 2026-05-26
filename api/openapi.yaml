@@ -311,7 +311,7 @@ paths:
         - If the sandbox is `paused`: resumes it (same code path as
           `/resume`), then returns the sandbox payload with the new token.
         - If the sandbox is in any other state (`pausing`, `resuming`,
-          `failed`, `creating`): returns 409 — caller should retry once
+          `failed`, `starting`): returns 409 — caller should retry once
           the state settles.
         - If the sandbox does not exist or belongs to another team: 404.
 
@@ -890,7 +890,12 @@ components:
 
     ExecStreamEvent:
       type: object
-      description: A single SSE event payload emitted by the exec/stream endpoint.
+      description: |
+        A single SSE event payload emitted by the exec/stream endpoint.
+        `stdout`/`stderr` are JSON strings — see `ExecResult` for the UTF-8
+        caveat on binary output. The stream also emits SSE comment frames
+        (`: keepalive\n\n`) every 15s to keep proxies from closing idle
+        connections; parsers MUST ignore lines that don't start with `data: `.
       properties:
         timestamp:
           type: string
@@ -939,6 +944,10 @@ components:
 
     ExecResult:
       type: object
+      description: |
+        `stdout` and `stderr` are JSON strings, which require valid UTF-8.
+        Non-UTF-8 bytes are replaced with U+FFFD. To capture binary output,
+        redirect it to a file in the sandbox and download via the files API.
       properties:
         stdout:
           type: string

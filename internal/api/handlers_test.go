@@ -996,20 +996,30 @@ func TestActivateSandbox_NotFound(t *testing.T) {
 	}
 }
 
-func TestActivateSandbox_FailedState_409(t *testing.T) {
-	sandboxID := uuid.New()
-	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusFailed}
-
-	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+func TestActivateSandbox_NonResumableStates_409(t *testing.T) {
+	cases := []db.SandboxStatus{
+		db.SandboxStatusFailed,
+		db.SandboxStatusPausing,
+		db.SandboxStatusResuming,
+		db.SandboxStatusStarting,
 	}
-	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
-	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+	for _, status := range cases {
+		t.Run(string(status), func(t *testing.T) {
+			sandboxID := uuid.New()
+			teamID := uuid.New()
+			sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: status}
 
-	if w.Code != http.StatusConflict {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+			mock := &mockDBTX{
+				queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+			}
+			h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+
+			if w.Code != http.StatusConflict {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+			}
+		})
 	}
 }
 

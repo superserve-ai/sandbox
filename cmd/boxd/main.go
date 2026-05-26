@@ -324,8 +324,9 @@ func resolveUser(name string) (*user.User, *syscall.Credential, error) {
 	return u, &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
 }
 
-// eventEmitter abstracts the event sink so runProcess can serve the
-// gRPC Start handler, HTTP /exec, and /exec/stream from one path.
+// eventEmitter is runProcess's sink — shared by gRPC Start, /exec, and
+// /exec/stream. Contract: invoked from a single goroutine. Fanning out
+// would corrupt the response on both HTTP endpoints.
 type eventEmitter func(*pb.ProcessEvent) error
 
 func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
