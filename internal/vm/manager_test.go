@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-
-	"github.com/superserve-ai/sandbox/internal/vm/uffd"
 )
 
 // TestPlanRestore pins the restore-decision behavior across the four input
@@ -384,92 +382,67 @@ func newTestManager() *Manager {
 	return &Manager{log: zerolog.Nop()}
 }
 
-func TestWaitFaultsSettle_Converges(t *testing.T) {
-	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
-	stop := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				h.Stats().FaultsServed.Add(100)
-			}
-		}
-	}()
-	time.AfterFunc(150*time.Millisecond, func() { close(stop) })
-
-	mgr := newTestManager()
-	settled, elapsed, total := mgr.waitFaultsSettle(context.Background(), h, 5*time.Second)
-	if !settled {
-		t.Errorf("expected settled=true, got false (elapsed=%v total=%d)", elapsed, total)
+func TestRecordWarmup_CompletesWhenTimerFires(t *testing.T) {
+	start := time.Now()
+	got := recordWarmup(context.Background(), 20*time.Millisecond)
+	elapsed := time.Since(start)
+	if got != warmupCompleted {
+		t.Fatalf("got %v, want warmupCompleted", got)
 	}
-	if elapsed > 2*time.Second {
-		t.Errorf("settle took too long: %v", elapsed)
-	}
-	if total == 0 {
-		t.Error("expected non-zero total faults")
+	if elapsed < 15*time.Millisecond {
+		t.Fatalf("returned too early: %v", elapsed)
 	}
 }
 
-func TestWaitFaultsSettle_NoActivityHitsCeiling(t *testing.T) {
-	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
-	mgr := newTestManager()
-	settled, elapsed, total := mgr.waitFaultsSettle(context.Background(), h, 300*time.Millisecond)
-	if settled {
-		t.Errorf("expected settled=false (no activity), got true")
-	}
-	if total != 0 {
-		t.Errorf("expected zero total faults, got %d", total)
-	}
-	if elapsed < 250*time.Millisecond {
-		t.Errorf("ceiling hit too early: %v", elapsed)
-	}
-}
-
-func TestWaitFaultsSettle_NeverQuietHitsCeiling(t *testing.T) {
-	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		ticker := time.NewTicker(30 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				h.Stats().FaultsServed.Add(1)
-			}
-		}
-	}()
-
-	mgr := newTestManager()
-	settled, elapsed, total := mgr.waitFaultsSettle(context.Background(), h, 400*time.Millisecond)
-	if settled {
-		t.Errorf("expected settled=false (continuous activity), got true")
-	}
-	if total == 0 {
-		t.Error("expected non-zero total faults")
-	}
-	if elapsed < 350*time.Millisecond {
-		t.Errorf("ceiling tripped too early: %v", elapsed)
-	}
-}
-
-func TestWaitFaultsSettle_CtxCancel(t *testing.T) {
-	h := uffd.New(uffd.Config{Logger: zerolog.Nop()})
+func TestRecordWarmup_ReturnsCancelledWhenCtxFiresFirst(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(100*time.Millisecond, cancel)
-
-	mgr := newTestManager()
-	settled, elapsed, _ := mgr.waitFaultsSettle(ctx, h, 30*time.Second)
-	if settled {
-		t.Errorf("expected settled=false on cancel")
+	time.AfterFunc(10*time.Millisecond, cancel)
+	start := time.Now()
+	got := recordWarmup(ctx, 5*time.Second)
+	elapsed := time.Since(start)
+	if got != warmupCancelled {
+		t.Fatalf("got %v, want warmupCancelled", got)
 	}
-	if elapsed > 500*time.Millisecond {
-		t.Errorf("cancel did not propagate promptly: %v", elapsed)
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("cancellation did not propagate promptly: %v", elapsed)
 	}
 }
+
+func TestInspectRecordedTrace_MissingFile(t *testing.T) {
+	pages, exists := inspectRecordedTrace(filepath.Join(t.TempDir(), "does-not-exist.log"))
+	if exists {
+		t.Errorf("exists = true for missing file")
+	}
+	if pages != 0 {
+		t.Errorf("pages = %d for missing file, want 0", pages)
+	}
+}
+
+func TestInspectRecordedTrace_EmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.log")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pages, exists := inspectRecordedTrace(path)
+	if !exists {
+		t.Errorf("exists = false for empty file")
+	}
+	if pages != 0 {
+		t.Errorf("pages = %d for empty file, want 0", pages)
+	}
+}
+
+func TestInspectRecordedTrace_CountsLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace.log")
+	if err := os.WriteFile(path, []byte("0\n4096\n8192\n12288\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pages, exists := inspectRecordedTrace(path)
+	if !exists {
+		t.Errorf("exists = false for present file")
+	}
+	if pages != 4 {
+		t.Errorf("pages = %d, want 4", pages)
+	}
+}
+

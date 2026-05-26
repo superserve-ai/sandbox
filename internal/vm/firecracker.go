@@ -346,19 +346,18 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 	return nil
 }
 
-// RestoreSnapshotUffdWithOverrides is the UFFD-backend variant of
-// RestoreSnapshotWithOverrides. Instead of pointing Firecracker at the
-// mem.snap file (File backend, which synchronously reads and CRC64-verifies
-// the entire snapshot before returning), it points Firecracker at a Unix
-// domain socket served by our in-process UFFD handler.
+// RestoreSnapshotUffdInternalWithOverrides loads a snapshot using Firecracker's
+// in-process UFFD handler. Pages are demand-loaded from `memPath` by a handler
+// thread inside the Firecracker process whose lifetime equals the VM's, so vmd
+// restarts cannot leave the kernel waiting on a dead handler.
 //
-// LoadSnapshot returns in milliseconds because pages are not read upfront.
-// As the guest touches pages, the kernel forwards faults to our handler,
-// which serves them from a memory-mapped mem.snap.
-//
-// uffdSocketPath must be a bound Unix socket; the caller is responsible for
-// starting the handler goroutine before invoking this function.
-func RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, ifaceID, tapDevice, blockDeltaDir string) error {
+// `accessLogPath` (optional) is a recorded page-access trace replayed as
+// prefetch; `recordToPath` (optional) is where the handler writes each served
+// page offset (template-build mode). When recordToPath is set, prefetch is
+// suppressed on the Firecracker side regardless of accessLogPath.
+func RestoreSnapshotUffdInternalWithOverrides(
+	socketPath, snapshotPath, memPath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
+) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -368,8 +367,10 @@ func RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, 
 		Body: &models.SnapshotLoadParams{
 			SnapshotPath: &snapshotPath,
 			MemBackend: &models.MemoryBackend{
-				BackendType: strPtr(models.MemoryBackendBackendTypeUffd),
-				BackendPath: &uffdSocketPath,
+				BackendType:   strPtr(models.MemoryBackendBackendTypeUffdInternal),
+				BackendPath:   &memPath,
+				AccessLogPath: accessLogPath,
+				RecordTo:      recordToPath,
 			},
 			ResumeVM: true,
 			NetworkOverrides: []*models.NetworkOverride{
@@ -379,9 +380,9 @@ func RestoreSnapshotUffdWithOverrides(socketPath, snapshotPath, uffdSocketPath, 
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {
-			return fmt.Errorf("load snapshot (uffd): %w: %v", ErrTornSnapshot, err)
+			return fmt.Errorf("load snapshot (uffd-internal): %w: %v", ErrTornSnapshot, err)
 		}
-		return fmt.Errorf("load snapshot (uffd): %w", err)
+		return fmt.Errorf("load snapshot (uffd-internal): %w", err)
 	}
 	return nil
 }
