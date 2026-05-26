@@ -20,7 +20,7 @@ func newProcessService() *processService {
 
 func TestHandleExec_Success(t *testing.T) {
 	s := newProcessService()
-	body := `{"command":"/bin/sh","args":["-c","printf hi; printf err 1>&2; exit 0"]}`
+	body := `{"command":"/bin/sh","args":["-c","printf hi; printf err 1>&2; exit 0"],"working_dir":"/tmp"}`
 	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
 	w := httptest.NewRecorder()
 
@@ -46,7 +46,7 @@ func TestHandleExec_Success(t *testing.T) {
 
 func TestHandleExec_NonzeroExit(t *testing.T) {
 	s := newProcessService()
-	body := `{"command":"/bin/sh","args":["-c","exit 7"]}`
+	body := `{"command":"/bin/sh","args":["-c","exit 7"],"working_dir":"/tmp"}`
 	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
 	w := httptest.NewRecorder()
 
@@ -135,7 +135,7 @@ func parseSSEEvents(t *testing.T, body []byte) []map[string]any {
 
 func TestHandleExecStream_Success(t *testing.T) {
 	s := newProcessService()
-	body := `{"command":"/bin/sh","args":["-c","printf one; printf two; exit 0"]}`
+	body := `{"command":"/bin/sh","args":["-c","printf one; printf two; exit 0"],"working_dir":"/tmp"}`
 	req := httptest.NewRequest(http.MethodPost, "/exec/stream", strings.NewReader(body))
 	w := httptest.NewRecorder()
 
