@@ -32,12 +32,13 @@ func newExecTestEnv(t *testing.T) *filesTestEnv {
 	env.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		env.upstreamMu.Lock()
 		env.lastReq = capturedRequest{
-			method:   r.Method,
-			path:     r.URL.Path,
-			host:     r.Host,
-			hasToken: r.Header.Get("X-Access-Token") != "",
-			fwdFor:   r.Header.Get("X-Forwarded-For"),
-			received: true,
+			method:             r.Method,
+			path:               r.URL.Path,
+			host:               r.Host,
+			hasToken:           r.Header.Get("X-Access-Token") != "",
+			hasSandboxIDHeader: r.Header.Get(headerSandboxID) != "",
+			fwdFor:             r.Header.Get("X-Forwarded-For"),
+			received:           true,
 		}
 		env.upstreamMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -228,5 +229,8 @@ func TestExec_SharedHost_ForwardsToUpstream(t *testing.T) {
 	}
 	if env.lastReq.hasToken {
 		t.Error("X-Access-Token was forwarded to upstream — should be scrubbed")
+	}
+	if env.lastReq.hasSandboxIDHeader {
+		t.Error("X-Superserve-Sandbox-Id was forwarded to upstream — should be scrubbed")
 	}
 }

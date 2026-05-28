@@ -137,7 +137,7 @@ func TestParseHost(t *testing.T) {
 	}
 }
 
-func TestParse(t *testing.T) {
+func TestParseRequest(t *testing.T) {
 	const sandboxID = "b150ee22-4956-4f5b-926a-f921ed8c37d6"
 
 	tests := []struct {
@@ -214,7 +214,7 @@ func TestParse(t *testing.T) {
 			if tt.headerID != "" {
 				headers.Set(headerSandboxID, tt.headerID)
 			}
-			port, instanceID, err := Parse(tt.host, headers, testDomain)
+			port, instanceID, err := ParseRequest(tt.host, headers, testDomain)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error, got port=%d instanceID=%q", port, instanceID)
@@ -235,14 +235,14 @@ func TestParse(t *testing.T) {
 }
 
 // On a subdomain Host, the routing header is ignored — the subdomain wins.
-func TestParse_HeaderRoutingRequiresSharedHost(t *testing.T) {
+func TestParseRequest_HeaderRoutingRequiresSharedHost(t *testing.T) {
 	const targetID = "b150ee22-4956-4f5b-926a-f921ed8c37d6"
 	const attackerID = "deadbeef"
 
 	headers := http.Header{}
 	headers.Set(headerSandboxID, attackerID)
 
-	_, gotID, err := Parse("boxd-"+targetID+"."+testDomain, headers, testDomain)
+	_, gotID, err := ParseRequest("boxd-"+targetID+"."+testDomain, headers, testDomain)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

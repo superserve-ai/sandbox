@@ -15,7 +15,7 @@ var validInstanceID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$`)
 
 const headerSandboxID = "X-Superserve-Sandbox-Id"
 
-// Parse resolves the target sandbox + port from an incoming request.
+// ParseRequest resolves the target sandbox + port from an incoming request.
 // Two routing modes:
 //
 //   - Shared-host: Host equals the configured domain and the
@@ -24,7 +24,7 @@ const headerSandboxID = "X-Superserve-Sandbox-Id"
 //   - Subdomain: Host is "{label}-{id}.{domain}", same as ParseHost.
 //
 // A subdomain-form Host is never overridden by a routing header.
-func Parse(host string, headers http.Header, domain string) (port int, instanceID string, err error) {
+func ParseRequest(host string, headers http.Header, domain string) (port int, instanceID string, err error) {
 	if isSharedHost(host, domain) {
 		id := headers.Get(headerSandboxID)
 		if id == "" {

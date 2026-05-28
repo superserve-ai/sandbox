@@ -156,6 +156,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 
 	// Scrub the token before forwarding to boxd.
 	r.Header.Del(accessTokenHeader)
+	r.Header.Del(headerSandboxID)
 
 	w.Header().Set("Referrer-Policy", "no-referrer")
 

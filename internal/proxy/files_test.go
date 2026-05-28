@@ -54,14 +54,15 @@ type filesTestEnv struct {
 }
 
 type capturedRequest struct {
-	method      string
-	path        string
-	rawQuery    string
-	host        string
-	hasToken    bool
-	fwdFor      string
-	body        string
-	received    bool
+	method             string
+	path               string
+	rawQuery           string
+	host               string
+	hasToken           bool
+	hasSandboxIDHeader bool
+	fwdFor             string
+	body               string
+	received           bool
 }
 
 func newFilesTestEnv(t *testing.T) *filesTestEnv {
@@ -80,14 +81,15 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		env.upstreamMu.Lock()
 		env.lastReq = capturedRequest{
-			method:   r.Method,
-			path:     r.URL.Path,
-			rawQuery: r.URL.RawQuery,
-			host:     r.Host,
-			hasToken: r.Header.Get("X-Access-Token") != "",
-			fwdFor:   r.Header.Get("X-Forwarded-For"),
-			body:     string(bodyBytes),
-			received: true,
+			method:             r.Method,
+			path:               r.URL.Path,
+			rawQuery:           r.URL.RawQuery,
+			host:               r.Host,
+			hasToken:           r.Header.Get("X-Access-Token") != "",
+			hasSandboxIDHeader: r.Header.Get(headerSandboxID) != "",
+			fwdFor:             r.Header.Get("X-Forwarded-For"),
+			body:               string(bodyBytes),
+			received:           true,
 		}
 		env.upstreamMu.Unlock()
 
@@ -386,5 +388,8 @@ func TestFiles_SharedHost_ForwardsToUpstream(t *testing.T) {
 	}
 	if env.lastReq.path != "/files" {
 		t.Errorf("upstream path = %q, want /files", env.lastReq.path)
+	}
+	if env.lastReq.hasSandboxIDHeader {
+		t.Error("X-Superserve-Sandbox-Id was forwarded to upstream — should be scrubbed")
 	}
 }
