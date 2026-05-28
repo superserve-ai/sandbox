@@ -272,37 +272,16 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 	relay(conn, upstream)
 }
 
-// isAllowed checks if egress is allowed based on domain and CIDR rules.
-// Returns (allowed, matchType).
-//
-// Priority order is fail-safe: deny is always checked BEFORE allow, so a
-// user who writes {"allow_out": ["*.example.com"], "deny_out": ["0.0.0.0/0"]}
-// cannot accidentally bypass the deny rule via a matching allowlist entry.
-//
-//  1. No rules configured → allow (default)
-//  2. Destination matches any deny CIDR → deny
-//  3. Destination matches any allow domain → allow
-//  4. Destination matches any allow CIDR → allow
-//  5. Allow list is non-empty but nothing matched → deny (implicit deny)
-//  6. Allow list is empty → allow (deny list only)
+// isAllowed uses an "allow wins" model: a match in allow_out short-circuits
+// before deny_out, so {"allow_out": ["api.openai.com"], "deny_out": ["0.0.0.0/0"]}
+// allows the named host and blocks everything else. A broad allow therefore
+// shadows a more specific deny — narrow the allow list rather than relying on
+// overlapping denies.
 func (p *EgressProxy) isAllowed(rules *EgressRules, hostname string, dstIP net.IP) (bool, string) {
 	if rules == nil {
 		return true, "default"
 	}
 
-	// Priority 1: deny CIDRs — evaluated first so they cannot be bypassed
-	// by a matching allow entry.
-	for _, cidr := range rules.DeniedCIDRs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		if ipNet.Contains(dstIP) {
-			return false, "cidr"
-		}
-	}
-
-	// Priority 2: allow domains.
 	if hostname != "" {
 		for _, domain := range rules.AllowedDomains {
 			if matchDomain(hostname, domain) {
@@ -311,7 +290,6 @@ func (p *EgressProxy) isAllowed(rules *EgressRules, hostname string, dstIP net.I
 		}
 	}
 
-	// Priority 2: allow CIDRs.
 	for _, cidr := range rules.AllowedCIDRs {
 		_, ipNet, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -322,14 +300,20 @@ func (p *EgressProxy) isAllowed(rules *EgressRules, hostname string, dstIP net.I
 		}
 	}
 
-	// Allow list was non-empty but nothing matched → implicit deny.
-	// This makes {"allow_out": ["api.openai.com"]} work as users expect
-	// (only the listed domain is allowed, everything else blocked).
+	for _, cidr := range rules.DeniedCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if ipNet.Contains(dstIP) {
+			return false, "cidr"
+		}
+	}
+
 	if len(rules.AllowedDomains) > 0 || len(rules.AllowedCIDRs) > 0 {
 		return false, "implicit-deny"
 	}
 
-	// Only a deny list was configured and nothing matched → allow.
 	return true, "default"
 }
 
