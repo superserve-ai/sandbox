@@ -101,7 +101,8 @@ func TestHandleExec_WrongMethod(t *testing.T) {
 
 func TestHandleExec_CommandNotFound_400(t *testing.T) {
 	s := newProcessService()
-	body := `{"command":"this-binary-does-not-exist-anywhere"}`
+	// args mode bypasses shell-wrap so we test the PATH-lookup branch.
+	body := `{"command":"this-binary-does-not-exist-anywhere","args":["x"]}`
 	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
 	w := httptest.NewRecorder()
 
@@ -109,6 +110,47 @@ func TestHandleExec_CommandNotFound_400(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d (resolve error → 400)", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleExec_ShellWrapsWhenNoArgs(t *testing.T) {
+	s := newProcessService()
+	body := `{"command":"echo hello world","working_dir":"/tmp"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleExec(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp execResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Stdout != "hello world\n" {
+		t.Errorf("stdout = %q, want %q", resp.Stdout, "hello world\n")
+	}
+	if resp.ExitCode != 0 {
+		t.Errorf("exit_code = %d, want 0", resp.ExitCode)
+	}
+}
+
+func TestHandleExec_ArgsModeSkipsShellWrap(t *testing.T) {
+	s := newProcessService()
+	// Shell metacharacters as literal args — would be interpreted in
+	// shell-wrap mode; here they should reach echo unchanged.
+	body := `{"command":"echo","args":["$HOME","|","wc"],"working_dir":"/tmp"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleExec(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp execResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Stdout != "$HOME | wc\n" {
+		t.Errorf("stdout = %q, want %q (literal, no shell expansion)", resp.Stdout, "$HOME | wc\n")
 	}
 }
 
@@ -236,7 +278,8 @@ func TestHandleExecStream_KeepaliveFiresAndDoesNotRaceWithEmit(t *testing.T) {
 
 func TestHandleExecStream_BadCommand_EmitsErrorEvent(t *testing.T) {
 	s := newProcessService()
-	body := `{"command":"this-binary-does-not-exist-anywhere"}`
+	// args mode bypasses shell-wrap so missing-binary surfaces as an error event.
+	body := `{"command":"this-binary-does-not-exist-anywhere","args":["x"]}`
 	req := httptest.NewRequest(http.MethodPost, "/exec/stream", strings.NewReader(body))
 	w := httptest.NewRecorder()
 
