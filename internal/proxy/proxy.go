@@ -140,7 +140,7 @@ func (h *Handler) StartSweeper(ctx context.Context) {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	port, instanceID, err := ParseHost(r.Host, h.domain)
+	port, instanceID, err := ParseRequest(r.Host, r.Header, h.domain)
 	if err != nil {
 		h.log.Warn().Err(err).Str("host", r.Host).Msg("bad host")
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)

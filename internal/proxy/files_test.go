@@ -54,14 +54,15 @@ type filesTestEnv struct {
 }
 
 type capturedRequest struct {
-	method      string
-	path        string
-	rawQuery    string
-	host        string
-	hasToken    bool
-	fwdFor      string
-	body        string
-	received    bool
+	method             string
+	path               string
+	rawQuery           string
+	host               string
+	hasToken           bool
+	hasSandboxIDHeader bool
+	fwdFor             string
+	body               string
+	received           bool
 }
 
 func newFilesTestEnv(t *testing.T) *filesTestEnv {
@@ -80,14 +81,15 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		env.upstreamMu.Lock()
 		env.lastReq = capturedRequest{
-			method:   r.Method,
-			path:     r.URL.Path,
-			rawQuery: r.URL.RawQuery,
-			host:     r.Host,
-			hasToken: r.Header.Get("X-Access-Token") != "",
-			fwdFor:   r.Header.Get("X-Forwarded-For"),
-			body:     string(bodyBytes),
-			received: true,
+			method:             r.Method,
+			path:               r.URL.Path,
+			rawQuery:           r.URL.RawQuery,
+			host:               r.Host,
+			hasToken:           r.Header.Get("X-Access-Token") != "",
+			hasSandboxIDHeader: r.Header.Get(headerSandboxID) != "",
+			fwdFor:             r.Header.Get("X-Forwarded-For"),
+			body:               string(bodyBytes),
+			received:           true,
 		}
 		env.upstreamMu.Unlock()
 
@@ -362,5 +364,32 @@ func TestFiles_DisabledReturns404(t *testing.T) {
 	env.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestFiles_SharedHost_ForwardsToUpstream(t *testing.T) {
+	env := newFilesTestEnv(t)
+
+	req := httptest.NewRequest(http.MethodPost, "http://unused/files?path=/f.txt", strings.NewReader("content"))
+	req.Host = env.domain
+	req.Header.Set(headerSandboxID, env.sandboxID)
+	req.Header.Set("X-Access-Token", env.validToken())
+	w := httptest.NewRecorder()
+
+	env.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	env.upstreamMu.Lock()
+	defer env.upstreamMu.Unlock()
+	if !env.lastReq.received {
+		t.Fatal("upstream did not receive the request")
+	}
+	if env.lastReq.path != "/files" {
+		t.Errorf("upstream path = %q, want /files", env.lastReq.path)
+	}
+	if env.lastReq.hasSandboxIDHeader {
+		t.Error("X-Superserve-Sandbox-Id was forwarded to upstream — should be scrubbed")
 	}
 }
