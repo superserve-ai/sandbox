@@ -55,9 +55,16 @@ func (r *execRequest) toStartRequest() *pb.StartRequest {
 	if timeoutMs == 0 {
 		timeoutMs = 30 * 1000
 	}
+	// No args → wrap in /bin/sh -c (shell-string mode). Args provided
+	// → run command raw. Matches OpenAPI ExecRequest contract.
+	cmd, args := r.Command, r.Args
+	if len(args) == 0 {
+		cmd = "/bin/sh"
+		args = []string{"-c", r.Command}
+	}
 	return &pb.StartRequest{
-		Cmd:       r.Command,
-		Args:      r.Args,
+		Cmd:       cmd,
+		Args:      args,
 		Envs:      r.Env,
 		Cwd:       r.WorkingDir,
 		TimeoutMs: timeoutMs,
