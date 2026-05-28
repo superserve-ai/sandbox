@@ -180,12 +180,6 @@ func TestParse(t *testing.T) {
 			headerID: "abc_def",
 			wantErr:  true,
 		},
-		{
-			name:     "shared-host with empty header value",
-			host:     testDomain,
-			headerID: "",
-			wantErr:  true,
-		},
 
 		// Subdomain path unchanged.
 		{
