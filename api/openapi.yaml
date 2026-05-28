@@ -29,6 +29,15 @@ info:
     and build-essential pre-installed). Callers can override with any template
     name (e.g. `superserve/python-3.11`, `superserve/node-22`) or a team-owned template UUID
     via the `from_template` field on `POST /sandboxes`.
+
+    ## Data-plane endpoints
+
+    `/exec`, `/exec/stream`, and `/files` are served on a separate host. Authenticate
+    with the per-sandbox `X-Access-Token` returned by create / resume / activate.
+    Either of these host forms reaches the same endpoints:
+
+    - `https://sandbox.superserve.ai/...` with `X-Superserve-Sandbox-Id: <sandbox_id>`
+    - `https://boxd-{sandbox_id}.sandbox.superserve.ai/...` (no routing header needed)
   contact:
     name: Superserve Team
   license:

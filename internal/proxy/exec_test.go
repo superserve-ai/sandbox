@@ -203,3 +203,30 @@ func TestExec_WithoutWithAuth_Panics(t *testing.T) {
 	h := NewHandler("sandbox.test", &stubResolver{}, zerolog.Nop())
 	h.WithExec()
 }
+
+func TestExec_SharedHost_ForwardsToUpstream(t *testing.T) {
+	env := newExecTestEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "http://unused/exec", strings.NewReader(`{"command":"echo"}`))
+	req.Host = env.domain
+	req.Header.Set(headerSandboxID, env.sandboxID)
+	req.Header.Set("X-Access-Token", env.validToken())
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	env.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	env.upstreamMu.Lock()
+	defer env.upstreamMu.Unlock()
+	if !env.lastReq.received {
+		t.Fatal("upstream did not receive the request")
+	}
+	if env.lastReq.path != "/exec" {
+		t.Errorf("upstream path = %q, want /exec", env.lastReq.path)
+	}
+	if env.lastReq.hasToken {
+		t.Error("X-Access-Token was forwarded to upstream — should be scrubbed")
+	}
+}

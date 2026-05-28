@@ -364,3 +364,27 @@ func TestFiles_DisabledReturns404(t *testing.T) {
 		t.Fatalf("status = %d, want 404", w.Code)
 	}
 }
+
+func TestFiles_SharedHost_ForwardsToUpstream(t *testing.T) {
+	env := newFilesTestEnv(t)
+
+	req := httptest.NewRequest(http.MethodPost, "http://unused/files?path=/f.txt", strings.NewReader("content"))
+	req.Host = env.domain
+	req.Header.Set(headerSandboxID, env.sandboxID)
+	req.Header.Set("X-Access-Token", env.validToken())
+	w := httptest.NewRecorder()
+
+	env.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	env.upstreamMu.Lock()
+	defer env.upstreamMu.Unlock()
+	if !env.lastReq.received {
+		t.Fatal("upstream did not receive the request")
+	}
+	if env.lastReq.path != "/files" {
+		t.Errorf("upstream path = %q, want /files", env.lastReq.path)
+	}
+}
