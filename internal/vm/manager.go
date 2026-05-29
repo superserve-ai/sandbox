@@ -972,6 +972,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
+	tBoxdStart := time.Now()
 	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
@@ -981,10 +982,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
+	tBoxdReady := time.Now()
 
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
-	log.Info().Int("pid", pid).Msg("VM restored from snapshot")
+	tPersisted := time.Now()
+
+	log.Info().
+		Int("pid", pid).
+		Int64("wait_boxd_ms", tBoxdReady.Sub(tBoxdStart).Milliseconds()).
+		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
+		Msg("VM restored from snapshot")
 	return inst, nil
 }
 
