@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/fsnotify/fsnotify"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
@@ -248,9 +249,9 @@ func TemplateMagicOverlayPath(runDir string) string {
 type restoreDiskAction int
 
 const (
-	restoreCreateOverlay  restoreDiskAction = iota // overlay clone of a template
-	restoreReuseOverlay                            // existing per-VM overlay (resume)
-	restoreLegacyResolve                           // legacy non-overlay path
+	restoreCreateOverlay restoreDiskAction = iota // overlay clone of a template
+	restoreReuseOverlay                           // existing per-VM overlay (resume)
+	restoreLegacyResolve                          // legacy non-overlay path
 )
 
 // restorePlan is planRestore's output — pure decision, no I/O.
@@ -314,8 +315,8 @@ func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath str
 // <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
 // without needing controlplane to pass it.
 func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
-	parent := filepath.Dir(snapshotPath)            // .../templates/<templateID>
-	templateID := filepath.Base(parent)             // <templateID>
+	parent := filepath.Dir(snapshotPath) // .../templates/<templateID>
+	templateID := filepath.Base(parent)  // <templateID>
 	if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
 		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
 	}
@@ -950,6 +951,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// UFFD disabled but fresh restore — File backend with network overrides.
 		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
 	}
+	log.Info().
+		Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).
+		Bool("ok", restoreErr == nil).
+		Msg("snapshot loaded")
 	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before other
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
@@ -1648,7 +1653,53 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 	m.log.Debug().Str("vm_id", vmID).Int("pid", pid).Msg("resolved systemd MainPID")
 }
 
+// waitForSocket blocks until the given socket path appears or the timeout
+// elapses. Falls back to polling if inotify setup fails.
 func waitForSocket(path string, timeout time.Duration) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return waitForSocketPolling(path, timeout)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(filepath.Dir(path)); err != nil {
+		return waitForSocketPolling(path, timeout)
+	}
+
+	// Recheck after the watch is active: the socket could have appeared
+	// in the race window between the stat above and watcher.Add returning.
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+
+	name := filepath.Base(path)
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return waitForSocketPolling(path, timeout)
+			}
+			if (ev.Op&fsnotify.Create) != 0 && filepath.Base(ev.Name) == name {
+				return nil
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok || err != nil {
+				return waitForSocketPolling(path, timeout)
+			}
+		case <-deadline.C:
+			return fmt.Errorf("socket %s did not appear within %s", path, timeout)
+		}
+	}
+}
+
+func waitForSocketPolling(path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
@@ -1662,5 +1713,3 @@ func waitForSocket(path string, timeout time.Duration) error {
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {
 	return waitForHTTPHealth(ctx, vmIP, timeout)
 }
-
-

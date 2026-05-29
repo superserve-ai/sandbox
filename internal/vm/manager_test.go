@@ -111,8 +111,8 @@ func TestTemplateRootfsForSnapshot_RejectsNonTemplatePaths(t *testing.T) {
 func TestResolveRestoreDisk_NonTemplate_NoExistingRootfs_Errors(t *testing.T) {
 	runDir := t.TempDir()
 	mgr := &Manager{cfg: ManagerConfig{
-		RunDir:          runDir,
-		BaseRootfsPath:  "/should/not/be/used.ext4",
+		RunDir:         runDir,
+		BaseRootfsPath: "/should/not/be/used.ext4",
 	}}
 
 	_, err := mgr.resolveRestoreDisk(context.Background(), "vm-abc", "/snapshots/not-a-template/vmstate.snap")
@@ -446,3 +446,53 @@ func TestInspectRecordedTrace_CountsLines(t *testing.T) {
 	}
 }
 
+func TestWaitForSocket_AlreadyPresent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sock")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForSocket(path, time.Second); err != nil {
+		t.Errorf("waitForSocket on existing file: %v", err)
+	}
+}
+
+func TestWaitForSocket_AppearsAfterStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sock")
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = os.WriteFile(path, nil, 0o644)
+	}()
+
+	start := time.Now()
+	if err := waitForSocket(path, time.Second); err != nil {
+		t.Errorf("waitForSocket: %v", err)
+	}
+	// 100ms guards against an accidental fall-through to polling.
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("waitForSocket took %s; expected < 100ms", elapsed)
+	}
+}
+
+func TestWaitForSocket_TimesOut(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "never-appears")
+	err := waitForSocket(path, 50*time.Millisecond)
+	if err == nil {
+		t.Errorf("expected timeout error, got nil")
+	}
+}
+
+func TestWaitForSocketPolling_AppearsAfterStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sock")
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = os.WriteFile(path, nil, 0o644)
+	}()
+	if err := waitForSocketPolling(path, time.Second); err != nil {
+		t.Errorf("waitForSocketPolling: %v", err)
+	}
+}
