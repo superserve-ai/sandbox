@@ -509,15 +509,15 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	// build_id so clients can also subscribe to log streams immediately.
 	resp := toTemplateResponse(templateFromWithBuild(row))
 	respBody := gin.H{
-		"id":            resp.ID,
-		"team_id":       resp.TeamID,
-		"name":          resp.Name,
-		"status":        resp.Status,
-		"vcpu":          resp.Vcpu,
-		"memory_mib":    resp.MemoryMib,
-		"disk_mib":      resp.DiskMib,
-		"created_at":    resp.CreatedAt,
-		"build_id":      row.BuildID,
+		"id":         resp.ID,
+		"team_id":    resp.TeamID,
+		"name":       resp.Name,
+		"status":     resp.Status,
+		"vcpu":       resp.Vcpu,
+		"memory_mib": resp.MemoryMib,
+		"disk_mib":   resp.DiskMib,
+		"created_at": resp.CreatedAt,
+		"build_id":   row.BuildID,
 	}
 	c.JSON(http.StatusAccepted, respBody)
 
@@ -893,11 +893,17 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 		return db.Template{}, fmt.Errorf("empty ref")
 	}
 	if id, err := uuid.Parse(ref); err == nil {
+		tDBStart := time.Now()
 		tpl, err := h.DB.GetTemplate(c.Request.Context(), db.GetTemplateParams{
 			ID:       id,
 			TeamID:   teamID,
 			TeamID_2: h.systemTeamID(),
 		})
+		log.Info().
+			Int64("template_db_ms", time.Since(tDBStart).Milliseconds()).
+			Str("by", "id").
+			Bool("ok", err == nil).
+			Msg("template lookup")
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
@@ -909,11 +915,17 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 		}
 		return tpl, nil
 	}
+	tDBStart := time.Now()
 	tpl, err := h.DB.GetTemplateByName(c.Request.Context(), db.GetTemplateByNameParams{
 		Name:     ref,
 		TeamID:   teamID,
 		TeamID_2: h.systemTeamID(),
 	})
+	log.Info().
+		Int64("template_db_ms", time.Since(tDBStart).Milliseconds()).
+		Str("by", "name").
+		Bool("ok", err == nil).
+		Msg("template lookup")
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
