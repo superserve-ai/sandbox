@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -509,15 +511,15 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	// build_id so clients can also subscribe to log streams immediately.
 	resp := toTemplateResponse(templateFromWithBuild(row))
 	respBody := gin.H{
-		"id":            resp.ID,
-		"team_id":       resp.TeamID,
-		"name":          resp.Name,
-		"status":        resp.Status,
-		"vcpu":          resp.Vcpu,
-		"memory_mib":    resp.MemoryMib,
-		"disk_mib":      resp.DiskMib,
-		"created_at":    resp.CreatedAt,
-		"build_id":      row.BuildID,
+		"id":         resp.ID,
+		"team_id":    resp.TeamID,
+		"name":       resp.Name,
+		"status":     resp.Status,
+		"vcpu":       resp.Vcpu,
+		"memory_mib": resp.MemoryMib,
+		"disk_mib":   resp.DiskMib,
+		"created_at": resp.CreatedAt,
+		"build_id":   row.BuildID,
 	}
 	c.JSON(http.StatusAccepted, respBody)
 
@@ -883,6 +885,70 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 		buildMetadata(buildID))
 }
 
+// errTemplateNotFound is the wrapper-friendly form of pgx.ErrNoRows.
+var errTemplateNotFound = errors.New("template not found")
+
+// Cache scoped to system-owned templates; team-owned lookups bypass it.
+type templateCacheKey struct {
+	teamID uuid.UUID
+	ref    string
+}
+
+type templateCacheEntry struct {
+	tpl    db.Template
+	expiry time.Time
+}
+
+var (
+	templateCache       sync.Map           // key: templateCacheKey, value: *templateCacheEntry
+	templateLookupGroup singleflight.Group // coalesces concurrent identical misses
+)
+
+const templateCacheTTL = 5 * time.Second
+
+// pureLookupTemplate runs the DB query. Must stay free of HTTP side-effects
+// so it can safely sit under singleflight.Group.
+func (h *Handlers) pureLookupTemplate(ctx context.Context, teamID uuid.UUID, ref string) (db.Template, error) {
+	if id, err := uuid.Parse(ref); err == nil {
+		tDBStart := time.Now()
+		tpl, err := h.DB.GetTemplate(ctx, db.GetTemplateParams{
+			ID:       id,
+			TeamID:   teamID,
+			TeamID_2: h.systemTeamID(),
+		})
+		log.Info().
+			Int64("template_db_ms", time.Since(tDBStart).Milliseconds()).
+			Str("by", "id").
+			Bool("ok", err == nil).
+			Msg("template lookup")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return db.Template{}, errTemplateNotFound
+		}
+		if err != nil {
+			return db.Template{}, fmt.Errorf("GetTemplate: %w", err)
+		}
+		return tpl, nil
+	}
+	tDBStart := time.Now()
+	tpl, err := h.DB.GetTemplateByName(ctx, db.GetTemplateByNameParams{
+		Name:     ref,
+		TeamID:   teamID,
+		TeamID_2: h.systemTeamID(),
+	})
+	log.Info().
+		Int64("template_db_ms", time.Since(tDBStart).Milliseconds()).
+		Str("by", "name").
+		Bool("ok", err == nil).
+		Msg("template lookup")
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.Template{}, errTemplateNotFound
+	}
+	if err != nil {
+		return db.Template{}, fmt.Errorf("GetTemplateByName: %w", err)
+	}
+	return tpl, nil
+}
+
 // lookupTemplateForCreate resolves a from_template ref (UUID or name) to a
 // Template row that is visible to teamID. Writes a 4xx response and returns
 // a non-nil error on failure so callers can early-return.
@@ -892,37 +958,42 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 		respondErrorMsg(c, "bad_request", "from_template is empty", http.StatusBadRequest)
 		return db.Template{}, fmt.Errorf("empty ref")
 	}
-	if id, err := uuid.Parse(ref); err == nil {
-		tpl, err := h.DB.GetTemplate(c.Request.Context(), db.GetTemplateParams{
-			ID:       id,
-			TeamID:   teamID,
-			TeamID_2: h.systemTeamID(),
-		})
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
-				return db.Template{}, err
-			}
-			log.Error().Err(err).Str("template_id", id.String()).Msg("DB GetTemplate failed")
-			respondError(c, ErrInternal)
-			return db.Template{}, err
+
+	cacheKey := templateCacheKey{teamID: teamID, ref: ref}
+	if entry, ok := templateCache.Load(cacheKey); ok {
+		e := entry.(*templateCacheEntry)
+		if time.Now().Before(e.expiry) {
+			return e.tpl, nil
 		}
-		return tpl, nil
+		// CompareAndDelete so a concurrent fresh Store isn't clobbered.
+		templateCache.CompareAndDelete(cacheKey, entry)
 	}
-	tpl, err := h.DB.GetTemplateByName(c.Request.Context(), db.GetTemplateByNameParams{
-		Name:     ref,
-		TeamID:   teamID,
-		TeamID_2: h.systemTeamID(),
+
+	sfKey := teamID.String() + "|" + ref
+	result, err, _ := templateLookupGroup.Do(sfKey, func() (interface{}, error) {
+		// Detach: other coalesced waiters may still need the result.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		defer cancel()
+		return h.pureLookupTemplate(ctx, teamID, ref)
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, errTemplateNotFound) {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
 			return db.Template{}, err
 		}
-		log.Error().Err(err).Str("name", ref).Msg("DB GetTemplateByName failed")
+		log.Error().Err(err).Str("ref", ref).Msg("template lookup failed")
 		respondError(c, ErrInternal)
 		return db.Template{}, err
 	}
+	tpl := result.(db.Template)
+
+	if tpl.TeamID == h.systemTeamID() {
+		templateCache.Store(cacheKey, &templateCacheEntry{
+			tpl:    tpl,
+			expiry: time.Now().Add(templateCacheTTL),
+		})
+	}
+
 	return tpl, nil
 }
 
