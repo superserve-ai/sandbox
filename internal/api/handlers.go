@@ -160,6 +160,45 @@ func actorUUID(actorID *uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: *actorID, Valid: true}
 }
 
+// openSandboxInterval records the start of an active period in
+// sandbox_active_interval. Called when a sandbox transitions into 'active'
+// (created or resumed). Run synchronously rather than in a goroutine so the
+// DB-side partial unique index on open rows is the single arbiter of
+// per-sandbox open/close ordering; an async goroutine could race a quickly-
+// following close. Cancellation is stripped from reqCtx so a client
+// disconnect after the status update can't leave us with an active sandbox
+// and no open interval row. Best-effort: failures are logged but do not
+// fail the request — losing an interval row degrades metrics, not the user
+// flow.
+func (h *Handlers) openSandboxInterval(reqCtx context.Context, sandboxID, teamID uuid.UUID, actorID *uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		ActorID:   actorUUID(actorID),
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval failed")
+	}
+}
+
+// closeSandboxInterval closes the currently-open interval for a sandbox.
+// reason is one of paused / timeout_paused / deleted / failed. Idempotent:
+// if no interval is open (e.g. delete-after-pause), the UPDATE matches zero
+// rows and the call is a no-op — this is what prevents a long paused
+// window from being counted as active time. Cancellation and best-effort
+// semantics match openSandboxInterval.
+func (h *Handlers) closeSandboxInterval(reqCtx context.Context, sandboxID uuid.UUID, reason string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	if err := h.DB.CloseSandboxActiveInterval(ctx, db.CloseSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		EndReason: &reason,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Str("reason", reason).Msg("close sandbox_active_interval failed")
+	}
+}
+
 // loadActiveSandbox fetches a sandbox by ID, verifies team ownership, and
 // requires that it is in the `active` state. Non-active sandboxes (paused,
 // pausing, failed, etc.) are rejected — callers must resume the sandbox
@@ -398,6 +437,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
+	h.openSandboxInterval(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c))
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	return true
 }
@@ -635,7 +675,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// last reference and the template has since moved to a newer build.
 	h.gcOldBuildArtifacts(c.Request.Context(), sandbox)
 
-	// Async activity log.
+	h.closeSandboxInterval(c.Request.Context(), sandboxID, "deleted")
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
@@ -1352,6 +1392,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			"template_id":   fromTemplateID,
 		})
 	}
+	h.openSandboxInterval(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c))
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 
 	sandbox.Status = db.SandboxStatusActive
@@ -1503,7 +1544,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Async observability.
+	h.closeSandboxInterval(c.Request.Context(), sandboxID, "paused")
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)

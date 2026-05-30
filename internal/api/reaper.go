@@ -188,6 +188,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	}
 
 	l.Info().Msg("reaper: sandbox paused due to timeout")
+	h.closeSandboxInterval(ctx, sbx.ID, "timeout_paused")
 	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
 }
 
@@ -276,5 +277,6 @@ func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSan
 		l.Error().Err(err).Str("reason", reason).Msg("reaper: TERMINAL — sandbox stuck in 'pausing', mark-failed also failed, manual recovery required")
 		return
 	}
+	h.closeSandboxInterval(ctx, sbx.ID, "failed")
 	l.Error().Str("reason", reason).Msg("reaper: TERMINAL — sandbox marked 'failed', manual recovery required")
 }
