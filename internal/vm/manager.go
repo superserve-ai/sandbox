@@ -1620,8 +1620,9 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	tStartUnitDone := time.Now()
 
 	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+		status := unitFailureSummary(ctx, systemdUnitName(vmID))
 		_ = stopUnit(ctx, systemdUnitName(vmID))
-		return 0, fmt.Errorf("wait for socket: %w", err)
+		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
 	}
 	tSocketReady := time.Now()
 

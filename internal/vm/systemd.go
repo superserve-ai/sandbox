@@ -14,14 +14,32 @@ func systemdUnitName(vmID string) string {
 }
 
 // startUnit starts a systemd unit. Idempotent — starting an already-running
-// unit is a no-op.
+// unit is a no-op. Returns after the start job is queued; readiness is
+// signalled by the unit's own side effect (e.g., API socket appearing).
 func startUnit(ctx context.Context, unit string) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "start", unit)
+	cmd := exec.CommandContext(ctx, "systemctl", "start", "--no-block", unit)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemctl start %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// unitFailureSummary returns a one-line summary of a unit's
+// Result/SubState for embedding in error messages. Best-effort —
+// returns "unknown" on any error.
+func unitFailureSummary(ctx context.Context, unit string) string {
+	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=Result,SubState", "--value", unit)
+	out, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	s := strings.TrimSpace(string(out))
+	s = strings.ReplaceAll(s, "\n", " ")
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }
 
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
