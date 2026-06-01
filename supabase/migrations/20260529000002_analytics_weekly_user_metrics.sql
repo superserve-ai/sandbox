@@ -4,8 +4,16 @@
 
 CREATE SCHEMA IF NOT EXISTS analytics;
 
-GRANT USAGE ON SCHEMA analytics TO service_role;
-ALTER DEFAULT PRIVILEGES IN SCHEMA analytics GRANT SELECT ON TABLES TO service_role;
+-- Grants to service_role are Supabase-specific; vanilla Postgres (used by
+-- CI / integration tests) doesn't have that role. Guard with a role-exists
+-- check so the migration runs unchanged in both environments.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    GRANT USAGE ON SCHEMA analytics TO service_role;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA analytics GRANT SELECT ON TABLES TO service_role;
+  END IF;
+END $$;
 
 -- weekly_user_metrics: one row per ISO week (Mon–Sun, UTC) from the first
 -- signup through the current week.
@@ -120,4 +128,9 @@ SELECT week_start,
 FROM with_prev
 ORDER BY week_start;
 
-GRANT SELECT ON analytics.weekly_user_metrics TO service_role;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    GRANT SELECT ON analytics.weekly_user_metrics TO service_role;
+  END IF;
+END $$;
