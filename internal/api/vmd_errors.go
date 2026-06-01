@@ -79,18 +79,19 @@ func vmdErrorMessage(err error) string {
 	return err.Error()
 }
 
-// markSandboxFailedAsync writes status=failed in a detached goroutine.
-// Used when a handler discovers (via VMD NotFound) that the VM is gone.
-// Detaches cancellation so the state transition survives client disconnect,
-// but keeps the request's trace context so the write appears in the same span.
+// markSandboxFailedAsync writes status=failed in a detached goroutine. The
+// underlying MarkSandboxFailedInTeam query is a CTE that also closes any
+// open sandbox_active_interval row atomically, so a crash/timeout between
+// the two writes is unreachable. Detaches cancellation so the state
+// transition survives client disconnect, but keeps the request's trace
+// context so the write appears in the same span.
 func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
-		if err := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+		if err := h.DB.MarkSandboxFailedInTeam(ctx, db.MarkSandboxFailedInTeamParams{
 			ID:     sandboxID,
-			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
 		}); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async mark-failed write failed")

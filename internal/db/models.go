@@ -168,6 +168,19 @@ type Activity struct {
 	ResourceType string      `json:"resource_type"`
 }
 
+type AnalyticsWeeklyUserMetric struct {
+	WeekStart       pgtype.Date `json:"week_start"`
+	Signups         int64       `json:"signups"`
+	SignupsWow      int32       `json:"signups_wow"`
+	SignupsWowPct   interface{} `json:"signups_wow_pct"`
+	Wau             int64       `json:"wau"`
+	WauWow          int32       `json:"wau_wow"`
+	WauWowPct       interface{} `json:"wau_wow_pct"`
+	ReturningUsers  int64       `json:"returning_users"`
+	ReturningWow    int32       `json:"returning_wow"`
+	ReturningWowPct interface{} `json:"returning_wow_pct"`
+}
+
 type ApiKey struct {
 	ID         uuid.UUID          `json:"id"`
 	TeamID     uuid.UUID          `json:"team_id"`
@@ -260,6 +273,16 @@ type Sandbox struct {
 	MemPath      *string     `json:"mem_path"`
 	BasePath     *string     `json:"base_path"`
 	DeltaPath    *string     `json:"delta_path"`
+}
+
+type SandboxActiveInterval struct {
+	ID        uuid.UUID          `json:"id"`
+	SandboxID uuid.UUID          `json:"sandbox_id"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	ActorID   pgtype.UUID        `json:"actor_id"`
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
+	EndReason *string            `json:"end_reason"`
 }
 
 type Snapshot struct {

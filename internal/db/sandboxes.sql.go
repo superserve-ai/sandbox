@@ -8,19 +8,26 @@ package db
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const activateSandbox = `-- name: ActivateSandbox :exec
-UPDATE sandbox
-SET status = 'active',
-    vcpu_count = $2,
-    memory_mib = $3,
-    ip_address = $4,
-    updated_at = now()
-WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
+WITH activated AS (
+  UPDATE sandbox
+  SET status = 'active',
+      vcpu_count = $2,
+      memory_mib = $3,
+      ip_address = $4,
+      updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
+  RETURNING id, team_id
+)
+INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+SELECT a.id, a.team_id, $6, now()
+FROM activated a
 `
 
 type ActivateSandboxParams struct {
@@ -29,8 +36,14 @@ type ActivateSandboxParams struct {
 	MemoryMib int32       `json:"memory_mib"`
 	IpAddress *netip.Addr `json:"ip_address"`
 	TeamID    uuid.UUID   `json:"team_id"`
+	ActorID   pgtype.UUID `json:"actor_id"`
 }
 
+// Atomic status → active AND open of a sandbox_active_interval row. Bundling
+// the interval open into the activation statement guarantees that any
+// sandbox observable as active has a matching open interval — otherwise a
+// crash/timeout between the two writes would leave the sandbox active with
+// no interval, undercounting WAU until the next state transition.
 func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams) error {
 	_, err := q.db.Exec(ctx, activateSandbox,
 		arg.ID,
@@ -38,15 +51,31 @@ func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams
 		arg.MemoryMib,
 		arg.IpAddress,
 		arg.TeamID,
+		arg.ActorID,
 	)
 	return err
 }
 
 const beginPause = `-- name: BeginPause :one
-UPDATE sandbox
-SET status = 'pausing', updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
+WITH paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  WHERE sandbox.id = $1
+    AND sandbox.team_id = $2
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'active'
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
+),
+closed_interval AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path
+FROM paused p
+LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
 
 type BeginPauseParams struct {
@@ -54,16 +83,43 @@ type BeginPauseParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Atomic ownership + state check + transition to 'pausing'. Replaces the
-// GetSandbox → check status → UpdateSandboxStatus sequence on the pause
-// hot path, collapsing two DB roundtrips into one. The WHERE clause
-// enforces the invariant (only active, non-deleted sandboxes owned by
-// this team can be paused); a 0-row result means "no such sandbox OR
-// wrong team OR not currently active", and the caller disambiguates via
-// a fallback GetSandbox in the rare error path.
-func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox, error) {
+type BeginPauseRow struct {
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Name           string             `json:"name"`
+	Status         SandboxStatus      `json:"status"`
+	VcpuCount      int32              `json:"vcpu_count"`
+	MemoryMib      int32              `json:"memory_mib"`
+	HostID         string             `json:"host_id"`
+	IpAddress      *netip.Addr        `json:"ip_address"`
+	Pid            *int32             `json:"pid"`
+	SnapshotID     pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig  []byte             `json:"network_config"`
+	TimeoutSeconds *int32             `json:"timeout_seconds"`
+	Metadata       []byte             `json:"metadata"`
+	TemplateID     pgtype.UUID        `json:"template_id"`
+	SnapshotPath   *string            `json:"snapshot_path"`
+	MemPath        *string            `json:"mem_path"`
+	BasePath       *string            `json:"base_path"`
+	DeltaPath      *string            `json:"delta_path"`
+}
+
+// Atomic ownership + state check + transition to 'pausing' AND close of any
+// open sandbox_active_interval row, all in one statement so the "sandbox
+// left active" and "interval closed" facts commit together. If the handler
+// dies between status update and a separate interval close, the analytics
+// view would count the actor as active forever — bundling them into one
+// statement makes that gap unreachable.
+//
+// A 0-row result still means "no such sandbox OR wrong team OR not
+// currently active", and the caller disambiguates via a fallback
+// GetSandbox in the rare error path.
+func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPauseRow, error) {
 	row := q.db.QueryRow(ctx, beginPause, arg.ID, arg.TeamID)
-	var i Sandbox
+	var i BeginPauseRow
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
@@ -147,12 +203,29 @@ WITH expired AS (
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
+),
+paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM expired
+  WHERE sandbox.id = expired.id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+),
+closed_intervals AS (
+  -- Same atomicity story as BeginPause: bundle the active-interval close
+  -- into the claim statement so the reaper can't crash between claiming a
+  -- sandbox (status active → pausing) and closing its interval. Without
+  -- this, a crashed claim would leave the interval open forever and the
+  -- analytics view would keep counting the actor as active.
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'timeout_paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox
-SET status = 'pausing', updated_at = now()
-FROM expired
-WHERE sandbox.id = expired.id
-RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
 
 type ClaimExpiredSandboxesRow struct {
@@ -381,9 +454,16 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 }
 
 const destroySandbox = `-- name: DestroySandbox :exec
-UPDATE sandbox
-SET destroyed_at = now(), status = 'deleted', updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+WITH destroyed AS (
+  UPDATE sandbox
+  SET destroyed_at = now(), status = 'deleted', updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  RETURNING id
+)
+UPDATE sandbox_active_interval
+SET ended_at = now(), end_reason = 'deleted'
+WHERE sandbox_id IN (SELECT id FROM destroyed)
+  AND ended_at IS NULL
 `
 
 type DestroySandboxParams struct {
@@ -391,6 +471,11 @@ type DestroySandboxParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
+// Atomic soft-delete AND close of any open sandbox_active_interval row, so
+// a crash/timeout after the destroy can't leave an open interval that
+// causes weekly_user_metrics to count the actor as active forever. If the
+// WHERE clause matches 0 rows (already-deleted sandbox), the close CTE
+// also matches 0 rows via the empty `destroyed` subquery → no-op.
 func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) error {
 	_, err := q.db.Exec(ctx, destroySandbox, arg.ID, arg.TeamID)
 	return err
@@ -696,16 +781,51 @@ func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSan
 }
 
 const markSandboxFailed = `-- name: MarkSandboxFailed :exec
-UPDATE sandbox
-SET status = 'failed', updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+  RETURNING id
+)
+UPDATE sandbox_active_interval
+SET ended_at = now(), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL
 `
 
 // Used by the reconciler to mark a sandbox failed when VMD detects it is
 // actually gone. No team_id filter — the reconciler runs with host scope,
-// not team scope.
+// not team scope. The CTE bundles the active-interval close into the same
+// statement so a crash/timeout between the two writes can't leave the
+// interval open and have analytics count the actor as active forever.
 func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, markSandboxFailed, id)
+	return err
+}
+
+const markSandboxFailedInTeam = `-- name: MarkSandboxFailedInTeam :exec
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  RETURNING id
+)
+UPDATE sandbox_active_interval
+SET ended_at = now(), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL
+`
+
+type MarkSandboxFailedInTeamParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Like MarkSandboxFailed but with a team_id tenant check, used by handler
+// and reaper paths that know which team owns the sandbox. Same atomic
+// bundling of the active-interval close.
+func (q *Queries) MarkSandboxFailedInTeam(ctx context.Context, arg MarkSandboxFailedInTeamParams) error {
+	_, err := q.db.Exec(ctx, markSandboxFailedInTeam, arg.ID, arg.TeamID)
 	return err
 }
 

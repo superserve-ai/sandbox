@@ -160,6 +160,73 @@ func actorUUID(actorID *uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: *actorID, Valid: true}
 }
 
+// openSandboxInterval records the start of an active period in
+// sandbox_active_interval. Called when a sandbox transitions into 'active'
+// (created or resumed). Run synchronously rather than in a goroutine so the
+// DB-side partial unique index on open rows is the single arbiter of
+// per-sandbox open/close ordering; an async goroutine could race a quickly-
+// following close. Cancellation is stripped from reqCtx so a client
+// disconnect after the status update can't leave us with an active sandbox
+// and no open interval row. Best-effort: failures are logged but do not
+// fail the request — losing an interval row degrades metrics, not the user
+// flow.
+func (h *Handlers) openSandboxInterval(reqCtx context.Context, sandboxID, teamID uuid.UUID, actorID *uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		ActorID:   actorUUID(actorID),
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval failed")
+	}
+}
+
+// openSandboxIntervalInheritActor opens an interval after a system-initiated
+// revert (e.g. reaper's pause-then-rollback) where the original actor was
+// lost. Looks up the most recently closed interval's actor and uses it as
+// the new open's actor_id; this keeps the sandbox contributing to WAU
+// across a brief outage instead of getting dropped by the view's "actor_id
+// IS NOT NULL" filter. Falls back to NULL if no prior closed interval
+// exists.
+//
+// Only the reaper revert paths use this. The user-facing handler paths
+// always have an explicit actor from the request context, so they call
+// openSandboxInterval directly.
+func (h *Handlers) openSandboxIntervalInheritActor(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	var actorID *uuid.UUID
+	if prior, err := h.DB.GetMostRecentClosedSandboxIntervalActor(ctx, sandboxID); err == nil && prior.Valid {
+		a := uuid.UUID(prior.Bytes)
+		actorID = &a
+	}
+	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		ActorID:   actorUUID(actorID),
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval (inherit) failed")
+	}
+}
+
+// closeSandboxInterval closes the currently-open interval for a sandbox.
+// reason is one of paused / timeout_paused / deleted / failed. Idempotent:
+// if no interval is open (e.g. delete-after-pause), the UPDATE matches zero
+// rows and the call is a no-op — this is what prevents a long paused
+// window from being counted as active time. Cancellation and best-effort
+// semantics match openSandboxInterval.
+func (h *Handlers) closeSandboxInterval(reqCtx context.Context, sandboxID uuid.UUID, reason string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	if err := h.DB.CloseSandboxActiveInterval(ctx, db.CloseSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		EndReason: &reason,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Str("reason", reason).Msg("close sandbox_active_interval failed")
+	}
+}
+
 // loadActiveSandbox fetches a sandbox by ID, verifies team ownership, and
 // requires that it is in the `active` state. Non-active sandboxes (paused,
 // pausing, failed, etc.) are rejected — callers must resume the sandbox
@@ -387,6 +454,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		MemoryMib: int32(actualMemMiB),
 		IpAddress: ipAddr,
 		TeamID:    teamID,
+		ActorID:   actorUUID(actorIDFromContext(c)),
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
 		destroyAndRevert()
@@ -398,6 +466,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
+	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	return true
 }
@@ -635,7 +704,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// last reference and the template has since moved to a newer build.
 	h.gcOldBuildArtifacts(c.Request.Context(), sandbox)
 
-	// Async activity log.
+	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
@@ -1296,6 +1365,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// max(activate, network) instead of activate + network.
 	hasNetworkRules := req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0)
 
+	// Capture before goroutine — gin.Context is recycled after ServeHTTP
+	// returns. The CTE inside ActivateSandbox uses this to open the
+	// matching sandbox_active_interval row in the same statement.
+	actorID := actorIDFromContext(c)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -1306,6 +1379,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			MemoryMib: int32(actualMemMiB),
 			IpAddress: ipAddr,
 			TeamID:    teamID,
+			ActorID:   actorUUID(actorID),
 		}); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 		}
@@ -1352,7 +1426,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			"template_id":   fromTemplateID,
 		})
 	}
-	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
+	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
@@ -1419,6 +1494,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
+	// BeginPause's CTE atomically closed the open active interval together
+	// with the status transition; nothing to do here. If the pause
+	// subsequently fails, the revert paths reopen a new interval.
+
 	// Resolve the VMD client for this sandbox's host.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
@@ -1447,6 +1526,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		// the revert survives client disconnect, but keep trace context
 		// so the revert is linked to the original pause request.
 		revertCtx := context.WithoutCancel(c.Request.Context())
+		actorID := actorIDFromContext(c)
 		go func() {
 			ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
 			defer cancel()
@@ -1456,6 +1536,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 				TeamID: teamID,
 			}); revertErr != nil {
 				log.Error().Err(revertErr).Str("sandbox_id", sandboxID.String()).Msg("async revert to active failed")
+				return
+			}
+			// Reopen the interval we closed at BeginPause — sandbox is
+			// back to 'active' and should resume being counted as such.
+			if openErr := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+				SandboxID: sandboxID,
+				TeamID:    teamID,
+				ActorID:   actorUUID(actorID),
+			}); openErr != nil {
+				log.Error().Err(openErr).Str("sandbox_id", sandboxID.String()).Msg("async reopen interval after revert failed")
 			}
 		}()
 		respondError(c, ErrInternal)
@@ -1503,7 +1593,8 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Async observability.
+	// Interval was already closed at BeginPause; FinalizePause is the
+	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
