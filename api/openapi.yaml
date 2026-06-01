@@ -30,18 +30,14 @@ info:
     name (e.g. `superserve/python-3.11`, `superserve/node-22`) or a team-owned template UUID
     via the `from_template` field on `POST /sandboxes`.
 
-    ## Data-plane endpoints
+    ## Files and commands
 
-    `/exec`, `/exec/stream`, and `/files` are served on a separate host. Authenticate
-    with the per-sandbox `X-Access-Token` returned by create / resume / activate.
-    Two host forms reach the same endpoints:
+    `/files`, `/exec`, and `/exec/stream` run against a single sandbox and use
+    its `X-Access-Token` (returned by create, resume, and activate), not the
+    team API key. Two host forms reach them:
 
-    - `https://sandbox.superserve.ai/...` with `X-Superserve-Sandbox-Id: <sandbox_id>` —
-      preferred for server-side SDK clients; collapses all sandbox traffic onto a single
-      HTTP origin so the client's connection pool can be reused.
-    - `https://boxd-{sandbox_id}.sandbox.superserve.ai/...` — required for browsers
-      (avoids the CORS preflight that the routing header would otherwise trigger) and
-      convenient for ad-hoc curl. No routing header needed.
+    - `https://sandbox.superserve.ai/...` with `X-Superserve-Sandbox-Id: <sandbox_id>`.
+    - `https://boxd-{sandbox_id}.sandbox.superserve.ai/...` — no routing header needed.
   contact:
     name: Superserve Team
   license:
@@ -313,28 +309,16 @@ paths:
     post:
       operationId: activateSandbox
       tags: [Sandboxes]
-      summary: Ensure the sandbox is active and return a fresh access token
-      description: |
-        Idempotent "make this sandbox usable" endpoint, intended as the
-        single round-trip the SDK makes before doing operations directly
-        against the per-sandbox data plane.
-
-        - If the sandbox is `active`: returns the current sandbox payload
-          including a fresh access token, no state change.
-        - If the sandbox is `paused`: resumes it (same code path as
-          `/resume`), then returns the sandbox payload with the new token.
-        - If the sandbox is in any other state (`pausing`, `resuming`,
-          `failed`, `starting`): returns 409 — caller should retry once
-          the state settles.
-        - If the sandbox does not exist or belongs to another team: 404.
-
-        Unlike `/resume`, this endpoint is idempotent: calling it on an
-        already-active sandbox is a no-op that returns the current token.
+      summary: Activate a sandbox
+      description: >
+        Returns the sandbox with a fresh access token. If the sandbox is
+        paused, it is resumed first. Idempotent — calling it on an active
+        sandbox just returns a new token.
       security:
         - apiKey: []
       responses:
         "200":
-          description: Sandbox is now active; payload includes access token
+          description: The sandbox is active.
           content:
             application/json:
               schema:
@@ -425,6 +409,79 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /files:
+    servers:
+      - url: https://sandbox.superserve.ai
+        description: Shared host — send the sandbox ID in `X-Superserve-Sandbox-Id`.
+      - url: https://boxd-{sandbox_id}.sandbox.superserve.ai
+        description: Per-sandbox host.
+        variables:
+          sandbox_id:
+            default: ""
+            description: The sandbox ID.
+    parameters:
+      - name: path
+        in: query
+        required: true
+        schema:
+          type: string
+        description: >
+          Absolute path of the file inside the sandbox (e.g.
+          `/home/user/out.txt`).
+
+    get:
+      operationId: readFile
+      tags: [Files]
+      summary: Read a file from a sandbox
+      security:
+        - accessToken: []
+      responses:
+        "200":
+          description: File contents.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: writeFile
+      tags: [Files]
+      summary: Write a file to a sandbox
+      description: Creates parent directories as needed and overwrites any existing file.
+      security:
+        - accessToken: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: File written.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileWriteResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "507":
+          $ref: "#/components/responses/StorageFull"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -720,6 +777,14 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
+    accessToken:
+      type: apiKey
+      in: header
+      name: X-Access-Token
+      description: >
+        Per-sandbox token returned by create, resume, and activate. Grants
+        access to a single sandbox's files and commands. Distinct from the
+        team `X-API-Key`.
 
   parameters:
     SandboxId:
@@ -1267,6 +1332,21 @@ components:
           enum: [ready, failed, cancelled]
           description: Terminal status, present on the final event.
 
+    FileWriteResult:
+      type: object
+      description: Result of a successful file write.
+      properties:
+        path:
+          type: string
+          description: Absolute path the file was written to inside the sandbox.
+        size:
+          type: integer
+          format: int64
+          description: Number of bytes written.
+      example:
+        path: /home/user/out.txt
+        size: 1024
+
     Error:
       type: object
       description: |
@@ -1322,6 +1402,14 @@ components:
             $ref: "#/components/schemas/Error"
     InternalError:
       description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    StorageFull:
+      description: >
+        The sandbox has run out of disk space. Response body uses error code
+        `sandbox_storage_full`.
       content:
         application/json:
           schema:
