@@ -107,17 +107,35 @@ SET status = 'failed', updated_at = now()
 WHERE id = $1 AND destroyed_at IS NULL;
 
 -- name: BeginPause :one
--- Atomic ownership + state check + transition to 'pausing'. Replaces the
--- GetSandbox → check status → UpdateSandboxStatus sequence on the pause
--- hot path, collapsing two DB roundtrips into one. The WHERE clause
--- enforces the invariant (only active, non-deleted sandboxes owned by
--- this team can be paused); a 0-row result means "no such sandbox OR
--- wrong team OR not currently active", and the caller disambiguates via
--- a fallback GetSandbox in the rare error path.
-UPDATE sandbox
-SET status = 'pausing', updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
-RETURNING *;
+-- Atomic ownership + state check + transition to 'pausing' AND close of any
+-- open sandbox_active_interval row, all in one statement so the "sandbox
+-- left active" and "interval closed" facts commit together. If the handler
+-- dies between status update and a separate interval close, the analytics
+-- view would count the actor as active forever — bundling them into one
+-- statement makes that gap unreachable.
+--
+-- A 0-row result still means "no such sandbox OR wrong team OR not
+-- currently active", and the caller disambiguates via a fallback
+-- GetSandbox in the rare error path.
+WITH paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  WHERE sandbox.id = $1
+    AND sandbox.team_id = $2
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'active'
+  RETURNING *
+),
+closed_interval AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.*
+FROM paused p
+LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id;
 
 -- name: BeginResume :one
 -- Atomic claim for resume: transitions 'paused' to 'resuming' in one
@@ -200,9 +218,26 @@ WITH expired AS (
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
+),
+paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM expired
+  WHERE sandbox.id = expired.id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+),
+closed_intervals AS (
+  -- Same atomicity story as BeginPause: bundle the active-interval close
+  -- into the claim statement so the reaper can't crash between claiming a
+  -- sandbox (status active → pausing) and closing its interval. Without
+  -- this, a crashed claim would leave the interval open forever and the
+  -- analytics view would keep counting the actor as active.
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'timeout_paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox
-SET status = 'pausing', updated_at = now()
-FROM expired
-WHERE sandbox.id = expired.id
-RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id;
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;

@@ -8,6 +8,7 @@ package db
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -43,10 +44,25 @@ func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams
 }
 
 const beginPause = `-- name: BeginPause :one
-UPDATE sandbox
-SET status = 'pausing', updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
+WITH paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  WHERE sandbox.id = $1
+    AND sandbox.team_id = $2
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'active'
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path
+),
+closed_interval AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path
+FROM paused p
+LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
 
 type BeginPauseParams struct {
@@ -54,16 +70,43 @@ type BeginPauseParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Atomic ownership + state check + transition to 'pausing'. Replaces the
-// GetSandbox → check status → UpdateSandboxStatus sequence on the pause
-// hot path, collapsing two DB roundtrips into one. The WHERE clause
-// enforces the invariant (only active, non-deleted sandboxes owned by
-// this team can be paused); a 0-row result means "no such sandbox OR
-// wrong team OR not currently active", and the caller disambiguates via
-// a fallback GetSandbox in the rare error path.
-func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (Sandbox, error) {
+type BeginPauseRow struct {
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Name           string             `json:"name"`
+	Status         SandboxStatus      `json:"status"`
+	VcpuCount      int32              `json:"vcpu_count"`
+	MemoryMib      int32              `json:"memory_mib"`
+	HostID         string             `json:"host_id"`
+	IpAddress      *netip.Addr        `json:"ip_address"`
+	Pid            *int32             `json:"pid"`
+	SnapshotID     pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig  []byte             `json:"network_config"`
+	TimeoutSeconds *int32             `json:"timeout_seconds"`
+	Metadata       []byte             `json:"metadata"`
+	TemplateID     pgtype.UUID        `json:"template_id"`
+	SnapshotPath   *string            `json:"snapshot_path"`
+	MemPath        *string            `json:"mem_path"`
+	BasePath       *string            `json:"base_path"`
+	DeltaPath      *string            `json:"delta_path"`
+}
+
+// Atomic ownership + state check + transition to 'pausing' AND close of any
+// open sandbox_active_interval row, all in one statement so the "sandbox
+// left active" and "interval closed" facts commit together. If the handler
+// dies between status update and a separate interval close, the analytics
+// view would count the actor as active forever — bundling them into one
+// statement makes that gap unreachable.
+//
+// A 0-row result still means "no such sandbox OR wrong team OR not
+// currently active", and the caller disambiguates via a fallback
+// GetSandbox in the rare error path.
+func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPauseRow, error) {
 	row := q.db.QueryRow(ctx, beginPause, arg.ID, arg.TeamID)
-	var i Sandbox
+	var i BeginPauseRow
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
@@ -147,12 +190,29 @@ WITH expired AS (
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
+),
+paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM expired
+  WHERE sandbox.id = expired.id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+),
+closed_intervals AS (
+  -- Same atomicity story as BeginPause: bundle the active-interval close
+  -- into the claim statement so the reaper can't crash between claiming a
+  -- sandbox (status active → pausing) and closing its interval. Without
+  -- this, a crashed claim would leave the interval open forever and the
+  -- analytics view would keep counting the actor as active.
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'timeout_paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox
-SET status = 'pausing', updated_at = now()
-FROM expired
-WHERE sandbox.id = expired.id
-RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
 
 type ClaimExpiredSandboxesRow struct {

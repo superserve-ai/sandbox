@@ -1488,12 +1488,9 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Close the active interval at BeginPause (the moment the sandbox
-	// leaves 'active'), not at FinalizePause. The pausing window — VMD
-	// snapshot work, occasional revert paths — is not "running" time per
-	// the migration's contract. If the pause subsequently fails and we
-	// revert to active, the revert paths reopen a new interval.
-	h.closeSandboxInterval(c.Request.Context(), sandboxID, "paused")
+	// BeginPause's CTE atomically closed the open active interval together
+	// with the status transition; nothing to do here. If the pause
+	// subsequently fails, the revert paths reopen a new interval.
 
 	// Resolve the VMD client for this sandbox's host.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)

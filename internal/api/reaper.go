@@ -153,12 +153,9 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Str("name", sbx.Name).
 		Logger()
 
-	// ClaimExpiredSandboxes already moved status active → pausing. Close
-	// the active interval now (the moment the sandbox left active) instead
-	// of after FinalizePause. The pausing window — VMD snapshot work,
-	// revert paths — is not "running" time per the migration's contract.
+	// ClaimExpiredSandboxes's CTE atomically closed the open active
+	// interval together with the status transition; nothing to do here.
 	// Reverts below reopen a new interval if the sandbox returns to active.
-	h.closeSandboxInterval(ctx, sbx.ID, "timeout_paused")
 
 	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
 	if vmdLookupErr != nil {
