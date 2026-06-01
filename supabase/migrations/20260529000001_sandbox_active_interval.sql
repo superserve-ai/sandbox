@@ -42,3 +42,16 @@ CREATE INDEX idx_sai_actor_started ON sandbox_active_interval(actor_id, started_
 CREATE UNIQUE INDEX idx_sai_one_open_per_sandbox
     ON sandbox_active_interval(sandbox_id)
     WHERE ended_at IS NULL;
+
+-- Seed an open interval for every sandbox currently in 'active' state at
+-- migration time. Without this, live sandboxes at migration time would be
+-- invisible to WAU until their next state transition, and their eventual
+-- pause/delete would no-op because there's no open interval to close.
+-- actor_id is NULL — the sandbox row alone doesn't tell us who started it;
+-- post-migration intervals will have actor_id populated by the app handlers.
+-- started_at = now() is honest about what we know ("active as of migration");
+-- pre-migration active duration is genuinely unrecoverable from this table.
+INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+SELECT id, team_id, NULL, now()
+FROM sandbox
+WHERE status = 'active' AND destroyed_at IS NULL;

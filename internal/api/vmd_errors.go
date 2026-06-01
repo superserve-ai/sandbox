@@ -79,10 +79,15 @@ func vmdErrorMessage(err error) string {
 	return err.Error()
 }
 
-// markSandboxFailedAsync writes status=failed in a detached goroutine.
-// Used when a handler discovers (via VMD NotFound) that the VM is gone.
-// Detaches cancellation so the state transition survives client disconnect,
-// but keeps the request's trace context so the write appears in the same span.
+// markSandboxFailedAsync writes status=failed in a detached goroutine and
+// closes any open sandbox_active_interval row for the sandbox. Used when a
+// handler discovers (via VMD NotFound) that the VM is gone. Detaches
+// cancellation so the state transition survives client disconnect, but
+// keeps the request's trace context so the write appears in the same span.
+//
+// Interval close runs unconditionally after the status update so the
+// invariant "every transition to failed closes any open interval" holds
+// even when this path fires instead of reaper.markSandboxFailed.
 func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
@@ -94,6 +99,14 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 			TeamID: teamID,
 		}); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async mark-failed write failed")
+			return
+		}
+		failReason := "failed"
+		if err := h.DB.CloseSandboxActiveInterval(ctx, db.CloseSandboxActiveIntervalParams{
+			SandboxID: sandboxID,
+			EndReason: &failReason,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async close interval after mark-failed failed")
 		}
 	}()
 }

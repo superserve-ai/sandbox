@@ -1460,6 +1460,13 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
+	// Close the active interval at BeginPause (the moment the sandbox
+	// leaves 'active'), not at FinalizePause. The pausing window — VMD
+	// snapshot work, occasional revert paths — is not "running" time per
+	// the migration's contract. If the pause subsequently fails and we
+	// revert to active, the revert paths reopen a new interval.
+	h.closeSandboxInterval(c.Request.Context(), sandboxID, "paused")
+
 	// Resolve the VMD client for this sandbox's host.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
@@ -1488,6 +1495,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		// the revert survives client disconnect, but keep trace context
 		// so the revert is linked to the original pause request.
 		revertCtx := context.WithoutCancel(c.Request.Context())
+		actorID := actorIDFromContext(c)
 		go func() {
 			ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
 			defer cancel()
@@ -1497,6 +1505,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 				TeamID: teamID,
 			}); revertErr != nil {
 				log.Error().Err(revertErr).Str("sandbox_id", sandboxID.String()).Msg("async revert to active failed")
+				return
+			}
+			// Reopen the interval we closed at BeginPause — sandbox is
+			// back to 'active' and should resume being counted as such.
+			if openErr := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+				SandboxID: sandboxID,
+				TeamID:    teamID,
+				ActorID:   actorUUID(actorID),
+			}); openErr != nil {
+				log.Error().Err(openErr).Str("sandbox_id", sandboxID.String()).Msg("async reopen interval after revert failed")
 			}
 		}()
 		respondError(c, ErrInternal)
@@ -1544,7 +1562,8 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	h.closeSandboxInterval(c.Request.Context(), sandboxID, "paused")
+	// Interval was already closed at BeginPause; FinalizePause is the
+	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
