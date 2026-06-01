@@ -400,11 +400,10 @@ func (r *Reconciler) clearDrift(key string) {
 // can't consume the whole run's budget.
 const dbQueryTimeout = 5 * time.Second
 
-// markFailedInDB writes status=failed for the given sandbox ID and closes
-// any open sandbox_active_interval row. No-op if the DB is not configured.
-// The close maintains the invariant "every transition to failed closes any
-// open interval" so analytics.weekly_user_metrics doesn't count a sandbox
-// that the reconciler tore down as still-active in future weeks.
+// markFailedInDB writes status=failed for the given sandbox ID. The
+// underlying MarkSandboxFailed query is a CTE that also closes any open
+// sandbox_active_interval row atomically, so a crash/timeout between the
+// two writes is unreachable. No-op if the DB is not configured.
 func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
 	if r.cfg.DB == nil {
 		return
@@ -418,14 +417,6 @@ func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
 	defer cancel()
 	if err := r.cfg.DB.MarkSandboxFailed(qctx, id); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
-		return
-	}
-	failReason := "failed"
-	if err := r.cfg.DB.CloseSandboxActiveInterval(qctx, db.CloseSandboxActiveIntervalParams{
-		SandboxID: id,
-		EndReason: &failReason,
-	}); err != nil {
-		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to close active interval after mark-failed")
 	}
 }
 

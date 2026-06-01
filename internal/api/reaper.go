@@ -284,14 +284,14 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, reason string, l zerolog.Logger) {
 	failCtx, failCancel := context.WithTimeout(ctx, asyncTimeout)
 	defer failCancel()
-	if err := h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
+	// MarkSandboxFailedInTeam's CTE bundles the active-interval close into
+	// the same statement; no separate close call needed.
+	if err := h.DB.MarkSandboxFailedInTeam(failCtx, db.MarkSandboxFailedInTeamParams{
 		ID:     sbx.ID,
-		Status: db.SandboxStatusFailed,
 		TeamID: sbx.TeamID,
 	}); err != nil {
 		l.Error().Err(err).Str("reason", reason).Msg("reaper: TERMINAL — sandbox stuck in 'pausing', mark-failed also failed, manual recovery required")
 		return
 	}
-	h.closeSandboxInterval(ctx, sbx.ID, "failed")
 	l.Error().Str("reason", reason).Msg("reaper: TERMINAL — sandbox marked 'failed', manual recovery required")
 }

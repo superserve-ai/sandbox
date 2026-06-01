@@ -124,10 +124,34 @@ WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
 -- name: MarkSandboxFailed :exec
 -- Used by the reconciler to mark a sandbox failed when VMD detects it is
 -- actually gone. No team_id filter — the reconciler runs with host scope,
--- not team scope.
-UPDATE sandbox
-SET status = 'failed', updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL;
+-- not team scope. The CTE bundles the active-interval close into the same
+-- statement so a crash/timeout between the two writes can't leave the
+-- interval open and have analytics count the actor as active forever.
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+  RETURNING id
+)
+UPDATE sandbox_active_interval
+SET ended_at = now(), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL;
+
+-- name: MarkSandboxFailedInTeam :exec
+-- Like MarkSandboxFailed but with a team_id tenant check, used by handler
+-- and reaper paths that know which team owns the sandbox. Same atomic
+-- bundling of the active-interval close.
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  RETURNING id
+)
+UPDATE sandbox_active_interval
+SET ended_at = now(), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL;
 
 -- name: BeginPause :one
 -- Atomic ownership + state check + transition to 'pausing' AND close of any

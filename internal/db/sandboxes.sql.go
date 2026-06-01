@@ -781,16 +781,51 @@ func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSan
 }
 
 const markSandboxFailed = `-- name: MarkSandboxFailed :exec
-UPDATE sandbox
-SET status = 'failed', updated_at = now()
-WHERE id = $1 AND destroyed_at IS NULL
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+  RETURNING id
+)
+UPDATE sandbox_active_interval
+SET ended_at = now(), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL
 `
 
 // Used by the reconciler to mark a sandbox failed when VMD detects it is
 // actually gone. No team_id filter — the reconciler runs with host scope,
-// not team scope.
+// not team scope. The CTE bundles the active-interval close into the same
+// statement so a crash/timeout between the two writes can't leave the
+// interval open and have analytics count the actor as active forever.
 func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, markSandboxFailed, id)
+	return err
+}
+
+const markSandboxFailedInTeam = `-- name: MarkSandboxFailedInTeam :exec
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  RETURNING id
+)
+UPDATE sandbox_active_interval
+SET ended_at = now(), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL
+`
+
+type MarkSandboxFailedInTeamParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Like MarkSandboxFailed but with a team_id tenant check, used by handler
+// and reaper paths that know which team owns the sandbox. Same atomic
+// bundling of the active-interval close.
+func (q *Queries) MarkSandboxFailedInTeam(ctx context.Context, arg MarkSandboxFailedInTeamParams) error {
+	_, err := q.db.Exec(ctx, markSandboxFailedInTeam, arg.ID, arg.TeamID)
 	return err
 }
 
