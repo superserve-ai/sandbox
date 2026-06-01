@@ -454,6 +454,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		MemoryMib: int32(actualMemMiB),
 		IpAddress: ipAddr,
 		TeamID:    teamID,
+		ActorID:   actorUUID(actorIDFromContext(c)),
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
 		destroyAndRevert()
@@ -465,7 +466,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
-	h.openSandboxInterval(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c))
+	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	return true
 }
@@ -703,7 +704,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// last reference and the template has since moved to a newer build.
 	h.gcOldBuildArtifacts(c.Request.Context(), sandbox)
 
-	h.closeSandboxInterval(c.Request.Context(), sandboxID, "deleted")
+	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 
 	c.Status(http.StatusNoContent)
@@ -1364,6 +1365,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// max(activate, network) instead of activate + network.
 	hasNetworkRules := req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0)
 
+	// Capture before goroutine — gin.Context is recycled after ServeHTTP
+	// returns. The CTE inside ActivateSandbox uses this to open the
+	// matching sandbox_active_interval row in the same statement.
+	actorID := actorIDFromContext(c)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -1374,6 +1379,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			MemoryMib: int32(actualMemMiB),
 			IpAddress: ipAddr,
 			TeamID:    teamID,
+			ActorID:   actorUUID(actorID),
 		}); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 		}
@@ -1420,8 +1426,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			"template_id":   fromTemplateID,
 		})
 	}
-	h.openSandboxInterval(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c))
-	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
+	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
