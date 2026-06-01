@@ -182,6 +182,34 @@ func (h *Handlers) openSandboxInterval(reqCtx context.Context, sandboxID, teamID
 	}
 }
 
+// openSandboxIntervalInheritActor opens an interval after a system-initiated
+// revert (e.g. reaper's pause-then-rollback) where the original actor was
+// lost. Looks up the most recently closed interval's actor and uses it as
+// the new open's actor_id; this keeps the sandbox contributing to WAU
+// across a brief outage instead of getting dropped by the view's "actor_id
+// IS NOT NULL" filter. Falls back to NULL if no prior closed interval
+// exists.
+//
+// Only the reaper revert paths use this. The user-facing handler paths
+// always have an explicit actor from the request context, so they call
+// openSandboxInterval directly.
+func (h *Handlers) openSandboxIntervalInheritActor(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	var actorID *uuid.UUID
+	if prior, err := h.DB.GetMostRecentClosedSandboxIntervalActor(ctx, sandboxID); err == nil && prior.Valid {
+		a := uuid.UUID(prior.Bytes)
+		actorID = &a
+	}
+	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		ActorID:   actorUUID(actorID),
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval (inherit) failed")
+	}
+}
+
 // closeSandboxInterval closes the currently-open interval for a sandbox.
 // reason is one of paused / timeout_paused / deleted / failed. Idempotent:
 // if no interval is open (e.g. delete-after-pause), the UPDATE matches zero

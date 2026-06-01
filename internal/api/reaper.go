@@ -248,7 +248,7 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	// is back to active and should resume being counted as such.
 	// actor_id is nil because this is a system-initiated revert, not a
 	// user action.
-	h.openSandboxInterval(ctx, sbx.ID, sbx.TeamID, nil)
+	h.openSandboxIntervalInheritActor(ctx, sbx.ID, sbx.TeamID)
 
 	rl.Warn().Msg("reaper: rolled back failed pause, sandbox is active again — will retry next tick")
 }
@@ -273,7 +273,7 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 	}
 	// Reopen the interval that pauseExpired closed at the top — sandbox
 	// is back to active. System-initiated revert, so actor_id is nil.
-	h.openSandboxInterval(ctx, sbx.ID, sbx.TeamID, nil)
+	h.openSandboxIntervalInheritActor(ctx, sbx.ID, sbx.TeamID)
 }
 
 // markSandboxFailed sets the sandbox to 'failed' as a terminal state for

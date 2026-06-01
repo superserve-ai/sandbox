@@ -35,6 +35,26 @@ func (q *Queries) CloseSandboxActiveInterval(ctx context.Context, arg CloseSandb
 	return err
 }
 
+const getMostRecentClosedSandboxIntervalActor = `-- name: GetMostRecentClosedSandboxIntervalActor :one
+SELECT actor_id
+FROM sandbox_active_interval
+WHERE sandbox_id = $1 AND ended_at IS NOT NULL
+ORDER BY ended_at DESC
+LIMIT 1
+`
+
+// Returns the actor_id of the most recently closed interval for a sandbox.
+// Used by openSandboxInterval as a fallback when a reopen would otherwise
+// have actor_id = NULL (e.g. reaper revert after a failed pause). Without
+// this fallback, the analytics view's "actor_id IS NOT NULL" filter would
+// drop the sandbox from WAU for the rest of its run.
+func (q *Queries) GetMostRecentClosedSandboxIntervalActor(ctx context.Context, sandboxID uuid.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getMostRecentClosedSandboxIntervalActor, sandboxID)
+	var actor_id pgtype.UUID
+	err := row.Scan(&actor_id)
+	return actor_id, err
+}
+
 const openSandboxActiveInterval = `-- name: OpenSandboxActiveInterval :exec
 INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
 VALUES ($1, $2, $3, now())

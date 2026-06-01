@@ -19,3 +19,15 @@ SET ended_at = now(),
     end_reason = $2
 WHERE sandbox_id = $1
   AND ended_at IS NULL;
+
+-- name: GetMostRecentClosedSandboxIntervalActor :one
+-- Returns the actor_id of the most recently closed interval for a sandbox.
+-- Used by openSandboxInterval as a fallback when a reopen would otherwise
+-- have actor_id = NULL (e.g. reaper revert after a failed pause). Without
+-- this fallback, the analytics view's "actor_id IS NOT NULL" filter would
+-- drop the sandbox from WAU for the rest of its run.
+SELECT actor_id
+FROM sandbox_active_interval
+WHERE sandbox_id = $1 AND ended_at IS NOT NULL
+ORDER BY ended_at DESC
+LIMIT 1;

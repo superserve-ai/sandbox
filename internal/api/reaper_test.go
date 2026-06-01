@@ -83,6 +83,11 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 		return finalizePauseRow(uuid.New())
 	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
+	case strings.Contains(sql, "FROM sandbox_active_interval"):
+		// GetMostRecentClosedSandboxIntervalActor — return ErrNoRows so the
+		// inherit-actor lookup falls through to NULL (no prior interval in
+		// these tests).
+		return notFoundRow()
 	}
 	return activityRow()
 }

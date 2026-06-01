@@ -47,11 +47,32 @@ CREATE UNIQUE INDEX idx_sai_one_open_per_sandbox
 -- migration time. Without this, live sandboxes at migration time would be
 -- invisible to WAU until their next state transition, and their eventual
 -- pause/delete would no-op because there's no open interval to close.
--- actor_id is NULL — the sandbox row alone doesn't tell us who started it;
--- post-migration intervals will have actor_id populated by the app handlers.
--- started_at = now() is honest about what we know ("active as of migration");
--- pre-migration active duration is genuinely unrecoverable from this table.
+--
+-- actor_id resolution is best-effort, in priority order:
+--   1. the most-recent actor_id from activity for this sandbox (accurate
+--      when present — only populated post-ce1fdd1);
+--   2. fallback: whoever created the team's most recent API key
+--      (heuristic, but typically the team owner — better than NULL since
+--      the analytics view drops NULL actors).
+-- If both subqueries miss, actor_id stays NULL and the sandbox simply
+-- won't count toward WAU until a user action transitions it through a new
+-- open/close cycle.
+--
+-- started_at = now() is honest about what we know ("active as of
+-- migration"); pre-migration active duration is genuinely unrecoverable
+-- from this table.
 INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
-SELECT id, team_id, NULL, now()
-FROM sandbox
-WHERE status = 'active' AND destroyed_at IS NULL;
+SELECT
+    s.id,
+    s.team_id,
+    COALESCE(
+        (SELECT a.actor_id FROM activity a
+         WHERE a.sandbox_id = s.id AND a.actor_id IS NOT NULL
+         ORDER BY a.created_at DESC LIMIT 1),
+        (SELECT k.created_by FROM api_key k
+         WHERE k.team_id = s.team_id AND k.created_by IS NOT NULL
+         ORDER BY k.created_at DESC LIMIT 1)
+    ),
+    now()
+FROM sandbox s
+WHERE s.status = 'active' AND s.destroyed_at IS NULL;
