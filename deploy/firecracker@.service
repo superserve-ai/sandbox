@@ -2,6 +2,7 @@
 Description=Firecracker VM %i
 After=network-online.target
 StopWhenUnneeded=no
+CollectMode=inactive-or-failed
 
 [Service]
 Type=simple
