@@ -1613,16 +1613,24 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
 
-	// Start the systemd unit.
+	tStartUnit := time.Now()
 	if err := startUnit(ctx, systemdUnitName(vmID)); err != nil {
 		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
+	tStartUnitDone := time.Now()
 
-	// Wait for the Firecracker API socket.
 	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+		status := unitFailureSummary(ctx, systemdUnitName(vmID))
 		_ = stopUnit(ctx, systemdUnitName(vmID))
-		return 0, fmt.Errorf("wait for socket: %w", err)
+		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
 	}
+	tSocketReady := time.Now()
+
+	m.log.Info().
+		Str("vm_id", vmID).
+		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
+		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
+		Msg("fc startup phases")
 
 	// Read the PID asynchronously so the create path isn't slowed down
 	// by the ~15ms dbus roundtrip. The PID is populated in the instance
