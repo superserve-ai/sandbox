@@ -38,12 +38,16 @@ func TestSendInput_NonPTYStdin(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// `cat` with no args reads stdin until EOF and echoes it to stdout.
-		done <- s.runProcess(context.Background(), &pb.StartRequest{Cmd: "cat"}, emit)
+		// Cwd must exist or fork/exec fails (it defaults to a home dir that
+		// isn't present in the test environment).
+		done <- s.runProcess(context.Background(), &pb.StartRequest{Cmd: "cat", Cwd: "/tmp"}, emit)
 	}()
 
 	var pid uint32
 	select {
 	case pid = <-pidCh:
+	case err := <-done:
+		t.Fatalf("runProcess returned before StartEvent: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for StartEvent")
 	}
