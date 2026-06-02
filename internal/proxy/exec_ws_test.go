@@ -324,7 +324,7 @@ func TestServeExecWS_ForeignOriginAccepted(t *testing.T) {
 	defer srv.Close()
 
 	token := auth.ComputeAccessToken(seedKey, sandboxID)
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/exec/ws"
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/exec/connect"
 
 	fake.pushStart(99)
 	fake.pushStdout([]byte("from a foreign origin\n"))

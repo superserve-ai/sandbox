@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	// execWSPath is the full-duplex WebSocket counterpart to /exec/stream:
+	// execConnectPath is the full-duplex counterpart to /exec/stream:
 	// stdout/stderr/exit frames downstream, stdin upstream, over one socket.
-	execWSPath = "/exec/ws"
+	execConnectPath = "/exec/connect"
 
 	// execProtocol is echoed on upgrade. Bump the version if the frame format
 	// changes so old clients fail loudly.
@@ -97,7 +97,7 @@ func (s *execWSStart) toStartRequest() *pb.StartRequest {
 	}
 }
 
-// serveExecWS upgrades GET /exec/ws to a WebSocket and bridges it full-duplex
+// serveExecWS upgrades GET /exec/connect to a WebSocket and bridges it full-duplex
 // to boxd ProcessService.Start (non-PTY). Pre-upgrade errors are HTTP
 // responses; after upgrade they're WebSocket close frames.
 func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID string) {

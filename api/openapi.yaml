@@ -412,7 +412,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /exec/ws:
+  /exec/connect:
     servers:
       - url: https://sandbox.superserve.ai
         description: Shared host — send the sandbox ID in `X-Superserve-Sandbox-Id`.
@@ -423,7 +423,7 @@ paths:
             default: ""
             description: The sandbox ID.
     get:
-      operationId: execWebSocket
+      operationId: execConnect
       tags: [Exec]
       summary: Run a command over a WebSocket
       description: |
