@@ -525,8 +525,7 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		return connect.NewError(connect.CodeInternal, err)
 	}
 
-	// stdin pipe lets SendInput feed the process. cmd.Wait closes it once
-	// the process exits, so we don't close it on the read path.
+	// stdin pipe lets SendInput feed the process; cmd.Wait closes it on exit.
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)
@@ -641,8 +640,7 @@ func (s *processService) SendInput(ctx context.Context, req *connect.Request[pb.
 	}
 	proc := val.(*runningProcess)
 
-	// PTY mode: input goes to the terminal master. EOF has no meaning here
-	// (the client sends Ctrl-D as a data byte), so it's ignored.
+	// PTY mode: input goes to the terminal master; EOF is ignored.
 	if proc.tty != nil {
 		if _, err := proc.tty.Write(req.Msg.GetData()); err != nil {
 			return nil, connect.NewError(connect.CodeInternal, err)

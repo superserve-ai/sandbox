@@ -94,12 +94,9 @@ func (s *execWSStart) toStartRequest() *pb.StartRequest {
 	}
 }
 
-// serveExecWS handles GET /exec/ws on the boxd host label. It upgrades the
-// connection to a WebSocket and bridges full-duplex to boxd
-// ProcessService.Start in non-PTY mode.
-//
-// Pre-upgrade errors are returned as HTTP responses; post-upgrade errors go
-// back as WebSocket close frames.
+// serveExecWS upgrades GET /exec/ws to a WebSocket and bridges it full-duplex
+// to boxd ProcessService.Start (non-PTY). Pre-upgrade errors are HTTP
+// responses; after upgrade they're WebSocket close frames.
 func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID string) {
 	// Token-gated like /exec and /files — no Origin allowlist, since customer
 	// apps run on their own domains.
@@ -208,11 +205,9 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	sessionDeadline := time.NewTimer(execMaxSessionDuration)
 	defer sessionDeadline.Stop()
 
-	// Liveness: ping the client; a missed pong (within writeWait) tears down.
-	// Decoupled from output, so a quiet-but-running command isn't cut. Ping is
-	// safe alongside the writer and needs the read pump below to receive pongs.
-	// Read the interval once here (not in the goroutine) so tests can override
-	// the package var without racing the bridge's goroutines.
+	// Liveness: ping the client; a missed pong (within writeWait) tears down,
+	// so a quiet-but-running command isn't cut. Read the interval into a local
+	// (not in the goroutine) so tests can override the var without a race.
 	pingInterval := execPingInterval
 	go func() {
 		ticker := time.NewTicker(pingInterval)
@@ -310,11 +305,9 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 				return
 			}
 
-			// SendInput is synchronous and preserves stdin order. If the
-			// process stops draining stdin its pipe fills and SendInput
-			// blocks, parking this pump and delaying any control frame (e.g. a
-			// signal) queued behind it. Acceptable: interactive stdin is small
-			// and drained promptly — same trade-off as the terminal bridge.
+			// SendInput is synchronous (preserves stdin order). If the process
+			// stops draining stdin, SendInput blocks and delays later control
+			// frames (e.g. a signal). Acceptable for interactive stdin.
 			switch typ {
 			case websocket.MessageBinary:
 				if _, err := procClient.SendInput(bridgeCtx, connect.NewRequest(&pb.SendInputRequest{

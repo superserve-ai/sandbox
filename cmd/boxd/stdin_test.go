@@ -11,9 +11,8 @@ import (
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
-// TestSendInput_NonPTYStdin verifies that SendInput feeds a non-PTY process's
-// stdin and that Eof closes it, letting a stdin-consuming command (cat) echo
-// the input back and exit. This covers the wiring added for /exec/ws.
+// TestSendInput_NonPTYStdin verifies SendInput feeds a non-PTY process's stdin
+// and that Eof closes it — cat echoes the input back and exits.
 func TestSendInput_NonPTYStdin(t *testing.T) {
 	s := newProcessService()
 
@@ -38,9 +37,7 @@ func TestSendInput_NonPTYStdin(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		// `cat` with no args reads stdin until EOF and echoes it to stdout.
-		// Cwd must exist or fork/exec fails (it defaults to a home dir that
-		// isn't present in the test environment).
+		// `cat` echoes stdin to stdout. Cwd must exist or fork/exec fails.
 		done <- s.runProcess(context.Background(), &pb.StartRequest{Cmd: "cat", Cwd: "/tmp"}, emit)
 	}()
 
@@ -80,8 +77,7 @@ func TestSendInput_NonPTYStdin(t *testing.T) {
 }
 
 // TestSignal_TerminatesShellCommand guards that Signal terminates a non-PTY
-// shell-wrapped command. Delivery to a forked child (vs the shell leader) is
-// covered by the staging e2e check.
+// shell-wrapped command.
 func TestSignal_TerminatesShellCommand(t *testing.T) {
 	s := newProcessService()
 	pidCh := make(chan uint32, 1)
