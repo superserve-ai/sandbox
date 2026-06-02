@@ -572,9 +572,12 @@ func (*KeepAlive) Descriptor() ([]byte, []int) {
 }
 
 type SendInputRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Pid           uint32                 `protobuf:"varint,1,opt,name=pid,proto3" json:"pid,omitempty"`
-	Data          []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Pid   uint32                 `protobuf:"varint,1,opt,name=pid,proto3" json:"pid,omitempty"`
+	Data  []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	// When true, close the process's stdin after writing data, signalling EOF.
+	// Applies to non-PTY processes; ignored in PTY mode.
+	Eof           bool `protobuf:"varint,3,opt,name=eof,proto3" json:"eof,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -621,6 +624,13 @@ func (x *SendInputRequest) GetData() []byte {
 		return x.Data
 	}
 	return nil
+}
+
+func (x *SendInputRequest) GetEof() bool {
+	if x != nil {
+		return x.Eof
+	}
+	return false
 }
 
 type SendInputResponse struct {
@@ -1392,10 +1402,11 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\x06exited\x18\x02 \x01(\bR\x06exited\x12\x16\n" +
 	"\x06status\x18\x03 \x01(\tR\x06status\x12\x14\n" +
 	"\x05error\x18\x04 \x01(\tR\x05error\"\v\n" +
-	"\tKeepAlive\"8\n" +
+	"\tKeepAlive\"J\n" +
 	"\x10SendInputRequest\x12\x10\n" +
 	"\x03pid\x18\x01 \x01(\rR\x03pid\x12\x12\n" +
-	"\x04data\x18\x02 \x01(\fR\x04data\"\x13\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\x12\x10\n" +
+	"\x03eof\x18\x03 \x01(\bR\x03eof\"\x13\n" +
 	"\x11SendInputResponse\"W\n" +
 	"\rResizeRequest\x12\x10\n" +
 	"\x03pid\x18\x01 \x01(\rR\x03pid\x124\n" +

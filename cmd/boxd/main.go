@@ -180,8 +180,9 @@ func setHostname(name string) error {
 // ---------------------------------------------------------------------------
 
 type runningProcess struct {
-	cmd *exec.Cmd
-	tty *os.File // nil for non-PTY processes.
+	cmd   *exec.Cmd
+	tty   *os.File       // nil for non-PTY processes.
+	stdin io.WriteCloser // stdin pipe for non-PTY processes; nil in PTY mode.
 }
 
 // sandboxContext holds the sandbox-level state that persists across exec
@@ -524,12 +525,19 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		return connect.NewError(connect.CodeInternal, err)
 	}
 
+	// stdin pipe lets SendInput feed the process. cmd.Wait closes it once
+	// the process exits, so we don't close it on the read path.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return connect.NewError(connect.CodeInternal, err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		return connect.NewError(connect.CodeInternal, err)
 	}
 
 	pid := uint32(cmd.Process.Pid)
-	s.processes.Store(pid, &runningProcess{cmd: cmd})
+	s.processes.Store(pid, &runningProcess{cmd: cmd, stdin: stdin})
 	defer s.processes.Delete(pid)
 
 	if err := emit(&pb.ProcessEvent{
@@ -633,9 +641,27 @@ func (s *processService) SendInput(ctx context.Context, req *connect.Request[pb.
 	}
 	proc := val.(*runningProcess)
 
+	// PTY mode: input goes to the terminal master. EOF has no meaning here
+	// (the client sends Ctrl-D as a data byte), so it's ignored.
 	if proc.tty != nil {
 		if _, err := proc.tty.Write(req.Msg.GetData()); err != nil {
 			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		return connect.NewResponse(&pb.SendInputResponse{}), nil
+	}
+
+	// Non-PTY: write to the process's stdin pipe, then optionally close it
+	// to signal EOF.
+	if proc.stdin != nil {
+		if data := req.Msg.GetData(); len(data) > 0 {
+			if _, err := proc.stdin.Write(data); err != nil {
+				return nil, connect.NewError(connect.CodeInternal, err)
+			}
+		}
+		if req.Msg.GetEof() {
+			if err := proc.stdin.Close(); err != nil {
+				return nil, connect.NewError(connect.CodeInternal, err)
+			}
 		}
 	}
 

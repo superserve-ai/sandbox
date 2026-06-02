@@ -412,6 +412,43 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /exec/ws:
+    servers:
+      - url: https://sandbox.superserve.ai
+        description: Shared host — send the sandbox ID in `X-Superserve-Sandbox-Id`.
+      - url: https://boxd-{sandbox_id}.sandbox.superserve.ai
+        description: Per-sandbox host.
+        variables:
+          sandbox_id:
+            default: ""
+            description: The sandbox ID.
+    get:
+      operationId: execWebSocket
+      tags: [Exec]
+      summary: Run a command over a WebSocket
+      description: |
+        Runs a command over a WebSocket, streaming output back and accepting
+        stdin over one connection.
+
+        Connect with two `Sec-WebSocket-Protocol` values: `superserve.exec.v1`
+        and `token.<access-token>`.
+
+        - First frame (text): an `ExecRequest` JSON object. Omitting `timeout_s`
+          runs with no per-command timeout.
+        - Client frames: a binary frame is stdin; a text frame is JSON control —
+          `{"type":"stdin","data":"..."}`, `{"type":"stdin_close"}`, or
+          `{"type":"signal","name":"SIGINT"}`.
+        - Server frames (text): `ExecStreamEvent` JSON — `{"stdout":"..."}`,
+          `{"stderr":"..."}`, then `{"exit_code":N,"finished":true}`. Closes on
+          exit.
+      responses:
+        "101":
+          description: Switching Protocols — the WebSocket is established.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /files:
     servers:
       - url: https://sandbox.superserve.ai
