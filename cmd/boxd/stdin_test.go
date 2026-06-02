@@ -38,7 +38,7 @@ func TestSendInput_NonPTYStdin(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// `cat` echoes stdin to stdout. Cwd must exist or fork/exec fails.
-		done <- s.runProcess(context.Background(), &pb.StartRequest{Cmd: "cat", Cwd: "/tmp"}, emit)
+		done <- s.runProcess(context.Background(), &pb.StartRequest{Cmd: "cat", Cwd: "/tmp"}, emit, true)
 	}()
 
 	var pid uint32
@@ -76,6 +76,28 @@ func TestSendInput_NonPTYStdin(t *testing.T) {
 	}
 }
 
+// TestRunProcess_NoStdinExitsOnEOF guards that a non-interactive exec
+// (wantStdin=false) leaves stdin at /dev/null, so a stdin-reading command like
+// `cat` sees EOF and exits instead of blocking until the timeout.
+func TestRunProcess_NoStdinExitsOnEOF(t *testing.T) {
+	s := newProcessService()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.runProcess(context.Background(), &pb.StartRequest{
+			Cmd: "cat", Cwd: "/tmp",
+		}, func(*pb.ProcessEvent) error { return nil }, false)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runProcess: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cat blocked on stdin; expected immediate EOF with wantStdin=false")
+	}
+}
+
 // TestSignal_TerminatesShellCommand guards that Signal terminates a non-PTY
 // shell-wrapped command.
 func TestSignal_TerminatesShellCommand(t *testing.T) {
@@ -91,7 +113,7 @@ func TestSignal_TerminatesShellCommand(t *testing.T) {
 	go func() {
 		done <- s.runProcess(context.Background(), &pb.StartRequest{
 			Cmd: "/bin/sh", Args: []string{"-c", "sleep 30"}, Cwd: "/tmp",
-		}, emit)
+		}, emit, false)
 	}()
 
 	var pid uint32

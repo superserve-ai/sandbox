@@ -331,10 +331,11 @@ func resolveUser(name string) (*user.User, *syscall.Credential, error) {
 type eventEmitter func(*pb.ProcessEvent) error
 
 func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
-	return s.runProcess(ctx, req.Msg, stream.Send)
+	// Interactive: gets a stdin pipe for SendInput (one-shot /exec passes false).
+	return s.runProcess(ctx, req.Msg, stream.Send, true)
 }
 
-func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, emit eventEmitter) error {
+func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, emit eventEmitter, wantStdin bool) error {
 	cmdName := msg.GetCmd()
 	if cmdName == "" {
 		cmdName = defaultShell
@@ -420,7 +421,7 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		cmd.WaitDelay = time.Second
-		return s.startPipes(ctx, cmd, emit, &timedOut)
+		return s.startPipes(ctx, cmd, emit, &timedOut, wantStdin)
 	}
 	return s.startPTY(ctx, cmd, msg, emit, &timedOut)
 }
@@ -515,7 +516,7 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	})
 }
 
-func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eventEmitter, timedOut *atomic.Bool) error {
+func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eventEmitter, timedOut *atomic.Bool, wantStdin bool) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)
@@ -525,10 +526,15 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		return connect.NewError(connect.CodeInternal, err)
 	}
 
-	// stdin pipe lets SendInput feed the process; cmd.Wait closes it on exit.
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return connect.NewError(connect.CodeInternal, err)
+	// Only open a stdin pipe when the caller can feed it (the streaming RPC).
+	// Otherwise leave cmd.Stdin nil so the child reads /dev/null and sees EOF
+	// immediately, instead of blocking on a pipe nobody will close.
+	var stdin io.WriteCloser
+	if wantStdin {
+		stdin, err = cmd.StdinPipe()
+		if err != nil {
+			return connect.NewError(connect.CodeInternal, err)
+		}
 	}
 
 	if err := cmd.Start(); err != nil {

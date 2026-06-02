@@ -29,6 +29,12 @@ const (
 	// execMaxSessionDuration is the hard session ceiling; reaching it kills the
 	// running command. Longer than the terminal's — agent runs are longer-lived.
 	execMaxSessionDuration = 12 * time.Hour
+
+	// I/O rides binary frames tagged with a one-byte channel, so output stays
+	// byte-exact rather than being forced through a UTF-8 string.
+	execChStdin  = 0x00
+	execChStdout = 0x01
+	execChStderr = 0x02
 )
 
 // execPingInterval is how often the bridge pings the client; a missed pong
@@ -51,19 +57,16 @@ type execWSStart struct {
 	TimeoutS   int               `json:"timeout_s,omitempty"`
 }
 
-// execWSControl is a post-start client text frame. Binary frames are raw
-// stdin; text frames are JSON control, discriminated by Type.
+// execWSControl is a post-start client text frame. Binary frames carry I/O
+// (channel 0 = stdin); text frames are JSON control, discriminated by Type.
 type execWSControl struct {
-	Type string `json:"type"`           // "stdin" | "stdin_close" | "signal"
-	Data string `json:"data,omitempty"` // stdin payload when Type == "stdin"
+	Type string `json:"type"`           // "stdin_close" | "signal"
 	Name string `json:"name,omitempty"` // signal name when Type == "signal"
 }
 
-// execWSEvent is a server→client text frame, matching the SSE exec event
-// shape so clients parse both transports the same way.
+// execWSEvent is a server→client text frame for lifecycle and errors. Output
+// itself rides binary frames, not this struct.
 type execWSEvent struct {
-	Stdout   string `json:"stdout,omitempty"`
-	Stderr   string `json:"stderr,omitempty"`
 	ExitCode *int32 `json:"exit_code,omitempty"`
 	Finished bool   `json:"finished,omitempty"`
 	Error    string `json:"error,omitempty"`
@@ -239,39 +242,40 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	wg.Add(2)
 
 	// ------- boxd → client -------
-	// Translate ProcessEvents into JSON event frames. End closes the WS.
+	// stdout/stderr go out as channel-tagged binary frames; the End event is a
+	// text lifecycle frame that closes the WS.
 	go func() {
 		defer wg.Done()
 		defer cancel()
 		for stream.Receive() {
 			msg := stream.Msg()
-			var ev execWSEvent
-			send := false
 			if d := msg.GetData(); d != nil {
 				if out := d.GetStdout(); len(out) > 0 {
-					ev.Stdout = string(out)
-					send = true
-				} else if out := d.GetStderr(); len(out) > 0 {
-					ev.Stderr = string(out)
-					send = true
+					if err := writeExecData(bridgeCtx, ws, execChStdout, out); err != nil {
+						if !errors.Is(err, context.Canceled) {
+							l.Debug().Err(err).Msg("exec/ws: WS write failed")
+						}
+						return
+					}
 				}
+				if out := d.GetStderr(); len(out) > 0 {
+					if err := writeExecData(bridgeCtx, ws, execChStderr, out); err != nil {
+						if !errors.Is(err, context.Canceled) {
+							l.Debug().Err(err).Msg("exec/ws: WS write failed")
+						}
+						return
+					}
+				}
+				continue
 			}
 			if e := msg.GetEnd(); e != nil {
 				code := e.GetExitCode()
-				ev.ExitCode = &code
-				ev.Finished = true
-				send = true
-			}
-			if !send {
-				continue
-			}
-			if err := writeExecEvent(bridgeCtx, ws, &ev); err != nil {
-				if !errors.Is(err, context.Canceled) {
-					l.Debug().Err(err).Msg("exec/ws: WS write failed")
+				if err := writeExecEvent(bridgeCtx, ws, &execWSEvent{ExitCode: &code, Finished: true}); err != nil {
+					if !errors.Is(err, context.Canceled) {
+						l.Debug().Err(err).Msg("exec/ws: WS write failed")
+					}
+					return
 				}
-				return
-			}
-			if ev.Finished {
 				_ = ws.Close(websocket.StatusNormalClosure, "command exited")
 				return
 			}
@@ -289,7 +293,8 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	}()
 
 	// ------- client → boxd -------
-	// Binary frames are raw stdin; text frames are JSON control messages.
+	// Binary frames are channel-tagged I/O (channel 0 = stdin); text frames are
+	// JSON control messages.
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -310,9 +315,12 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 			// frames (e.g. a signal). Acceptable for interactive stdin.
 			switch typ {
 			case websocket.MessageBinary:
+				if len(data) == 0 || data[0] != execChStdin {
+					continue // empty or unknown channel
+				}
 				if _, err := procClient.SendInput(bridgeCtx, connect.NewRequest(&pb.SendInputRequest{
 					Pid:  pid,
-					Data: data,
+					Data: data[1:],
 				})); err != nil {
 					l.Warn().Err(err).Msg("exec/ws: SendInput failed")
 				}
@@ -337,14 +345,6 @@ func (h *Handler) handleExecControl(ctx context.Context, client boxdpbconnect.Pr
 	}
 
 	switch msg.Type {
-	case "stdin":
-		if _, err := client.SendInput(ctx, connect.NewRequest(&pb.SendInputRequest{
-			Pid:  pid,
-			Data: []byte(msg.Data),
-		})); err != nil {
-			l.Warn().Err(err).Msg("exec/ws: stdin SendInput failed")
-		}
-
 	case "stdin_close":
 		if _, err := client.SendInput(ctx, connect.NewRequest(&pb.SendInputRequest{
 			Pid: pid,
@@ -382,8 +382,8 @@ func clientExecError(err error) (message, code string) {
 	return "the command failed to run", "exec_failed"
 }
 
-// writeExecEvent marshals an event and writes it as a single text frame,
-// bounded by writeWait so a slow client can't block the bridge forever.
+// writeExecEvent marshals a lifecycle event and writes it as a single text
+// frame, bounded by writeWait so a slow client can't block the bridge forever.
 func writeExecEvent(ctx context.Context, ws *websocket.Conn, ev *execWSEvent) error {
 	raw, err := json.Marshal(ev)
 	if err != nil {
@@ -392,4 +392,15 @@ func writeExecEvent(ctx context.Context, ws *websocket.Conn, ev *execWSEvent) er
 	wctx, cancel := context.WithTimeout(ctx, writeWait)
 	defer cancel()
 	return ws.Write(wctx, websocket.MessageText, raw)
+}
+
+// writeExecData writes one output chunk as a binary frame prefixed with its
+// channel byte, keeping bytes exact end to end.
+func writeExecData(ctx context.Context, ws *websocket.Conn, channel byte, data []byte) error {
+	frame := make([]byte, 1+len(data))
+	frame[0] = channel
+	copy(frame[1:], data)
+	wctx, cancel := context.WithTimeout(ctx, writeWait)
+	defer cancel()
+	return ws.Write(wctx, websocket.MessageBinary, frame)
 }

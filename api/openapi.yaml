@@ -433,15 +433,19 @@ paths:
         Connect with two `Sec-WebSocket-Protocol` values: `superserve.exec.v1`
         and `token.<access-token>`.
 
+        I/O rides binary frames prefixed with a one-byte channel, so output is
+        byte-exact; lifecycle and control ride text JSON frames.
+
         - First frame (text): an `ExecRequest` JSON object. Omitting `timeout_s`
           runs with no per-command timeout.
-        - Client frames: a binary frame is stdin; a text frame is JSON control —
-          `{"type":"stdin","data":"..."}`, `{"type":"stdin_close"}`, or
-          `{"type":"signal","name":"SIGINT"}`. Frames are capped at 64 KiB, so
-          chunk larger stdin.
-        - Server frames (text): `ExecStreamEvent` JSON — `{"stdout":"..."}`,
-          `{"stderr":"..."}`, then `{"exit_code":N,"finished":true}`. Closes on
-          exit.
+        - Client frames: a binary frame is stdin, prefixed with channel `0x00`
+          (`[0x00][bytes]`); a text frame is JSON control —
+          `{"type":"stdin_close"}` or `{"type":"signal","name":"SIGINT"}`.
+          Frames are capped at 64 KiB, so chunk larger stdin.
+        - Server frames: a binary frame is output, prefixed with its channel
+          (`0x01` stdout, `0x02` stderr); a text frame is JSON lifecycle —
+          `{"exit_code":N,"finished":true}`, or `{"error":"...","code":"..."}`.
+          Closes on exit.
       responses:
         "101":
           description: Switching Protocols — the WebSocket is established.

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,9 +23,9 @@ import (
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 )
 
-// pushStdout / pushStderr enqueue non-PTY data events — these become JSON
-// text frames on the exec/ws client side. (pushStart/pushEnd/inputs/signals
-// live on fakeProcessService in terminal_test.go.)
+// pushStdout / pushStderr enqueue non-PTY data events — these become
+// channel-tagged binary frames on the exec/ws client side. (pushStart/pushEnd/
+// inputs/signals live on fakeProcessService in terminal_test.go.)
 func (f *fakeProcessService) pushStdout(data []byte) {
 	f.events <- &pb.ProcessEvent{Event: &pb.ProcessEvent_Data{
 		Data: &pb.DataEvent{Output: &pb.DataEvent_Stdout{Stdout: data}},
@@ -117,6 +118,23 @@ func (e *execWSTestEnv) readEvent(ctx context.Context) execWSEvent {
 	return ev
 }
 
+// readData reads one binary output frame and returns its channel byte and
+// payload. Fails if the next frame isn't binary.
+func (e *execWSTestEnv) readData(ctx context.Context) (byte, []byte) {
+	e.t.Helper()
+	typ, data, err := e.clientWS.Read(ctx)
+	if err != nil {
+		e.t.Fatalf("client read: %v", err)
+	}
+	if typ != websocket.MessageBinary {
+		e.t.Fatalf("frame type = %v, want Binary", typ)
+	}
+	if len(data) == 0 {
+		e.t.Fatalf("binary frame missing channel byte")
+	}
+	return data[0], data[1:]
+}
+
 func TestExecWS_StdoutForwarded(t *testing.T) {
 	env := newExecWSTestEnv(t)
 	env.sendStart(7, "echo hi")
@@ -124,12 +142,31 @@ func TestExecWS_StdoutForwarded(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	ev := env.readEvent(ctx)
-	if ev.Stdout != "hello\n" {
-		t.Errorf("stdout = %q, want %q", ev.Stdout, "hello\n")
+	ch, payload := env.readData(ctx)
+	if ch != execChStdout {
+		t.Errorf("channel = %d, want %d (stdout)", ch, execChStdout)
 	}
-	if ev.Stderr != "" || ev.Finished {
-		t.Errorf("unexpected fields on stdout event: %+v", ev)
+	if string(payload) != "hello\n" {
+		t.Errorf("stdout = %q, want %q", payload, "hello\n")
+	}
+}
+
+// TestExecWS_BinaryStdoutIsByteExact guards the whole point of the binary
+// framing: non-UTF-8 output survives the round trip unmangled.
+func TestExecWS_BinaryStdoutIsByteExact(t *testing.T) {
+	env := newExecWSTestEnv(t)
+	env.sendStart(7, "cat image.png")
+	raw := []byte{0x00, 0xff, 0xfe, 0x80, 0x01}
+	env.fake.pushStdout(raw)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ch, payload := env.readData(ctx)
+	if ch != execChStdout {
+		t.Errorf("channel = %d, want %d (stdout)", ch, execChStdout)
+	}
+	if !bytes.Equal(payload, raw) {
+		t.Errorf("stdout = %v, want %v (binary must be byte-exact)", payload, raw)
 	}
 }
 
@@ -140,9 +177,12 @@ func TestExecWS_StderrForwarded(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	ev := env.readEvent(ctx)
-	if ev.Stderr != "no such file\n" {
-		t.Errorf("stderr = %q, want %q", ev.Stderr, "no such file\n")
+	ch, payload := env.readData(ctx)
+	if ch != execChStderr {
+		t.Errorf("channel = %d, want %d (stderr)", ch, execChStderr)
+	}
+	if string(payload) != "no such file\n" {
+		t.Errorf("stderr = %q, want %q", payload, "no such file\n")
 	}
 }
 
@@ -172,7 +212,8 @@ func TestExecWS_BinaryFrameIsStdin(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := env.clientWS.Write(ctx, websocket.MessageBinary, []byte("piped input")); err != nil {
+	// Stdin rides channel 0; the payload follows the channel byte.
+	if err := env.clientWS.Write(ctx, websocket.MessageBinary, append([]byte{execChStdin}, "piped input"...)); err != nil {
 		t.Fatalf("client write: %v", err)
 	}
 
@@ -192,21 +233,12 @@ func TestExecWS_BinaryFrameIsStdin(t *testing.T) {
 	}
 }
 
-func TestExecWS_StdinControlAndClose(t *testing.T) {
+func TestExecWS_StdinClose(t *testing.T) {
 	env := newExecWSTestEnv(t)
 	env.sendStart(7, "cat")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-
-	// {type:"stdin"} writes to stdin without EOF.
-	if err := env.clientWS.Write(ctx, websocket.MessageText, []byte(`{"type":"stdin","data":"hi there"}`)); err != nil {
-		t.Fatalf("write stdin: %v", err)
-	}
-	got := <-env.fake.inputs
-	if string(got.Data) != "hi there" || got.Eof {
-		t.Errorf("stdin control = %+v, want data=%q eof=false", got, "hi there")
-	}
 
 	// {type:"stdin_close"} sends EOF.
 	if err := env.clientWS.Write(ctx, websocket.MessageText, []byte(`{"type":"stdin_close"}`)); err != nil {
@@ -316,15 +348,14 @@ func TestServeExecWS_ForeignOriginAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if typ != websocket.MessageText {
-		t.Fatalf("frame type = %v, want Text", typ)
+	if typ != websocket.MessageBinary {
+		t.Fatalf("frame type = %v, want Binary", typ)
 	}
-	var ev execWSEvent
-	if err := json.Unmarshal(data, &ev); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	if len(data) == 0 || data[0] != execChStdout {
+		t.Fatalf("frame channel = %v, want stdout", data)
 	}
-	if ev.Stdout != "from a foreign origin\n" {
-		t.Errorf("stdout = %q, want %q", ev.Stdout, "from a foreign origin\n")
+	if string(data[1:]) != "from a foreign origin\n" {
+		t.Errorf("stdout = %q, want %q", data[1:], "from a foreign origin\n")
 	}
 }
 
@@ -346,9 +377,9 @@ func TestExecWS_PingKeepsLiveSessionAlive(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	ev := env.readEvent(ctx)
-	if ev.Stdout != "still here\n" {
-		t.Errorf("stdout = %q, want %q (session should survive pings)", ev.Stdout, "still here\n")
+	ch, payload := env.readData(ctx)
+	if ch != execChStdout || string(payload) != "still here\n" {
+		t.Errorf("got channel %d %q, want stdout %q (session should survive pings)", ch, payload, "still here\n")
 	}
 }
 

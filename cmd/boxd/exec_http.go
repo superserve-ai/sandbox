@@ -115,7 +115,7 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	if err := s.runProcess(r.Context(), req.toStartRequest(), emit); err != nil {
+	if err := s.runProcess(r.Context(), req.toStartRequest(), emit, false); err != nil {
 		writeRunError(w, err)
 		return
 	}
@@ -213,7 +213,7 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 		return nil
 	}
 
-	if err := s.runProcess(r.Context(), req.toStartRequest(), emit); err != nil {
+	if err := s.runProcess(r.Context(), req.toStartRequest(), emit, false); err != nil {
 		errEvent, _ := json.Marshal(map[string]any{
 			"error":    err.Error(),
 			"code":     runErrorCode(err),
