@@ -437,7 +437,8 @@ paths:
           runs with no per-command timeout.
         - Client frames: a binary frame is stdin; a text frame is JSON control —
           `{"type":"stdin","data":"..."}`, `{"type":"stdin_close"}`, or
-          `{"type":"signal","name":"SIGINT"}`.
+          `{"type":"signal","name":"SIGINT"}`. Frames are capped at 64 KiB, so
+          chunk larger stdin.
         - Server frames (text): `ExecStreamEvent` JSON — `{"stdout":"..."}`,
           `{"stderr":"..."}`, then `{"exit_code":N,"finished":true}`. Closes on
           exit.

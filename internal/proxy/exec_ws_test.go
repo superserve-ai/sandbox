@@ -96,8 +96,8 @@ func (e *execWSTestEnv) sendStart(pid uint32, command string) {
 	if err := e.clientWS.Write(ctx, websocket.MessageText, []byte(`{"command":`+string(cmd)+`}`)); err != nil {
 		e.t.Fatalf("send start: %v", err)
 	}
-	// Give the bridge a moment to consume the start frame + StartEvent and
-	// enter the pump loop before the test drives traffic.
+	// Let the bridge consume the start frame + StartEvent and enter the pump
+	// loop before the test drives traffic.
 	time.Sleep(100 * time.Millisecond)
 }
 

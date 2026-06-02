@@ -36,6 +36,11 @@ const (
 // output, so a quiet-but-running command isn't cut. A var so tests can shorten it.
 var execPingInterval = 30 * time.Second
 
+// firstFrameWait bounds how long we wait for the client's start frame before
+// giving up, so a connection that upgrades but never sends one can't pin a
+// goroutine.
+const firstFrameWait = 10 * time.Second
+
 // execWSStart is the first (text) frame: the command to run. Mirrors the
 // /exec request body so one payload shape works across all transports.
 type execWSStart struct {
@@ -154,9 +159,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	defer cancel()
 
 	// The first frame must be a JSON start message naming the command.
-	// Bound the wait so a client that connects but never sends one doesn't
-	// pin a goroutine.
-	readCtx, readCancel := context.WithTimeout(bridgeCtx, writeWait)
+	readCtx, readCancel := context.WithTimeout(bridgeCtx, firstFrameWait)
 	typ, raw, err := ws.Read(readCtx)
 	readCancel()
 	if err != nil {
@@ -208,8 +211,11 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	// Liveness: ping the client; a missed pong (within writeWait) tears down.
 	// Decoupled from output, so a quiet-but-running command isn't cut. Ping is
 	// safe alongside the writer and needs the read pump below to receive pongs.
+	// Read the interval once here (not in the goroutine) so tests can override
+	// the package var without racing the bridge's goroutines.
+	pingInterval := execPingInterval
 	go func() {
-		ticker := time.NewTicker(execPingInterval)
+		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -304,6 +310,11 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 				return
 			}
 
+			// SendInput is synchronous and preserves stdin order. If the
+			// process stops draining stdin its pipe fills and SendInput
+			// blocks, parking this pump and delaying any control frame (e.g. a
+			// signal) queued behind it. Acceptable: interactive stdin is small
+			// and drained promptly — same trade-off as the terminal bridge.
 			switch typ {
 			case websocket.MessageBinary:
 				if _, err := procClient.SendInput(bridgeCtx, connect.NewRequest(&pb.SendInputRequest{
