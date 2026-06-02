@@ -703,7 +703,14 @@ func (s *processService) Signal(ctx context.Context, req *connect.Request[pb.Sig
 	}
 
 	sig := syscall.Signal(req.Msg.GetSignal())
-	if err := proc.cmd.Process.Signal(sig); err != nil {
+	// Non-PTY commands are their own process group (Setpgid), so signal the
+	// group — otherwise a child like `sleep` under `sh -c` survives. PTY keeps
+	// direct delivery.
+	if proc.tty == nil {
+		if err := syscall.Kill(-proc.cmd.Process.Pid, sig); err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+	} else if err := proc.cmd.Process.Signal(sig); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 

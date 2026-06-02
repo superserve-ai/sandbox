@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -75,5 +76,47 @@ func TestSendInput_NonPTYStdin(t *testing.T) {
 	mu.Unlock()
 	if got != "hello stdin\n" {
 		t.Errorf("stdout = %q, want %q", got, "hello stdin\n")
+	}
+}
+
+// TestSignal_TerminatesShellCommand guards that Signal terminates a non-PTY
+// shell-wrapped command. Delivery to a forked child (vs the shell leader) is
+// covered by the staging e2e check.
+func TestSignal_TerminatesShellCommand(t *testing.T) {
+	s := newProcessService()
+	pidCh := make(chan uint32, 1)
+	emit := func(ev *pb.ProcessEvent) error {
+		if st := ev.GetStart(); st != nil {
+			pidCh <- st.GetPid()
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.runProcess(context.Background(), &pb.StartRequest{
+			Cmd: "/bin/sh", Args: []string{"-c", "sleep 30"}, Cwd: "/tmp",
+		}, emit)
+	}()
+
+	var pid uint32
+	select {
+	case pid = <-pidCh:
+	case err := <-done:
+		t.Fatalf("runProcess returned before StartEvent: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for StartEvent")
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := s.Signal(context.Background(), connect.NewRequest(&pb.SignalRequest{
+		Pid: pid, Signal: int32(syscall.SIGTERM),
+	})); err != nil {
+		t.Fatalf("Signal: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGTERM did not terminate the command")
 	}
 }
