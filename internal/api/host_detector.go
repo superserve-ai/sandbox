@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 const (
@@ -27,6 +28,7 @@ const (
 // marks active hosts as unhealthy when their heartbeat goes stale.
 // Blocks until ctx is cancelled.
 func StartHostDetector(ctx context.Context, queries *db.Queries) {
+	defer sentrylog.RecoverAndCapture("host-detector")
 	log.Info().
 		Dur("timeout", heartbeatTimeout).
 		Dur("interval", detectorInterval).

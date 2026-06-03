@@ -36,6 +36,10 @@ type Config struct {
 	// "no system team configured" and users see only their own templates.
 	// Must be a valid UUID matching an existing team row.
 	SystemTeamID string
+
+	// SentryDSN is the Sentry data source name for error reporting.
+	// Loaded from SENTRY_DSN; empty disables Sentry.
+	SentryDSN string
 }
 
 // Load reads configuration from environment variables.
@@ -61,6 +65,7 @@ func Load() (*Config, error) {
 		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
 		SystemTeamID:           os.Getenv("SYSTEM_TEAM_ID"),
+		SentryDSN:              os.Getenv("SENTRY_DSN"),
 	}
 	return cfg, nil
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // ReaperConfig controls the timeout reaper loop.
@@ -52,6 +53,7 @@ func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
+	defer sentrylog.RecoverAndCapture("reaper")
 	parallelism := cfg.Parallelism
 	if parallelism <= 0 {
 		parallelism = 10

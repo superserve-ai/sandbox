@@ -26,6 +26,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -120,6 +121,7 @@ func (s *BuildSupervisor) Start(ctx context.Context) {
 }
 
 func (s *BuildSupervisor) loop(ctx context.Context) {
+	defer sentrylog.RecoverAndCapture("build-supervisor")
 	s.log.Info().
 		Dur("interval", s.cfg.Interval).
 		Int32("batch_size", s.cfg.BatchSize).
@@ -514,6 +516,7 @@ func specStepsToVMD(steps []builder.BuildStep) []vmdclient.BuildStep {
 // reconcileLoop runs the orphan-builds reconciler on its own cadence,
 // decoupled from per-build dispatch.
 func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
+	defer sentrylog.RecoverAndCapture("build-supervisor-reconcile")
 	t := time.NewTicker(s.cfg.ReconcileInterval)
 	defer t.Stop()
 	s.reconcileOrphanBuilds(ctx)

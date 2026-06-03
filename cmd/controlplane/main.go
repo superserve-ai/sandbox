@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
@@ -49,8 +51,11 @@ const vmdRetryServiceConfig = `{
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
-		With().Timestamp().Caller().Logger()
+	multi := zerolog.MultiLevelWriter(
+		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
+		&sentrylog.Writer{},
+	)
+	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
 
 	if err := run(); err != nil {
 		log.Fatal().Err(err).Msg("controlplane exited with error")
@@ -63,6 +68,14 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	log.Info().Str("port", cfg.Port).Str("vmd_address", cfg.VMDAddress).Msg("configuration loaded")
+
+	if cfg.SentryDSN != "" {
+		if err := sentry.Init(sentry.ClientOptions{Dsn: cfg.SentryDSN, EnableLogs: true}); err != nil {
+			return fmt.Errorf("sentry init: %w", err)
+		}
+		defer sentry.Flush(2 * time.Second)
+		log.Info().Msg("sentry initialized")
+	}
 
 	// Root context — cancelled on shutdown so background goroutines
 	// (rate limiter cleanup, etc.) exit cleanly.

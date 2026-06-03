@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/gin-gonic/gin"
+	sentrygin "github.com/getsentry/sentry-go/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,6 +21,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		SecurityHeaders(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),
+		sentrygin.New(sentrygin.Options{Repanic: true}),
 		ErrorHandler(),
 	)
 
