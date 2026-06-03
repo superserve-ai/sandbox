@@ -412,6 +412,48 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /exec/connect:
+    servers:
+      - url: https://sandbox.superserve.ai
+        description: Shared host — send the sandbox ID in `X-Superserve-Sandbox-Id`.
+      - url: https://boxd-{sandbox_id}.sandbox.superserve.ai
+        description: Per-sandbox host.
+        variables:
+          sandbox_id:
+            default: ""
+            description: The sandbox ID.
+    get:
+      operationId: execConnect
+      tags: [Exec]
+      summary: Run a command over a WebSocket
+      description: |
+        Runs a command over a WebSocket, streaming output back and accepting
+        stdin over one connection.
+
+        Connect with two `Sec-WebSocket-Protocol` values: `superserve.exec.v1`
+        and `token.<access-token>`.
+
+        I/O rides binary frames prefixed with a one-byte channel, so output is
+        byte-exact; lifecycle and control ride text JSON frames.
+
+        - First frame (text): an `ExecRequest` JSON object. Omitting `timeout_s`
+          runs with no per-command timeout.
+        - Client frames: a binary frame is stdin, prefixed with channel `0x00`
+          (`[0x00][bytes]`); a text frame is JSON control —
+          `{"type":"stdin_close"}` or `{"type":"signal","name":"SIGINT"}`.
+          Frames are capped at 64 KiB, so chunk larger stdin.
+        - Server frames: a binary frame is output, prefixed with its channel
+          (`0x01` stdout, `0x02` stderr); a text frame is JSON lifecycle —
+          `{"exit_code":N,"finished":true}`, or `{"error":"...","code":"..."}`.
+          Closes on exit.
+      responses:
+        "101":
+          description: Switching Protocols — the WebSocket is established.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /files:
     servers:
       - url: https://sandbox.superserve.ai

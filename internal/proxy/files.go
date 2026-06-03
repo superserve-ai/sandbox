@@ -77,6 +77,8 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 		h.serveExec(w, r, instanceID)
 	case execStreamPath:
 		h.serveExecStream(w, r, instanceID)
+	case execConnectPath:
+		h.serveExecWS(w, r, instanceID)
 	default:
 		http.NotFound(w, r)
 	}
@@ -121,7 +123,6 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	}
-
 
 	// Path traversal rejection. boxd's own safePath runs filepath.Clean,
 	// which silently resolves `..` segments instead of refusing them —
@@ -221,4 +222,3 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	}
 	rp.ServeHTTP(w, r)
 }
-

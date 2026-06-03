@@ -14,7 +14,8 @@ import (
 // dataPlaneSpecPaths are documented in the spec but served by boxd, not the
 // control-plane router, so they have no route here.
 var dataPlaneSpecPaths = map[string]bool{
-	"/files": true,
+	"/files":        true,
+	"/exec/connect": true,
 }
 
 // TestOpenAPISpecMatchesRoutes fails if a registered route is missing from

@@ -69,19 +69,19 @@ func main() {
 	}()
 
 	err := runBuild(ctx, buildConfig{
-		templateID: *templateID,
-		buildID:    *buildID,
-		spec:       spec,
-		vcpu:       uint32(*vcpu),
-		memoryMiB:  uint32(*memory),
-		diskMiB:    uint32(*disk),
-		runDir:     *runDir,
+		templateID:  *templateID,
+		buildID:     *buildID,
+		spec:        spec,
+		vcpu:        uint32(*vcpu),
+		memoryMiB:   uint32(*memory),
+		diskMiB:     uint32(*disk),
+		runDir:      *runDir,
 		snapshotDir: *snapshotDir,
-		kernelPath: *kernelPath,
-		fcBin:      *fcBin,
-		boxdBin:    *boxdBin,
-		hostIface:  *hostIface,
-		slotIndex:  *slotIndex,
+		kernelPath:  *kernelPath,
+		fcBin:       *fcBin,
+		boxdBin:     *boxdBin,
+		hostIface:   *hostIface,
+		slotIndex:   *slotIndex,
 	})
 	if err != nil {
 		// Emit a user-visible error (stable code + user-friendly message)
@@ -559,6 +559,8 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec)
 			"TERM":  "xterm",
 			"LANG":  "C.UTF-8",
 			"SHELL": "/bin/sh",
+			// Builds are non-interactive; keep apt/debconf from prompting.
+			"DEBIAN_FRONTEND": "noninteractive",
 		},
 	}
 

@@ -31,7 +31,11 @@ type StartRequest struct {
 	TimeoutMs uint32                 `protobuf:"varint,6,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"` // 0 = no timeout.
 	// User to run the command as. Empty falls back to boxd's default user
 	// (set by the template or root).
-	User          string `protobuf:"bytes,7,opt,name=user,proto3" json:"user,omitempty"`
+	User string `protobuf:"bytes,7,opt,name=user,proto3" json:"user,omitempty"`
+	// Attach a stdin pipe so SendInput can feed the process (interactive).
+	// False leaves stdin at /dev/null (immediate EOF), so non-interactive
+	// tooling like apt/debconf doesn't block on a prompt.
+	Stdin         bool `protobuf:"varint,8,opt,name=stdin,proto3" json:"stdin,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -113,6 +117,13 @@ func (x *StartRequest) GetUser() string {
 		return x.User
 	}
 	return ""
+}
+
+func (x *StartRequest) GetStdin() bool {
+	if x != nil {
+		return x.Stdin
+	}
+	return false
 }
 
 type PtyConfig struct {
@@ -572,9 +583,12 @@ func (*KeepAlive) Descriptor() ([]byte, []int) {
 }
 
 type SendInputRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Pid           uint32                 `protobuf:"varint,1,opt,name=pid,proto3" json:"pid,omitempty"`
-	Data          []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Pid   uint32                 `protobuf:"varint,1,opt,name=pid,proto3" json:"pid,omitempty"`
+	Data  []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	// When true, close the process's stdin after writing data, signalling EOF.
+	// Applies to non-PTY processes; ignored in PTY mode.
+	Eof           bool `protobuf:"varint,3,opt,name=eof,proto3" json:"eof,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -621,6 +635,13 @@ func (x *SendInputRequest) GetData() []byte {
 		return x.Data
 	}
 	return nil
+}
+
+func (x *SendInputRequest) GetEof() bool {
+	if x != nil {
+		return x.Eof
+	}
+	return false
 }
 
 type SendInputResponse struct {
@@ -1355,7 +1376,7 @@ var File_proto_boxd_proto protoreflect.FileDescriptor
 
 const file_proto_boxd_proto_rawDesc = "" +
 	"\n" +
-	"\x10proto/boxd.proto\x12\x12superserve.boxd.v1\"\xa3\x02\n" +
+	"\x10proto/boxd.proto\x12\x12superserve.boxd.v1\"\xb9\x02\n" +
 	"\fStartRequest\x12\x10\n" +
 	"\x03cmd\x18\x01 \x01(\tR\x03cmd\x12\x12\n" +
 	"\x04args\x18\x02 \x03(\tR\x04args\x12>\n" +
@@ -1364,7 +1385,8 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\x03pty\x18\x05 \x01(\v2\x1d.superserve.boxd.v1.PtyConfigR\x03pty\x12\x1d\n" +
 	"\n" +
 	"timeout_ms\x18\x06 \x01(\rR\ttimeoutMs\x12\x12\n" +
-	"\x04user\x18\a \x01(\tR\x04user\x1a7\n" +
+	"\x04user\x18\a \x01(\tR\x04user\x12\x14\n" +
+	"\x05stdin\x18\b \x01(\bR\x05stdin\x1a7\n" +
 	"\tEnvsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"A\n" +
@@ -1392,10 +1414,11 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\x06exited\x18\x02 \x01(\bR\x06exited\x12\x16\n" +
 	"\x06status\x18\x03 \x01(\tR\x06status\x12\x14\n" +
 	"\x05error\x18\x04 \x01(\tR\x05error\"\v\n" +
-	"\tKeepAlive\"8\n" +
+	"\tKeepAlive\"J\n" +
 	"\x10SendInputRequest\x12\x10\n" +
 	"\x03pid\x18\x01 \x01(\rR\x03pid\x12\x12\n" +
-	"\x04data\x18\x02 \x01(\fR\x04data\"\x13\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\x12\x10\n" +
+	"\x03eof\x18\x03 \x01(\bR\x03eof\"\x13\n" +
 	"\x11SendInputResponse\"W\n" +
 	"\rResizeRequest\x12\x10\n" +
 	"\x03pid\x18\x01 \x01(\rR\x03pid\x124\n" +

@@ -180,8 +180,9 @@ func setHostname(name string) error {
 // ---------------------------------------------------------------------------
 
 type runningProcess struct {
-	cmd *exec.Cmd
-	tty *os.File // nil for non-PTY processes.
+	cmd   *exec.Cmd
+	tty   *os.File       // nil for non-PTY processes.
+	stdin io.WriteCloser // stdin pipe for non-PTY processes; nil in PTY mode.
 }
 
 // sandboxContext holds the sandbox-level state that persists across exec
@@ -330,10 +331,11 @@ func resolveUser(name string) (*user.User, *syscall.Credential, error) {
 type eventEmitter func(*pb.ProcessEvent) error
 
 func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
-	return s.runProcess(ctx, req.Msg, stream.Send)
+	// Only the interactive bridge sets stdin; build steps and execs leave it off.
+	return s.runProcess(ctx, req.Msg, stream.Send, req.Msg.GetStdin())
 }
 
-func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, emit eventEmitter) error {
+func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, emit eventEmitter, wantStdin bool) error {
 	cmdName := msg.GetCmd()
 	if cmdName == "" {
 		cmdName = defaultShell
@@ -419,7 +421,7 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		cmd.WaitDelay = time.Second
-		return s.startPipes(ctx, cmd, emit, &timedOut)
+		return s.startPipes(ctx, cmd, emit, &timedOut, wantStdin)
 	}
 	return s.startPTY(ctx, cmd, msg, emit, &timedOut)
 }
@@ -514,7 +516,7 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	})
 }
 
-func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eventEmitter, timedOut *atomic.Bool) error {
+func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eventEmitter, timedOut *atomic.Bool, wantStdin bool) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)
@@ -524,12 +526,23 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		return connect.NewError(connect.CodeInternal, err)
 	}
 
+	// Only open a stdin pipe when the caller can feed it (the streaming RPC).
+	// Otherwise leave cmd.Stdin nil so the child reads /dev/null and sees EOF
+	// immediately, instead of blocking on a pipe nobody will close.
+	var stdin io.WriteCloser
+	if wantStdin {
+		stdin, err = cmd.StdinPipe()
+		if err != nil {
+			return connect.NewError(connect.CodeInternal, err)
+		}
+	}
+
 	if err := cmd.Start(); err != nil {
 		return connect.NewError(connect.CodeInternal, err)
 	}
 
 	pid := uint32(cmd.Process.Pid)
-	s.processes.Store(pid, &runningProcess{cmd: cmd})
+	s.processes.Store(pid, &runningProcess{cmd: cmd, stdin: stdin})
 	defer s.processes.Delete(pid)
 
 	if err := emit(&pb.ProcessEvent{
@@ -633,9 +646,26 @@ func (s *processService) SendInput(ctx context.Context, req *connect.Request[pb.
 	}
 	proc := val.(*runningProcess)
 
+	// PTY mode: input goes to the terminal master; EOF is ignored.
 	if proc.tty != nil {
 		if _, err := proc.tty.Write(req.Msg.GetData()); err != nil {
 			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		return connect.NewResponse(&pb.SendInputResponse{}), nil
+	}
+
+	// Non-PTY: write to the process's stdin pipe, then optionally close it
+	// to signal EOF.
+	if proc.stdin != nil {
+		if data := req.Msg.GetData(); len(data) > 0 {
+			if _, err := proc.stdin.Write(data); err != nil {
+				return nil, connect.NewError(connect.CodeInternal, err)
+			}
+		}
+		if req.Msg.GetEof() {
+			if err := proc.stdin.Close(); err != nil {
+				return nil, connect.NewError(connect.CodeInternal, err)
+			}
 		}
 	}
 
@@ -677,7 +707,14 @@ func (s *processService) Signal(ctx context.Context, req *connect.Request[pb.Sig
 	}
 
 	sig := syscall.Signal(req.Msg.GetSignal())
-	if err := proc.cmd.Process.Signal(sig); err != nil {
+	// Non-PTY commands are their own process group (Setpgid), so signal the
+	// group — otherwise a child like `sleep` under `sh -c` survives. PTY keeps
+	// direct delivery.
+	if proc.tty == nil {
+		if err := syscall.Kill(-proc.cmd.Process.Pid, sig); err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+	} else if err := proc.cmd.Process.Signal(sig); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
