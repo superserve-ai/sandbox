@@ -76,10 +76,34 @@ jobs:
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
-      - name: Verify
+      # Cloud Run only auto-routes to the new revision while traffic tracks
+      # "latest"; force it so a leftover pin can't keep prod on the old one.
+      - name: Route traffic to the new revision
         run: |
-          URL=$(gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE }} --region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }} --format 'value(status.url)')
-          curl -sf "$URL/health"
+          SVC=${{ vars.CLOUD_RUN_SERVICE }}
+          ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
+          if [ "$SERVING" != "$LATEST" ]; then
+            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
+          fi
+          gcloud run services update-traffic $SVC --to-latest $ARGS
+
+      # A plain /health curl hits whatever serves traffic, so confirm the
+      # just-deployed revision is the one actually at 100%.
+      - name: Verify latest revision serves traffic
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE }}
+          ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
+          if [ "$PCT" != "100" ]; then
+            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
+            exit 1
+          fi
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
 
   deploy-production:
     if: github.event_name == 'push' || github.event.inputs.environment == 'production'
@@ -118,7 +142,31 @@ jobs:
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
-      - name: Verify
+      # Cloud Run only auto-routes to the new revision while traffic tracks
+      # "latest"; force it so a leftover pin can't keep prod on the old one.
+      - name: Route traffic to the new revision
         run: |
-          URL=$(gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE }} --region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }} --format 'value(status.url)')
-          curl -sf "$URL/health"
+          SVC=${{ vars.CLOUD_RUN_SERVICE }}
+          ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
+          if [ "$SERVING" != "$LATEST" ]; then
+            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
+          fi
+          gcloud run services update-traffic $SVC --to-latest $ARGS
+
+      # A plain /health curl hits whatever serves traffic, so confirm the
+      # just-deployed revision is the one actually at 100%.
+      - name: Verify latest revision serves traffic
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE }}
+          ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
+          if [ "$PCT" != "100" ]; then
+            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
+            exit 1
+          fi
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
