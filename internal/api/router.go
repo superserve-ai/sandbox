@@ -21,8 +21,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		SecurityHeaders(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),
-		sentrygin.New(sentrygin.Options{Repanic: true}),
 		ErrorHandler(),
+		sentrygin.New(sentrygin.Options{Repanic: true}),
 	)
 
 	api := r.Group("/")
