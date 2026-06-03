@@ -94,6 +94,7 @@ func (s *execWSStart) toStartRequest() *pb.StartRequest {
 		Envs:      s.Env,
 		Cwd:       s.WorkingDir,
 		TimeoutMs: timeoutMs,
+		Stdin:     true, // interactive
 	}
 }
 

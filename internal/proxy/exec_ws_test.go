@@ -135,6 +135,14 @@ func (e *execWSTestEnv) readData(ctx context.Context) (byte, []byte) {
 	return data[0], data[1:]
 }
 
+// TestExecWSStart_RequestsStdin guards that the WS bridge requests an
+// interactive stdin pipe (build steps and one-shot execs don't).
+func TestExecWSStart_RequestsStdin(t *testing.T) {
+	if got := (&execWSStart{Command: "cat"}).toStartRequest().GetStdin(); !got {
+		t.Errorf("toStartRequest().Stdin = false, want true (interactive)")
+	}
+}
+
 func TestExecWS_StdoutForwarded(t *testing.T) {
 	env := newExecWSTestEnv(t)
 	env.sendStart(7, "echo hi")

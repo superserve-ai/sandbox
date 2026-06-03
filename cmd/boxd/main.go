@@ -331,8 +331,8 @@ func resolveUser(name string) (*user.User, *syscall.Credential, error) {
 type eventEmitter func(*pb.ProcessEvent) error
 
 func (s *processService) Start(ctx context.Context, req *connect.Request[pb.StartRequest], stream *connect.ServerStream[pb.ProcessEvent]) error {
-	// Interactive: gets a stdin pipe for SendInput (one-shot /exec passes false).
-	return s.runProcess(ctx, req.Msg, stream.Send, true)
+	// Only the interactive bridge sets stdin; build steps and execs leave it off.
+	return s.runProcess(ctx, req.Msg, stream.Send, req.Msg.GetStdin())
 }
 
 func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, emit eventEmitter, wantStdin bool) error {
