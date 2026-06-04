@@ -3,6 +3,8 @@ package vm
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -181,25 +183,67 @@ func (m *Manager) cancelBuildRecord(buildVMID string, reason string) (BuildStatu
 	return prev, true
 }
 
-// GetBuildStatus returns the read-only snapshot of a build's state. Returns
-// false when the build ID is unknown — the supervisor maps that to "vmd
-// has no record, build is effectively gone."
+// GetBuildStatus returns a build's state from the in-memory registry, falling
+// back to on-disk artifacts when memory has no record (e.g. after a vmd
+// restart) so a completed build is never reported as lost.
 func (m *Manager) GetBuildStatus(buildVMID string) (BuildStatusSnapshot, bool) {
 	m.buildsMu.RLock()
-	defer m.buildsMu.RUnlock()
 	rec, ok := m.builds[buildVMID]
-	if !ok {
+	if ok {
+		snap := BuildStatusSnapshot{
+			BuildVMID:  rec.BuildVMID,
+			TemplateID: rec.TemplateID,
+			Status:     rec.Status,
+			Result:     rec.Result,
+			Error:      rec.Error,
+			StartedAt:  rec.StartedAt,
+			EndedAt:    rec.EndedAt,
+		}
+		m.buildsMu.RUnlock()
+		return snap, true
+	}
+	m.buildsMu.RUnlock()
+	// Not in memory — consult durable artifacts on disk (no lock held).
+	return loadDurableBuild(m.cfg.SnapshotDir, buildVMID)
+}
+
+// loadDurableBuild adopts a completed build from its on-disk artifacts. To
+// avoid adopting a half-written build, it returns ready only when
+// build.meta.json parses and every artifact file it references exists.
+func loadDurableBuild(snapshotRoot, buildVMID string) (BuildStatusSnapshot, bool) {
+	matches, err := filepath.Glob(filepath.Join(snapshotRoot, TemplatesDirName, "*", buildVMID, "build.meta.json"))
+	if err != nil || len(matches) != 1 {
+		return BuildStatusSnapshot{}, false
+	}
+	dir := filepath.Dir(matches[0])
+	res, err := readBuildMetaJSON(dir)
+	if err != nil || !buildArtifactsPresent(res) {
 		return BuildStatusSnapshot{}, false
 	}
 	return BuildStatusSnapshot{
-		BuildVMID:  rec.BuildVMID,
-		TemplateID: rec.TemplateID,
-		Status:     rec.Status,
-		Result:     rec.Result,
-		Error:      rec.Error,
-		StartedAt:  rec.StartedAt,
-		EndedAt:    rec.EndedAt,
+		BuildVMID:  buildVMID,
+		TemplateID: filepath.Base(filepath.Dir(dir)),
+		Status:     BuildStatusReady,
+		Result:     res,
 	}, true
+}
+
+// buildArtifactsPresent reports whether every file build.meta.json references
+// exists and is non-empty, with a real snapshot (snapshot + mem) present.
+func buildArtifactsPresent(r *BuildTemplateResult) bool {
+	if r == nil || r.SnapshotPath == "" || r.MemFilePath == "" {
+		return false
+	}
+	for _, p := range []string{r.SnapshotPath, r.MemFilePath, r.BasePath, r.DeltaPath, r.RootfsPath} {
+		if p == "" {
+			continue
+		}
+		fi, err := os.Stat(p)
+		if err != nil || fi.Size() == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // CancelBuild marks a build cancelled and signals its template-builder
