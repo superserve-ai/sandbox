@@ -105,8 +105,9 @@ func classifyBuildError(err error) (code, userMsg string) {
 	// Specific-cause cases must come before the broad "build rootfs" / "pull "
 	// match below, which would otherwise swallow them as registry failures.
 
-	case strings.Contains(raw, "flattened image exceeds"):
-		return "image_too_large", "image is too large for the requested disk_mib; increase disk_mib"
+	case strings.Contains(raw, "flattened image exceeds"),
+		strings.Contains(raw, "while populating file system"):
+		return "image_too_large", "image is too large for the requested disk; increase disk_mib or use a smaller base image"
 
 	case strings.Contains(raw, "parse image reference"):
 		return "bad_reference", "image reference is malformed; check the format like 'python:3.11' or 'ghcr.io/org/image:tag'"
