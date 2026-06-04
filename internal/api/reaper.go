@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // ReaperConfig controls the timeout reaper loop.
@@ -71,7 +72,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
-	h.reapOnce(ctx, cfg.BatchSize, parallelism)
+	sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 
 	for {
 		select {
@@ -79,7 +80,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			log.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
-			h.reapOnce(ctx, cfg.BatchSize, parallelism)
+			sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 		}
 	}
 }

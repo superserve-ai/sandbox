@@ -26,6 +26,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -135,7 +136,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.Interval)
 	defer ticker.Stop()
 
-	s.tick(ctx)
+	sentrylog.RunSafe("build-supervisor", func() { s.tick(ctx) })
 
 	for {
 		select {
@@ -143,7 +144,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 			s.log.Info().Msg("build supervisor exiting")
 			return
 		case <-ticker.C:
-			s.tick(ctx)
+			sentrylog.RunSafe("build-supervisor", func() { s.tick(ctx) })
 		}
 	}
 }
@@ -557,13 +558,13 @@ func specStepsToVMD(steps []builder.BuildStep) []vmdclient.BuildStep {
 func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
 	t := time.NewTicker(s.cfg.ReconcileInterval)
 	defer t.Stop()
-	s.reconcileOrphanBuilds(ctx)
+	sentrylog.RunSafe("build-supervisor-reconcile", func() { s.reconcileOrphanBuilds(ctx) })
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.reconcileOrphanBuilds(ctx)
+			sentrylog.RunSafe("build-supervisor-reconcile", func() { s.reconcileOrphanBuilds(ctx) })
 		}
 	}
 }
