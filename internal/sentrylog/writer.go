@@ -4,7 +4,6 @@ package sentrylog
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/getsentry/sentry-go"
 	"github.com/rs/zerolog"
@@ -58,20 +57,25 @@ func (w *Writer) WriteLevel(level zerolog.Level, p []byte) (int, error) {
 	return len(p), nil
 }
 
-// RecoverAndCapture should be deferred at the top of critical background
-// goroutines. It captures any panic to Sentry (if initialized), logs it,
-// and flushes pending events. The goroutine exits without re-panicking.
+// RunSafe calls fn and recovers any panic, capturing it to Sentry and
+// logging it via zerolog. The loop continues after the call returns.
+// Use this for per-iteration work inside long-running goroutine loops so
+// a single panic does not permanently kill the loop.
 //
-//	go func() {
-//	    defer sentrylog.RecoverAndCapture("reaper")
-//	    ...
-//	}()
-func RecoverAndCapture(goroutine string) {
-	r := recover()
-	if r == nil {
-		return
-	}
-	log.Error().Interface("panic", r).Str("goroutine", goroutine).Msg("goroutine panicked")
-	sentry.CurrentHub().RecoverWithContext(context.Background(), r)
-	sentry.Flush(2 * time.Second)
+//	for {
+//	    select {
+//	    case <-ticker.C:
+//	        sentrylog.RunSafe("reaper", func() { doWork(ctx) })
+//	    }
+//	}
+func RunSafe(goroutine string, fn func()) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		log.Error().Interface("panic", r).Str("goroutine", goroutine).Msg("goroutine iteration panicked")
+		sentry.CurrentHub().RecoverWithContext(context.Background(), r)
+	}()
+	fn()
 }

@@ -53,7 +53,6 @@ func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
-	defer sentrylog.RecoverAndCapture("reaper")
 	parallelism := cfg.Parallelism
 	if parallelism <= 0 {
 		parallelism = 10
@@ -73,7 +72,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
-	h.reapOnce(ctx, cfg.BatchSize, parallelism)
+	sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 
 	for {
 		select {
@@ -81,7 +80,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			log.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
-			h.reapOnce(ctx, cfg.BatchSize, parallelism)
+			sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 		}
 	}
 }

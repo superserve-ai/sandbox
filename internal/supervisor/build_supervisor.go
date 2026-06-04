@@ -121,7 +121,6 @@ func (s *BuildSupervisor) Start(ctx context.Context) {
 }
 
 func (s *BuildSupervisor) loop(ctx context.Context) {
-	defer sentrylog.RecoverAndCapture("build-supervisor")
 	s.log.Info().
 		Dur("interval", s.cfg.Interval).
 		Int32("batch_size", s.cfg.BatchSize).
@@ -132,7 +131,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.Interval)
 	defer ticker.Stop()
 
-	s.tick(ctx)
+	sentrylog.RunSafe("build-supervisor", func() { s.tick(ctx) })
 
 	for {
 		select {
@@ -140,7 +139,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 			s.log.Info().Msg("build supervisor exiting")
 			return
 		case <-ticker.C:
-			s.tick(ctx)
+			sentrylog.RunSafe("build-supervisor", func() { s.tick(ctx) })
 		}
 	}
 }
@@ -516,16 +515,15 @@ func specStepsToVMD(steps []builder.BuildStep) []vmdclient.BuildStep {
 // reconcileLoop runs the orphan-builds reconciler on its own cadence,
 // decoupled from per-build dispatch.
 func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
-	defer sentrylog.RecoverAndCapture("build-supervisor-reconcile")
 	t := time.NewTicker(s.cfg.ReconcileInterval)
 	defer t.Stop()
-	s.reconcileOrphanBuilds(ctx)
+	sentrylog.RunSafe("build-supervisor-reconcile", func() { s.reconcileOrphanBuilds(ctx) })
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.reconcileOrphanBuilds(ctx)
+			sentrylog.RunSafe("build-supervisor-reconcile", func() { s.reconcileOrphanBuilds(ctx) })
 		}
 	}
 }

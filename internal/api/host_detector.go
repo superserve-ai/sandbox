@@ -28,7 +28,6 @@ const (
 // marks active hosts as unhealthy when their heartbeat goes stale.
 // Blocks until ctx is cancelled.
 func StartHostDetector(ctx context.Context, queries *db.Queries) {
-	defer sentrylog.RecoverAndCapture("host-detector")
 	log.Info().
 		Dur("timeout", heartbeatTimeout).
 		Dur("interval", detectorInterval).
@@ -37,7 +36,7 @@ func StartHostDetector(ctx context.Context, queries *db.Queries) {
 	ticker := time.NewTicker(detectorInterval)
 	defer ticker.Stop()
 
-	detectOnce(ctx, queries)
+	sentrylog.RunSafe("host-detector", func() { detectOnce(ctx, queries) })
 
 	for {
 		select {
@@ -46,7 +45,7 @@ func StartHostDetector(ctx context.Context, queries *db.Queries) {
 			return
 		case <-ticker.C:
 			runCtx, cancel := context.WithTimeout(ctx, detectorRunTimeout)
-			detectOnce(runCtx, queries)
+			sentrylog.RunSafe("host-detector", func() { detectOnce(runCtx, queries) })
 			cancel()
 		}
 	}
