@@ -58,6 +58,10 @@ type BuildSupervisorConfig struct {
 	// vmd.CancelBuild and mark failed.
 	BuildTimeout time.Duration
 
+	// RegisterGrace is how long after dispatch a vmd "not found" is tolerated
+	// before being treated as terminal (covers the poll-before-register race).
+	RegisterGrace time.Duration
+
 	// ReapBatchSize caps how many stale rows ReapStaleBuilds touches per
 	// tick. Mirrors BatchSize's bounding rationale.
 	ReapBatchSize int32
@@ -80,6 +84,7 @@ func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 		HostID:                    hostID,
 		PendingTimeout:            2 * time.Minute,
 		BuildTimeout:              30 * time.Minute,
+		RegisterGrace:             60 * time.Second,
 		ReapBatchSize:             20,
 		ReconcileInterval:         5 * time.Minute,
 		MaxDeletesPerReconcile:    50,
@@ -365,14 +370,19 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		rowLog.Warn().Err(err).Msg("GetBuildStatus failed")
 		return
 	}
-	if res.NotFound {
-		// vmd lost this build (restart, or never dispatched). Mark failed
-		// so the user can retry rather than waiting indefinitely.
-		rowLog.Warn().Msg("vmd has no record of build; marking failed")
-		s.failBuild(ctx, row.ID, "vmd has no record of this build (likely vmd restarted)")
+	switch classifyNotFound(res, row.StartedAt.Time, row.StartedAt.Valid, time.Now(), s.cfg.RegisterGrace) {
+	case nfWait:
+		// Within grace of dispatch, NotFound is the poll-before-register race,
+		// not a lost build — retry next tick.
+		rowLog.Debug().Msg("vmd has no record yet; within register grace, retrying next tick")
+		return
+	case nfFail:
+		rowLog.Warn().Dur("grace", s.cfg.RegisterGrace).Msg("vmd has no record of build after dispatch grace; marking failed")
+		s.failBuild(ctx, row.ID, "build was not found on the build host after dispatch (it may have been lost to a host restart); retry the build")
 		return
 	}
 
+	// nfProceed: vmd has the build — act on its reported status.
 	switch res.Status {
 	case "running":
 		// No transition needed; we're already 'building' in DB.
@@ -432,6 +442,37 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		rowLog.Info().Str("status", res.Status).Str("error", res.ErrorMessage).Msg("build terminal")
 		s.logBuildCompleted(ctx, row, "error", res.ErrorMessage, "")
 	}
+}
+
+// notFoundDecision is what a vmd GetBuildStatus result implies for the poll.
+type notFoundDecision int
+
+const (
+	nfProceed notFoundDecision = iota // vmd has the build — act on res.Status
+	nfWait                            // NotFound, but still within register grace
+	nfFail                            // NotFound past grace — treat as lost
+)
+
+// classifyNotFound decides how pollOne should handle a GetBuildStatus result.
+// Pure so the decision is unit-testable without DB or gRPC.
+func classifyNotFound(res vmdclient.BuildStatusResult, startedAt time.Time, startedValid bool, now time.Time, grace time.Duration) notFoundDecision {
+	if !res.NotFound {
+		return nfProceed
+	}
+	if notFoundIsTerminal(startedAt, startedValid, now, grace) {
+		return nfFail
+	}
+	return nfWait
+}
+
+// notFoundIsTerminal reports whether a vmd "not found" is a permanent failure:
+// true only once the build has been dispatched longer than grace. With no valid
+// dispatch time it returns false (the stale-build reaper is the backstop).
+func notFoundIsTerminal(startedAt time.Time, startedValid bool, now time.Time, grace time.Duration) bool {
+	if !startedValid || startedAt.IsZero() {
+		return false
+	}
+	return now.Sub(startedAt) >= grace
 }
 
 // logBuildCompleted writes a template/build_completed activity row so user
