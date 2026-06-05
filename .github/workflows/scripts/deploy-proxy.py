@@ -11,6 +11,7 @@ Env vars:
   SANDBOX_ACCESS_TOKEN_SEED  optional — hex, >=32 bytes (>=64 hex chars)
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
+  SENTRY_DSN                 optional — Sentry DSN URL for error reporting
 """
 
 import os
@@ -45,6 +46,10 @@ def main() -> int:
     require_data_plane = os.environ.get("REQUIRE_DATA_PLANE", "")
     if require_data_plane not in ("", "0", "1"):
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
+        return 1
+    sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    if sentry_dsn and not re.fullmatch(r"https://[A-Za-z0-9@./:_\-]+", sentry_dsn):
+        print("ERROR: SENTRY_DSN must be a https:// URL or empty", file=sys.stderr)
         return 1
 
     result = subprocess.run(
@@ -104,6 +109,7 @@ def main() -> int:
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
+            SENTRY_DSN={sentry_dsn}
             PROXYENV
             sudo chmod 0600 /etc/sandbox/proxy.env
 

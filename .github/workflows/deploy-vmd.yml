@@ -121,5 +121,6 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
