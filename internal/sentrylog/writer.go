@@ -40,7 +40,8 @@ func (w *Writer) WriteLevel(level zerolog.Level, p []byte) (int, error) {
 	for k, v := range fields {
 		extras[k] = v
 	}
-	for _, k := range []string{"level", "time", "message", "msg"} {
+	// caller is promoted to a tag below, so drop it here to avoid duplication.
+	for _, k := range []string{"level", "time", "message", "msg", "caller"} {
 		delete(extras, k)
 	}
 
