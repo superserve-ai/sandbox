@@ -103,7 +103,7 @@ const (
 	defaultMaxVcpu      = 2
 	defaultMaxMemoryMib = 2048
 	defaultMaxDiskMib   = 8192
-	defaultMaxTemplates = 10
+	defaultMaxTemplates = 50
 
 	defaultVcpu     = 1
 	defaultMemoryMi = 1024
