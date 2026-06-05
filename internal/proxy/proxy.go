@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // Timeout constants.
@@ -144,6 +145,7 @@ func (h *Handler) captureUsage(instanceID, event string, info InstanceInfo) {
 // It stops when ctx is cancelled.
 func (h *Handler) StartSweeper(ctx context.Context) {
 	go func() {
+		defer sentrylog.Recover("transport-sweeper")
 		t := time.NewTicker(transportSweepInterval)
 		defer t.Stop()
 		for {

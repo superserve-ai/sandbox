@@ -10,6 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
+
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // RateLimitConfig defines rate limiting parameters for a token-bucket limiter.
@@ -103,6 +105,7 @@ func (l *keyedRateLimiter) cleanup(maxAge time.Duration) {
 // startCleanup runs a ticker-driven cleanup loop that exits when ctx is done.
 func (l *keyedRateLimiter) startCleanup(ctx context.Context, cfg RateLimitConfig) {
 	go func() {
+		defer sentrylog.Recover("ratelimit-cleanup")
 		ticker := time.NewTicker(cfg.CleanupInterval)
 		defer ticker.Stop()
 		for {

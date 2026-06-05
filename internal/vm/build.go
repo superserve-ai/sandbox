@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/builder"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // BuildTemplateRequest is the input to Manager.BuildTemplate.
@@ -87,7 +88,7 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 		return "", err
 	}
 
-	go m.buildTemplateWorker(buildCtx, buildVMID, req)
+	go func() { defer sentrylog.Recover("build-worker"); m.buildTemplateWorker(buildCtx, buildVMID, req) }()
 
 	return buildVMID, nil
 }
