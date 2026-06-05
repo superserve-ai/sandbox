@@ -183,6 +183,14 @@ func run() error {
 	// excludes unhealthy hosts from placement.
 	go api.StartHostDetector(ctx, queries)
 
+	// Quota watcher: alerts (Slack) when a team crosses 80% of a resource limit.
+	// Only runs when a webhook is configured.
+	if webhook := os.Getenv("SLACK_QUOTA_ALERT_WEBHOOK"); webhook != "" {
+		go api.StartQuotaWatcher(ctx, queries, api.NewSlackQuotaNotifier(webhook))
+	} else {
+		log.Info().Msg("quota watcher disabled (SLACK_QUOTA_ALERT_WEBHOOK not set)")
+	}
+
 	// Start HTTP server.
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
