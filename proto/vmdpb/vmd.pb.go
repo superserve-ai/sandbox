@@ -1598,7 +1598,11 @@ type RestoreSnapshotRequest struct {
 	// Directory containing rootfs.delta for fast clone-from-template. When
 	// empty, the per-VM overlay starts empty (used for pause/resume of a
 	// single sandbox, where the overlay file is already populated).
-	DeltaDir      string `protobuf:"bytes,9,opt,name=delta_dir,json=deltaDir,proto3" json:"delta_dir,omitempty"`
+	DeltaDir string `protobuf:"bytes,9,opt,name=delta_dir,json=deltaDir,proto3" json:"delta_dir,omitempty"`
+	// Owning team and creating user, carried so the data-plane proxy can
+	// attribute exec/file activity without a database. Both may be empty.
+	TeamId        string `protobuf:"bytes,10,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
+	OwnerId       string `protobuf:"bytes,11,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1685,6 +1689,20 @@ func (x *RestoreSnapshotRequest) GetBasePath() string {
 func (x *RestoreSnapshotRequest) GetDeltaDir() string {
 	if x != nil {
 		return x.DeltaDir
+	}
+	return ""
+}
+
+func (x *RestoreSnapshotRequest) GetTeamId() string {
+	if x != nil {
+		return x.TeamId
+	}
+	return ""
+}
+
+func (x *RestoreSnapshotRequest) GetOwnerId() string {
+	if x != nil {
+		return x.OwnerId
 	}
 	return ""
 }
@@ -2850,7 +2868,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xe8\x03\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\x9c\x04\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -2859,7 +2877,10 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0enetwork_config\x18\x06 \x01(\v2 .superserve.vmd.v1.NetworkConfigR\rnetworkConfig\x12Q\n" +
 	"\benv_vars\x18\a \x03(\v26.superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntryR\aenvVars\x12\x1b\n" +
 	"\tbase_path\x18\b \x01(\tR\bbasePath\x12\x1b\n" +
-	"\tdelta_dir\x18\t \x01(\tR\bdeltaDir\x1a:\n" +
+	"\tdelta_dir\x18\t \x01(\tR\bdeltaDir\x12\x17\n" +
+	"\ateam_id\x18\n" +
+	" \x01(\tR\x06teamId\x12\x19\n" +
+	"\bowner_id\x18\v \x01(\tR\aownerId\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"\xcc\x01\n" +

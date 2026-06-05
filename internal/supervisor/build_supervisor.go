@@ -24,6 +24,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -99,10 +100,11 @@ type Resolver func(ctx context.Context, hostID string) (vmdclient.Client, error)
 // state lives in the DB. Safe to instantiate once at controlplane boot and
 // Start() with the process-lifetime context.
 type BuildSupervisor struct {
-	cfg     BuildSupervisorConfig
-	q       *db.Queries
-	resolve Resolver
-	log     zerolog.Logger
+	cfg       BuildSupervisorConfig
+	q         *db.Queries
+	resolve   Resolver
+	log       zerolog.Logger
+	analytics *analytics.Client // when set, emits build-outcome events; nil is a no-op
 }
 
 // NewBuildSupervisor constructs a supervisor.
@@ -113,6 +115,12 @@ func NewBuildSupervisor(cfg BuildSupervisorConfig, q *db.Queries, resolve Resolv
 		resolve: resolve,
 		log:     log.With().Str("component", "build_supervisor").Logger(),
 	}
+}
+
+// WithAnalytics enables build-outcome events (succeeded/failed).
+func (s *BuildSupervisor) WithAnalytics(a *analytics.Client) *BuildSupervisor {
+	s.analytics = a
+	return s
 }
 
 // Start launches the ticker goroutine. Exits cleanly when ctx is cancelled.
@@ -501,6 +509,18 @@ func (s *BuildSupervisor) logBuildCompleted(ctx context.Context, row db.Template
 		Metadata:     metaJSON,
 	}); err != nil {
 		s.log.Error().Err(err).Str("build_id", row.ID.String()).Msg("activity log build_completed")
+	}
+
+	if s.analytics != nil {
+		event := "template_build_succeeded"
+		if status != "success" {
+			event = "template_build_failed"
+		}
+		// The build row carries no creator, so attribution is team-scoped.
+		s.analytics.Capture("", row.TeamID.String(), event, map[string]any{
+			"template_id": row.TemplateID.String(),
+			"build_id":    row.ID.String(),
+		})
 	}
 }
 

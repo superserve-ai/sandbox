@@ -527,6 +527,10 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, actorID, "template", "created", "success", nil)
 	h.logTemplateActivity(c.Request.Context(), row.ID, teamID, actorID, "template", "build_started", "success",
 		buildMetadata(row.BuildID))
+	h.capture(c, "template_build_started", map[string]any{
+		"template_id": row.ID.String(),
+		"build_id":    row.BuildID.String(),
+	})
 }
 
 func buildMetadata(buildID uuid.UUID) []byte {

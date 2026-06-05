@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -123,6 +124,14 @@ func run() error {
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
 
+	// Product-usage analytics — no-op when POSTHOG_KEY is unset.
+	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log.Logger)
+	if err != nil {
+		log.Fatal().Err(err).Msg("init analytics")
+	}
+	defer analyticsClient.Close()
+	handlers.Analytics = analyticsClient
+
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
 	// Interceptors below fire onDead on codes.Unavailable so the registry
 	// drops stale cached clients.
@@ -167,7 +176,7 @@ func run() error {
 		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
 		queries,
 		buildResolver,
-	).Start(ctx)
+	).WithAnalytics(analyticsClient).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
@@ -297,13 +306,15 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. Used as
 // a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
 // map to a crash but the snapshot files are still on disk).
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 		BasePath:     basePath,
 		DeltaDir:     deltaDir,
+		TeamId:       teamID,
+		OwnerId:      ownerID,
 		EnvVars:      envVars,
 	})
 	if err != nil {

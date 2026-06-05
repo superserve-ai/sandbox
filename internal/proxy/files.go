@@ -167,6 +167,11 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		fail.write(w)
 		return
 	}
+	fileEvent := "file_read" // only GET/POST reach here; POST is a write
+	if r.Method == http.MethodPost {
+		fileEvent = "file_write"
+	}
+	h.captureUsage(instanceID, fileEvent, info)
 
 	// From here on it's just a transparent reverse proxy to boxd.
 	// Reuse the lifecycle-keyed transport cache for the same reasons

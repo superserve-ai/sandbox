@@ -193,6 +193,7 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 		fail.write(w)
 		return
 	}
+	h.captureUsage(instanceID, "terminal_opened", info)
 
 	// From here on, errors go back through the WebSocket (if the upgrade
 	// succeeds) because we've committed to streaming.

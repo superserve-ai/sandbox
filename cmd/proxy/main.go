@@ -13,6 +13,7 @@ import (
 	"github.com/getsentry/sentry-go"
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/proxy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -51,6 +52,14 @@ func main() {
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domain, resolver, log)
 	proxyHandler.StartSweeper(ctx)
+
+	// Product-usage analytics for exec/files — no-op when POSTHOG_KEY is unset.
+	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log)
+	if err != nil {
+		log.Fatal().Err(err).Msg("init analytics")
+	}
+	defer analyticsClient.Close()
+	proxyHandler.WithAnalytics(analyticsClient)
 
 	// Data-plane auth — the HMAC seed is shared with the control plane.
 	// Both sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).

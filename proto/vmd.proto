@@ -299,6 +299,10 @@ message RestoreSnapshotRequest {
   // empty, the per-VM overlay starts empty (used for pause/resume of a
   // single sandbox, where the overlay file is already populated).
   string delta_dir = 9;
+  // Owning team and creating user, carried so the data-plane proxy can
+  // attribute exec/file activity without a database. Both may be empty.
+  string team_id = 10;
+  string owner_id = 11;
 }
 
 message RestoreSnapshotResponse {

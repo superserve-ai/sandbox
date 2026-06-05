@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -65,6 +66,23 @@ type Handlers struct {
 	Config    *config.Config
 	Hosts     HostRegistry // when set, routes VMD calls via host_id
 	Scheduler Scheduler    // when set, picks host on create
+	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
+}
+
+// capture emits a usage event attributed to the API key's owner and team.
+func (h *Handlers) capture(c *gin.Context, event string, props map[string]any) {
+	if h.Analytics == nil {
+		return
+	}
+	var actor string
+	if a := actorIDFromContext(c); a != nil {
+		actor = a.String()
+	}
+	var team string
+	if t, err := teamIDFromContext(c); err == nil {
+		team = t.String()
+	}
+	h.Analytics.Capture(actor, team, event, props)
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -392,7 +410,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -468,6 +486,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
+	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
 	return true
 }
 
@@ -571,6 +590,14 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+// ownerIDFromContext returns the actor's UUID as a string, or "" when unknown.
+func ownerIDFromContext(c *gin.Context) string {
+	if a := actorIDFromContext(c); a != nil {
+		return a.String()
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +733,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 
 	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
+	h.capture(c, "sandbox_deleted", map[string]any{"sandbox_id": sandboxID.String()})
 
 	c.Status(http.StatusNoContent)
 }
@@ -1258,7 +1286,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// on top of the template's baked defaults by vmd (boxd resumes with
 	// template context, then the restore RPC posts these on top).
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -1428,6 +1456,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
+	h.capture(c, "sandbox_created", map[string]any{
+		"sandbox_id":  sandbox.ID.String(),
+		"template_id": fromTemplateID,
+	})
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
@@ -1596,6 +1628,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Interval was already closed at BeginPause; FinalizePause is the
 	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
+	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
 
 	c.Status(http.StatusNoContent)
 }
@@ -1814,6 +1847,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		}
 
 		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "network", "updated", "success", &sandbox.Name, nil, networkConfig)
+		h.capture(c, "sandbox_network_updated", map[string]any{"sandbox_id": sandboxID.String()})
 	}
 
 	if body.Metadata != nil {

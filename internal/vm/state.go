@@ -43,6 +43,9 @@ type VMRecord struct {
 	// persisted — it's only relevant at create-from-template; a resumed
 	// sandbox reuses its existing overlay file in place.
 	BasePath string `json:"base_path,omitempty"`
+	// Persisted so usage attribution survives a vmd restart.
+	TeamID  string `json:"team_id,omitempty"`
+	OwnerID string `json:"owner_id,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -162,6 +165,8 @@ func toRecord(inst *VMInstance) VMRecord {
 		VCPU:         inst.Config.VCPU,
 		MemoryMiB:    inst.Config.MemoryMiB,
 		BasePath:     inst.Config.BasePath,
+		TeamID:       inst.TeamID,
+		OwnerID:      inst.OwnerID,
 	}
 }
 
@@ -183,6 +188,8 @@ func toInstance(rec VMRecord) *VMInstance {
 		MemFilePath:  rec.MemFilePath,
 		CreatedAt:    rec.CreatedAt,
 		Metadata:     rec.Metadata,
+		TeamID:       rec.TeamID,
+		OwnerID:      rec.OwnerID,
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
 			MemoryMiB: rec.MemoryMiB,
