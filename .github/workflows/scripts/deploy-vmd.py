@@ -185,8 +185,11 @@ def main() -> int:
             rm -f {bundle_remote}
 
             # Upsert SENTRY_DSN in the vmd env file without touching other vars.
-            sudo sed -i '/^SENTRY_DSN=/d' /etc/sandbox/vmd.env
-            echo 'SENTRY_DSN={sentry_dsn}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            # Only update when a non-empty value is provided; skip silently otherwise.
+            if [ -n '{sentry_dsn}' ]; then
+                sudo sed -i '/^SENTRY_DSN=/d' /etc/sandbox/vmd.env
+                echo 'SENTRY_DSN={sentry_dsn}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
 
             sudo systemctl restart {service}
             sleep 3
