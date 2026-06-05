@@ -15,12 +15,15 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/puddle/v2"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -123,6 +126,27 @@ func (s *BuildSupervisor) WithAnalytics(a *analytics.Client) *BuildSupervisor {
 	return s
 }
 
+// logTickErr keeps only shutdown and dropped-connection blips below error level;
+// timeouts, connection-refused, and query errors stay at error (they may be real).
+func (s *BuildSupervisor) logTickErr(err error, msg string) {
+	switch {
+	case errors.Is(err, puddle.ErrClosedPool), errors.Is(err, context.Canceled):
+		s.log.Debug().Err(err).Msg(msg)
+	case isConnDroppedErr(err):
+		s.log.Warn().Err(err).Msg(msg)
+	default:
+		s.log.Error().Err(err).Msg(msg)
+	}
+}
+
+// isConnDroppedErr reports whether an established DB connection was dropped mid-use.
+func isConnDroppedErr(err error) bool {
+	m := err.Error()
+	return strings.Contains(m, "connection reset") ||
+		strings.Contains(m, "broken pipe") ||
+		strings.Contains(m, "unexpected EOF")
+}
+
 // Start launches the ticker goroutine. Exits cleanly when ctx is cancelled.
 // Runs one cycle immediately so a control plane restart doesn't delay
 // dispatch by up to Interval seconds.
@@ -179,7 +203,7 @@ func (s *BuildSupervisor) reapStale(ctx context.Context) {
 		BuildTimeoutSeconds:   int32(s.cfg.BuildTimeout / time.Second),
 	})
 	if err != nil {
-		s.log.Error().Err(err).Msg("reap stale builds failed")
+		s.logTickErr(err, "reap stale builds failed")
 		return
 	}
 	for _, r := range reaped {
@@ -217,7 +241,7 @@ func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
 	// picked up next tick and the budget cap keeps us bounded.
 	inflightGlobal, err := s.countInflightGlobal(queryCtx)
 	if err != nil {
-		s.log.Error().Err(err).Msg("count in-flight builds failed")
+		s.logTickErr(err, "count in-flight builds failed")
 		return
 	}
 	if inflightGlobal >= int64(s.cfg.GlobalMaxConcurrentBuilds) {
@@ -228,7 +252,7 @@ func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
 
 	pending, err := s.q.ListPendingBuildsOrdered(queryCtx, s.cfg.BatchSize)
 	if err != nil {
-		s.log.Error().Err(err).Msg("list pending builds failed")
+		s.logTickErr(err, "list pending builds failed")
 		return
 	}
 
@@ -341,7 +365,7 @@ func (s *BuildSupervisor) pollActive(ctx context.Context) {
 	active, err := s.q.ListActiveBuilds(queryCtx)
 	cancel()
 	if err != nil {
-		s.log.Error().Err(err).Msg("list active builds failed")
+		s.logTickErr(err, "list active builds failed")
 		return
 	}
 
@@ -429,6 +453,10 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			DeltaPath:    deltaPathArg,
 		})
 		cancel()
+		if errors.Is(err, pgx.ErrNoRows) {
+			rowLog.Debug().Msg("build already finalized by a concurrent tick; skipping")
+			return
+		}
 		if err != nil {
 			rowLog.Error().Err(err).Msg("finalize build")
 			return

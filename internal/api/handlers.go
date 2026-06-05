@@ -24,6 +24,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -128,6 +129,7 @@ const asyncTimeout = 5 * time.Second
 func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID uuid.UUID, actorID *uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
+		defer sentrylog.Recover("activity-log")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
@@ -153,6 +155,7 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamID uuid.UUID, actorID *uuid.UUID, category, action, status string, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
+		defer sentrylog.Recover("template-activity-log")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{

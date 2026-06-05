@@ -13,6 +13,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 )
@@ -215,6 +216,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	// (not in the goroutine) so tests can override the var without a race.
 	pingInterval := execPingInterval
 	go func() {
+		defer sentrylog.Recover("exec-ws-ping")
 		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 		for {
@@ -247,6 +249,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	// stdout/stderr go out as channel-tagged binary frames; the End event is a
 	// text lifecycle frame that closes the WS.
 	go func() {
+		defer sentrylog.Recover("exec-ws-out")
 		defer wg.Done()
 		defer cancel()
 		for stream.Receive() {
@@ -298,6 +301,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	// Binary frames are channel-tagged I/O (channel 0 = stdin); text frames are
 	// JSON control messages.
 	go func() {
+		defer sentrylog.Recover("exec-ws-in")
 		defer wg.Done()
 		defer cancel()
 		for {

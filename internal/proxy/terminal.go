@@ -19,6 +19,7 @@ import (
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // terminalBridgeDeps holds the dependencies specific to the /terminal
@@ -316,6 +317,7 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 	defer sessionDeadline.Stop()
 
 	go func() {
+		defer sentrylog.Recover("terminal-idle")
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
@@ -348,6 +350,7 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 	// PTY mode, End, Keepalive) are ignored — we asked for PTY so
 	// everything interactive comes through PtyData.
 	go func() {
+		defer sentrylog.Recover("terminal-out")
 		defer wg.Done()
 		defer cancel()
 		for stream.Receive() {
@@ -383,6 +386,7 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 	// Read WS frames. Binary frames are PTY input (forward as SendInput
 	// with the captured PID). Text frames are control JSON.
 	go func() {
+		defer sentrylog.Recover("terminal-in")
 		defer wg.Done()
 		defer cancel()
 		for {

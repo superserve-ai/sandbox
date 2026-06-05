@@ -14,6 +14,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
+
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // upstreamDialTimeout is the maximum time to wait for upstream connections.
@@ -136,7 +138,7 @@ func (p *EgressProxy) listen(ctx context.Context, port uint16, handler func(cont
 			p.log.Warn().Err(err).Uint16("port", port).Msg("accept error")
 			continue
 		}
-		go handler(ctx, conn)
+		go func() { defer sentrylog.Recover("net-conn"); handler(ctx, conn) }()
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // ErrSandboxGone is returned when a handler detects that the underlying VM
@@ -88,6 +89,7 @@ func vmdErrorMessage(err error) string {
 func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
+		defer sentrylog.Recover("mark-failed-async")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		if err := h.DB.MarkSandboxFailedInTeam(ctx, db.MarkSandboxFailedInTeamParams{
