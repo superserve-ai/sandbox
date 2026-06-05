@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/analytics"
 )
 
 // Timeout constants.
@@ -78,6 +80,9 @@ type Handler struct {
 	// allowedOrigins is the set of browser origins allowed for CORS on
 	// data-plane endpoints (/files). Shared with the terminal origin check.
 	allowedOrigins []string
+
+	// analytics emits data-plane usage events; set via WithAnalytics, nil no-ops.
+	analytics *analytics.Client
 }
 
 // originAllowed checks whether the given Origin header matches one of the
@@ -118,6 +123,20 @@ func NewHandler(domain string, resolver Resolver, log zerolog.Logger) *Handler {
 		log:          log,
 	}
 	return h
+}
+
+// WithAnalytics enables data-plane usage events (exec/files).
+func (h *Handler) WithAnalytics(a *analytics.Client) *Handler {
+	h.analytics = a
+	return h
+}
+
+// captureUsage emits a data-plane usage event attributed to the sandbox owner.
+func (h *Handler) captureUsage(instanceID, event string, info InstanceInfo) {
+	if h.analytics == nil {
+		return
+	}
+	h.analytics.Capture(info.OwnerID, info.TeamID, event, map[string]any{"sandbox_id": instanceID})
 }
 
 // StartSweeper launches a background goroutine that periodically closes

@@ -60,6 +60,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		fail.write(w)
 		return
 	}
+	h.captureUsage(instanceID, "command_run", info)
 
 	transport := h.transports.get(instanceID, info)
 	target := &url.URL{

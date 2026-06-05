@@ -16,7 +16,7 @@ type Client interface {
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +
 	// deltaDir are populated for overlay-mode templates, empty for legacy.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// DeleteSnapshot removes the on-disk vmstate + memory files for a
 	// previous snapshot. Idempotent: missing files return nil. Used by the
 	// control plane to garbage-collect the previous snapshot after a new

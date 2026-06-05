@@ -126,6 +126,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		fail.write(w)
 		return
 	}
+	h.captureUsage(instanceID, "command_run", info)
 
 	acceptOpts := &websocket.AcceptOptions{
 		// Any origin: the token is the control. Auth isn't ambient (the token

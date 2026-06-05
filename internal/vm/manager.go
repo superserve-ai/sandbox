@@ -95,6 +95,8 @@ type VMInstance struct {
 	MemFilePath  string
 	CreatedAt    time.Time
 	Metadata     map[string]string
+	TeamID       string // owning team; carried for data-plane usage attribution
+	OwnerID      string // creating user; empty when unknown
 
 	mu sync.RWMutex
 }
@@ -775,9 +777,9 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
-	resourceLimits VMConfig, netCfg *network.Config,
+	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
 ) (*VMInstance, error) {
-	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "")
+	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
 }
 
 // restoreVMSnapshot is the implementation. recordToPath is empty for normal
@@ -785,7 +787,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 // recording, in which case the in-firecracker UFFD handler writes each served
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
-	resourceLimits VMConfig, netCfg *network.Config, recordToPath string,
+	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -823,6 +825,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Config:       resourceLimits,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
+		TeamID:       teamID,
+		OwnerID:      ownerID,
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -1297,6 +1301,8 @@ type InstanceInfo struct {
 	VMIP      string
 	Status    VMStatus
 	CreatedAt time.Time
+	TeamID    string
+	OwnerID   string
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -1315,6 +1321,8 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		VMIP:      inst.IP,
 		Status:    inst.Status,
 		CreatedAt: inst.CreatedAt,
+		TeamID:    inst.TeamID,
+		OwnerID:   inst.OwnerID,
 	}
 	inst.mu.RUnlock()
 	return info, true
@@ -1469,7 +1477,7 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		return nil
 	}
 
-	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, outputPath)
+	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", outputPath)
 	if err != nil {
 		return fmt.Errorf("restore for recording: %w", err)
 	}

@@ -22,6 +22,8 @@ type InstanceInfo struct {
 	VMIP      string
 	Status    string
 	StartedAt int64 // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	TeamID    string // owning team, for usage attribution
+	OwnerID   string // creating user, for usage attribution; empty when unknown
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -113,6 +115,8 @@ type vmdResponse struct {
 	VMIP      string `json:"vm_ip"`
 	Status    string `json:"status"`
 	StartedAt int64  `json:"started_at"`
+	TeamID    string `json:"team_id"`
+	OwnerID   string `json:"owner_id"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, error) {
@@ -141,7 +145,7 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInf
 		return InstanceInfo{}, fmt.Errorf("resolver: decode response: %w", err)
 	}
 
-	info := InstanceInfo{VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt}
+	info := InstanceInfo{VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt, TeamID: raw.TeamID, OwnerID: raw.OwnerID}
 	r.store(instanceID, info, nil, r.ttl)
 	return info, nil
 }
