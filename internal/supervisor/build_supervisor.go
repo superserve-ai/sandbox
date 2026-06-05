@@ -15,12 +15,15 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/puddle/v2"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -123,6 +126,16 @@ func (s *BuildSupervisor) WithAnalytics(a *analytics.Client) *BuildSupervisor {
 	return s
 }
 
+// logTickErr logs a per-tick query failure, downgrading the expected
+// closed-pool error (control plane shutting down) to debug.
+func (s *BuildSupervisor) logTickErr(err error, msg string) {
+	if errors.Is(err, puddle.ErrClosedPool) {
+		s.log.Debug().Err(err).Msg(msg)
+		return
+	}
+	s.log.Error().Err(err).Msg(msg)
+}
+
 // Start launches the ticker goroutine. Exits cleanly when ctx is cancelled.
 // Runs one cycle immediately so a control plane restart doesn't delay
 // dispatch by up to Interval seconds.
@@ -179,7 +192,7 @@ func (s *BuildSupervisor) reapStale(ctx context.Context) {
 		BuildTimeoutSeconds:   int32(s.cfg.BuildTimeout / time.Second),
 	})
 	if err != nil {
-		s.log.Error().Err(err).Msg("reap stale builds failed")
+		s.logTickErr(err, "reap stale builds failed")
 		return
 	}
 	for _, r := range reaped {
@@ -217,7 +230,7 @@ func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
 	// picked up next tick and the budget cap keeps us bounded.
 	inflightGlobal, err := s.countInflightGlobal(queryCtx)
 	if err != nil {
-		s.log.Error().Err(err).Msg("count in-flight builds failed")
+		s.logTickErr(err, "count in-flight builds failed")
 		return
 	}
 	if inflightGlobal >= int64(s.cfg.GlobalMaxConcurrentBuilds) {
@@ -341,7 +354,7 @@ func (s *BuildSupervisor) pollActive(ctx context.Context) {
 	active, err := s.q.ListActiveBuilds(queryCtx)
 	cancel()
 	if err != nil {
-		s.log.Error().Err(err).Msg("list active builds failed")
+		s.logTickErr(err, "list active builds failed")
 		return
 	}
 
@@ -429,6 +442,11 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			DeltaPath:    deltaPathArg,
 		})
 		cancel()
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Already finalized by a concurrent supervisor tick — idempotent no-op.
+			rowLog.Debug().Msg("build already finalized; skipping")
+			return
+		}
 		if err != nil {
 			rowLog.Error().Err(err).Msg("finalize build")
 			return
