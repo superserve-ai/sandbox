@@ -126,14 +126,25 @@ func (s *BuildSupervisor) WithAnalytics(a *analytics.Client) *BuildSupervisor {
 	return s
 }
 
-// logTickErr logs a per-tick query failure, downgrading the expected
-// closed-pool error (control plane shutting down) to debug.
+// logTickErr keeps only shutdown and dropped-connection blips below error level;
+// timeouts, connection-refused, and query errors stay at error (they may be real).
 func (s *BuildSupervisor) logTickErr(err error, msg string) {
-	if errors.Is(err, puddle.ErrClosedPool) {
+	switch {
+	case errors.Is(err, puddle.ErrClosedPool), errors.Is(err, context.Canceled):
 		s.log.Debug().Err(err).Msg(msg)
-		return
+	case isConnDroppedErr(err):
+		s.log.Warn().Err(err).Msg(msg)
+	default:
+		s.log.Error().Err(err).Msg(msg)
 	}
-	s.log.Error().Err(err).Msg(msg)
+}
+
+// isConnDroppedErr reports whether an established DB connection was dropped mid-use.
+func isConnDroppedErr(err error) bool {
+	m := err.Error()
+	return strings.Contains(m, "connection reset") ||
+		strings.Contains(m, "broken pipe") ||
+		strings.Contains(m, "unexpected EOF")
 }
 
 // Start launches the ticker goroutine. Exits cleanly when ctx is cancelled.
@@ -241,7 +252,7 @@ func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
 
 	pending, err := s.q.ListPendingBuildsOrdered(queryCtx, s.cfg.BatchSize)
 	if err != nil {
-		s.log.Error().Err(err).Msg("list pending builds failed")
+		s.logTickErr(err, "list pending builds failed")
 		return
 	}
 
@@ -443,8 +454,7 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		})
 		cancel()
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Already finalized by a concurrent supervisor tick — idempotent no-op.
-			rowLog.Debug().Msg("build already finalized; skipping")
+			rowLog.Debug().Msg("build already finalized by a concurrent tick; skipping")
 			return
 		}
 		if err != nil {
