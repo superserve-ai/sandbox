@@ -14,12 +14,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -203,10 +205,19 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 func main() {
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log := zerolog.New(os.Stdout).With().
+	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
+	log := zerolog.New(multi).With().
 		Timestamp().
 		Str("service", "vmd").
 		Logger()
+
+	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
+		if err := sentry.Init(sentry.ClientOptions{Dsn: dsn, EnableLogs: true}); err != nil {
+			log.Warn().Err(err).Msg("sentry.Init failed")
+		} else {
+			defer sentry.Flush(2 * time.Second)
+		}
+	}
 
 	cfg, err := loadConfig()
 	if err != nil {

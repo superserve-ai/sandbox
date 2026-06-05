@@ -66,6 +66,7 @@ def main() -> int:
     service = os.environ.get("VMD_SERVICE", "superserve-vmd")
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
+    sentry_dsn = os.environ.get("SENTRY_DSN", "")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -182,6 +183,10 @@ def main() -> int:
 
             sudo rm -rf {extract_dir}
             rm -f {bundle_remote}
+
+            # Upsert SENTRY_DSN in the vmd env file without touching other vars.
+            sudo sed -i '/^SENTRY_DSN=/d' /etc/sandbox/vmd.env
+            echo 'SENTRY_DSN={sentry_dsn}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
 
             sudo systemctl restart {service}
             sleep 3
