@@ -109,5 +109,6 @@ jobs:
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           python3 .github/workflows/scripts/deploy-proxy.py
