@@ -70,9 +70,14 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
+	runTick := func() {
+		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
+		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
+	}
+
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
-	sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
+	runTick()
 
 	for {
 		select {
@@ -80,8 +85,23 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			log.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
-			sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
+			runTick()
 		}
+	}
+}
+
+// sweepOrphanedIntervals closes intervals left open on no-longer-active
+// sandboxes — defense-in-depth for WAU accuracy, off the request path.
+func (h *Handlers) sweepOrphanedIntervals(ctx context.Context) {
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	n, err := h.DB.CloseOrphanedActiveIntervals(qctx)
+	if err != nil {
+		log.Error().Err(err).Msg("reaper: CloseOrphanedActiveIntervals failed")
+		return
+	}
+	if n > 0 {
+		log.Warn().Int64("closed", n).Msg("reaper: closed orphaned active intervals")
 	}
 }
 

@@ -624,6 +624,116 @@ func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	}
 }
 
+func countOpenIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_active_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&n); err != nil {
+		t.Fatalf("count open intervals: %v", err)
+	}
+	return n
+}
+
+// A stale OPEN interval (a prior transition that failed to close it) must not
+// break resume: before ON CONFLICT it collided and the handler tore the VM
+// down. Now the open row is reused and resume succeeds.
+func TestIntegration_ResumeSandbox_StaleOpenInterval(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+
+	// Simulate the orphan: open a second interval while the sandbox is paused,
+	// leaving its row dangling exactly as a missed close would.
+	if err := testQueries.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	}); err != nil {
+		t.Fatalf("seed stale interval: %v", err)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("setup: open intervals = %d, want 1", open)
+	}
+
+	rw := do(r, "POST", "/sandboxes/"+sid+"/resume", apiKey, "")
+	if rw.Code != http.StatusOK {
+		t.Fatalf("resume with stale interval: expected 200, got %d: %s", rw.Code, rw.Body.String())
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sb.Status != db.SandboxStatusActive {
+		t.Errorf("DB status = %q, want active", sb.Status)
+	}
+	// ON CONFLICT DO NOTHING reuses the existing open row — no duplicate.
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Errorf("open intervals after resume = %d, want 1", open)
+	}
+}
+
+// The reaper's orphan sweep closes intervals left open while their sandbox is
+// no longer active, but only once the settle window has passed.
+func TestIntegration_CloseOrphanedActiveIntervals(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"orphan-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if err := testQueries.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	}); err != nil {
+		t.Fatalf("seed stale interval: %v", err)
+	}
+
+	// Within the settle window → sweep must leave the fresh transition alone.
+	if _, err := testQueries.CloseOrphanedActiveIntervals(ctx); err != nil {
+		t.Fatalf("sweep (fresh): %v", err)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Errorf("within settle window: open = %d, want 1 (untouched)", open)
+	}
+
+	// Backdate past the settle window → sweep now closes the orphan.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET updated_at = now() - interval '10 minutes' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	n, err := testQueries.CloseOrphanedActiveIntervals(ctx)
+	if err != nil {
+		t.Fatalf("sweep (settled): %v", err)
+	}
+	if n < 1 {
+		t.Errorf("sweep closed %d rows, want >= 1", n)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 0 {
+		t.Errorf("after settle window: open = %d, want 0 (closed)", open)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // DELETE /sandboxes/:id
 // ---------------------------------------------------------------------------
