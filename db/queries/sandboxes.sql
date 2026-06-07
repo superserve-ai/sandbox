@@ -77,6 +77,7 @@ WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 --
 -- A leftover open interval must not fail the activation, so ON CONFLICT keeps
 -- the existing open row — an orphaned interval can never block a resumed VM.
+-- (Creation has no prior interval; this reuse only ever applies on resume.)
 WITH activated AS (
   UPDATE sandbox
   SET status = 'active',

@@ -457,8 +457,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// resumable 'paused' state. Prefer leak over loss.
 	pauseAndRevert := func() {
 		pctx, pcancel := context.WithTimeout(revertCtx, vmdTimeout)
-		defer pcancel()
 		snapPath, memPath, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
+		pcancel()
 		if perr != nil {
 			// VM unreachable — nothing to preserve; mark failed rather than
 			// wedge in 'resuming' (the CTE also closes any open interval).
@@ -466,13 +466,16 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID)
 			return
 		}
-		// Overlay preserved; flip resuming → paused via the normal pause finalize.
-		if _, ferr := h.DB.FinalizePause(pctx, db.FinalizePauseParams{
+		// Fresh deadline so a slow snapshot above can't starve the DB write.
+		// Overlay preserved; flip resuming → paused via FinalizePause.
+		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
+		defer fcancel()
+		if _, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
 			ID:        sandboxID,
 			TeamID:    teamID,
 			Path:      snapPath,
 			MemPath:   &memPath,
-			SizeBytes: 0,
+			SizeBytes: 0, // snapshot size isn't tracked for pauses (matches PauseSandbox)
 			Trigger:   "resume_revert",
 		}); ferr != nil {
 			// VM is safely paused; only bookkeeping failed. Best-effort status

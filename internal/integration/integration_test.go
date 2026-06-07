@@ -635,6 +635,26 @@ func countOpenIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) 
 	return n
 }
 
+// waitForSandboxStatus polls until the sandbox reaches want (or fails), rather
+// than sleeping a fixed interval that goes flaky under load.
+func waitForSandboxStatus(t *testing.T, ctx context.Context, id, teamID uuid.UUID, want db.SandboxStatus) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: id, TeamID: teamID})
+		if err != nil {
+			t.Fatalf("get sandbox: %v", err)
+		}
+		if sb.Status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox status = %q, want %q (timed out)", sb.Status, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // A stale OPEN interval (a prior transition that failed to close it) must not
 // break resume: before ON CONFLICT it collided and the handler tore the VM
 // down. Now the open row is reused and resume succeeds.
@@ -671,14 +691,7 @@ func TestIntegration_ResumeSandbox_StaleOpenInterval(t *testing.T) {
 		t.Fatalf("resume with stale interval: expected 200, got %d: %s", rw.Code, rw.Body.String())
 	}
 
-	time.Sleep(50 * time.Millisecond)
-	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
-	if err != nil {
-		t.Fatalf("get sandbox: %v", err)
-	}
-	if sb.Status != db.SandboxStatusActive {
-		t.Errorf("DB status = %q, want active", sb.Status)
-	}
+	waitForSandboxStatus(t, ctx, sandboxID, teamID, db.SandboxStatusActive)
 	// ON CONFLICT DO NOTHING reuses the existing open row — no duplicate.
 	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
 		t.Errorf("open intervals after resume = %d, want 1", open)
@@ -731,6 +744,52 @@ func TestIntegration_CloseOrphanedActiveIntervals(t *testing.T) {
 	}
 	if open := countOpenIntervals(t, ctx, sandboxID); open != 0 {
 		t.Errorf("after settle window: open = %d, want 0 (closed)", open)
+	}
+}
+
+// pauseAndRevert calls FinalizePause from 'resuming', not 'pausing'. Confirm on
+// real Postgres that it has no source-status precondition: it flips to paused.
+func TestIntegration_FinalizePause_FromResuming(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"finalize-resuming"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+	// Pause first for a deterministic state, then force 'resuming' directly.
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET status = 'resuming' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("force resuming: %v", err)
+	}
+
+	mem := "/snapshots/" + sid + "/mem.snap"
+	snapID, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
+		ID:      sandboxID,
+		TeamID:  teamID,
+		Path:    "/snapshots/" + sid + "/vmstate.snap",
+		MemPath: &mem,
+		Trigger: "resume_revert",
+	})
+	if err != nil {
+		t.Fatalf("FinalizePause from resuming failed (status precondition?): %v", err)
+	}
+	if snapID == uuid.Nil {
+		t.Fatal("FinalizePause returned nil snapshot id")
+	}
+
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sb.Status != db.SandboxStatusPaused {
+		t.Errorf("status after FinalizePause = %q, want paused", sb.Status)
 	}
 }
 

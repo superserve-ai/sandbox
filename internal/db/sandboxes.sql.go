@@ -48,6 +48,7 @@ type ActivateSandboxParams struct {
 //
 // A leftover open interval must not fail the activation, so ON CONFLICT keeps
 // the existing open row — an orphaned interval can never block a resumed VM.
+// (Creation has no prior interval; this reuse only ever applies on resume.)
 func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams) error {
 	_, err := q.db.Exec(ctx, activateSandbox,
 		arg.ID,
