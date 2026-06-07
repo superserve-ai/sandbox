@@ -624,6 +624,175 @@ func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	}
 }
 
+func countOpenIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_active_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&n); err != nil {
+		t.Fatalf("count open intervals: %v", err)
+	}
+	return n
+}
+
+// waitForSandboxStatus polls until the sandbox reaches want (or fails), rather
+// than sleeping a fixed interval that goes flaky under load.
+func waitForSandboxStatus(t *testing.T, ctx context.Context, id, teamID uuid.UUID, want db.SandboxStatus) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: id, TeamID: teamID})
+		if err != nil {
+			t.Fatalf("get sandbox: %v", err)
+		}
+		if sb.Status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox status = %q, want %q (timed out)", sb.Status, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A stale OPEN interval (a prior transition that failed to close it) must not
+// break resume: before ON CONFLICT it collided and the handler tore the VM
+// down. Now the open row is reused and resume succeeds.
+func TestIntegration_ResumeSandbox_StaleOpenInterval(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+
+	// Simulate the orphan: open a second interval while the sandbox is paused,
+	// leaving its row dangling exactly as a missed close would.
+	if err := testQueries.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	}); err != nil {
+		t.Fatalf("seed stale interval: %v", err)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("setup: open intervals = %d, want 1", open)
+	}
+
+	rw := do(r, "POST", "/sandboxes/"+sid+"/resume", apiKey, "")
+	if rw.Code != http.StatusOK {
+		t.Fatalf("resume with stale interval: expected 200, got %d: %s", rw.Code, rw.Body.String())
+	}
+
+	waitForSandboxStatus(t, ctx, sandboxID, teamID, db.SandboxStatusActive)
+	// ON CONFLICT DO NOTHING reuses the existing open row — no duplicate.
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Errorf("open intervals after resume = %d, want 1", open)
+	}
+}
+
+// The reaper's orphan sweep closes intervals left open while their sandbox is
+// no longer active, but only once the settle window has passed.
+func TestIntegration_CloseOrphanedActiveIntervals(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"orphan-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if err := testQueries.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	}); err != nil {
+		t.Fatalf("seed stale interval: %v", err)
+	}
+
+	// Within the settle window → sweep must leave the fresh transition alone.
+	if _, err := testQueries.CloseOrphanedActiveIntervals(ctx); err != nil {
+		t.Fatalf("sweep (fresh): %v", err)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Errorf("within settle window: open = %d, want 1 (untouched)", open)
+	}
+
+	// Backdate past the settle window → sweep now closes the orphan.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET updated_at = now() - interval '10 minutes' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	n, err := testQueries.CloseOrphanedActiveIntervals(ctx)
+	if err != nil {
+		t.Fatalf("sweep (settled): %v", err)
+	}
+	if n < 1 {
+		t.Errorf("sweep closed %d rows, want >= 1", n)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 0 {
+		t.Errorf("after settle window: open = %d, want 0 (closed)", open)
+	}
+}
+
+// pauseAndRevert calls FinalizePause from 'resuming', not 'pausing'. Confirm on
+// real Postgres that it has no source-status precondition: it flips to paused.
+func TestIntegration_FinalizePause_FromResuming(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"finalize-resuming"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+	// Pause first for a deterministic state, then force 'resuming' directly.
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET status = 'resuming' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("force resuming: %v", err)
+	}
+
+	mem := "/snapshots/" + sid + "/mem.snap"
+	snapID, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
+		ID:      sandboxID,
+		TeamID:  teamID,
+		Path:    "/snapshots/" + sid + "/vmstate.snap",
+		MemPath: &mem,
+		Trigger: "resume_revert",
+	})
+	if err != nil {
+		t.Fatalf("FinalizePause from resuming failed (status precondition?): %v", err)
+	}
+	if snapID == uuid.Nil {
+		t.Fatal("FinalizePause returned nil snapshot id")
+	}
+
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sb.Status != db.SandboxStatusPaused {
+		t.Errorf("status after FinalizePause = %q, want paused", sb.Status)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // DELETE /sandboxes/:id
 // ---------------------------------------------------------------------------

@@ -451,20 +451,45 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	destroyAndRevert := func() {
-		dctx, dcancel := context.WithTimeout(revertCtx, vmdTimeout)
-		defer dcancel()
-		if err := vmd.DestroyInstance(dctx, sandboxID.String(), true); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy VM after resume failure failed")
+	// Once the VM is up, a failed finalize step must NOT destroy it —
+	// DestroyInstance deletes the overlay (the sandbox's disk). Re-pause
+	// instead: snapshotting preserves the overlay and returns it to a clean,
+	// resumable 'paused' state. Prefer leak over loss.
+	pauseAndRevert := func() {
+		pctx, pcancel := context.WithTimeout(revertCtx, vmdTimeout)
+		snapPath, memPath, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
+		pcancel()
+		if perr != nil {
+			// VM unreachable — nothing to preserve; mark failed rather than
+			// wedge in 'resuming' (the CTE also closes any open interval).
+			log.Error().Err(perr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: PauseInstance failed, marking sandbox failed")
+			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID)
+			return
 		}
-		revertToPaused()
+		// Fresh deadline so a slow snapshot above can't starve the DB write.
+		// Overlay preserved; flip resuming → paused via FinalizePause.
+		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
+		defer fcancel()
+		if _, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
+			ID:        sandboxID,
+			TeamID:    teamID,
+			Path:      snapPath,
+			MemPath:   &memPath,
+			SizeBytes: 0, // snapshot size isn't tracked for pauses (matches PauseSandbox)
+			Trigger:   "resume_revert",
+		}); ferr != nil {
+			// VM is safely paused; only bookkeeping failed. Best-effort status
+			// flip — the reconciler is the backstop.
+			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
+			revertToPaused()
+		}
 	}
 
 	// Apply egress rules before committing to 'active' so "active ⇒ rules
 	// applied" holds by construction.
 	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
-		destroyAndRevert()
+		pauseAndRevert()
 		respondError(c, ErrInternal)
 		return false
 	}
@@ -478,7 +503,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		ActorID:   actorUUID(actorIDFromContext(c)),
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
-		destroyAndRevert()
+		pauseAndRevert()
 		respondError(c, ErrInternal)
 		return false
 	}

@@ -12,6 +12,33 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const closeOrphanedActiveIntervals = `-- name: CloseOrphanedActiveIntervals :execrows
+UPDATE sandbox_active_interval sai
+SET ended_at = now(),
+    end_reason = CASE s.status
+        WHEN 'failed'  THEN 'failed'
+        WHEN 'deleted' THEN 'deleted'
+        ELSE 'paused'
+    END
+FROM sandbox s
+WHERE sai.sandbox_id = s.id
+  AND sai.ended_at IS NULL
+  AND s.status IN ('paused', 'failed', 'deleted')
+  AND s.updated_at < now() - interval '5 minutes'
+`
+
+// Defense-in-depth sweep: close interval rows left open while their sandbox is
+// no longer active (a transition whose close didn't land). Left alone they
+// count the sandbox active in WAU forever. end_reason mirrors the terminal
+// state; the settle window avoids racing a transiently non-active sandbox.
+func (q *Queries) CloseOrphanedActiveIntervals(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, closeOrphanedActiveIntervals)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const closeSandboxActiveInterval = `-- name: CloseSandboxActiveInterval :exec
 UPDATE sandbox_active_interval
 SET ended_at = now(),
@@ -58,6 +85,7 @@ func (q *Queries) GetMostRecentClosedSandboxIntervalActor(ctx context.Context, s
 const openSandboxActiveInterval = `-- name: OpenSandboxActiveInterval :exec
 INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
 VALUES ($1, $2, $3, now())
+ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
 `
 
 type OpenSandboxActiveIntervalParams struct {
@@ -67,11 +95,9 @@ type OpenSandboxActiveIntervalParams struct {
 }
 
 // Opens an interval row when a sandbox transitions into 'active' (created or
-// resumed). The partial unique index sandbox_active_interval(sandbox_id) WHERE
-// ended_at IS NULL guarantees at most one open row per sandbox at any time;
-// in the unlikely event a prior open row was left dangling, the caller should
-// treat the unique-violation as recoverable (sandbox is already considered
-// running) rather than a hard error.
+// resumed). A dangling open row from a prior transition is recoverable, so
+// ON CONFLICT makes this a no-op rather than a unique-violation the caller
+// would have to special-case.
 func (q *Queries) OpenSandboxActiveInterval(ctx context.Context, arg OpenSandboxActiveIntervalParams) error {
 	_, err := q.db.Exec(ctx, openSandboxActiveInterval, arg.SandboxID, arg.TeamID, arg.ActorID)
 	return err

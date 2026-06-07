@@ -1,12 +1,11 @@
 -- name: OpenSandboxActiveInterval :exec
 -- Opens an interval row when a sandbox transitions into 'active' (created or
--- resumed). The partial unique index sandbox_active_interval(sandbox_id) WHERE
--- ended_at IS NULL guarantees at most one open row per sandbox at any time;
--- in the unlikely event a prior open row was left dangling, the caller should
--- treat the unique-violation as recoverable (sandbox is already considered
--- running) rather than a hard error.
+-- resumed). A dangling open row from a prior transition is recoverable, so
+-- ON CONFLICT makes this a no-op rather than a unique-violation the caller
+-- would have to special-case.
 INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
-VALUES ($1, $2, $3, now());
+VALUES ($1, $2, $3, now())
+ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
 -- name: CloseSandboxActiveInterval :exec
 -- Closes the currently-open interval for a sandbox. The WHERE ended_at IS NULL
@@ -31,3 +30,21 @@ FROM sandbox_active_interval
 WHERE sandbox_id = $1 AND ended_at IS NOT NULL
 ORDER BY ended_at DESC
 LIMIT 1;
+
+-- name: CloseOrphanedActiveIntervals :execrows
+-- Defense-in-depth sweep: close interval rows left open while their sandbox is
+-- no longer active (a transition whose close didn't land). Left alone they
+-- count the sandbox active in WAU forever. end_reason mirrors the terminal
+-- state; the settle window avoids racing a transiently non-active sandbox.
+UPDATE sandbox_active_interval sai
+SET ended_at = now(),
+    end_reason = CASE s.status
+        WHEN 'failed'  THEN 'failed'
+        WHEN 'deleted' THEN 'deleted'
+        ELSE 'paused'
+    END
+FROM sandbox s
+WHERE sai.sandbox_id = s.id
+  AND sai.ended_at IS NULL
+  AND s.status IN ('paused', 'failed', 'deleted')
+  AND s.updated_at < now() - interval '5 minutes';

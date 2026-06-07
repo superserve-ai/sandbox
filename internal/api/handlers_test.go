@@ -215,6 +215,15 @@ func errorRow(err error) *mockRow {
 	return &mockRow{scanFn: func(...any) error { return err }}
 }
 
+// uuidRow returns a mockRow for a query that RETURNs a single uuid (e.g.
+// FinalizePause's snapshot_id).
+func uuidRow(id uuid.UUID) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = id
+		return nil
+	}}
+}
+
 // activityRow returns a mockRow for CreateActivity's Scan (14 fields).
 func activityRow() *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
@@ -743,7 +752,9 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 
 // Network-reapply failure after VMD resume must destroy the VM, revert DB to
 // paused, and never flip status to active.
-func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
+// A resume that gets the VM up but then fails to reapply egress rules must
+// re-pause the VM (preserving the overlay), never destroy it.
+func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -754,7 +765,7 @@ func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
-	var destroyCalled, updateNetworkCalled int32
+	var destroyCalled, pauseCalled, updateNetworkCalled, finalizeCalled, activateCalled int32
 	vmd := &stubVMD{
 		resumeFn: func(context.Context, string, string, string) (string, error) {
 			return "10.0.0.5", nil
@@ -763,31 +774,34 @@ func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
 			atomic.AddInt32(&destroyCalled, 1)
 			return nil
 		},
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			atomic.AddInt32(&pauseCalled, 1)
+			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+		},
 		updateNetworkFn: func(context.Context, string, []string, []string, []string) error {
 			atomic.AddInt32(&updateNetworkCalled, 1)
 			return fmt.Errorf("nftables push failed")
 		},
 	}
 
-	var activateCalled, revertCalled int32
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "FROM sandbox"):
-				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
+				atomic.AddInt32(&finalizeCalled, 1)
+				return uuidRow(snapshotID)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
 			}
 			return activityRow()
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 			if strings.Contains(sql, "'active'") {
 				atomic.AddInt32(&activateCalled, 1)
-			}
-			if strings.Contains(sql, "SET status = 'paused'") {
-				atomic.AddInt32(&revertCalled, 1)
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
@@ -803,19 +817,24 @@ func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
 	if got := atomic.LoadInt32(&updateNetworkCalled); got != 1 {
 		t.Errorf("reapplyNetworkConfig calls = %d, want 1", got)
 	}
-	if got := atomic.LoadInt32(&destroyCalled); got != 1 {
-		t.Errorf("DestroyInstance calls = %d, want 1 (on failure)", got)
+	// Must never destroy a resumed VM — that deletes the overlay.
+	if got := atomic.LoadInt32(&destroyCalled); got != 0 {
+		t.Errorf("DestroyInstance calls = %d, want 0 (must not destroy a resumed VM)", got)
+	}
+	if got := atomic.LoadInt32(&pauseCalled); got != 1 {
+		t.Errorf("PauseInstance calls = %d, want 1 (re-pause preserves overlay)", got)
+	}
+	if got := atomic.LoadInt32(&finalizeCalled); got != 1 {
+		t.Errorf("FinalizePause calls = %d, want 1 (revert to paused)", got)
 	}
 	if got := atomic.LoadInt32(&activateCalled); got != 0 {
 		t.Errorf("ActivateSandbox calls = %d, want 0 (network failed before commit)", got)
 	}
-	if got := atomic.LoadInt32(&revertCalled); got != 1 {
-		t.Errorf("RevertResumeToPaused calls = %d, want 1", got)
-	}
 }
 
-// DB activate failure after network reapply must also destroy the VM + revert.
-func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
+// A DB activate failure after the VM is up must re-pause (preserve the
+// overlay), never destroy — the path that previously bricked a sandbox.
+func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -825,7 +844,7 @@ func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
-	var destroyCalled int32
+	var destroyCalled, pauseCalled, finalizeCalled int32
 	vmd := &stubVMD{
 		resumeFn: func(context.Context, string, string, string) (string, error) {
 			return "10.0.0.5", nil
@@ -834,27 +853,30 @@ func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
 			atomic.AddInt32(&destroyCalled, 1)
 			return nil
 		},
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			atomic.AddInt32(&pauseCalled, 1)
+			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+		},
 	}
 
-	var revertCalled int32
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "FROM sandbox"):
-				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
+				atomic.AddInt32(&finalizeCalled, 1)
+				return uuidRow(snapshotID)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
 			}
 			return activityRow()
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 			if strings.Contains(sql, "'active'") {
 				return pgconn.CommandTag{}, fmt.Errorf("db connection lost")
-			}
-			if strings.Contains(sql, "SET status = 'paused'") {
-				atomic.AddInt32(&revertCalled, 1)
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
@@ -867,11 +889,14 @@ func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
 	}
-	if got := atomic.LoadInt32(&destroyCalled); got != 1 {
-		t.Errorf("DestroyInstance calls = %d, want 1", got)
+	if got := atomic.LoadInt32(&destroyCalled); got != 0 {
+		t.Errorf("DestroyInstance calls = %d, want 0 (must not destroy a resumed VM)", got)
 	}
-	if got := atomic.LoadInt32(&revertCalled); got != 1 {
-		t.Errorf("RevertResumeToPaused calls = %d, want 1", got)
+	if got := atomic.LoadInt32(&pauseCalled); got != 1 {
+		t.Errorf("PauseInstance calls = %d, want 1 (re-pause preserves overlay)", got)
+	}
+	if got := atomic.LoadInt32(&finalizeCalled); got != 1 {
+		t.Errorf("FinalizePause calls = %d, want 1 (revert to paused)", got)
 	}
 }
 

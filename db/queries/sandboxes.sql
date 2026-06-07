@@ -74,6 +74,10 @@ WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 -- sandbox observable as active has a matching open interval — otherwise a
 -- crash/timeout between the two writes would leave the sandbox active with
 -- no interval, undercounting WAU until the next state transition.
+--
+-- A leftover open interval must not fail the activation, so ON CONFLICT keeps
+-- the existing open row — an orphaned interval can never block a resumed VM.
+-- (Creation has no prior interval; this reuse only ever applies on resume.)
 WITH activated AS (
   UPDATE sandbox
   SET status = 'active',
@@ -86,7 +90,8 @@ WITH activated AS (
 )
 INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
 SELECT a.id, a.team_id, $6, now()
-FROM activated a;
+FROM activated a
+ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
 -- name: SetSandboxSnapshot :exec
 UPDATE sandbox
