@@ -87,19 +87,26 @@ func computeQuotaAlerts(rows []db.ListTeamQuotaUsageRow) map[quotaKey]QuotaAlert
 // StartQuotaWatcher periodically alerts on teams over the threshold, off the
 // request path. Blocks until ctx is cancelled.
 func StartQuotaWatcher(ctx context.Context, queries *db.Queries, notifier QuotaNotifier) {
+	defer sentrylog.Recover("quota-watcher-loop")
 	log.Info().Int("threshold_pct", quotaAlertPct).Dur("interval", quotaWatchInterval).Msg("quota watcher started")
 	ticker := time.NewTicker(quotaWatchInterval)
 	defer ticker.Stop()
-	sentrylog.RunSafe("quota-watcher", func() { quotaWatchOnce(ctx, queries, notifier) })
+
+	// Every run — initial and tick-driven — gets the same bounded deadline.
+	runOnce := func() {
+		runCtx, cancel := context.WithTimeout(ctx, quotaWatchTimeout)
+		defer cancel()
+		sentrylog.RunSafe("quota-watcher", func() { quotaWatchOnce(runCtx, queries, notifier) })
+	}
+
+	runOnce()
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info().Msg("quota watcher exiting")
 			return
 		case <-ticker.C:
-			runCtx, cancel := context.WithTimeout(ctx, quotaWatchTimeout)
-			sentrylog.RunSafe("quota-watcher", func() { quotaWatchOnce(runCtx, queries, notifier) })
-			cancel()
+			runOnce()
 		}
 	}
 }
