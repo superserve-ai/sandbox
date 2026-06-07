@@ -239,6 +239,12 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type QuotaAlertState struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	QuotaType string    `json:"quota_type"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type ReconcilerLog struct {
 	ID        int64       `json:"id"`
 	HostID    string      `json:"host_id"`
