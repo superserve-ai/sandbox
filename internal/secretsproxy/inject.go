@@ -53,6 +53,15 @@ func injectRequest(
 		}, nil
 	}
 
+	authType, authConfig, ok := dispatchAuthShape(binding, upstreamHost)
+	if !ok {
+		return InjectOutcome{
+			Action:          denyAction,
+			Reason:          "credential_host_mismatch",
+			MatchedSecretID: binding.SecretID,
+		}, nil
+	}
+
 	value, err := vault.FetchCredential(ctx, scope.TeamID, binding.SecretID)
 	if err != nil {
 		if errors.Is(err, ErrCredentialRevoked) {
@@ -65,7 +74,7 @@ func injectRequest(
 		return InjectOutcome{}, err
 	}
 
-	if err := applyInjection(req, binding, value); err != nil {
+	if err := applyInjectionShape(req, authType, authConfig, value); err != nil {
 		return InjectOutcome{}, fmt.Errorf("apply injection: %w", err)
 	}
 
@@ -73,6 +82,23 @@ func injectRequest(
 		Action:          allowAction,
 		MatchedSecretID: binding.SecretID,
 	}, nil
+}
+
+// dispatchAuthShape returns the (authType, authConfig) the writer should use
+// for upstreamHost. For multi-rule bindings, it picks the first rule whose
+// host list includes upstreamHost; ok=false if none match (binding allowlist
+// reaches the host but no rule covers it — fail closed). For legacy single-rule
+// bindings, it returns the binding's top-level shape directly.
+func dispatchAuthShape(b Binding, upstreamHost string) (string, map[string]any, bool) {
+	if len(b.Rules) == 0 {
+		return b.AuthType, b.AuthConfig, true
+	}
+	for _, r := range b.Rules {
+		if hostMatchesCredential(upstreamHost, r.Hosts) {
+			return r.AuthType, r.AuthConfig, true
+		}
+	}
+	return "", nil, false
 }
 
 // hostAllowedByEgress applies allow → deny → unmatched_host_policy in order;
@@ -134,39 +160,50 @@ func hostMatchesCredential(host string, allowed []string) bool {
 	return false
 }
 
-// findMatchingBinding scans the binding's expected auth header for a known proxy token.
+// findMatchingBinding scans every binding's expected auth shapes for a known
+// proxy token. Multi-rule bindings are scanned against every rule's shape so
+// the same credential can flow as one scheme to one host and another scheme
+// to a different host of the same provider.
 func findMatchingBinding(req *http.Request, scope *Scope) (Binding, bool) {
 	for proxyToken, binding := range scope.Bindings {
-		if headerHasToken(req, binding, proxyToken) {
+		if len(binding.Rules) > 0 {
+			for _, r := range binding.Rules {
+				if shapeHasToken(req, r.AuthType, r.AuthConfig, proxyToken) {
+					return binding, true
+				}
+			}
+			continue
+		}
+		if shapeHasToken(req, binding.AuthType, binding.AuthConfig, proxyToken) {
 			return binding, true
 		}
 	}
 	return Binding{}, false
 }
 
-// headerHasToken reports whether req carries the proxy token in the shape b expects.
-func headerHasToken(req *http.Request, b Binding, proxyToken string) bool {
-	switch b.AuthType {
+// shapeHasToken reports whether req carries proxyToken in the (authType, cfg)
+// shape. Shared by the legacy single-rule scan and the multi-rule scan.
+func shapeHasToken(req *http.Request, authType string, cfg map[string]any, proxyToken string) bool {
+	switch authType {
 	case "bearer":
 		got := req.Header.Get("Authorization")
 		return strings.EqualFold(got, "Bearer "+proxyToken)
 	case "basic":
-		// Match by password portion; the client's username is preserved on inject.
 		_, pw, ok := decodeBasicAuth(req.Header.Get("Authorization"))
 		if !ok {
 			return false
 		}
 		return subtle.ConstantTimeCompare([]byte(pw), []byte(proxyToken)) == 1
 	case "api-key":
-		name, _ := stringFromAuthConfig(b.AuthConfig, "header")
+		name, _ := stringFromAuthConfig(cfg, "header")
 		if name == "" {
 			name = "Authorization"
 		}
-		prefix, _ := stringFromAuthConfig(b.AuthConfig, "prefix")
+		prefix, _ := stringFromAuthConfig(cfg, "prefix")
 		got := req.Header.Get(name)
 		return got == prefix+proxyToken
 	case "custom":
-		headers, _ := mapStringFromAuthConfig(b.AuthConfig, "headers")
+		headers, _ := mapStringFromAuthConfig(cfg, "headers")
 		for name, tmpl := range headers {
 			expected := strings.ReplaceAll(tmpl, "{{ value }}", proxyToken)
 			if req.Header.Get(name) == expected {
@@ -178,34 +215,41 @@ func headerHasToken(req *http.Request, b Binding, proxyToken string) bool {
 	return false
 }
 
-// applyInjection strips auth-owned headers and sets them to the real value(s).
+// applyInjectionShape strips auth-owned headers and sets them to the real value(s).
 // The strip is unconditional so a client-set value can never be preserved.
-func applyInjection(req *http.Request, b Binding, real string) error {
-	switch b.AuthType {
+// For basic, a configured username overrides preserve-inbound so the writer
+// can pin a required username regardless of what the client sent.
+func applyInjectionShape(req *http.Request, authType string, cfg map[string]any, real string) error {
+	switch authType {
 	case "bearer":
 		req.Header.Del("Authorization")
 		req.Header.Set("Authorization", "Bearer "+real)
 		return nil
 	case "basic":
-		// Preserve the inbound username; fall back to "x" for empty-user inputs.
-		user, _, ok := decodeBasicAuth(req.Header.Get("Authorization"))
-		if !ok || user == "" {
-			user = "x"
+		user, _ := stringFromAuthConfig(cfg, "username")
+		if user == "" {
+			// Preserve the inbound username; fall back to "x" for empty-user inputs.
+			inbound, _, ok := decodeBasicAuth(req.Header.Get("Authorization"))
+			if ok && inbound != "" {
+				user = inbound
+			} else {
+				user = "x"
+			}
 		}
 		req.Header.Del("Authorization")
 		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+real)))
 		return nil
 	case "api-key":
-		name, _ := stringFromAuthConfig(b.AuthConfig, "header")
+		name, _ := stringFromAuthConfig(cfg, "header")
 		if name == "" {
 			name = "Authorization"
 		}
-		prefix, _ := stringFromAuthConfig(b.AuthConfig, "prefix")
+		prefix, _ := stringFromAuthConfig(cfg, "prefix")
 		req.Header.Del(name)
 		req.Header.Set(name, prefix+real)
 		return nil
 	case "custom":
-		headers, _ := mapStringFromAuthConfig(b.AuthConfig, "headers")
+		headers, _ := mapStringFromAuthConfig(cfg, "headers")
 		for name := range headers {
 			req.Header.Del(name)
 		}
@@ -218,7 +262,7 @@ func applyInjection(req *http.Request, b Binding, real string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("unknown auth_type %q", b.AuthType)
+	return fmt.Errorf("unknown auth_type %q", authType)
 }
 
 // decodeBasicAuth parses `Basic <base64(user:password)>`; ok=false on any malformed input.

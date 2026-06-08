@@ -28,13 +28,27 @@ const SecretsBindingsCap = 32
 
 // SecretsBindingClaim is the per-binding entry in the JWT's `bindings` array.
 // Field tags use short names to keep the JWT compact in HTTPS_PROXY userinfo.
+// When Rules is non-empty it overrides AuthType/AuthConfig; the daemon dispatches
+// by upstream host. Hosts remains the binding-wide allowlist.
 type SecretsBindingClaim struct {
-	ProxyToken string         `json:"p"`
-	SecretID   string         `json:"s"`
-	EnvKey     string         `json:"e"`
-	Hosts      []string       `json:"h"`
-	AuthType   string         `json:"t"`
-	AuthConfig map[string]any `json:"c,omitempty"`
+	ProxyToken string                    `json:"p"`
+	SecretID   string                    `json:"s"`
+	EnvKey     string                    `json:"e"`
+	Hosts      []string                  `json:"h"`
+	AuthType   string                    `json:"t,omitempty"`
+	AuthConfig map[string]any            `json:"c,omitempty"`
+	Rules      []SecretsBindingRuleClaim `json:"rules,omitempty"`
+}
+
+// SecretsBindingRuleClaim is one (hosts → auth shape) entry inside Rules.
+// Flat fields keep the JWT compact; the daemon dispatches on Hosts.
+type SecretsBindingRuleClaim struct {
+	Hosts    []string          `json:"h"`
+	AuthType string            `json:"t"`
+	Username string            `json:"u,omitempty"`  // basic only
+	Header   string            `json:"hd,omitempty"` // api-key only
+	Prefix   string            `json:"pf,omitempty"` // api-key only
+	Headers  map[string]string `json:"hs,omitempty"` // custom only
 }
 
 // SecretsClaims is the JWT payload.

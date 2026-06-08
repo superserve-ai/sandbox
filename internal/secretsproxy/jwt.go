@@ -21,13 +21,26 @@ import (
 const secretsJWTIssuer = "superserve-controlplane"
 
 // JWTBindingClaim mirrors `api.SecretsBindingClaim` over the JWT wire shape.
+// When Rules is present, AuthType/AuthConfig are unused; the daemon dispatches
+// by upstream host using the rule list.
 type JWTBindingClaim struct {
-	ProxyToken string         `json:"p"`
-	SecretID   string         `json:"s"`
-	EnvKey     string         `json:"e"`
-	Hosts      []string       `json:"h"`
-	AuthType   string         `json:"t"`
-	AuthConfig map[string]any `json:"c,omitempty"`
+	ProxyToken string            `json:"p"`
+	SecretID   string            `json:"s"`
+	EnvKey     string            `json:"e"`
+	Hosts      []string          `json:"h"`
+	AuthType   string            `json:"t,omitempty"`
+	AuthConfig map[string]any    `json:"c,omitempty"`
+	Rules      []JWTRuleClaim    `json:"rules,omitempty"`
+}
+
+// JWTRuleClaim is one (hosts → auth shape) entry inside JWTBindingClaim.Rules.
+type JWTRuleClaim struct {
+	Hosts    []string          `json:"h"`
+	AuthType string            `json:"t"`
+	Username string            `json:"u,omitempty"`
+	Header   string            `json:"hd,omitempty"`
+	Prefix   string            `json:"pf,omitempty"`
+	Headers  map[string]string `json:"hs,omitempty"`
 }
 
 // JWTClaims is the parsed JWT payload.

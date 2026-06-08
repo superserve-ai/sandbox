@@ -29,13 +29,24 @@ type Scope struct {
 	Bindings map[string]Binding
 }
 
-// Binding is one (proxy_token → credential) pair carried in the JWT.
+// Binding is one (proxy_token → credential) pair carried in the JWT. When
+// Rules is non-empty, AuthType/AuthConfig are unused at egress; the inject
+// pipeline picks a rule by upstream host. Hosts stays as the binding-wide
+// allowlist regardless.
 type Binding struct {
 	SecretID   string
 	EnvKey     string
 	AuthType   string         // bearer | basic | api-key | custom
 	AuthConfig map[string]any // type-specific config
 	Hosts      []string       // upstream hosts this credential applies to
+	Rules      []BindingRule  // per-host rules, dispatched at egress
+}
+
+// BindingRule is one (hosts → auth shape) entry inside Binding.Rules.
+type BindingRule struct {
+	Hosts      []string
+	AuthType   string
+	AuthConfig map[string]any
 }
 
 // ErrUnknownSandbox is returned for any rejection of the proxy CONNECT (bad

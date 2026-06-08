@@ -383,3 +383,95 @@ func TestHTTPJWKSFetcher_SkipsNonEd25519Keys(t *testing.T) {
 		t.Error("Ed25519 key should be present")
 	}
 }
+
+func TestVerifier_PerHostRulesRoundTrip(t *testing.T) {
+	// A JWT minted with multi-rule bindings must survive parse and produce
+	// the matching Rule list on the verified claims.
+	pub, priv := newKeypair(t)
+	fetcher := &stubFetcher{fn: func() (map[string]ed25519.PublicKey, error) {
+		return map[string]ed25519.PublicKey{"v1": pub}, nil
+	}}
+	v, err := NewVerifier(context.Background(), fetcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tok := signForTest(t, priv, "v1", JWTClaims{
+		TeamID:   "team-1",
+		SourceIP: "10.0.0.5",
+		Bindings: []JWTBindingClaim{{
+			ProxyToken: "ghp_proxy_aaa",
+			SecretID:   "sec-gh",
+			EnvKey:     "GITHUB_TOKEN",
+			Hosts:      []string{"api.github.com", "github.com"},
+			Rules: []JWTRuleClaim{
+				{Hosts: []string{"api.github.com"}, AuthType: "bearer"},
+				{Hosts: []string{"github.com"}, AuthType: "basic", Username: "x-access-token"},
+			},
+		}},
+	}, time.Now())
+
+	claims, err := v.Verify(context.Background(), tok, "10.0.0.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims.Bindings) != 1 {
+		t.Fatalf("bindings count: %d", len(claims.Bindings))
+	}
+	b := claims.Bindings[0]
+	if len(b.Rules) != 2 {
+		t.Fatalf("rules count: %d", len(b.Rules))
+	}
+	if b.Rules[0].AuthType != "bearer" || b.Rules[0].Hosts[0] != "api.github.com" {
+		t.Errorf("rule 0 drift: %+v", b.Rules[0])
+	}
+	if b.Rules[1].AuthType != "basic" || b.Rules[1].Username != "x-access-token" {
+		t.Errorf("rule 1 drift: %+v", b.Rules[1])
+	}
+}
+
+func TestJWTResolver_PerHostRulesPopulateBindingRules(t *testing.T) {
+	// Resolver must translate JWTRuleClaim → BindingRule with the right
+	// AuthConfig shape so the inject pipeline finds the username.
+	pub, priv := newKeypair(t)
+	fetcher := &stubFetcher{fn: func() (map[string]ed25519.PublicKey, error) {
+		return map[string]ed25519.PublicKey{"v1": pub}, nil
+	}}
+	v, err := NewVerifier(context.Background(), fetcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := NewJWTResolver(v)
+
+	tok := signForTest(t, priv, "v1", JWTClaims{
+		TeamID:   "team-1",
+		SourceIP: "10.0.0.5",
+		Bindings: []JWTBindingClaim{{
+			ProxyToken: "ghp_proxy_bbb",
+			SecretID:   "sec-gh",
+			EnvKey:     "GITHUB_TOKEN",
+			Hosts:      []string{"api.github.com", "github.com"},
+			Rules: []JWTRuleClaim{
+				{Hosts: []string{"api.github.com"}, AuthType: "bearer"},
+				{Hosts: []string{"github.com"}, AuthType: "basic", Username: "x-access-token"},
+			},
+		}},
+	}, time.Now())
+
+	scope, err := resolver.Authenticate(context.Background(), "10.0.0.5", tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok := scope.Bindings["ghp_proxy_bbb"]
+	if !ok {
+		t.Fatal("binding not present in scope")
+	}
+	if len(b.Rules) != 2 {
+		t.Fatalf("rules count: %d", len(b.Rules))
+	}
+	// Basic rule's username must round-trip into AuthConfig where the writer reads it.
+	got, _ := stringFromAuthConfig(b.Rules[1].AuthConfig, "username")
+	if got != "x-access-token" {
+		t.Errorf("basic rule username lost: cfg=%v", b.Rules[1].AuthConfig)
+	}
+}

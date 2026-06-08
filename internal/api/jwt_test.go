@@ -362,3 +362,77 @@ func TestSecretsSigner_RejectsTooManyBindings(t *testing.T) {
 		t.Fatal("want error for exceeding bindings cap, got nil")
 	}
 }
+
+func TestSecretsSigner_PerHostRulesSurviveSignAndParse(t *testing.T) {
+	// Round-trip a multi-rule binding through sign + parse, confirming the
+	// wire-format Rules field carries through and the legacy t+c fields are
+	// omitted when omitempty applies.
+	signer := newTestSigner(t, "v1")
+	claims := SecretsClaims{
+		TeamID:   "team-1",
+		SourceIP: "10.0.0.5",
+		Bindings: []SecretsBindingClaim{{
+			ProxyToken: "ghp_proxy_aaaa",
+			SecretID:   "secret-gh-1",
+			EnvKey:     "GITHUB_TOKEN",
+			Hosts:      []string{"api.github.com", "github.com"},
+			Rules: []SecretsBindingRuleClaim{
+				{Hosts: []string{"api.github.com"}, AuthType: "bearer"},
+				{Hosts: []string{"github.com"}, AuthType: "basic", Username: "x-access-token"},
+			},
+		}},
+	}
+	tok, err := signer.Sign("sandbox-1", claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Parse back and check Rules survive.
+	parsed, err := jwt.ParseWithClaims(tok, &SecretsClaims{}, func(*jwt.Token) (any, error) {
+		return signer.PublicKey(), nil
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := parsed.Claims.(*SecretsClaims)
+	if len(got.Bindings) != 1 {
+		t.Fatalf("bindings count: %d", len(got.Bindings))
+	}
+	b := got.Bindings[0]
+	if b.AuthType != "" {
+		t.Errorf("legacy AuthType should be empty for per_host binding, got %q", b.AuthType)
+	}
+	if len(b.Rules) != 2 {
+		t.Fatalf("rules count: %d", len(b.Rules))
+	}
+	if b.Rules[0].AuthType != "bearer" || b.Rules[0].Hosts[0] != "api.github.com" {
+		t.Errorf("rule 0 drift: %+v", b.Rules[0])
+	}
+	if b.Rules[1].AuthType != "basic" || b.Rules[1].Username != "x-access-token" {
+		t.Errorf("rule 1 drift: %+v", b.Rules[1])
+	}
+	// Decode the JWT body and assert that the legacy `t` field is absent for
+	// the multi-rule binding (omitempty had to fire).
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		t.Fatal("malformed jwt")
+	}
+	body, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	rawBindings := raw["bindings"].([]any)
+	rawBinding := rawBindings[0].(map[string]any)
+	if _, hasT := rawBinding["t"]; hasT {
+		t.Errorf("legacy t field should be omitted from per_host binding, body=%v", rawBinding)
+	}
+	if _, hasC := rawBinding["c"]; hasC {
+		t.Errorf("legacy c field should be omitted from per_host binding, body=%v", rawBinding)
+	}
+	if _, hasRules := rawBinding["rules"]; !hasRules {
+		t.Errorf("rules field missing from JWT body: %v", rawBinding)
+	}
+}

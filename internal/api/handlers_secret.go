@@ -54,10 +54,16 @@ var providerShortcuts = map[string]providerShortcut{
 		Token:      tokenSpec{Prefix: "sk-proj-", BodyLen: 64, Alphabet: "alnum"},
 	},
 	"github": {
-		AuthType:   "bearer",
-		AuthConfig: map[string]any{},
-		Hosts:      []string{"api.github.com", "github.com"},
-		Token:      tokenSpec{Prefix: "ghp_", BodyLen: 36, Alphabet: "alnum"},
+		// REST uses Bearer; git over HTTPS uses Basic with x-access-token.
+		AuthType: authTypePerHost,
+		AuthConfig: map[string]any{
+			"per_host": []map[string]any{
+				{"hosts": []string{"api.github.com"}, "type": "bearer"},
+				{"hosts": []string{"github.com"}, "type": "basic", "username": "x-access-token"},
+			},
+		},
+		Hosts: []string{"api.github.com", "github.com"},
+		Token: tokenSpec{Prefix: "ghp_", BodyLen: 36, Alphabet: "alnum"},
 	},
 	"stripe": {
 		AuthType:   "bearer",
@@ -94,11 +100,25 @@ func knownProviders() []string {
 
 // authConfigRequest is the typed auth block (bearer | basic | api-key | custom).
 // For type=basic, value is the password; the user portion is preserved at egress.
+// When PerHost is set, Type and the type-specific fields must be empty; each
+// rule in PerHost carries its own shape.
 type authConfigRequest struct {
-	Type    string            `json:"type"`
-	Header  string            `json:"header,omitempty"`  // api-key only
-	Prefix  string            `json:"prefix,omitempty"`  // api-key only
-	Headers map[string]string `json:"headers,omitempty"` // custom only
+	Type     string            `json:"type,omitempty"`
+	Header   string            `json:"header,omitempty"`   // api-key only
+	Prefix   string            `json:"prefix,omitempty"`   // api-key only
+	Username string            `json:"username,omitempty"` // basic only — overrides preserve-inbound
+	Headers  map[string]string `json:"headers,omitempty"`  // custom only
+	PerHost  []perHostRule     `json:"per_host,omitempty"` // multi-rule, dispatched by upstream host
+}
+
+// perHostRule is one (hosts → auth shape) entry inside authConfigRequest.PerHost.
+type perHostRule struct {
+	Hosts    []string          `json:"hosts"`
+	Type     string            `json:"type"`
+	Header   string            `json:"header,omitempty"`
+	Prefix   string            `json:"prefix,omitempty"`
+	Username string            `json:"username,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
 }
 
 type createSecretRequest struct {
@@ -208,45 +228,170 @@ func validateAuthConfig(auth *authConfigRequest) error {
 	if auth == nil {
 		return errors.New("auth is required when provider is not set")
 	}
-	switch auth.Type {
-	case "bearer", "basic":
-		if auth.Header != "" || auth.Prefix != "" || len(auth.Headers) > 0 {
-			return fmt.Errorf("auth.type=%q does not accept header/prefix/headers", auth.Type)
+	if len(auth.PerHost) > 0 {
+		if auth.Type != "" || auth.Header != "" || auth.Prefix != "" || auth.Username != "" || len(auth.Headers) > 0 {
+			return errors.New("auth.per_host is mutually exclusive with auth.type and the type-specific fields")
+		}
+		return nil // per-host rules validated separately against the hosts allowlist
+	}
+	return validateAuthShape(auth.Type, auth.Header, auth.Prefix, auth.Username, auth.Headers, "auth")
+}
+
+// validateAuthShape validates one (type, fields) combo. fieldPath is the JSON
+// pointer prefix used in error messages (e.g. "auth" or "auth.per_host[0]").
+func validateAuthShape(authType, header, prefix, username string, headers map[string]string, fieldPath string) error {
+	switch authType {
+	case "bearer":
+		if header != "" || prefix != "" || username != "" || len(headers) > 0 {
+			return fmt.Errorf("%s.type=%q does not accept header/prefix/username/headers", fieldPath, authType)
+		}
+	case "basic":
+		if header != "" || prefix != "" || len(headers) > 0 {
+			return fmt.Errorf("%s.type=%q does not accept header/prefix/headers", fieldPath, authType)
+		}
+		if username != "" && strings.ContainsAny(username, ":\r\n") {
+			return fmt.Errorf("%s.username may not contain ':' or CR/LF", fieldPath)
 		}
 	case "api-key":
-		if auth.Header == "" {
-			return errors.New("auth.header is required for type=api-key")
+		if header == "" {
+			return fmt.Errorf("%s.header is required for type=api-key", fieldPath)
 		}
-		if !headerNameRE.MatchString(auth.Header) {
-			return fmt.Errorf("auth.header %q is not a valid header name", auth.Header)
+		if !headerNameRE.MatchString(header) {
+			return fmt.Errorf("%s.header %q is not a valid header name", fieldPath, header)
 		}
-		if len(auth.Headers) > 0 {
-			return errors.New("auth.headers is not allowed for type=api-key")
+		if len(headers) > 0 {
+			return fmt.Errorf("%s.headers is not allowed for type=api-key", fieldPath)
+		}
+		if username != "" {
+			return fmt.Errorf("%s.username is not allowed for type=api-key", fieldPath)
 		}
 	case "custom":
-		if len(auth.Headers) == 0 {
-			return errors.New("auth.headers is required for type=custom")
+		if len(headers) == 0 {
+			return fmt.Errorf("%s.headers is required for type=custom", fieldPath)
 		}
-		if len(auth.Headers) > maxCustomHeaders {
-			return fmt.Errorf("auth.headers has %d entries, max is %d", len(auth.Headers), maxCustomHeaders)
+		if len(headers) > maxCustomHeaders {
+			return fmt.Errorf("%s.headers has %d entries, max is %d", fieldPath, len(headers), maxCustomHeaders)
 		}
-		for name, tmpl := range auth.Headers {
+		for name, tmpl := range headers {
 			if !headerNameRE.MatchString(name) {
-				return fmt.Errorf("auth.headers: %q is not a valid header name", name)
+				return fmt.Errorf("%s.headers: %q is not a valid header name", fieldPath, name)
 			}
 			if !strings.Contains(tmpl, "{{ value }}") {
-				return fmt.Errorf("auth.headers[%s]: template must reference {{ value }} so the credential is actually injected", name)
+				return fmt.Errorf("%s.headers[%s]: template must reference {{ value }} so the credential is actually injected", fieldPath, name)
 			}
 		}
-		if auth.Header != "" || auth.Prefix != "" {
-			return errors.New("auth.type=custom does not accept header/prefix; use headers map")
+		if header != "" || prefix != "" || username != "" {
+			return fmt.Errorf("%s.type=custom does not accept header/prefix/username; use headers map", fieldPath)
 		}
 	case "":
-		return errors.New("auth.type is required")
+		return fmt.Errorf("%s.type is required", fieldPath)
 	default:
-		return fmt.Errorf("auth.type %q is not supported (got: bearer, basic, api-key, custom)", auth.Type)
+		return fmt.Errorf("%s.type %q is not supported (got: bearer, basic, api-key, custom)", fieldPath, authType)
 	}
 	return nil
+}
+
+// validatePerHostRules checks that every rule's hosts are reachable from
+// the top-level allowlist (wildcard-aware), that no two rules' hosts overlap,
+// and that each rule's auth fields validate against its declared type.
+func validatePerHostRules(rules []perHostRule, allowedHosts []string) error {
+	if len(rules) == 0 {
+		return errors.New("auth.per_host must contain at least one rule")
+	}
+	if len(rules) > maxHostsPerSecret {
+		return fmt.Errorf("auth.per_host has %d rules, max is %d", len(rules), maxHostsPerSecret)
+	}
+	type seenHost struct {
+		ruleIdx int
+		host    string
+	}
+	var seen []seenHost
+	for i := range rules {
+		r := &rules[i]
+		if err := validateHosts(r.Hosts); err != nil {
+			return fmt.Errorf("auth.per_host[%d]: %w", i, err)
+		}
+		for _, h := range r.Hosts {
+			if !hostReachable(h, allowedHosts) {
+				return fmt.Errorf("auth.per_host[%d].hosts: %q is not reachable from the top-level hosts allowlist", i, h)
+			}
+			for _, prev := range seen {
+				if patternsOverlap(h, prev.host) {
+					return fmt.Errorf("auth.per_host[%d].hosts: %q overlaps with auth.per_host[%d].hosts %q", i, h, prev.ruleIdx, prev.host)
+				}
+			}
+			seen = append(seen, seenHost{i, h})
+		}
+		if err := validateAuthShape(r.Type, r.Header, r.Prefix, r.Username, r.Headers, fmt.Sprintf("auth.per_host[%d]", i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hostReachable reports whether at least one pattern in allowedHosts matches
+// every host that h could refer to. Mirrors the daemon's matchHost semantics
+// so validation and runtime agree on what "reachable" means.
+func hostReachable(h string, allowedHosts []string) bool {
+	for _, p := range allowedHosts {
+		if patternCovers(p, h) {
+			return true
+		}
+	}
+	return false
+}
+
+// patternCovers returns true if every host matched by inner is also matched
+// by outer. Both args may be exact hosts or `*.suffix` wildcards.
+func patternCovers(outer, inner string) bool {
+	outer = strings.ToLower(strings.TrimSpace(outer))
+	inner = strings.ToLower(strings.TrimSpace(inner))
+	if outer == inner {
+		return true
+	}
+	outerWild := strings.HasPrefix(outer, "*.")
+	innerWild := strings.HasPrefix(inner, "*.")
+	if !outerWild {
+		// An exact outer can only cover an identical exact inner (handled above).
+		return false
+	}
+	outerSuffix := outer[1:] // ".X"
+	outerBare := outer[2:]   // "X"
+	if !innerWild {
+		// Wildcard *.X covers exact host h iff h ends in ".X" and h != "X".
+		return strings.HasSuffix(inner, outerSuffix) && inner != outerBare
+	}
+	// Wildcard *.X covers wildcard *.Y iff Y ends in .X (so every host matched
+	// by *.Y also has the .X suffix). The bare-domain exclusion is preserved
+	// at runtime by matchHost on each individual host.
+	return strings.HasSuffix(inner[1:], outerSuffix)
+}
+
+// patternsOverlap returns true if a and b share at least one host they both
+// match. Used at create time to reject ambiguous per-host rules.
+func patternsOverlap(a, b string) bool {
+	a = strings.ToLower(strings.TrimSpace(a))
+	b = strings.ToLower(strings.TrimSpace(b))
+	if a == b {
+		return true
+	}
+	aWild := strings.HasPrefix(a, "*.")
+	bWild := strings.HasPrefix(b, "*.")
+	switch {
+	case !aWild && !bWild:
+		return false
+	case aWild && !bWild:
+		suf, bare := a[1:], a[2:]
+		return strings.HasSuffix(b, suf) && b != bare
+	case !aWild && bWild:
+		suf, bare := b[1:], b[2:]
+		return strings.HasSuffix(a, suf) && a != bare
+	default:
+		// Two wildcards *.X and *.Y overlap iff one suffix-contains the other:
+		// every host *.foo.example.com matches is also matched by *.example.com.
+		aSuf, bSuf := a[1:], b[1:]
+		return strings.HasSuffix(aSuf, bSuf) || strings.HasSuffix(bSuf, aSuf)
+	}
 }
 
 // resolveAuth flattens the request into (auth_type, auth_config, hosts, provider_shortcut).
@@ -287,6 +432,15 @@ func resolveAuth(req createSecretRequest) (authType string, authConfig []byte, h
 	if err = validateHosts(req.Hosts); err != nil {
 		return
 	}
+	if len(req.Auth.PerHost) > 0 {
+		if err = validatePerHostRules(req.Auth.PerHost, req.Hosts); err != nil {
+			return
+		}
+		authType = authTypePerHost
+		authConfig, err = marshalPerHostConfig(req.Auth.PerHost)
+		hosts = req.Hosts
+		return
+	}
 	authType = req.Auth.Type
 	cfg := map[string]any{}
 	switch authType {
@@ -295,12 +449,46 @@ func resolveAuth(req createSecretRequest) (authType string, authConfig []byte, h
 		if req.Auth.Prefix != "" {
 			cfg["prefix"] = req.Auth.Prefix
 		}
+	case "basic":
+		if req.Auth.Username != "" {
+			cfg["username"] = req.Auth.Username
+		}
 	case "custom":
 		cfg["headers"] = req.Auth.Headers
 	}
 	authConfig, err = json.Marshal(cfg)
 	hosts = req.Hosts
 	return
+}
+
+// authTypePerHost is the auth_type sentinel for multi-rule secrets. The
+// daemon dispatches by upstream host using the rules embedded in auth_config.
+const authTypePerHost = "per_host"
+
+// marshalPerHostConfig serializes the rule list into auth_config jsonb shape.
+func marshalPerHostConfig(rules []perHostRule) ([]byte, error) {
+	out := make([]map[string]any, 0, len(rules))
+	for _, r := range rules {
+		entry := map[string]any{
+			"hosts": r.Hosts,
+			"type":  r.Type,
+		}
+		switch r.Type {
+		case "basic":
+			if r.Username != "" {
+				entry["username"] = r.Username
+			}
+		case "api-key":
+			entry["header"] = r.Header
+			if r.Prefix != "" {
+				entry["prefix"] = r.Prefix
+			}
+		case "custom":
+			entry["headers"] = r.Headers
+		}
+		out = append(out, entry)
+	}
+	return json.Marshal(map[string]any{"per_host": out})
 }
 
 func (h *Handlers) requireEncryptor(c *gin.Context) bool {
@@ -747,16 +935,73 @@ func (h *Handlers) mintSecretsJWT(sandboxID, teamID, sourceIP, unmatchedHostPoli
 				return "", fmt.Errorf("decode auth_config for env_key=%q: %w", m.EnvKey, err)
 			}
 		}
-		claims.Bindings = append(claims.Bindings, SecretsBindingClaim{
+		binding := SecretsBindingClaim{
 			ProxyToken: m.ProxyToken,
 			SecretID:   m.SecretID.String(),
 			EnvKey:     m.EnvKey,
 			Hosts:      m.Hosts,
-			AuthType:   m.AuthType,
-			AuthConfig: authCfg,
-		})
+		}
+		if m.AuthType == authTypePerHost {
+			rules, rerr := perHostRulesFromConfig(authCfg)
+			if rerr != nil {
+				return "", fmt.Errorf("decode per_host rules for env_key=%q: %w", m.EnvKey, rerr)
+			}
+			binding.Rules = rules
+		} else {
+			binding.AuthType = m.AuthType
+			binding.AuthConfig = authCfg
+		}
+		claims.Bindings = append(claims.Bindings, binding)
 	}
 	return h.Signer.Sign(sandboxID, claims)
+}
+
+// perHostRulesFromConfig converts the jsonb per_host blob into JWT rule claims.
+func perHostRulesFromConfig(cfg map[string]any) ([]SecretsBindingRuleClaim, error) {
+	raw, ok := cfg["per_host"]
+	if !ok {
+		return nil, errors.New("auth_config missing per_host entry")
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil, errors.New("auth_config.per_host is not a list")
+	}
+	out := make([]SecretsBindingRuleClaim, 0, len(list))
+	for i, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("per_host[%d] is not an object", i)
+		}
+		rule := SecretsBindingRuleClaim{}
+		if h, ok := m["hosts"].([]any); ok {
+			rule.Hosts = make([]string, 0, len(h))
+			for _, hv := range h {
+				if s, ok := hv.(string); ok {
+					rule.Hosts = append(rule.Hosts, s)
+				}
+			}
+		}
+		rule.AuthType, _ = m["type"].(string)
+		if v, ok := m["username"].(string); ok {
+			rule.Username = v
+		}
+		if v, ok := m["header"].(string); ok {
+			rule.Header = v
+		}
+		if v, ok := m["prefix"].(string); ok {
+			rule.Prefix = v
+		}
+		if hs, ok := m["headers"].(map[string]any); ok {
+			rule.Headers = make(map[string]string, len(hs))
+			for k, v := range hs {
+				if s, ok := v.(string); ok {
+					rule.Headers[k] = s
+				}
+			}
+		}
+		out = append(out, rule)
+	}
+	return out, nil
 }
 
 // mergeEnvVarsWithSecrets overlays per-binding proxy tokens onto envVars,

@@ -558,3 +558,234 @@ func TestKnownProvidersStable(t *testing.T) {
 		}
 	}
 }
+
+func TestValidatePerHostRulesRejectsOverlap(t *testing.T) {
+	rules := []perHostRule{
+		{Hosts: []string{"api.github.com"}, Type: "bearer"},
+		{Hosts: []string{"api.github.com"}, Type: "basic"},
+	}
+	err := validatePerHostRules(rules, []string{"api.github.com"})
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Errorf("want overlap error, got %v", err)
+	}
+}
+
+func TestValidatePerHostRulesRejectsHostOutsideAllowlist(t *testing.T) {
+	rules := []perHostRule{
+		{Hosts: []string{"github.com"}, Type: "basic", Username: "x-access-token"},
+	}
+	err := validatePerHostRules(rules, []string{"api.github.com"})
+	if err == nil || !strings.Contains(err.Error(), "not reachable") {
+		t.Errorf("want reachability error, got %v", err)
+	}
+}
+
+func TestValidatePerHostRulesRejectsWildcardExactOverlap(t *testing.T) {
+	// "*.example.com" and "api.example.com" both match api.example.com — ambiguous.
+	rules := []perHostRule{
+		{Hosts: []string{"*.example.com"}, Type: "bearer"},
+		{Hosts: []string{"api.example.com"}, Type: "basic"},
+	}
+	err := validatePerHostRules(rules, []string{"*.example.com", "api.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Errorf("want overlap error, got %v", err)
+	}
+}
+
+func TestValidatePerHostRulesRejectsNestedWildcardOverlap(t *testing.T) {
+	// "*.example.com" covers everything "*.foo.example.com" covers — overlap.
+	rules := []perHostRule{
+		{Hosts: []string{"*.example.com"}, Type: "bearer"},
+		{Hosts: []string{"*.foo.example.com"}, Type: "basic"},
+	}
+	err := validatePerHostRules(rules, []string{"*.example.com", "*.foo.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Errorf("want overlap error, got %v", err)
+	}
+}
+
+func TestValidatePerHostRulesAllowsWildcardCoverageOfExactRuleHost(t *testing.T) {
+	// Top-level "*.example.com" should make "api.example.com" reachable.
+	rules := []perHostRule{
+		{Hosts: []string{"api.example.com"}, Type: "bearer"},
+	}
+	err := validatePerHostRules(rules, []string{"*.example.com"})
+	if err != nil {
+		t.Errorf("wildcard allowlist should cover exact rule host: %v", err)
+	}
+}
+
+func TestValidatePerHostRulesAllowsNonOverlappingWildcards(t *testing.T) {
+	// Two wildcards on disjoint domains must not be flagged as overlapping.
+	rules := []perHostRule{
+		{Hosts: []string{"*.example.com"}, Type: "bearer"},
+		{Hosts: []string{"*.other.com"}, Type: "basic"},
+	}
+	err := validatePerHostRules(rules, []string{"*.example.com", "*.other.com"})
+	if err != nil {
+		t.Errorf("disjoint wildcards must not overlap: %v", err)
+	}
+}
+
+func TestPatternCovers(t *testing.T) {
+	cases := []struct {
+		outer, inner string
+		want         bool
+	}{
+		{"api.example.com", "api.example.com", true},
+		{"api.example.com", "other.example.com", false},
+		{"*.example.com", "api.example.com", true},
+		{"*.example.com", "example.com", false}, // wildcard excludes bare
+		{"*.example.com", "api.foo.example.com", true},
+		{"*.example.com", "*.foo.example.com", true},
+		{"*.foo.example.com", "*.example.com", false}, // narrow doesn't cover wide
+		{"*.com", "*.example.com", true},
+		{"api.example.com", "*.example.com", false}, // exact doesn't cover wildcard
+	}
+	for _, c := range cases {
+		if got := patternCovers(c.outer, c.inner); got != c.want {
+			t.Errorf("patternCovers(%q, %q) = %v, want %v", c.outer, c.inner, got, c.want)
+		}
+	}
+}
+
+func TestPatternsOverlap(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"api.example.com", "api.example.com", true},
+		{"api.example.com", "other.example.com", false},
+		{"*.example.com", "api.example.com", true},
+		{"*.example.com", "example.com", false},
+		{"*.example.com", "*.example.com", true},
+		{"*.example.com", "*.foo.example.com", true}, // narrower nested inside wider
+		{"*.example.com", "*.other.com", false},
+		{"*.com", "*.example.com", true},
+	}
+	for _, c := range cases {
+		if got := patternsOverlap(c.a, c.b); got != c.want {
+			t.Errorf("patternsOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestValidatePerHostRulesPropagatesPerTypeValidation(t *testing.T) {
+	rules := []perHostRule{
+		{Hosts: []string{"api.example.com"}, Type: "api-key"}, // missing header
+	}
+	err := validatePerHostRules(rules, []string{"api.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "header is required") {
+		t.Errorf("want missing-header error, got %v", err)
+	}
+}
+
+func TestValidateAuthConfigRejectsMixingLegacyAndPerHost(t *testing.T) {
+	auth := &authConfigRequest{
+		Type:    "bearer",
+		PerHost: []perHostRule{{Hosts: []string{"api.example.com"}, Type: "bearer"}},
+	}
+	err := validateAuthConfig(auth)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("want mutual-exclusion error, got %v", err)
+	}
+}
+
+func TestResolveAuthEmitsPerHostShape(t *testing.T) {
+	// Explicit per-host secret → auth_type=per_host, auth_config carries the rules.
+	req := createSecretRequest{
+		Name:  "gh", Value: "github_pat_xxx",
+		Auth: &authConfigRequest{
+			PerHost: []perHostRule{
+				{Hosts: []string{"api.github.com"}, Type: "bearer"},
+				{Hosts: []string{"github.com"}, Type: "basic", Username: "x-access-token"},
+			},
+		},
+		Hosts: []string{"api.github.com", "github.com"},
+	}
+	authType, authConfig, hosts, shortcut, err := resolveAuth(req)
+	if err != nil {
+		t.Fatalf("resolveAuth: %v", err)
+	}
+	if authType != authTypePerHost {
+		t.Errorf("auth_type: want per_host, got %q", authType)
+	}
+	if shortcut != nil {
+		t.Errorf("shortcut should be nil for explicit auth")
+	}
+	if len(hosts) != 2 {
+		t.Errorf("hosts: want 2, got %v", hosts)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(authConfig, &cfg); err != nil {
+		t.Fatalf("auth_config JSON: %v", err)
+	}
+	list, ok := cfg["per_host"].([]any)
+	if !ok || len(list) != 2 {
+		t.Fatalf("per_host shape drift: %v", cfg)
+	}
+}
+
+func TestGitHubProviderShortcutEmitsPerHost(t *testing.T) {
+	// github now emits per-host config so a single PAT covers both api.github.com
+	// (Bearer) and github.com (Basic with x-access-token).
+	req := createSecretRequest{Name: "gh", Value: "github_pat_xxx", Provider: "github"}
+	authType, authConfig, _, shortcut, err := resolveAuth(req)
+	if err != nil {
+		t.Fatalf("resolveAuth: %v", err)
+	}
+	if authType != authTypePerHost {
+		t.Errorf("github should emit per_host auth_type, got %q", authType)
+	}
+	if shortcut == nil || *shortcut != "github" {
+		t.Errorf("shortcut metadata lost: %v", shortcut)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(authConfig, &cfg); err != nil {
+		t.Fatalf("auth_config JSON: %v", err)
+	}
+	list, _ := cfg["per_host"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("github should have 2 rules, got %d", len(list))
+	}
+	// Verify rule 0 is bearer for api.github.com.
+	r0 := list[0].(map[string]any)
+	if r0["type"] != "bearer" {
+		t.Errorf("rule 0 type: %v", r0["type"])
+	}
+	// Verify rule 1 is basic with x-access-token username for github.com.
+	r1 := list[1].(map[string]any)
+	if r1["type"] != "basic" || r1["username"] != "x-access-token" {
+		t.Errorf("rule 1 shape: %v", r1)
+	}
+}
+
+func TestPerHostRulesFromConfig(t *testing.T) {
+	// Round-trip a per_host jsonb config through the JWT-claim translator.
+	cfg := map[string]any{
+		"per_host": []any{
+			map[string]any{
+				"hosts": []any{"api.github.com"},
+				"type":  "bearer",
+			},
+			map[string]any{
+				"hosts":    []any{"github.com"},
+				"type":     "basic",
+				"username": "x-access-token",
+			},
+		},
+	}
+	rules, err := perHostRulesFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("perHostRulesFromConfig: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("rule count: %d", len(rules))
+	}
+	if rules[0].AuthType != "bearer" || rules[0].Hosts[0] != "api.github.com" {
+		t.Errorf("rule 0 drift: %+v", rules[0])
+	}
+	if rules[1].AuthType != "basic" || rules[1].Username != "x-access-token" {
+		t.Errorf("rule 1 drift: %+v", rules[1])
+	}
+}

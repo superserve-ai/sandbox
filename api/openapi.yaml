@@ -1610,7 +1610,10 @@ components:
           description: >
             Built-in provider shortcut (e.g. `anthropic`, `openai`, `github`,
             `stripe`). When set, auto-fills auth scheme and allowed upstream
-            hosts. Mutually exclusive with `auth` and `hosts`.
+            hosts. Mutually exclusive with `auth` and `hosts`. `github`
+            emits a `per_host` config so the same PAT works for both
+            api.github.com REST (`Bearer`) and github.com git over HTTPS
+            (`Basic` with `x-access-token`).
         auth:
           $ref: "#/components/schemas/SecretAuthConfig"
         hosts:
@@ -1633,6 +1636,18 @@ components:
           description: New cleartext value to encrypt and store.
 
     SecretAuthConfig:
+      description: |
+        Egress auth shape. Use the single-rule form (`type` + type-specific
+        fields) for credentials that authenticate the same way on every host.
+        Use `per_host` when the same credential needs different auth schemes
+        on different hosts of the same provider — for example one host
+        accepts `Bearer` while another accepts `Basic` with a fixed username.
+        Single-rule and `per_host` are mutually exclusive.
+      oneOf:
+        - $ref: "#/components/schemas/SecretAuthConfigSingleRule"
+        - $ref: "#/components/schemas/SecretAuthConfigPerHost"
+
+    SecretAuthConfigSingleRule:
       type: object
       required: [type]
       properties:
@@ -1642,7 +1657,7 @@ components:
           description: |
             Egress auth scheme:
             - `bearer`: `Authorization: Bearer <value>`
-            - `basic`: `Authorization: Basic <base64(value)>`
+            - `basic`: `Authorization: Basic <base64(username:value)>`
             - `api-key`: custom header (set `header`, optionally `prefix`)
             - `custom`: caller-defined `headers` map
         header:
@@ -1651,6 +1666,61 @@ components:
         prefix:
           type: string
           description: Optional value prefix (used by `api-key`).
+        username:
+          type: string
+          description: >
+            Optional username for `basic`. When set, this username is used
+            verbatim in the outbound Basic header (overrides any username sent
+            by the client). When empty, the inbound username is preserved, or
+            `x` is used if absent.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          maxProperties: 8
+          description: Header-name → value template (required for `custom`).
+
+    SecretAuthConfigPerHost:
+      type: object
+      required: [per_host]
+      properties:
+        per_host:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/SecretPerHostRule"
+          description: >
+            Per-host rule list. The daemon picks the first rule whose `hosts`
+            match the upstream host at egress. Every host referenced here must
+            also appear in the top-level `hosts` allowlist. Rules may not
+            overlap (a host belongs to at most one rule).
+
+    SecretPerHostRule:
+      type: object
+      required: [hosts, type]
+      properties:
+        hosts:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: string
+          description: >
+            Hosts this rule authenticates. Exact hostnames or single-level
+            wildcards (`*.example.com`).
+        type:
+          type: string
+          enum: [bearer, basic, api-key, custom]
+        header:
+          type: string
+          description: Header name (required for `api-key`).
+        prefix:
+          type: string
+          description: Optional value prefix (used by `api-key`).
+        username:
+          type: string
+          description: Username slot for `basic`. Used verbatim in the outbound `Basic <base64(username:value)>` header.
         headers:
           type: object
           additionalProperties:
@@ -1669,7 +1739,10 @@ components:
           type: string
         auth_type:
           type: string
-          enum: [bearer, basic, api-key, custom]
+          enum: [bearer, basic, api-key, custom, per_host]
+          description: >
+            `per_host` indicates a multi-rule secret; the resolved rules are
+            in `auth_config.per_host`.
         auth_config:
           type: object
           additionalProperties: true

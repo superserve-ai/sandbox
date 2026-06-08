@@ -541,3 +541,145 @@ func TestCachedVaultPropagatesError(t *testing.T) {
 		t.Errorf("want boom error, got %v", err)
 	}
 }
+
+// githubPerHostBinding mirrors what the JWT resolver builds for a github
+// provider-shortcut secret.
+func githubPerHostBinding(secretID string) Binding {
+	return Binding{
+		SecretID: secretID,
+		EnvKey:   "GITHUB_TOKEN",
+		Hosts:    []string{"api.github.com", "github.com"},
+		Rules: []BindingRule{
+			{Hosts: []string{"api.github.com"}, AuthType: "bearer"},
+			{Hosts: []string{"github.com"}, AuthType: "basic", AuthConfig: map[string]any{"username": "x-access-token"}},
+		},
+	}
+}
+
+func TestPerHostDispatchPicksBearerForRESTHost(t *testing.T) {
+	// api.github.com → Bearer rule wins, swap into Authorization header verbatim.
+	proxyTok := "ghp_proxy_token_aaaa"
+	st := sandboxWithBindings(nil, nil, map[string]Binding{proxyTok: githubPerHostBinding("sec-gh")})
+	vault := &stubVault{values: map[string]string{"sec-gh": "github_pat_REAL"}}
+
+	req := newReq("GET", "api.github.com", map[string]string{
+		"Authorization": "Bearer " + proxyTok,
+	})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.github.com")
+	if err != nil || out.Action != "allow" {
+		t.Fatalf("want allow, got %+v err=%v", out, err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer github_pat_REAL" {
+		t.Errorf("Bearer rule should swap header verbatim, got %q", got)
+	}
+}
+
+func TestPerHostDispatchPicksBasicForGitHost(t *testing.T) {
+	// github.com → Basic rule wins, with username forced to x-access-token
+	// regardless of what the client sent.
+	proxyTok := "ghp_proxy_token_bbbb"
+	st := sandboxWithBindings(nil, nil, map[string]Binding{proxyTok: githubPerHostBinding("sec-gh")})
+	vault := &stubVault{values: map[string]string{"sec-gh": "github_pat_REAL"}}
+
+	// git over HTTPS sends username=x-access-token and password=<PAT>.
+	inbound := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+proxyTok))
+	req := newReq("GET", "github.com", map[string]string{"Authorization": inbound})
+
+	out, err := injectRequest(context.Background(), st, vault, req, "github.com")
+	if err != nil || out.Action != "allow" {
+		t.Fatalf("want allow, got %+v err=%v", out, err)
+	}
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:github_pat_REAL"))
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Errorf("Basic rule with username override: want %q, got %q", want, got)
+	}
+}
+
+func TestPerHostBasicUsernameOverridesInbound(t *testing.T) {
+	// Even if the agent sent a different Basic username, the rule's username
+	// is authoritative — prevents an agent from picking a wrong username that
+	// the upstream silently rejects.
+	binding := Binding{
+		SecretID: "sec-x", Hosts: []string{"git.example.com"},
+		Rules: []BindingRule{
+			{Hosts: []string{"git.example.com"}, AuthType: "basic", AuthConfig: map[string]any{"username": "forced-user"}},
+		},
+	}
+	tok := "proxy-xyz"
+	st := sandboxWithBindings(nil, nil, map[string]Binding{tok: binding})
+	vault := &stubVault{values: map[string]string{"sec-x": "REAL"}}
+
+	inbound := "Basic " + base64.StdEncoding.EncodeToString([]byte("agent-picked:"+tok))
+	req := newReq("GET", "git.example.com", map[string]string{"Authorization": inbound})
+	out, err := injectRequest(context.Background(), st, vault, req, "git.example.com")
+	if err != nil || out.Action != "allow" {
+		t.Fatalf("want allow, got %+v err=%v", out, err)
+	}
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("forced-user:REAL"))
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Errorf("rule username should override inbound: want %q got %q", want, got)
+	}
+}
+
+func TestPerHostNoMatchingRuleDeniesAsHostMismatch(t *testing.T) {
+	// Binding's allowlist reaches the host (so the egress check passes), but
+	// none of the per-host rules cover it — fail closed.
+	binding := Binding{
+		SecretID: "sec-x",
+		// allowlist explicitly includes both hosts so egress passes the first
+		// hostMatchesCredential check; per-host rules are stricter.
+		Hosts: []string{"api.github.com", "github.com", "raw.githubusercontent.com"},
+		Rules: []BindingRule{
+			{Hosts: []string{"api.github.com"}, AuthType: "bearer"},
+			{Hosts: []string{"github.com"}, AuthType: "basic", AuthConfig: map[string]any{"username": "x-access-token"}},
+		},
+	}
+	tok := "ghp_proxy_token_cccc"
+	st := sandboxWithBindings(nil, nil, map[string]Binding{tok: binding})
+	vault := &stubVault{values: map[string]string{"sec-x": "REAL"}}
+
+	req := newReq("GET", "raw.githubusercontent.com", map[string]string{
+		"Authorization": "Bearer " + tok,
+	})
+	out, err := injectRequest(context.Background(), st, vault, req, "raw.githubusercontent.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Action != "deny" || out.Reason != "credential_host_mismatch" {
+		t.Errorf("want credential_host_mismatch, got %+v", out)
+	}
+	// Strip-then-set invariant: a denied request still has its original header.
+	if got := req.Header.Get("Authorization"); got != "Bearer "+tok {
+		t.Errorf("denied request should not have its header swapped, got %q", got)
+	}
+}
+
+func TestPerHostScannerMatchesBasicShapeOnRuleBindings(t *testing.T) {
+	// A binding with no top-level AuthType (multi-rule) must still match
+	// requests in any of the rule shapes.
+	binding := githubPerHostBinding("sec-gh")
+	binding.AuthType = "" // multi-rule bindings carry no top-level type
+	tok := "ghp_proxy_token_dddd"
+	st := sandboxWithBindings(nil, nil, map[string]Binding{tok: binding})
+	vault := &stubVault{values: map[string]string{"sec-gh": "github_pat_REAL"}}
+
+	bearReq := newReq("GET", "api.github.com", map[string]string{"Authorization": "Bearer " + tok})
+	if out, _ := injectRequest(context.Background(), st, vault, bearReq, "api.github.com"); out.Action != "allow" {
+		t.Errorf("bearer-shaped request must match bearer rule, got %+v", out)
+	}
+
+	basicHdr := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+tok))
+	basicReq := newReq("GET", "github.com", map[string]string{"Authorization": basicHdr})
+	if out, _ := injectRequest(context.Background(), st, vault, basicReq, "github.com"); out.Action != "allow" {
+		t.Errorf("basic-shaped request must match basic rule, got %+v", out)
+	}
+}
+
+func TestDispatchAuthShapeLegacySingleRule(t *testing.T) {
+	// Legacy single-rule bindings (no Rules) keep working unchanged.
+	b := Binding{AuthType: "bearer", AuthConfig: nil, Hosts: []string{"api.example.com"}}
+	authType, cfg, ok := dispatchAuthShape(b, "api.example.com")
+	if !ok || authType != "bearer" || cfg != nil {
+		t.Errorf("legacy dispatch: got (%q, %v, %v), want (bearer, nil, true)", authType, cfg, ok)
+	}
+}
