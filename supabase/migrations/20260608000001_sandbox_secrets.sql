@@ -1,18 +1,20 @@
 -- Team-scoped credentials for the sandbox enforcement proxy.
 -- Values are encrypted at rest with envelope encryption (per-row AES-256-GCM
 -- DEK wrapped by a Cloud KMS KEK). Plaintext is never persisted.
+--
+-- Idempotent: re-running on a database that already has these objects is a no-op.
 
 -- Team-level knobs:
 --   credential_store_kind: 'builtin' (encrypted here) or 'external' (BYO vault).
 --   unmatched_host_policy: 'passthrough' or 'deny' for hosts no credential covers.
 ALTER TABLE team
-    ADD COLUMN credential_store_kind   text   NOT NULL DEFAULT 'builtin'
+    ADD COLUMN IF NOT EXISTS credential_store_kind   text   NOT NULL DEFAULT 'builtin'
         CHECK (credential_store_kind IN ('builtin', 'external')),
-    ADD COLUMN credential_store_config jsonb,
-    ADD COLUMN unmatched_host_policy   text   NOT NULL DEFAULT 'passthrough'
+    ADD COLUMN IF NOT EXISTS credential_store_config jsonb,
+    ADD COLUMN IF NOT EXISTS unmatched_host_policy   text   NOT NULL DEFAULT 'passthrough'
         CHECK (unmatched_host_policy IN ('passthrough', 'deny'));
 
-CREATE TABLE secret (
+CREATE TABLE IF NOT EXISTS secret (
     id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id             uuid NOT NULL REFERENCES team(id),
     name                text NOT NULL,
@@ -37,22 +39,22 @@ CREATE TABLE secret (
 );
 
 -- Unique by (team, name) among active rows; soft-deleted names are reusable.
-CREATE UNIQUE INDEX secret_team_name_unique
+CREATE UNIQUE INDEX IF NOT EXISTS secret_team_name_unique
     ON secret (team_id, name) WHERE deleted_at IS NULL;
 
-CREATE INDEX secret_team_idx ON secret (team_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS secret_team_idx ON secret (team_id) WHERE deleted_at IS NULL;
 
-CREATE TABLE sandbox_secret (
+CREATE TABLE IF NOT EXISTS sandbox_secret (
     sandbox_id  uuid NOT NULL REFERENCES sandbox(id) ON DELETE CASCADE,
     secret_id   uuid NOT NULL REFERENCES secret(id),
     env_key     text NOT NULL,
     PRIMARY KEY (sandbox_id, env_key)
 );
 
-CREATE INDEX sandbox_secret_secret_idx ON sandbox_secret (secret_id);
+CREATE INDEX IF NOT EXISTS sandbox_secret_secret_idx ON sandbox_secret (secret_id);
 
 -- Append-only audit of every proxy-mediated request.
-CREATE TABLE proxy_audit (
+CREATE TABLE IF NOT EXISTS proxy_audit (
     id               bigserial PRIMARY KEY,
     ts               timestamptz NOT NULL DEFAULT now(),
     team_id          uuid NOT NULL,
@@ -71,11 +73,11 @@ CREATE TABLE proxy_audit (
     error_code       text
 );
 
-CREATE INDEX proxy_audit_sandbox_ts_idx ON proxy_audit (sandbox_id, ts DESC);
-CREATE INDEX proxy_audit_team_ts_idx    ON proxy_audit (team_id,    ts DESC);
-CREATE INDEX proxy_audit_secret_ts_idx  ON proxy_audit (secret_id,  ts DESC) WHERE secret_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS proxy_audit_sandbox_ts_idx ON proxy_audit (sandbox_id, ts DESC);
+CREATE INDEX IF NOT EXISTS proxy_audit_team_ts_idx    ON proxy_audit (team_id,    ts DESC);
+CREATE INDEX IF NOT EXISTS proxy_audit_secret_ts_idx  ON proxy_audit (secret_id,  ts DESC) WHERE secret_id IS NOT NULL;
 
--- Internal tables — only the control plane (service_role) touches them.
+-- Internal tables — only the control plane (service_role) touches them. ENABLE RLS is idempotent.
 ALTER TABLE public.secret         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sandbox_secret ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.proxy_audit    ENABLE ROW LEVEL SECURITY;
