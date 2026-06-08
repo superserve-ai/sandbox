@@ -61,14 +61,15 @@ type Proxy struct {
 	resolver Resolver
 	logger   *slog.Logger
 
-	vault             VaultClient
-	audit             AuditSink
-	revoker           *Revoker
-	httpServer        *http.Server
-	tlsConfig         *tls.Config
-	upstream          *http.Transport
-	isListening       atomic.Bool
-	sandboxFacingHost string
+	vault               VaultClient
+	audit               AuditSink
+	revoker             *Revoker
+	httpServer          *http.Server
+	tlsConfig           *tls.Config
+	upstream            *http.Transport
+	isListening         atomic.Bool
+	sandboxFacingHost   string
+	maxRequestBodyBytes int64
 }
 
 // Options carries Proxy dependencies. Nil Logger, Vault, Audit, and UpstreamTransport
@@ -84,7 +85,13 @@ type Options struct {
 
 	// IP sandboxes connect to. SNI fallback for clients that omit it (e.g. curl to an IP).
 	SandboxFacingHost string
+
+	// MaxRequestBodyBytes caps each forwarded request body. Zero falls back
+	// to defaultMaxRequestBodyBytes.
+	MaxRequestBodyBytes int64
 }
+
+const defaultMaxRequestBodyBytes int64 = 256 * 1024 * 1024
 
 // NewProxy constructs the proxy bound to addr.
 func NewProxy(addr string, opts Options) *Proxy {
@@ -108,16 +115,21 @@ func NewProxy(addr string, opts Options) *Proxy {
 	if audit == nil {
 		audit = NewNopAuditSink()
 	}
+	maxBody := opts.MaxRequestBodyBytes
+	if maxBody <= 0 {
+		maxBody = defaultMaxRequestBodyBytes
+	}
 	p := &Proxy{
-		addr:              addr,
-		ca:                opts.CA,
-		resolver:          opts.Resolver,
-		vault:             opts.Vault,
-		audit:             audit,
-		revoker:           opts.Revoker,
-		logger:            logger,
-		upstream:          upstream,
-		sandboxFacingHost: opts.SandboxFacingHost,
+		addr:                addr,
+		ca:                  opts.CA,
+		resolver:            opts.Resolver,
+		vault:               opts.Vault,
+		audit:               audit,
+		revoker:             opts.Revoker,
+		logger:              logger,
+		upstream:            upstream,
+		sandboxFacingHost:   opts.SandboxFacingHost,
+		maxRequestBodyBytes: maxBody,
 	}
 
 	p.tlsConfig = &tls.Config{

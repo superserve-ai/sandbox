@@ -37,7 +37,8 @@ func (s *stubResolver) Authenticate(_ context.Context, _ string, jwt string) (*S
 }
 
 // setupProxy stands up a Proxy bound to a random port plus an httptest HTTPS upstream.
-func setupProxy(t *testing.T, resolver Resolver) (proxyAddr string, upstream *httptest.Server, ca *CA, revoker *Revoker) {
+// opt overrides apply on top of the default Options (CA, Resolver, transport, revoker).
+func setupProxy(t *testing.T, resolver Resolver, opts ...func(*Options)) (proxyAddr string, upstream *httptest.Server, ca *CA, revoker *Revoker) {
 	t.Helper()
 
 	upstream = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -69,12 +70,16 @@ func setupProxy(t *testing.T, resolver Resolver) (proxyAddr string, upstream *ht
 	}
 
 	revoker = NewRevoker()
-	p := NewProxy("127.0.0.1:0", Options{
+	pOpts := Options{
 		CA:                ca,
 		Resolver:          resolver,
 		UpstreamTransport: tr,
 		Revoker:           revoker,
-	})
+	}
+	for _, fn := range opts {
+		fn(&pOpts)
+	}
+	p := NewProxy("127.0.0.1:0", pOpts)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -631,5 +636,62 @@ func TestProxyTLS_SANFallbacks(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("leaf SAN missing %s; got DNS=%v IP=%v", wantIP, leaf.DNSNames, leaf.IPAddresses)
+	}
+}
+
+func TestProxyRejectsOversizedBodyWith413(t *testing.T) {
+	// A body larger than MaxRequestBodyBytes must surface as 413 Payload
+	// Too Large with a body_too_large reason so the agent can handle it.
+	const testJWT = "test-jwt-body"
+	const limit = 1024
+	resolver := &stubResolver{wantJWT: testJWT, scopeOut: &Scope{SandboxID: "sb-body", TeamID: "team-1"}}
+	proxyAddr, upstream, ca, _ := setupProxy(t, resolver,
+		func(o *Options) { o.MaxRequestBodyBytes = limit },
+	)
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	conn := dialProxy(t, proxyAddr, ca)
+	defer conn.Close()
+
+	target := upstreamURL.Host
+	status, ok := sendConnect(t, conn, target, testJWT)
+	if !ok {
+		t.Fatalf("CONNECT failed: %q", status)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(ca.RootPEM())
+	upstreamHost, _, _ := net.SplitHostPort(target)
+	tlsClient := tls.Client(conn, &tls.Config{
+		ServerName: upstreamHost, RootCAs: pool, MinVersion: tls.VersionTLS12,
+	})
+	if err := tlsClient.Handshake(); err != nil {
+		t.Fatalf("inner TLS handshake: %v", err)
+	}
+
+	// Send a body comfortably larger than the limit.
+	body := strings.Repeat("X", limit*4)
+	req := fmt.Sprintf(
+		"POST /large HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n%s",
+		target, len(body), body,
+	)
+	if _, err := tlsClient.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(tlsClient)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("status: want 413, got %d", resp.StatusCode)
+	}
+	if reason := resp.Header.Get("X-Superserve-Proxy-Reason"); reason != "body_too_large" {
+		t.Errorf("proxy reason: want body_too_large, got %q", reason)
+	}
+	if flag := resp.Header.Get("X-Superserve-Proxy-Error"); flag != "true" {
+		t.Errorf("proxy error flag missing, got %q", flag)
 	}
 }

@@ -206,6 +206,16 @@ def main() -> int:
                 echo 'SENTRY_DSN={sentry_dsn}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
+            # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
+            # its control socket into RuntimeDirectory=/run/secretsproxy under
+            # DynamicUser; vmd connects to the same path.
+            for env_file in /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env; do
+                if [ -f "$env_file" ]; then
+                    sudo sed -i '/^SECRETSPROXY_SOCKET=/d' "$env_file"
+                    echo 'SECRETSPROXY_SOCKET=/run/secretsproxy/control.sock' | sudo tee -a "$env_file" > /dev/null
+                fi
+            done
+
             sudo systemctl restart {service}
             sleep 3
             sudo systemctl is-active --quiet {service} || (

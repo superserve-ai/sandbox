@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // hop-by-hop headers per RFC 7230 plus proxy-auth headers; none of these
@@ -26,7 +29,10 @@ var hopByHop = map[string]bool{
 
 // handleConnect terminates a CONNECT tunnel, runs the MITM TLS handshake
 // on the client side, and forwards each inner request to the captured upstream.
+// A panic in any per-tunnel stage is reported to Sentry and contained so the
+// daemon keeps serving other sandboxes.
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	defer sentrylog.Recover("secretsproxy.handleConnect")
 	target := r.Host
 	host, _, err := net.SplitHostPort(target)
 	if err != nil {
@@ -203,7 +209,8 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
-		outReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL.String(), r.Body)
+		bodyReader := http.MaxBytesReader(w, r.Body, p.maxRequestBodyBytes)
+		outReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL.String(), bodyReader)
 		if err != nil {
 			p.logger.Warn("build upstream request failed",
 				"host", host, "sandbox", scope.SandboxID, "err", err.Error())
@@ -240,6 +247,16 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 
 		resp, err := p.upstream.RoundTrip(outReq)
 		if err != nil {
+			// Body-size overflow surfaces here as RoundTrip returning a
+			// MaxBytesError wrapped by the transport; distinguish it from
+			// genuine unreachable upstream so the agent sees the right code.
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				msg := fmt.Sprintf("request body exceeds %d bytes", p.maxRequestBodyBytes)
+				writeBrokerError(w, http.StatusRequestEntityTooLarge, "body_too_large", msg)
+				finalize(http.StatusRequestEntityTooLarge, nil, matchedSecretIDs, "body_too_large")
+				return
+			}
 			p.logger.Warn("upstream RoundTrip failed",
 				"host", host, "sandbox", scope.SandboxID, "err", err.Error())
 			writeBrokerError(w, http.StatusBadGateway, "upstream_unreachable", "upstream unreachable")

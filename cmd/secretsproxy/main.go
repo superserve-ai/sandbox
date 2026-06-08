@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -80,12 +81,13 @@ func run() error {
 	}()
 
 	proxy := secretsproxy.NewProxy(cfg.ProxyAddr, secretsproxy.Options{
-		CA:                ca,
-		Resolver:          resolver,
-		Vault:             cachedVault,
-		Audit:             auditSink,
-		Revoker:           revoker,
-		SandboxFacingHost: cfg.SandboxFacingHost,
+		CA:                  ca,
+		Resolver:            resolver,
+		Vault:               cachedVault,
+		Audit:               auditSink,
+		Revoker:             revoker,
+		SandboxFacingHost:   cfg.SandboxFacingHost,
+		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
 	})
 	proxyErrCh := make(chan error, 1)
 	go func() { proxyErrCh <- proxy.ListenAndServe() }()
@@ -154,13 +156,14 @@ type config struct {
 	AuditBatchSize  int
 	AuditFlushEvery time.Duration
 
-	SandboxFacingHost string
+	SandboxFacingHost   string
+	MaxRequestBodyBytes int64
 }
 
 func loadConfig() (*config, error) {
 	c := &config{
 		ProxyAddr:         envOr("SECRETSPROXY_LISTEN", "0.0.0.0:9443"),
-		ControlSocketPath: envOr("SECRETSPROXY_SOCKET", "/run/secretsproxy.sock"),
+		ControlSocketPath: envOr("SECRETSPROXY_SOCKET", "/run/secretsproxy/control.sock"),
 		CACertPath:        envOr("SECRETSPROXY_CA_CERT", "/var/lib/secretsproxy/ca.crt"),
 		CAKeyPath:         envOr("SECRETSPROXY_CA_KEY", "/var/lib/secretsproxy/ca.key"),
 		CertCacheSize:     1024,
@@ -168,9 +171,10 @@ func loadConfig() (*config, error) {
 		DaemonAuthToken:   os.Getenv("DAEMON_AUTH_TOKEN"),
 		VaultCacheTTL:     parseDur(os.Getenv("VAULT_CACHE_TTL"), 60*time.Second),
 		DatabaseURL:       os.Getenv("DATABASE_URL"),
-		AuditBufferSize:   4096,
-		AuditBatchSize:    64,
-		AuditFlushEvery:   250 * time.Millisecond,
+		AuditBufferSize:     4096,
+		AuditBatchSize:      64,
+		AuditFlushEvery:     250 * time.Millisecond,
+		MaxRequestBodyBytes: parseInt64Bytes(os.Getenv("SECRETSPROXY_MAX_BODY_BYTES"), 256*1024*1024),
 	}
 	flag.StringVar(&c.ProxyAddr, "listen", c.ProxyAddr, "proxy listener address (host:port)")
 	flag.StringVar(&c.ControlSocketPath, "socket", c.ControlSocketPath, "control RPC unix socket path")
@@ -211,6 +215,17 @@ func parseDur(raw string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func parseInt64Bytes(raw string, fallback int64) int64 {
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 // buildAuditSink returns the SQL sink; missing DATABASE_URL fails closed unless SECRETSPROXY_AUDIT_DISABLED=true.
