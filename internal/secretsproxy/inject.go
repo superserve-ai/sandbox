@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -16,8 +17,9 @@ type InjectOutcome struct {
 	Action string
 	// Reason is a short machine-readable code for rejection responses.
 	Reason string
-	// MatchedSecretID is the secret used for injection, captured for the audit row.
-	MatchedSecretID string
+	// MatchedSecretIDs lists every secret swapped for this request, or — on
+	// deny/revoked — the binding that triggered the rejection. Empty = passthrough.
+	MatchedSecretIDs []string
 }
 
 const (
@@ -28,6 +30,8 @@ const (
 
 // injectRequest applies the egress + credential-injection pipeline to an
 // outbound request, mutating headers in place under a strip-then-set invariant.
+// If the request carries proxy tokens for multiple bindings, each is swapped
+// independently — every binding's credential reaches its intended slot.
 func injectRequest(
 	ctx context.Context,
 	scope *Scope,
@@ -39,48 +43,67 @@ func injectRequest(
 		return InjectOutcome{Action: denyAction, Reason: reason}, nil
 	}
 
-	binding, found := findMatchingBinding(req, scope)
-	if !found {
+	matches := findAllMatchingBindings(req, scope)
+	if len(matches) == 0 {
 		return InjectOutcome{Action: allowAction}, nil
 	}
 
-	// Refuse to swap a credential onto a host outside its own allow list.
-	if !hostMatchesCredential(upstreamHost, binding.Hosts) {
-		return InjectOutcome{
-			Action:          denyAction,
-			Reason:          "credential_host_mismatch",
-			MatchedSecretID: binding.SecretID,
-		}, nil
+	// Phase 1: resolve every match before mutating headers, so a failure
+	// surfaces cleanly without leaving the request half-swapped.
+	type resolvedSwap struct {
+		secretID   string
+		authType   string
+		authConfig map[string]any
+		value      string
 	}
-
-	authType, authConfig, ok := dispatchAuthShape(binding, upstreamHost)
-	if !ok {
-		return InjectOutcome{
-			Action:          denyAction,
-			Reason:          "credential_host_mismatch",
-			MatchedSecretID: binding.SecretID,
-		}, nil
-	}
-
-	value, err := vault.FetchCredential(ctx, scope.TeamID, binding.SecretID)
-	if err != nil {
-		if errors.Is(err, ErrCredentialRevoked) {
+	swaps := make([]resolvedSwap, 0, len(matches))
+	for _, binding := range matches {
+		if !hostMatchesCredential(upstreamHost, binding.Hosts) {
 			return InjectOutcome{
-				Action:          revokedAction,
-				Reason:          "credential_revoked",
-				MatchedSecretID: binding.SecretID,
+				Action:           denyAction,
+				Reason:           "credential_host_mismatch",
+				MatchedSecretIDs: []string{binding.SecretID},
 			}, nil
 		}
-		return InjectOutcome{}, err
+		authType, authConfig, ok := dispatchAuthShape(binding, upstreamHost)
+		if !ok {
+			return InjectOutcome{
+				Action:           denyAction,
+				Reason:           "credential_host_mismatch",
+				MatchedSecretIDs: []string{binding.SecretID},
+			}, nil
+		}
+		value, err := vault.FetchCredential(ctx, scope.TeamID, binding.SecretID)
+		if err != nil {
+			if errors.Is(err, ErrCredentialRevoked) {
+				return InjectOutcome{
+					Action:           revokedAction,
+					Reason:           "credential_revoked",
+					MatchedSecretIDs: []string{binding.SecretID},
+				}, nil
+			}
+			return InjectOutcome{}, err
+		}
+		swaps = append(swaps, resolvedSwap{
+			secretID:   binding.SecretID,
+			authType:   authType,
+			authConfig: authConfig,
+			value:      value,
+		})
 	}
 
-	if err := applyInjectionShape(req, authType, authConfig, value); err != nil {
-		return InjectOutcome{}, fmt.Errorf("apply injection: %w", err)
+	// Phase 2: apply every swap.
+	matched := make([]string, 0, len(swaps))
+	for _, s := range swaps {
+		if err := applyInjectionShape(req, s.authType, s.authConfig, s.value); err != nil {
+			return InjectOutcome{}, fmt.Errorf("apply injection: %w", err)
+		}
+		matched = append(matched, s.secretID)
 	}
 
 	return InjectOutcome{
-		Action:          allowAction,
-		MatchedSecretID: binding.SecretID,
+		Action:           allowAction,
+		MatchedSecretIDs: matched,
 	}, nil
 }
 
@@ -160,25 +183,27 @@ func hostMatchesCredential(host string, allowed []string) bool {
 	return false
 }
 
-// findMatchingBinding scans every binding's expected auth shapes for a known
-// proxy token. Multi-rule bindings are scanned against every rule's shape so
-// the same credential can flow as one scheme to one host and another scheme
-// to a different host of the same provider.
-func findMatchingBinding(req *http.Request, scope *Scope) (Binding, bool) {
+// findAllMatchingBindings returns every binding whose proxy token appears in
+// the request. Multi-rule bindings are scanned against every rule's shape.
+// Output is sorted by SecretID for deterministic ordering across runs.
+func findAllMatchingBindings(req *http.Request, scope *Scope) []Binding {
+	var out []Binding
 	for proxyToken, binding := range scope.Bindings {
 		if len(binding.Rules) > 0 {
 			for _, r := range binding.Rules {
 				if shapeHasToken(req, r.AuthType, r.AuthConfig, proxyToken) {
-					return binding, true
+					out = append(out, binding)
+					break
 				}
 			}
 			continue
 		}
 		if shapeHasToken(req, binding.AuthType, binding.AuthConfig, proxyToken) {
-			return binding, true
+			out = append(out, binding)
 		}
 	}
-	return Binding{}, false
+	sort.Slice(out, func(i, j int) bool { return out[i].SecretID < out[j].SecretID })
+	return out
 }
 
 // shapeHasToken reports whether req carries proxyToken in the (authType, cfg)

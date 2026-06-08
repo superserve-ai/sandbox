@@ -164,20 +164,35 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 		path := r.URL.Path
 		start := time.Now()
 
-		event := AuditEvent{
+		baseEvent := AuditEvent{
 			SandboxID: scope.SandboxID,
 			TeamID:    scope.TeamID,
 			Method:    method,
 			Host:      host,
 			Path:      path,
 		}
-		finalize := func(status int, upstreamStatus *int32, secretID, reason string) {
-			event.Status = int32(status)
-			event.UpstreamStatus = upstreamStatus
-			event.SecretID = secretID
-			event.ErrorCode = reason
-			event.LatencyMs = int32(time.Since(start).Milliseconds())
-			p.audit.Emit(event)
+		// finalize emits one audit row per swapped secret. With no swap,
+		// a single row is emitted with secret_id="" so the request is recorded.
+		finalize := func(status int, upstreamStatus *int32, secretIDs []string, reason string) {
+			latency := int32(time.Since(start).Milliseconds())
+			if len(secretIDs) == 0 {
+				ev := baseEvent
+				ev.Status = int32(status)
+				ev.UpstreamStatus = upstreamStatus
+				ev.ErrorCode = reason
+				ev.LatencyMs = latency
+				p.audit.Emit(ev)
+				return
+			}
+			for _, sid := range secretIDs {
+				ev := baseEvent
+				ev.Status = int32(status)
+				ev.UpstreamStatus = upstreamStatus
+				ev.SecretID = sid
+				ev.ErrorCode = reason
+				ev.LatencyMs = latency
+				p.audit.Emit(ev)
+			}
 		}
 
 		// Rebuild against the captured host so a Host-header rewrite cannot redirect mid-stream.
@@ -193,32 +208,32 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			p.logger.Warn("build upstream request failed",
 				"host", host, "sandbox", scope.SandboxID, "err", err.Error())
 			writeBrokerError(w, http.StatusBadGateway, "build_request", "could not build upstream request")
-			finalize(http.StatusBadGateway, nil, "", "build_request")
+			finalize(http.StatusBadGateway, nil, nil, "build_request")
 			return
 		}
 		copyForwardableHeaders(r.Header, outReq.Header)
 		outReq.Host = host
 
 		// Pipeline runs when both Vault and a non-empty Scope are wired; otherwise pass through.
-		var matchedSecretID string
+		var matchedSecretIDs []string
 		if scope != nil && p.vault != nil {
 			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host)
 			if ierr != nil {
 				p.logger.Warn("inject pipeline failed",
 					"host", host, "sandbox", scope.SandboxID, "err", ierr.Error())
 				writeBrokerError(w, http.StatusBadGateway, "inject_error", "request rejected by sandbox proxy")
-				finalize(http.StatusBadGateway, nil, out.MatchedSecretID, "inject_error")
+				finalize(http.StatusBadGateway, nil, out.MatchedSecretIDs, "inject_error")
 				return
 			}
-			matchedSecretID = out.MatchedSecretID
+			matchedSecretIDs = out.MatchedSecretIDs
 			switch out.Action {
 			case denyAction:
 				writeBrokerError(w, http.StatusForbidden, out.Reason, "host or credential blocked by sandbox policy")
-				finalize(http.StatusForbidden, nil, matchedSecretID, out.Reason)
+				finalize(http.StatusForbidden, nil, matchedSecretIDs, out.Reason)
 				return
 			case revokedAction:
 				writeBrokerError(w, http.StatusServiceUnavailable, out.Reason, "credential revoked")
-				finalize(http.StatusServiceUnavailable, nil, matchedSecretID, out.Reason)
+				finalize(http.StatusServiceUnavailable, nil, matchedSecretIDs, out.Reason)
 				return
 			}
 		}
@@ -228,7 +243,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			p.logger.Warn("upstream RoundTrip failed",
 				"host", host, "sandbox", scope.SandboxID, "err", err.Error())
 			writeBrokerError(w, http.StatusBadGateway, "upstream_unreachable", "upstream unreachable")
-			finalize(http.StatusBadGateway, nil, matchedSecretID, "upstream_unreachable")
+			finalize(http.StatusBadGateway, nil, matchedSecretIDs, "upstream_unreachable")
 			return
 		}
 		defer resp.Body.Close()
@@ -240,7 +255,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 		streamWithFlush(w, resp.Body, flusher)
 
 		upstreamStatus := int32(resp.StatusCode)
-		finalize(resp.StatusCode, &upstreamStatus, matchedSecretID, "")
+		finalize(resp.StatusCode, &upstreamStatus, matchedSecretIDs, "")
 	})
 }
 

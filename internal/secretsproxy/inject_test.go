@@ -129,7 +129,7 @@ func TestBearerInjectionEndToEnd(t *testing.T) {
 	if out.Action != "allow" {
 		t.Fatalf("want allow, got %+v", out)
 	}
-	if out.MatchedSecretID != "sec-anthropic" {
+	if len(out.MatchedSecretIDs) != 1 || out.MatchedSecretIDs[0] != "sec-anthropic" {
 		t.Errorf("secret_id not captured for audit: %+v", out)
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer sk-ant-REAL-KEY" {
@@ -438,7 +438,7 @@ func TestRevokedCredentialSurfacesAsRevoked(t *testing.T) {
 	if out.Action != "revoked" {
 		t.Errorf("want revoked action, got %+v", out)
 	}
-	if out.MatchedSecretID != "sec-revoked" {
+	if len(out.MatchedSecretIDs) != 1 || out.MatchedSecretIDs[0] != "sec-revoked" {
 		t.Errorf("want secret id in outcome, got %+v", out)
 	}
 }
@@ -681,5 +681,111 @@ func TestDispatchAuthShapeLegacySingleRule(t *testing.T) {
 	authType, cfg, ok := dispatchAuthShape(b, "api.example.com")
 	if !ok || authType != "bearer" || cfg != nil {
 		t.Errorf("legacy dispatch: got (%q, %v, %v), want (bearer, nil, true)", authType, cfg, ok)
+	}
+}
+
+func TestMultiBindingSwapsAllMatchedHeaders(t *testing.T) {
+	// When a request carries proxy tokens for multiple bindings, every one
+	// of them must be swapped — not just the first match.
+	bA := Binding{
+		SecretID: "sec-A", AuthType: "custom",
+		AuthConfig: map[string]any{"headers": map[string]string{"X-Header-A": "{{ value }}"}},
+		Hosts:      []string{"api.example.com"},
+	}
+	bB := Binding{
+		SecretID: "sec-B", AuthType: "custom",
+		AuthConfig: map[string]any{"headers": map[string]string{"X-Header-B": "{{ value }}"}},
+		Hosts:      []string{"api.example.com"},
+	}
+	tokA := "proxy-tok-A"
+	tokB := "proxy-tok-B"
+	st := sandboxWithBindings(nil, nil, map[string]Binding{tokA: bA, tokB: bB})
+	vault := &stubVault{values: map[string]string{
+		"sec-A": "REAL-VALUE-A",
+		"sec-B": "REAL-VALUE-B",
+	}}
+
+	req := newReq("GET", "api.example.com", map[string]string{
+		"X-Header-A": tokA,
+		"X-Header-B": tokB,
+	})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	if err != nil || out.Action != "allow" {
+		t.Fatalf("want allow, got %+v err=%v", out, err)
+	}
+	if got := req.Header.Get("X-Header-A"); got != "REAL-VALUE-A" {
+		t.Errorf("X-Header-A: want REAL-VALUE-A, got %q", got)
+	}
+	if got := req.Header.Get("X-Header-B"); got != "REAL-VALUE-B" {
+		t.Errorf("X-Header-B: want REAL-VALUE-B, got %q (binding B's swap was skipped)", got)
+	}
+	if len(out.MatchedSecretIDs) != 2 {
+		t.Errorf("want 2 matched secret IDs for audit, got %v", out.MatchedSecretIDs)
+	}
+}
+
+func TestMultiBindingDeterministicOrder(t *testing.T) {
+	// Outcome ordering must be deterministic across runs even though
+	// scope.Bindings is a Go map (which iterates in randomized order).
+	bA := Binding{SecretID: "sec-A", AuthType: "bearer", Hosts: []string{"api.example.com"}}
+	bB := Binding{SecretID: "sec-B", AuthType: "custom",
+		AuthConfig: map[string]any{"headers": map[string]string{"X-B": "{{ value }}"}},
+		Hosts:      []string{"api.example.com"},
+	}
+	st := sandboxWithBindings(nil, nil, map[string]Binding{
+		"proxy-A": bA, "proxy-B": bB,
+	})
+	vault := &stubVault{values: map[string]string{"sec-A": "RA", "sec-B": "RB"}}
+
+	for i := 0; i < 20; i++ {
+		req := newReq("GET", "api.example.com", map[string]string{
+			"Authorization": "Bearer proxy-A",
+			"X-B":           "proxy-B",
+		})
+		out, _ := injectRequest(context.Background(), st, vault, req, "api.example.com")
+		if len(out.MatchedSecretIDs) != 2 ||
+			out.MatchedSecretIDs[0] != "sec-A" || out.MatchedSecretIDs[1] != "sec-B" {
+			t.Fatalf("iteration %d: matched IDs not sorted: %v", i, out.MatchedSecretIDs)
+		}
+	}
+}
+
+func TestMultiBindingRevocationAbortsRequest(t *testing.T) {
+	// If any matched binding is revoked, the whole request must abort —
+	// no partial swap leaving one header with a real value and another with
+	// a (now meaningless) proxy token.
+	bA := Binding{
+		SecretID: "sec-OK", AuthType: "custom",
+		AuthConfig: map[string]any{"headers": map[string]string{"X-A": "{{ value }}"}},
+		Hosts:      []string{"api.example.com"},
+	}
+	bB := Binding{
+		SecretID: "sec-REVOKED", AuthType: "custom",
+		AuthConfig: map[string]any{"headers": map[string]string{"X-B": "{{ value }}"}},
+		Hosts:      []string{"api.example.com"},
+	}
+	st := sandboxWithBindings(nil, nil, map[string]Binding{
+		"proxy-A": bA, "proxy-B": bB,
+	})
+	// stubVault returns the OK value for sec-OK; sec-REVOKED isn't in the map.
+	vault := &stubVault{values: map[string]string{"sec-OK": "REAL-OK"}}
+
+	req := newReq("GET", "api.example.com", map[string]string{
+		"X-A": "proxy-A",
+		"X-B": "proxy-B",
+	})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Action != "revoked" {
+		t.Errorf("want revoked action, got %+v", out)
+	}
+	// X-A must not have been swapped — resolution failed before any apply.
+	if got := req.Header.Get("X-A"); got != "proxy-A" {
+		t.Errorf("X-A should be untouched on revocation; got %q", got)
+	}
+	if got := req.Header.Get("X-B"); got != "proxy-B" {
+		t.Errorf("X-B should be untouched on revocation; got %q", got)
 	}
 }
