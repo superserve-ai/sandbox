@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -20,6 +21,10 @@ type PoolConfig struct {
 	// setup (namespace, veth, TAP, nftables are already configured).
 	// Default: 100.
 	RecycleSize int
+	// MountNsTmpfsMountPoint MUST match firecracker's snapshot
+	// `path_on_host`. Empty disables mount-ns prealloc (start.sh
+	// then takes the legacy `unshare -m` path).
+	MountNsTmpfsMountPoint string
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -29,22 +34,24 @@ type PoolConfig struct {
 // The pool is optional — if not started, SetupVM falls back to on-demand
 // setup (the original behavior). Call StartPool after NewManager to enable.
 type Pool struct {
-	mgr      *Manager
-	log      zerolog.Logger
-	newSize  int
-	fresh    chan *preallocSlot // pre-allocated from scratch
-	recycled chan *preallocSlot // returned from destroyed sandboxes
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	mgr             *Manager
+	log             zerolog.Logger
+	newSize         int
+	tmpfsMountPoint string
+	fresh           chan *preallocSlot // pre-allocated from scratch
+	recycled        chan *preallocSlot // returned from destroyed sandboxes
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
 }
 
 // preallocSlot holds a fully configured network namespace ready to be
-// assigned to a VM.
+// assigned to a VM. mountNs is nil when prealloc is disabled (start.sh
+// then falls back to `unshare -m`).
 type preallocSlot struct {
-	idx  int
-	info *VMNetInfo
-	// vethName is needed for cleanup if the slot is never claimed.
+	idx      int
+	info     *VMNetInfo
 	vethName string
+	mountNs  *slotMountNs
 }
 
 // StartPool creates and starts the network slot pool. Blocks until the
@@ -60,12 +67,18 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	}
 
 	p := &Pool{
-		mgr:      m,
-		log:      m.log.With().Str("component", "net_pool").Logger(),
-		newSize:  newSize,
-		fresh:    make(chan *preallocSlot, newSize),
-		recycled: make(chan *preallocSlot, recycleSize),
-		stopCh:   make(chan struct{}),
+		mgr:             m,
+		log:             m.log.With().Str("component", "net_pool").Logger(),
+		newSize:         newSize,
+		tmpfsMountPoint: cfg.MountNsTmpfsMountPoint,
+		fresh:           make(chan *preallocSlot, newSize),
+		recycled:        make(chan *preallocSlot, recycleSize),
+		stopCh:          make(chan struct{}),
+	}
+	if p.tmpfsMountPoint != "" {
+		if err := ClearStaleSlotBindMounts(ctx); err != nil {
+			p.log.Warn().Err(err).Msg("clearing stale slot bind mounts failed; continuing")
+		}
 	}
 
 	// Fill initial batch synchronously so the pool is warm on first create.
@@ -123,6 +136,10 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			continue
 		}
 		tNsChecked := time.Now()
+
+		if slot.mountNs != nil {
+			slot.info.MountNsBindPath = slot.mountNs.BindPath
+		}
 
 		p.mgr.mu.Lock()
 		p.mgr.devices[vmID] = slot.info
@@ -240,12 +257,28 @@ func (p *Pool) allocate(ctx context.Context) (*preallocSlot, error) {
 		return nil, err
 	}
 
-	return &preallocSlot{idx: idx, info: info, vethName: vethName}, nil
+	slot := &preallocSlot{idx: idx, info: info, vethName: vethName}
+
+	if p.tmpfsMountPoint != "" {
+		mns, err := prepareSlotMountNamespace(ctx, idx, p.tmpfsMountPoint)
+		if err != nil {
+			// idx stays consumed (matches setupSlot's invariant) so a
+			// persistent prep failure can't loop on the same broken idx.
+			p.mgr.cleanupFull(info.Namespace, vethName)
+			return nil, fmt.Errorf("prepare mount ns: %w", err)
+		}
+		slot.mountNs = mns
+	}
+
+	return slot, nil
 }
 
 func (p *Pool) cleanup(slot *preallocSlot) {
 	if slot == nil || slot.info == nil {
 		return
+	}
+	if slot.mountNs != nil {
+		_ = releaseSlotMountNamespace(context.Background(), slot.mountNs)
 	}
 	nsName := slot.info.Namespace
 	p.mgr.cleanupFull(nsName, slot.vethName)

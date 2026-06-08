@@ -1114,6 +1114,19 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		if inst.Namespace != "" && inst.IP != "" {
 			if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
 				log.Error().Err(err).Msg("reattach: restore network state failed")
+			} else if rec.PID > 0 {
+				// Restore the slot's mount-ns bind so the next sandbox
+				// lifecycle keeps the fast nsenter path.
+				if idx, ok := network.SlotFromNamespace(inst.Namespace); ok {
+					rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
+					bindPath, rerr := network.RestoreSlotMountNsBind(rctx, idx, rec.PID)
+					rcancel()
+					if rerr != nil {
+						log.Warn().Err(rerr).Int("slot", idx).Msg("reattach: mount-ns bind restore failed; slot will fall back to legacy on next claim")
+					} else {
+						m.netMgr.SetMountNsBindPath(rec.ID, bindPath)
+					}
+				}
 			}
 		}
 
@@ -1592,8 +1605,7 @@ func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath
 
 // startFirecrackerViaSystemd writes the start script and launches Firecracker
 // as a standalone systemd unit. The VM survives VMD restarts because systemd
-// owns the process, not VMD. Non-empty basePath switches the start script to
-// the dual-symlink overlay layout.
+// owns the process, not VMD.
 func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
@@ -1602,21 +1614,37 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	templateDir := m.templateRunDir()
 
-	var setupCmds string
-	if basePath != "" {
-		baseLink := filepath.Join(templateDir, "base.ext4")
-		overlayLink := filepath.Join(templateDir, "overlay.ext4")
-		setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q",
-			templateDir, basePath, baseLink, perVMRootfs, overlayLink)
+	netInfo := m.netMgr.GetVMNetInfo(vmID)
+	mountNsBindPath := ""
+	if netInfo != nil {
+		mountNsBindPath = netInfo.MountNsBindPath
+	}
+
+	var scriptContent string
+	if mountNsBindPath != "" {
+		if err := m.bindSandboxLinks(ctx, mountNsBindPath, templateDir, perVMRootfs, basePath); err != nil {
+			return 0, fmt.Errorf("bind sandbox links into slot: %w", err)
+		}
+		scriptContent = fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s nsenter --mount=%s -- %s --api-sock %s --id %s\n",
+			netNS, shellQuote(mountNsBindPath), shellQuote(m.cfg.FirecrackerBin), shellQuote(socketPath), shellQuote(vmID))
 	} else {
-		rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
-		setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q",
-			templateDir, perVMRootfs, rootfsLink)
+		var setupCmds string
+		if basePath != "" {
+			baseLink := filepath.Join(templateDir, "base.ext4")
+			overlayLink := filepath.Join(templateDir, "overlay.ext4")
+			setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q",
+				templateDir, basePath, baseLink, perVMRootfs, overlayLink)
+		} else {
+			rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
+			setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q",
+				templateDir, perVMRootfs, rootfsLink)
+		}
+		// %q (Go double-quoted) is safe inside `sh -c '...'` for our controlled paths.
+		scriptContent = fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s unshare -m -- sh -c '%s && exec %q --api-sock %q --id %q'\n",
+			netNS, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	}
 
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	scriptContent := fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s unshare -m -- sh -c '%s && exec %q --api-sock %q --id %q'\n",
-		netNS, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
@@ -1634,10 +1662,15 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	}
 	tSocketReady := time.Now()
 
+	mountNsMode := "prealloc"
+	if mountNsBindPath == "" {
+		mountNsMode = "legacy"
+	}
 	m.log.Info().
 		Str("vm_id", vmID).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
+		Str("mount_ns_mode", mountNsMode).
 		Msg("fc startup phases")
 
 	// Read the PID asynchronously so the create path isn't slowed down
@@ -1646,6 +1679,30 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	go m.resolveAndSetPID(vmID)
 
 	return 0, nil
+}
+
+// bindSandboxLinks creates the per-VM template symlinks inside the slot's
+// mount namespace. Layout matches the legacy branch: dual-link
+// (base+overlay) when basePath is non-empty, single-link (rootfs) otherwise.
+func (m *Manager) bindSandboxLinks(ctx context.Context, bindPath, tmpfsMountPoint, perVMRootfs, basePath string) error {
+	var links [][2]string
+	if basePath != "" {
+		links = [][2]string{
+			{basePath, "base.ext4"},
+			{perVMRootfs, "overlay.ext4"},
+		}
+	} else {
+		links = [][2]string{
+			{perVMRootfs, "rootfs.ext4"},
+		}
+	}
+	return network.BindSandboxIntoSlot(ctx, bindPath, tmpfsMountPoint, links)
+}
+
+// shellQuote single-quotes s for safe inclusion in /bin/sh exec lines.
+// Embedded single quotes are escaped as '\''.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func (m *Manager) resolveAndSetPID(vmID string) {

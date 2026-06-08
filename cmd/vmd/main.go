@@ -321,7 +321,8 @@ func main() {
 	// claims one off the hot path instead of building it inline.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "128"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize: netPoolFresh,
+		NewSize:                netPoolFresh,
+		MountNsTmpfsMountPoint: filepath.Join(cfg.RunDir, "template"),
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 

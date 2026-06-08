@@ -61,6 +61,9 @@ type VMNetInfo struct {
 	HostIP     string    // Host-side IP to reach this VM.
 	MACAddress string
 	Firewall   *Firewall // nftables firewall for this VM (inside namespace).
+	// MountNsBindPath is non-empty when the slot has a preallocated
+	// mount namespace; empty selects the legacy `unshare -m` start.sh path.
+	MountNsBindPath string
 }
 
 // ---------------------------------------------------------------------------
@@ -363,14 +366,26 @@ func (m *Manager) CleanupVM(vmID string) {
 		m.egressProxy.RemoveRules(info.HostIP)
 	}
 
-	// Recycle the slot into the pool — namespace, veth, TAP, and base
-	// nftables stay configured; the next Claim re-adds vmID-specific
-	// rules. Skipped when info.Firewall is nil (reattached VM whose
-	// in-ns handle couldn't be rebound) — pooling would let the next
-	// Claim silently lose per-VM egress filtering.
+	if info.MountNsBindPath != "" && m.pool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		UnbindSandboxFromSlot(ctx, info.MountNsBindPath, m.pool.tmpfsMountPoint, sandboxLinkNames)
+		cancel()
+	}
+
+	// Recycle the slot into the pool. Skipped when info.Firewall is nil
+	// (reattached VM whose in-ns handle couldn't be rebound) — pooling
+	// would let the next Claim silently lose per-VM egress filtering.
 	if m.pool != nil && info.Firewall != nil {
 		_ = info.Firewall.ReplaceUserRules(nil, nil)
-		m.pool.Return(&preallocSlot{idx: idx, info: info, vethName: vethName})
+		slot := &preallocSlot{idx: idx, info: info, vethName: vethName}
+		if info.MountNsBindPath != "" {
+			slot.mountNs = &slotMountNs{
+				BindPath:        info.MountNsBindPath,
+				TmpfsMountPoint: m.pool.tmpfsMountPoint,
+			}
+		}
+		info.MountNsBindPath = ""
+		m.pool.Return(slot)
 		return
 	}
 
@@ -395,7 +410,24 @@ func (m *Manager) CleanupVM(vmID string) {
 	_ = run(ctx, "ip", "link", "del", vethName)
 	_ = run(ctx, "ip", "netns", "del", info.Namespace)
 
+	// Release the mount-ns bind here too — recycle path was skipped,
+	// so without this the bind leaks until the next vmd boot.
+	if info.MountNsBindPath != "" {
+		_ = run(ctx, "umount", info.MountNsBindPath)
+		_ = os.Remove(info.MountNsBindPath)
+	}
+
 	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+}
+
+// SetMountNsBindPath is used by reattach to record a restored bind so
+// the slot keeps its prepared-namespace fast path. No-op if vmID isn't tracked.
+func (m *Manager) SetMountNsBindPath(vmID, bindPath string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if info, ok := m.devices[vmID]; ok {
+		info.MountNsBindPath = bindPath
+	}
 }
 
 // ReattachVM rebinds vmd's view of an already-running VM's network state
@@ -513,6 +545,11 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 	m.mu.Unlock()
 
 	return info, nil
+}
+
+// SlotFromNamespace is the exported form of slotFromNamespace.
+func SlotFromNamespace(namespace string) (int, bool) {
+	return slotFromNamespace(namespace)
 }
 
 // slotFromNamespace parses "ns-N" → N (digits only). Returns (0, false)
