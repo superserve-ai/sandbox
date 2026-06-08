@@ -1,0 +1,267 @@
+package secretsproxy
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// secretsJWTIssuer is the iss claim the daemon requires; matches the control
+// plane's `api.SecretsJWTIssuer`.
+const secretsJWTIssuer = "superserve-controlplane"
+
+// JWTBindingClaim mirrors `api.SecretsBindingClaim` over the JWT wire shape.
+type JWTBindingClaim struct {
+	ProxyToken string         `json:"p"`
+	SecretID   string         `json:"s"`
+	EnvKey     string         `json:"e"`
+	Hosts      []string       `json:"h"`
+	AuthType   string         `json:"t"`
+	AuthConfig map[string]any `json:"c,omitempty"`
+}
+
+// JWTClaims is the parsed JWT payload.
+type JWTClaims struct {
+	TeamID              string            `json:"team_id"`
+	SourceIP            string            `json:"source_ip"`
+	UnmatchedHostPolicy string            `json:"unmatched_host_policy,omitempty"`
+	Allow               []string          `json:"allow,omitempty"`
+	Deny                []string          `json:"deny,omitempty"`
+	Bindings            []JWTBindingClaim `json:"bindings,omitempty"`
+
+	jwt.RegisteredClaims
+}
+
+// JWT verification errors. Discrete sentinel values so callers can branch on
+// reason (typically all map to 407 on the wire).
+var (
+	ErrJWTMissing         = errors.New("secretsproxy: jwt missing")
+	ErrJWTMalformed       = errors.New("secretsproxy: jwt malformed")
+	ErrJWTBadSignature    = errors.New("secretsproxy: jwt signature failed")
+	ErrJWTExpired         = errors.New("secretsproxy: jwt expired")
+	ErrJWTWrongIssuer     = errors.New("secretsproxy: jwt wrong issuer")
+	ErrJWTUnknownKid      = errors.New("secretsproxy: jwt unknown kid")
+	ErrJWTSourceIPMismatch = errors.New("secretsproxy: jwt source_ip does not match remote address")
+	ErrJWTMissingClaim    = errors.New("secretsproxy: jwt missing required claim")
+)
+
+// JWKSFetcher loads the set of trusted verification keys. The production
+// implementation hits the control plane's /internal/jwks endpoint; tests
+// inject a stub that returns canned keys.
+type JWKSFetcher interface {
+	Fetch(ctx context.Context) (map[string]ed25519.PublicKey, error)
+}
+
+// Verifier parses and verifies secrets JWTs against keys fetched from a
+// JWKSFetcher. Concurrency-safe; the key map is replaced atomically on refresh.
+type Verifier struct {
+	fetcher JWKSFetcher
+
+	mu             sync.RWMutex
+	keys           map[string]ed25519.PublicKey
+	lastFetch      time.Time
+	missCooldown   time.Duration // bounds how often a Verify call can trigger a refresh on unknown kid
+	lastMissFetch  time.Time
+	clock          func() time.Time
+}
+
+// NewVerifier builds a Verifier and performs the initial JWKS load. Returns
+// an error if the initial load fails — the daemon should refuse to start in
+// that state rather than accept any JWT silently.
+func NewVerifier(ctx context.Context, fetcher JWKSFetcher) (*Verifier, error) {
+	v := &Verifier{
+		fetcher:      fetcher,
+		missCooldown: 60 * time.Second,
+		clock:        time.Now,
+	}
+	if err := v.refresh(ctx); err != nil {
+		return nil, fmt.Errorf("initial JWKS load: %w", err)
+	}
+	return v, nil
+}
+
+// Refresh re-fetches the JWKS and atomically replaces the cached keys.
+func (v *Verifier) Refresh(ctx context.Context) error { return v.refresh(ctx) }
+
+func (v *Verifier) refresh(ctx context.Context) error {
+	keys, err := v.fetcher.Fetch(ctx)
+	if err != nil {
+		return err
+	}
+	v.mu.Lock()
+	v.keys = keys
+	v.lastFetch = v.clock()
+	v.mu.Unlock()
+	return nil
+}
+
+// Verify parses jwtString, verifies signature + standard claims, and checks
+// that the source_ip claim matches expectedSourceIP. On unknown kid, the
+// verifier attempts one cached refresh (debounced) before failing.
+func (v *Verifier) Verify(ctx context.Context, jwtString, expectedSourceIP string) (*JWTClaims, error) {
+	if jwtString == "" {
+		return nil, ErrJWTMissing
+	}
+
+	claims := &JWTClaims{}
+	token, err := jwt.ParseWithClaims(jwtString, claims, v.keyfunc(ctx),
+		jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}),
+		jwt.WithIssuer(secretsJWTIssuer),
+		jwt.WithExpirationRequired(),
+	)
+	if err != nil {
+		return nil, mapJWTError(err)
+	}
+	if !token.Valid {
+		return nil, ErrJWTBadSignature
+	}
+
+	if claims.TeamID == "" || claims.SourceIP == "" || claims.Subject == "" {
+		return nil, ErrJWTMissingClaim
+	}
+	if claims.SourceIP != expectedSourceIP {
+		return nil, ErrJWTSourceIPMismatch
+	}
+	return claims, nil
+}
+
+// keyfunc returns the per-Parse callback the JWT library uses to look up a
+// public key by kid. On unknown kid, triggers a debounced refresh.
+func (v *Verifier) keyfunc(ctx context.Context) jwt.Keyfunc {
+	return func(token *jwt.Token) (any, error) {
+		kid, _ := token.Header["kid"].(string)
+		if kid == "" {
+			return nil, ErrJWTMalformed
+		}
+		if key, ok := v.lookup(kid); ok {
+			return key, nil
+		}
+
+		// Unknown kid — try one refresh, debounced.
+		v.mu.Lock()
+		now := v.clock()
+		may := now.Sub(v.lastMissFetch) >= v.missCooldown
+		if may {
+			v.lastMissFetch = now
+		}
+		v.mu.Unlock()
+		if !may {
+			return nil, ErrJWTUnknownKid
+		}
+		if err := v.refresh(ctx); err != nil {
+			return nil, ErrJWTUnknownKid
+		}
+		if key, ok := v.lookup(kid); ok {
+			return key, nil
+		}
+		return nil, ErrJWTUnknownKid
+	}
+}
+
+func (v *Verifier) lookup(kid string) (ed25519.PublicKey, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	key, ok := v.keys[kid]
+	return key, ok
+}
+
+// mapJWTError converts library errors to our sentinels so callers can branch
+// uniformly. Anything we don't recognize maps to ErrJWTBadSignature.
+func mapJWTError(err error) error {
+	switch {
+	case errors.Is(err, jwt.ErrTokenExpired):
+		return ErrJWTExpired
+	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
+		return ErrJWTWrongIssuer
+	case errors.Is(err, ErrJWTUnknownKid):
+		return ErrJWTUnknownKid
+	case errors.Is(err, ErrJWTMalformed):
+		return ErrJWTMalformed
+	case errors.Is(err, jwt.ErrTokenMalformed):
+		return ErrJWTMalformed
+	default:
+		return ErrJWTBadSignature
+	}
+}
+
+// HTTPJWKSFetcher reads the JWKS from the control plane's /internal/jwks
+// endpoint. Authenticates with the daemon's shared token (same as the vault
+// decrypt path).
+type HTTPJWKSFetcher struct {
+	baseURL    string
+	authToken  string
+	httpClient *http.Client
+}
+
+// NewHTTPJWKSFetcher builds a fetcher targeting {baseURL}/internal/jwks.
+func NewHTTPJWKSFetcher(baseURL, authToken string) *HTTPJWKSFetcher {
+	return &HTTPJWKSFetcher{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		authToken:  authToken,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// jwksResponse mirrors the wire shape of /internal/jwks. Only Ed25519 keys
+// (kty=OKP, crv=Ed25519) are accepted; other entries are skipped.
+type jwksResponse struct {
+	Keys []struct {
+		Kid string `json:"kid"`
+		Kty string `json:"kty"`
+		Crv string `json:"crv"`
+		X   string `json:"x"`
+	} `json:"keys"`
+}
+
+// Fetch implements JWKSFetcher.
+func (f *HTTPJWKSFetcher) Fetch(ctx context.Context) (map[string]ed25519.PublicKey, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/internal/jwks", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build jwks request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+f.authToken)
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("jwks request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("control plane rejected daemon auth on JWKS fetch (%d): check DAEMON_AUTH_TOKEN matches control plane INTERNAL_API_TOKEN", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("control plane returned %d on JWKS fetch: %s", resp.StatusCode, string(raw))
+	}
+	var body jwksResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode jwks: %w", err)
+	}
+	out := make(map[string]ed25519.PublicKey, len(body.Keys))
+	for _, k := range body.Keys {
+		if k.Kty != "OKP" || k.Crv != "Ed25519" || k.Kid == "" {
+			continue
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(k.X)
+		if err != nil {
+			continue
+		}
+		if len(raw) != ed25519.PublicKeySize {
+			continue
+		}
+		out[k.Kid] = ed25519.PublicKey(raw)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no usable Ed25519 keys in JWKS response")
+	}
+	return out, nil
+}

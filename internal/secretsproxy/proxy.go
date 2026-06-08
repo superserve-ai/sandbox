@@ -1,0 +1,187 @@
+package secretsproxy
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"sync/atomic"
+	"time"
+)
+
+// Resolver authenticates a proxy connection from its source IP and bearer JWT.
+type Resolver interface {
+	Authenticate(ctx context.Context, sourceIP, jwt string) (*Scope, error)
+}
+
+// Scope is the per-connection authorization context built from a verified JWT.
+type Scope struct {
+	SandboxID           string
+	TeamID              string
+	SourceIP            string
+	UnmatchedHostPolicy string
+	Allow               []string
+	Deny                []string
+	// Bindings is the proxy_token → Binding map the inject pipeline uses to
+	// match outbound requests against the sandbox's configured credentials.
+	Bindings map[string]Binding
+}
+
+// Binding is one (proxy_token → credential) pair carried in the JWT.
+type Binding struct {
+	SecretID   string
+	EnvKey     string
+	AuthType   string         // bearer | basic | api-key | custom
+	AuthConfig map[string]any // type-specific config
+	Hosts      []string       // upstream hosts this credential applies to
+}
+
+// ErrUnknownSandbox is returned for any rejection of the proxy CONNECT (bad
+// signature, expired JWT, source-IP mismatch, etc.). The dispatcher maps all
+// of these to a 407.
+var ErrUnknownSandbox = errors.New("secretsproxy: connection rejected")
+
+// Proxy is the MITM HTTPS ingress.
+type Proxy struct {
+	addr     string
+	ca       *CA
+	resolver Resolver
+	logger   *slog.Logger
+
+	vault             VaultClient
+	audit             AuditSink
+	revoker           *Revoker
+	httpServer        *http.Server
+	tlsConfig         *tls.Config
+	upstream          *http.Transport
+	isListening       atomic.Bool
+	sandboxFacingHost string
+}
+
+// Options carries Proxy dependencies. Nil Logger, Vault, Audit, and UpstreamTransport
+// fall back to safe defaults (discard logger, passthrough, no-op sink, strict TLS transport).
+type Options struct {
+	CA                *CA
+	Resolver          Resolver
+	Vault             VaultClient
+	Audit             AuditSink
+	Revoker           *Revoker
+	Logger            *slog.Logger
+	UpstreamTransport *http.Transport
+
+	// IP sandboxes connect to. SNI fallback for clients that omit it (e.g. curl to an IP).
+	SandboxFacingHost string
+}
+
+// NewProxy constructs the proxy bound to addr.
+func NewProxy(addr string, opts Options) *Proxy {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+
+	upstream := opts.UpstreamTransport
+	if upstream == nil {
+		upstream = &http.Transport{
+			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ForceAttemptHTTP2:     false,
+		}
+	}
+	audit := opts.Audit
+	if audit == nil {
+		audit = NewNopAuditSink()
+	}
+	p := &Proxy{
+		addr:              addr,
+		ca:                opts.CA,
+		resolver:          opts.Resolver,
+		vault:             opts.Vault,
+		audit:             audit,
+		revoker:           opts.Revoker,
+		logger:            logger,
+		upstream:          upstream,
+		sandboxFacingHost: opts.SandboxFacingHost,
+	}
+
+	p.tlsConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			sni := hello.ServerName
+			if sni == "" {
+				sni = p.sandboxFacingHost
+			}
+			if sni == "" {
+				host, _, err := net.SplitHostPort(hello.Conn.LocalAddr().String())
+				if err != nil || host == "" {
+					host = "127.0.0.1"
+				}
+				sni = host
+			}
+			return p.ca.MintLeaf(sni)
+		},
+	}
+
+	p.httpServer = &http.Server{
+		Addr:              addr,
+		Handler:           http.HandlerFunc(p.dispatch),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	return p
+}
+
+// Addr returns the configured listener address.
+func (p *Proxy) Addr() string { return p.addr }
+
+// RootPEM returns the CA cert in PEM form for installation into client trust stores.
+func (p *Proxy) RootPEM() []byte { return p.ca.RootPEM() }
+
+// IsListening reports whether the listener is bound and accepting connections.
+func (p *Proxy) IsListening() bool { return p.isListening.Load() }
+
+// ListenAndServe binds and serves. Blocks until Shutdown is called.
+func (p *Proxy) ListenAndServe() error {
+	l, err := net.Listen("tcp", p.addr)
+	if err != nil {
+		return err
+	}
+	return p.Serve(l)
+}
+
+// Serve accepts on the provided listener, wrapping it in TLS so the
+// Proxy-Authorization header is encrypted on the wire.
+func (p *Proxy) Serve(l net.Listener) error {
+	p.isListening.Store(true)
+	defer p.isListening.Store(false)
+	return p.httpServer.Serve(tls.NewListener(l, p.tlsConfig))
+}
+
+// Shutdown stops the listener gracefully.
+func (p *Proxy) Shutdown(ctx context.Context) error {
+	p.upstream.CloseIdleConnections()
+	return p.httpServer.Shutdown(ctx)
+}
+
+func (p *Proxy) dispatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		p.handleConnect(w, r)
+		return
+	}
+	http.Error(w,
+		"this endpoint is an HTTPS forward proxy; only CONNECT is supported",
+		http.StatusBadRequest)
+}
+
+// remoteHost extracts the host portion (no port) from r.RemoteAddr.
+func remoteHost(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
+}

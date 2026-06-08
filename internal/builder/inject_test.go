@@ -7,6 +7,80 @@ import (
 	"testing"
 )
 
+func TestInjectProxyCA(t *testing.T) {
+	t.Parallel()
+	const certPEM = "-----BEGIN CERTIFICATE-----\nTESTCERT\n-----END CERTIFICATE-----\n"
+
+	writeCertFile := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "ca.crt")
+		if err := os.WriteFile(path, []byte(certPEM), 0o644); err != nil {
+			t.Fatalf("seed cert: %v", err)
+		}
+		return path
+	}
+
+	t.Run("empty path is a no-op", func(t *testing.T) {
+		rootfs := t.TempDir()
+		if err := injectProxyCA(rootfs, "", nil); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(rootfs, "usr/local/share/ca-certificates/superserve-proxy.crt")); !os.IsNotExist(err) {
+			t.Fatalf("cert should not have been written when path is empty: %v", err)
+		}
+	})
+
+	t.Run("writes additional cert and appends to existing bundle", func(t *testing.T) {
+		rootfs := t.TempDir()
+		bundleDir := filepath.Join(rootfs, "etc/ssl/certs")
+		if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+			t.Fatalf("mkdir bundle: %v", err)
+		}
+		bundlePath := filepath.Join(bundleDir, "ca-certificates.crt")
+		existing := "-----BEGIN CERTIFICATE-----\nEXISTING\n-----END CERTIFICATE-----\n"
+		if err := os.WriteFile(bundlePath, []byte(existing), 0o644); err != nil {
+			t.Fatalf("seed bundle: %v", err)
+		}
+
+		if err := injectProxyCA(rootfs, writeCertFile(t), nil); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		got, err := os.ReadFile(filepath.Join(rootfs, "usr/local/share/ca-certificates/superserve-proxy.crt"))
+		if err != nil || string(got) != certPEM {
+			t.Fatalf("additional cert: %v, %q", err, got)
+		}
+		bundle, err := os.ReadFile(bundlePath)
+		if err != nil {
+			t.Fatalf("read bundle: %v", err)
+		}
+		if !strings.HasPrefix(string(bundle), existing) || !strings.HasSuffix(string(bundle), certPEM) {
+			t.Fatalf("bundle did not preserve existing + append cert; got: %q", bundle)
+		}
+	})
+
+	t.Run("missing bundle still writes the additional cert", func(t *testing.T) {
+		rootfs := t.TempDir()
+		if err := injectProxyCA(rootfs, writeCertFile(t), nil); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(rootfs, "usr/local/share/ca-certificates/superserve-proxy.crt")); err != nil {
+			t.Fatalf("additional cert missing: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(rootfs, "etc/ssl/certs/ca-certificates.crt")); !os.IsNotExist(err) {
+			t.Fatalf("bundle should remain absent: %v", err)
+		}
+	})
+
+	t.Run("source path missing returns an error", func(t *testing.T) {
+		err := injectProxyCA(t.TempDir(), "/no/such/cert", nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
 // TestRewriteAptSources covers the apt-source rewrite path: canonical hosts
 // get redirected to the replacement mirror over both http:// and https://
 // (emitted as http://), unrelated URLs are left alone, the rewrite is

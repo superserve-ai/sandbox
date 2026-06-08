@@ -24,6 +24,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
@@ -65,9 +66,11 @@ type Handlers struct {
 	DB        *db.Queries
 	Pool      *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
 	Config    *config.Config
-	Hosts     HostRegistry // when set, routes VMD calls via host_id
-	Scheduler Scheduler    // when set, picks host on create
+	Hosts     HostRegistry      // when set, routes VMD calls via host_id
+	Scheduler Scheduler         // when set, picks host on create
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
+	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
+	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
 }
 
 // capture emits a usage event attributed to the API key's owner and team.
@@ -405,7 +408,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
+	// per-binding proxy tokens are in the snapshot.
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
@@ -750,6 +755,17 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
+	// Record the revocation so daemons can refuse the JWT, and fan out the
+	// notification to the host. Bootstrap-on-restart recovers if fanout fails.
+	if err := h.DB.InsertSandboxRevocation(c.Request.Context(), db.InsertSandboxRevocationParams{
+		SandboxID: sandboxID,
+		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
+	}); err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertSandboxRevocation failed")
+	} else {
+		go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+	}
+
 	// Best-effort cleanup of pause snapshots. Failures are logged but
 	// don't fail the delete — manual cleanup may be required if vmd was
 	// unreachable.
@@ -891,6 +907,10 @@ type createSandboxRequest struct {
 	// they live in boxd's memory for the sandbox's lifetime and survive
 	// pause/resume via snapshot.
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+
+	// Secrets binds team-stored credentials to env-var names; the agent sees a
+	// per-binding proxy token, swapped for the real value at egress.
+	Secrets map[string]string `json:"secrets,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -1136,6 +1156,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateSecretsRefs(req.Secrets); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	// env_vars and secrets share the env-var namespace; 400 on collision.
+	for k := range req.Secrets {
+		if _, dup := req.EnvVars[k]; dup {
+			respondErrorMsg(c, "bad_request",
+				fmt.Sprintf("env-var key %q appears in both env_vars and secrets; pick one", k),
+				http.StatusBadRequest)
+			return
+		}
+	}
 	// Marshal once into the canonical jsonb shape. Empty / nil maps are
 	// stored as the empty object so the column is never NULL.
 	metadataJSON, err := json.Marshal(req.Metadata)
@@ -1152,6 +1185,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+
+	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
+	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
+	if appErr != nil {
+		respondError(c, appErr)
 		return
 	}
 
@@ -1306,13 +1346,25 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
-	// RestoreSnapshot (not ResumeInstance) for the from_template path:
-	// ResumeInstance assumes the VM already exists in vmd's in-memory map
-	// (the pause→resume contract), which is fine for a paused sandbox but
-	// not for a fresh one we're creating now. Restore takes snapshot paths
-	// and boots a new VM from them statelessly. Caller env vars are merged
-	// on top of the template's baked defaults by vmd (boxd resumes with
-	// template context, then the restore RPC posts these on top).
+	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
+
+	// Lookup the team's unmatched_host_policy up front so we don't make a DB
+	// call after we've already started a VM boot.
+	var teamUnmatchedHostPolicy string
+	if len(secretMeta) > 0 {
+		team, terr := h.DB.GetTeam(c.Request.Context(), teamID)
+		if terr != nil {
+			log.Error().Err(terr).Str("team_id", teamID.String()).Msg("DB GetTeam during sandbox create")
+			respondError(c, ErrInternal)
+			return
+		}
+		teamUnmatchedHostPolicy = team.UnmatchedHostPolicy
+	}
+
+	// Phase 1: RestoreSnapshot boots the VM with the caller's env vars and
+	// returns its source IP. For sandboxes with secrets, a follow-up
+	// InjectSandboxEnv pushes the env again together with the JWT minted
+	// against the now-known source IP.
 	tVmdStart := time.Now()
 	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	tVmdEnd := time.Now()
@@ -1384,11 +1436,30 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Past this point the VM is running. Detach from cancellation so a
-	// client disconnect cannot lose the state transition, but preserve
-	// the trace/span context so post-VMD writes stay in the request trace.
+	// Phase 2: with the source IP known, mint the per-sandbox secrets JWT
+	// (when secrets are configured) and push env vars to the running boxd.
+	// If injection fails, tear the VM down and mark the row failed — a
+	// sandbox that boots without its env vars is unusable.
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
+
+	var secretsJWT string
+	if len(secretMeta) > 0 {
+		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, teamUnmatchedHostPolicy, req.Network, secretMeta)
+		if jerr != nil {
+			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
+			h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
+			respondError(c, ErrInternal)
+			return
+		}
+		secretsJWT = jwt
+	}
+	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+		log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
+		h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
+		respondError(c, ErrInternal)
+		return
+	}
 
 	// Single atomic transition: starting → active with real resources
 	// and IP. VMD's response is the source of truth for vcpu/memory
@@ -1440,6 +1511,22 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 		}
 	}()
+
+	if len(secretBindings) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range secretBindings {
+				secretBindings[i].SandboxID = sandbox.ID
+				if err := h.DB.AddSandboxSecret(postCtx, secretBindings[i]); err != nil {
+					log.Error().Err(err).
+						Str("sandbox_id", sandbox.ID.String()).
+						Str("env_key", secretBindings[i].EnvKey).
+						Msg("DB AddSandboxSecret failed")
+				}
+			}
+		}()
+	}
 
 	if hasNetworkRules {
 		wg.Add(1)

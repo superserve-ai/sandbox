@@ -22,9 +22,11 @@ const vmIPRange = "10.11.0.0/16"
 // installHostFirewall installs the static rules that route all VM traffic
 // through the host: UDP/443 DROP (kills QUIC bypass of the SNI allowlist),
 // MSS clamp, FORWARD ACCEPT between veth+ and the host iface, MASQUERADE
-// for vmIPRange to the host iface, and REDIRECT HTTP/HTTPS from veth+ to
-// the egress proxy. All operations are idempotent.
-func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log zerolog.Logger) error {
+// for vmIPRange to the host iface, REDIRECT HTTP/HTTPS from veth+ to the
+// egress proxy, and (when secretsProxyPort > 0) REDIRECT secretsProxyDst:
+// secretsProxyPort to the local secretsproxy daemon. All operations are
+// idempotent.
+func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, secretsProxyDst string, secretsProxyPort uint16, log zerolog.Logger) error {
 	_, ipnet, err := net.ParseCIDR(vmIPRange)
 	if err != nil {
 		return fmt.Errorf("vmIPRange %s invalid: %w", vmIPRange, err)
@@ -76,13 +78,26 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, l
 		rules = append(rules, rule{"nat", "PREROUTING",
 			[]string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort)}})
 	}
+	if secretsProxyPort > 0 {
+		if ip := net.ParseIP(secretsProxyDst); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("invalid secretsProxyDst %q (must be IPv4)", secretsProxyDst)
+		}
+		// -d narrows the match so we don't intercept unrelated dport-9443 traffic.
+		rules = append(rules, rule{"nat", "PREROUTING",
+			[]string{"-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort),
+				"-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort)}})
+	}
 	for _, r := range rules {
 		if err := ipt.AppendUnique(r.table, r.chain, r.args...); err != nil {
 			return fmt.Errorf("add %s/%s rule: %w", r.table, r.chain, err)
 		}
 	}
 
-	log.Info().Str("host_iface", hostIface).Msg("host firewall ready (static prefix rules)")
+	log.Info().
+		Str("host_iface", hostIface).
+		Str("secrets_proxy_dst", secretsProxyDst).
+		Uint16("secrets_proxy_port", secretsProxyPort).
+		Msg("host firewall ready (static prefix rules)")
 	return nil
 }
 

@@ -52,7 +52,9 @@ BUNDLE_FILES = [
     "bin/vmd",
     "bin/boxd",
     "bin/template-builder",
+    "bin/secretsproxy",
     "deploy/superserve-vmd.service",
+    "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
     "deploy/sandboxes.slice",
@@ -181,6 +183,19 @@ def main() -> int:
                 echo "boxd unchanged ($CUR_HASH) — skipping install + rootfs rebuild"
             fi
 
+            # secretsproxy daemon: hash-compare for idempotent install.
+            NEW_SP_HASH=$(sha256sum {extract_dir}/bin/secretsproxy | awk '{{print $1}}')
+            CUR_SP_HASH=$(sha256sum {install_dir}/secretsproxy 2>/dev/null | awk '{{print $1}}' || echo none)
+            if [ "$NEW_SP_HASH" != "$CUR_SP_HASH" ]; then
+                echo "secretsproxy changed ($CUR_SP_HASH -> $NEW_SP_HASH) — installing"
+                sudo install -m 0755 {extract_dir}/bin/secretsproxy {install_dir}/secretsproxy
+            else
+                echo "secretsproxy unchanged ($CUR_SP_HASH) — skipping binary install"
+            fi
+            sudo install -m 0644 {extract_dir}/deploy/superserve-secretsproxy.service /etc/systemd/system/superserve-secretsproxy.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable --quiet superserve-secretsproxy.service
+
             sudo rm -rf {extract_dir}
             rm -f {bundle_remote}
 
@@ -199,6 +214,21 @@ def main() -> int:
                 sudo journalctl -u {service} --no-pager -n 40 >&2 || true
                 exit 1
             )
+
+            # Restart secretsproxy; tolerate missing env file on hosts not
+            # yet provisioned (is-active check below is gated on the file).
+            sudo systemctl restart superserve-secretsproxy.service || true
+            if [ -f /etc/sandbox/secretsproxy.env ]; then
+                sleep 2
+                sudo systemctl is-active --quiet superserve-secretsproxy.service || (
+                    echo "ERROR: superserve-secretsproxy failed to become active after restart" >&2
+                    sudo systemctl status --no-pager superserve-secretsproxy.service >&2 || true
+                    sudo journalctl -u superserve-secretsproxy.service --no-pager -n 40 >&2 || true
+                    exit 1
+                )
+            else
+                echo "/etc/sandbox/secretsproxy.env not present; daemon not started (provision env file to enable)"
+            fi
         """)
 
         r = subprocess.run(

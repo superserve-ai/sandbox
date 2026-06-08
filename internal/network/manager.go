@@ -94,6 +94,10 @@ type Manager struct {
 	httpProxyPort  uint16
 	tlsProxyPort   uint16
 	otherProxyPort uint16
+
+	// Sandbox-facing address for the secretsproxy daemon. Zero port disables the REDIRECT.
+	secretsProxyDst  string
+	secretsProxyPort uint16
 }
 
 // SetEgressProxy attaches the TCP egress proxy so the manager can remove
@@ -119,6 +123,15 @@ func WithHTTPProxyPort(port uint16) ManagerOption {
 	return func(m *Manager) { m.httpProxyPort = port }
 }
 
+// WithSecretsProxyAddr sets the sandbox-facing address for the secretsproxy
+// daemon. Port 0 disables the REDIRECT.
+func WithSecretsProxyAddr(host string, port uint16) ManagerOption {
+	return func(m *Manager) {
+		m.secretsProxyDst = host
+		m.secretsProxyPort = port
+	}
+}
+
 func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, opts ...ManagerOption) (*Manager, error) {
 	if err := enableIPForward(ctx); err != nil {
 		return nil, err
@@ -137,7 +150,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 		opt(mgr)
 	}
 
-	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, log.With().Str("component", "host_fw").Logger()); err != nil {
+	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.secretsProxyDst, mgr.secretsProxyPort, log.With().Str("component", "host_fw").Logger()); err != nil {
 		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
 

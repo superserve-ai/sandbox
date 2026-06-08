@@ -449,10 +449,198 @@ paths:
       responses:
         "101":
           description: Switching Protocols — the WebSocket is established.
+
+  /secrets:
+    post:
+      operationId: createSecret
+      tags: [Secrets]
+      summary: Create a secret
+      description: |
+        Stores a credential under the caller's team. The plaintext is
+        envelope-encrypted at rest and is never returned by any API.
+        At sandbox-create time, bind the secret to an environment-variable
+        name via the `secrets` map on `POST /sandboxes`; the agent sees a
+        proxy token in env and the in-host enforcement daemon swaps it for
+        the real value at egress.
+
+        Use `provider` for built-in shortcuts (e.g. `anthropic`, `openai`,
+        `github`, `stripe`) which auto-fill the auth scheme and allowed
+        upstream hosts. Use `auth` + `hosts` for a custom integration.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSecretRequest"
+      responses:
+        "201":
+          description: Secret created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      operationId: listSecrets
+      tags: [Secrets]
+      summary: List secrets for the calling team
+      description: |
+        Returns metadata for all secrets owned by the team. Cleartext values
+        are never returned.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Secret metadata list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SecretResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /secrets/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Secret name as set at creation.
+    get:
+      operationId: getSecret
+      tags: [Secrets]
+      summary: Get a secret's metadata
+      description: Returns metadata only — the cleartext value is never returned.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Secret metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      operationId: updateSecretValue
+      tags: [Secrets]
+      summary: Rotate a secret's value
+      description: |
+        Replaces the stored ciphertext with a freshly-encrypted copy of the
+        new value. All sandboxes bound to this secret continue to work; in-host
+        caches are invalidated so the next egress uses the new value.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSecretRequest"
+      responses:
+        "200":
+          description: Secret updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteSecret
+      tags: [Secrets]
+      summary: Revoke a secret
+      description: |
+        Soft-deletes the secret: the proxy daemon refuses to serve it and
+        new sandbox bindings fail. Existing audit-history queries still
+        resolve the row. The same name can be re-used by creating a new secret.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Secret revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/audit:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    get:
+      operationId: listSandboxAudit
+      tags: [Secrets]
+      summary: List proxy egress events for a sandbox
+      description: |
+        Returns proxy_audit events recorded by the in-host enforcement daemon
+        for this sandbox — each outbound HTTPS request that traversed the
+        proxy, plus the upstream host, status, latency, and (when relevant)
+        the secret that was used. Most recent first.
+
+        Paginate with `before=<id>` using the smallest `id` from the previous
+        page; `limit` defaults to 50 and is capped at 200.
+      security:
+        - apiKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: before
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Return events with `id` strictly less than this cursor.
+      responses:
+        "200":
+          description: Audit events (most recent first)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProxyAuditEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
 
   /files:
     servers:
@@ -929,6 +1117,19 @@ components:
             run_id: 7f3c-21
         network:
           $ref: "#/components/schemas/NetworkConfig"
+        secrets:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Bind team-stored credentials to environment variables inside the
+            sandbox. Keys are env-var names; values are secret names from
+            `POST /secrets`. The agent never sees the real value: it sees a
+            proxy token in env, and the in-host enforcement daemon swaps the
+            token for the real credential at egress.
+          example:
+            ANTHROPIC_API_KEY: anthropic-prod
+            GITHUB_TOKEN: ghp-readonly
 
     SandboxListItem:
       description: Sandbox shape returned by list endpoints.
@@ -1388,6 +1589,153 @@ components:
       example:
         path: /home/user/out.txt
         size: 1024
+
+    CreateSecretRequest:
+      type: object
+      required: [name, value]
+      properties:
+        name:
+          type: string
+          maxLength: 128
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]*$"
+          description: >
+            Identifier used to reference the secret later (e.g. in the
+            `secrets` map on `POST /sandboxes`).
+        value:
+          type: string
+          maxLength: 8192
+          description: Cleartext credential. Encrypted at rest; never returned.
+        provider:
+          type: string
+          description: >
+            Built-in provider shortcut (e.g. `anthropic`, `openai`, `github`,
+            `stripe`). When set, auto-fills auth scheme and allowed upstream
+            hosts. Mutually exclusive with `auth` and `hosts`.
+        auth:
+          $ref: "#/components/schemas/SecretAuthConfig"
+        hosts:
+          type: array
+          items:
+            type: string
+          maxItems: 16
+          description: >
+            Upstream allow list. Required when `auth` is set. Each entry is a
+            hostname or single-level wildcard (e.g. `api.example.com`,
+            `*.example.com`).
+
+    UpdateSecretRequest:
+      type: object
+      required: [value]
+      properties:
+        value:
+          type: string
+          maxLength: 8192
+          description: New cleartext value to encrypt and store.
+
+    SecretAuthConfig:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [bearer, basic, api-key, custom]
+          description: |
+            Egress auth scheme:
+            - `bearer`: `Authorization: Bearer <value>`
+            - `basic`: `Authorization: Basic <base64(value)>`
+            - `api-key`: custom header (set `header`, optionally `prefix`)
+            - `custom`: caller-defined `headers` map
+        header:
+          type: string
+          description: Header name (required for `api-key`).
+        prefix:
+          type: string
+          description: Optional value prefix (used by `api-key`).
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          maxProperties: 8
+          description: Header-name → value template (required for `custom`).
+
+    SecretResponse:
+      type: object
+      required: [id, name, auth_type, auth_config, hosts, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        auth_type:
+          type: string
+          enum: [bearer, basic, api-key, custom]
+        auth_config:
+          type: object
+          additionalProperties: true
+          description: Resolved auth scheme details (no cleartext value).
+        provider_shortcut:
+          type: string
+          nullable: true
+          description: Provider shortcut used at creation, if any.
+        hosts:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp of the most recent egress that used this secret.
+
+    ProxyAuditEvent:
+      type: object
+      required: [id, ts, sandbox_id, method, host, path, status]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Monotonic event id — also the pagination cursor.
+        ts:
+          type: string
+          format: date-time
+        sandbox_id:
+          type: string
+          format: uuid
+        secret_id:
+          type: string
+          format: uuid
+          description: Secret involved in this request, if any.
+        method:
+          type: string
+        host:
+          type: string
+          description: Upstream host targeted by the request.
+        path:
+          type: string
+        status:
+          type: integer
+          format: int32
+          description: Status the proxy returned to the sandbox.
+        upstream_status:
+          type: integer
+          format: int32
+          nullable: true
+          description: Status returned by the upstream (absent if the proxy short-circuited).
+        latency_ms:
+          type: integer
+          format: int32
+          nullable: true
+        error_code:
+          type: string
+          nullable: true
+          description: Stable error tag when the proxy denied or failed the request.
 
     Error:
       type: object

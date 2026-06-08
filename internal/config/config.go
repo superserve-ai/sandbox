@@ -40,6 +40,18 @@ type Config struct {
 	// SentryDSN is the Sentry data source name for error reporting.
 	// Loaded from SENTRY_DSN; empty disables Sentry.
 	SentryDSN string
+
+	// KMSKeyResource is the Cloud KMS key resource name used to wrap per-row DEKs.
+	// Empty disables the /secrets endpoints.
+	KMSKeyResource string
+
+	// SecretsSigningKey is the base64-encoded Ed25519 private seed used to
+	// sign per-sandbox JWTs. Empty disables JWT minting.
+	SecretsSigningKey string
+
+	// SecretsSigningKeyID is the kid stamped on minted JWTs and served by
+	// the JWKS endpoint. Defaults to "v1".
+	SecretsSigningKeyID string
 }
 
 // Load reads configuration from environment variables.
@@ -66,6 +78,9 @@ func Load() (*Config, error) {
 		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
 		SystemTeamID:           os.Getenv("SYSTEM_TEAM_ID"),
 		SentryDSN:              os.Getenv("SENTRY_DSN"),
+		KMSKeyResource:         os.Getenv("KMS_KEY_RESOURCE"),
+		SecretsSigningKey:      os.Getenv("SECRETS_SIGNING_KEY"),
+		SecretsSigningKeyID:    envOrDefault("SECRETS_SIGNING_KEY_ID", "v1"),
 	}
 	return cfg, nil
 }

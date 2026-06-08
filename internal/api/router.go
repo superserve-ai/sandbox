@@ -58,6 +58,14 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/templates/:template_id/builds/:build_id", h.GetTemplateBuild)
 		api.DELETE("/templates/:template_id/builds/:build_id", h.CancelTemplateBuild)
 		api.GET("/templates/:template_id/builds/:build_id/logs", h.StreamTemplateBuildLogs)
+
+		api.POST("/secrets", h.CreateSecret)
+		api.GET("/secrets", h.ListSecrets)
+		api.GET("/secrets/:name", h.GetSecret)
+		api.PATCH("/secrets/:name", h.PatchSecret)
+		api.DELETE("/secrets/:name", h.DeleteSecret)
+
+		api.GET("/sandboxes/:sandbox_id/audit", h.GetSandboxAudit)
 	}
 
 	r.GET("/health", h.Health)
@@ -71,6 +79,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	internal.Use(InternalAuth())
 	{
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
+		internal.POST("/secrets/decrypt", h.DecryptSecret)
+		internal.GET("/jwks", h.JWKS)
+		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)
 	}
 
 	return r
