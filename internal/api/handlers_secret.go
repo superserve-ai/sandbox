@@ -234,6 +234,9 @@ func validateAuthConfig(auth *authConfigRequest) error {
 		}
 		return nil // per-host rules validated separately against the hosts allowlist
 	}
+	if auth.Type == "" {
+		return errors.New("auth.type or auth.per_host is required")
+	}
 	return validateAuthShape(auth.Type, auth.Header, auth.Prefix, auth.Username, auth.Headers, "auth")
 }
 

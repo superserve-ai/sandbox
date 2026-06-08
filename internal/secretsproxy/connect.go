@@ -56,12 +56,13 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		http.Error(w, "internal proxy error", http.StatusInternalServerError)
 		return
 	}
 	clientConn, _, err := hj.Hijack()
 	if err != nil {
-		http.Error(w, "hijack failed", http.StatusInternalServerError)
+		p.logger.Warn("hijack failed", "err", err.Error())
+		http.Error(w, "internal proxy error", http.StatusInternalServerError)
 		return
 	}
 
@@ -189,7 +190,9 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 
 		outReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL.String(), r.Body)
 		if err != nil {
-			writeBrokerError(w, http.StatusBadGateway, "build_request", err.Error())
+			p.logger.Warn("build upstream request failed",
+				"host", host, "sandbox", scope.SandboxID, "err", err.Error())
+			writeBrokerError(w, http.StatusBadGateway, "build_request", "could not build upstream request")
 			finalize(http.StatusBadGateway, nil, "", "build_request")
 			return
 		}
@@ -203,7 +206,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			if ierr != nil {
 				p.logger.Warn("inject pipeline failed",
 					"host", host, "sandbox", scope.SandboxID, "err", ierr.Error())
-				writeBrokerError(w, http.StatusBadGateway, "inject_error", ierr.Error())
+				writeBrokerError(w, http.StatusBadGateway, "inject_error", "request rejected by sandbox proxy")
 				finalize(http.StatusBadGateway, nil, out.MatchedSecretID, "inject_error")
 				return
 			}
@@ -224,7 +227,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 		if err != nil {
 			p.logger.Warn("upstream RoundTrip failed",
 				"host", host, "sandbox", scope.SandboxID, "err", err.Error())
-			writeBrokerError(w, http.StatusBadGateway, "upstream_unreachable", err.Error())
+			writeBrokerError(w, http.StatusBadGateway, "upstream_unreachable", "upstream unreachable")
 			finalize(http.StatusBadGateway, nil, matchedSecretID, "upstream_unreachable")
 			return
 		}

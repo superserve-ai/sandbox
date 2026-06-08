@@ -124,7 +124,7 @@ func TestValidateAuthConfig(t *testing.T) {
 		wantErr string
 	}{
 		{"nil rejected", nil, "required"},
-		{"empty type", &authConfigRequest{}, "type is required"},
+		{"empty type", &authConfigRequest{}, "auth.type or auth.per_host is required"},
 		{"unsupported type", &authConfigRequest{Type: "oauth"}, "not supported"},
 
 		// bearer
