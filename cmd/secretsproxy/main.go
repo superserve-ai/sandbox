@@ -60,7 +60,11 @@ func run() error {
 	log.Info().Str("control_plane", cfg.ControlPlaneURL).Msg("JWKS loaded from control plane")
 
 	httpVault := secretsproxy.NewHTTPVaultClient(cfg.ControlPlaneURL, cfg.DaemonAuthToken)
-	cachedVault := secretsproxy.NewCachedVault(httpVault, cfg.VaultCacheTTL)
+	cachedVault := secretsproxy.NewCachedVault(httpVault, secretsproxy.VaultCacheOptions{
+		TTL:      cfg.VaultCacheTTL,
+		IdleTTL:  cfg.VaultCacheIdleTTL,
+		Capacity: cfg.VaultCacheCapacity,
+	})
 
 	revoker := secretsproxy.NewRevoker()
 	revoked, err := secretsproxy.FetchRevokedSandboxes(rootCtx, cfg.ControlPlaneURL, cfg.DaemonAuthToken)
@@ -146,9 +150,11 @@ type config struct {
 	CAKeyPath         string
 	CertCacheSize     int
 
-	ControlPlaneURL string
-	DaemonAuthToken string
-	VaultCacheTTL   time.Duration
+	ControlPlaneURL    string
+	DaemonAuthToken    string
+	VaultCacheTTL      time.Duration
+	VaultCacheIdleTTL  time.Duration
+	VaultCacheCapacity int
 
 	DatabaseURL string
 
@@ -167,10 +173,12 @@ func loadConfig() (*config, error) {
 		CACertPath:        envOr("SECRETSPROXY_CA_CERT", "/var/lib/secretsproxy/ca.crt"),
 		CAKeyPath:         envOr("SECRETSPROXY_CA_KEY", "/var/lib/secretsproxy/ca.key"),
 		CertCacheSize:     1024,
-		ControlPlaneURL:   strings.TrimRight(envOr("CONTROL_PLANE_URL", ""), "/"),
-		DaemonAuthToken:   os.Getenv("DAEMON_AUTH_TOKEN"),
-		VaultCacheTTL:     parseDur(os.Getenv("VAULT_CACHE_TTL"), 60*time.Second),
-		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		ControlPlaneURL:    strings.TrimRight(envOr("CONTROL_PLANE_URL", ""), "/"),
+		DaemonAuthToken:    os.Getenv("DAEMON_AUTH_TOKEN"),
+		VaultCacheTTL:      parseDur(os.Getenv("VAULT_CACHE_TTL"), 60*time.Second),
+		VaultCacheIdleTTL:  parseDur(os.Getenv("VAULT_CACHE_IDLE_TTL"), 10*time.Minute),
+		VaultCacheCapacity: int(parseInt64Bytes(os.Getenv("VAULT_CACHE_CAPACITY"), 1024)),
+		DatabaseURL:        os.Getenv("DATABASE_URL"),
 		AuditBufferSize:     4096,
 		AuditBatchSize:      64,
 		AuditFlushEvery:     250 * time.Millisecond,

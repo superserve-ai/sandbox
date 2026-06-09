@@ -239,11 +239,13 @@ func TestVerifier_RejectsMalformed(t *testing.T) {
 	}
 }
 
-func TestVerifier_UnknownKidTriggersRefresh(t *testing.T) {
+func TestVerifier_UnknownKidTriggersAsyncRefresh(t *testing.T) {
+	// Unknown kid kicks off a background refresh: the request that triggered
+	// the miss fails with ErrJWTUnknownKid (JWKS fetch never blocks the
+	// request path), but the next request after the refresh completes succeeds.
 	pub1, priv1 := newKeypair(t)
 	pub2, priv2 := newKeypair(t)
 
-	// Initial fetch returns v1 only.
 	fetcher := &stubFetcher{fn: func() (map[string]ed25519.PublicKey, error) {
 		return map[string]ed25519.PublicKey{"v1": pub1}, nil
 	}}
@@ -251,24 +253,45 @@ func TestVerifier_UnknownKidTriggersRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = priv1 // unused on the happy v1 path here
+	_ = priv1
 
-	// Simulate rotation: fetcher now returns v2 too.
+	// Simulate rotation.
 	fetcher.setFn(func() (map[string]ed25519.PublicKey, error) {
 		return map[string]ed25519.PublicKey{"v1": pub1, "v2": pub2}, nil
 	})
 	tokV2 := signForTest(t, priv2, "v2", JWTClaims{TeamID: "t", SourceIP: "1.1.1.1"}, time.Now())
 
+	// First attempt fails — refresh kicks off in the background.
+	prevRefreshes := v.backgroundRefreshes.Load()
+	if _, err := v.Verify(context.Background(), tokV2, "1.1.1.1"); !errors.Is(err, ErrJWTUnknownKid) {
+		t.Fatalf("first miss must fail fast with ErrJWTUnknownKid, got %v", err)
+	}
+	waitForBackgroundRefresh(t, v, prevRefreshes)
+
+	// Second attempt — keys are now refreshed.
 	claims, err := v.Verify(context.Background(), tokV2, "1.1.1.1")
 	if err != nil {
-		t.Fatalf("expected refresh on unknown kid to recover, got %v", err)
+		t.Fatalf("after background refresh, expected success, got %v", err)
 	}
 	if claims.TeamID != "t" {
 		t.Errorf("claims TeamID drift: %q", claims.TeamID)
 	}
-	if fetcher.callCount() < 2 {
-		t.Errorf("expected at least 2 fetches (initial + refresh-on-miss), got %d", fetcher.callCount())
+	if fetcher.callCount() != 2 {
+		t.Errorf("expected exactly 2 fetches (initial + one background refresh), got %d", fetcher.callCount())
 	}
+}
+
+// waitForBackgroundRefresh polls until at least one background refresh has
+// completed since prev. Avoids time.Sleep dependence in tests.
+func waitForBackgroundRefresh(t *testing.T, v *Verifier, prev uint64) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if v.backgroundRefreshes.Load() > prev {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("background refresh never completed")
 }
 
 func TestVerifier_UnknownKidRefreshDebounced(t *testing.T) {
@@ -286,11 +309,13 @@ func TestVerifier_UnknownKidRefreshDebounced(t *testing.T) {
 	_, otherPriv := newKeypair(t)
 	tok := signForTest(t, otherPriv, "v2", JWTClaims{TeamID: "t", SourceIP: "1.1.1.1"}, time.Now())
 
-	// First miss triggers a refresh; subsequent misses within the cooldown
-	// must NOT trigger more fetches.
+	// First miss kicks off an async refresh; subsequent misses within
+	// the cooldown must NOT trigger more fetches.
+	prevRefreshes := v.backgroundRefreshes.Load()
 	for i := 0; i < 5; i++ {
 		_, _ = v.Verify(context.Background(), tok, "1.1.1.1")
 	}
+	waitForBackgroundRefresh(t, v, prevRefreshes)
 	// 1 initial + 1 miss-refresh = 2 total.
 	if fetcher.callCount() != 2 {
 		t.Errorf("expected 2 fetches with cooldown, got %d", fetcher.callCount())

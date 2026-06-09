@@ -789,3 +789,28 @@ func TestPerHostRulesFromConfig(t *testing.T) {
 		t.Errorf("rule 1 drift: %+v", rules[1])
 	}
 }
+
+func TestRejectOverbroadWildcardOnPublicSuffix(t *testing.T) {
+	cases := []struct {
+		host      string
+		wantError bool
+	}{
+		{"api.example.com", false},
+		{"*.example.com", false},
+		{"*.example.co.uk", false},
+		{"*.bbc.co.uk", false},
+		{"*.com", true},     // public suffix
+		{"*.co.uk", true},   // multi-label public suffix
+		{"*.io", true},      // public suffix
+		{"*.us", true},      // public suffix
+		{"*.example.local", false}, // private TLD not in PSL
+	}
+	for _, c := range cases {
+		t.Run(c.host, func(t *testing.T) {
+			err := rejectOverbroadWildcard(c.host)
+			if (err != nil) != c.wantError {
+				t.Errorf("rejectOverbroadWildcard(%q) = %v, wantError=%v", c.host, err, c.wantError)
+			}
+		})
+	}
+}

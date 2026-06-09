@@ -11,10 +11,15 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// backgroundRefreshTimeout caps an async JWKS fetch — long enough for a slow
+// control plane, short enough that a stuck fetcher doesn't hold a goroutine.
+const backgroundRefreshTimeout = 30 * time.Second
 
 // secretsJWTIssuer is the iss claim the daemon requires; matches the control
 // plane's `api.SecretsJWTIssuer`.
@@ -80,12 +85,17 @@ type JWKSFetcher interface {
 type Verifier struct {
 	fetcher JWKSFetcher
 
-	mu             sync.RWMutex
-	keys           map[string]ed25519.PublicKey
-	lastFetch      time.Time
-	missCooldown   time.Duration // bounds how often a Verify call can trigger a refresh on unknown kid
-	lastMissFetch  time.Time
-	clock          func() time.Time
+	mu            sync.RWMutex
+	keys          map[string]ed25519.PublicKey
+	lastFetch     time.Time
+	missCooldown  time.Duration // bounds how often a kid miss can trigger a refresh
+	lastMissFetch time.Time
+	refreshing    bool // true while a background JWKS fetch is in flight
+	clock         func() time.Time
+
+	// backgroundRefreshes increments after each background refresh attempt
+	// (success or failure). Tests observe completion via this counter.
+	backgroundRefreshes atomic.Uint64
 }
 
 // NewVerifier builds a Verifier and performs the initial JWKS load. Returns
@@ -149,8 +159,10 @@ func (v *Verifier) Verify(ctx context.Context, jwtString, expectedSourceIP strin
 }
 
 // keyfunc returns the per-Parse callback the JWT library uses to look up a
-// public key by kid. On unknown kid, triggers a debounced refresh.
-func (v *Verifier) keyfunc(ctx context.Context) jwt.Keyfunc {
+// public key by kid. On unknown kid, kicks off an async JWKS refresh and
+// fails the current request — JWKS fetch latency never blocks the request
+// path; the next request after refresh completes will succeed.
+func (v *Verifier) keyfunc(_ context.Context) jwt.Keyfunc {
 	return func(token *jwt.Token) (any, error) {
 		kid, _ := token.Header["kid"].(string)
 		if kid == "" {
@@ -159,26 +171,37 @@ func (v *Verifier) keyfunc(ctx context.Context) jwt.Keyfunc {
 		if key, ok := v.lookup(kid); ok {
 			return key, nil
 		}
-
-		// Unknown kid — try one refresh, debounced.
-		v.mu.Lock()
-		now := v.clock()
-		may := now.Sub(v.lastMissFetch) >= v.missCooldown
-		if may {
-			v.lastMissFetch = now
-		}
-		v.mu.Unlock()
-		if !may {
-			return nil, ErrJWTUnknownKid
-		}
-		if err := v.refresh(ctx); err != nil {
-			return nil, ErrJWTUnknownKid
-		}
-		if key, ok := v.lookup(kid); ok {
-			return key, nil
-		}
+		v.maybeRefreshAsync()
 		return nil, ErrJWTUnknownKid
 	}
+}
+
+// maybeRefreshAsync kicks off a JWKS refresh in a background goroutine if
+// (a) the miss cooldown has elapsed and (b) no refresh is already in flight.
+// Detached from the request context so the refresh isn't cancelled when the
+// request returns.
+func (v *Verifier) maybeRefreshAsync() {
+	v.mu.Lock()
+	now := v.clock()
+	if v.refreshing || now.Sub(v.lastMissFetch) < v.missCooldown {
+		v.mu.Unlock()
+		return
+	}
+	v.refreshing = true
+	v.lastMissFetch = now
+	v.mu.Unlock()
+
+	go func() {
+		defer func() {
+			v.mu.Lock()
+			v.refreshing = false
+			v.mu.Unlock()
+			v.backgroundRefreshes.Add(1)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), backgroundRefreshTimeout)
+		defer cancel()
+		_ = v.refresh(ctx)
+	}()
 }
 
 func (v *Verifier) lookup(kid string) (ed25519.PublicKey, bool) {

@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/net/publicsuffix"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/secrets"
@@ -219,7 +220,25 @@ func validateHosts(hosts []string) error {
 		if !hostRE.MatchString(h) {
 			return fmt.Errorf("hosts[%d]: %q is not a valid hostname", i, h)
 		}
+		if err := rejectOverbroadWildcard(h); err != nil {
+			return fmt.Errorf("hosts[%d]: %w", i, err)
+		}
 		hosts[i] = h
+	}
+	return nil
+}
+
+// rejectOverbroadWildcard refuses wildcards rooted at a public suffix
+// (`*.com`, `*.co.uk`). Private TLDs (.local, .test) aren't on Mozilla's
+// PSL and so are allowed through.
+func rejectOverbroadWildcard(host string) error {
+	if !strings.HasPrefix(host, "*.") {
+		return nil
+	}
+	base := strings.ToLower(host[2:])
+	suffix, _ := publicsuffix.PublicSuffix(base)
+	if base == suffix {
+		return fmt.Errorf("wildcard %q is too broad — %q is a public suffix; narrow to a specific subdomain", host, base)
 	}
 	return nil
 }

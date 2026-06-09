@@ -16,9 +16,11 @@ type stubVault struct {
 	teamID string
 	values map[string]string
 	err    error
+	calls  int
 }
 
 func (s *stubVault) FetchCredential(_ context.Context, teamID, secretID string) (string, error) {
+	s.calls++
 	if s.err != nil {
 		return "", s.err
 	}
@@ -464,12 +466,13 @@ func (c *fakeClock) advance(d time.Duration) {
 }
 
 func newCachedVaultWithClock(upstream VaultClient, ttl time.Duration, clock *fakeClock) *cachedVault {
-	return &cachedVault{
-		upstream: upstream,
-		ttl:      ttl,
-		now:      clock.Now,
-		entries:  make(map[cacheKey]cachedEntry),
-	}
+	cv := NewCachedVault(upstream, VaultCacheOptions{
+		TTL:      ttl,
+		IdleTTL:  time.Hour,
+		Capacity: 256,
+	})
+	cv.now = clock.Now
+	return cv
 }
 
 // TestCachedVaultIsTeamScoped: same secretID under a different teamID must not hit the cache.
@@ -787,5 +790,85 @@ func TestMultiBindingRevocationAbortsRequest(t *testing.T) {
 	}
 	if got := req.Header.Get("X-B"); got != "proxy-B" {
 		t.Errorf("X-B should be untouched on revocation; got %q", got)
+	}
+}
+
+func TestCachedVaultEvictsLRUWhenCapacityReached(t *testing.T) {
+	// Cache must bound its size: once capacity is reached, the least
+	// recently used entry is evicted on insert. Without this, the cache
+	// grows unbounded for sandboxes with many short-lived secrets.
+	clock := &fakeClock{t: time.Now()}
+	upstream := &stubVault{values: map[string]string{"a": "A", "b": "B", "c": "C"}}
+	cv := NewCachedVault(upstream, VaultCacheOptions{
+		TTL:      time.Hour,
+		IdleTTL:  time.Hour,
+		Capacity: 2,
+	})
+	cv.now = clock.Now
+
+	for _, sid := range []string{"a", "b", "c"} {
+		if _, err := cv.FetchCredential(context.Background(), "team-1", sid); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if cv.order.Len() != 2 {
+		t.Errorf("cache len = %d, want 2 (capacity bound)", cv.order.Len())
+	}
+	// "a" was the oldest insert; should be evicted.
+	if _, ok := cv.entries[cacheKey{teamID: "team-1", secretID: "a"}]; ok {
+		t.Error("expected oldest entry 'a' to be evicted")
+	}
+	if _, ok := cv.entries[cacheKey{teamID: "team-1", secretID: "c"}]; !ok {
+		t.Error("newest entry 'c' must be present")
+	}
+}
+
+func TestCachedVaultLRUOrderPromotedOnHit(t *testing.T) {
+	// A cache hit must move the entry to the front of the LRU list,
+	// otherwise frequently-accessed entries get evicted prematurely.
+	clock := &fakeClock{t: time.Now()}
+	upstream := &stubVault{values: map[string]string{"a": "A", "b": "B", "c": "C"}}
+	cv := NewCachedVault(upstream, VaultCacheOptions{
+		TTL: time.Hour, IdleTTL: time.Hour, Capacity: 2,
+	})
+	cv.now = clock.Now
+
+	_, _ = cv.FetchCredential(context.Background(), "team-1", "a")
+	_, _ = cv.FetchCredential(context.Background(), "team-1", "b")
+	// Touch "a" — must move it to front.
+	_, _ = cv.FetchCredential(context.Background(), "team-1", "a")
+	// Insert "c" — now "b" should be the LRU victim, not "a".
+	_, _ = cv.FetchCredential(context.Background(), "team-1", "c")
+
+	if _, ok := cv.entries[cacheKey{teamID: "team-1", secretID: "a"}]; !ok {
+		t.Error("touched 'a' was prematurely evicted")
+	}
+	if _, ok := cv.entries[cacheKey{teamID: "team-1", secretID: "b"}]; ok {
+		t.Error("'b' should have been LRU-evicted in favor of touched 'a'")
+	}
+}
+
+func TestCachedVaultIdleTTLEvictsStaleEntry(t *testing.T) {
+	// An entry that hasn't been accessed in IdleTTL is dropped on the next
+	// access attempt and re-fetched, bounding memory for never-revisited
+	// entries even when capacity isn't reached.
+	clock := &fakeClock{t: time.Now()}
+	upstream := &stubVault{values: map[string]string{"a": "A"}}
+	cv := NewCachedVault(upstream, VaultCacheOptions{
+		TTL: time.Hour, IdleTTL: 5 * time.Minute, Capacity: 1024,
+	})
+	cv.now = clock.Now
+
+	_, _ = cv.FetchCredential(context.Background(), "team-1", "a")
+	if upstream.calls != 1 {
+		t.Fatalf("upstream calls after first fetch: got %d, want 1", upstream.calls)
+	}
+
+	// Advance past idle TTL with no access.
+	clock.advance(6 * time.Minute)
+	_, _ = cv.FetchCredential(context.Background(), "team-1", "a")
+	if upstream.calls != 2 {
+		t.Errorf("idle-evicted entry should trigger a re-fetch, got %d upstream calls", upstream.calls)
 	}
 }
