@@ -597,7 +597,7 @@ func (h *Handlers) CreateSecret(c *gin.Context) {
 		"provider_shortcut": shortcut,
 		"hosts":             hosts,
 	})
-	h.logSecretActivity(c.Request.Context(), row.ID, teamID, actorIDFromContext(c), "created", "ok", row.Name, meta)
+	h.logSecretActivity(c.Request.Context(), row.ID, teamID, actorIDFromContext(c), "created", "success", row.Name, meta)
 
 	c.JSON(http.StatusCreated, toSecretResponse(row))
 }
@@ -705,7 +705,7 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 	// Best-effort cache fanout; the daemon TTL is the fallback.
 	go h.fanoutInvalidate(context.Background(), updated.ID)
 
-	h.logSecretActivity(c.Request.Context(), updated.ID, teamID, actorIDFromContext(c), "rotated", "ok", updated.Name, nil)
+	h.logSecretActivity(c.Request.Context(), updated.ID, teamID, actorIDFromContext(c), "rotated", "success", updated.Name, nil)
 
 	c.JSON(http.StatusOK, toSecretResponse(updated))
 }
@@ -737,7 +737,7 @@ func (h *Handlers) DeleteSecret(c *gin.Context) {
 	// Best-effort cache fanout; the daemon TTL is the fallback.
 	go h.fanoutInvalidate(context.Background(), row.ID)
 
-	h.logSecretActivity(c.Request.Context(), row.ID, teamID, actorIDFromContext(c), "deleted", "ok", row.Name, nil)
+	h.logSecretActivity(c.Request.Context(), row.ID, teamID, actorIDFromContext(c), "deleted", "success", row.Name, nil)
 
 	c.Status(http.StatusNoContent)
 }
