@@ -86,14 +86,60 @@ func TestHTTPVaultClientSurfacesGenericFailure(t *testing.T) {
 	}
 }
 
-func TestHTTPVaultClientRejectsEmptyValue(t *testing.T) {
+func TestHTTPVaultClientEmptyValueMapsToRevoked(t *testing.T) {
+	// Empty plaintext is treated as a revoked credential so the request
+	// path returns the same 503 as any other unusable secret.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(decryptResponse{Value: ""})
 	}))
 	defer srv.Close()
 	c := NewHTTPVaultClient(srv.URL, "tok")
 	_, err := c.FetchCredential(context.Background(), "team-1", "sec-1")
-	if err == nil || !strings.Contains(err.Error(), "empty value") {
-		t.Errorf("want empty-value error, got %v", err)
+	if !errors.Is(err, ErrCredentialRevoked) {
+		t.Errorf("want ErrCredentialRevoked, got %v", err)
+	}
+}
+
+func TestHTTPVaultClientRetriesOnTransient5xx(t *testing.T) {
+	// One brief upstream hiccup must not fail the request — the client
+	// retries 502/503/504 once before giving up.
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(decryptResponse{Value: "real-value"})
+	}))
+	defer srv.Close()
+	c := NewHTTPVaultClient(srv.URL, "tok")
+	val, err := c.FetchCredential(context.Background(), "team-1", "sec-1")
+	if err != nil {
+		t.Fatalf("retry should have succeeded, got %v", err)
+	}
+	if val != "real-value" {
+		t.Errorf("value mismatch: got %q", val)
+	}
+	if calls != 2 {
+		t.Errorf("want 2 calls (one fail, one success), got %d", calls)
+	}
+}
+
+func TestHTTPVaultClientStopsAfterOneRetry(t *testing.T) {
+	// Persistent upstream failure shouldn't loop forever — give up after
+	// one retry and surface the last error.
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	c := NewHTTPVaultClient(srv.URL, "tok")
+	if _, err := c.FetchCredential(context.Background(), "team-1", "sec-1"); err == nil {
+		t.Errorf("want error on persistent 502, got nil")
+	}
+	if calls != 2 {
+		t.Errorf("want exactly 2 attempts, got %d", calls)
 	}
 }

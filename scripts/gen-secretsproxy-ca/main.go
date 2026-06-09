@@ -27,8 +27,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "write cert:", err)
 		os.Exit(1)
 	}
+	// Force final mode regardless of umask — a restrictive umask can
+	// otherwise leave the key unreadable by the daemon at runtime.
+	if err := os.Chmod(*certPath, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "chmod cert:", err)
+		os.Exit(1)
+	}
 	if err := os.WriteFile(*keyPath, keyPEM, 0o600); err != nil {
 		fmt.Fprintln(os.Stderr, "write key:", err)
+		os.Exit(1)
+	}
+	if err := os.Chmod(*keyPath, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "chmod key:", err)
 		os.Exit(1)
 	}
 }

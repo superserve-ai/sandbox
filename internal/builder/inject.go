@@ -187,6 +187,11 @@ func injectProxyCA(rootfsDir, caCertPath string, logger *zerolog.Logger) error {
 		return fmt.Errorf("open %s: %w", bundlePath, err)
 	}
 	defer bf.Close()
+	// Defensive newline so an existing bundle without a trailing newline
+	// doesn't run the appended cert's BEGIN line into the previous line.
+	if _, err := bf.Write([]byte("\n")); err != nil {
+		return fmt.Errorf("append separator to %s: %w", bundlePath, err)
+	}
 	if _, err := bf.Write(cert); err != nil {
 		return fmt.Errorf("append to %s: %w", bundlePath, err)
 	}
