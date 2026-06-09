@@ -2,10 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestValidateSecretName(t *testing.T) {
@@ -812,5 +815,82 @@ func TestRejectOverbroadWildcardOnPublicSuffix(t *testing.T) {
 				t.Errorf("rejectOverbroadWildcard(%q) = %v, wantError=%v", c.host, err, c.wantError)
 			}
 		})
+	}
+}
+
+func TestParseStatusFilter(t *testing.T) {
+	cases := []struct {
+		in            string
+		wantMin       int32
+		wantMax       int32
+		wantErrSubstr string
+	}{
+		{"", 0, 9999, ""},
+		{"2xx", 200, 299, ""},
+		{"3xx", 300, 399, ""},
+		{"4xx", 400, 499, ""},
+		{"5xx", 500, 599, ""},
+		{"errors", 400, 9999, ""},
+		{"bogus", 0, 0, "status must be one of"},
+		{"200", 0, 0, "status must be one of"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			min, max, err := parseStatusFilter(c.in)
+			if c.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("unexpected err: %v", err)
+				}
+				if min != c.wantMin || max != c.wantMax {
+					t.Errorf("got (%d, %d), want (%d, %d)", min, max, c.wantMin, c.wantMax)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErrSubstr) {
+				t.Errorf("want err containing %q, got %v", c.wantErrSubstr, err)
+			}
+		})
+	}
+}
+
+func TestListProvidersReturnsCatalog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	r := gin.New()
+	r.GET("/providers", h.ListProviders)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/providers", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status: %d", w.Code)
+	}
+	var got []providerResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(providerShortcuts) {
+		t.Fatalf("provider count: got %d, want %d", len(got), len(providerShortcuts))
+	}
+	wantNames := knownProviders()
+	for i, p := range got {
+		if p.Name != wantNames[i] {
+			t.Errorf("order drift at [%d]: got %q want %q", i, p.Name, wantNames[i])
+		}
+		if p.Display == "" {
+			t.Errorf("display empty for %q", p.Name)
+		}
+		if p.TokenShape == "" {
+			t.Errorf("token_shape empty for %q", p.Name)
+		}
+	}
+}
+
+func TestProviderShortcutsHaveDisplayNames(t *testing.T) {
+	for name, p := range providerShortcuts {
+		if p.Display == "" {
+			t.Errorf("provider %q missing Display field", name)
+		}
 	}
 }

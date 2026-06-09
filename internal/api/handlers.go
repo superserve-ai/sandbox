@@ -153,6 +153,32 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 	}()
 }
 
+// logSecretActivity writes a secret-scoped activity record. secretName is a
+// denormalized snapshot stored at write time so the row stays readable even
+// after the underlying secret is hard-deleted.
+func (h *Handlers) logSecretActivity(reqCtx context.Context, secretID, teamID uuid.UUID, actorID *uuid.UUID, action, status, secretName string, metadata []byte) {
+	asyncCtx := context.WithoutCancel(reqCtx)
+	go func() {
+		defer sentrylog.Recover("secret-activity-log")
+		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
+		defer cancel()
+		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+			SecretID:     pgtype.UUID{Bytes: secretID, Valid: true},
+			SecretName:   &secretName,
+			ResourceType: "secret",
+			TeamID:       teamID,
+			ActorID:      actorUUID(actorID),
+			Category:     "secret",
+			Action:       action,
+			Status:       &status,
+			Metadata:     metadata,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("secret_id", secretID.String()).Msgf("async secret/%s activity log failed", action)
+		}
+	}()
+}
+
 // logTemplateActivity writes a template-scoped activity record. Same async
 // semantics as logSandboxActivity.
 func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamID uuid.UUID, actorID *uuid.UUID, category, action, status string, metadata []byte) {
@@ -918,17 +944,27 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID             `json:"id"`
-	Name           string                `json:"name"`
-	Status         string                `json:"status"`
-	VcpuCount      int32                 `json:"vcpu_count"`
-	MemoryMib      int32                 `json:"memory_mib"`
-	AccessToken    string                `json:"access_token,omitempty"`
-	SnapshotID     *uuid.UUID            `json:"snapshot_id,omitempty"`
-	CreatedAt      time.Time             `json:"created_at"`
-	TimeoutSeconds *int32                `json:"timeout_seconds,omitempty"`
-	Network        *networkConfigRequest `json:"network,omitempty"`
-	Metadata       map[string]string     `json:"metadata"`
+	ID             uuid.UUID                `json:"id"`
+	Name           string                   `json:"name"`
+	Status         string                   `json:"status"`
+	VcpuCount      int32                    `json:"vcpu_count"`
+	MemoryMib      int32                    `json:"memory_mib"`
+	AccessToken    string                   `json:"access_token,omitempty"`
+	SnapshotID     *uuid.UUID               `json:"snapshot_id,omitempty"`
+	CreatedAt      time.Time                `json:"created_at"`
+	TimeoutSeconds *int32                   `json:"timeout_seconds,omitempty"`
+	Network        *networkConfigRequest    `json:"network,omitempty"`
+	Metadata       map[string]string        `json:"metadata"`
+	Secrets        []sandboxSecretBinding   `json:"secrets,omitempty"`
+}
+
+// sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
+// `revoked` is true when the underlying secret has been soft-deleted —
+// the binding row stays but the daemon refuses to swap on use.
+type sandboxSecretBinding struct {
+	EnvKey     string `json:"env_key"`
+	SecretName string `json:"secret_name"`
+	Revoked    bool   `json:"revoked,omitempty"`
 }
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
@@ -1109,7 +1145,32 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(sandbox))
+	resp := h.sandboxToResponseWithToken(sandbox)
+	resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
+	c.JSON(http.StatusOK, resp)
+}
+
+// fetchSandboxSecretBindings is a best-effort read of the sandbox's secret
+// bindings for the detail response. A DB failure is logged but doesn't fail
+// the request — the sandbox shape is still useful without the bindings list.
+func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uuid.UUID) []sandboxSecretBinding {
+	rows, err := h.DB.ListSandboxSecretBindings(ctx, sandboxID)
+	if err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListSandboxSecretBindings failed")
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]sandboxSecretBinding, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, sandboxSecretBinding{
+			EnvKey:     r.EnvKey,
+			SecretName: r.SecretName,
+			Revoked:    r.SecretRevoked,
+		})
+	}
+	return out
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {

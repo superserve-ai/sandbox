@@ -64,6 +64,10 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/secrets/:name", h.GetSecret)
 		api.PATCH("/secrets/:name", h.PatchSecret)
 		api.DELETE("/secrets/:name", h.DeleteSecret)
+		api.GET("/secrets/:name/audit", h.GetSecretAudit)
+		api.GET("/secrets/:name/sandboxes", h.GetSecretSandboxes)
+
+		api.GET("/providers", h.ListProviders)
 
 		api.GET("/sandboxes/:sandbox_id/audit", h.GetSandboxAudit)
 	}

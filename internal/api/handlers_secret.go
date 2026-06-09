@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/publicsuffix"
 
@@ -35,6 +36,7 @@ type tokenSpec struct {
 
 // providerShortcut is a pre-baked credential template (auth config + hosts + token spec).
 type providerShortcut struct {
+	Display    string // human-readable label shown in console pickers
 	AuthType   string
 	AuthConfig map[string]any
 	Hosts      []string
@@ -43,12 +45,14 @@ type providerShortcut struct {
 
 var providerShortcuts = map[string]providerShortcut{
 	"anthropic": {
+		Display:    "Anthropic",
 		AuthType:   "api-key",
 		AuthConfig: map[string]any{"header": "x-api-key"},
 		Hosts:      []string{"api.anthropic.com"},
 		Token:      tokenSpec{Prefix: "sk-ant-api03-", BodyLen: 48, Alphabet: "alnum"},
 	},
 	"openai": {
+		Display:    "OpenAI",
 		AuthType:   "bearer",
 		AuthConfig: map[string]any{},
 		Hosts:      []string{"api.openai.com"},
@@ -56,6 +60,7 @@ var providerShortcuts = map[string]providerShortcut{
 	},
 	"github": {
 		// REST uses Bearer; git over HTTPS uses Basic with x-access-token.
+		Display:  "GitHub",
 		AuthType: authTypePerHost,
 		AuthConfig: map[string]any{
 			"per_host": []map[string]any{
@@ -67,6 +72,7 @@ var providerShortcuts = map[string]providerShortcut{
 		Token: tokenSpec{Prefix: "ghp_", BodyLen: 36, Alphabet: "alnum"},
 	},
 	"stripe": {
+		Display:    "Stripe",
 		AuthType:   "bearer",
 		AuthConfig: map[string]any{},
 		Hosts:      []string{"api.stripe.com"},
@@ -74,12 +80,14 @@ var providerShortcuts = map[string]providerShortcut{
 		Token: tokenSpec{Prefix: "sk_test_", BodyLen: 24, Alphabet: "alnum"},
 	},
 	"slack": {
+		Display:    "Slack",
 		AuthType:   "bearer",
 		AuthConfig: map[string]any{},
 		Hosts:      []string{"slack.com"},
 		Token:      tokenSpec{Prefix: "xoxb-", BodyLen: 43, Alphabet: "b64url"},
 	},
 	"linear": {
+		Display:    "Linear",
 		AuthType:   "api-key",
 		AuthConfig: map[string]any{"header": "Authorization"},
 		Hosts:      []string{"api.linear.app"},
@@ -584,6 +592,13 @@ func (h *Handlers) CreateSecret(c *gin.Context) {
 		return
 	}
 
+	meta, _ := json.Marshal(map[string]any{
+		"auth_type":         authType,
+		"provider_shortcut": shortcut,
+		"hosts":             hosts,
+	})
+	h.logSecretActivity(c.Request.Context(), row.ID, teamID, actorIDFromContext(c), "created", "ok", row.Name, meta)
+
 	c.JSON(http.StatusCreated, toSecretResponse(row))
 }
 
@@ -690,6 +705,8 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 	// Best-effort cache fanout; the daemon TTL is the fallback.
 	go h.fanoutInvalidate(context.Background(), updated.ID)
 
+	h.logSecretActivity(c.Request.Context(), updated.ID, teamID, actorIDFromContext(c), "rotated", "ok", updated.Name, nil)
+
 	c.JSON(http.StatusOK, toSecretResponse(updated))
 }
 
@@ -719,6 +736,8 @@ func (h *Handlers) DeleteSecret(c *gin.Context) {
 
 	// Best-effort cache fanout; the daemon TTL is the fallback.
 	go h.fanoutInvalidate(context.Background(), row.ID)
+
+	h.logSecretActivity(c.Request.Context(), row.ID, teamID, actorIDFromContext(c), "deleted", "ok", row.Name, nil)
 
 	c.Status(http.StatusNoContent)
 }
@@ -1126,6 +1145,7 @@ type proxyAuditResponse struct {
 	ID             int64   `json:"id"`
 	Ts             string  `json:"ts"`
 	SandboxID      string  `json:"sandbox_id"`
+	SandboxName    *string `json:"sandbox_name,omitempty"` // populated for cross-sandbox views; null for deleted sandboxes
 	SecretID       string  `json:"secret_id,omitempty"`
 	Method         string  `json:"method"`
 	Host           string  `json:"host"`
@@ -1141,6 +1161,28 @@ func toAuditResponse(r db.ProxyAudit) proxyAuditResponse {
 		ID:             r.ID,
 		Ts:             r.Ts.UTC().Format(time.RFC3339Nano),
 		SandboxID:      r.SandboxID.String(),
+		Method:         r.Method,
+		Host:           r.Host,
+		Path:           r.Path,
+		Status:         r.Status,
+		UpstreamStatus: r.UpstreamStatus,
+		LatencyMs:      r.LatencyMs,
+		ErrorCode:      r.ErrorCode,
+	}
+	if r.SecretID.Valid {
+		resp.SecretID = uuid.UUID(r.SecretID.Bytes).String()
+	}
+	return resp
+}
+
+// toAuditResponseFromSecret renders a row from ListAuditForSecret. SandboxName
+// is nil when the sandbox referenced in the audit row has been deleted.
+func toAuditResponseFromSecret(r db.ListAuditForSecretRow) proxyAuditResponse {
+	resp := proxyAuditResponse{
+		ID:             r.ID,
+		Ts:             r.Ts.UTC().Format(time.RFC3339Nano),
+		SandboxID:      r.SandboxID.String(),
+		SandboxName:    r.SandboxName,
 		Method:         r.Method,
 		Host:           r.Host,
 		Path:           r.Path,
@@ -1187,10 +1229,17 @@ func (h *Handlers) GetSandboxAudit(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	minStatus, maxStatus, err := parseStatusFilter(c.Query("status"))
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	rows, err := h.DB.ListAuditForSandbox(c.Request.Context(), db.ListAuditForSandboxParams{
 		SandboxID: sandboxID,
 		Column2:   before,
+		Column3:   minStatus,
+		Column4:   maxStatus,
 		Limit:     limit,
 	})
 	if err != nil {
@@ -1204,6 +1253,145 @@ func (h *Handlers) GetSandboxAudit(c *gin.Context) {
 		out[i] = toAuditResponse(r)
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// GetSecretAudit returns the per-secret audit log: every egress request that
+// used this credential across every sandbox it was bound to.
+func (h *Handlers) GetSecretAudit(c *gin.Context) {
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+	name := c.Param("name")
+	if err := validateSecretName(name); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	secret, err := h.DB.GetSecretByName(c.Request.Context(), db.GetSecretByNameParams{
+		TeamID: teamID, Name: name,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "not_found", "Secret not found", http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("name", name).Msg("DB GetSecretByName failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	limit, err := parseAuditLimit(c.Query("limit"))
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	before, err := parseAuditBefore(c.Query("before"))
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	minStatus, maxStatus, err := parseStatusFilter(c.Query("status"))
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	rows, err := h.DB.ListAuditForSecret(c.Request.Context(), db.ListAuditForSecretParams{
+		SecretID: pgtype.UUID{Bytes: secret.ID, Valid: true},
+		TeamID:   teamID,
+		Column3:  before,
+		Column4:  minStatus,
+		Column5:  maxStatus,
+		Limit:    limit,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("name", name).Msg("DB ListAuditForSecret failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	out := make([]proxyAuditResponse, len(rows))
+	for i, r := range rows {
+		out[i] = toAuditResponseFromSecret(r)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// sandboxBoundResponse is one row of "sandboxes bound to this secret".
+type sandboxBoundResponse struct {
+	SandboxID   string `json:"sandbox_id"`
+	SandboxName string `json:"sandbox_name"`
+	EnvKey      string `json:"env_key"`
+	Status      string `json:"status"`
+}
+
+// GetSecretSandboxes returns the active sandboxes that have this secret
+// bound, with the env-var name each binding uses.
+func (h *Handlers) GetSecretSandboxes(c *gin.Context) {
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+	name := c.Param("name")
+	if err := validateSecretName(name); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	secret, err := h.DB.GetSecretByName(c.Request.Context(), db.GetSecretByNameParams{
+		TeamID: teamID, Name: name,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "not_found", "Secret not found", http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("name", name).Msg("DB GetSecretByName failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	rows, err := h.DB.ListSandboxesBoundToSecret(c.Request.Context(), db.ListSandboxesBoundToSecretParams{
+		SecretID: secret.ID,
+		TeamID:   teamID,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("name", name).Msg("DB ListSandboxesBoundToSecret failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	out := make([]sandboxBoundResponse, len(rows))
+	for i, r := range rows {
+		out[i] = sandboxBoundResponse{
+			SandboxID:   r.ID.String(),
+			SandboxName: r.Name,
+			EnvKey:      r.EnvKey,
+			Status:      string(r.Status),
+		}
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// parseStatusFilter accepts "", "2xx", "3xx", "4xx", "5xx", or "errors"
+// (errors = anything ≥ 400). Returns (min, max) inclusive bounds. "" means
+// no filter (0, 9999 — the sentinel the sqlc query expects).
+func parseStatusFilter(raw string) (int32, int32, error) {
+	switch raw {
+	case "":
+		return 0, 9999, nil
+	case "2xx":
+		return 200, 299, nil
+	case "3xx":
+		return 300, 399, nil
+	case "4xx":
+		return 400, 499, nil
+	case "5xx":
+		return 500, 599, nil
+	case "errors":
+		return 400, 9999, nil
+	default:
+		return 0, 0, fmt.Errorf("status must be one of: 2xx, 3xx, 4xx, 5xx, errors")
+	}
 }
 
 func parseAuditLimit(raw string) (int32, error) {
@@ -1229,5 +1417,36 @@ func parseAuditBefore(raw string) (int64, error) {
 		return 0, fmt.Errorf("before must be a non-negative integer")
 	}
 	return v, nil
+}
+
+// providerResponse is one entry of the provider catalog returned by
+// GET /providers. Backend-of-record so consumers stay in sync with the
+// in-memory providerShortcuts map.
+type providerResponse struct {
+	Name       string         `json:"name"`
+	Display    string         `json:"display"`
+	AuthType   string         `json:"auth_type"`
+	AuthConfig map[string]any `json:"auth_config"`
+	Hosts      []string       `json:"hosts"`
+	TokenShape string         `json:"token_shape"` // prefix + body-len hint for UX ("sk-ant-api03-...")
+}
+
+// ListProviders returns the built-in provider catalog in canonical order so
+// the console always picks the same default. No team-scope check — the
+// catalog is identical across teams.
+func (h *Handlers) ListProviders(c *gin.Context) {
+	out := make([]providerResponse, 0, len(providerShortcuts))
+	for _, name := range knownProviders() {
+		p := providerShortcuts[name]
+		out = append(out, providerResponse{
+			Name:       name,
+			Display:    p.Display,
+			AuthType:   p.AuthType,
+			AuthConfig: p.AuthConfig,
+			Hosts:      append([]string(nil), p.Hosts...),
+			TokenShape: p.Token.Prefix + "...",
+		})
+	}
+	c.JSON(http.StatusOK, out)
 }
 

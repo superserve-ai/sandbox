@@ -166,6 +166,8 @@ type Activity struct {
 	CreatedAt    time.Time   `json:"created_at"`
 	TemplateID   pgtype.UUID `json:"template_id"`
 	ResourceType string      `json:"resource_type"`
+	SecretID     pgtype.UUID `json:"secret_id"`
+	SecretName   *string     `json:"secret_name"`
 }
 
 type AnalyticsWeeklyUserMetric struct {

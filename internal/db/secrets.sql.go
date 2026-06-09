@@ -220,19 +220,30 @@ const listAuditForSandbox = `-- name: ListAuditForSandbox :many
 SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
 WHERE sandbox_id = $1
   AND ($2::bigint = 0 OR id < $2)
+  AND status >= $3::int
+  AND status <= $4::int
 ORDER BY id DESC
-LIMIT $3
+LIMIT $5
 `
 
 type ListAuditForSandboxParams struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	Column2   int64     `json:"column_2"`
+	Column3   int32     `json:"column_3"`
+	Column4   int32     `json:"column_4"`
 	Limit     int32     `json:"limit"`
 }
 
 // $2=0 returns the most recent rows; otherwise rows older than that id.
+// $3/$4 status bounds: 0/9999 = unfiltered.
 func (q *Queries) ListAuditForSandbox(ctx context.Context, arg ListAuditForSandboxParams) ([]ProxyAudit, error) {
-	rows, err := q.db.Query(ctx, listAuditForSandbox, arg.SandboxID, arg.Column2, arg.Limit)
+	rows, err := q.db.Query(ctx, listAuditForSandbox,
+		arg.SandboxID,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Limit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -265,28 +276,63 @@ func (q *Queries) ListAuditForSandbox(ctx context.Context, arg ListAuditForSandb
 }
 
 const listAuditForSecret = `-- name: ListAuditForSecret :many
-SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
-WHERE secret_id = $1
-  AND ($2::bigint = 0 OR id < $2)
-ORDER BY id DESC
-LIMIT $3
+SELECT pa.id, pa.ts, pa.team_id, pa.sandbox_id, pa.secret_id, pa.method, pa.host, pa.path, pa.status, pa.upstream_status, pa.latency_ms, pa.error_code, sb.name AS sandbox_name
+FROM proxy_audit pa
+LEFT JOIN sandbox sb ON sb.id = pa.sandbox_id
+WHERE pa.secret_id = $1
+  AND pa.team_id = $2
+  AND ($3::bigint = 0 OR pa.id < $3)
+  AND pa.status >= $4::int
+  AND pa.status <= $5::int
+ORDER BY pa.id DESC
+LIMIT $6
 `
 
 type ListAuditForSecretParams struct {
 	SecretID pgtype.UUID `json:"secret_id"`
-	Column2  int64       `json:"column_2"`
+	TeamID   uuid.UUID   `json:"team_id"`
+	Column3  int64       `json:"column_3"`
+	Column4  int32       `json:"column_4"`
+	Column5  int32       `json:"column_5"`
 	Limit    int32       `json:"limit"`
 }
 
-func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecretParams) ([]ProxyAudit, error) {
-	rows, err := q.db.Query(ctx, listAuditForSecret, arg.SecretID, arg.Column2, arg.Limit)
+type ListAuditForSecretRow struct {
+	ID             int64       `json:"id"`
+	Ts             time.Time   `json:"ts"`
+	TeamID         uuid.UUID   `json:"team_id"`
+	SandboxID      uuid.UUID   `json:"sandbox_id"`
+	SecretID       pgtype.UUID `json:"secret_id"`
+	Method         string      `json:"method"`
+	Host           string      `json:"host"`
+	Path           string      `json:"path"`
+	Status         int32       `json:"status"`
+	UpstreamStatus *int32      `json:"upstream_status"`
+	LatencyMs      *int32      `json:"latency_ms"`
+	ErrorCode      *string     `json:"error_code"`
+	SandboxName    *string     `json:"sandbox_name"`
+}
+
+// Per-secret audit with LEFT JOIN sandbox so the UI can render readable
+// sandbox names; null when the sandbox was deleted.
+// $3=0 returns the most recent rows; otherwise rows older than that id.
+// $4/$5 status bounds: 0/9999 = unfiltered.
+func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecretParams) ([]ListAuditForSecretRow, error) {
+	rows, err := q.db.Query(ctx, listAuditForSecret,
+		arg.SecretID,
+		arg.TeamID,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+		arg.Limit,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ProxyAudit{}
+	items := []ListAuditForSecretRow{}
 	for rows.Next() {
-		var i ProxyAudit
+		var i ListAuditForSecretRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Ts,
@@ -300,7 +346,44 @@ func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecret
 			&i.UpstreamStatus,
 			&i.LatencyMs,
 			&i.ErrorCode,
+			&i.SandboxName,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSandboxSecretBindings = `-- name: ListSandboxSecretBindings :many
+SELECT ss.env_key, s.name AS secret_name, (s.deleted_at IS NOT NULL)::bool AS secret_revoked
+FROM sandbox_secret ss
+JOIN secret s ON s.id = ss.secret_id
+WHERE ss.sandbox_id = $1
+ORDER BY ss.env_key
+`
+
+type ListSandboxSecretBindingsRow struct {
+	EnvKey        string `json:"env_key"`
+	SecretName    string `json:"secret_name"`
+	SecretRevoked bool   `json:"secret_revoked"`
+}
+
+// env_key → secret_name map for the sandbox detail response. Includes
+// bindings to soft-deleted secrets so the UI can show "(revoked)".
+func (q *Queries) ListSandboxSecretBindings(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretBindingsRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxSecretBindings, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxSecretBindingsRow{}
+	for rows.Next() {
+		var i ListSandboxSecretBindingsRow
+		if err := rows.Scan(&i.EnvKey, &i.SecretName, &i.SecretRevoked); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -361,6 +444,55 @@ func (q *Queries) ListSandboxSecrets(ctx context.Context, sandboxID uuid.UUID) (
 			&i.UpdatedAt,
 			&i.LastUsedAt,
 			&i.DeletedAt,
+			&i.EnvKey,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSandboxesBoundToSecret = `-- name: ListSandboxesBoundToSecret :many
+SELECT sb.id, sb.name, sb.status, ss.env_key
+FROM sandbox_secret ss
+JOIN sandbox sb ON sb.id = ss.sandbox_id
+WHERE ss.secret_id = $1
+  AND sb.team_id = $2
+  AND sb.destroyed_at IS NULL
+ORDER BY sb.created_at DESC
+`
+
+type ListSandboxesBoundToSecretParams struct {
+	SecretID uuid.UUID `json:"secret_id"`
+	TeamID   uuid.UUID `json:"team_id"`
+}
+
+type ListSandboxesBoundToSecretRow struct {
+	ID     uuid.UUID     `json:"id"`
+	Name   string        `json:"name"`
+	Status SandboxStatus `json:"status"`
+	EnvKey string        `json:"env_key"`
+}
+
+// For the secret-detail "bound to" panel: which living sandboxes use this
+// credential, under which env_var, and at what status.
+func (q *Queries) ListSandboxesBoundToSecret(ctx context.Context, arg ListSandboxesBoundToSecretParams) ([]ListSandboxesBoundToSecretRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxesBoundToSecret, arg.SecretID, arg.TeamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxesBoundToSecretRow{}
+	for rows.Next() {
+		var i ListSandboxesBoundToSecretRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Status,
 			&i.EnvKey,
 		); err != nil {
 			return nil, err

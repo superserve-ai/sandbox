@@ -605,25 +605,14 @@ paths:
         the secret that was used. Most recent first.
 
         Paginate with `before=<id>` using the smallest `id` from the previous
-        page; `limit` defaults to 50 and is capped at 200.
+        page; `limit` defaults to 50 and is capped at 200. Optional `status`
+        filter narrows by HTTP status class.
       security:
         - apiKey: []
       parameters:
-        - name: limit
-          in: query
-          required: false
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 200
-            default: 50
-        - name: before
-          in: query
-          required: false
-          schema:
-            type: integer
-            format: int64
-          description: Return events with `id` strictly less than this cursor.
+        - $ref: "#/components/parameters/AuditLimit"
+        - $ref: "#/components/parameters/AuditBefore"
+        - $ref: "#/components/parameters/AuditStatusFilter"
       responses:
         "200":
           description: Audit events (most recent first)
@@ -641,6 +630,92 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /secrets/{name}/audit:
+    parameters:
+      - $ref: "#/components/parameters/SecretName"
+    get:
+      operationId: listSecretAudit
+      tags: [Secrets]
+      summary: List proxy egress events that used this credential
+      description: |
+        Returns proxy_audit events for every outbound request that the
+        in-host enforcement daemon swapped with this credential, across
+        every sandbox it was bound to. Each row includes the originating
+        sandbox name (null when that sandbox has since been deleted).
+      security:
+        - apiKey: []
+      parameters:
+        - $ref: "#/components/parameters/AuditLimit"
+        - $ref: "#/components/parameters/AuditBefore"
+        - $ref: "#/components/parameters/AuditStatusFilter"
+      responses:
+        "200":
+          description: Audit events (most recent first)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProxyAuditEvent"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /secrets/{name}/sandboxes:
+    parameters:
+      - $ref: "#/components/parameters/SecretName"
+    get:
+      operationId: listSecretSandboxes
+      tags: [Secrets]
+      summary: List sandboxes currently bound to this credential
+      description: >
+        Returns the active (non-destroyed) sandboxes that have this credential
+        bound, with the env-var name each binding uses. Useful before rotation
+        or deletion ("which sandboxes will be affected?").
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Bound sandboxes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxSecretBinding"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /providers:
+    get:
+      operationId: listProviders
+      tags: [Secrets]
+      summary: List the built-in provider shortcut catalog
+      description: >
+        Returns the providers customers can pass as `provider` on
+        `POST /secrets`. Backend-of-record so the console picker stays
+        in sync as the catalog grows.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Provider catalog
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProviderShortcut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /files:
     servers:
@@ -1044,6 +1119,42 @@ components:
         format: uuid
       description: The unique identifier of the template build.
 
+    SecretName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Secret name as set at creation.
+
+    AuditLimit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+
+    AuditBefore:
+      name: before
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+      description: Return events with `id` strictly less than this cursor.
+
+    AuditStatusFilter:
+      name: status
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [2xx, 3xx, 4xx, 5xx, errors]
+      description: Narrow by HTTP status class; `errors` includes 4xx and 5xx.
+
   schemas:
     CreateSandboxRequest:
       type: object
@@ -1183,7 +1294,7 @@ components:
             owner: agent-7
 
     SandboxResponse:
-      description: Single-sandbox shape — `SandboxListItem` plus `access_token`.
+      description: Single-sandbox shape — `SandboxListItem` plus `access_token` and bound secrets.
       allOf:
         - $ref: "#/components/schemas/SandboxListItem"
         - type: object
@@ -1194,6 +1305,24 @@ components:
                 Per-sandbox access token for data-plane operations (file
                 upload/download, terminal). Pass as the `X-Access-Token`
                 header.
+            secrets:
+              type: array
+              description: >
+                Credentials bound to this sandbox. Each entry maps an env-var
+                name visible to the agent to the secret name it resolves to.
+                `revoked=true` when the underlying secret has been soft-deleted
+                (the env var still holds the now-useless proxy token).
+              items:
+                type: object
+                required: [env_key, secret_name]
+                properties:
+                  env_key:
+                    type: string
+                  secret_name:
+                    type: string
+                  revoked:
+                    type: boolean
+                    default: false
 
     ResumeResponse:
       type: object
@@ -1781,6 +1910,13 @@ components:
         sandbox_id:
           type: string
           format: uuid
+        sandbox_name:
+          type: string
+          nullable: true
+          description: >
+            Originating sandbox's name at query time. Only populated by
+            cross-sandbox views such as `GET /secrets/{name}/audit`. Null
+            when the sandbox has since been deleted.
         secret_id:
           type: string
           format: uuid
@@ -1809,6 +1945,51 @@ components:
           type: string
           nullable: true
           description: Stable error tag when the proxy denied or failed the request.
+
+    SandboxSecretBinding:
+      type: object
+      required: [sandbox_id, sandbox_name, env_key, status]
+      properties:
+        sandbox_id:
+          type: string
+          format: uuid
+        sandbox_name:
+          type: string
+        env_key:
+          type: string
+          description: Env-var name the secret resolves to inside the sandbox.
+        status:
+          type: string
+          enum: [active, paused, resuming, failed]
+
+    ProviderShortcut:
+      type: object
+      required: [name, display, auth_type, hosts, token_shape]
+      description: >
+        One entry of the built-in provider catalog. The console renders pickers
+        from this list so a new shortcut added on the backend appears without
+        a frontend redeploy.
+      properties:
+        name:
+          type: string
+          description: Stable identifier used as `provider` on `POST /secrets`.
+        display:
+          type: string
+          description: Human-readable label.
+        auth_type:
+          type: string
+          enum: [bearer, basic, api-key, custom, per_host]
+        auth_config:
+          type: object
+          additionalProperties: true
+          description: Resolved auth shape; same JSON shape as `SecretResponse.auth_config`.
+        hosts:
+          type: array
+          items:
+            type: string
+        token_shape:
+          type: string
+          description: Prefix-shaped sample of the proxy token issued for this provider (e.g. `sk-ant-api03-...`).
 
     Error:
       type: object
