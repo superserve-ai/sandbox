@@ -184,3 +184,12 @@ func TestControlSocketIsModeRestricted(t *testing.T) {
 		t.Errorf("socket mode = %o, want 0600", mode)
 	}
 }
+
+func TestControlShutdownBeforeServeIsSafe(t *testing.T) {
+	// httpServer is constructed in NewControlServer, so Shutdown can be
+	// called before Serve without racing on a nil pointer.
+	c := NewControlServer("/dev/null/not-a-socket", nil, nil)
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Errorf("Shutdown before Serve should be a no-op, got %v", err)
+	}
+}

@@ -249,3 +249,35 @@ func TestLeafCacheZeroCapacityDefaults(t *testing.T) {
 		t.Errorf("zero-capacity cache should have fallen back to a default")
 	}
 }
+
+func TestMintLeafRejectsAttackerControlledSNI(t *testing.T) {
+	// Overlong or control-character SNIs must be rejected before they touch
+	// the LRU cache, so an attacker can't grind it with many unique inputs.
+	dir := t.TempDir()
+	ca, err := NewCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		sni  string
+	}{
+		{"empty", ""},
+		{"too long", strings.Repeat("a.", 200)},                         // 400 bytes
+		{"control character", "evil.example.com\x00.actual.example.com"}, // null injection
+		{"newline", "host\nhost2"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := ca.MintLeaf(c.sni); err == nil {
+				t.Errorf("MintLeaf(%q) should have rejected, got nil error", c.sni)
+			}
+		})
+	}
+
+	// Sanity: a normal hostname still works.
+	if _, err := ca.MintLeaf("api.example.com"); err != nil {
+		t.Errorf("MintLeaf for normal host failed: %v", err)
+	}
+}

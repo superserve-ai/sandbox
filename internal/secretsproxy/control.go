@@ -26,11 +26,16 @@ type ControlServer struct {
 // NewControlServer builds the server. Nil cachedVault or revoker turn the
 // corresponding endpoints into no-ops.
 func NewControlServer(socketPath string, cv *cachedVault, r *Revoker) *ControlServer {
-	return &ControlServer{
+	c := &ControlServer{
 		cachedVault: cv,
 		revoker:     r,
 		socketPath:  socketPath,
 	}
+	c.httpServer = &http.Server{
+		Handler:           c.handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return c
 }
 
 // IsListening reports whether the control socket is bound.
@@ -57,10 +62,6 @@ func (c *ControlServer) ListenAndServe() error {
 
 // Serve accepts on the provided listener.
 func (c *ControlServer) Serve(l net.Listener) error {
-	c.httpServer = &http.Server{
-		Handler:           c.handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
 	c.isListening.Store(true)
 	defer c.isListening.Store(false)
 	return c.httpServer.Serve(l)
@@ -68,9 +69,6 @@ func (c *ControlServer) Serve(l net.Listener) error {
 
 // Shutdown stops the server; safe to call multiple times.
 func (c *ControlServer) Shutdown(ctx context.Context) error {
-	if c.httpServer == nil {
-		return nil
-	}
 	return c.httpServer.Shutdown(ctx)
 }
 

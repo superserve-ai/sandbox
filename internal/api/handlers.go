@@ -756,8 +756,12 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	// Record the revocation so daemons can refuse the JWT, and fan out the
-	// notification to the host. Bootstrap-on-restart recovers if fanout fails.
-	if err := h.DB.InsertSandboxRevocation(c.Request.Context(), db.InsertSandboxRevocationParams{
+	// notification to the host. Detach from the request context so a client
+	// disconnect mid-DELETE doesn't strand a destroyed sandbox without its
+	// revocation row. Bootstrap-on-restart still recovers if fanout fails.
+	revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer revokeCancel()
+	if err := h.DB.InsertSandboxRevocation(revokeCtx, db.InsertSandboxRevocationParams{
 		SandboxID: sandboxID,
 		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
 	}); err != nil {

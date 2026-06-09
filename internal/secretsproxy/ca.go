@@ -140,6 +140,9 @@ func (ca *CA) RootPEM() []byte { return ca.rootPEM }
 
 // MintLeaf returns a TLS leaf cert for sni, generating + caching on miss. Concurrency-safe.
 func (ca *CA) MintLeaf(sni string) (*tls.Certificate, error) {
+	if err := validateSNI(sni); err != nil {
+		return nil, err
+	}
 	if c, ok := ca.cache.get(sni); ok {
 		return c, nil
 	}
@@ -176,6 +179,27 @@ func (ca *CA) MintLeaf(sni string) (*tls.Certificate, error) {
 	}
 	ca.cache.set(sni, cert)
 	return cert, nil
+}
+
+// validateSNI bounds the LRU-cache attack surface: cap at the DNS-name max
+// (253 bytes), reject control chars, allow IP literals through.
+func validateSNI(sni string) error {
+	if sni == "" {
+		return fmt.Errorf("sni: empty")
+	}
+	if len(sni) > 253 {
+		return fmt.Errorf("sni: %d bytes exceeds DNS-name max of 253", len(sni))
+	}
+	if net.ParseIP(sni) != nil {
+		return nil
+	}
+	for i := 0; i < len(sni); i++ {
+		c := sni[i]
+		if c < 0x20 || c == 0x7f {
+			return fmt.Errorf("sni: control character at byte %d", i)
+		}
+	}
+	return nil
 }
 
 func randomSerial() (*big.Int, error) {
