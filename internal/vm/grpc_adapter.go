@@ -51,7 +51,7 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 		return nil, err
 	}
 	return &vmdpb.PauseVMResponse{
-		VmId:        req.GetVmId(),
+		VmId:         req.GetVmId(),
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 	}, nil
@@ -329,6 +329,7 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 				AllowedCIDRs:   egress.GetAllowedCidrs(),
 				DeniedCIDRs:    egress.GetDeniedCidrs(),
 				AllowedDomains: egress.GetAllowedDomains(),
+				SandboxID:      vmID,
 			})
 		}
 	}

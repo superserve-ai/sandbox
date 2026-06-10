@@ -228,6 +228,22 @@ type Host struct {
 	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
+type NetFlow struct {
+	ID         int64      `json:"id"`
+	Ts         time.Time  `json:"ts"`
+	TeamID     uuid.UUID  `json:"team_id"`
+	SandboxID  uuid.UUID  `json:"sandbox_id"`
+	Protocol   string     `json:"protocol"`
+	Host       *string    `json:"host"`
+	DstIp      netip.Addr `json:"dst_ip"`
+	DstPort    int32      `json:"dst_port"`
+	Verdict    string     `json:"verdict"`
+	MatchRule  *string    `json:"match_rule"`
+	BytesSent  *int64     `json:"bytes_sent"`
+	BytesRecv  *int64     `json:"bytes_recv"`
+	DurationMs *int32     `json:"duration_ms"`
+}
+
 type Profile struct {
 	ID                uuid.UUID `json:"id"`
 	Email             string    `json:"email"`

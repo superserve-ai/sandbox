@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -40,6 +41,12 @@ type EgressProxy struct {
 	// maxConnsPerSandbox is the per-sandbox connection limit. -1 = unlimited.
 	maxConnsPerSandbox int
 
+	// flowSink records one event per connection. Never nil — defaults to a nop
+	// sink so the data path is unaffected when logging is not configured.
+	// Guarded by sinkMu so it can be installed after Start.
+	sinkMu   sync.RWMutex
+	flowSink FlowSink
+
 	// sandboxRules maps sandbox host IPs to their egress config.
 	mu    sync.RWMutex
 	rules map[string]*EgressRules // key = sandbox host IP
@@ -50,6 +57,8 @@ type EgressRules struct {
 	AllowedCIDRs   []string
 	DeniedCIDRs    []string
 	AllowedDomains []string
+	// SandboxID attributes flow-log rows. Empty disables logging for the sandbox.
+	SandboxID string
 }
 
 func NewEgressProxy(httpPort, tlsPort, otherPort uint16, maxConns int, log zerolog.Logger) *EgressProxy {
@@ -60,7 +69,39 @@ func NewEgressProxy(httpPort, tlsPort, otherPort uint16, maxConns int, log zerol
 		log:                log.With().Str("component", "egress-proxy").Logger(),
 		limiter:            NewConnectionLimiter(),
 		maxConnsPerSandbox: maxConns,
+		flowSink:           NewNopFlowSink(),
 		rules:              make(map[string]*EgressRules),
+	}
+}
+
+// SetFlowSink installs the connection-flow logging sink. Safe to call after Start.
+func (p *EgressProxy) SetFlowSink(sink FlowSink) {
+	if sink == nil {
+		return
+	}
+	p.sinkMu.Lock()
+	p.flowSink = sink
+	p.sinkMu.Unlock()
+}
+
+func (p *EgressProxy) getFlowSink() FlowSink {
+	p.sinkMu.RLock()
+	defer p.sinkMu.RUnlock()
+	return p.flowSink
+}
+
+// RegisterSandbox associates a sandbox ID with a host IP for flow attribution,
+// preserving any allow/deny rules already set for that IP. Idempotent.
+func (p *EgressProxy) RegisterSandbox(hostIP, sandboxID string) {
+	if hostIP == "" || sandboxID == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if r, ok := p.rules[hostIP]; ok {
+		r.SandboxID = sandboxID
+	} else {
+		p.rules[hostIP] = &EgressRules{SandboxID: sandboxID}
 	}
 }
 
@@ -144,24 +185,24 @@ func (p *EgressProxy) listen(ctx context.Context, port uint16, handler func(cont
 
 // handleHTTP handles port 80 traffic — reads the HTTP Host header for domain filtering.
 func (p *EgressProxy) handleHTTP(ctx context.Context, conn net.Conn) {
-	p.handleConn(ctx, conn, func(peeked []byte) string {
+	p.handleConn(ctx, conn, "http", func(peeked []byte) string {
 		return extractHTTPHost(peeked)
 	})
 }
 
 // handleTLS handles port 443 traffic — reads the TLS ClientHello SNI for domain filtering.
 func (p *EgressProxy) handleTLS(ctx context.Context, conn net.Conn) {
-	p.handleConn(ctx, conn, func(peeked []byte) string {
+	p.handleConn(ctx, conn, "tls", func(peeked []byte) string {
 		return extractSNI(peeked)
 	})
 }
 
 // handleOther handles all other TCP traffic — CIDR-only, no protocol inspection.
 func (p *EgressProxy) handleOther(ctx context.Context, conn net.Conn) {
-	p.handleConn(ctx, conn, nil)
+	p.handleConn(ctx, conn, "other", nil)
 }
 
-func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHostname func([]byte) string) {
+func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol string, extractHostname func([]byte) string) {
 	defer conn.Close()
 
 	// Get original destination before REDIRECT.
@@ -221,6 +262,20 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 	// Check egress rules.
 	rules := p.getRules(srcHost)
 	allowed, matchType := p.isAllowed(rules, hostname, dstIP)
+
+	var sandboxID string
+	if rules != nil {
+		sandboxID = rules.SandboxID
+	}
+	flow := FlowEvent{
+		SandboxID: sandboxID,
+		Protocol:  protocol,
+		Host:      hostname,
+		DstIP:     dstIP.String(),
+		DstPort:   int32(dstPort),
+		MatchRule: matchType,
+	}
+
 	if !allowed {
 		p.log.Info().
 			Str("src", srcHost).
@@ -228,6 +283,10 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 			Str("hostname", hostname).
 			Str("match", matchType).
 			Msg("egress blocked")
+		if sandboxID != "" {
+			flow.Verdict = "blocked"
+			p.getFlowSink().Emit(flow)
+		}
 		return
 	}
 
@@ -240,7 +299,10 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 		upstreamAddr = net.JoinHostPort(dstIP.String(), fmt.Sprintf("%d", dstPort))
 	}
 
-	// Dial upstream with DNS rebinding protection.
+	// Dial upstream with DNS rebinding protection. ipDenied distinguishes an
+	// internal-IP rejection from a plain dial failure for logging. Atomic
+	// because Control may run on parallel dial goroutines for dual-stack hosts.
+	var ipDenied atomic.Bool
 	dialer := &net.Dialer{
 		Timeout: upstreamDialTimeout,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -250,6 +312,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 			}
 			resolved := net.ParseIP(host)
 			if resolved != nil && IsIPDenied(resolved) {
+				ipDenied.Store(true)
 				return fmt.Errorf("blocked: hostname resolved to internal IP %s", resolved)
 			}
 			return nil
@@ -259,19 +322,42 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 	upstream, err := dialer.DialContext(ctx, "tcp", upstreamAddr)
 	if err != nil {
 		p.log.Debug().Err(err).Str("upstream", upstreamAddr).Msg("dial failed")
+		if sandboxID != "" {
+			// Internal-IP rejection is a policy block; anything else failed to connect.
+			if ipDenied.Load() {
+				flow.Verdict = "blocked"
+				flow.MatchRule = "internal-ip"
+			} else {
+				flow.Verdict = "failed"
+			}
+			p.getFlowSink().Emit(flow)
+		}
 		return
 	}
 	defer upstream.Close()
 
 	// If we peeked data, write it to upstream first.
+	sent := int64(len(peekedData))
 	if len(peekedData) > 0 {
 		if _, err := upstream.Write(peekedData); err != nil {
+			if sandboxID != "" {
+				flow.Verdict = "failed"
+				p.getFlowSink().Emit(flow)
+			}
 			return
 		}
 	}
 
 	// Bidirectional proxy.
-	relay(conn, upstream)
+	start := time.Now()
+	up, down := relay(conn, upstream)
+	if sandboxID != "" {
+		flow.Verdict = "allowed"
+		flow.BytesSent = sent + up
+		flow.BytesRecv = down
+		flow.DurationMs = int32(time.Since(start).Milliseconds())
+		p.getFlowSink().Emit(flow)
+	}
 }
 
 // isAllowed uses an "allow wins" model: a match in allow_out short-circuits
@@ -342,21 +428,23 @@ func matchDomain(hostname, pattern string) bool {
 	return false
 }
 
-// relay copies data bidirectionally between two connections.
-func relay(a, b net.Conn) {
+// relay proxies bytes in both directions and returns the totals: aToB is bytes
+// sent from the sandbox (a) to the upstream (b), bToA the reverse.
+func relay(a, b net.Conn) (aToB, bToA int64) {
 	done := make(chan struct{})
 	go func() {
-		io.Copy(b, a)
+		aToB, _ = io.Copy(b, a)
 		if tc, ok := b.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 		close(done)
 	}()
-	io.Copy(a, b)
+	bToA, _ = io.Copy(a, b)
 	if tc, ok := a.(*net.TCPConn); ok {
 		tc.CloseWrite()
 	}
 	<-done
+	return aToB, bToA
 }
 
 // ---------------------------------------------------------------------------
@@ -414,12 +502,12 @@ func (r *sniReader) Read(b []byte) (int, error) {
 }
 
 func (r *sniReader) Write(b []byte) (int, error)        { return len(b), nil }
-func (r *sniReader) Close() error                        { return nil }
-func (r *sniReader) LocalAddr() net.Addr                 { return &net.TCPAddr{} }
-func (r *sniReader) RemoteAddr() net.Addr                { return &net.TCPAddr{} }
-func (r *sniReader) SetDeadline(t time.Time) error       { return nil }
-func (r *sniReader) SetReadDeadline(t time.Time) error   { return nil }
-func (r *sniReader) SetWriteDeadline(t time.Time) error  { return nil }
+func (r *sniReader) Close() error                       { return nil }
+func (r *sniReader) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (r *sniReader) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
+func (r *sniReader) SetDeadline(t time.Time) error      { return nil }
+func (r *sniReader) SetReadDeadline(t time.Time) error  { return nil }
+func (r *sniReader) SetWriteDeadline(t time.Time) error { return nil }
 
 // ---------------------------------------------------------------------------
 // SO_ORIGINAL_DST — retrieve original destination before REDIRECT

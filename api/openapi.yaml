@@ -591,37 +591,42 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /sandboxes/{sandbox_id}/audit:
+  /sandboxes/{sandbox_id}/network:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
     get:
-      operationId: listSandboxAudit
-      tags: [Secrets]
-      summary: List proxy egress events for a sandbox
+      operationId: listSandboxNetwork
+      tags: [Sandboxes]
+      summary: List a sandbox's egress activity
       description: |
-        Returns proxy_audit events recorded by the in-host enforcement daemon
-        for this sandbox — each outbound HTTPS request that traversed the
-        proxy, plus the upstream host, status, latency, and (when relevant)
-        the secret that was used. Most recent first.
+        The unified per-sandbox network log: every outbound connection the
+        sandbox made, merged into one time-ordered stream, most recent first.
+        Each row has a `kind` — `connection` (host, bytes, allow/deny verdict)
+        or `request` (HTTP method, path, status, and the secret used, when a
+        credential was injected). Fields not relevant to a row's kind are
+        omitted.
 
-        Paginate with `before=<id>` using the smallest `id` from the previous
-        page; `limit` defaults to 50 and is capped at 200. Optional `status`
-        filter narrows by HTTP status class.
+        Paginate with `before=<ts>` using the `ts` of the last row from the
+        previous page; `limit` defaults to 50 and is capped at 200.
       security:
         - apiKey: []
       parameters:
         - $ref: "#/components/parameters/AuditLimit"
-        - $ref: "#/components/parameters/AuditBefore"
-        - $ref: "#/components/parameters/AuditStatusFilter"
+        - name: before
+          in: query
+          description: Return rows older than this RFC3339 timestamp.
+          schema:
+            type: string
+            format: date-time
       responses:
         "200":
-          description: Audit events (most recent first)
+          description: Network events (most recent first)
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/ProxyAuditEvent"
+                  $ref: "#/components/schemas/NetworkEvent"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1945,6 +1950,67 @@ components:
           type: string
           nullable: true
           description: Stable error tag when the proxy denied or failed the request.
+
+    NetworkEvent:
+      type: object
+      required: [kind, id, ts]
+      description: |
+        One row in the unified network log. `kind` selects which fields are
+        present: connection rows carry dst_ip/verdict/bytes, request rows carry
+        method/path/status/secret_id. Unused fields are omitted.
+      properties:
+        kind:
+          type: string
+          enum: [connection, request]
+        id:
+          type: integer
+          format: int64
+        ts:
+          type: string
+          format: date-time
+        host:
+          type: string
+          description: Destination host (SNI / HTTP Host).
+        dst_ip:
+          type: string
+          description: Connection rows only.
+        dst_port:
+          type: integer
+          format: int32
+        verdict:
+          type: string
+          enum: [allowed, blocked, failed]
+          description: Connection rows only.
+        match_rule:
+          type: string
+          description: Connection rows — which rule decided (domain, cidr, internal-ip, …).
+        bytes_sent:
+          type: integer
+          format: int64
+        bytes_recv:
+          type: integer
+          format: int64
+        method:
+          type: string
+          description: Request rows only.
+        path:
+          type: string
+        status:
+          type: integer
+          format: int32
+          description: Request rows — HTTP status returned to the sandbox.
+        upstream_status:
+          type: integer
+          format: int32
+        latency_ms:
+          type: integer
+          format: int32
+        secret_id:
+          type: string
+          format: uuid
+          description: Request rows — the secret injected, if any.
+        error_code:
+          type: string
 
     SandboxSecretBinding:
       type: object

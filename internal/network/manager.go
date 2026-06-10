@@ -54,11 +54,11 @@ type Config struct {
 
 // VMNetInfo holds the network resources for a single VM.
 type VMNetInfo struct {
-	Namespace  string    // Network namespace name.
-	TAPDevice  string    // TAP device inside namespace (always "tap0").
-	VMIP       string    // VM's internal IP (always VMInternalIP).
-	GatewayIP  string    // Gateway inside namespace (always VMGatewayIP).
-	HostIP     string    // Host-side IP to reach this VM.
+	Namespace  string // Network namespace name.
+	TAPDevice  string // TAP device inside namespace (always "tap0").
+	VMIP       string // VM's internal IP (always VMInternalIP).
+	GatewayIP  string // Gateway inside namespace (always VMGatewayIP).
+	HostIP     string // Host-side IP to reach this VM.
 	MACAddress string
 	Firewall   *Firewall // nftables firewall for this VM (inside namespace).
 }
@@ -98,6 +98,14 @@ type Manager struct {
 	// Sandbox-facing address for the secretsproxy daemon. Zero port disables the REDIRECT.
 	secretsProxyDst  string
 	secretsProxyPort uint16
+}
+
+// registerEgress attributes a VM's flows so logging covers every sandbox,
+// not only those with explicit egress rules.
+func (m *Manager) registerEgress(vmID string, info *VMNetInfo) {
+	if m.egressProxy != nil && info != nil {
+		m.egressProxy.RegisterSandbox(info.HostIP, vmID)
+	}
 }
 
 // SetEgressProxy attaches the TCP egress proxy so the manager can remove
@@ -191,6 +199,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	// Try the pre-allocated pool first; fall back to on-demand setup.
 	if m.pool != nil {
 		if info := m.pool.Claim(vmID); info != nil {
+			m.registerEgress(vmID, info)
 			return info, nil
 		}
 		m.log.Info().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
@@ -210,6 +219,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	m.mu.Lock()
 	m.devices[vmID] = info
 	m.mu.Unlock()
+	m.registerEgress(vmID, info)
 
 	m.log.Info().
 		Str("vm_id", vmID).
@@ -313,11 +323,11 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	if err := nsExecGo(nsName, func() error {
 		var fwErr error
 		fw, fwErr = NewFirewall(FirewallConfig{
-			TAPInterface:   TAPName,
-			VethPeer:       vpeerName,
-			VMIP:           VMInternalIP,
-			HostIP:         hostIP,
-			GatewayIP:      VMGatewayIP,
+			TAPInterface: TAPName,
+			VethPeer:     vpeerName,
+			VMIP:         VMInternalIP,
+			HostIP:       hostIP,
+			GatewayIP:    VMGatewayIP,
 		})
 		return fwErr
 	}); err != nil {
@@ -450,7 +460,7 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	if idx >= m.nextSlot {
 		m.nextSlot = idx + 1
 	}
-	m.devices[vmID] = &VMNetInfo{
+	info := &VMNetInfo{
 		Namespace:  namespace,
 		TAPDevice:  TAPName,
 		VMIP:       VMInternalIP,
@@ -459,7 +469,9 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		MACAddress: macAddress,
 		Firewall:   fw, // nil if AttachFirewall failed; CleanupVM tolerates it
 	}
+	m.devices[vmID] = info
 	m.mu.Unlock()
+	m.registerEgress(vmID, info)
 
 	m.log.Info().Str("vm_id", vmID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
 	return nil
@@ -524,6 +536,7 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 	}
 	m.devices[vmID] = info
 	m.mu.Unlock()
+	m.registerEgress(vmID, info)
 
 	return info, nil
 }

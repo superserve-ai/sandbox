@@ -216,65 +216,6 @@ func (q *Queries) InsertProxyAudit(ctx context.Context, arg InsertProxyAuditPara
 	return err
 }
 
-const listAuditForSandbox = `-- name: ListAuditForSandbox :many
-SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
-WHERE sandbox_id = $1
-  AND ($2::bigint = 0 OR id < $2)
-  AND status >= $3::int
-  AND status <= $4::int
-ORDER BY id DESC
-LIMIT $5
-`
-
-type ListAuditForSandboxParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Column2   int64     `json:"column_2"`
-	Column3   int32     `json:"column_3"`
-	Column4   int32     `json:"column_4"`
-	Limit     int32     `json:"limit"`
-}
-
-// $2=0 returns the most recent rows; otherwise rows older than that id.
-// $3/$4 status bounds: 0/9999 = unfiltered.
-func (q *Queries) ListAuditForSandbox(ctx context.Context, arg ListAuditForSandboxParams) ([]ProxyAudit, error) {
-	rows, err := q.db.Query(ctx, listAuditForSandbox,
-		arg.SandboxID,
-		arg.Column2,
-		arg.Column3,
-		arg.Column4,
-		arg.Limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ProxyAudit{}
-	for rows.Next() {
-		var i ProxyAudit
-		if err := rows.Scan(
-			&i.ID,
-			&i.Ts,
-			&i.TeamID,
-			&i.SandboxID,
-			&i.SecretID,
-			&i.Method,
-			&i.Host,
-			&i.Path,
-			&i.Status,
-			&i.UpstreamStatus,
-			&i.LatencyMs,
-			&i.ErrorCode,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listAuditForSecret = `-- name: ListAuditForSecret :many
 SELECT pa.id, pa.ts, pa.team_id, pa.sandbox_id, pa.secret_id, pa.method, pa.host, pa.path, pa.status, pa.upstream_status, pa.latency_ms, pa.error_code, sb.name AS sandbox_name
 FROM proxy_audit pa
@@ -347,6 +288,55 @@ func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecret
 			&i.LatencyMs,
 			&i.ErrorCode,
 			&i.SandboxName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProxyAuditEvents = `-- name: ListProxyAuditEvents :many
+SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
+WHERE sandbox_id = $1
+  AND ($2::timestamptz IS NULL OR ts < $2::timestamptz)
+ORDER BY ts DESC
+LIMIT $3
+`
+
+type ListProxyAuditEventsParams struct {
+	SandboxID uuid.UUID          `json:"sandbox_id"`
+	Before    pgtype.Timestamptz `json:"before"`
+	RowLimit  int32              `json:"row_limit"`
+}
+
+// Request rows for the unified per-sandbox network log. Paginated by timestamp
+// ($2) to merge cleanly with net_flow connection rows in the handler.
+func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEventsParams) ([]ProxyAudit, error) {
+	rows, err := q.db.Query(ctx, listProxyAuditEvents, arg.SandboxID, arg.Before, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ProxyAudit{}
+	for rows.Next() {
+		var i ProxyAudit
+		if err := rows.Scan(
+			&i.ID,
+			&i.Ts,
+			&i.TeamID,
+			&i.SandboxID,
+			&i.SecretID,
+			&i.Method,
+			&i.Host,
+			&i.Path,
+			&i.Status,
+			&i.UpstreamStatus,
+			&i.LatencyMs,
+			&i.ErrorCode,
 		); err != nil {
 			return nil, err
 		}

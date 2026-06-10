@@ -1156,25 +1156,6 @@ type proxyAuditResponse struct {
 	ErrorCode      *string `json:"error_code,omitempty"`
 }
 
-func toAuditResponse(r db.ProxyAudit) proxyAuditResponse {
-	resp := proxyAuditResponse{
-		ID:             r.ID,
-		Ts:             r.Ts.UTC().Format(time.RFC3339Nano),
-		SandboxID:      r.SandboxID.String(),
-		Method:         r.Method,
-		Host:           r.Host,
-		Path:           r.Path,
-		Status:         r.Status,
-		UpstreamStatus: r.UpstreamStatus,
-		LatencyMs:      r.LatencyMs,
-		ErrorCode:      r.ErrorCode,
-	}
-	if r.SecretID.Valid {
-		resp.SecretID = uuid.UUID(r.SecretID.Bytes).String()
-	}
-	return resp
-}
-
 // toAuditResponseFromSecret renders a row from ListAuditForSecret. SandboxName
 // is nil when the sandbox referenced in the audit row has been deleted.
 func toAuditResponseFromSecret(r db.ListAuditForSecretRow) proxyAuditResponse {
@@ -1195,64 +1176,6 @@ func toAuditResponseFromSecret(r db.ListAuditForSecretRow) proxyAuditResponse {
 		resp.SecretID = uuid.UUID(r.SecretID.Bytes).String()
 	}
 	return resp
-}
-
-func (h *Handlers) GetSandboxAudit(c *gin.Context) {
-	teamID, err := teamIDFromContext(c)
-	if err != nil {
-		return
-	}
-	sandboxID, err := parseSandboxID(c)
-	if err != nil {
-		return
-	}
-
-	if _, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID: sandboxID, TeamID: teamID,
-	}); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			respondError(c, ErrSandboxNotFound)
-			return
-		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	limit, err := parseAuditLimit(c.Query("limit"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-	before, err := parseAuditBefore(c.Query("before"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-	minStatus, maxStatus, err := parseStatusFilter(c.Query("status"))
-	if err != nil {
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	rows, err := h.DB.ListAuditForSandbox(c.Request.Context(), db.ListAuditForSandboxParams{
-		SandboxID: sandboxID,
-		Column2:   before,
-		Column3:   minStatus,
-		Column4:   maxStatus,
-		Limit:     limit,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListAuditForSandbox failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	out := make([]proxyAuditResponse, len(rows))
-	for i, r := range rows {
-		out[i] = toAuditResponse(r)
-	}
-	c.JSON(http.StatusOK, out)
 }
 
 // GetSecretAudit returns the per-secret audit log: every egress request that
@@ -1449,4 +1372,3 @@ func (h *Handlers) ListProviders(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, out)
 }
-

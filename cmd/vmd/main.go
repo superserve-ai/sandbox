@@ -74,16 +74,16 @@ func loadConfig() (Config, error) {
 	}
 
 	cfg := Config{
-		FirecrackerBin: envOrDefault("FIRECRACKER_BIN", "/usr/local/bin/firecracker"),
-		JailerBin:      envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
-		KernelPath:     requireEnv("KERNEL_PATH"),
-		BaseRootfsPath: requireEnv("BASE_ROOTFS_PATH"),
-		SnapshotDir:    envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
-		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
-		GRPCPort:       port,
-		HostInterface:      envOrDefault("HOST_INTERFACE", "eth0"),
-		TemplateBuilderBin: envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
-		BoxdBinaryPath:     envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
+		FirecrackerBin:          envOrDefault("FIRECRACKER_BIN", "/usr/local/bin/firecracker"),
+		JailerBin:               envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
+		KernelPath:              requireEnv("KERNEL_PATH"),
+		BaseRootfsPath:          requireEnv("BASE_ROOTFS_PATH"),
+		SnapshotDir:             envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
+		RunDir:                  envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
+		GRPCPort:                port,
+		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
+		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
+		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
 		HostID:                  envOrDefault("HOST_ID", "default"),
 		DatabaseURL:             os.Getenv("DATABASE_URL"),
 		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
@@ -387,6 +387,15 @@ func main() {
 			return nil
 		})
 		log.Info().Msg("reconciler DB connection ready")
+
+		// Per-connection egress logging. Drops on a full buffer rather than
+		// back-pressuring the proxy's data path.
+		flowSink := network.NewSQLFlowSink(reconcilerDB, network.SQLFlowSinkOptions{})
+		egressProxy.SetFlowSink(flowSink)
+		lc.addCloser("net_flow sink", func(closeCtx context.Context) error {
+			return flowSink.Shutdown(closeCtx)
+		})
+		log.Info().Msg("egress flow logging enabled")
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
 	}

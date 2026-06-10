@@ -3,8 +3,8 @@ package api
 import (
 	"context"
 
-	"github.com/gin-gonic/gin"
 	sentrygin "github.com/getsentry/sentry-go/gin"
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -69,7 +69,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 
 		api.GET("/providers", h.ListProviders)
 
-		api.GET("/sandboxes/:sandbox_id/audit", h.GetSandboxAudit)
+		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)
 	}
 
 	r.GET("/health", h.Health)

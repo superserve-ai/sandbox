@@ -98,16 +98,14 @@ INSERT INTO proxy_audit (
     method, host, path, status, upstream_status, latency_ms, error_code
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
 
--- name: ListAuditForSandbox :many
--- $2=0 returns the most recent rows; otherwise rows older than that id.
--- $3/$4 status bounds: 0/9999 = unfiltered.
+-- name: ListProxyAuditEvents :many
+-- Request rows for the unified per-sandbox network log. Paginated by timestamp
+-- ($2) to merge cleanly with net_flow connection rows in the handler.
 SELECT * FROM proxy_audit
-WHERE sandbox_id = $1
-  AND ($2::bigint = 0 OR id < $2)
-  AND status >= $3::int
-  AND status <= $4::int
-ORDER BY id DESC
-LIMIT $5;
+WHERE sandbox_id = sqlc.arg('sandbox_id')
+  AND (sqlc.narg('before')::timestamptz IS NULL OR ts < sqlc.narg('before')::timestamptz)
+ORDER BY ts DESC
+LIMIT sqlc.arg('row_limit');
 
 -- name: ListAuditForSecret :many
 -- Per-secret audit with LEFT JOIN sandbox so the UI can render readable
