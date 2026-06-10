@@ -241,10 +241,12 @@ func (b *Blocklist) refresh(ctx context.Context) {
 	builder.addConfigEntries(b.cfg)
 
 	fetched, cached, failed := 0, 0, 0
+	degraded := false
 	var stateText strings.Builder
 	for _, src := range b.cfg.DomainFeeds {
 		text, err := b.fetchFeed(ctx, src)
 		if err != nil {
+			degraded = true
 			prev, ok := b.feedCache[src]
 			if !ok {
 				failed++
@@ -263,15 +265,16 @@ func (b *Blocklist) refresh(ctx context.Context) {
 		stateText.WriteString("\n")
 	}
 
-	if fetched == 0 && cached == 0 && len(b.cfg.DomainFeeds) > 0 {
-		b.log.Warn().Int("feeds", len(b.cfg.DomainFeeds)).Msg("no blocklist feed data (fresh or cached); keeping previous snapshot")
-		// Still push the current (e.g. state-seeded) CIDRs to the sink: on a
-		// cold start with all feeds down, the host drop set would otherwise
-		// stay empty and leave seeded IPs reachable on non-proxied ports.
-		if b.sink != nil {
-			b.sink(b.CIDRs())
+	// Fail-safe: a failed or missing feed must never shrink coverage. Union
+	// the previous snapshot so entries sourced only from an unavailable feed
+	// survive — including entries seeded from the state file at startup, for
+	// which there is no per-feed cache to fall back on. A later fully
+	// successful refresh rebuilds without this union, so legitimate removals
+	// still take effect once every feed is reachable again.
+	if degraded {
+		if prev := b.cur.Load(); prev != nil {
+			builder.addSnapshot(prev)
 		}
-		return
 	}
 
 	snap := builder.snapshot()
@@ -284,13 +287,16 @@ func (b *Blocklist) refresh(ctx context.Context) {
 		Int("feeds_failed", failed).
 		Msg("blocklist refreshed")
 
+	// Mirror CIDRs to the host firewall on every refresh, degraded ones
+	// included, so the host drop set always matches the active snapshot.
 	if b.sink != nil {
 		b.sink(b.CIDRs())
 	}
 
-	// Persist only freshly fetched data — a refresh served entirely from
-	// cache adds nothing new, and the state file already holds it.
-	if fetched > 0 {
+	// Persist only a fully successful fetch so the on-disk state always
+	// represents a complete snapshot for cold-start seeding — never the
+	// shrunken text of a degraded round.
+	if !degraded && fetched > 0 {
 		if err := writeFileAtomic(b.cfg.StatePath, []byte(stateText.String())); err != nil {
 			b.log.Warn().Err(err).Str("path", b.cfg.StatePath).Msg("failed to persist blocklist state")
 		}
@@ -338,6 +344,17 @@ func newSnapshotBuilder() *snapshotBuilder {
 	return &snapshotBuilder{
 		domains: make(map[string]struct{}),
 		nets:    make(map[netip.Prefix]struct{}),
+	}
+}
+
+// addSnapshot merges an existing snapshot's entries into the builder. Used to
+// retain previous coverage across a degraded refresh.
+func (sb *snapshotBuilder) addSnapshot(s *blocklistSnapshot) {
+	for d := range s.domains {
+		sb.domains[d] = struct{}{}
+	}
+	for _, p := range s.nets {
+		sb.nets[p] = struct{}{}
 	}
 }
 

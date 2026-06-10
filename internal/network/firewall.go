@@ -352,6 +352,14 @@ func (fw *Firewall) installNATRules() {
 	hostIP := mustParseAddr(fw.hostIP)
 
 	// POSTROUTING: SNAT outbound from VM IP → host IP.
+	//
+	// INVARIANT: this SNAT happens inside the namespace, so sandbox egress
+	// already appears sourced from hostIP (within vmIPRange) by the time it
+	// reaches the host FORWARD hook. The host egress-block drop relies on
+	// that to scope itself with `ip saddr vmIPRange` (see
+	// internal/network/egressblock.go). If SNAT ever moves to the host,
+	// packets would still carry the VM IP at FORWARD and that drop would
+	// silently stop matching — update both sites together.
 	fw.conn.AddRule(&nftables.Rule{
 		Table: fw.table,
 		Chain: fw.postChain,

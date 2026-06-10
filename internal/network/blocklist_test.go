@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -193,6 +194,47 @@ func TestCIDRSinkInvokedOnRefresh(t *testing.T) {
 	}
 	if !found["10.20.30.0/24"] || !found["203.0.113.7/32"] {
 		t.Errorf("sink CIDRs = %v, missing expected entries", got)
+	}
+}
+
+func TestRefreshPreservesSeededStateOnPartialFirstFailure(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state")
+	// State from a prior good run holds entries from BOTH feeds (the on-disk
+	// state is a merged blob, not attributable to a specific feed).
+	if err := os.WriteFile(statePath, []byte("from-good.example.com\nfrom-flaky.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	good := filepath.Join(dir, "good.txt")
+	if err := os.WriteFile(good, []byte("from-good.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flaky := filepath.Join(dir, "flaky.txt") // missing → fails, and no cache yet
+	cfg := &BlocklistConfig{
+		DomainFeeds: []string{good, flaky},
+		StatePath:   statePath,
+	}
+	b := NewBlocklist(cfg, zerolog.Nop()) // seeds cur from state; feedCache empty
+
+	b.refresh(t.Context()) // good succeeds, flaky fails on the very first refresh
+
+	// The flaky feed's entry existed only in seeded state (no per-feed cache),
+	// so it must be retained via the previous-snapshot union, not dropped.
+	if got, _ := b.Blocked("from-flaky.example.com", nil); !got {
+		t.Error("state-seeded entry from a feed that failed on first refresh was dropped")
+	}
+	if got, _ := b.Blocked("from-good.example.com", nil); !got {
+		t.Error("entry from the healthy feed missing")
+	}
+
+	// A round that fails must not overwrite the on-disk state with a shrunken
+	// snapshot, so a subsequent cold start still seeds the full set.
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "from-flaky.example.com") {
+		t.Error("degraded refresh overwrote state file, losing the failed feed's entries")
 	}
 }
 

@@ -26,6 +26,22 @@ import (
 
 const hostEgressBlockTable = "sandbox-egress-block"
 
+// RemoveHostEgressBlock deletes the vmd-owned drop table if it exists. Call
+// at startup when the blocklist feature is disabled so a table installed by a
+// previous run stops dropping sandbox egress. Best-effort: a missing table is
+// not an error.
+func RemoveHostEgressBlock() error {
+	conn, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("new nftables conn: %w", err)
+	}
+	conn.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: hostEgressBlockTable})
+	if err := conn.Flush(); err != nil {
+		return nil // table absent (or already gone) — nothing to clean up
+	}
+	return nil
+}
+
 // HostEgressBlock manages the host nftables table that drops traffic to
 // blocklisted IPv4 prefixes. Safe for use from a single refresh goroutine.
 type HostEgressBlock struct {
@@ -83,6 +99,11 @@ func NewHostEgressBlock(log zerolog.Logger) (*HostEgressBlock, error) {
 	// (in vmIPRange), so unrelated forwarded traffic on a cohabitated host
 	// (Docker, kube, VPN) is left untouched. Guarded by nfproto ipv4 since
 	// this is an inet table.
+	//
+	// This saddr match depends on the in-namespace SNAT in firewall.go
+	// (installNATRules). If that SNAT moves to the host, sandbox packets
+	// would carry the VM IP here instead and this match would silently fail
+	// to scope — keep the two in sync.
 	conn.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,

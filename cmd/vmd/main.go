@@ -264,6 +264,14 @@ func main() {
 		blocklist = network.NewBlocklist(blCfg, log)
 		netMgrOpts = append(netMgrOpts, network.WithBlockedEgressPorts(blCfg.BlockedEgressPorts))
 		log.Info().Str("path", path).Int("feeds", len(blCfg.DomainFeeds)).Int("blocked_ports", len(blCfg.BlockedEgressPorts)).Msg("egress blocklist configured")
+	} else {
+		// Feature disabled — drop any host egress-block table a previous run
+		// installed so its CIDR drops stop affecting sandbox egress. The
+		// per-VM port-drop chain self-heals: installHostFirewall always runs
+		// and ClearChain empties it when no ports are configured.
+		if err := network.RemoveHostEgressBlock(); err != nil {
+			log.Debug().Err(err).Msg("removing stale host egress block table")
+		}
 	}
 
 	// ---- Network manager + host firewall ----
