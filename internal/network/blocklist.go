@@ -131,6 +131,10 @@ type Blocklist struct {
 	cur  atomic.Pointer[blocklistSnapshot]
 	http *http.Client
 
+	// maxBytes caps a single HTTP feed download. Defaults to maxFeedBytes;
+	// overridable in tests.
+	maxBytes int64
+
 	// feedCache holds the last successfully fetched text per feed URL so a
 	// transient failure of one feed does not drop that feed's entries from
 	// the merged snapshot. Only touched from the single refresh goroutine.
@@ -149,6 +153,7 @@ func NewBlocklist(cfg *BlocklistConfig, log zerolog.Logger) *Blocklist {
 		log:       log.With().Str("component", "egress-blocklist").Logger(),
 		http:      &http.Client{Timeout: feedFetchTimeout},
 		feedCache: make(map[string]string),
+		maxBytes:  maxFeedBytes,
 	}
 
 	seed := newSnapshotBuilder()
@@ -333,9 +338,16 @@ func (b *Blocklist) fetchFeed(ctx context.Context, src string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxFeedBytes))
+	// Read one byte past the cap so truncation is detectable. A silently
+	// truncated feed would otherwise count as a successful fetch, overwrite
+	// the cache, and persist a partial state — dropping every entry past the
+	// cutoff. Fail instead, so refresh() falls back to the last-good copy.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, b.maxBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if int64(len(raw)) > b.maxBytes {
+		return "", fmt.Errorf("feed exceeds %d byte cap", b.maxBytes)
 	}
 	return string(raw), nil
 }

@@ -2,6 +2,8 @@ package network
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -262,6 +264,47 @@ func TestCIDRSinkFiresWhenAllFeedsDownWithSeededState(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "198.51.100.0/24" {
 		t.Errorf("sink CIDRs = %v, want [198.51.100.0/24] from seeded state", got)
+	}
+}
+
+func TestOversizedFeedFailsAndKeepsLastGood(t *testing.T) {
+	dir := t.TempDir()
+
+	// Server whose body length depends on a switch, so we can serve a small
+	// good body first, then an oversized one.
+	oversized := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if oversized {
+			w.Write([]byte("a.example.com\nb.example.com\nc.example.com\n")) // > cap below
+		} else {
+			w.Write([]byte("a.example.com\n"))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &BlocklistConfig{
+		DomainFeeds: []string{srv.URL},
+		StatePath:   filepath.Join(dir, "state"),
+	}
+	b := NewBlocklist(cfg, zerolog.Nop())
+	b.maxBytes = 20 // tiny cap for the test
+
+	b.refresh(t.Context()) // small body, succeeds
+	if got, _ := b.Blocked("a.example.com", nil); !got {
+		t.Fatal("expected a.example.com blocked after first refresh")
+	}
+
+	// Now the feed exceeds the cap: the fetch must fail, not silently
+	// truncate, so the last-good snapshot is retained.
+	oversized = true
+	b.refresh(t.Context())
+	if got, _ := b.Blocked("a.example.com", nil); !got {
+		t.Error("last-good entry lost after oversized feed; truncation was treated as success")
+	}
+
+	// State file must not have been overwritten with truncated content.
+	if raw, err := os.ReadFile(cfg.StatePath); err == nil && len(raw) > 20 {
+		t.Errorf("state file holds %d bytes; oversized feed should not have persisted", len(raw))
 	}
 }
 
