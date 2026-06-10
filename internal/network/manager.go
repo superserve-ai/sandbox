@@ -99,6 +99,11 @@ type Manager struct {
 	// sandbox traffic. Sourced from the operator blocklist config.
 	blockedEgressPorts []uint16
 
+	// dnsRedirectPort, when non-zero, transparently redirects all sandbox
+	// DNS (TCP and UDP dport 53) to this host port, where the operator
+	// runs a resolver. Zero leaves guest DNS untouched.
+	dnsRedirectPort uint16
+
 	// ownsEgressPortChain marks this manager as the sole owner of the
 	// shared SANDBOX_EGRESS_PORTS chain. Only the vmd daemon sets it;
 	// auxiliary managers (template-builder) must not flush the chain or
@@ -136,6 +141,15 @@ func WithBlockedEgressPorts(ports []uint16) ManagerOption {
 	return func(m *Manager) { m.blockedEgressPorts = ports }
 }
 
+// WithDNSRedirectPort redirects all sandbox DNS traffic (TCP and UDP port
+// 53) to the given port on the host, regardless of which nameserver the
+// guest has configured. The operator is responsible for running a resolver
+// on that port; with the redirect active, encrypted-DNS bypass on port 853
+// (DoT/DoQ) is dropped. Pass 0 (default) to leave guest DNS untouched.
+func WithDNSRedirectPort(port uint16) ManagerOption {
+	return func(m *Manager) { m.dnsRedirectPort = port }
+}
+
 // WithEgressPortChainOwner marks this manager as the owner of the shared
 // SANDBOX_EGRESS_PORTS chain, so it reconciles (flushes and rebuilds) that
 // chain on startup. Set this only for the vmd daemon — auxiliary managers
@@ -163,7 +177,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 		opt(mgr)
 	}
 
-	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
+	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.dnsRedirectPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
 		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
 
