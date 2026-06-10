@@ -255,7 +255,10 @@ func main() {
 	// (feeds, pinned domains/CIDRs, blocked ports). Unset = no global
 	// blocklist.
 	var blocklist *network.Blocklist
-	var netMgrOpts []network.ManagerOption
+	// vmd is the daemon, so it owns and reconciles the shared egress port
+	// chain even when no ports are configured (so disabling the feature
+	// clears stale drops). template-builder must not pass this.
+	netMgrOpts := []network.ManagerOption{network.WithEgressPortChainOwner()}
 	if path := os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG"); path != "" {
 		blCfg, err := network.LoadBlocklistConfig(path)
 		if err != nil {
@@ -328,6 +331,11 @@ func main() {
 			log.Fatal().Err(err).Msg("failed to install host egress block table")
 		}
 		blocklist.SetCIDRSink(hostBlock.UpdateCIDRs)
+		// Seed the host drop set from the state-seeded snapshot now, before
+		// the first feed fetch (which may block up to feedFetchTimeout per
+		// feed). Otherwise seeded CIDRs go unenforced on non-proxied ports
+		// during the startup window.
+		hostBlock.UpdateCIDRs(blocklist.CIDRs())
 		lc.addCloser("host egress block", func(_ context.Context) error { return hostBlock.Close() })
 		lc.start("egress blocklist", func() error { return blocklist.Start(ctx) })
 	}
