@@ -19,12 +19,26 @@ import (
 // vmIPRange must contain every host IP that hostIPForSlot can return.
 const vmIPRange = "10.11.0.0/16"
 
+// portDropChain is the vmd-owned filter chain holding the operator-configured
+// egress port drops. Kept separate from FORWARD so it can be flushed and
+// rebuilt on each start, reconciling away ports removed from config.
+const portDropChain = "SANDBOX_EGRESS_PORTS"
+
 // installHostFirewall installs the static rules that route all VM traffic
 // through the host: UDP/443 DROP (kills QUIC bypass of the SNI allowlist),
-// MSS clamp, FORWARD ACCEPT between veth+ and the host iface, MASQUERADE
-// for vmIPRange to the host iface, and REDIRECT HTTP/HTTPS from veth+ to
-// the egress proxy. All operations are idempotent.
-func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, log zerolog.Logger) error {
+// operator-configured egress port DROPs, MSS clamp, FORWARD ACCEPT between
+// veth+ and the host iface, MASQUERADE for vmIPRange to the host iface, and
+// REDIRECT HTTP/HTTPS from veth+ to the egress proxy. All operations are
+// idempotent.
+//
+// blockedPorts come from the operator blocklist config — only ports 80/443
+// are redirected through the egress proxy, so anything else a VM dials goes
+// straight through FORWARD and must be dropped here.
+//
+// manageEgressPortChain gates ownership of the shared SANDBOX_EGRESS_PORTS
+// chain: only the vmd daemon reconciles it. Auxiliary managers pass false so
+// a concurrent template build does not flush the daemon's port drops.
+func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, blockedPorts []uint16, manageEgressPortChain bool, log zerolog.Logger) error {
 	_, ipnet, err := net.ParseCIDR(vmIPRange)
 	if err != nil {
 		return fmt.Errorf("vmIPRange %s invalid: %w", vmIPRange, err)
@@ -39,7 +53,8 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, l
 	}
 
 	// UDP/443 DROP must precede the veth+ ACCEPT below so QUIC traffic
-	// is dropped before the broad ACCEPT terminates the chain walk.
+	// (which would bypass the SNI allowlist) is dropped before the broad
+	// ACCEPT terminates the chain walk. This rule is static.
 	udpDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
 	exists, err := ipt.Exists("filter", "FORWARD", udpDrop...)
 	if err != nil {
@@ -48,6 +63,39 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, l
 	if !exists {
 		if err := ipt.Insert("filter", "FORWARD", 1, udpDrop...); err != nil {
 			return fmt.Errorf("insert veth+ UDP/443 DROP: %w", err)
+		}
+	}
+
+	// Operator-configured egress port drops live in a vmd-owned chain so the
+	// live ruleset stays in sync with config. ClearChain creates-or-flushes,
+	// so a port removed from blockedPorts since the last start is dropped
+	// from the chain instead of lingering in FORWARD forever. The chain is
+	// entered via a single jump for veth+ traffic, placed before the ACCEPT.
+	//
+	// Only the chain owner (vmd) touches it. An auxiliary manager flushing
+	// the shared chain would wipe the daemon's port drops for the duration
+	// of, e.g., a template build.
+	if manageEgressPortChain {
+		if err := ipt.ClearChain("filter", portDropChain); err != nil {
+			return fmt.Errorf("reset %s chain: %w", portDropChain, err)
+		}
+		for _, port := range blockedPorts {
+			for _, proto := range []string{"tcp", "udp"} {
+				if err := ipt.AppendUnique("filter", portDropChain,
+					"-p", proto, "--dport", fmt.Sprintf("%d", port), "-j", "DROP"); err != nil {
+					return fmt.Errorf("add %s/%d DROP to %s: %w", proto, port, portDropChain, err)
+				}
+			}
+		}
+		portJump := []string{"-i", "veth+", "-j", portDropChain}
+		exists, err = ipt.Exists("filter", "FORWARD", portJump...)
+		if err != nil {
+			return fmt.Errorf("check %s jump: %w", portDropChain, err)
+		}
+		if !exists {
+			if err := ipt.Insert("filter", "FORWARD", 1, portJump...); err != nil {
+				return fmt.Errorf("insert %s jump: %w", portDropChain, err)
+			}
 		}
 	}
 

@@ -94,6 +94,16 @@ type Manager struct {
 	httpProxyPort  uint16
 	tlsProxyPort   uint16
 	otherProxyPort uint16
+
+	// blockedEgressPorts are dropped in the host FORWARD chain for all
+	// sandbox traffic. Sourced from the operator blocklist config.
+	blockedEgressPorts []uint16
+
+	// ownsEgressPortChain marks this manager as the sole owner of the
+	// shared SANDBOX_EGRESS_PORTS chain. Only the vmd daemon sets it;
+	// auxiliary managers (template-builder) must not flush the chain or
+	// they would wipe the daemon's port drops on every build.
+	ownsEgressPortChain bool
 }
 
 // SetEgressProxy attaches the TCP egress proxy so the manager can remove
@@ -119,6 +129,22 @@ func WithHTTPProxyPort(port uint16) ManagerOption {
 	return func(m *Manager) { m.httpProxyPort = port }
 }
 
+// WithBlockedEgressPorts sets destination ports dropped in the host FORWARD
+// chain for all sandbox traffic (TCP and UDP). Ports come from the operator
+// blocklist config.
+func WithBlockedEgressPorts(ports []uint16) ManagerOption {
+	return func(m *Manager) { m.blockedEgressPorts = ports }
+}
+
+// WithEgressPortChainOwner marks this manager as the owner of the shared
+// SANDBOX_EGRESS_PORTS chain, so it reconciles (flushes and rebuilds) that
+// chain on startup. Set this only for the vmd daemon — auxiliary managers
+// (e.g. template-builder) must leave the chain alone so concurrent builds
+// don't wipe the daemon's port drops.
+func WithEgressPortChainOwner() ManagerOption {
+	return func(m *Manager) { m.ownsEgressPortChain = true }
+}
+
 func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, opts ...ManagerOption) (*Manager, error) {
 	if err := enableIPForward(ctx); err != nil {
 		return nil, err
@@ -137,7 +163,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 		opt(mgr)
 	}
 
-	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, log.With().Str("component", "host_fw").Logger()); err != nil {
+	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
 		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
 

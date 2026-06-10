@@ -40,6 +40,11 @@ type EgressProxy struct {
 	// maxConnsPerSandbox is the per-sandbox connection limit. -1 = unlimited.
 	maxConnsPerSandbox int
 
+	// blocklist is the global egress denylist (nil = disabled). Checked
+	// before per-sandbox rules; a blocklist hit cannot be overridden by a
+	// sandbox's own allow rules.
+	blocklist *Blocklist
+
 	// sandboxRules maps sandbox host IPs to their egress config.
 	mu    sync.RWMutex
 	rules map[string]*EgressRules // key = sandbox host IP
@@ -62,6 +67,12 @@ func NewEgressProxy(httpPort, tlsPort, otherPort uint16, maxConns int, log zerol
 		maxConnsPerSandbox: maxConns,
 		rules:              make(map[string]*EgressRules),
 	}
+}
+
+// SetBlocklist attaches the global egress denylist. Must be called before
+// Start; the blocklist's own snapshot swapping handles later updates.
+func (p *EgressProxy) SetBlocklist(b *Blocklist) {
+	p.blocklist = b
 }
 
 // SetRules updates the egress rules for a sandbox identified by its host IP.
@@ -218,6 +229,20 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 		peekedData = buf
 	}
 
+	// Global blocklist first — a hit here cannot be overridden by the
+	// sandbox's own allow rules.
+	if p.blocklist != nil {
+		if blocked, dim := p.blocklist.Blocked(hostname, dstIP); blocked {
+			p.log.Warn().
+				Str("src", srcHost).
+				Str("dst", dstIP.String()).
+				Str("hostname", hostname).
+				Str("match", dim).
+				Msg("egress blocked by global blocklist")
+			return
+		}
+	}
+
 	// Check egress rules.
 	rules := p.getRules(srcHost)
 	allowed, matchType := p.isAllowed(rules, hostname, dstIP)
@@ -251,6 +276,11 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, extractHost
 			resolved := net.ParseIP(host)
 			if resolved != nil && IsIPDenied(resolved) {
 				return fmt.Errorf("blocked: hostname resolved to internal IP %s", resolved)
+			}
+			if resolved != nil && p.blocklist != nil {
+				if blocked, _ := p.blocklist.Blocked("", resolved); blocked {
+					return fmt.Errorf("blocked: hostname resolved to blocklisted IP %s", resolved)
+				}
 			}
 			return nil
 		},
