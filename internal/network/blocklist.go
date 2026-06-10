@@ -90,6 +90,15 @@ func LoadBlocklistConfig(path string) (*BlocklistConfig, error) {
 			return nil, fmt.Errorf("invalid custom_cidrs entry %q: %w", c, err)
 		}
 	}
+	for _, p := range cfg.BlockedEgressPorts {
+		// 80/443 are REDIRECTed to the egress proxy in PREROUTING, which runs
+		// before the FORWARD drop, so a port drop here would be a silent
+		// no-op. Web traffic is governed by the domain blocklist and the
+		// proxy path instead. Reject rather than silently ignore.
+		if p == 80 || p == 443 {
+			return nil, fmt.Errorf("blocked_egress_ports must not contain %d: web ports are enforced via the egress proxy and domain rules, not port drops", p)
+		}
+	}
 	if cfg.StatePath == "" {
 		cfg.StatePath = filepath.Join(filepath.Dir(path), "blocklist.state")
 	}

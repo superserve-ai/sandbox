@@ -295,10 +295,13 @@ refresh_interval: 30m
 		t.Errorf("default state path = %q", cfg.StatePath)
 	}
 
-	// Invalid duration and invalid CIDR must be rejected at load time.
+	// Invalid duration, invalid CIDR, and un-droppable web ports must all be
+	// rejected at load time.
 	for name, content := range map[string]string{
 		"bad duration": "refresh_interval: nonsense\n",
 		"bad cidr":     "custom_cidrs: [not-a-cidr]\n",
+		"web port 80":  "blocked_egress_ports: [80]\n",
+		"web port 443": "blocked_egress_ports: [443, 3333]\n",
 	} {
 		p := filepath.Join(dir, "bad.yaml")
 		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {

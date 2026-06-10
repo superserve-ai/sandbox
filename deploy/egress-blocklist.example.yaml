@@ -25,7 +25,10 @@ custom_domains:
 custom_cidrs:
   - 192.0.2.0/24
 
-# Destination ports dropped (TCP and UDP) for all sandbox traffic.
+# Destination ports dropped (TCP and UDP) for all sandbox traffic. Ports 80
+# and 443 are rejected here — they are REDIRECTed to the egress proxy before
+# the drop would apply, so web traffic is governed by the domain blocklist
+# and the proxy, not by port drops.
 blocked_egress_ports: [12345]
 
 # How often feeds are re-fetched. Go duration syntax. Default 6h.
