@@ -1,0 +1,403 @@
+package network
+
+// blocklist.go implements a global egress denylist for the egress proxy and
+// host firewall. Which feeds are fetched, which domains/CIDRs are pinned,
+// and which ports are dropped all come from an operator-supplied config
+// file; nothing is built in.
+//
+// Enforcement points:
+//   - EgressProxy checks Blocked() on every HTTP/TLS connection (SNI/Host
+//     plus original destination IP) before per-sandbox rules.
+//   - installHostFirewall drops BlockedEgressPorts in the FORWARD chain for
+//     traffic that is not redirected through the proxy.
+//
+// The list is a denylist, so the failure mode is "no extra blocking", never
+// "block everything": a fetch error keeps the last good snapshot, and the
+// last good snapshot is persisted to StatePath so a vmd restart does not
+// come up empty while the first fetch is in flight.
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/rs/zerolog"
+	yaml "go.yaml.in/yaml/v3"
+)
+
+const (
+	// defaultBlocklistRefresh is used when refresh_interval is unset.
+	defaultBlocklistRefresh = 6 * time.Hour
+
+	// maxFeedBytes caps a single feed download so a hijacked or
+	// misconfigured feed URL cannot exhaust memory.
+	maxFeedBytes = 16 << 20 // 16 MiB
+
+	feedFetchTimeout = 60 * time.Second
+)
+
+// BlocklistConfig is the schema of the operator-supplied config file
+// (VMD_EGRESS_BLOCKLIST_CONFIG). All fields are optional.
+type BlocklistConfig struct {
+	// DomainFeeds are URLs (http/https) or local file paths to plain-text
+	// feeds: one entry per line, '#' starts a comment. Entries may be
+	// domains, IPs, IP:port pairs, or CIDRs.
+	DomainFeeds []string `yaml:"domain_feeds"`
+
+	// CustomDomains and CustomCIDRs are pinned entries that are always
+	// blocked regardless of feed contents.
+	CustomDomains []string `yaml:"custom_domains"`
+	CustomCIDRs   []string `yaml:"custom_cidrs"`
+
+	// BlockedEgressPorts are dropped in the host FORWARD chain for all
+	// sandbox traffic (both TCP and UDP).
+	BlockedEgressPorts []uint16 `yaml:"blocked_egress_ports"`
+
+	// RefreshInterval is a Go duration string ("6h", "30m"). Default 6h.
+	RefreshInterval string `yaml:"refresh_interval"`
+
+	// StatePath is where the last good merged list is persisted. Default:
+	// "<config dir>/blocklist.state".
+	StatePath string `yaml:"state_path"`
+}
+
+// LoadBlocklistConfig reads and validates the YAML config at path.
+func LoadBlocklistConfig(path string) (*BlocklistConfig, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read blocklist config: %w", err)
+	}
+	var cfg BlocklistConfig
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("parse blocklist config %s: %w", path, err)
+	}
+	if cfg.RefreshInterval != "" {
+		if _, err := time.ParseDuration(cfg.RefreshInterval); err != nil {
+			return nil, fmt.Errorf("invalid refresh_interval %q: %w", cfg.RefreshInterval, err)
+		}
+	}
+	for _, c := range cfg.CustomCIDRs {
+		if _, err := parseCIDROrIP(c); err != nil {
+			return nil, fmt.Errorf("invalid custom_cidrs entry %q: %w", c, err)
+		}
+	}
+	if cfg.StatePath == "" {
+		cfg.StatePath = filepath.Join(filepath.Dir(path), "blocklist.state")
+	}
+	return &cfg, nil
+}
+
+func (c *BlocklistConfig) refreshInterval() time.Duration {
+	if c.RefreshInterval == "" {
+		return defaultBlocklistRefresh
+	}
+	d, err := time.ParseDuration(c.RefreshInterval)
+	if err != nil {
+		return defaultBlocklistRefresh
+	}
+	return d
+}
+
+// blocklistSnapshot is an immutable merged view of all sources. Swapped
+// atomically on refresh so lookups never take a lock.
+type blocklistSnapshot struct {
+	domains map[string]struct{}
+	nets    []netip.Prefix
+}
+
+// Blocklist holds the current snapshot and refreshes it from the configured
+// feeds. Lookup methods are safe for concurrent use.
+type Blocklist struct {
+	cfg  *BlocklistConfig
+	log  zerolog.Logger
+	cur  atomic.Pointer[blocklistSnapshot]
+	http *http.Client
+}
+
+// NewBlocklist builds a Blocklist seeded from the pinned config entries and
+// the persisted state file (if present). Feeds are first fetched in Start.
+func NewBlocklist(cfg *BlocklistConfig, log zerolog.Logger) *Blocklist {
+	b := &Blocklist{
+		cfg:  cfg,
+		log:  log.With().Str("component", "egress-blocklist").Logger(),
+		http: &http.Client{Timeout: feedFetchTimeout},
+	}
+
+	seed := newSnapshotBuilder()
+	seed.addConfigEntries(cfg)
+	if raw, err := os.ReadFile(cfg.StatePath); err == nil {
+		n := seed.addFeedText(string(raw))
+		b.log.Info().Int("entries", n).Str("path", cfg.StatePath).Msg("seeded blocklist from persisted state")
+	}
+	b.cur.Store(seed.snapshot())
+	return b
+}
+
+// Start fetches all feeds immediately, then refreshes on the configured
+// interval. Blocks until ctx is cancelled.
+func (b *Blocklist) Start(ctx context.Context) error {
+	b.refresh(ctx)
+	ticker := time.NewTicker(b.cfg.refreshInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			b.refresh(ctx)
+		}
+	}
+}
+
+// Blocked reports whether a connection identified by hostname (may be empty)
+// and destination IP hits the blocklist. The second return value names the
+// matching dimension ("domain" or "ip") for logging.
+func (b *Blocklist) Blocked(hostname string, dstIP net.IP) (bool, string) {
+	snap := b.cur.Load()
+	if snap == nil {
+		return false, ""
+	}
+	if hostname != "" && snap.blockedDomain(hostname) {
+		return true, "domain"
+	}
+	if dstIP != nil {
+		if addr, ok := netip.AddrFromSlice(dstIP.To4()); ok {
+			for _, p := range snap.nets {
+				if p.Contains(addr) {
+					return true, "ip"
+				}
+			}
+		}
+	}
+	return false, ""
+}
+
+// blockedDomain walks parent labels so a blocked "example.com" also blocks
+// "pool.example.com".
+func (s *blocklistSnapshot) blockedDomain(hostname string) bool {
+	h := strings.ToLower(strings.TrimSuffix(hostname, "."))
+	for h != "" {
+		if _, ok := s.domains[h]; ok {
+			return true
+		}
+		_, parent, ok := strings.Cut(h, ".")
+		if !ok {
+			break
+		}
+		h = parent
+	}
+	return false
+}
+
+// refresh fetches every feed and atomically swaps in the merged snapshot.
+// A feed that fails to fetch is logged and skipped; if ALL feeds fail the
+// previous snapshot is kept so transient outages never shrink coverage.
+func (b *Blocklist) refresh(ctx context.Context) {
+	builder := newSnapshotBuilder()
+	builder.addConfigEntries(b.cfg)
+
+	fetched, failed := 0, 0
+	var stateText strings.Builder
+	for _, src := range b.cfg.DomainFeeds {
+		text, err := b.fetchFeed(ctx, src)
+		if err != nil {
+			failed++
+			b.log.Warn().Err(err).Str("feed", src).Msg("blocklist feed fetch failed")
+			continue
+		}
+		fetched++
+		builder.addFeedText(text)
+		stateText.WriteString(text)
+		stateText.WriteString("\n")
+	}
+
+	if fetched == 0 && len(b.cfg.DomainFeeds) > 0 {
+		b.log.Warn().Int("feeds", len(b.cfg.DomainFeeds)).Msg("all blocklist feeds failed; keeping previous snapshot")
+		return
+	}
+
+	snap := builder.snapshot()
+	b.cur.Store(snap)
+	b.log.Info().
+		Int("domains", len(snap.domains)).
+		Int("cidrs", len(snap.nets)).
+		Int("feeds_ok", fetched).
+		Int("feeds_failed", failed).
+		Msg("blocklist refreshed")
+
+	if fetched > 0 {
+		if err := writeFileAtomic(b.cfg.StatePath, []byte(stateText.String())); err != nil {
+			b.log.Warn().Err(err).Str("path", b.cfg.StatePath).Msg("failed to persist blocklist state")
+		}
+	}
+}
+
+func (b *Blocklist) fetchFeed(ctx context.Context, src string) (string, error) {
+	if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+		raw, err := os.ReadFile(src)
+		if err != nil {
+			return "", err
+		}
+		return string(raw), nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxFeedBytes))
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot building / feed parsing
+// ---------------------------------------------------------------------------
+
+type snapshotBuilder struct {
+	domains map[string]struct{}
+	nets    map[netip.Prefix]struct{}
+}
+
+func newSnapshotBuilder() *snapshotBuilder {
+	return &snapshotBuilder{
+		domains: make(map[string]struct{}),
+		nets:    make(map[netip.Prefix]struct{}),
+	}
+}
+
+func (sb *snapshotBuilder) addConfigEntries(cfg *BlocklistConfig) {
+	for _, d := range cfg.CustomDomains {
+		if d = normalizeDomain(d); d != "" {
+			sb.domains[d] = struct{}{}
+		}
+	}
+	for _, c := range cfg.CustomCIDRs {
+		if p, err := parseCIDROrIP(c); err == nil {
+			sb.nets[p] = struct{}{}
+		}
+	}
+}
+
+// addFeedText parses feed lines into the builder and returns the number of
+// entries accepted. Unparseable lines are skipped — feeds aggregated from
+// threat intel commonly mix formats and annotations.
+func (sb *snapshotBuilder) addFeedText(text string) int {
+	added := 0
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// CIDR (1.2.3.0/24)
+		if strings.Contains(line, "/") {
+			if p, err := netip.ParsePrefix(line); err == nil && p.Addr().Is4() {
+				sb.nets[p.Masked()] = struct{}{}
+				added++
+			}
+			continue
+		}
+
+		// IP:port (1.2.3.4:8080) — port is irrelevant for a destination
+		// denylist; block the IP outright.
+		if host, _, err := net.SplitHostPort(line); err == nil {
+			line = host
+		}
+
+		// Bare IP (1.2.3.4)
+		if addr, err := netip.ParseAddr(line); err == nil {
+			if addr.Is4() {
+				sb.nets[netip.PrefixFrom(addr, 32)] = struct{}{}
+				added++
+			}
+			continue
+		}
+
+		// Domain
+		if d := normalizeDomain(line); d != "" {
+			sb.domains[d] = struct{}{}
+			added++
+		}
+	}
+	return added
+}
+
+func (sb *snapshotBuilder) snapshot() *blocklistSnapshot {
+	nets := make([]netip.Prefix, 0, len(sb.nets))
+	for p := range sb.nets {
+		nets = append(nets, p)
+	}
+	return &blocklistSnapshot{domains: sb.domains, nets: nets}
+}
+
+// normalizeDomain lowercases and validates a domain-ish entry. Returns ""
+// for entries that cannot be a DNS name (so junk feed lines are dropped
+// instead of polluting the set).
+func normalizeDomain(d string) string {
+	d = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(d, ".")))
+	d = strings.TrimPrefix(d, "*.")
+	if d == "" || !strings.Contains(d, ".") || len(d) > 253 {
+		return ""
+	}
+	for _, r := range d {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '.', r == '_':
+		default:
+			return ""
+		}
+	}
+	return d
+}
+
+// parseCIDROrIP accepts both "1.2.3.0/24" and bare "1.2.3.4" config entries.
+func parseCIDROrIP(s string) (netip.Prefix, error) {
+	if strings.Contains(s, "/") {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		return p.Masked(), nil
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}

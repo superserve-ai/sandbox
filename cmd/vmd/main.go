@@ -250,8 +250,24 @@ func main() {
 
 	lc := newLifecycle(log)
 
+	// ---- Egress blocklist (optional) ----
+	// VMD_EGRESS_BLOCKLIST_CONFIG points at the operator-supplied config
+	// (feeds, pinned domains/CIDRs, blocked ports). Unset = no global
+	// blocklist.
+	var blocklist *network.Blocklist
+	var netMgrOpts []network.ManagerOption
+	if path := os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG"); path != "" {
+		blCfg, err := network.LoadBlocklistConfig(path)
+		if err != nil {
+			log.Fatal().Err(err).Str("path", path).Msg("failed to load egress blocklist config")
+		}
+		blocklist = network.NewBlocklist(blCfg, log)
+		netMgrOpts = append(netMgrOpts, network.WithBlockedEgressPorts(blCfg.BlockedEgressPorts))
+		log.Info().Str("path", path).Int("feeds", len(blCfg.DomainFeeds)).Int("blocked_ports", len(blCfg.BlockedEgressPorts)).Msg("egress blocklist configured")
+	}
+
 	// ---- Network manager + host firewall ----
-	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log)
+	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
 	}
@@ -295,6 +311,10 @@ func main() {
 	)
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
+	if blocklist != nil {
+		egressProxy.SetBlocklist(blocklist)
+		lc.start("egress blocklist", func() error { return blocklist.Start(ctx) })
+	}
 	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
 
 	// ---- BoltDB state store ----
