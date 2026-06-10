@@ -121,15 +121,25 @@ type Blocklist struct {
 	log  zerolog.Logger
 	cur  atomic.Pointer[blocklistSnapshot]
 	http *http.Client
+
+	// feedCache holds the last successfully fetched text per feed URL so a
+	// transient failure of one feed does not drop that feed's entries from
+	// the merged snapshot. Only touched from the single refresh goroutine.
+	feedCache map[string]string
+
+	// sink, if set, receives the snapshot's CIDRs after every refresh so
+	// downstream enforcers (e.g. the host firewall) can mirror them.
+	sink func([]string)
 }
 
 // NewBlocklist builds a Blocklist seeded from the pinned config entries and
 // the persisted state file (if present). Feeds are first fetched in Start.
 func NewBlocklist(cfg *BlocklistConfig, log zerolog.Logger) *Blocklist {
 	b := &Blocklist{
-		cfg:  cfg,
-		log:  log.With().Str("component", "egress-blocklist").Logger(),
-		http: &http.Client{Timeout: feedFetchTimeout},
+		cfg:       cfg,
+		log:       log.With().Str("component", "egress-blocklist").Logger(),
+		http:      &http.Client{Timeout: feedFetchTimeout},
+		feedCache: make(map[string]string),
 	}
 
 	seed := newSnapshotBuilder()
@@ -140,6 +150,27 @@ func NewBlocklist(cfg *BlocklistConfig, log zerolog.Logger) *Blocklist {
 	}
 	b.cur.Store(seed.snapshot())
 	return b
+}
+
+// SetCIDRSink registers a callback invoked with the snapshot's CIDR list
+// after each refresh (and on the initial refresh in Start). Used to mirror
+// IP/CIDR entries into the host firewall so they are enforced on every port,
+// not only the proxied HTTP/TLS ports. Must be set before Start.
+func (b *Blocklist) SetCIDRSink(fn func([]string)) {
+	b.sink = fn
+}
+
+// CIDRs returns the current snapshot's blocked prefixes as strings.
+func (b *Blocklist) CIDRs() []string {
+	snap := b.cur.Load()
+	if snap == nil {
+		return nil
+	}
+	out := make([]string, 0, len(snap.nets))
+	for _, p := range snap.nets {
+		out = append(out, p.String())
+	}
+	return out
 }
 
 // Start fetches all feeds immediately, then refreshes on the configured
@@ -199,29 +230,41 @@ func (s *blocklistSnapshot) blockedDomain(hostname string) bool {
 }
 
 // refresh fetches every feed and atomically swaps in the merged snapshot.
-// A feed that fails to fetch is logged and skipped; if ALL feeds fail the
-// previous snapshot is kept so transient outages never shrink coverage.
+//
+// A feed that fails to fetch falls back to its last successfully fetched
+// text (feedCache) so one transient failure cannot drop that feed's entries
+// while others succeed. A feed that has never succeeded contributes nothing.
+// If no feed yields any text (fresh or cached) the previous snapshot is kept
+// so transient outages never shrink coverage.
 func (b *Blocklist) refresh(ctx context.Context) {
 	builder := newSnapshotBuilder()
 	builder.addConfigEntries(b.cfg)
 
-	fetched, failed := 0, 0
+	fetched, cached, failed := 0, 0, 0
 	var stateText strings.Builder
 	for _, src := range b.cfg.DomainFeeds {
 		text, err := b.fetchFeed(ctx, src)
 		if err != nil {
-			failed++
-			b.log.Warn().Err(err).Str("feed", src).Msg("blocklist feed fetch failed")
-			continue
+			prev, ok := b.feedCache[src]
+			if !ok {
+				failed++
+				b.log.Warn().Err(err).Str("feed", src).Msg("blocklist feed fetch failed (no cached copy)")
+				continue
+			}
+			cached++
+			text = prev
+			b.log.Warn().Err(err).Str("feed", src).Msg("blocklist feed fetch failed; using cached copy")
+		} else {
+			fetched++
+			b.feedCache[src] = text
 		}
-		fetched++
 		builder.addFeedText(text)
 		stateText.WriteString(text)
 		stateText.WriteString("\n")
 	}
 
-	if fetched == 0 && len(b.cfg.DomainFeeds) > 0 {
-		b.log.Warn().Int("feeds", len(b.cfg.DomainFeeds)).Msg("all blocklist feeds failed; keeping previous snapshot")
+	if fetched == 0 && cached == 0 && len(b.cfg.DomainFeeds) > 0 {
+		b.log.Warn().Int("feeds", len(b.cfg.DomainFeeds)).Msg("no blocklist feed data (fresh or cached); keeping previous snapshot")
 		return
 	}
 
@@ -231,9 +274,16 @@ func (b *Blocklist) refresh(ctx context.Context) {
 		Int("domains", len(snap.domains)).
 		Int("cidrs", len(snap.nets)).
 		Int("feeds_ok", fetched).
+		Int("feeds_cached", cached).
 		Int("feeds_failed", failed).
 		Msg("blocklist refreshed")
 
+	if b.sink != nil {
+		b.sink(b.CIDRs())
+	}
+
+	// Persist only freshly fetched data — a refresh served entirely from
+	// cache adds nothing new, and the state file already holds it.
 	if fetched > 0 {
 		if err := writeFileAtomic(b.cfg.StatePath, []byte(stateText.String())); err != nil {
 			b.log.Warn().Err(err).Str("path", b.cfg.StatePath).Msg("failed to persist blocklist state")

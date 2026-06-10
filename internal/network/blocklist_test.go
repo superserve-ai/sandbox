@@ -135,6 +135,67 @@ func TestRefreshKeepsLastGoodOnTotalFailure(t *testing.T) {
 	}
 }
 
+func TestRefreshKeepsFailedFeedFromCache(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.txt")
+	flaky := filepath.Join(dir, "flaky.txt")
+	if err := os.WriteFile(good, []byte("stable.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(flaky, []byte("flaky-only.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &BlocklistConfig{
+		DomainFeeds: []string{good, flaky},
+		StatePath:   filepath.Join(dir, "state"),
+	}
+	b := NewBlocklist(cfg, zerolog.Nop())
+	b.refresh(t.Context())
+
+	// One feed fails this round; the other still succeeds. The failed feed's
+	// entries must survive from cache rather than vanishing.
+	os.Remove(flaky)
+	b.refresh(t.Context())
+
+	if got, _ := b.Blocked("flaky-only.example.com", nil); !got {
+		t.Error("entry from transiently-failed feed was dropped; expected cache fallback")
+	}
+	if got, _ := b.Blocked("stable.example.com", nil); !got {
+		t.Error("entry from healthy feed missing after partial-failure refresh")
+	}
+}
+
+func TestCIDRSinkInvokedOnRefresh(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.txt")
+	if err := os.WriteFile(feed, []byte("10.20.30.0/24\nblocked.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &BlocklistConfig{
+		DomainFeeds: []string{feed},
+		CustomCIDRs: []string{"203.0.113.7"},
+		StatePath:   filepath.Join(dir, "state"),
+	}
+	b := NewBlocklist(cfg, zerolog.Nop())
+
+	var got []string
+	b.SetCIDRSink(func(c []string) { got = c })
+	b.refresh(t.Context())
+
+	// Sink should receive only CIDRs (not domains): the feed /24 and the
+	// pinned /32.
+	if len(got) != 2 {
+		t.Fatalf("sink got %v, want 2 CIDRs", got)
+	}
+	found := map[string]bool{}
+	for _, c := range got {
+		found[c] = true
+	}
+	if !found["10.20.30.0/24"] || !found["203.0.113.7/32"] {
+		t.Errorf("sink CIDRs = %v, missing expected entries", got)
+	}
+}
+
 func TestLoadBlocklistConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bl.yaml")

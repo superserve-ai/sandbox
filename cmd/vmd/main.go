@@ -313,6 +313,14 @@ func main() {
 	netMgr.SetEgressProxy(egressProxy)
 	if blocklist != nil {
 		egressProxy.SetBlocklist(blocklist)
+		// Mirror IP/CIDR entries into a host-level nftables drop set so they
+		// are enforced on every port, not just the proxied web ports.
+		hostBlock, err := network.NewHostEgressBlock(log)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to install host egress block table")
+		}
+		blocklist.SetCIDRSink(hostBlock.UpdateCIDRs)
+		lc.addCloser("host egress block", func(_ context.Context) error { return hostBlock.Close() })
 		lc.start("egress blocklist", func() error { return blocklist.Start(ctx) })
 	}
 	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
