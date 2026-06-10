@@ -14,7 +14,7 @@ import (
 
 func TestAddFeedText(t *testing.T) {
 	sb := newSnapshotBuilder()
-	n := sb.addFeedText(`
+	n, err := sb.addFeedText(`
 # comment line
 pool.example.com
 EVIL.Example.ORG.   # trailing comment
@@ -25,6 +25,9 @@ not a valid entry !!
 singlelabel
 2001:db8::1
 `)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if n != 5 {
 		t.Errorf("addFeedText accepted %d entries, want 5", n)
 	}
@@ -264,6 +267,43 @@ func TestCIDRSinkFiresWhenAllFeedsDownWithSeededState(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "198.51.100.0/24" {
 		t.Errorf("sink CIDRs = %v, want [198.51.100.0/24] from seeded state", got)
+	}
+}
+
+func TestAddFeedTextRejectsOverlongLine(t *testing.T) {
+	sb := newSnapshotBuilder()
+	// A single line larger than the scanner's 1 MiB buffer stops Scan early.
+	overlong := strings.Repeat("a", 2<<20)
+	_, err := sb.addFeedText("good.example.com\n" + overlong + "\n")
+	if err == nil {
+		t.Fatal("expected a scanner error for an over-long line, got nil")
+	}
+}
+
+func TestFeedParseErrorKeepsLastGood(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.txt")
+	if err := os.WriteFile(feed, []byte("keep.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &BlocklistConfig{
+		DomainFeeds: []string{feed},
+		StatePath:   filepath.Join(dir, "state"),
+	}
+	b := NewBlocklist(cfg, zerolog.Nop())
+	b.refresh(t.Context())
+	if got, _ := b.Blocked("keep.example.com", nil); !got {
+		t.Fatal("expected keep.example.com blocked after first refresh")
+	}
+
+	// Feed mutates to contain an over-long line: the parse must fail and the
+	// last-good snapshot must be retained, not replaced by a truncated set.
+	if err := os.WriteFile(feed, []byte(strings.Repeat("a", 2<<20)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b.refresh(t.Context())
+	if got, _ := b.Blocked("keep.example.com", nil); !got {
+		t.Error("last-good entry lost after a feed parse error")
 	}
 }
 

@@ -159,7 +159,10 @@ func NewBlocklist(cfg *BlocklistConfig, log zerolog.Logger) *Blocklist {
 	seed := newSnapshotBuilder()
 	seed.addConfigEntries(cfg)
 	if raw, err := os.ReadFile(cfg.StatePath); err == nil {
-		n := seed.addFeedText(string(raw))
+		n, perr := seed.addFeedText(string(raw))
+		if perr != nil {
+			b.log.Warn().Err(perr).Str("path", cfg.StatePath).Msg("persisted state parse incomplete")
+		}
 		b.log.Info().Int("entries", n).Str("path", cfg.StatePath).Msg("seeded blocklist from persisted state")
 	}
 	b.cur.Store(seed.snapshot())
@@ -259,6 +262,7 @@ func (b *Blocklist) refresh(ctx context.Context) {
 	var stateText strings.Builder
 	for _, src := range b.cfg.DomainFeeds {
 		text, err := b.fetchFeed(ctx, src)
+		fromCache := false
 		if err != nil {
 			degraded = true
 			prev, ok := b.feedCache[src]
@@ -267,14 +271,29 @@ func (b *Blocklist) refresh(ctx context.Context) {
 				b.log.Warn().Err(err).Str("feed", src).Msg("blocklist feed fetch failed (no cached copy)")
 				continue
 			}
-			cached++
 			text = prev
+			fromCache = true
 			b.log.Warn().Err(err).Str("feed", src).Msg("blocklist feed fetch failed; using cached copy")
+		}
+
+		// Parse in isolation so a malformed feed (e.g. a line longer than the
+		// scanner buffer, which stops Scan mid-stream) is treated as a failed
+		// feed rather than silently contributing a truncated set.
+		fb := newSnapshotBuilder()
+		if _, perr := fb.addFeedText(text); perr != nil {
+			degraded = true
+			failed++
+			b.log.Warn().Err(perr).Str("feed", src).Msg("blocklist feed parse failed; skipping feed")
+			continue
+		}
+
+		if fromCache {
+			cached++
 		} else {
 			fetched++
 			b.feedCache[src] = text
 		}
-		builder.addFeedText(text)
+		builder.addSnapshot(fb.snapshot())
 		stateText.WriteString(text)
 		stateText.WriteString("\n")
 	}
@@ -394,8 +413,10 @@ func (sb *snapshotBuilder) addConfigEntries(cfg *BlocklistConfig) {
 
 // addFeedText parses feed lines into the builder and returns the number of
 // entries accepted. Unparseable lines are skipped — feeds aggregated from
-// threat intel commonly mix formats and annotations.
-func (sb *snapshotBuilder) addFeedText(text string) int {
+// threat intel commonly mix formats and annotations. A non-nil error means
+// the scan stopped early (e.g. a line exceeding the buffer), so the parse is
+// incomplete and the caller must not treat the result as authoritative.
+func (sb *snapshotBuilder) addFeedText(text string) (int, error) {
 	added := 0
 	scanner := bufio.NewScanner(strings.NewReader(text))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
@@ -439,7 +460,7 @@ func (sb *snapshotBuilder) addFeedText(text string) int {
 			added++
 		}
 	}
-	return added
+	return added, scanner.Err()
 }
 
 func (sb *snapshotBuilder) snapshot() *blocklistSnapshot {
