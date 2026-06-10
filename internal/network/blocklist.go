@@ -265,6 +265,12 @@ func (b *Blocklist) refresh(ctx context.Context) {
 
 	if fetched == 0 && cached == 0 && len(b.cfg.DomainFeeds) > 0 {
 		b.log.Warn().Int("feeds", len(b.cfg.DomainFeeds)).Msg("no blocklist feed data (fresh or cached); keeping previous snapshot")
+		// Still push the current (e.g. state-seeded) CIDRs to the sink: on a
+		// cold start with all feeds down, the host drop set would otherwise
+		// stay empty and leave seeded IPs reachable on non-proxied ports.
+		if b.sink != nil {
+			b.sink(b.CIDRs())
+		}
 		return
 	}
 

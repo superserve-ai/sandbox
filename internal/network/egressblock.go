@@ -16,6 +16,7 @@ package network
 
 import (
 	"fmt"
+	"net/netip"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
@@ -75,13 +76,19 @@ func NewHostEgressBlock(log zerolog.Logger) (*HostEgressBlock, error) {
 		Policy:   &policy,
 	})
 
-	// ip daddr @blocked_v4 drop — guarded by nfproto ipv4 since this is an
-	// inet table (IPv6 sandbox egress is already dropped upstream).
+	// ip saddr <vmIPRange> ip daddr @blocked_v4 drop.
+	//
+	// The source match scopes the drop to sandbox egress: by the time a VM's
+	// packet reaches the host FORWARD hook it has been SNAT'd to its hostIP
+	// (in vmIPRange), so unrelated forwarded traffic on a cohabitated host
+	// (Docker, kube, VPN) is left untouched. Guarded by nfproto ipv4 since
+	// this is an inet table.
 	conn.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,
 		Exprs: flatten(
 			nfprotoIPv4(),
+			ipv4SrcInPrefix(vmIPRange),
 			ipv4DstLookup(set),
 			verdictDrop(),
 		),
@@ -139,4 +146,28 @@ func nfprotoIPv4() []expr.Any {
 		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
 		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: []byte{unix.NFPROTO_IPV4}},
 	}
+}
+
+// ipv4SrcInPrefix matches packets whose IPv4 source address falls inside the
+// given CIDR. Panics if cidr is not a valid IPv4 prefix — callers pass a
+// compile-time constant (vmIPRange).
+func ipv4SrcInPrefix(cidr string) []expr.Any {
+	p := netip.MustParsePrefix(cidr)
+	network := p.Masked().Addr().As4()
+	mask := prefixMask4(p.Bits())
+	return []expr.Any{
+		// Load IPv4 src addr (offset 12 in network header, 4 bytes).
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: mask[:], Xor: []byte{0, 0, 0, 0}},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: network[:]},
+	}
+}
+
+// prefixMask4 returns the 4-byte network mask for an IPv4 prefix length.
+func prefixMask4(bits int) [4]byte {
+	var m uint32
+	if bits > 0 {
+		m = ^uint32(0) << uint(32-bits)
+	}
+	return [4]byte{byte(m >> 24), byte(m >> 16), byte(m >> 8), byte(m)}
 }

@@ -19,6 +19,11 @@ import (
 // vmIPRange must contain every host IP that hostIPForSlot can return.
 const vmIPRange = "10.11.0.0/16"
 
+// portDropChain is the vmd-owned filter chain holding the operator-configured
+// egress port drops. Kept separate from FORWARD so it can be flushed and
+// rebuilt on each start, reconciling away ports removed from config.
+const portDropChain = "SANDBOX_EGRESS_PORTS"
+
 // installHostFirewall installs the static rules that route all VM traffic
 // through the host: UDP/443 DROP (kills QUIC bypass of the SNI allowlist),
 // operator-configured egress port DROPs, MSS clamp, FORWARD ACCEPT between
@@ -43,27 +48,44 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort uint16, b
 		return fmt.Errorf("init iptables: %w", err)
 	}
 
-	// DROP rules must precede the veth+ ACCEPT below so matching traffic
-	// is dropped before the broad ACCEPT terminates the chain walk.
-	// UDP/443 kills the QUIC bypass of the SNI allowlist; blockedPorts are
-	// the operator-configured egress port denylist.
-	drops := [][]string{
-		{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"},
+	// UDP/443 DROP must precede the veth+ ACCEPT below so QUIC traffic
+	// (which would bypass the SNI allowlist) is dropped before the broad
+	// ACCEPT terminates the chain walk. This rule is static.
+	udpDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
+	exists, err := ipt.Exists("filter", "FORWARD", udpDrop...)
+	if err != nil {
+		return fmt.Errorf("check veth+ UDP/443 DROP: %w", err)
+	}
+	if !exists {
+		if err := ipt.Insert("filter", "FORWARD", 1, udpDrop...); err != nil {
+			return fmt.Errorf("insert veth+ UDP/443 DROP: %w", err)
+		}
+	}
+
+	// Operator-configured egress port drops live in a vmd-owned chain so the
+	// live ruleset stays in sync with config. ClearChain creates-or-flushes,
+	// so a port removed from blockedPorts since the last start is dropped
+	// from the chain instead of lingering in FORWARD forever. The chain is
+	// entered via a single jump for veth+ traffic, placed before the ACCEPT.
+	if err := ipt.ClearChain("filter", portDropChain); err != nil {
+		return fmt.Errorf("reset %s chain: %w", portDropChain, err)
 	}
 	for _, port := range blockedPorts {
 		for _, proto := range []string{"tcp", "udp"} {
-			drops = append(drops, []string{"-i", "veth+", "-p", proto, "--dport", fmt.Sprintf("%d", port), "-j", "DROP"})
+			if err := ipt.AppendUnique("filter", portDropChain,
+				"-p", proto, "--dport", fmt.Sprintf("%d", port), "-j", "DROP"); err != nil {
+				return fmt.Errorf("add %s/%d DROP to %s: %w", proto, port, portDropChain, err)
+			}
 		}
 	}
-	for _, drop := range drops {
-		exists, err := ipt.Exists("filter", "FORWARD", drop...)
-		if err != nil {
-			return fmt.Errorf("check veth+ DROP %v: %w", drop, err)
-		}
-		if !exists {
-			if err := ipt.Insert("filter", "FORWARD", 1, drop...); err != nil {
-				return fmt.Errorf("insert veth+ DROP %v: %w", drop, err)
-			}
+	portJump := []string{"-i", "veth+", "-j", portDropChain}
+	exists, err = ipt.Exists("filter", "FORWARD", portJump...)
+	if err != nil {
+		return fmt.Errorf("check %s jump: %w", portDropChain, err)
+	}
+	if !exists {
+		if err := ipt.Insert("filter", "FORWARD", 1, portJump...); err != nil {
+			return fmt.Errorf("insert %s jump: %w", portDropChain, err)
 		}
 	}
 

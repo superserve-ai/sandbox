@@ -196,6 +196,33 @@ func TestCIDRSinkInvokedOnRefresh(t *testing.T) {
 	}
 }
 
+func TestCIDRSinkFiresWhenAllFeedsDownWithSeededState(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state")
+	// Pre-seed a state file with a CIDR, simulating a prior good fetch.
+	if err := os.WriteFile(statePath, []byte("198.51.100.0/24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &BlocklistConfig{
+		DomainFeeds: []string{filepath.Join(dir, "missing-feed.txt")}, // never resolves
+		StatePath:   statePath,
+	}
+	b := NewBlocklist(cfg, zerolog.Nop()) // seeds snapshot from state
+
+	var got []string
+	sinkCalled := false
+	b.SetCIDRSink(func(c []string) { sinkCalled = true; got = c })
+
+	b.refresh(t.Context()) // feed fails, no cache → early return path
+
+	if !sinkCalled {
+		t.Fatal("sink not invoked on total feed outage; host drop set would stay empty")
+	}
+	if len(got) != 1 || got[0] != "198.51.100.0/24" {
+		t.Errorf("sink CIDRs = %v, want [198.51.100.0/24] from seeded state", got)
+	}
+}
+
 func TestLoadBlocklistConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bl.yaml")
