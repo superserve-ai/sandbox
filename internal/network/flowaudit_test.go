@@ -12,29 +12,60 @@ import (
 	"github.com/google/uuid"
 )
 
+// tcpPair returns a connected pair of TCP loopback conns: the dialer side and
+// the accepted side. Real TCP (not net.Pipe) so relay's CloseWrite half-close
+// works and writes are buffered rather than synchronous.
+func tcpPair(t *testing.T) (dial, accept net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		c, err := ln.Accept()
+		ch <- res{c, err}
+	}()
+	dial, err = net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	r := <-ch
+	if r.err != nil {
+		t.Fatalf("accept: %v", r.err)
+	}
+	return dial, r.c
+}
+
 func TestRelayCountsBytesBothDirections(t *testing.T) {
-	// a1/a2 is the sandbox side, b1/b2 the upstream side.
-	a1, a2 := net.Pipe()
-	b1, b2 := net.Pipe()
+	sandboxClient, a := tcpPair(t) // a is relay's sandbox side
+	b, upstream := tcpPair(t)      // b is relay's upstream side
 
 	var up, down int64
 	done := make(chan struct{})
 	go func() {
-		up, down = relay(a2, b1)
+		up, down = relay(a, b)
 		close(done)
 	}()
 
-	// Sandbox → upstream: 5 bytes. Upstream → sandbox: 11 bytes.
+	// Upstream reads the request, replies, then closes (EOF to relay's b→a).
 	go func() {
-		a1.Write([]byte("hello"))
-		a1.Close()
+		buf := make([]byte, 5)
+		io.ReadFull(upstream, buf)
+		upstream.Write([]byte("world-reply"))
+		upstream.Close()
 	}()
-	go func() {
-		// Drain whatever upstream receives.
-		io.Copy(io.Discard, b2)
-	}()
-	b2.Write([]byte("world-reply"))
-	b2.Close()
+
+	// Sandbox sends 5 bytes, half-closes (EOF to relay's a→b), reads the reply.
+	sandboxClient.Write([]byte("hello"))
+	sandboxClient.(*net.TCPConn).CloseWrite()
+	io.ReadAll(sandboxClient)
+	sandboxClient.Close()
 
 	<-done
 	if up != 5 {
