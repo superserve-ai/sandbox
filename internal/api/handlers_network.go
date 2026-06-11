@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"time"
@@ -44,9 +45,19 @@ type networkEvent struct {
 	ts time.Time // unexported, for the merge sort
 }
 
+// networkResponse wraps the event page with cursor metadata so clients can
+// paginate without inferring the cursor from the rows themselves.
+type networkResponse struct {
+	Data       []networkEvent `json:"data"`
+	NextCursor *string        `json:"next_cursor"`
+	HasMore    bool           `json:"has_more"`
+}
+
 // GetSandboxNetwork returns the unified per-sandbox egress log: connection rows
 // (net_flow) and request rows (proxy_audit) merged into one time-ordered
-// stream, most recent first. Paginate with before=<ts> from the last row.
+// stream, most recent first. Supports an optional time window (since/before)
+// and verdict filter; before is also the pagination cursor. The response wraps
+// the rows with next_cursor and has_more.
 func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
@@ -74,7 +85,17 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
-	before, err := parseNetworkBefore(c.Query("before"))
+	before, err := parseNetworkTime(c.Query("before"), "before")
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	since, err := parseNetworkTime(c.Query("since"), "since")
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	verdict, err := parseNetworkVerdict(c.Query("verdict"))
 	if err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
@@ -84,20 +105,25 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 	// Fetch a full page from each source; merging then trimming to `limit`
 	// yields the correct newest-first window across both.
 	flows, err := h.DB.ListNetFlowEvents(ctx, db.ListNetFlowEventsParams{
-		SandboxID: sandboxID, Before: before, RowLimit: limit,
+		SandboxID: sandboxID, Before: before, Since: since, Verdict: verdict, RowLimit: limit,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListNetFlowEvents failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	requests, err := h.DB.ListProxyAuditEvents(ctx, db.ListProxyAuditEventsParams{
-		SandboxID: sandboxID, Before: before, RowLimit: limit,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListProxyAuditEvents failed")
-		respondError(c, ErrInternal)
-		return
+	// Request rows carry no verdict, so a verdict filter restricts the result
+	// to connection rows.
+	var requests []db.ProxyAudit
+	if verdict == nil {
+		requests, err = h.DB.ListProxyAuditEvents(ctx, db.ListProxyAuditEventsParams{
+			SandboxID: sandboxID, Before: before, Since: since, RowLimit: limit,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListProxyAuditEvents failed")
+			respondError(c, ErrInternal)
+			return
+		}
 	}
 
 	merged := make([]networkEvent, 0, len(flows)+len(requests))
@@ -108,10 +134,19 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 		merged = append(merged, requestToEvent(r))
 	}
 	sort.Slice(merged, func(i, j int) bool { return merged[i].ts.After(merged[j].ts) })
+
+	// More rows remain if either source filled its page, or the merge held more
+	// than one page's worth (the trimmed remainder is also "more").
+	hasMore := len(flows) == int(limit) || len(requests) == int(limit) || len(merged) > int(limit)
 	if len(merged) > int(limit) {
 		merged = merged[:limit]
 	}
-	c.JSON(http.StatusOK, merged)
+	var nextCursor *string
+	if hasMore && len(merged) > 0 {
+		cursor := merged[len(merged)-1].Ts
+		nextCursor = &cursor
+	}
+	c.JSON(http.StatusOK, networkResponse{Data: merged, NextCursor: nextCursor, HasMore: hasMore})
 }
 
 func flowToEvent(f db.NetFlow) networkEvent {
@@ -154,14 +189,28 @@ func requestToEvent(r db.ProxyAudit) networkEvent {
 	return ev
 }
 
-// parseNetworkBefore parses the ?before= cursor (RFC3339). Empty = most recent.
-func parseNetworkBefore(raw string) (pgtype.Timestamptz, error) {
+// parseNetworkTime parses an RFC3339 time-window param (before/since). Empty
+// leaves the bound unset.
+func parseNetworkTime(raw, param string) (pgtype.Timestamptz, error) {
 	if raw == "" {
 		return pgtype.Timestamptz{}, nil
 	}
 	t, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		return pgtype.Timestamptz{}, errors.New("before must be an RFC3339 timestamp")
+		return pgtype.Timestamptz{}, fmt.Errorf("%s must be an RFC3339 timestamp", param)
 	}
 	return pgtype.Timestamptz{Time: t, Valid: true}, nil
+}
+
+// parseNetworkVerdict validates the optional ?verdict= filter. Empty = no
+// filter (nil); a verdict restricts results to connection rows.
+func parseNetworkVerdict(raw string) (*string, error) {
+	switch raw {
+	case "":
+		return nil, nil
+	case "allowed", "blocked", "failed":
+		return &raw, nil
+	default:
+		return nil, errors.New("verdict must be one of allowed, blocked, failed")
+	}
 }

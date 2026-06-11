@@ -606,27 +606,39 @@ paths:
         credential was injected). Fields not relevant to a row's kind are
         omitted.
 
-        Paginate with `before=<ts>` using the `ts` of the last row from the
-        previous page; `limit` defaults to 50 and is capped at 200.
+        Filter by time window (`since`/`before`) and `verdict`. Paginate by
+        passing the response's `next_cursor` as `before` while `has_more` is
+        true. A `verdict` filter returns only `connection` rows, since request
+        rows carry no verdict.
       security:
         - apiKey: []
       parameters:
         - $ref: "#/components/parameters/AuditLimit"
         - name: before
           in: query
-          description: Return rows older than this RFC3339 timestamp.
+          description: Return rows strictly older than this RFC3339 timestamp. Also the pagination cursor.
           schema:
             type: string
             format: date-time
+        - name: since
+          in: query
+          description: Return rows at or newer than this RFC3339 timestamp.
+          schema:
+            type: string
+            format: date-time
+        - name: verdict
+          in: query
+          description: Filter to connection rows with this verdict. Excludes request rows.
+          schema:
+            type: string
+            enum: [allowed, blocked, failed]
       responses:
         "200":
-          description: Network events (most recent first)
+          description: A page of network events (most recent first)
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/NetworkEvent"
+                $ref: "#/components/schemas/NetworkEventPage"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1950,6 +1962,24 @@ components:
           type: string
           nullable: true
           description: Stable error tag when the proxy denied or failed the request.
+
+    NetworkEventPage:
+      type: object
+      required: [data, next_cursor, has_more]
+      description: A page of network events with pagination metadata.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkEvent"
+        next_cursor:
+          type: string
+          format: date-time
+          nullable: true
+          description: Pass as `before` to fetch the next page. Null when has_more is false.
+        has_more:
+          type: boolean
+          description: Whether more rows exist beyond this page.
 
     NetworkEvent:
       type: object

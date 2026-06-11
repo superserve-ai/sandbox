@@ -303,20 +303,28 @@ const listProxyAuditEvents = `-- name: ListProxyAuditEvents :many
 SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
 WHERE sandbox_id = $1
   AND ($2::timestamptz IS NULL OR ts < $2::timestamptz)
+  AND ($3::timestamptz IS NULL OR ts >= $3::timestamptz)
 ORDER BY ts DESC
-LIMIT $3
+LIMIT $4
 `
 
 type ListProxyAuditEventsParams struct {
 	SandboxID uuid.UUID          `json:"sandbox_id"`
 	Before    pgtype.Timestamptz `json:"before"`
+	Since     pgtype.Timestamptz `json:"since"`
 	RowLimit  int32              `json:"row_limit"`
 }
 
-// Request rows for the unified per-sandbox network log. Paginated by timestamp
-// ($2) to merge cleanly with net_flow connection rows in the handler.
+// Request rows for the unified per-sandbox network log, filtered by an optional
+// time window (before/since); before doubles as the pagination cursor. Merged
+// with net_flow connection rows in the handler.
 func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEventsParams) ([]ProxyAudit, error) {
-	rows, err := q.db.Query(ctx, listProxyAuditEvents, arg.SandboxID, arg.Before, arg.RowLimit)
+	rows, err := q.db.Query(ctx, listProxyAuditEvents,
+		arg.SandboxID,
+		arg.Before,
+		arg.Since,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

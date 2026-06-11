@@ -69,14 +69,28 @@ func TestRequestToEventNullSecret(t *testing.T) {
 	}
 }
 
-func TestParseNetworkBefore(t *testing.T) {
-	if got, err := parseNetworkBefore(""); err != nil || got.Valid {
+func TestParseNetworkTime(t *testing.T) {
+	if got, err := parseNetworkTime("", "before"); err != nil || got.Valid {
 		t.Errorf("empty should be (invalid, nil), got (%v, %v)", got, err)
 	}
-	if got, err := parseNetworkBefore("2026-06-09T12:00:00Z"); err != nil || !got.Valid {
+	if got, err := parseNetworkTime("2026-06-09T12:00:00Z", "since"); err != nil || !got.Valid {
 		t.Errorf("valid RFC3339 should parse, got (%v, %v)", got, err)
 	}
-	if _, err := parseNetworkBefore("not-a-time"); err == nil {
+	if _, err := parseNetworkTime("not-a-time", "since"); err == nil {
 		t.Error("garbage timestamp should error")
+	}
+}
+
+func TestParseNetworkVerdict(t *testing.T) {
+	if got, err := parseNetworkVerdict(""); err != nil || got != nil {
+		t.Errorf("empty should be (nil, nil), got (%v, %v)", got, err)
+	}
+	for _, v := range []string{"allowed", "blocked", "failed"} {
+		if got, err := parseNetworkVerdict(v); err != nil || got == nil || *got != v {
+			t.Errorf("%q should parse, got (%v, %v)", v, got, err)
+		}
+	}
+	if _, err := parseNetworkVerdict("bogus"); err == nil {
+		t.Error("invalid verdict should error")
 	}
 }

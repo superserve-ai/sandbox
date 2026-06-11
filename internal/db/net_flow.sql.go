@@ -68,22 +68,32 @@ const listNetFlowEvents = `-- name: ListNetFlowEvents :many
 SELECT id, ts, team_id, sandbox_id, protocol, host, dst_ip, dst_port, verdict, match_rule, bytes_sent, bytes_recv, duration_ms FROM net_flow
 WHERE sandbox_id = $1
   AND ($2::timestamptz IS NULL OR ts < $2::timestamptz)
+  AND ($3::timestamptz IS NULL OR ts >= $3::timestamptz)
+  AND ($4::text IS NULL OR verdict = $4::text)
 ORDER BY ts DESC
-LIMIT $3
+LIMIT $5
 `
 
 type ListNetFlowEventsParams struct {
 	SandboxID uuid.UUID          `json:"sandbox_id"`
 	Before    pgtype.Timestamptz `json:"before"`
+	Since     pgtype.Timestamptz `json:"since"`
+	Verdict   *string            `json:"verdict"`
 	RowLimit  int32              `json:"row_limit"`
 }
 
-// Connection rows for the unified network log. Paginated by timestamp ($2):
-// null returns the most recent rows, otherwise rows strictly older than $2.
+// Connection rows for the unified network log. Filtered by an optional time
+// window (before/since) and verdict; before doubles as the pagination cursor.
 // The merge with proxy_audit happens in the handler; the cursor is a timestamp
 // because the two tables have independent id sequences.
 func (q *Queries) ListNetFlowEvents(ctx context.Context, arg ListNetFlowEventsParams) ([]NetFlow, error) {
-	rows, err := q.db.Query(ctx, listNetFlowEvents, arg.SandboxID, arg.Before, arg.RowLimit)
+	rows, err := q.db.Query(ctx, listNetFlowEvents,
+		arg.SandboxID,
+		arg.Before,
+		arg.Since,
+		arg.Verdict,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
