@@ -115,6 +115,21 @@ var providerShortcuts = map[string]providerShortcut{
 		Hosts:      []string{"api.perplexity.ai"},
 		Token:      tokenSpec{Prefix: "pplx-", BodyLen: 48, Alphabet: "alnum"},
 	},
+	"exa": {
+		Display:    "Exa",
+		AuthType:   "api-key",
+		AuthConfig: map[string]any{"header": "x-api-key"},
+		Hosts:      []string{"api.exa.ai"},
+		// Exa keys have no documented prefix; mint a prefixless body.
+		Token: tokenSpec{BodyLen: 32, Alphabet: "alnum"},
+	},
+	"firecrawl": {
+		Display:    "Firecrawl",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.firecrawl.dev"},
+		Token:      tokenSpec{Prefix: "fc-", BodyLen: 36, Alphabet: "alnum"},
+	},
 }
 
 // defaultTokenSpec mints tokens for explicit-auth credentials (no provider shortcut).
@@ -1099,7 +1114,7 @@ type SecretBindingMeta struct {
 func mintProxyToken(providerShortcut *string) (string, error) {
 	spec := defaultTokenSpec
 	if providerShortcut != nil {
-		if sc, ok := providerShortcuts[*providerShortcut]; ok && sc.Token.Prefix != "" {
+		if sc, ok := providerShortcuts[*providerShortcut]; ok && sc.Token.BodyLen > 0 {
 			spec = sc.Token
 		}
 	}
