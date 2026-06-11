@@ -47,6 +47,11 @@ type EgressProxy struct {
 	sinkMu   sync.RWMutex
 	flowSink FlowSink
 
+	// blocklist is the global egress denylist (nil = disabled). Checked
+	// before per-sandbox rules; a blocklist hit cannot be overridden by a
+	// sandbox's own allow rules.
+	blocklist *Blocklist
+
 	// sandboxRules maps sandbox host IPs to their egress config.
 	mu    sync.RWMutex
 	rules map[string]*EgressRules // key = sandbox host IP
@@ -103,6 +108,12 @@ func (p *EgressProxy) RegisterSandbox(hostIP, sandboxID string) {
 	} else {
 		p.rules[hostIP] = &EgressRules{SandboxID: sandboxID}
 	}
+}
+
+// SetBlocklist attaches the global egress denylist. Must be called before
+// Start; the blocklist's own snapshot swapping handles later updates.
+func (p *EgressProxy) SetBlocklist(b *Blocklist) {
+	p.blocklist = b
 }
 
 // SetRules updates the egress rules for a sandbox identified by its host IP.
@@ -259,10 +270,9 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		peekedData = buf
 	}
 
-	// Check egress rules.
+	// Identify the sandbox up front so every block path (global blocklist,
+	// per-sandbox rule, dial-time) can attribute a flow-log row.
 	rules := p.getRules(srcHost)
-	allowed, matchType := p.isAllowed(rules, hostname, dstIP)
-
 	var sandboxID string
 	if rules != nil {
 		sandboxID = rules.SandboxID
@@ -273,8 +283,30 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		Host:      hostname,
 		DstIP:     dstIP.String(),
 		DstPort:   int32(dstPort),
-		MatchRule: matchType,
 	}
+
+	// Global blocklist first — a hit here cannot be overridden by the
+	// sandbox's own allow rules.
+	if p.blocklist != nil {
+		if blocked, dim := p.blocklist.Blocked(hostname, dstIP); blocked {
+			p.log.Warn().
+				Str("src", srcHost).
+				Str("dst", dstIP.String()).
+				Str("hostname", hostname).
+				Str("match", dim).
+				Msg("egress blocked by global blocklist")
+			if sandboxID != "" {
+				flow.Verdict = "blocked"
+				flow.MatchRule = "blocklist"
+				p.getFlowSink().Emit(flow)
+			}
+			return
+		}
+	}
+
+	// Check egress rules.
+	allowed, matchType := p.isAllowed(rules, hostname, dstIP)
+	flow.MatchRule = matchType
 
 	if !allowed {
 		p.log.Info().
@@ -299,10 +331,11 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		upstreamAddr = net.JoinHostPort(dstIP.String(), fmt.Sprintf("%d", dstPort))
 	}
 
-	// Dial upstream with DNS rebinding protection. ipDenied distinguishes an
-	// internal-IP rejection from a plain dial failure for logging. Atomic
-	// because Control may run on parallel dial goroutines for dual-stack hosts.
-	var ipDenied atomic.Bool
+	// Dial upstream with DNS rebinding protection. The flags distinguish a
+	// policy block (internal-IP guard or blocklist, caught once the hostname
+	// resolves) from a plain dial failure, for logging. Atomic because Control
+	// may run on parallel dial goroutines for dual-stack hosts.
+	var ipDenied, dialBlocklisted atomic.Bool
 	dialer := &net.Dialer{
 		Timeout: upstreamDialTimeout,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -315,6 +348,12 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 				ipDenied.Store(true)
 				return fmt.Errorf("blocked: hostname resolved to internal IP %s", resolved)
 			}
+			if resolved != nil && p.blocklist != nil {
+				if blocked, _ := p.blocklist.Blocked("", resolved); blocked {
+					dialBlocklisted.Store(true)
+					return fmt.Errorf("blocked: hostname resolved to blocklisted IP %s", resolved)
+				}
+			}
 			return nil
 		},
 	}
@@ -323,11 +362,16 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	if err != nil {
 		p.log.Debug().Err(err).Str("upstream", upstreamAddr).Msg("dial failed")
 		if sandboxID != "" {
-			// Internal-IP rejection is a policy block; anything else failed to connect.
-			if ipDenied.Load() {
+			// A resolved-IP rejection is a policy block; anything else failed
+			// to connect.
+			switch {
+			case dialBlocklisted.Load():
+				flow.Verdict = "blocked"
+				flow.MatchRule = "blocklist"
+			case ipDenied.Load():
 				flow.Verdict = "blocked"
 				flow.MatchRule = "internal-ip"
-			} else {
+			default:
 				flow.Verdict = "failed"
 			}
 			p.getFlowSink().Emit(flow)
