@@ -152,6 +152,35 @@ var providerShortcuts = map[string]providerShortcut{
 		// Cloudflare API tokens are a 40-char alphanumeric string with no prefix.
 		Token: tokenSpec{BodyLen: 40, Alphabet: "alnum"},
 	},
+	"asana": {
+		Display:    "Asana",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"app.asana.com"},
+		// Asana tokens are opaque with no stable prefix.
+		Token: tokenSpec{BodyLen: 32, Alphabet: "alnum"},
+	},
+	"sentry": {
+		Display:    "Sentry",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"sentry.io"},
+		Token:      tokenSpec{Prefix: "sntrys_", BodyLen: 32, Alphabet: "alnum"},
+	},
+	"resend": {
+		Display:    "Resend",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.resend.com"},
+		Token:      tokenSpec{Prefix: "re_", BodyLen: 24, Alphabet: "alnum"},
+	},
+	"notion": {
+		Display:    "Notion",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.notion.com"},
+		Token:      tokenSpec{Prefix: "ntn_", BodyLen: 43, Alphabet: "alnum"},
+	},
 }
 
 // defaultTokenSpec mints tokens for explicit-auth credentials (no provider shortcut).

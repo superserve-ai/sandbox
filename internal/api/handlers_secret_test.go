@@ -550,7 +550,7 @@ func TestMergeEnvVarsWithSecretsNoBindingsIsCheap(t *testing.T) {
 }
 
 func TestKnownProvidersStable(t *testing.T) {
-	want := []string{"anthropic", "cloudflare", "exa", "firecrawl", "gemini", "github", "gitlab", "linear", "openai", "perplexity", "slack", "stripe", "vercel", "xai"}
+	want := []string{"anthropic", "asana", "cloudflare", "exa", "firecrawl", "gemini", "github", "gitlab", "linear", "notion", "openai", "perplexity", "resend", "sentry", "slack", "stripe", "vercel", "xai"}
 	got := knownProviders()
 	if len(got) != len(want) {
 		t.Fatalf("provider count drift: want %d (%v), got %d (%v)", len(want), want, len(got), got)
