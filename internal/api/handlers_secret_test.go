@@ -550,7 +550,7 @@ func TestMergeEnvVarsWithSecretsNoBindingsIsCheap(t *testing.T) {
 }
 
 func TestKnownProvidersStable(t *testing.T) {
-	want := []string{"anthropic", "github", "linear", "openai", "slack", "stripe"}
+	want := []string{"anthropic", "gemini", "github", "linear", "openai", "perplexity", "slack", "stripe", "xai"}
 	got := knownProviders()
 	if len(got) != len(want) {
 		t.Fatalf("provider count drift: want %d (%v), got %d (%v)", len(want), want, len(got), got)
@@ -697,7 +697,7 @@ func TestValidateAuthConfigRejectsMixingLegacyAndPerHost(t *testing.T) {
 func TestResolveAuthEmitsPerHostShape(t *testing.T) {
 	// Explicit per-host secret → auth_type=per_host, auth_config carries the rules.
 	req := createSecretRequest{
-		Name:  "gh", Value: "github_pat_xxx",
+		Name: "gh", Value: "github_pat_xxx",
 		Auth: &authConfigRequest{
 			PerHost: []perHostRule{
 				{Hosts: []string{"api.github.com"}, Type: "bearer"},
@@ -802,10 +802,10 @@ func TestRejectOverbroadWildcardOnPublicSuffix(t *testing.T) {
 		{"*.example.com", false},
 		{"*.example.co.uk", false},
 		{"*.bbc.co.uk", false},
-		{"*.com", true},     // public suffix
-		{"*.co.uk", true},   // multi-label public suffix
-		{"*.io", true},      // public suffix
-		{"*.us", true},      // public suffix
+		{"*.com", true},            // public suffix
+		{"*.co.uk", true},          // multi-label public suffix
+		{"*.io", true},             // public suffix
+		{"*.us", true},             // public suffix
 		{"*.example.local", false}, // private TLD not in PSL
 	}
 	for _, c := range cases {

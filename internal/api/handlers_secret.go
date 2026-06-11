@@ -93,6 +93,28 @@ var providerShortcuts = map[string]providerShortcut{
 		Hosts:      []string{"api.linear.app"},
 		Token:      tokenSpec{Prefix: "lin_api_", BodyLen: 32, Alphabet: "alnum"},
 	},
+	"xai": {
+		Display:    "xAI",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.x.ai"},
+		Token:      tokenSpec{Prefix: "xai-", BodyLen: 80, Alphabet: "alnum"},
+	},
+	"gemini": {
+		// Native API takes the key in the x-goog-api-key header.
+		Display:    "Google Gemini",
+		AuthType:   "api-key",
+		AuthConfig: map[string]any{"header": "x-goog-api-key"},
+		Hosts:      []string{"generativelanguage.googleapis.com"},
+		Token:      tokenSpec{Prefix: "AIza", BodyLen: 35, Alphabet: "b64url"},
+	},
+	"perplexity": {
+		Display:    "Perplexity",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.perplexity.ai"},
+		Token:      tokenSpec{Prefix: "pplx-", BodyLen: 48, Alphabet: "alnum"},
+	},
 }
 
 // defaultTokenSpec mints tokens for explicit-auth credentials (no provider shortcut).
