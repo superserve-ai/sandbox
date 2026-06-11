@@ -130,6 +130,28 @@ var providerShortcuts = map[string]providerShortcut{
 		Hosts:      []string{"api.firecrawl.dev"},
 		Token:      tokenSpec{Prefix: "fc-", BodyLen: 36, Alphabet: "alnum"},
 	},
+	"gitlab": {
+		Display:    "GitLab",
+		AuthType:   "api-key",
+		AuthConfig: map[string]any{"header": "PRIVATE-TOKEN"},
+		Hosts:      []string{"gitlab.com"},
+		Token:      tokenSpec{Prefix: "glpat-", BodyLen: 20, Alphabet: "alnum"},
+	},
+	"vercel": {
+		Display:    "Vercel",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.vercel.com"},
+		Token:      tokenSpec{Prefix: "vcp_", BodyLen: 24, Alphabet: "alnum"},
+	},
+	"cloudflare": {
+		Display:    "Cloudflare",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.cloudflare.com"},
+		// Cloudflare API tokens are a 40-char alphanumeric string with no prefix.
+		Token: tokenSpec{BodyLen: 40, Alphabet: "alnum"},
+	},
 }
 
 // defaultTokenSpec mints tokens for explicit-auth credentials (no provider shortcut).
