@@ -277,6 +277,20 @@ func main() {
 		}
 	}
 
+	// ---- Guest DNS redirect (optional) ----
+	// VMD_DNS_REDIRECT_PORT routes all sandbox DNS (TCP+UDP/53) to a
+	// resolver the operator runs on that host port, regardless of the
+	// nameservers configured inside the guest. Unset = guest DNS goes
+	// out unmodified.
+	if v := os.Getenv("VMD_DNS_REDIRECT_PORT"); v != "" {
+		port, err := strconv.ParseUint(v, 10, 16)
+		if err != nil || port == 0 {
+			log.Fatal().Str("value", v).Msg("VMD_DNS_REDIRECT_PORT must be a port number (1-65535)")
+		}
+		netMgrOpts = append(netMgrOpts, network.WithDNSRedirectPort(uint16(port)))
+		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
+	}
+
 	// ---- Network manager + host firewall ----
 	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
