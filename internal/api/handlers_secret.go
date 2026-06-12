@@ -181,6 +181,13 @@ var providerShortcuts = map[string]providerShortcut{
 		Hosts:      []string{"api.notion.com"},
 		Token:      tokenSpec{Prefix: "ntn_", BodyLen: 43, Alphabet: "alnum"},
 	},
+	"openrouter": {
+		Display:    "OpenRouter",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"openrouter.ai"},
+		Token:      tokenSpec{Prefix: "sk-or-v1-", BodyLen: 64, Alphabet: "alnum"},
+	},
 }
 
 // defaultTokenSpec mints tokens for explicit-auth credentials (no provider shortcut).
