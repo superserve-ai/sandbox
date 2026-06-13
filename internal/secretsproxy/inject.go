@@ -6,9 +6,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
+
+	"github.com/superserve-ai/sandbox/internal/egresspolicy"
 )
 
 // InjectOutcome describes what the proxy decided for one request.
@@ -38,8 +41,9 @@ func injectRequest(
 	vault VaultClient,
 	req *http.Request,
 	upstreamHost string,
+	upstreamIP net.IP,
 ) (InjectOutcome, error) {
-	if allowed, reason := hostAllowedByEgress(upstreamHost, scope); !allowed {
+	if allowed, reason := hostAllowedByEgress(upstreamHost, upstreamIP, scope); !allowed {
 		return InjectOutcome{Action: denyAction, Reason: reason}, nil
 	}
 
@@ -124,48 +128,15 @@ func dispatchAuthShape(b Binding, upstreamHost string) (string, map[string]any, 
 	return "", nil, false
 }
 
-// hostAllowedByEgress applies allow → deny → unmatched_host_policy in order;
-// an allow-list match short-circuits before deny is consulted.
-func hostAllowedByEgress(host string, scope *Scope) (bool, string) {
-	host = strings.ToLower(host)
-
-	for _, a := range scope.Allow {
-		if matchHost(host, a) {
-			return true, ""
-		}
-	}
-	for _, d := range scope.Deny {
-		if matchHost(host, d) {
-			return false, "host_denied"
-		}
-	}
-	if len(scope.Allow) > 0 {
-		return false, "host_not_allowed"
-	}
-	switch scope.UnmatchedHostPolicy {
-	case "deny":
-		return false, "unmatched_host_denied"
-	default:
-		return true, ""
-	}
+// hostAllowedByEgress evaluates the scope's egress policy; upstreamIP is used
+// for CIDR rules.
+func hostAllowedByEgress(host string, upstreamIP net.IP, scope *Scope) (bool, string) {
+	return egresspolicy.EvalEgress(host, upstreamIP, scope.Allow, scope.Deny, scope.UnmatchedHostPolicy)
 }
 
 // matchHost compares host to pattern; supports exact and `*.suffix` wildcard.
 func matchHost(host, pattern string) bool {
-	p := strings.ToLower(strings.TrimSpace(pattern))
-	if p == "" {
-		return false
-	}
-	if p == host {
-		return true
-	}
-	if strings.HasPrefix(p, "*.") {
-		suffix := p[1:]
-		if strings.HasSuffix(host, suffix) && host != suffix[1:] {
-			return true
-		}
-	}
-	return false
+	return egresspolicy.MatchHost(host, pattern)
 }
 
 // hostMatchesCredential checks host against the credential's allowed list.

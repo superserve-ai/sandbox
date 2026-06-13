@@ -22,6 +22,7 @@ import (
 	yaml "go.yaml.in/yaml/v3"
 
 	dbq "github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/egresspolicy"
 	"github.com/superserve-ai/sandbox/internal/secretsproxy"
 )
 
@@ -91,6 +92,7 @@ func run() error {
 		log.Warn().Err(err).Msg("could not load blocked egress ports; port policy disabled")
 	}
 
+	dnsResolver := buildPolicyResolver(cfg.UpstreamResolverAddr)
 	proxy := secretsproxy.NewProxy(cfg.ProxyAddr, secretsproxy.Options{
 		CA:                  ca,
 		Resolver:            resolver,
@@ -99,8 +101,10 @@ func run() error {
 		Revoker:             revoker,
 		SandboxFacingHost:   cfg.SandboxFacingHost,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
-		UpstreamTransport:   buildUpstreamTransport(cfg.UpstreamResolverAddr),
+		UpstreamTransport:   buildUpstreamTransport(dnsResolver),
 		BlockedPorts:        blockedPorts,
+		BlockInternalAddrs:  true,
+		DNSResolver:         dnsResolver,
 	})
 	if cfg.UpstreamResolverAddr != "" {
 		log.Info().Str("resolver", cfg.UpstreamResolverAddr).Msg("upstream name resolution routed through policy resolver")
@@ -177,11 +181,33 @@ func loadBlockedPorts(path string) ([]int, error) {
 	return doc.BlockedEgressPorts, nil
 }
 
-// buildUpstreamTransport builds the upstream transport. When resolverAddr is
-// set, upstream DNS is sent there so name resolution follows the same egress
-// policy as guest traffic.
-func buildUpstreamTransport(resolverAddr string) *http.Transport {
-	t := &http.Transport{
+// buildPolicyResolver returns a resolver that sends queries to resolverAddr so
+// resolution follows the same egress policy as guest traffic. A nil result
+// (resolverAddr unset) means the default resolver.
+func buildPolicyResolver(resolverAddr string) *net.Resolver {
+	if resolverAddr == "" {
+		return nil
+	}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, network, resolverAddr)
+		},
+	}
+}
+
+// buildUpstreamTransport builds the upstream transport, resolving through res
+// and applying the internal-IP guard on every dial.
+func buildUpstreamTransport(res *net.Resolver) *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   denyInternalDial,
+		Resolver:  res,
+	}
+	return &http.Transport{
+		DialContext:           dialer.DialContext,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -189,19 +215,19 @@ func buildUpstreamTransport(resolverAddr string) *http.Transport {
 		ResponseHeaderTimeout: 30 * time.Second,
 		ForceAttemptHTTP2:     false,
 	}
-	if resolverAddr == "" {
-		return t
+}
+
+// denyInternalDial rejects dials to internal ranges. Running on the resolved
+// address, it catches IP-literal targets and hostnames that resolve internally.
+func denyInternalDial(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
 	}
-	res := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(ctx, network, resolverAddr)
-		},
+	if ip := net.ParseIP(host); ip != nil && egresspolicy.IsIPDenied(ip) {
+		return fmt.Errorf("blocked: internal address %s", ip)
 	}
-	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Resolver: res}
-	t.DialContext = dialer.DialContext
-	return t
+	return nil
 }
 
 type config struct {

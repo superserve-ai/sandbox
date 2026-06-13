@@ -72,6 +72,8 @@ type Proxy struct {
 	sandboxFacingHost   string
 	maxRequestBodyBytes int64
 	blockedPorts        map[int]bool
+	blockInternalAddrs  bool
+	dnsResolver         *net.Resolver
 }
 
 // Options carries Proxy dependencies. Nil Logger, Vault, Audit, and UpstreamTransport
@@ -95,6 +97,13 @@ type Options struct {
 	// BlockedPorts lists egress ports the proxy refuses to tunnel to,
 	// matching the operator's host-firewall port policy.
 	BlockedPorts []int
+
+	// BlockInternalAddrs rejects CONNECTs to internal-range IP literals.
+	BlockInternalAddrs bool
+
+	// DNSResolver resolves upstream hosts for CIDR egress rules. Nil uses the
+	// default resolver.
+	DNSResolver *net.Resolver
 }
 
 const defaultMaxRequestBodyBytes int64 = 256 * 1024 * 1024
@@ -144,6 +153,8 @@ func NewProxy(addr string, opts Options) *Proxy {
 		sandboxFacingHost:   opts.SandboxFacingHost,
 		maxRequestBodyBytes: maxBody,
 		blockedPorts:        blockedPorts,
+		blockInternalAddrs:  opts.BlockInternalAddrs,
+		dnsResolver:         opts.DNSResolver,
 	}
 
 	p.tlsConfig = &tls.Config{
@@ -226,6 +237,24 @@ func (p *Proxy) isBlockedPort(portStr string) bool {
 		return false
 	}
 	return p.blockedPorts[port]
+}
+
+// resolveUpstreamIP resolves host to a single IP for CIDR rule evaluation. An
+// IP-literal host is returned as-is; a resolution failure returns nil, which
+// never matches a CIDR rule.
+func (p *Proxy) resolveUpstreamIP(ctx context.Context, host string) net.IP {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip
+	}
+	r := p.dnsResolver
+	if r == nil {
+		r = net.DefaultResolver
+	}
+	ips, err := r.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return nil
+	}
+	return ips[0]
 }
 
 // remoteHost extracts the host portion (no port) from r.RemoteAddr.

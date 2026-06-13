@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/superserve-ai/sandbox/internal/egresspolicy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
@@ -64,6 +65,16 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.logger.Warn("blocked egress port", "sandbox", scope.SandboxID, "host", host, "port", port)
 		http.Error(w, "destination port blocked by policy", http.StatusForbidden)
 		return
+	}
+
+	// IP-literal targets in an internal range are rejected here; hostnames that
+	// resolve to an internal IP are caught by the upstream dialer.
+	if p.blockInternalAddrs {
+		if ip := net.ParseIP(host); ip != nil && egresspolicy.IsIPDenied(ip) {
+			p.logger.Warn("blocked internal address", "sandbox", scope.SandboxID, "host", host)
+			http.Error(w, "destination address blocked by policy", http.StatusForbidden)
+			return
+		}
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -230,7 +241,12 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 		// Pipeline runs when both Vault and a non-empty Scope are wired; otherwise pass through.
 		var matchedSecretIDs []string
 		if scope != nil && p.vault != nil {
-			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host)
+			// Resolve the upstream only when CIDR rules need an IP to match.
+			var upstreamIP net.IP
+			if egresspolicy.HasCIDR(scope.Allow) || egresspolicy.HasCIDR(scope.Deny) {
+				upstreamIP = p.resolveUpstreamIP(ctx, host)
+			}
+			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP)
 			if ierr != nil {
 				p.logger.Warn("inject pipeline failed",
 					"host", host, "sandbox", scope.SandboxID, "err", ierr.Error())

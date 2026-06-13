@@ -64,7 +64,7 @@ func sandboxWithBindings(allow, deny []string, bindings map[string]Binding) *Sco
 func TestHostAllowedByEgress(t *testing.T) {
 	t.Run("passthrough default when no rules", func(t *testing.T) {
 		st := sandboxWithBindings(nil, nil, nil)
-		ok, _ := hostAllowedByEgress("api.openai.com", st)
+		ok, _ := hostAllowedByEgress("api.openai.com", nil, st)
 		if !ok {
 			t.Error("want allow on empty rules + passthrough policy")
 		}
@@ -72,7 +72,7 @@ func TestHostAllowedByEgress(t *testing.T) {
 	t.Run("deny policy + no rules blocks all", func(t *testing.T) {
 		st := sandboxWithBindings(nil, nil, nil)
 		st.UnmatchedHostPolicy = "deny"
-		ok, reason := hostAllowedByEgress("api.openai.com", st)
+		ok, reason := hostAllowedByEgress("api.openai.com", nil, st)
 		if ok {
 			t.Error("want deny under default-deny policy")
 		}
@@ -82,14 +82,14 @@ func TestHostAllowedByEgress(t *testing.T) {
 	})
 	t.Run("allow short-circuits before deny", func(t *testing.T) {
 		st := sandboxWithBindings([]string{"api.openai.com"}, []string{"0.0.0.0/0"}, nil)
-		ok, _ := hostAllowedByEgress("api.openai.com", st)
+		ok, _ := hostAllowedByEgress("api.openai.com", nil, st)
 		if !ok {
 			t.Error("allow match should win even with a broad deny configured")
 		}
 	})
 	t.Run("non-allow falls through to deny then implicit-deny", func(t *testing.T) {
 		st := sandboxWithBindings([]string{"api.openai.com"}, nil, nil)
-		ok, reason := hostAllowedByEgress("evil.com", st)
+		ok, reason := hostAllowedByEgress("evil.com", nil, st)
 		if ok {
 			t.Error("want implicit-deny when allow list non-empty and no match")
 		}
@@ -99,10 +99,10 @@ func TestHostAllowedByEgress(t *testing.T) {
 	})
 	t.Run("wildcard host matches", func(t *testing.T) {
 		st := sandboxWithBindings([]string{"*.openai.com"}, nil, nil)
-		if ok, _ := hostAllowedByEgress("api.openai.com", st); !ok {
+		if ok, _ := hostAllowedByEgress("api.openai.com", nil, st); !ok {
 			t.Error("wildcard should match subdomain")
 		}
-		if ok, _ := hostAllowedByEgress("other.com", st); ok {
+		if ok, _ := hostAllowedByEgress("other.com", nil, st); ok {
 			t.Error("wildcard should not match unrelated host")
 		}
 	})
@@ -124,7 +124,7 @@ func TestBearerInjectionEndToEnd(t *testing.T) {
 		"User-Agent":    "agent/1.0",
 	})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestBasicInjectionMatchesPasswordAndPreservesUser(t *testing.T) {
 		"Authorization": clientAuth,
 	})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "yoursite.atlassian.net")
+	out, err := injectRequest(context.Background(), st, vault, req, "yoursite.atlassian.net", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestBasicMatchRejectsWrongPassword(t *testing.T) {
 	wrong := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:other-tok"))
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": wrong})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestBasicInjectionFallsBackToXUserWhenAgentSendsNoUser(t *testing.T) {
 
 	emptyUser := "Basic " + base64.StdEncoding.EncodeToString([]byte(":"+tok))
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": emptyUser})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -220,11 +220,11 @@ func TestBasicInjectionFallsBackToXUserWhenAgentSendsNoUser(t *testing.T) {
 
 func TestDecodeBasicAuthEdgeCases(t *testing.T) {
 	cases := []struct {
-		name    string
-		header  string
-		ok      bool
-		user    string
-		pw      string
+		name   string
+		header string
+		ok     bool
+		user   string
+		pw     string
 	}{
 		{"not basic", "Bearer xyz", false, "", ""},
 		{"empty after Basic", "Basic ", false, "", ""},
@@ -257,7 +257,7 @@ func TestAPIKeyInjectionUsesConfiguredHeader(t *testing.T) {
 	req := newReq("POST", "api.anthropic.com", map[string]string{
 		"x-api-key": "sk-ant-proxy-aaa",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestAPIKeyInjectionWithPrefix(t *testing.T) {
 	vault := &stubVault{values: map[string]string{"sec-x": "REAL"}}
 
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": "ApiKey prox-tok"})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestCustomInjectionSetsMultipleHeaders(t *testing.T) {
 	req := newReq("POST", "api.acme.internal", map[string]string{
 		"X-Api-Key": "Bearer proxy-acme",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.acme.internal")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.acme.internal", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestStripThenSetStripsClientPlantedHeader(t *testing.T) {
 	})
 	req.Header.Add("Authorization", "Bearer planted-evil-key")
 
-	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +369,7 @@ func TestCustomTemplateRejectsCRLFInResolvedValue(t *testing.T) {
 	vault := &stubVault{values: map[string]string{"sec-bad": "innocent\r\nX-Evil: planted"}}
 
 	req := newReq("GET", "api.bad.example", map[string]string{"X-Token": "Bearer proxy-bad"})
-	_, err := injectRequest(context.Background(), st, vault, req, "api.bad.example")
+	_, err := injectRequest(context.Background(), st, vault, req, "api.bad.example", nil)
 	if err == nil {
 		t.Fatal("want CRLF-guard error")
 	}
@@ -382,7 +382,7 @@ func TestNoMatchingBindingFallsThroughToPassthrough(t *testing.T) {
 	req := newReq("GET", "api.openai.com", map[string]string{
 		"Authorization": "Bearer client-managed-key",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +407,7 @@ func TestCredentialHostMismatchDenied(t *testing.T) {
 	req := newReq("POST", "evil.example.com", map[string]string{
 		"Authorization": "Bearer proxy-openai-aaa",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "evil.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "evil.example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +433,7 @@ func TestRevokedCredentialSurfacesAsRevoked(t *testing.T) {
 	vault := &stubVault{err: ErrCredentialRevoked}
 
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": "Bearer proxy-tok"})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +568,7 @@ func TestPerHostDispatchPicksBearerForRESTHost(t *testing.T) {
 	req := newReq("GET", "api.github.com", map[string]string{
 		"Authorization": "Bearer " + proxyTok,
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.github.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.github.com", nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -588,7 +588,7 @@ func TestPerHostDispatchPicksBasicForGitHost(t *testing.T) {
 	inbound := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+proxyTok))
 	req := newReq("GET", "github.com", map[string]string{"Authorization": inbound})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "github.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "github.com", nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -614,7 +614,7 @@ func TestPerHostBasicUsernameOverridesInbound(t *testing.T) {
 
 	inbound := "Basic " + base64.StdEncoding.EncodeToString([]byte("agent-picked:"+tok))
 	req := newReq("GET", "git.example.com", map[string]string{"Authorization": inbound})
-	out, err := injectRequest(context.Background(), st, vault, req, "git.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "git.example.com", nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -644,7 +644,7 @@ func TestPerHostNoMatchingRuleDeniesAsHostMismatch(t *testing.T) {
 	req := newReq("GET", "raw.githubusercontent.com", map[string]string{
 		"Authorization": "Bearer " + tok,
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "raw.githubusercontent.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "raw.githubusercontent.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,13 +667,13 @@ func TestPerHostScannerMatchesBasicShapeOnRuleBindings(t *testing.T) {
 	vault := &stubVault{values: map[string]string{"sec-gh": "github_pat_REAL"}}
 
 	bearReq := newReq("GET", "api.github.com", map[string]string{"Authorization": "Bearer " + tok})
-	if out, _ := injectRequest(context.Background(), st, vault, bearReq, "api.github.com"); out.Action != "allow" {
+	if out, _ := injectRequest(context.Background(), st, vault, bearReq, "api.github.com", nil); out.Action != "allow" {
 		t.Errorf("bearer-shaped request must match bearer rule, got %+v", out)
 	}
 
 	basicHdr := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+tok))
 	basicReq := newReq("GET", "github.com", map[string]string{"Authorization": basicHdr})
-	if out, _ := injectRequest(context.Background(), st, vault, basicReq, "github.com"); out.Action != "allow" {
+	if out, _ := injectRequest(context.Background(), st, vault, basicReq, "github.com", nil); out.Action != "allow" {
 		t.Errorf("basic-shaped request must match basic rule, got %+v", out)
 	}
 }
@@ -712,7 +712,7 @@ func TestMultiBindingSwapsAllMatchedHeaders(t *testing.T) {
 		"X-Header-A": tokA,
 		"X-Header-B": tokB,
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -745,7 +745,7 @@ func TestMultiBindingDeterministicOrder(t *testing.T) {
 			"Authorization": "Bearer proxy-A",
 			"X-B":           "proxy-B",
 		})
-		out, _ := injectRequest(context.Background(), st, vault, req, "api.example.com")
+		out, _ := injectRequest(context.Background(), st, vault, req, "api.example.com", nil)
 		if len(out.MatchedSecretIDs) != 2 ||
 			out.MatchedSecretIDs[0] != "sec-A" || out.MatchedSecretIDs[1] != "sec-B" {
 			t.Fatalf("iteration %d: matched IDs not sorted: %v", i, out.MatchedSecretIDs)
@@ -777,7 +777,7 @@ func TestMultiBindingRevocationAbortsRequest(t *testing.T) {
 		"X-A": "proxy-A",
 		"X-B": "proxy-B",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com")
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

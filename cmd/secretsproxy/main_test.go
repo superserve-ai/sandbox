@@ -7,14 +7,32 @@ import (
 )
 
 func TestBuildUpstreamTransport(t *testing.T) {
-	// No resolver configured: keep the default DialContext (host resolver).
-	if got := buildUpstreamTransport(""); got.DialContext != nil {
-		t.Error("empty resolver address should leave DialContext unset")
+	// DialContext is always set so the internal-IP guard applies, whether or
+	// not a policy resolver is configured.
+	if got := buildUpstreamTransport(nil); got.DialContext == nil {
+		t.Error("DialContext should be set for the internal-IP guard without a resolver")
 	}
-	// Resolver configured: install a custom DialContext that routes name
-	// resolution through the policy resolver.
-	if got := buildUpstreamTransport("127.0.0.1:19053"); got.DialContext == nil {
-		t.Error("resolver address should install a custom DialContext")
+	if got := buildUpstreamTransport(buildPolicyResolver("127.0.0.1:19053")); got.DialContext == nil {
+		t.Error("DialContext should be set with a resolver")
+	}
+}
+
+func TestDenyInternalDial(t *testing.T) {
+	cases := []struct {
+		addr      string
+		wantBlock bool
+	}{
+		{"10.0.0.1:443", true},
+		{"169.254.169.254:443", true},
+		{"192.168.0.5:8080", true},
+		{"8.8.8.8:443", false},
+		{"1.1.1.1:80", false},
+	}
+	for _, c := range cases {
+		err := denyInternalDial("tcp", c.addr, nil)
+		if (err != nil) != c.wantBlock {
+			t.Errorf("denyInternalDial(%q) err=%v, wantBlock=%v", c.addr, err, c.wantBlock)
+		}
 	}
 }
 

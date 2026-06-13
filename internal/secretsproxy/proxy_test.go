@@ -289,6 +289,24 @@ func TestProxyRejectsBlockedPort(t *testing.T) {
 	}
 }
 
+func TestProxyRejectsInternalAddress(t *testing.T) {
+	resolver := &stubResolver{wantJWT: "good-jwt", scopeOut: &Scope{SandboxID: "sandbox-1", TeamID: "team-1"}}
+	proxyAddr, _, ca, _ := setupProxy(t, resolver, func(o *Options) {
+		o.BlockInternalAddrs = true
+	})
+
+	conn := dialProxy(t, proxyAddr, ca)
+	defer conn.Close()
+
+	status, ok := sendConnect(t, conn, "169.254.169.254:443", "good-jwt")
+	if ok {
+		t.Fatalf("CONNECT to an internal IP must fail; got %q", status)
+	}
+	if !strings.Contains(status, "403") {
+		t.Errorf("want 403 on internal address, got %q", status)
+	}
+}
+
 func TestIsBlockedPort(t *testing.T) {
 	p := NewProxy("127.0.0.1:0", Options{BlockedPorts: []int{4444, 3333}})
 	cases := []struct {
