@@ -76,6 +76,11 @@ func TestParseNetworkTime(t *testing.T) {
 	if got, err := parseNetworkTime("2026-06-09T12:00:00Z", "since"); err != nil || !got.Valid {
 		t.Errorf("valid RFC3339 should parse, got (%v, %v)", got, err)
 	}
+	// The next_cursor is sub-second; it must round-trip back through before/since.
+	sub := "2026-06-09T12:00:00.123456789Z"
+	if got, err := parseNetworkTime(sub, "before"); err != nil || !got.Valid || got.Time.Nanosecond() != 123456789 {
+		t.Errorf("sub-second cursor should parse with nanos, got (%v, %v)", got, err)
+	}
 	if _, err := parseNetworkTime("not-a-time", "since"); err == nil {
 		t.Error("garbage timestamp should error")
 	}

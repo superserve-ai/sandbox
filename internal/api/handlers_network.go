@@ -153,7 +153,7 @@ func flowToEvent(f db.NetFlow) networkEvent {
 	ev := networkEvent{
 		Kind:      "connection",
 		ID:        f.ID,
-		Ts:        f.Ts.UTC().Format(time.RFC3339),
+		Ts:        f.Ts.UTC().Format(time.RFC3339Nano),
 		ts:        f.Ts,
 		DstIP:     f.DstIp.String(),
 		DstPort:   &f.DstPort,
@@ -172,7 +172,7 @@ func requestToEvent(r db.ProxyAudit) networkEvent {
 	ev := networkEvent{
 		Kind:           "request",
 		ID:             r.ID,
-		Ts:             r.Ts.UTC().Format(time.RFC3339),
+		Ts:             r.Ts.UTC().Format(time.RFC3339Nano),
 		ts:             r.Ts,
 		Host:           r.Host,
 		Method:         r.Method,
@@ -189,13 +189,13 @@ func requestToEvent(r db.ProxyAudit) networkEvent {
 	return ev
 }
 
-// parseNetworkTime parses an RFC3339 time-window param (before/since). Empty
-// leaves the bound unset.
+// parseNetworkTime parses an RFC3339 time-window param (before/since), including
+// the sub-second cursor emitted as next_cursor. Empty leaves the bound unset.
 func parseNetworkTime(raw, param string) (pgtype.Timestamptz, error) {
 	if raw == "" {
 		return pgtype.Timestamptz{}, nil
 	}
-	t, err := time.Parse(time.RFC3339, raw)
+	t, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil {
 		return pgtype.Timestamptz{}, fmt.Errorf("%s must be an RFC3339 timestamp", param)
 	}
