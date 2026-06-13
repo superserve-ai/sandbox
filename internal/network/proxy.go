@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
 
+	"github.com/superserve-ai/sandbox/internal/egresspolicy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
@@ -454,22 +455,7 @@ func (p *EgressProxy) isAllowed(rules *EgressRules, hostname string, dstIP net.I
 // A bare "*" is NOT supported — it's too easy to misuse and would silently
 // bypass all deny rules. Use explicit CIDR allow rules for "match all".
 func matchDomain(hostname, pattern string) bool {
-	if pattern == "" {
-		return false
-	}
-	if pattern == "*" {
-		return false // bare wildcard is intentionally rejected
-	}
-	if strings.EqualFold(pattern, hostname) {
-		return true
-	}
-	if strings.HasPrefix(pattern, "*.") {
-		suffix := pattern[1:]
-		if strings.HasSuffix(strings.ToLower(hostname), strings.ToLower(suffix)) {
-			return true
-		}
-	}
-	return false
+	return egresspolicy.MatchHost(hostname, pattern)
 }
 
 // relay proxies bytes in both directions and returns the totals: aToB is bytes

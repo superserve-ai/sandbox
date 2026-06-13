@@ -6,7 +6,8 @@ import (
 )
 
 // MatchHost reports whether host matches pattern: an exact match or a
-// `*.suffix` wildcard.
+// `*.suffix` wildcard that matches subdomains at any depth (but not the bare
+// domain). Used for egress allow/deny rules.
 func MatchHost(host, pattern string) bool {
 	host = strings.ToLower(host)
 	p := strings.ToLower(strings.TrimSpace(pattern))
@@ -17,9 +18,33 @@ func MatchHost(host, pattern string) bool {
 		return true
 	}
 	if strings.HasPrefix(p, "*.") {
-		suffix := p[1:] // ".suffix"
+		suffix := p[1:] // ".example.com"
 		if strings.HasSuffix(host, suffix) && host != suffix[1:] {
 			return true
+		}
+	}
+	return false
+}
+
+// MatchHostStrict is like MatchHost but the wildcard matches exactly one label,
+// like DNS/TLS: `*.example.com` matches `api.example.com` but not
+// `a.b.example.com`. Used for credential host matching.
+func MatchHostStrict(host, pattern string) bool {
+	host = strings.ToLower(host)
+	p := strings.ToLower(strings.TrimSpace(pattern))
+	if p == "" {
+		return false
+	}
+	if p == host {
+		return true
+	}
+	if strings.HasPrefix(p, "*.") {
+		suffix := p[1:] // ".example.com"
+		if strings.HasSuffix(host, suffix) {
+			label := host[:len(host)-len(suffix)]
+			if label != "" && !strings.Contains(label, ".") {
+				return true
+			}
 		}
 	}
 	return false

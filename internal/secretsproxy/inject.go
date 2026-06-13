@@ -134,20 +134,15 @@ func hostAllowedByEgress(host string, upstreamIP net.IP, scope *Scope) (bool, st
 	return egresspolicy.EvalEgress(host, upstreamIP, scope.Allow, scope.Deny, scope.UnmatchedHostPolicy)
 }
 
-// matchHost compares host to pattern; supports exact and `*.suffix` wildcard.
-func matchHost(host, pattern string) bool {
-	return egresspolicy.MatchHost(host, pattern)
-}
-
-// hostMatchesCredential checks host against the credential's allowed list.
-// An empty list fails closed.
+// hostMatchesCredential checks host against the credential's allowed list using
+// strict single-label wildcards, so a credential can't be routed to an
+// unintended deep subdomain. An empty list fails closed.
 func hostMatchesCredential(host string, allowed []string) bool {
 	if len(allowed) == 0 {
 		return false
 	}
-	host = strings.ToLower(host)
 	for _, p := range allowed {
-		if matchHost(host, p) {
+		if egresspolicy.MatchHostStrict(host, p) {
 			return true
 		}
 	}

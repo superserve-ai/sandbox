@@ -12,8 +12,8 @@ func TestMatchHost(t *testing.T) {
 	}{
 		{"api.openai.com", "api.openai.com", true},
 		{"api.openai.com", "*.openai.com", true},
-		{"a.b.openai.com", "*.openai.com", true},
-		{"openai.com", "*.openai.com", false}, // bare apex not matched by wildcard
+		{"a.b.openai.com", "*.openai.com", true}, // egress wildcard matches any depth
+		{"openai.com", "*.openai.com", false},    // bare apex not matched by wildcard
 		{"evil.com", "api.openai.com", false},
 		{"API.OpenAI.com", "api.openai.com", true}, // case-insensitive
 		{"x", "", false},
@@ -21,6 +21,23 @@ func TestMatchHost(t *testing.T) {
 	for _, c := range cases {
 		if got := MatchHost(c.host, c.pattern); got != c.want {
 			t.Errorf("MatchHost(%q,%q)=%v want %v", c.host, c.pattern, got, c.want)
+		}
+	}
+}
+
+func TestMatchHostStrict(t *testing.T) {
+	cases := []struct {
+		host, pattern string
+		want          bool
+	}{
+		{"api.openai.com", "api.openai.com", true},
+		{"api.openai.com", "*.openai.com", true},
+		{"a.b.openai.com", "*.openai.com", false}, // strict: single label only
+		{"openai.com", "*.openai.com", false},
+	}
+	for _, c := range cases {
+		if got := MatchHostStrict(c.host, c.pattern); got != c.want {
+			t.Errorf("MatchHostStrict(%q,%q)=%v want %v", c.host, c.pattern, got, c.want)
 		}
 	}
 }
