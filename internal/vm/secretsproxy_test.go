@@ -130,8 +130,9 @@ func TestInjectHTTPSProxyEnvWithJWT(t *testing.T) {
 			if got := out["HTTPS_PROXY"]; got != tc.wantProxy {
 				t.Errorf("HTTPS_PROXY: want %q, got %q", tc.wantProxy, got)
 			}
-			if got := out["HTTP_PROXY"]; got != tc.wantProxy {
-				t.Errorf("HTTP_PROXY: want %q, got %q", tc.wantProxy, got)
+			// HTTP_PROXY must not be set — plain-HTTP egress stays direct.
+			if _, ok := out["HTTP_PROXY"]; ok {
+				t.Errorf("HTTP_PROXY should not be set")
 			}
 			for _, k := range trustKeys {
 				if out[k] == "" {

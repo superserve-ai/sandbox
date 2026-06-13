@@ -101,21 +101,22 @@ const (
 	proxyCAOnlyCert   = "/usr/local/share/ca-certificates/superserve-proxy.crt"
 )
 
-// InjectHTTPSProxyEnvWithJWT returns a copy of envVars with HTTPS_PROXY,
-// HTTP_PROXY, and the CA-trust env vars set so the sandbox routes egress
-// through the daemon and trusts its MITM cert. No-op when sandboxAddr or jwt
-// is empty.
+// InjectHTTPSProxyEnvWithJWT returns a copy of envVars with HTTPS_PROXY and the
+// CA-trust env vars set so the sandbox routes HTTPS egress through the daemon
+// and trusts its MITM cert. No-op when sandboxAddr or jwt is empty.
+//
+// HTTP_PROXY is intentionally omitted: the daemon is CONNECT-only and never
+// injects secrets into cleartext HTTP, so plain-HTTP egress flows direct.
 func InjectHTTPSProxyEnvWithJWT(envVars map[string]string, sandboxAddr, jwt string) map[string]string {
 	if sandboxAddr == "" || jwt == "" {
 		return envVars
 	}
 	proxyURL := fmt.Sprintf("https://sb:%s@%s", jwt, sandboxAddr)
-	out := make(map[string]string, len(envVars)+7)
+	out := make(map[string]string, len(envVars)+6)
 	for k, v := range envVars {
 		out[k] = v
 	}
 	out["HTTPS_PROXY"] = proxyURL
-	out["HTTP_PROXY"] = proxyURL
 	out["SSL_CERT_FILE"] = systemTrustBundle
 	out["SSL_CERT_DIR"] = systemTrustDir
 	out["CURL_CA_BUNDLE"] = systemTrustBundle
