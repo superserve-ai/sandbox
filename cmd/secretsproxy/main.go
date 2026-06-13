@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net"
@@ -92,7 +93,11 @@ func run() error {
 		Revoker:             revoker,
 		SandboxFacingHost:   cfg.SandboxFacingHost,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
+		UpstreamTransport:   buildUpstreamTransport(cfg.UpstreamResolverAddr),
 	})
+	if cfg.UpstreamResolverAddr != "" {
+		log.Info().Str("resolver", cfg.UpstreamResolverAddr).Msg("upstream name resolution routed through policy resolver")
+	}
 	proxyErrCh := make(chan error, 1)
 	go func() { proxyErrCh <- proxy.ListenAndServe() }()
 	log.Info().Str("addr", cfg.ProxyAddr).Msg("proxy listener started")
@@ -143,6 +148,33 @@ func droppedCount(sink secretsproxy.AuditSink) int64 {
 	return 0
 }
 
+// buildUpstreamTransport builds the upstream transport. When resolverAddr is
+// set, upstream DNS is sent there so name resolution follows the same egress
+// policy as guest traffic.
+func buildUpstreamTransport(resolverAddr string) *http.Transport {
+	t := &http.Transport{
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ForceAttemptHTTP2:     false,
+	}
+	if resolverAddr == "" {
+		return t
+	}
+	res := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, network, resolverAddr)
+		},
+	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Resolver: res}
+	t.DialContext = dialer.DialContext
+	return t
+}
+
 type config struct {
 	ProxyAddr         string
 	ControlSocketPath string
@@ -164,25 +196,31 @@ type config struct {
 
 	SandboxFacingHost   string
 	MaxRequestBodyBytes int64
+
+	// UpstreamResolverAddr, when set, routes upstream name resolution through
+	// this DNS server (host:port) so dials follow the same egress policy as
+	// guest traffic.
+	UpstreamResolverAddr string
 }
 
 func loadConfig() (*config, error) {
 	c := &config{
-		ProxyAddr:         envOr("SECRETSPROXY_LISTEN", "0.0.0.0:9443"),
-		ControlSocketPath: envOr("SECRETSPROXY_SOCKET", "/run/secretsproxy/control.sock"),
-		CACertPath:        envOr("SECRETSPROXY_CA_CERT", "/var/lib/secretsproxy/ca.crt"),
-		CAKeyPath:         envOr("SECRETSPROXY_CA_KEY", "/var/lib/secretsproxy/ca.key"),
-		CertCacheSize:     1024,
-		ControlPlaneURL:    strings.TrimRight(envOr("CONTROL_PLANE_URL", ""), "/"),
-		DaemonAuthToken:    os.Getenv("DAEMON_AUTH_TOKEN"),
-		VaultCacheTTL:      parseDur(os.Getenv("VAULT_CACHE_TTL"), 60*time.Second),
-		VaultCacheIdleTTL:  parseDur(os.Getenv("VAULT_CACHE_IDLE_TTL"), 10*time.Minute),
-		VaultCacheCapacity: int(parseInt64Bytes(os.Getenv("VAULT_CACHE_CAPACITY"), 1024)),
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		AuditBufferSize:     4096,
-		AuditBatchSize:      64,
-		AuditFlushEvery:     250 * time.Millisecond,
-		MaxRequestBodyBytes: parseInt64Bytes(os.Getenv("SECRETSPROXY_MAX_BODY_BYTES"), 256*1024*1024),
+		ProxyAddr:            envOr("SECRETSPROXY_LISTEN", "0.0.0.0:9443"),
+		ControlSocketPath:    envOr("SECRETSPROXY_SOCKET", "/run/secretsproxy/control.sock"),
+		CACertPath:           envOr("SECRETSPROXY_CA_CERT", "/var/lib/secretsproxy/ca.crt"),
+		CAKeyPath:            envOr("SECRETSPROXY_CA_KEY", "/var/lib/secretsproxy/ca.key"),
+		CertCacheSize:        1024,
+		ControlPlaneURL:      strings.TrimRight(envOr("CONTROL_PLANE_URL", ""), "/"),
+		DaemonAuthToken:      os.Getenv("DAEMON_AUTH_TOKEN"),
+		VaultCacheTTL:        parseDur(os.Getenv("VAULT_CACHE_TTL"), 60*time.Second),
+		VaultCacheIdleTTL:    parseDur(os.Getenv("VAULT_CACHE_IDLE_TTL"), 10*time.Minute),
+		VaultCacheCapacity:   int(parseInt64Bytes(os.Getenv("VAULT_CACHE_CAPACITY"), 1024)),
+		DatabaseURL:          os.Getenv("DATABASE_URL"),
+		AuditBufferSize:      4096,
+		AuditBatchSize:       64,
+		AuditFlushEvery:      250 * time.Millisecond,
+		MaxRequestBodyBytes:  parseInt64Bytes(os.Getenv("SECRETSPROXY_MAX_BODY_BYTES"), 256*1024*1024),
+		UpstreamResolverAddr: strings.TrimSpace(os.Getenv("SECRETSPROXY_DNS_RESOLVER")),
 	}
 	flag.StringVar(&c.ProxyAddr, "listen", c.ProxyAddr, "proxy listener address (host:port)")
 	flag.StringVar(&c.ControlSocketPath, "socket", c.ControlSocketPath, "control RPC unix socket path")
@@ -200,6 +238,11 @@ func loadConfig() (*config, error) {
 			return nil, fmt.Errorf("SECRETSPROXY_SANDBOX_ADDR %q: %w", addr, err)
 		}
 		c.SandboxFacingHost = host
+	}
+	if c.UpstreamResolverAddr != "" {
+		if _, _, err := net.SplitHostPort(c.UpstreamResolverAddr); err != nil {
+			return nil, fmt.Errorf("SECRETSPROXY_DNS_RESOLVER %q: %w", c.UpstreamResolverAddr, err)
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(c.CACertPath), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir CA dir: %w", err)

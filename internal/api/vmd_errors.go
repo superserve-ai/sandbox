@@ -71,6 +71,15 @@ func isVMDInvalidArgument(err error) bool {
 	return status.Code(err) == codes.InvalidArgument
 }
 
+// isVMDUnimplemented reports whether vmd lacks the called RPC (gRPC
+// Unimplemented) — e.g. a host that predates InjectSandboxEnv.
+func isVMDUnimplemented(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Unimplemented
+}
+
 // vmdErrorMessage returns the gRPC message from a vmd error, stripping
 // gRPC/transport framing so the string is safe to surface to API callers.
 func vmdErrorMessage(err error) string {

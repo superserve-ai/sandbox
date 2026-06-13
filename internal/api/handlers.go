@@ -1520,10 +1520,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		secretsJWT = jwt
 	}
 	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
-		log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-		h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
-		respondError(c, ErrInternal)
-		return
+		// A vmd without this RPC already applied these env vars during
+		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
+		if secretsJWT == "" && isVMDUnimplemented(injErr) {
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
+		} else {
+			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
+			h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
+			respondError(c, ErrInternal)
+			return
+		}
 	}
 
 	// Single atomic transition: starting → active with real resources
