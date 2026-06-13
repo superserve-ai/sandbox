@@ -34,7 +34,7 @@ var hopByHop = map[string]bool{
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer sentrylog.Recover("secretsproxy.handleConnect")
 	target := r.Host
-	host, _, err := net.SplitHostPort(target)
+	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		http.Error(w, "CONNECT target must be host:port", http.StatusBadRequest)
 		return
@@ -57,6 +57,12 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if p.revoker != nil && p.revoker.IsSandboxRevoked(scope.SandboxID) {
 		p.logger.Warn("sandbox revoked", "sandbox", scope.SandboxID, "host", host)
 		http.Error(w, "sandbox revoked", http.StatusForbidden)
+		return
+	}
+
+	if p.isBlockedPort(port) {
+		p.logger.Warn("blocked egress port", "sandbox", scope.SandboxID, "host", host, "port", port)
+		http.Error(w, "destination port blocked by policy", http.StatusForbidden)
 		return
 	}
 

@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	yaml "go.yaml.in/yaml/v3"
 
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/secretsproxy"
@@ -85,6 +86,11 @@ func run() error {
 		}
 	}()
 
+	blockedPorts, err := loadBlockedPorts(cfg.BlocklistConfigPath)
+	if err != nil {
+		log.Warn().Err(err).Msg("could not load blocked egress ports; port policy disabled")
+	}
+
 	proxy := secretsproxy.NewProxy(cfg.ProxyAddr, secretsproxy.Options{
 		CA:                  ca,
 		Resolver:            resolver,
@@ -94,9 +100,13 @@ func run() error {
 		SandboxFacingHost:   cfg.SandboxFacingHost,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
 		UpstreamTransport:   buildUpstreamTransport(cfg.UpstreamResolverAddr),
+		BlockedPorts:        blockedPorts,
 	})
 	if cfg.UpstreamResolverAddr != "" {
 		log.Info().Str("resolver", cfg.UpstreamResolverAddr).Msg("upstream name resolution routed through policy resolver")
+	}
+	if len(blockedPorts) > 0 {
+		log.Info().Int("count", len(blockedPorts)).Msg("egress port policy loaded")
 	}
 	proxyErrCh := make(chan error, 1)
 	go func() { proxyErrCh <- proxy.ListenAndServe() }()
@@ -146,6 +156,25 @@ func droppedCount(sink secretsproxy.AuditSink) int64 {
 		return s.Dropped()
 	}
 	return 0
+}
+
+// loadBlockedPorts reads blocked_egress_ports from the operator egress-blocklist
+// YAML. An empty path yields no blocked ports.
+func loadBlockedPorts(path string) ([]int, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read blocklist config: %w", err)
+	}
+	var doc struct {
+		BlockedEgressPorts []int `yaml:"blocked_egress_ports"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse blocklist config %s: %w", path, err)
+	}
+	return doc.BlockedEgressPorts, nil
 }
 
 // buildUpstreamTransport builds the upstream transport. When resolverAddr is
@@ -201,6 +230,10 @@ type config struct {
 	// this DNS server (host:port) so dials follow the same egress policy as
 	// guest traffic.
 	UpstreamResolverAddr string
+
+	// BlocklistConfigPath points at the operator egress-blocklist YAML. Its
+	// blocked_egress_ports are refused at CONNECT, matching the host firewall.
+	BlocklistConfigPath string
 }
 
 func loadConfig() (*config, error) {
@@ -221,6 +254,7 @@ func loadConfig() (*config, error) {
 		AuditFlushEvery:      250 * time.Millisecond,
 		MaxRequestBodyBytes:  parseInt64Bytes(os.Getenv("SECRETSPROXY_MAX_BODY_BYTES"), 256*1024*1024),
 		UpstreamResolverAddr: strings.TrimSpace(os.Getenv("SECRETSPROXY_DNS_RESOLVER")),
+		BlocklistConfigPath:  strings.TrimSpace(os.Getenv("SECRETSPROXY_BLOCKLIST_CONFIG")),
 	}
 	flag.StringVar(&c.ProxyAddr, "listen", c.ProxyAddr, "proxy listener address (host:port)")
 	flag.StringVar(&c.ControlSocketPath, "socket", c.ControlSocketPath, "control RPC unix socket path")

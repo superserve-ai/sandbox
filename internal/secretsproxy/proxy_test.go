@@ -23,9 +23,9 @@ import (
 // stubResolver accepts a fixed JWT string. Tests use this to exercise the
 // proxy without standing up a full Verifier + JWKS.
 type stubResolver struct {
-	wantJWT   string
-	scopeOut  *Scope
-	calls     int
+	wantJWT  string
+	scopeOut *Scope
+	calls    int
 }
 
 func (s *stubResolver) Authenticate(_ context.Context, _ string, jwt string) (*Scope, error) {
@@ -268,6 +268,46 @@ func TestProxyRejectsRevokedSandbox(t *testing.T) {
 	}
 	if !strings.Contains(status, "403") {
 		t.Errorf("want 403 on revoked sandbox, got %q", status)
+	}
+}
+
+func TestProxyRejectsBlockedPort(t *testing.T) {
+	resolver := &stubResolver{wantJWT: "good-jwt", scopeOut: &Scope{SandboxID: "sandbox-1", TeamID: "team-1"}}
+	proxyAddr, _, ca, _ := setupProxy(t, resolver, func(o *Options) {
+		o.BlockedPorts = []int{4444}
+	})
+
+	conn := dialProxy(t, proxyAddr, ca)
+	defer conn.Close()
+
+	status, ok := sendConnect(t, conn, "example.com:4444", "good-jwt")
+	if ok {
+		t.Fatalf("CONNECT to a blocked port must fail; got %q", status)
+	}
+	if !strings.Contains(status, "403") {
+		t.Errorf("want 403 on blocked port, got %q", status)
+	}
+}
+
+func TestIsBlockedPort(t *testing.T) {
+	p := NewProxy("127.0.0.1:0", Options{BlockedPorts: []int{4444, 3333}})
+	cases := []struct {
+		port string
+		want bool
+	}{
+		{"4444", true},
+		{"3333", true},
+		{"443", false},
+		{"notaport", false}, // unparseable → not blocked
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := p.isBlockedPort(c.port); got != c.want {
+			t.Errorf("isBlockedPort(%q) = %v, want %v", c.port, got, c.want)
+		}
+	}
+	if NewProxy("127.0.0.1:0", Options{}).isBlockedPort("4444") {
+		t.Error("no blocked ports configured: 4444 should not be blocked")
 	}
 }
 

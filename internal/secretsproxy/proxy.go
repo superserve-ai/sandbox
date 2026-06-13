@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -70,6 +71,7 @@ type Proxy struct {
 	isListening         atomic.Bool
 	sandboxFacingHost   string
 	maxRequestBodyBytes int64
+	blockedPorts        map[int]bool
 }
 
 // Options carries Proxy dependencies. Nil Logger, Vault, Audit, and UpstreamTransport
@@ -89,6 +91,10 @@ type Options struct {
 	// MaxRequestBodyBytes caps each forwarded request body. Zero falls back
 	// to defaultMaxRequestBodyBytes.
 	MaxRequestBodyBytes int64
+
+	// BlockedPorts lists egress ports the proxy refuses to tunnel to,
+	// matching the operator's host-firewall port policy.
+	BlockedPorts []int
 }
 
 const defaultMaxRequestBodyBytes int64 = 256 * 1024 * 1024
@@ -119,6 +125,13 @@ func NewProxy(addr string, opts Options) *Proxy {
 	if maxBody <= 0 {
 		maxBody = defaultMaxRequestBodyBytes
 	}
+	var blockedPorts map[int]bool
+	if len(opts.BlockedPorts) > 0 {
+		blockedPorts = make(map[int]bool, len(opts.BlockedPorts))
+		for _, port := range opts.BlockedPorts {
+			blockedPorts[port] = true
+		}
+	}
 	p := &Proxy{
 		addr:                addr,
 		ca:                  opts.CA,
@@ -130,6 +143,7 @@ func NewProxy(addr string, opts Options) *Proxy {
 		upstream:            upstream,
 		sandboxFacingHost:   opts.SandboxFacingHost,
 		maxRequestBodyBytes: maxBody,
+		blockedPorts:        blockedPorts,
 	}
 
 	p.tlsConfig = &tls.Config{
@@ -199,6 +213,19 @@ func (p *Proxy) dispatch(w http.ResponseWriter, r *http.Request) {
 	http.Error(w,
 		"this endpoint is an HTTPS forward proxy; only CONNECT is supported",
 		http.StatusBadRequest)
+}
+
+// isBlockedPort reports whether portStr is an operator-blocked egress port.
+// An unparseable port is treated as not blocked; the dial fails downstream.
+func (p *Proxy) isBlockedPort(portStr string) bool {
+	if len(p.blockedPorts) == 0 {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return false
+	}
+	return p.blockedPorts[port]
 }
 
 // remoteHost extracts the host portion (no port) from r.RemoteAddr.
