@@ -22,11 +22,14 @@ on:
       - 'cmd/vmd/**'
       - 'cmd/boxd/**'
       - 'cmd/template-builder/**'
+      - 'cmd/secretsproxy/**'
       - 'internal/vm/**'
       - 'internal/network/**'
       - 'internal/builder/**'
       - 'internal/db/**'
+      - 'internal/secretsproxy/**'
       - 'deploy/superserve-vmd.service'
+      - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
@@ -50,15 +53,14 @@ jobs:
           cache: true
 
       - name: Build binaries
-        # Always build all three. Hash-compare on the host decides whether
-        # to install boxd + rebuild the rootfs, so a no-op is cheap at rest.
-        # The previous HEAD~1..HEAD diff check missed boxd changes that
-        # landed in any commit other than the last one on a push.
+        # Always build all four. Hash-compare on the host decides whether
+        # to install boxd / secretsproxy, so a no-op is cheap at rest.
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/secretsproxy ./cmd/secretsproxy
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -98,12 +100,13 @@ jobs:
           cache: true
 
       - name: Build binaries
-        # Always build all three; hash-compare on the host decides install.
+        # Always build all four; hash-compare on the host decides install.
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/secretsproxy ./cmd/secretsproxy
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2

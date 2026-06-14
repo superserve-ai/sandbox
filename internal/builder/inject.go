@@ -154,6 +154,50 @@ const aptRewriteHeader = `# Rewritten by Superserve template builder.
 # serves the same archive contents over a separate, healthy sync path.
 `
 
+// injectProxyCA writes the secretsproxy CA into the rootfs trust store.
+// No-op when caCertPath is empty.
+func injectProxyCA(rootfsDir, caCertPath string, logger *zerolog.Logger) error {
+	if caCertPath == "" {
+		return nil
+	}
+	cert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return fmt.Errorf("read proxy CA: %w", err)
+	}
+
+	additionalDir := filepath.Join(rootfsDir, "usr/local/share/ca-certificates")
+	if err := os.MkdirAll(additionalDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", additionalDir, err)
+	}
+	additionalCert := filepath.Join(additionalDir, "superserve-proxy.crt")
+	if err := os.WriteFile(additionalCert, cert, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", additionalCert, err)
+	}
+
+	// Append to the bundle so tools trust the cert without running update-ca-certificates.
+	bundlePath := filepath.Join(rootfsDir, "etc/ssl/certs/ca-certificates.crt")
+	bf, err := os.OpenFile(bundlePath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if logger != nil {
+				logger.Warn().Str("bundle", bundlePath).Msg("system trust bundle absent; proxy CA installed only to /usr/local/share/ca-certificates")
+			}
+			return nil
+		}
+		return fmt.Errorf("open %s: %w", bundlePath, err)
+	}
+	defer bf.Close()
+	// Defensive newline so an existing bundle without a trailing newline
+	// doesn't run the appended cert's BEGIN line into the previous line.
+	if _, err := bf.Write([]byte("\n")); err != nil {
+		return fmt.Errorf("append separator to %s: %w", bundlePath, err)
+	}
+	if _, err := bf.Write(cert); err != nil {
+		return fmt.Errorf("append to %s: %w", bundlePath, err)
+	}
+	return nil
+}
+
 // rewriteAptSources rewrites http:// and https:// references to
 // canonicalUbuntuMirrors in /etc/apt/sources.list and
 // /etc/apt/sources.list.d/{*.list,*.sources} to point at ubuntuMirrorHost.

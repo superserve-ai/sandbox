@@ -84,6 +84,9 @@ type Config struct {
 	// MaxUncompressedSizeBytes is a safety cap on the flattened filesystem
 	// before mkfs.ext4 runs. 0 means "no cap".
 	MaxUncompressedSizeBytes int64
+
+	// Path to the secretsproxy CA cert. Empty disables CA install.
+	ProxyCACertPath string
 }
 
 // ApplyDefaults fills in zero-valued fields with sensible defaults.
