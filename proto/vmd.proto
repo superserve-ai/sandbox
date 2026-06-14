@@ -18,8 +18,15 @@ service VMDaemon {
   // CreateSnapshot captures a point-in-time snapshot of a running VM.
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
 
-  // RestoreSnapshot boots a VM from a previously captured snapshot.
+  // RestoreSnapshot boots a VM from a previously captured snapshot and
+  // returns its source IP. The caller must follow with InjectSandboxEnv to
+  // push env vars (and the optional secrets JWT) into the running boxd.
   rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
+
+  // InjectSandboxEnv pushes env vars (and optionally a secrets JWT used to
+  // build HTTPS_PROXY) into a running sandbox's boxd. Idempotent: calling
+  // it twice with the same args is a no-op on the second call.
+  rpc InjectSandboxEnv(InjectSandboxEnvRequest) returns (InjectSandboxEnvResponse);
 
   // DeleteSnapshot removes a snapshot's on-disk artifacts (vmstate + memory
   // file). Idempotent — missing files are treated as success. Used by the
@@ -51,6 +58,19 @@ service VMDaemon {
 
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
+
+  // InvalidateSecret drops any cached cleartext for the given secret in the
+  // local secretsproxy daemon. Idempotent.
+  rpc InvalidateSecret(InvalidateSecretRequest) returns (InvalidateSecretResponse);
+
+  // RevokeSandbox tells the local secretsproxy daemon to refuse the sandbox's
+  // JWT. Used by the control plane on sandbox destroy. Idempotent.
+  rpc RevokeSandbox(RevokeSandboxRequest) returns (RevokeSandboxResponse);
+
+  // InvalidateSandboxRules drops the daemon's cached egress rules for the
+  // sandbox so the next request re-fetches them. Used after a network PATCH.
+  // Idempotent.
+  rpc InvalidateSandboxRules(InvalidateSandboxRulesRequest) returns (InvalidateSandboxRulesResponse);
 
   // BuildTemplate kicks off a template build asynchronously. Returns a
   // build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
@@ -251,6 +271,8 @@ message ResumeVMRequest {
   string mem_file_path = 3;
   SandboxNetworkConfig sandbox_network = 4;  // Reapply egress rules after resume.
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
+  reserved 6;                                 // was secrets_broker (SecretsBrokerConfig)
+  reserved "secrets_broker";
 }
 
 message ResumeVMResponse {
@@ -290,7 +312,9 @@ message RestoreSnapshotRequest {
   ResourceLimits resource_limits = 5;
   NetworkConfig network_config = 6;
   // Per-sandbox env vars merged on top of the template's baked defaults
-  // (captured in the snapshot). Caller keys override template keys.
+  // (captured in the snapshot). Caller keys override template keys. For
+  // sandboxes with secrets, pass empty here and push via InjectSandboxEnv
+  // once the source IP is known and a JWT is minted.
   map<string, string> env_vars = 7;
   // Read-only base image shared across all VMs from this template. Empty for
   // legacy (non-overlay) sandboxes that still use a full per-VM rootfs copy.
@@ -311,6 +335,19 @@ message RestoreSnapshotResponse {
   string ip_address = 3;
   uint32 pid = 4;
   ResourceLimits resource_limits = 5;
+}
+
+// InjectSandboxEnv pushes env vars into a running sandbox's boxd. When
+// secrets_jwt is non-empty vmd builds HTTPS_PROXY=https://sb:<jwt>@<addr>
+// using its configured daemon address and adds it to env_vars.
+message InjectSandboxEnvRequest {
+  string vm_id = 1;
+  map<string, string> env_vars = 2;
+  string secrets_jwt = 3;
+}
+
+message InjectSandboxEnvResponse {
+  string vm_id = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -446,3 +483,20 @@ message UpdateSandboxNetworkRequest {
 message UpdateSandboxNetworkResponse {
   string vm_id = 1;
 }
+
+message InvalidateSecretRequest {
+  string secret_id = 1;
+}
+
+message InvalidateSecretResponse {}
+
+message RevokeSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message RevokeSandboxResponse {}
+
+message InvalidateSandboxRulesRequest {
+  string sandbox_id = 1;
+}
+message InvalidateSandboxRulesResponse {}
