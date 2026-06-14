@@ -3,7 +3,9 @@
 // internal/hostreg can reference it without circular imports.
 package vmdclient
 
-import "context"
+import (
+	"context"
+)
 
 // Client defines the subset of the VM daemon gRPC interface used by the
 // control plane. Implementations: grpcVMDClient in cmd/controlplane,
@@ -11,12 +13,18 @@ import "context"
 type Client interface {
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// ResumeInstance restores a paused VM.
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +
 	// deltaDir are populated for overlay-mode templates, empty for legacy.
+	// For sandboxes with secrets the caller passes envVars=nil here and uses
+	// InjectSandboxEnv below once the source IP is known and a JWT is minted.
 	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
+	// running sandbox's boxd. Idempotent.
+	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
 	// DeleteSnapshot removes the on-disk vmstate + memory files for a
 	// previous snapshot. Idempotent: missing files return nil. Used by the
 	// control plane to garbage-collect the previous snapshot after a new
@@ -33,6 +41,21 @@ type Client interface {
 	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
 	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+
+	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the
+	// cached cleartext for secretID. Used by the control plane to push
+	// a rotation or revocation faster than the daemon's vault-cache TTL.
+	// Idempotent on the daemon side.
+	InvalidateSecret(ctx context.Context, secretID string) error
+
+	// RevokeSandbox tells the local secretsproxy daemon that sandboxID's
+	// JWT must no longer authorize requests. Idempotent.
+	RevokeSandbox(ctx context.Context, sandboxID string) error
+
+	// InvalidateSandboxRules asks the local secretsproxy daemon to drop its
+	// cached egress rules for sandboxID, so the next request re-fetches them.
+	// Used by the control plane after a network PATCH. Idempotent.
+	InvalidateSandboxRules(ctx context.Context, sandboxID string) error
 
 	// BuildTemplate kicks off an async template build on this vmd host.
 	// Returns the opaque build VM id; poll GetBuildStatus with it until a

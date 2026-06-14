@@ -24,6 +24,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
@@ -65,9 +66,11 @@ type Handlers struct {
 	DB        *db.Queries
 	Pool      *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
 	Config    *config.Config
-	Hosts     HostRegistry // when set, routes VMD calls via host_id
-	Scheduler Scheduler    // when set, picks host on create
+	Hosts     HostRegistry      // when set, routes VMD calls via host_id
+	Scheduler Scheduler         // when set, picks host on create
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
+	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
+	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
 }
 
 // capture emits a usage event attributed to the API key's owner and team.
@@ -146,6 +149,32 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 		})
 		if err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msgf("async %s/%s activity log failed", category, action)
+		}
+	}()
+}
+
+// logSecretActivity writes a secret-scoped activity record. secretName is a
+// denormalized snapshot stored at write time so the row stays readable even
+// after the underlying secret is hard-deleted.
+func (h *Handlers) logSecretActivity(reqCtx context.Context, secretID, teamID uuid.UUID, actorID *uuid.UUID, action, status, secretName string, metadata []byte) {
+	asyncCtx := context.WithoutCancel(reqCtx)
+	go func() {
+		defer sentrylog.Recover("secret-activity-log")
+		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
+		defer cancel()
+		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+			SecretID:     pgtype.UUID{Bytes: secretID, Valid: true},
+			SecretName:   &secretName,
+			ResourceType: "secret",
+			TeamID:       teamID,
+			ActorID:      actorUUID(actorID),
+			Category:     "secret",
+			Action:       action,
+			Status:       &status,
+			Metadata:     metadata,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("secret_id", secretID.String()).Msgf("async secret/%s activity log failed", action)
 		}
 	}()
 }
@@ -405,7 +434,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
+	// per-binding proxy tokens are in the snapshot.
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
@@ -535,6 +566,26 @@ type persistedEgressConfig struct {
 		DeniedCIDRs    []string `json:"denied_cidrs"`
 		AllowedDomains []string `json:"allowed_domains"`
 	} `json:"egress"`
+}
+
+// egressConfigJSON splits the request's egress entries into CIDRs and domains
+// and marshals the network_config jsonb shape persisted on the sandbox row.
+func egressConfigJSON(network *networkConfigRequest) (allowedCIDRs, allowedDomains []string, raw []byte) {
+	for _, entry := range network.AllowOut {
+		if isIPOrCIDR(entry) {
+			allowedCIDRs = append(allowedCIDRs, entry)
+		} else {
+			allowedDomains = append(allowedDomains, entry)
+		}
+	}
+	raw, _ = json.Marshal(map[string]any{
+		"egress": map[string]any{
+			"allowed_cidrs":   allowedCIDRs,
+			"denied_cidrs":    network.DenyOut,
+			"allowed_domains": allowedDomains,
+		},
+	})
+	return allowedCIDRs, allowedDomains, raw
 }
 
 // reapplyNetworkConfig reads the sandbox's persisted egress config and pushes
@@ -750,6 +801,21 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
+	// Record the revocation so daemons can refuse the JWT, and fan out the
+	// notification to the host. Detach from the request context so a client
+	// disconnect mid-DELETE doesn't strand a destroyed sandbox without its
+	// revocation row. Bootstrap-on-restart still recovers if fanout fails.
+	revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer revokeCancel()
+	if err := h.DB.InsertSandboxRevocation(revokeCtx, db.InsertSandboxRevocationParams{
+		SandboxID: sandboxID,
+		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
+	}); err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertSandboxRevocation failed")
+	} else {
+		go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+	}
+
 	// Best-effort cleanup of pause snapshots. Failures are logged but
 	// don't fail the delete — manual cleanup may be required if vmd was
 	// unreachable.
@@ -891,20 +957,34 @@ type createSandboxRequest struct {
 	// they live in boxd's memory for the sandbox's lifetime and survive
 	// pause/resume via snapshot.
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+
+	// Secrets binds team-stored credentials to env-var names; the agent sees a
+	// per-binding proxy token, swapped for the real value at egress.
+	Secrets map[string]string `json:"secrets,omitempty"`
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID             `json:"id"`
-	Name           string                `json:"name"`
-	Status         string                `json:"status"`
-	VcpuCount      int32                 `json:"vcpu_count"`
-	MemoryMib      int32                 `json:"memory_mib"`
-	AccessToken    string                `json:"access_token,omitempty"`
-	SnapshotID     *uuid.UUID            `json:"snapshot_id,omitempty"`
-	CreatedAt      time.Time             `json:"created_at"`
-	TimeoutSeconds *int32                `json:"timeout_seconds,omitempty"`
-	Network        *networkConfigRequest `json:"network,omitempty"`
-	Metadata       map[string]string     `json:"metadata"`
+	ID             uuid.UUID              `json:"id"`
+	Name           string                 `json:"name"`
+	Status         string                 `json:"status"`
+	VcpuCount      int32                  `json:"vcpu_count"`
+	MemoryMib      int32                  `json:"memory_mib"`
+	AccessToken    string                 `json:"access_token,omitempty"`
+	SnapshotID     *uuid.UUID             `json:"snapshot_id,omitempty"`
+	CreatedAt      time.Time              `json:"created_at"`
+	TimeoutSeconds *int32                 `json:"timeout_seconds,omitempty"`
+	Network        *networkConfigRequest  `json:"network,omitempty"`
+	Metadata       map[string]string      `json:"metadata"`
+	Secrets        []sandboxSecretBinding `json:"secrets,omitempty"`
+}
+
+// sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
+// `revoked` is true when the underlying secret has been soft-deleted —
+// the binding row stays but the daemon refuses to swap on use.
+type sandboxSecretBinding struct {
+	EnvKey     string `json:"env_key"`
+	SecretName string `json:"secret_name"`
+	Revoked    bool   `json:"revoked,omitempty"`
 }
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
@@ -1085,7 +1165,32 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(sandbox))
+	resp := h.sandboxToResponseWithToken(sandbox)
+	resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
+	c.JSON(http.StatusOK, resp)
+}
+
+// fetchSandboxSecretBindings is a best-effort read of the sandbox's secret
+// bindings for the detail response. A DB failure is logged but doesn't fail
+// the request — the sandbox shape is still useful without the bindings list.
+func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uuid.UUID) []sandboxSecretBinding {
+	rows, err := h.DB.ListSandboxSecretBindings(ctx, sandboxID)
+	if err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListSandboxSecretBindings failed")
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]sandboxSecretBinding, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, sandboxSecretBinding{
+			EnvKey:     r.EnvKey,
+			SecretName: r.SecretName,
+			Revoked:    r.SecretRevoked,
+		})
+	}
+	return out
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
@@ -1136,6 +1241,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateSecretsRefs(req.Secrets); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	// env_vars and secrets share the env-var namespace; 400 on collision.
+	for k := range req.Secrets {
+		if _, dup := req.EnvVars[k]; dup {
+			respondErrorMsg(c, "bad_request",
+				fmt.Sprintf("env-var key %q appears in both env_vars and secrets; pick one", k),
+				http.StatusBadRequest)
+			return
+		}
+	}
 	// Marshal once into the canonical jsonb shape. Empty / nil maps are
 	// stored as the empty object so the column is never NULL.
 	metadataJSON, err := json.Marshal(req.Metadata)
@@ -1152,6 +1270,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+
+	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
+	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
+	if appErr != nil {
+		respondError(c, appErr)
 		return
 	}
 
@@ -1306,13 +1431,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
-	// RestoreSnapshot (not ResumeInstance) for the from_template path:
-	// ResumeInstance assumes the VM already exists in vmd's in-memory map
-	// (the pause→resume contract), which is fine for a paused sandbox but
-	// not for a fresh one we're creating now. Restore takes snapshot paths
-	// and boots a new VM from them statelessly. Caller env vars are merged
-	// on top of the template's baked defaults by vmd (boxd resumes with
-	// template context, then the restore RPC posts these on top).
+	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
+
+	// Phase 1: RestoreSnapshot boots the VM with the caller's env vars and
+	// returns its source IP. For sandboxes with secrets, a follow-up
+	// InjectSandboxEnv pushes the env again together with the JWT minted
+	// against the now-known source IP.
 	tVmdStart := time.Now()
 	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	tVmdEnd := time.Now()
@@ -1384,11 +1508,63 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Past this point the VM is running. Detach from cancellation so a
-	// client disconnect cannot lose the state transition, but preserve
-	// the trace/span context so post-VMD writes stay in the request trace.
+	// Phase 2: with the source IP known, mint the per-sandbox secrets JWT
+	// (when secrets are configured) and push env vars to the running boxd.
+	// If injection fails, tear the VM down and mark the row failed — a
+	// sandbox that boots without its env vars is unusable.
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
+
+	// Persist egress rules before injecting the env, so the secrets proxy's live
+	// rule fetch sees them before the agent can issue a proxied request. The
+	// nftables push happens later (it needs the booted VM); the DB write does not.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		_, _, networkConfig := egressConfigJSON(req.Network)
+		if err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
+			ID:            sandbox.ID,
+			NetworkConfig: networkConfig,
+			TeamID:        teamID,
+		}); err != nil {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("persist network_config before env inject failed")
+		}
+	}
+
+	var secretsJWT string
+	if len(secretMeta) > 0 {
+		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, secretMeta)
+		if jerr != nil {
+			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
+			h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
+			respondError(c, ErrInternal)
+			return
+		}
+		secretsJWT = jwt
+	}
+	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+		// A vmd without this RPC already applied these env vars during
+		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
+		if secretsJWT == "" && isVMDUnimplemented(injErr) {
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
+		} else {
+			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
+			h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+
+	// Prime the secrets proxy's egress-rules cache so the agent's first proxied
+	// request hits a warm cache (covers a control-plane blip right after create).
+	// Best-effort; the on-demand fetch + TTL is the fallback.
+	if len(secretMeta) > 0 {
+		go func() {
+			pctx, pcancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer pcancel()
+			if err := vmd.InvalidateSandboxRules(pctx, sandboxID.String()); err != nil {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("prime egress rules cache failed (fetch fallback)")
+			}
+		}()
+	}
 
 	// Single atomic transition: starting → active with real resources
 	// and IP. VMD's response is the source of truth for vcpu/memory
@@ -1441,35 +1617,32 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 	}()
 
+	if len(secretBindings) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range secretBindings {
+				secretBindings[i].SandboxID = sandbox.ID
+				if err := h.DB.AddSandboxSecret(postCtx, secretBindings[i]); err != nil {
+					log.Error().Err(err).
+						Str("sandbox_id", sandbox.ID.String()).
+						Str("env_key", secretBindings[i].EnvKey).
+						Msg("DB AddSandboxSecret failed")
+				}
+			}
+		}()
+	}
+
 	if hasNetworkRules {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var allowedCIDRs, allowedDomains []string
-			for _, entry := range req.Network.AllowOut {
-				if isIPOrCIDR(entry) {
-					allowedCIDRs = append(allowedCIDRs, entry)
-				} else {
-					allowedDomains = append(allowedDomains, entry)
-				}
-			}
-
+			// network_config was persisted above (before env injection); this
+			// only pushes the nftables rules, which need the booted VM.
+			allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
 			if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
-				return
 			}
-			networkConfig, _ := json.Marshal(map[string]any{
-				"egress": map[string]any{
-					"allowed_cidrs":   allowedCIDRs,
-					"denied_cidrs":    req.Network.DenyOut,
-					"allowed_domains": allowedDomains,
-				},
-			})
-			_ = h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
-				ID:            sandbox.ID,
-				NetworkConfig: networkConfig,
-				TeamID:        teamID,
-			})
 		}()
 	}
 	wg.Wait()
@@ -1876,6 +2049,18 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 
 		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 		h.capture(c, "sandbox_network_updated", map[string]any{"sandbox_id": sandboxID.String()})
+
+		// Push the egress-rules invalidation so the secrets proxy re-fetches the
+		// new rules immediately; the daemon's cache TTL is the fallback if this
+		// best-effort push fails. Detached context — the gin.Context is recycled
+		// once the handler returns.
+		go func() {
+			ictx, icancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer icancel()
+			if err := vmd.InvalidateSandboxRules(ictx, sandboxID.String()); err != nil {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("PATCH: invalidate sandbox rules failed (TTL fallback)")
+			}
+		}()
 	}
 
 	if body.Metadata != nil {
