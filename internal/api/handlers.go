@@ -568,6 +568,26 @@ type persistedEgressConfig struct {
 	} `json:"egress"`
 }
 
+// egressConfigJSON splits the request's egress entries into CIDRs and domains
+// and marshals the network_config jsonb shape persisted on the sandbox row.
+func egressConfigJSON(network *networkConfigRequest) (allowedCIDRs, allowedDomains []string, raw []byte) {
+	for _, entry := range network.AllowOut {
+		if isIPOrCIDR(entry) {
+			allowedCIDRs = append(allowedCIDRs, entry)
+		} else {
+			allowedDomains = append(allowedDomains, entry)
+		}
+	}
+	raw, _ = json.Marshal(map[string]any{
+		"egress": map[string]any{
+			"allowed_cidrs":   allowedCIDRs,
+			"denied_cidrs":    network.DenyOut,
+			"allowed_domains": allowedDomains,
+		},
+	})
+	return allowedCIDRs, allowedDomains, raw
+}
+
 // reapplyNetworkConfig reads the sandbox's persisted egress config and pushes
 // it to VMD. Called after every snapshot restore (explicit /resume, auto-resume
 // via /exec, and CreateSandbox's from-snapshot path) because nftables rules
@@ -944,18 +964,18 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID                `json:"id"`
-	Name           string                   `json:"name"`
-	Status         string                   `json:"status"`
-	VcpuCount      int32                    `json:"vcpu_count"`
-	MemoryMib      int32                    `json:"memory_mib"`
-	AccessToken    string                   `json:"access_token,omitempty"`
-	SnapshotID     *uuid.UUID               `json:"snapshot_id,omitempty"`
-	CreatedAt      time.Time                `json:"created_at"`
-	TimeoutSeconds *int32                   `json:"timeout_seconds,omitempty"`
-	Network        *networkConfigRequest    `json:"network,omitempty"`
-	Metadata       map[string]string        `json:"metadata"`
-	Secrets        []sandboxSecretBinding   `json:"secrets,omitempty"`
+	ID             uuid.UUID              `json:"id"`
+	Name           string                 `json:"name"`
+	Status         string                 `json:"status"`
+	VcpuCount      int32                  `json:"vcpu_count"`
+	MemoryMib      int32                  `json:"memory_mib"`
+	AccessToken    string                 `json:"access_token,omitempty"`
+	SnapshotID     *uuid.UUID             `json:"snapshot_id,omitempty"`
+	CreatedAt      time.Time              `json:"created_at"`
+	TimeoutSeconds *int32                 `json:"timeout_seconds,omitempty"`
+	Network        *networkConfigRequest  `json:"network,omitempty"`
+	Metadata       map[string]string      `json:"metadata"`
+	Secrets        []sandboxSecretBinding `json:"secrets,omitempty"`
 }
 
 // sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
@@ -1413,19 +1433,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
 
-	// Lookup the team's unmatched_host_policy up front so we don't make a DB
-	// call after we've already started a VM boot.
-	var teamUnmatchedHostPolicy string
-	if len(secretMeta) > 0 {
-		team, terr := h.DB.GetTeam(c.Request.Context(), teamID)
-		if terr != nil {
-			log.Error().Err(terr).Str("team_id", teamID.String()).Msg("DB GetTeam during sandbox create")
-			respondError(c, ErrInternal)
-			return
-		}
-		teamUnmatchedHostPolicy = team.UnmatchedHostPolicy
-	}
-
 	// Phase 1: RestoreSnapshot boots the VM with the caller's env vars and
 	// returns its source IP. For sandboxes with secrets, a follow-up
 	// InjectSandboxEnv pushes the env again together with the JWT minted
@@ -1508,9 +1515,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
+	// Persist egress rules before injecting the env, so the secrets proxy's live
+	// rule fetch sees them before the agent can issue a proxied request. The
+	// nftables push happens later (it needs the booted VM); the DB write does not.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		_, _, networkConfig := egressConfigJSON(req.Network)
+		if err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
+			ID:            sandbox.ID,
+			NetworkConfig: networkConfig,
+			TeamID:        teamID,
+		}); err != nil {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("persist network_config before env inject failed")
+		}
+	}
+
 	var secretsJWT string
 	if len(secretMeta) > 0 {
-		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, teamUnmatchedHostPolicy, req.Network, secretMeta)
+		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, secretMeta)
 		if jerr != nil {
 			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
 			h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
@@ -1530,6 +1551,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
+	}
+
+	// Prime the secrets proxy's egress-rules cache so the agent's first proxied
+	// request hits a warm cache (covers a control-plane blip right after create).
+	// Best-effort; the on-demand fetch + TTL is the fallback.
+	if len(secretMeta) > 0 {
+		go func() {
+			pctx, pcancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer pcancel()
+			if err := vmd.InvalidateSandboxRules(pctx, sandboxID.String()); err != nil {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("prime egress rules cache failed (fetch fallback)")
+			}
+		}()
 	}
 
 	// Single atomic transition: starting → active with real resources
@@ -1603,31 +1637,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var allowedCIDRs, allowedDomains []string
-			for _, entry := range req.Network.AllowOut {
-				if isIPOrCIDR(entry) {
-					allowedCIDRs = append(allowedCIDRs, entry)
-				} else {
-					allowedDomains = append(allowedDomains, entry)
-				}
-			}
-
+			// network_config was persisted above (before env injection); this
+			// only pushes the nftables rules, which need the booted VM.
+			allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
 			if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
-				return
 			}
-			networkConfig, _ := json.Marshal(map[string]any{
-				"egress": map[string]any{
-					"allowed_cidrs":   allowedCIDRs,
-					"denied_cidrs":    req.Network.DenyOut,
-					"allowed_domains": allowedDomains,
-				},
-			})
-			_ = h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
-				ID:            sandbox.ID,
-				NetworkConfig: networkConfig,
-				TeamID:        teamID,
-			})
 		}()
 	}
 	wg.Wait()
@@ -2034,6 +2049,18 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 
 		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 		h.capture(c, "sandbox_network_updated", map[string]any{"sandbox_id": sandboxID.String()})
+
+		// Push the egress-rules invalidation so the secrets proxy re-fetches the
+		// new rules immediately; the daemon's cache TTL is the fallback if this
+		// best-effort push fails. Detached context — the gin.Context is recycled
+		// once the handler returns.
+		go func() {
+			ictx, icancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer icancel()
+			if err := vmd.InvalidateSandboxRules(ictx, sandboxID.String()); err != nil {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("PATCH: invalidate sandbox rules failed (TTL fallback)")
+			}
+		}()
 	}
 
 	if body.Metadata != nil {

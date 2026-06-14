@@ -35,6 +35,7 @@ const (
 	VMDaemon_UpdateSandboxNetwork_FullMethodName    = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
 	VMDaemon_InvalidateSecret_FullMethodName        = "/superserve.vmd.v1.VMDaemon/InvalidateSecret"
 	VMDaemon_RevokeSandbox_FullMethodName           = "/superserve.vmd.v1.VMDaemon/RevokeSandbox"
+	VMDaemon_InvalidateSandboxRules_FullMethodName  = "/superserve.vmd.v1.VMDaemon/InvalidateSandboxRules"
 	VMDaemon_BuildTemplate_FullMethodName           = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
 	VMDaemon_GetBuildStatus_FullMethodName          = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
 	VMDaemon_CancelBuild_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CancelBuild"
@@ -92,6 +93,10 @@ type VMDaemonClient interface {
 	// RevokeSandbox tells the local secretsproxy daemon to refuse the sandbox's
 	// JWT. Used by the control plane on sandbox destroy. Idempotent.
 	RevokeSandbox(ctx context.Context, in *RevokeSandboxRequest, opts ...grpc.CallOption) (*RevokeSandboxResponse, error)
+	// InvalidateSandboxRules drops the daemon's cached egress rules for the
+	// sandbox so the next request re-fetches them. Used after a network PATCH.
+	// Idempotent.
+	InvalidateSandboxRules(ctx context.Context, in *InvalidateSandboxRulesRequest, opts ...grpc.CallOption) (*InvalidateSandboxRulesResponse, error)
 	// BuildTemplate kicks off a template build asynchronously. Returns a
 	// build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
 	// for progress and uses CancelBuild(build_vm_id) to abort.
@@ -287,6 +292,16 @@ func (c *vMDaemonClient) RevokeSandbox(ctx context.Context, in *RevokeSandboxReq
 	return out, nil
 }
 
+func (c *vMDaemonClient) InvalidateSandboxRules(ctx context.Context, in *InvalidateSandboxRulesRequest, opts ...grpc.CallOption) (*InvalidateSandboxRulesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InvalidateSandboxRulesResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_InvalidateSandboxRules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vMDaemonClient) BuildTemplate(ctx context.Context, in *BuildTemplateRequest, opts ...grpc.CallOption) (*BuildTemplateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BuildTemplateResponse)
@@ -387,6 +402,10 @@ type VMDaemonServer interface {
 	// RevokeSandbox tells the local secretsproxy daemon to refuse the sandbox's
 	// JWT. Used by the control plane on sandbox destroy. Idempotent.
 	RevokeSandbox(context.Context, *RevokeSandboxRequest) (*RevokeSandboxResponse, error)
+	// InvalidateSandboxRules drops the daemon's cached egress rules for the
+	// sandbox so the next request re-fetches them. Used after a network PATCH.
+	// Idempotent.
+	InvalidateSandboxRules(context.Context, *InvalidateSandboxRulesRequest) (*InvalidateSandboxRulesResponse, error)
 	// BuildTemplate kicks off a template build asynchronously. Returns a
 	// build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
 	// for progress and uses CancelBuild(build_vm_id) to abort.
@@ -460,6 +479,9 @@ func (UnimplementedVMDaemonServer) InvalidateSecret(context.Context, *Invalidate
 }
 func (UnimplementedVMDaemonServer) RevokeSandbox(context.Context, *RevokeSandboxRequest) (*RevokeSandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RevokeSandbox not implemented")
+}
+func (UnimplementedVMDaemonServer) InvalidateSandboxRules(context.Context, *InvalidateSandboxRulesRequest) (*InvalidateSandboxRulesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method InvalidateSandboxRules not implemented")
 }
 func (UnimplementedVMDaemonServer) BuildTemplate(context.Context, *BuildTemplateRequest) (*BuildTemplateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BuildTemplate not implemented")
@@ -775,6 +797,24 @@ func _VMDaemon_RevokeSandbox_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_InvalidateSandboxRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InvalidateSandboxRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).InvalidateSandboxRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_InvalidateSandboxRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).InvalidateSandboxRules(ctx, req.(*InvalidateSandboxRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VMDaemon_BuildTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(BuildTemplateRequest)
 	if err := dec(in); err != nil {
@@ -906,6 +946,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RevokeSandbox",
 			Handler:    _VMDaemon_RevokeSandbox_Handler,
+		},
+		{
+			MethodName: "InvalidateSandboxRules",
+			Handler:    _VMDaemon_InvalidateSandboxRules_Handler,
 		},
 		{
 			MethodName: "BuildTemplate",

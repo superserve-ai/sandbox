@@ -86,6 +86,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.POST("/secrets/decrypt", h.DecryptSecret)
 		internal.GET("/jwks", h.JWKS)
 		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)
+		internal.GET("/sandboxes/:sandbox_id/egress_rules", h.GetSandboxEgressRules)
 	}
 
 	return r

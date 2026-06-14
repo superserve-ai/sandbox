@@ -29,13 +29,13 @@ const secretsJWTIssuer = "superserve-controlplane"
 // When Rules is present, AuthType/AuthConfig are unused; the daemon dispatches
 // by upstream host using the rule list.
 type JWTBindingClaim struct {
-	ProxyToken string            `json:"p"`
-	SecretID   string            `json:"s"`
-	EnvKey     string            `json:"e"`
-	Hosts      []string          `json:"h"`
-	AuthType   string            `json:"t,omitempty"`
-	AuthConfig map[string]any    `json:"c,omitempty"`
-	Rules      []JWTRuleClaim    `json:"rules,omitempty"`
+	ProxyToken string         `json:"p"`
+	SecretID   string         `json:"s"`
+	EnvKey     string         `json:"e"`
+	Hosts      []string       `json:"h"`
+	AuthType   string         `json:"t,omitempty"`
+	AuthConfig map[string]any `json:"c,omitempty"`
+	Rules      []JWTRuleClaim `json:"rules,omitempty"`
 }
 
 // JWTRuleClaim is one (hosts → auth shape) entry inside JWTBindingClaim.Rules.
@@ -48,14 +48,12 @@ type JWTRuleClaim struct {
 	Headers  map[string]string `json:"hs,omitempty"`
 }
 
-// JWTClaims is the parsed JWT payload.
+// JWTClaims is the parsed JWT payload. Egress rules are not carried here — the
+// proxy fetches them live so a PATCH applies without re-minting.
 type JWTClaims struct {
-	TeamID              string            `json:"team_id"`
-	SourceIP            string            `json:"source_ip"`
-	UnmatchedHostPolicy string            `json:"unmatched_host_policy,omitempty"`
-	Allow               []string          `json:"allow,omitempty"`
-	Deny                []string          `json:"deny,omitempty"`
-	Bindings            []JWTBindingClaim `json:"bindings,omitempty"`
+	TeamID   string            `json:"team_id"`
+	SourceIP string            `json:"source_ip"`
+	Bindings []JWTBindingClaim `json:"bindings,omitempty"`
 
 	jwt.RegisteredClaims
 }
@@ -63,14 +61,14 @@ type JWTClaims struct {
 // JWT verification errors. Discrete sentinel values so callers can branch on
 // reason (typically all map to 407 on the wire).
 var (
-	ErrJWTMissing         = errors.New("secretsproxy: jwt missing")
-	ErrJWTMalformed       = errors.New("secretsproxy: jwt malformed")
-	ErrJWTBadSignature    = errors.New("secretsproxy: jwt signature failed")
-	ErrJWTExpired         = errors.New("secretsproxy: jwt expired")
-	ErrJWTWrongIssuer     = errors.New("secretsproxy: jwt wrong issuer")
-	ErrJWTUnknownKid      = errors.New("secretsproxy: jwt unknown kid")
+	ErrJWTMissing          = errors.New("secretsproxy: jwt missing")
+	ErrJWTMalformed        = errors.New("secretsproxy: jwt malformed")
+	ErrJWTBadSignature     = errors.New("secretsproxy: jwt signature failed")
+	ErrJWTExpired          = errors.New("secretsproxy: jwt expired")
+	ErrJWTWrongIssuer      = errors.New("secretsproxy: jwt wrong issuer")
+	ErrJWTUnknownKid       = errors.New("secretsproxy: jwt unknown kid")
 	ErrJWTSourceIPMismatch = errors.New("secretsproxy: jwt source_ip does not match remote address")
-	ErrJWTMissingClaim    = errors.New("secretsproxy: jwt missing required claim")
+	ErrJWTMissingClaim     = errors.New("secretsproxy: jwt missing required claim")
 )
 
 // JWKSFetcher loads the set of trusted verification keys. The production

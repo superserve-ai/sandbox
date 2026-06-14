@@ -18,13 +18,12 @@ type Resolver interface {
 }
 
 // Scope is the per-connection authorization context built from a verified JWT.
+// Egress rules are not carried here — they are fetched live per request so a
+// PATCH takes effect without re-minting the JWT.
 type Scope struct {
-	SandboxID           string
-	TeamID              string
-	SourceIP            string
-	UnmatchedHostPolicy string
-	Allow               []string
-	Deny                []string
+	SandboxID string
+	TeamID    string
+	SourceIP  string
 	// Bindings is the proxy_token → Binding map the inject pipeline uses to
 	// match outbound requests against the sandbox's configured credentials.
 	Bindings map[string]Binding
@@ -63,6 +62,7 @@ type Proxy struct {
 	logger   *slog.Logger
 
 	vault               VaultClient
+	rules               RulesClient
 	audit               AuditSink
 	revoker             *Revoker
 	httpServer          *http.Server
@@ -82,6 +82,7 @@ type Options struct {
 	CA                *CA
 	Resolver          Resolver
 	Vault             VaultClient
+	Rules             RulesClient
 	Audit             AuditSink
 	Revoker           *Revoker
 	Logger            *slog.Logger
@@ -146,6 +147,7 @@ func NewProxy(addr string, opts Options) *Proxy {
 		ca:                  opts.CA,
 		resolver:            opts.Resolver,
 		vault:               opts.Vault,
+		rules:               opts.Rules,
 		audit:               audit,
 		revoker:             opts.Revoker,
 		logger:              logger,
@@ -237,6 +239,22 @@ func (p *Proxy) isBlockedPort(portStr string) bool {
 		return false
 	}
 	return p.blockedPorts[port]
+}
+
+// fetchEgressRules returns the sandbox's current egress rules. ok is false only
+// when there is no policy source at all (cold cache + control plane unreachable),
+// so the caller can fail the request closed instead of enforcing nothing. A nil
+// rules client (passthrough/test mode) yields empty rules and ok=true.
+func (p *Proxy) fetchEgressRules(ctx context.Context, sandboxID string) (EgressRules, bool) {
+	if p.rules == nil {
+		return EgressRules{}, true
+	}
+	r, err := p.rules.FetchRules(ctx, sandboxID)
+	if err != nil {
+		p.logger.Warn("fetch egress rules failed", "sandbox", sandboxID, "err", err.Error())
+		return EgressRules{}, false
+	}
+	return r, true
 }
 
 // resolveUpstreamIP resolves host to a single IP for CIDR rule evaluation. An

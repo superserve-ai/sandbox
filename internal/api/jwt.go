@@ -53,12 +53,9 @@ type SecretsBindingRuleClaim struct {
 
 // SecretsClaims is the JWT payload.
 type SecretsClaims struct {
-	TeamID              string                `json:"team_id"`
-	SourceIP            string                `json:"source_ip"`
-	UnmatchedHostPolicy string                `json:"unmatched_host_policy,omitempty"`
-	Allow               []string              `json:"allow,omitempty"`
-	Deny                []string              `json:"deny,omitempty"`
-	Bindings            []SecretsBindingClaim `json:"bindings,omitempty"`
+	TeamID   string                `json:"team_id"`
+	SourceIP string                `json:"source_ip"`
+	Bindings []SecretsBindingClaim `json:"bindings,omitempty"`
 
 	jwt.RegisteredClaims
 }

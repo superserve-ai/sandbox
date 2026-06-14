@@ -249,6 +249,12 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 SELECT network_config FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
+-- name: GetSandboxEgressContext :one
+SELECT s.network_config, t.unmatched_host_policy
+FROM sandbox s
+JOIN team t ON s.team_id = t.id
+WHERE s.id = $1 AND s.destroyed_at IS NULL;
+
 -- name: ClaimExpiredSandboxes :many
 -- Atomically claims active sandboxes whose hard timeout has elapsed and marks
 -- them as 'pausing'. FOR UPDATE SKIP LOCKED lets concurrent reaper replicas

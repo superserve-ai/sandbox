@@ -330,10 +330,9 @@ func TestSecretsSigner_JWTSizeAtCap(t *testing.T) {
 		}
 	}
 	tok, err := signer.Sign("sandbox-1", SecretsClaims{
-		TeamID:              "11111111-2222-3333-4444-555555555555",
-		SourceIP:            "10.0.0.5",
-		UnmatchedHostPolicy: "passthrough",
-		Bindings:            bindings,
+		TeamID:   "11111111-2222-3333-4444-555555555555",
+		SourceIP: "10.0.0.5",
+		Bindings: bindings,
 	})
 	if err != nil {
 		t.Fatal(err)

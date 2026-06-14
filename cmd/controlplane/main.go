@@ -26,11 +26,11 @@ import (
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
-	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
 	"github.com/superserve-ai/sandbox/internal/secrets"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/supervisor"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
@@ -365,9 +365,9 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 
 func (c *grpcVMDClient) InjectSandboxEnv(ctx context.Context, vmID string, envVars map[string]string, secretsJWT string) error {
 	_, err := c.client.InjectSandboxEnv(ctx, &vmdpb.InjectSandboxEnvRequest{
-		VmId:        vmID,
-		EnvVars:     envVars,
-		SecretsJwt:  secretsJWT,
+		VmId:       vmID,
+		EnvVars:    envVars,
+		SecretsJwt: secretsJWT,
 	})
 	if err != nil {
 		return fmt.Errorf("gRPC InjectSandboxEnv: %w", err)
@@ -515,6 +515,14 @@ func (c *grpcVMDClient) RevokeSandbox(ctx context.Context, sandboxID string) err
 	_, err := c.client.RevokeSandbox(ctx, &vmdpb.RevokeSandboxRequest{SandboxId: sandboxID})
 	if err != nil {
 		return fmt.Errorf("gRPC RevokeSandbox: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) InvalidateSandboxRules(ctx context.Context, sandboxID string) error {
+	_, err := c.client.InvalidateSandboxRules(ctx, &vmdpb.InvalidateSandboxRulesRequest{SandboxId: sandboxID})
+	if err != nil {
+		return fmt.Errorf("gRPC InvalidateSandboxRules: %w", err)
 	}
 	return nil
 }

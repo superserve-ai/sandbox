@@ -16,6 +16,7 @@ import (
 // ControlServer is the daemon-internal HTTP API served over a 0600 unix socket.
 type ControlServer struct {
 	cachedVault *cachedVault
+	cachedRules *cachedRules
 	revoker     *Revoker
 
 	httpServer  *http.Server
@@ -23,11 +24,12 @@ type ControlServer struct {
 	isListening atomic.Bool
 }
 
-// NewControlServer builds the server. Nil cachedVault or revoker turn the
-// corresponding endpoints into no-ops.
-func NewControlServer(socketPath string, cv *cachedVault, r *Revoker) *ControlServer {
+// NewControlServer builds the server. Nil cachedVault, cachedRules, or revoker
+// turn the corresponding endpoints into no-ops.
+func NewControlServer(socketPath string, cv *cachedVault, cr *cachedRules, r *Revoker) *ControlServer {
 	c := &ControlServer{
 		cachedVault: cv,
+		cachedRules: cr,
 		revoker:     r,
 		socketPath:  socketPath,
 	}
@@ -113,12 +115,23 @@ func (c *ControlServer) handleSandboxAction(w http.ResponseWriter, r *http.Reque
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/sandboxes/")
 	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) != 2 || parts[1] != "revoke" || parts[0] == "" {
-		http.Error(w, "expected /v1/sandboxes/{id}/revoke", http.StatusNotFound)
+	if len(parts) != 2 || parts[0] == "" {
+		http.Error(w, "expected /v1/sandboxes/{id}/{revoke|rules}", http.StatusNotFound)
 		return
 	}
-	if c.revoker != nil {
-		c.revoker.RevokeSandbox(parts[0])
+	switch parts[1] {
+	case "revoke":
+		if c.revoker != nil {
+			c.revoker.RevokeSandbox(parts[0])
+		}
+	case "rules":
+		if c.cachedRules != nil {
+			c.cachedRules.Invalidate(parts[0])        // drop stale (PATCH)
+			c.cachedRules.Warm(r.Context(), parts[0]) // pre-fetch fresh (prime / re-warm)
+		}
+	default:
+		http.Error(w, "expected /v1/sandboxes/{id}/{revoke|rules}", http.StatusNotFound)
+		return
 	}
 	w.WriteHeader(http.StatusOK)
 }

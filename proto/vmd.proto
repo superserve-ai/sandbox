@@ -67,6 +67,11 @@ service VMDaemon {
   // JWT. Used by the control plane on sandbox destroy. Idempotent.
   rpc RevokeSandbox(RevokeSandboxRequest) returns (RevokeSandboxResponse);
 
+  // InvalidateSandboxRules drops the daemon's cached egress rules for the
+  // sandbox so the next request re-fetches them. Used after a network PATCH.
+  // Idempotent.
+  rpc InvalidateSandboxRules(InvalidateSandboxRulesRequest) returns (InvalidateSandboxRulesResponse);
+
   // BuildTemplate kicks off a template build asynchronously. Returns a
   // build_vm_id immediately; the caller polls GetBuildStatus(build_vm_id)
   // for progress and uses CancelBuild(build_vm_id) to abort.
@@ -490,3 +495,8 @@ message RevokeSandboxRequest {
 }
 
 message RevokeSandboxResponse {}
+
+message InvalidateSandboxRulesRequest {
+  string sandbox_id = 1;
+}
+message InvalidateSandboxRulesResponse {}

@@ -894,6 +894,39 @@ func (h *Handlers) ListSandboxRevocations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"sandboxes": out})
 }
 
+// GetSandboxEgressRules serves a sandbox's current egress rules to the secrets
+// proxy, which fetches them live rather than reading stale values from the JWT.
+// Internal endpoint (daemon-authed), so it is not team-scoped.
+func (h *Handlers) GetSandboxEgressRules(c *gin.Context) {
+	sandboxID, err := uuid.Parse(c.Param("sandbox_id"))
+	if err != nil {
+		respondErrorMsg(c, "bad_request", "invalid sandbox id", http.StatusBadRequest)
+		return
+	}
+	row, err := h.DB.GetSandboxEgressContext(c.Request.Context(), sandboxID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxEgressContext failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	var cfg persistedEgressConfig
+	if len(row.NetworkConfig) > 0 {
+		if uerr := json.Unmarshal(row.NetworkConfig, &cfg); uerr != nil {
+			log.Warn().Err(uerr).Str("sandbox_id", sandboxID.String()).Msg("parse network_config for egress rules")
+		}
+	}
+	allow := append(append([]string{}, cfg.Egress.AllowedCIDRs...), cfg.Egress.AllowedDomains...)
+	c.JSON(http.StatusOK, gin.H{
+		"allow":                 allow,
+		"deny":                  cfg.Egress.DeniedCIDRs,
+		"unmatched_host_policy": row.UnmatchedHostPolicy,
+	})
+}
+
 // fanoutSandboxRevoke calls RevokeSandbox on the daemon at hostID. Best-effort;
 // the daemon picks it up via bootstrap on next restart if this call fails.
 func (h *Handlers) fanoutSandboxRevoke(ctx context.Context, sandboxID uuid.UUID, hostID string) {
@@ -1047,21 +1080,15 @@ func (h *Handlers) resolveSecretBindingsForCreate(
 }
 
 // mintSecretsJWT builds the per-sandbox secrets JWT. Returns the signed JWT
-// string. Callers pass the sandbox's veth source IP and the team's
-// unmatched-host policy. network may be nil when no customer egress rules
-// apply (e.g., resume path preserves snapshotted firewall rules).
-func (h *Handlers) mintSecretsJWT(sandboxID, teamID, sourceIP, unmatchedHostPolicy string, network *networkConfigRequest, meta []SecretBindingMeta) (string, error) {
+// string. The sandbox's veth source IP binds the token; egress rules are not
+// carried here — the proxy fetches them live from GetSandboxEgressRules.
+func (h *Handlers) mintSecretsJWT(sandboxID, teamID, sourceIP string, meta []SecretBindingMeta) (string, error) {
 	if h.Signer == nil {
 		return "", fmt.Errorf("secrets signer not configured")
 	}
 	claims := SecretsClaims{
-		TeamID:              teamID,
-		SourceIP:            sourceIP,
-		UnmatchedHostPolicy: unmatchedHostPolicy,
-	}
-	if network != nil {
-		claims.Allow = append(claims.Allow, network.AllowOut...)
-		claims.Deny = append(claims.Deny, network.DenyOut...)
+		TeamID:   teamID,
+		SourceIP: sourceIP,
 	}
 	claims.Bindings = make([]SecretsBindingClaim, 0, len(meta))
 	for _, m := range meta {

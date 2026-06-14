@@ -42,8 +42,9 @@ func injectRequest(
 	req *http.Request,
 	upstreamHost string,
 	upstreamIP net.IP,
+	rules EgressRules,
 ) (InjectOutcome, error) {
-	if allowed, reason := hostAllowedByEgress(upstreamHost, upstreamIP, scope); !allowed {
+	if allowed, reason := hostAllowedByEgress(upstreamHost, upstreamIP, rules); !allowed {
 		return InjectOutcome{Action: denyAction, Reason: reason}, nil
 	}
 
@@ -128,10 +129,10 @@ func dispatchAuthShape(b Binding, upstreamHost string) (string, map[string]any, 
 	return "", nil, false
 }
 
-// hostAllowedByEgress evaluates the scope's egress policy; upstreamIP is used
+// hostAllowedByEgress evaluates the fetched egress policy; upstreamIP is used
 // for CIDR rules.
-func hostAllowedByEgress(host string, upstreamIP net.IP, scope *Scope) (bool, string) {
-	return egresspolicy.EvalEgress(host, upstreamIP, scope.Allow, scope.Deny, scope.UnmatchedHostPolicy)
+func hostAllowedByEgress(host string, upstreamIP net.IP, rules EgressRules) (bool, string) {
+	return egresspolicy.EvalEgress(host, upstreamIP, rules.Allow, rules.Deny, rules.UnmatchedHostPolicy)
 }
 
 // hostMatchesCredential checks host against the credential's allowed list using

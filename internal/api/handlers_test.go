@@ -89,8 +89,9 @@ func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, 
 	}
 	return nil
 }
-func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error { return nil }
-func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error    { return nil }
+func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error       { return nil }
+func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error          { return nil }
+func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) InjectSandboxEnv(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error {
 	if s.injectEnvFn != nil {
 		return s.injectEnvFn(ctx, id, envVars, secretsJWT)

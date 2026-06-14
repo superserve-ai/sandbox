@@ -86,6 +86,28 @@ func (c *SecretsBrokerClient) RevokeSandbox(ctx context.Context, sandboxID strin
 	return nil
 }
 
+// InvalidateSandboxRules tells the daemon to drop cached egress rules for sandboxID. Idempotent.
+func (c *SecretsBrokerClient) InvalidateSandboxRules(ctx context.Context, sandboxID string) error {
+	if !c.Enabled() {
+		return nil
+	}
+	url := "http://unix/v1/sandboxes/" + sandboxID + "/rules"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("daemon invalidate rules: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%w: status %d: %s", ErrDaemonRefused, resp.StatusCode, string(raw))
+	}
+	return nil
+}
+
 // RequireProxyForJWT errors when a JWT is present but no proxy is configured.
 func RequireProxyForJWT(jwt, proxyURL string) error {
 	if jwt != "" && proxyURL == "" {

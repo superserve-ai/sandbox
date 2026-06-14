@@ -72,12 +72,9 @@ func (r *JWTResolver) Authenticate(ctx context.Context, sourceIP, jwt string) (*
 		bindings[b.ProxyToken] = binding
 	}
 	return &Scope{
-		SandboxID:           claims.Subject,
-		TeamID:              claims.TeamID,
-		SourceIP:            claims.SourceIP,
-		UnmatchedHostPolicy: claims.UnmatchedHostPolicy,
-		Allow:               claims.Allow,
-		Deny:                claims.Deny,
-		Bindings:            bindings,
+		SandboxID: claims.Subject,
+		TeamID:    claims.TeamID,
+		SourceIP:  claims.SourceIP,
+		Bindings:  bindings,
 	}, nil
 }

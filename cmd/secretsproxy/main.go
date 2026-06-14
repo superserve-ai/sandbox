@@ -69,6 +69,9 @@ func run() error {
 		Capacity: cfg.VaultCacheCapacity,
 	})
 
+	httpRules := secretsproxy.NewHTTPRulesClient(cfg.ControlPlaneURL, cfg.DaemonAuthToken)
+	cachedRules := secretsproxy.NewCachedRules(httpRules, secretsproxy.RulesCacheOptions{})
+
 	revoker := secretsproxy.NewRevoker()
 	revoked, err := secretsproxy.FetchRevokedSandboxes(rootCtx, cfg.ControlPlaneURL, cfg.DaemonAuthToken)
 	if err != nil {
@@ -97,6 +100,7 @@ func run() error {
 		CA:                  ca,
 		Resolver:            resolver,
 		Vault:               cachedVault,
+		Rules:               cachedRules,
 		Audit:               auditSink,
 		Revoker:             revoker,
 		SandboxFacingHost:   cfg.SandboxFacingHost,
@@ -116,7 +120,7 @@ func run() error {
 	go func() { proxyErrCh <- proxy.ListenAndServe() }()
 	log.Info().Str("addr", cfg.ProxyAddr).Msg("proxy listener started")
 
-	control := secretsproxy.NewControlServer(cfg.ControlSocketPath, cachedVault, revoker)
+	control := secretsproxy.NewControlServer(cfg.ControlSocketPath, cachedVault, cachedRules, revoker)
 	controlErrCh := make(chan error, 1)
 	go func() { controlErrCh <- control.ListenAndServe() }()
 	log.Info().Str("socket", cfg.ControlSocketPath).Msg("control RPC listener started")

@@ -241,12 +241,20 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 		// Pipeline runs when both Vault and a non-empty Scope are wired; otherwise pass through.
 		var matchedSecretIDs []string
 		if scope != nil && p.vault != nil {
+			rules, ok := p.fetchEgressRules(ctx, scope.SandboxID)
+			if !ok {
+				// Cold cache + control plane unreachable: fail the request
+				// closed and loud rather than enforce no policy.
+				writeBrokerError(w, http.StatusServiceUnavailable, "policy_unavailable", "egress policy temporarily unavailable")
+				finalize(http.StatusServiceUnavailable, nil, nil, "policy_unavailable")
+				return
+			}
 			// Resolve the upstream only when CIDR rules need an IP to match.
 			var upstreamIP net.IP
-			if egresspolicy.HasCIDR(scope.Allow) || egresspolicy.HasCIDR(scope.Deny) {
+			if egresspolicy.HasCIDR(rules.Allow) || egresspolicy.HasCIDR(rules.Deny) {
 				upstreamIP = p.resolveUpstreamIP(ctx, host)
 			}
-			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP)
+			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP, rules)
 			if ierr != nil {
 				p.logger.Warn("inject pipeline failed",
 					"host", host, "sandbox", scope.SandboxID, "err", ierr.Error())

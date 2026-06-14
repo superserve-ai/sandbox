@@ -52,6 +52,11 @@ type Client interface {
 	// JWT must no longer authorize requests. Idempotent.
 	RevokeSandbox(ctx context.Context, sandboxID string) error
 
+	// InvalidateSandboxRules asks the local secretsproxy daemon to drop its
+	// cached egress rules for sandboxID, so the next request re-fetches them.
+	// Used by the control plane after a network PATCH. Idempotent.
+	InvalidateSandboxRules(ctx context.Context, sandboxID string) error
+
 	// BuildTemplate kicks off an async template build on this vmd host.
 	// Returns the opaque build VM id; poll GetBuildStatus with it until a
 	// terminal status is reached. vmd runs the build well past this RPC's

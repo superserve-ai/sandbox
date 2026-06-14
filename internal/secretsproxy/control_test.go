@@ -12,11 +12,11 @@ import (
 )
 
 // startControlServerOnSocket binds the control server to a temp unix socket.
-func startControlServerOnSocket(t *testing.T, cv *cachedVault) (*http.Client, *ControlServer, *Revoker) {
+func startControlServerOnSocket(t *testing.T, cv *cachedVault, cr *cachedRules) (*http.Client, *ControlServer, *Revoker) {
 	t.Helper()
 	sockPath := filepath.Join(t.TempDir(), "control.sock")
 	rev := NewRevoker()
-	cs := NewControlServer(sockPath, cv, rev)
+	cs := NewControlServer(sockPath, cv, cr, rev)
 
 	l, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -50,7 +50,7 @@ func TestControlInvalidateDropsCacheEntry(t *testing.T) {
 	clock := newFakeClock()
 	upstream := &stubVault{values: map[string]string{"s": "v1"}}
 	cv := newCachedVaultWithClock(upstream, time.Hour, clock)
-	client, _, _ := startControlServerOnSocket(t, cv)
+	client, _, _ := startControlServerOnSocket(t, cv, nil)
 
 	// Warm the cache.
 	_, _ = cv.FetchCredential(context.Background(), "team-1", "s")
@@ -73,7 +73,7 @@ func TestControlInvalidateDropsCacheEntry(t *testing.T) {
 }
 
 func TestControlInvalidateIsNoOpWithoutVault(t *testing.T) {
-	client, _, _ := startControlServerOnSocket(t, nil)
+	client, _, _ := startControlServerOnSocket(t, nil, nil)
 
 	req, _ := http.NewRequest(http.MethodPost, "http://unix/v1/secrets/sec-1/invalidate", nil)
 	resp, _ := client.Do(req)
@@ -83,7 +83,7 @@ func TestControlInvalidateIsNoOpWithoutVault(t *testing.T) {
 }
 
 func TestControlInvalidateRejectsMalformedPath(t *testing.T) {
-	client, _, _ := startControlServerOnSocket(t, nil)
+	client, _, _ := startControlServerOnSocket(t, nil, nil)
 	req, _ := http.NewRequest(http.MethodPost, "http://unix/v1/secrets/bare", nil)
 	resp, _ := client.Do(req)
 	if resp.StatusCode != http.StatusNotFound {
@@ -92,7 +92,7 @@ func TestControlInvalidateRejectsMalformedPath(t *testing.T) {
 }
 
 func TestControlInvalidateRejectsGET(t *testing.T) {
-	client, _, _ := startControlServerOnSocket(t, nil)
+	client, _, _ := startControlServerOnSocket(t, nil, nil)
 	resp, _ := client.Get("http://unix/v1/secrets/s/invalidate")
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("GET should be 405, got %d", resp.StatusCode)
@@ -100,7 +100,7 @@ func TestControlInvalidateRejectsGET(t *testing.T) {
 }
 
 func TestControlSandboxRevoke(t *testing.T) {
-	client, _, rev := startControlServerOnSocket(t, nil)
+	client, _, rev := startControlServerOnSocket(t, nil, nil)
 
 	req, _ := http.NewRequest(http.MethodPost, "http://unix/v1/sandboxes/sb-1/revoke", nil)
 	resp, err := client.Do(req)
@@ -115,8 +115,30 @@ func TestControlSandboxRevoke(t *testing.T) {
 	}
 }
 
+func TestControlInvalidateSandboxRules(t *testing.T) {
+	upstream := &stubRules{rules: EgressRules{Allow: []string{"a.com"}}}
+	cr := NewCachedRules(upstream, RulesCacheOptions{TTL: time.Hour})
+	client, _, _ := startControlServerOnSocket(t, nil, cr)
+
+	_, _ = cr.FetchRules(context.Background(), "sb-1") // warm
+
+	req, _ := http.NewRequest(http.MethodPost, "http://unix/v1/sandboxes/sb-1/rules", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rules invalidate: want 200, got %d", resp.StatusCode)
+	}
+
+	_, _ = cr.FetchRules(context.Background(), "sb-1") // must re-fetch
+	if upstream.calls != 2 {
+		t.Errorf("invalidate should force a refetch; calls=%d", upstream.calls)
+	}
+}
+
 func TestControlSandboxRevokeRejectsMalformedPath(t *testing.T) {
-	client, _, _ := startControlServerOnSocket(t, nil)
+	client, _, _ := startControlServerOnSocket(t, nil, nil)
 
 	for _, path := range []string{"/v1/sandboxes/", "/v1/sandboxes/sb-1", "/v1/sandboxes/sb-1/destroy"} {
 		req, _ := http.NewRequest(http.MethodPost, "http://unix"+path, nil)
@@ -131,7 +153,7 @@ func TestControlSandboxRevokeRejectsMalformedPath(t *testing.T) {
 }
 
 func TestControlSandboxRevokeRejectsGET(t *testing.T) {
-	client, _, _ := startControlServerOnSocket(t, nil)
+	client, _, _ := startControlServerOnSocket(t, nil, nil)
 	resp, err := client.Get("http://unix/v1/sandboxes/sb-1/revoke")
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +164,7 @@ func TestControlSandboxRevokeRejectsGET(t *testing.T) {
 }
 
 func TestControlHealth(t *testing.T) {
-	client, _, _ := startControlServerOnSocket(t, nil)
+	client, _, _ := startControlServerOnSocket(t, nil, nil)
 	resp, err := client.Get("http://unix/healthz")
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +183,7 @@ func TestControlHealth(t *testing.T) {
 
 func TestControlSocketIsModeRestricted(t *testing.T) {
 	sockPath := filepath.Join(t.TempDir(), "ctl.sock")
-	cs := NewControlServer(sockPath, nil, nil)
+	cs := NewControlServer(sockPath, nil, nil, nil)
 	go func() { _ = cs.ListenAndServe() }()
 	t.Cleanup(func() { _ = cs.Shutdown(context.Background()) })
 
@@ -188,7 +210,7 @@ func TestControlSocketIsModeRestricted(t *testing.T) {
 func TestControlShutdownBeforeServeIsSafe(t *testing.T) {
 	// httpServer is constructed in NewControlServer, so Shutdown can be
 	// called before Serve without racing on a nil pointer.
-	c := NewControlServer("/dev/null/not-a-socket", nil, nil)
+	c := NewControlServer("/dev/null/not-a-socket", nil, nil, nil)
 	if err := c.Shutdown(context.Background()); err != nil {
 		t.Errorf("Shutdown before Serve should be a no-op, got %v", err)
 	}

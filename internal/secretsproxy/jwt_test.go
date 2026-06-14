@@ -117,8 +117,8 @@ func TestVerifier_HappyPath(t *testing.T) {
 }
 
 func TestVerifier_RejectsBadSignature(t *testing.T) {
-	pub, _ := newKeypair(t)            // trusted public key
-	_, otherPriv := newKeypair(t)     // attacker's private key, never trusted
+	pub, _ := newKeypair(t)       // trusted public key
+	_, otherPriv := newKeypair(t) // attacker's private key, never trusted
 	fetcher := &stubFetcher{fn: func() (map[string]ed25519.PublicKey, error) {
 		return map[string]ed25519.PublicKey{"v1": pub}, nil
 	}}

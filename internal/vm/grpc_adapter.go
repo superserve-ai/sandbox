@@ -360,6 +360,18 @@ func (a *GRPCAdapter) RevokeSandbox(ctx context.Context, req *vmdpb.RevokeSandbo
 	return &vmdpb.RevokeSandboxResponse{}, nil
 }
 
+// InvalidateSandboxRules forwards the egress-rules invalidation to the local
+// secretsproxy daemon. Returns OK when the daemon is disabled on this host.
+func (a *GRPCAdapter) InvalidateSandboxRules(ctx context.Context, req *vmdpb.InvalidateSandboxRulesRequest) (*vmdpb.InvalidateSandboxRulesResponse, error) {
+	if req.GetSandboxId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
+	}
+	if err := a.secrets.InvalidateSandboxRules(ctx, req.GetSandboxId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "secretsproxy invalidate rules: %v", err)
+	}
+	return &vmdpb.InvalidateSandboxRulesResponse{}, nil
+}
+
 func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplateRequest) (*vmdpb.BuildTemplateResponse, error) {
 	if req.GetTemplateId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "template_id is required")
