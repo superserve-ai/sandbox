@@ -1,4 +1,4 @@
-package network
+package blocklist
 
 // blocklist.go implements a global egress denylist for the egress proxy and
 // host firewall. Which feeds are fetched, which domains/CIDRs are pinned,
@@ -45,9 +45,9 @@ const (
 	feedFetchTimeout = 60 * time.Second
 )
 
-// BlocklistConfig is the schema of the operator-supplied config file
+// Config is the schema of the operator-supplied config file
 // (VMD_EGRESS_BLOCKLIST_CONFIG). All fields are optional.
-type BlocklistConfig struct {
+type Config struct {
 	// DomainFeeds are URLs (http/https) or local file paths to plain-text
 	// feeds: one entry per line, '#' starts a comment. Entries may be
 	// domains, IPs, IP:port pairs, or CIDRs.
@@ -70,13 +70,13 @@ type BlocklistConfig struct {
 	StatePath string `yaml:"state_path"`
 }
 
-// LoadBlocklistConfig reads and validates the YAML config at path.
-func LoadBlocklistConfig(path string) (*BlocklistConfig, error) {
+// LoadConfig reads and validates the YAML config at path.
+func LoadConfig(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read blocklist config: %w", err)
 	}
-	var cfg BlocklistConfig
+	var cfg Config
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse blocklist config %s: %w", path, err)
 	}
@@ -105,7 +105,7 @@ func LoadBlocklistConfig(path string) (*BlocklistConfig, error) {
 	return &cfg, nil
 }
 
-func (c *BlocklistConfig) refreshInterval() time.Duration {
+func (c *Config) refreshInterval() time.Duration {
 	if c.RefreshInterval == "" {
 		return defaultBlocklistRefresh
 	}
@@ -126,7 +126,7 @@ type blocklistSnapshot struct {
 // Blocklist holds the current snapshot and refreshes it from the configured
 // feeds. Lookup methods are safe for concurrent use.
 type Blocklist struct {
-	cfg  *BlocklistConfig
+	cfg  *Config
 	log  zerolog.Logger
 	cur  atomic.Pointer[blocklistSnapshot]
 	http *http.Client
@@ -145,9 +145,9 @@ type Blocklist struct {
 	sink func([]string)
 }
 
-// NewBlocklist builds a Blocklist seeded from the pinned config entries and
+// New builds a Blocklist seeded from the pinned config entries and
 // the persisted state file (if present). Feeds are first fetched in Start.
-func NewBlocklist(cfg *BlocklistConfig, log zerolog.Logger) *Blocklist {
+func New(cfg *Config, log zerolog.Logger) *Blocklist {
 	b := &Blocklist{
 		cfg:       cfg,
 		log:       log.With().Str("component", "egress-blocklist").Logger(),
@@ -398,7 +398,7 @@ func (sb *snapshotBuilder) addSnapshot(s *blocklistSnapshot) {
 	}
 }
 
-func (sb *snapshotBuilder) addConfigEntries(cfg *BlocklistConfig) {
+func (sb *snapshotBuilder) addConfigEntries(cfg *Config) {
 	for _, d := range cfg.CustomDomains {
 		if d = normalizeDomain(d); d != "" {
 			sb.domains[d] = struct{}{}

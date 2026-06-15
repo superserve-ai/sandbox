@@ -19,6 +19,7 @@ import (
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
+	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -294,17 +295,17 @@ func main() {
 	// VMD_EGRESS_BLOCKLIST_CONFIG points at the operator-supplied config
 	// (feeds, pinned domains/CIDRs, blocked ports). Unset = no global
 	// blocklist.
-	var blocklist *network.Blocklist
+	var blockList *blocklist.Blocklist
 	// vmd is the daemon, so it owns and reconciles the shared egress port
 	// chain even when no ports are configured (so disabling the feature
 	// clears stale drops). template-builder must not pass this.
 	netMgrOpts := []network.ManagerOption{network.WithEgressPortChainOwner()}
 	if path := os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG"); path != "" {
-		blCfg, err := network.LoadBlocklistConfig(path)
+		blCfg, err := blocklist.LoadConfig(path)
 		if err != nil {
 			log.Fatal().Err(err).Str("path", path).Msg("failed to load egress blocklist config")
 		}
-		blocklist = network.NewBlocklist(blCfg, log)
+		blockList = blocklist.New(blCfg, log)
 		netMgrOpts = append(netMgrOpts, network.WithBlockedEgressPorts(blCfg.BlockedEgressPorts))
 		log.Info().Str("path", path).Int("feeds", len(blCfg.DomainFeeds)).Int("blocked_ports", len(blCfg.BlockedEgressPorts)).Msg("egress blocklist configured")
 	} else {
@@ -378,22 +379,22 @@ func main() {
 	)
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
-	if blocklist != nil {
-		egressProxy.SetBlocklist(blocklist)
+	if blockList != nil {
+		egressProxy.SetBlocklist(blockList)
 		// Mirror IP/CIDR entries into a host-level nftables drop set so they
 		// are enforced on every port, not just the proxied web ports.
 		hostBlock, err := network.NewHostEgressBlock(log)
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to install host egress block table")
 		}
-		blocklist.SetCIDRSink(hostBlock.UpdateCIDRs)
+		blockList.SetCIDRSink(hostBlock.UpdateCIDRs)
 		// Seed the host drop set from the state-seeded snapshot now, before
 		// the first feed fetch (which may block up to feedFetchTimeout per
 		// feed). Otherwise seeded CIDRs go unenforced on non-proxied ports
 		// during the startup window.
-		hostBlock.UpdateCIDRs(blocklist.CIDRs())
+		hostBlock.UpdateCIDRs(blockList.CIDRs())
 		lc.addCloser("host egress block", func(_ context.Context) error { return hostBlock.Close() })
-		lc.start("egress blocklist", func() error { return blocklist.Start(ctx) })
+		lc.start("egress blocklist", func() error { return blockList.Start(ctx) })
 	}
 	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
 

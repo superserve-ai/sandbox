@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
 
+	"github.com/superserve-ai/sandbox/internal/blocklist"
 	"github.com/superserve-ai/sandbox/internal/egresspolicy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
@@ -51,7 +52,7 @@ type EgressProxy struct {
 	// blocklist is the global egress denylist (nil = disabled). Checked
 	// before per-sandbox rules; a blocklist hit cannot be overridden by a
 	// sandbox's own allow rules.
-	blocklist *Blocklist
+	blocklist *blocklist.Blocklist
 
 	// sandboxRules maps sandbox host IPs to their egress config.
 	mu    sync.RWMutex
@@ -113,7 +114,7 @@ func (p *EgressProxy) RegisterSandbox(hostIP, sandboxID string) {
 
 // SetBlocklist attaches the global egress denylist. Must be called before
 // Start; the blocklist's own snapshot swapping handles later updates.
-func (p *EgressProxy) SetBlocklist(b *Blocklist) {
+func (p *EgressProxy) SetBlocklist(b *blocklist.Blocklist) {
 	p.blocklist = b
 }
 
