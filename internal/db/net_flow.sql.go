@@ -67,31 +67,35 @@ func (q *Queries) InsertNetFlow(ctx context.Context, arg InsertNetFlowParams) er
 const listNetFlowEvents = `-- name: ListNetFlowEvents :many
 SELECT id, ts, team_id, sandbox_id, protocol, host, dst_ip, dst_port, verdict, match_rule, bytes_sent, bytes_recv, duration_ms FROM net_flow
 WHERE sandbox_id = $1
-  AND ($2::timestamptz IS NULL OR ts < $2::timestamptz)
-  AND ($3::timestamptz IS NULL OR ts >= $3::timestamptz)
-  AND ($4::text IS NULL OR verdict = $4::text)
-ORDER BY ts DESC
-LIMIT $5
+  AND ($2::timestamptz IS NULL OR ts >= $2::timestamptz)
+  AND ($3::text IS NULL OR verdict = $3::text)
+  AND ($4::timestamptz IS NULL
+       OR (ts, 'connection', id) < ($4::timestamptz, $5::text, $6::bigint))
+ORDER BY ts DESC, id DESC
+LIMIT $7
 `
 
 type ListNetFlowEventsParams struct {
-	SandboxID uuid.UUID          `json:"sandbox_id"`
-	Before    pgtype.Timestamptz `json:"before"`
-	Since     pgtype.Timestamptz `json:"since"`
-	Verdict   *string            `json:"verdict"`
-	RowLimit  int32              `json:"row_limit"`
+	SandboxID  uuid.UUID          `json:"sandbox_id"`
+	Since      pgtype.Timestamptz `json:"since"`
+	Verdict    *string            `json:"verdict"`
+	CursorTs   pgtype.Timestamptz `json:"cursor_ts"`
+	CursorKind *string            `json:"cursor_kind"`
+	CursorID   *int64             `json:"cursor_id"`
+	RowLimit   int32              `json:"row_limit"`
 }
 
-// Connection rows for the unified network log. Filtered by an optional time
-// window (before/since) and verdict; before doubles as the pagination cursor.
-// The merge with proxy_audit happens in the handler; the cursor is a timestamp
-// because the two tables have independent id sequences.
+// Connection rows for the unified network log, optionally filtered by verdict.
+// Keyset-paginated by the (ts, kind, id) cursor; 'connection' is this source's
+// kind. The handler merges these with proxy_audit under the same total order.
 func (q *Queries) ListNetFlowEvents(ctx context.Context, arg ListNetFlowEventsParams) ([]NetFlow, error) {
 	rows, err := q.db.Query(ctx, listNetFlowEvents,
 		arg.SandboxID,
-		arg.Before,
 		arg.Since,
 		arg.Verdict,
+		arg.CursorTs,
+		arg.CursorKind,
+		arg.CursorID,
 		arg.RowLimit,
 	)
 	if err != nil {
