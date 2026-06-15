@@ -228,6 +228,15 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			}
 		}
 
+		// Re-check revocation per request, not only at CONNECT: an open
+		// keep-alive tunnel must stop injecting as soon as the sandbox is
+		// revoked, without waiting for the tunnel to idle out.
+		if p.revoker != nil && scope != nil && p.revoker.IsSandboxRevoked(scope.SandboxID) {
+			writeBrokerError(w, http.StatusForbidden, "sandbox_revoked", "sandbox access revoked")
+			finalize(http.StatusForbidden, nil, nil, "sandbox_revoked")
+			return
+		}
+
 		// Rebuild against the captured host so a Host-header rewrite cannot redirect mid-stream.
 		upstreamURL := *r.URL
 		upstreamURL.Scheme = "https"

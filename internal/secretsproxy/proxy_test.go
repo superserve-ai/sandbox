@@ -753,3 +753,19 @@ func TestProxyRejectsOversizedBodyWith413(t *testing.T) {
 		t.Errorf("proxy error flag missing, got %q", flag)
 	}
 }
+
+func TestForwardHandlerRechecksRevocationPerRequest(t *testing.T) {
+	rev := NewRevoker()
+	rev.RevokeSandbox("sb-revoked")
+	p := NewProxy("127.0.0.1:0", Options{Revoker: rev})
+
+	h := p.forwardHandler("upstream:443", "upstream", &Scope{SandboxID: "sb-revoked", TeamID: "team-1"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "https://upstream/v1/models", nil))
+
+	// An open tunnel for a now-revoked sandbox is refused on the next request,
+	// before any credential injection.
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("revoked per-request: want 403, got %d", rec.Code)
+	}
+}
