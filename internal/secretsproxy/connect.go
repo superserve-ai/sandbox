@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/egresspolicy"
@@ -255,7 +256,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			return
 		}
 		copyForwardableHeaders(r.Header, outReq.Header)
-		outReq.Host = host
+		outReq.Host = forwardedHostHeader(target, host)
 
 		// Pipeline runs when both Vault and a non-empty Scope are wired; otherwise pass through.
 		var matchedSecretIDs []string
@@ -272,6 +273,10 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			var upstreamIP net.IP
 			if egresspolicy.HasCIDR(rules.Allow) || egresspolicy.HasCIDR(rules.Deny) {
 				upstreamIP = p.resolveUpstreamIP(ctx, host)
+				// Dial the IP the policy was evaluated against, not a re-resolved one.
+				if upstreamIP != nil {
+					outReq = outReq.WithContext(WithPinnedDialIP(outReq.Context(), upstreamIP))
+				}
 			}
 			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP, rules)
 			if ierr != nil {
@@ -334,16 +339,62 @@ func writeBrokerError(w http.ResponseWriter, status int, reason, msg string) {
 	_, _ = w.Write([]byte(msg))
 }
 
-// copyForwardableHeaders copies headers skipping hop-by-hop ones.
+// copyForwardableHeaders copies headers, skipping both the fixed hop-by-hop set
+// and any header names the message lists in its own Connection header (RFC 7230
+// §6.1), which are scoped to this hop and must not be forwarded.
 func copyForwardableHeaders(src, dst http.Header) {
+	perMsg := connectionHopByHop(src)
 	for k, vv := range src {
-		if hopByHop[http.CanonicalHeaderKey(k)] {
+		ck := http.CanonicalHeaderKey(k)
+		if hopByHop[ck] || perMsg[ck] {
 			continue
 		}
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// forwardedHostHeader returns the Host header value for the upstream request:
+// the CONNECT authority, with the port kept when it is not the default 443 so
+// custom-port virtual hosts route correctly.
+func forwardedHostHeader(target, host string) string {
+	if _, port, err := net.SplitHostPort(target); err == nil && port != "443" {
+		return target
+	}
+	return host
+}
+
+// pinnedDialIPKey carries the upstream IP the dial must use; see WithPinnedDialIP.
+type pinnedDialIPKey struct{}
+
+// WithPinnedDialIP pins the upstream dial to ip, so the address used for CIDR
+// policy evaluation is the address actually connected to — closing the gap where
+// a second DNS lookup at dial time could resolve to a different IP.
+func WithPinnedDialIP(ctx context.Context, ip net.IP) context.Context {
+	return context.WithValue(ctx, pinnedDialIPKey{}, ip)
+}
+
+// PinnedDialIP returns the pinned upstream IP, or nil when none was set.
+func PinnedDialIP(ctx context.Context) net.IP {
+	ip, _ := ctx.Value(pinnedDialIPKey{}).(net.IP)
+	return ip
+}
+
+// connectionHopByHop returns the header names listed in the Connection header.
+func connectionHopByHop(h http.Header) map[string]bool {
+	var set map[string]bool
+	for _, v := range h.Values("Connection") {
+		for _, name := range strings.Split(v, ",") {
+			if name = http.CanonicalHeaderKey(strings.TrimSpace(name)); name != "" {
+				if set == nil {
+					set = make(map[string]bool)
+				}
+				set[name] = true
+			}
+		}
+	}
+	return set
 }
 
 // streamWithFlush copies src → dst, flushing after each read for SSE / chunked transfers.

@@ -769,3 +769,43 @@ func TestForwardHandlerRechecksRevocationPerRequest(t *testing.T) {
 		t.Errorf("revoked per-request: want 403, got %d", rec.Code)
 	}
 }
+
+func TestForwardedHostHeader(t *testing.T) {
+	if got := forwardedHostHeader("api.example.com:443", "api.example.com"); got != "api.example.com" {
+		t.Errorf("443 should drop the port, got %q", got)
+	}
+	if got := forwardedHostHeader("api.example.com:8443", "api.example.com"); got != "api.example.com:8443" {
+		t.Errorf("non-default port must be kept, got %q", got)
+	}
+}
+
+func TestCopyForwardableHeadersHonorsConnection(t *testing.T) {
+	src := http.Header{}
+	src.Set("Connection", "X-Hop-Secret, Keep-Alive")
+	src.Set("X-Hop-Secret", "scoped-to-this-hop")
+	src.Set("X-Keep", "forward-me")
+	dst := http.Header{}
+
+	copyForwardableHeaders(src, dst)
+
+	if dst.Get("X-Hop-Secret") != "" {
+		t.Error("a header listed in Connection must not be forwarded")
+	}
+	if dst.Get("Connection") != "" {
+		t.Error("Connection itself is hop-by-hop and must not be forwarded")
+	}
+	if dst.Get("X-Keep") != "forward-me" {
+		t.Error("a normal header should be forwarded")
+	}
+}
+
+func TestPinnedDialIPRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	if PinnedDialIP(ctx) != nil {
+		t.Error("no pin should return nil")
+	}
+	ip := net.ParseIP("203.0.113.7")
+	if got := PinnedDialIP(WithPinnedDialIP(ctx, ip)); !got.Equal(ip) {
+		t.Errorf("pinned IP = %v, want %v", got, ip)
+	}
+}
