@@ -16,14 +16,14 @@ RETURNING *;
 -- UPDATE. Returns 0 rows if the template is missing, deleted, or not
 -- visible to the caller.
 WITH tpl AS (
-  SELECT t.id AS tpl_id FROM template t
+  SELECT t.id AS tpl_id, t.disk_mib FROM template t
   WHERE t.id = $13
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19 FROM tpl
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib FROM tpl
 RETURNING *;
 
 -- name: GetSandbox :one
@@ -86,11 +86,29 @@ WITH activated AS (
       ip_address = $4,
       updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
-  RETURNING id, team_id
+  RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
+),
+opened_compute AS (
+  INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+  SELECT a.id, a.team_id, $6, now()
+  FROM activated a
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+  RETURNING sandbox_id
+),
+opened_billing_compute AS (
+  INSERT INTO sandbox_compute_billing_interval (
+    sandbox_id, team_id, vcpu_count, memory_mib, started_at
+  )
+  SELECT a.id, a.team_id, a.vcpu_count, a.memory_mib, now()
+  FROM activated a
+  WHERE feature_enabled('billing_metrics_write', a.team_id)
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+  RETURNING sandbox_id
 )
-INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
-SELECT a.id, a.team_id, $6, now()
+INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
+SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
+WHERE feature_enabled('billing_metrics_write', a.team_id)
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
 -- name: SetSandboxSnapshot :exec
@@ -109,8 +127,22 @@ WITH destroyed AS (
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   RETURNING id
+),
+closed_compute AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'deleted'
+  WHERE sandbox_id IN (SELECT id FROM destroyed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = now(), end_reason = 'deleted'
+  WHERE sandbox_id IN (SELECT id FROM destroyed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_active_interval
+UPDATE sandbox_storage_interval
 SET ended_at = now(), end_reason = 'deleted'
 WHERE sandbox_id IN (SELECT id FROM destroyed)
   AND ended_at IS NULL;
@@ -137,8 +169,15 @@ WITH failed AS (
   SET status = 'failed', updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
   RETURNING id
+),
+closed_active AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_active_interval
+UPDATE sandbox_compute_billing_interval
 SET ended_at = now(), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL;
@@ -152,8 +191,15 @@ WITH failed AS (
   SET status = 'failed', updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   RETURNING id
+),
+closed_active AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_active_interval
+UPDATE sandbox_compute_billing_interval
 SET ended_at = now(), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL;
@@ -180,6 +226,13 @@ WITH paused AS (
 ),
 closed_interval AS (
   UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
   SET ended_at = now(), end_reason = 'paused'
   WHERE sandbox_id IN (SELECT id FROM paused)
     AND ended_at IS NULL
@@ -291,6 +344,13 @@ closed_intervals AS (
   -- this, a crashed claim would leave the interval open forever and the
   -- analytics view would keep counting the actor as active.
   UPDATE sandbox_active_interval
+  SET ended_at = now(), end_reason = 'timeout_paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
   SET ended_at = now(), end_reason = 'timeout_paused'
   WHERE sandbox_id IN (SELECT id FROM paused)
     AND ended_at IS NULL

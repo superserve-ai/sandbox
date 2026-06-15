@@ -271,7 +271,7 @@ func (h *Handlers) closeSandboxInterval(reqCtx context.Context, sandboxID uuid.U
 	defer cancel()
 	if err := h.DB.CloseSandboxActiveInterval(ctx, db.CloseSandboxActiveIntervalParams{
 		SandboxID: sandboxID,
-		EndReason: &reason,
+		EndReason: reason,
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Str("reason", reason).Msg("close sandbox_active_interval failed")
 	}
