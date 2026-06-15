@@ -69,6 +69,11 @@ func HasCIDR(entries []string) bool {
 // matched against ip (a nil ip never matches one); domain entries against host.
 func EvalEgress(host string, ip net.IP, allow, deny []string, unmatchedPolicy string) (allowed bool, reason string) {
 	host = strings.ToLower(host)
+	// Reserved internal ranges are denied ahead of user allow rules, so an allow
+	// such as 10.0.0.0/8 can never open metadata or internal-network egress.
+	if ip != nil && IsIPDenied(ip) {
+		return false, "internal_address_denied"
+	}
 	for _, a := range allow {
 		if entryMatches(a, host, ip) {
 			return true, ""
