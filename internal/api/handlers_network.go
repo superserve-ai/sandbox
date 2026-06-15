@@ -1,6 +1,8 @@
 package api
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -85,7 +87,7 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
-	before, err := parseNetworkTime(c.Query("before"), "before")
+	cursor, err := parseNetworkCursor(c.Query("before"))
 	if err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
@@ -105,7 +107,8 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 	// Fetch a full page from each source; merging then trimming to `limit`
 	// yields the correct newest-first window across both.
 	flows, err := h.DB.ListNetFlowEvents(ctx, db.ListNetFlowEventsParams{
-		SandboxID: sandboxID, Before: before, Since: since, Verdict: verdict, RowLimit: limit,
+		SandboxID: sandboxID, Since: since, Verdict: verdict, RowLimit: limit,
+		CursorTs: cursor.ts, CursorKind: cursor.kind, CursorID: cursor.id,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListNetFlowEvents failed")
@@ -117,7 +120,8 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 	var requests []db.ProxyAudit
 	if verdict == nil {
 		requests, err = h.DB.ListProxyAuditEvents(ctx, db.ListProxyAuditEventsParams{
-			SandboxID: sandboxID, Before: before, Since: since, RowLimit: limit,
+			SandboxID: sandboxID, Since: since, RowLimit: limit,
+			CursorTs: cursor.ts, CursorKind: cursor.kind, CursorID: cursor.id,
 		})
 		if err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListProxyAuditEvents failed")
@@ -133,7 +137,18 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 	for _, r := range requests {
 		merged = append(merged, requestToEvent(r))
 	}
-	sort.Slice(merged, func(i, j int) bool { return merged[i].ts.After(merged[j].ts) })
+	// Total order (ts, kind, id) DESC — the same order the queries and the cursor
+	// use, so a page boundary inside a group of equal-ts rows resumes exactly.
+	sort.Slice(merged, func(i, j int) bool {
+		a, b := merged[i], merged[j]
+		if !a.ts.Equal(b.ts) {
+			return a.ts.After(b.ts)
+		}
+		if a.Kind != b.Kind {
+			return a.Kind > b.Kind
+		}
+		return a.ID > b.ID
+	})
 
 	// More rows remain if either source filled its page, or the merge held more
 	// than one page's worth (the trimmed remainder is also "more").
@@ -143,8 +158,9 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 	}
 	var nextCursor *string
 	if hasMore && len(merged) > 0 {
-		cursor := merged[len(merged)-1].Ts
-		nextCursor = &cursor
+		last := merged[len(merged)-1]
+		tok := encodeNetworkCursor(last.ts, last.Kind, last.ID)
+		nextCursor = &tok
 	}
 	c.JSON(http.StatusOK, networkResponse{Data: merged, NextCursor: nextCursor, HasMore: hasMore})
 }
@@ -189,8 +205,59 @@ func requestToEvent(r db.ProxyAudit) networkEvent {
 	return ev
 }
 
-// parseNetworkTime parses an RFC3339 time-window param (before/since), including
-// the sub-second cursor emitted as next_cursor. Empty leaves the bound unset.
+// networkCursor is the (ts, kind, id) keyset both list queries page against.
+type networkCursor struct {
+	ts   pgtype.Timestamptz
+	kind *string
+	id   *int64
+}
+
+// cursorToken is the opaque next_cursor payload: the total-order position of the
+// last returned row. Clients treat it as opaque and echo it back via ?before=.
+type cursorToken struct {
+	Ts   time.Time `json:"t"`
+	Kind string    `json:"k"`
+	ID   int64     `json:"i"`
+}
+
+// parseNetworkCursor interprets ?before=, which is either a plain RFC3339 time
+// bound (first request) or an opaque token from a prior next_cursor. Both reduce
+// to a (ts, kind, id) keyset; a time bound t becomes (t, "", 0), i.e. strictly
+// older than t. Empty leaves the keyset unset.
+func parseNetworkCursor(raw string) (networkCursor, error) {
+	if raw == "" {
+		return networkCursor{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		k, id := "", int64(0)
+		return networkCursor{ts: pgtype.Timestamptz{Time: t, Valid: true}, kind: &k, id: &id}, nil
+	}
+	tok, ok := decodeNetworkCursor(raw)
+	if !ok {
+		return networkCursor{}, fmt.Errorf("before must be an RFC3339 timestamp or a cursor from next_cursor")
+	}
+	return networkCursor{ts: pgtype.Timestamptz{Time: tok.Ts, Valid: true}, kind: &tok.Kind, id: &tok.ID}, nil
+}
+
+func encodeNetworkCursor(ts time.Time, kind string, id int64) string {
+	b, _ := json.Marshal(cursorToken{Ts: ts, Kind: kind, ID: id})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeNetworkCursor(s string) (cursorToken, bool) {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return cursorToken{}, false
+	}
+	var tok cursorToken
+	if err := json.Unmarshal(raw, &tok); err != nil || tok.Ts.IsZero() {
+		return cursorToken{}, false
+	}
+	return tok, true
+}
+
+// parseNetworkTime parses an RFC3339 time-window param (since). Empty leaves the
+// bound unset.
 func parseNetworkTime(raw, param string) (pgtype.Timestamptz, error) {
 	if raw == "" {
 		return pgtype.Timestamptz{}, nil

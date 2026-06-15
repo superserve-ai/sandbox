@@ -10,14 +10,14 @@ INSERT INTO net_flow (
 SELECT team_id FROM sandbox WHERE id = $1;
 
 -- name: ListNetFlowEvents :many
--- Connection rows for the unified network log. Filtered by an optional time
--- window (before/since) and verdict; before doubles as the pagination cursor.
--- The merge with proxy_audit happens in the handler; the cursor is a timestamp
--- because the two tables have independent id sequences.
+-- Connection rows for the unified network log, optionally filtered by verdict.
+-- Keyset-paginated by the (ts, kind, id) cursor; 'connection' is this source's
+-- kind. The handler merges these with proxy_audit under the same total order.
 SELECT * FROM net_flow
 WHERE sandbox_id = sqlc.arg('sandbox_id')
-  AND (sqlc.narg('before')::timestamptz IS NULL OR ts < sqlc.narg('before')::timestamptz)
   AND (sqlc.narg('since')::timestamptz IS NULL OR ts >= sqlc.narg('since')::timestamptz)
   AND (sqlc.narg('verdict')::text IS NULL OR verdict = sqlc.narg('verdict')::text)
-ORDER BY ts DESC
+  AND (sqlc.narg('cursor_ts')::timestamptz IS NULL
+       OR (ts, 'connection', id) < (sqlc.narg('cursor_ts')::timestamptz, sqlc.narg('cursor_kind')::text, sqlc.narg('cursor_id')::bigint))
+ORDER BY ts DESC, id DESC
 LIMIT sqlc.arg('row_limit');

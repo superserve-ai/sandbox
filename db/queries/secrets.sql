@@ -106,14 +106,15 @@ INSERT INTO proxy_audit (
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
 
 -- name: ListProxyAuditEvents :many
--- Request rows for the unified per-sandbox network log, filtered by an optional
--- time window (before/since); before doubles as the pagination cursor. Merged
--- with net_flow connection rows in the handler.
+-- Request rows for the unified per-sandbox network log. Keyset-paginated by the
+-- (ts, kind, id) cursor; 'request' is this source's kind. The handler merges
+-- these with net_flow connection rows under the same total order.
 SELECT * FROM proxy_audit
 WHERE sandbox_id = sqlc.arg('sandbox_id')
-  AND (sqlc.narg('before')::timestamptz IS NULL OR ts < sqlc.narg('before')::timestamptz)
   AND (sqlc.narg('since')::timestamptz IS NULL OR ts >= sqlc.narg('since')::timestamptz)
-ORDER BY ts DESC
+  AND (sqlc.narg('cursor_ts')::timestamptz IS NULL
+       OR (ts, 'request', id) < (sqlc.narg('cursor_ts')::timestamptz, sqlc.narg('cursor_kind')::text, sqlc.narg('cursor_id')::bigint))
+ORDER BY ts DESC, id DESC
 LIMIT sqlc.arg('row_limit');
 
 -- name: ListAuditForSecret :many

@@ -321,27 +321,32 @@ func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecret
 const listProxyAuditEvents = `-- name: ListProxyAuditEvents :many
 SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
 WHERE sandbox_id = $1
-  AND ($2::timestamptz IS NULL OR ts < $2::timestamptz)
-  AND ($3::timestamptz IS NULL OR ts >= $3::timestamptz)
-ORDER BY ts DESC
-LIMIT $4
+  AND ($2::timestamptz IS NULL OR ts >= $2::timestamptz)
+  AND ($3::timestamptz IS NULL
+       OR (ts, 'request', id) < ($3::timestamptz, $4::text, $5::bigint))
+ORDER BY ts DESC, id DESC
+LIMIT $6
 `
 
 type ListProxyAuditEventsParams struct {
-	SandboxID uuid.UUID          `json:"sandbox_id"`
-	Before    pgtype.Timestamptz `json:"before"`
-	Since     pgtype.Timestamptz `json:"since"`
-	RowLimit  int32              `json:"row_limit"`
+	SandboxID  uuid.UUID          `json:"sandbox_id"`
+	Since      pgtype.Timestamptz `json:"since"`
+	CursorTs   pgtype.Timestamptz `json:"cursor_ts"`
+	CursorKind *string            `json:"cursor_kind"`
+	CursorID   *int64             `json:"cursor_id"`
+	RowLimit   int32              `json:"row_limit"`
 }
 
-// Request rows for the unified per-sandbox network log, filtered by an optional
-// time window (before/since); before doubles as the pagination cursor. Merged
-// with net_flow connection rows in the handler.
+// Request rows for the unified per-sandbox network log. Keyset-paginated by the
+// (ts, kind, id) cursor; 'request' is this source's kind. The handler merges
+// these with net_flow connection rows under the same total order.
 func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEventsParams) ([]ProxyAudit, error) {
 	rows, err := q.db.Query(ctx, listProxyAuditEvents,
 		arg.SandboxID,
-		arg.Before,
 		arg.Since,
+		arg.CursorTs,
+		arg.CursorKind,
+		arg.CursorID,
 		arg.RowLimit,
 	)
 	if err != nil {
