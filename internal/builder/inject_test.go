@@ -60,7 +60,7 @@ func TestInjectProxyCA(t *testing.T) {
 		}
 	})
 
-	t.Run("missing bundle still writes the additional cert", func(t *testing.T) {
+	t.Run("missing bundle is created from the proxy CA", func(t *testing.T) {
 		rootfs := t.TempDir()
 		if err := injectProxyCA(rootfs, writeCertFile(t), nil); err != nil {
 			t.Fatalf("err: %v", err)
@@ -68,8 +68,12 @@ func TestInjectProxyCA(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(rootfs, "usr/local/share/ca-certificates/superserve-proxy.crt")); err != nil {
 			t.Fatalf("additional cert missing: %v", err)
 		}
-		if _, err := os.Stat(filepath.Join(rootfs, "etc/ssl/certs/ca-certificates.crt")); !os.IsNotExist(err) {
-			t.Fatalf("bundle should remain absent: %v", err)
+		bundle, err := os.ReadFile(filepath.Join(rootfs, "etc/ssl/certs/ca-certificates.crt"))
+		if err != nil {
+			t.Fatalf("bundle should have been created: %v", err)
+		}
+		if !strings.Contains(string(bundle), certPEM) {
+			t.Fatalf("created bundle missing the proxy CA; got: %q", bundle)
 		}
 	})
 

@@ -46,9 +46,10 @@ var seedentropyBinary []byte
 // Must be called AFTER pullAndFlatten — operates on the extracted tree.
 //
 // Layout produced:
-//   /usr/bin/boxd              (0755)  — the guest agent binary
-//   /usr/local/bin/tini        (0755)  — PID 1 helper, embedded at build
-//   /sbin/init                 (0755)  — shell wrapper that execs tini
+//
+//	/usr/bin/boxd              (0755)  — the guest agent binary
+//	/usr/local/bin/tini        (0755)  — PID 1 helper, embedded at build
+//	/sbin/init                 (0755)  — shell wrapper that execs tini
 //
 // Returns the byte count of the boxd binary copied, for observability.
 func injectGuestAgent(rootfsDir, boxdBinaryPath string, logger *zerolog.Logger) (int64, error) {
@@ -179,8 +180,13 @@ func injectProxyCA(rootfsDir, caCertPath string, logger *zerolog.Logger) error {
 	bf, err := os.OpenFile(bundlePath, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if logger != nil {
-				logger.Warn().Str("bundle", bundlePath).Msg("system trust bundle absent; proxy CA installed only to /usr/local/share/ca-certificates")
+			// Minimal image with no system bundle: create it from the proxy CA,
+			// since the injected SSL_CERT_FILE/CURL_CA_BUNDLE env vars point here.
+			if mkErr := os.MkdirAll(filepath.Dir(bundlePath), 0o755); mkErr != nil {
+				return fmt.Errorf("mkdir %s: %w", filepath.Dir(bundlePath), mkErr)
+			}
+			if wErr := os.WriteFile(bundlePath, cert, 0o644); wErr != nil {
+				return fmt.Errorf("write %s: %w", bundlePath, wErr)
 			}
 			return nil
 		}

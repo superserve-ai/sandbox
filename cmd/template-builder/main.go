@@ -192,10 +192,16 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 
 	emitUser("system", "Pulling image %s", cfg.spec.From)
+	// Default to the daemon's CA path so templates trust the MITM CA even when
+	// SECRETSPROXY_CA_CERT is not set explicitly in the build environment.
+	proxyCA := os.Getenv("SECRETSPROXY_CA_CERT")
+	if proxyCA == "" {
+		proxyCA = "/var/lib/secretsproxy/ca.crt"
+	}
 	b, err := builder.NewBuilder(builder.Config{
 		BoxdBinaryPath:           cfg.boxdBin,
 		MaxUncompressedSizeBytes: int64(cfg.diskMiB) * 1024 * 1024,
-		ProxyCACertPath:          os.Getenv("SECRETSPROXY_CA_CERT"),
+		ProxyCACertPath:          proxyCA,
 	})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
