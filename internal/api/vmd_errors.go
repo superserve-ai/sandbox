@@ -111,11 +111,12 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 }
 
 // failSandboxAfterBoot destroys a running VM and marks the sandbox row as failed.
-// Used by CreateSandbox when a post-restore step (env injection, JWT mint)
-// fails — the VM is already running but unusable, so we tear it down and
-// surface the failure to the customer.
-func (h *Handlers) failSandboxAfterBoot(ctx context.Context, sandboxID, teamID uuid.UUID, instanceID string) {
-	if err := h.VMD.DestroyInstance(ctx, instanceID, true); err != nil {
+// Used by CreateSandbox when a post-restore step (env injection, JWT mint) fails:
+// the VM is already running but unusable. vmd must be the client for the host the
+// VM booted on — destroying through the default client would leave the VM running
+// on a non-default host.
+func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sandboxID, teamID uuid.UUID, instanceID string) {
+	if err := vmd.DestroyInstance(ctx, instanceID, true); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy after failed boot")
 	}
 	if err := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
