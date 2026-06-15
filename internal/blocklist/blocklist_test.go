@@ -1,4 +1,4 @@
-package network
+package blocklist
 
 import (
 	"net"
@@ -73,13 +73,13 @@ func TestBlocklistBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds:   []string{feed},
 		CustomDomains: []string{"pinned.example.net"},
 		CustomCIDRs:   []string{"1.2.3.4"},
 		StatePath:     filepath.Join(dir, "state"),
 	}
-	b := NewBlocklist(cfg, zerolog.Nop())
+	b := New(cfg, zerolog.Nop())
 	b.refresh(t.Context())
 
 	tests := []struct {
@@ -111,7 +111,7 @@ func TestBlocklistBlocked(t *testing.T) {
 
 	// A fresh Blocklist seeded only from state (feed gone) still blocks.
 	os.Remove(feed)
-	b2 := NewBlocklist(cfg, zerolog.Nop())
+	b2 := New(cfg, zerolog.Nop())
 	if got, _ := b2.Blocked("pool.example.com", nil); !got {
 		t.Error("state-seeded blocklist should block pool.example.com before first refresh")
 	}
@@ -123,11 +123,11 @@ func TestRefreshKeepsLastGoodOnTotalFailure(t *testing.T) {
 	if err := os.WriteFile(feed, []byte("pool.example.com\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds: []string{feed},
 		StatePath:   filepath.Join(dir, "state"),
 	}
-	b := NewBlocklist(cfg, zerolog.Nop())
+	b := New(cfg, zerolog.Nop())
 	b.refresh(t.Context())
 	if got, _ := b.Blocked("pool.example.com", nil); !got {
 		t.Fatal("expected pool.example.com blocked after first refresh")
@@ -151,11 +151,11 @@ func TestRefreshKeepsFailedFeedFromCache(t *testing.T) {
 	if err := os.WriteFile(flaky, []byte("flaky-only.example.com\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds: []string{good, flaky},
 		StatePath:   filepath.Join(dir, "state"),
 	}
-	b := NewBlocklist(cfg, zerolog.Nop())
+	b := New(cfg, zerolog.Nop())
 	b.refresh(t.Context())
 
 	// One feed fails this round; the other still succeeds. The failed feed's
@@ -177,12 +177,12 @@ func TestCIDRSinkInvokedOnRefresh(t *testing.T) {
 	if err := os.WriteFile(feed, []byte("10.20.30.0/24\nblocked.example.com\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds: []string{feed},
 		CustomCIDRs: []string{"203.0.113.7"},
 		StatePath:   filepath.Join(dir, "state"),
 	}
-	b := NewBlocklist(cfg, zerolog.Nop())
+	b := New(cfg, zerolog.Nop())
 
 	var got []string
 	b.SetCIDRSink(func(c []string) { got = c })
@@ -215,11 +215,11 @@ func TestRefreshPreservesSeededStateOnPartialFirstFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	flaky := filepath.Join(dir, "flaky.txt") // missing → fails, and no cache yet
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds: []string{good, flaky},
 		StatePath:   statePath,
 	}
-	b := NewBlocklist(cfg, zerolog.Nop()) // seeds cur from state; feedCache empty
+	b := New(cfg, zerolog.Nop()) // seeds cur from state; feedCache empty
 
 	b.refresh(t.Context()) // good succeeds, flaky fails on the very first refresh
 
@@ -250,11 +250,11 @@ func TestCIDRSinkFiresWhenAllFeedsDownWithSeededState(t *testing.T) {
 	if err := os.WriteFile(statePath, []byte("198.51.100.0/24\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds: []string{filepath.Join(dir, "missing-feed.txt")}, // never resolves
 		StatePath:   statePath,
 	}
-	b := NewBlocklist(cfg, zerolog.Nop()) // seeds snapshot from state
+	b := New(cfg, zerolog.Nop()) // seeds snapshot from state
 
 	var got []string
 	sinkCalled := false
@@ -286,11 +286,11 @@ func TestFeedParseErrorKeepsLastGood(t *testing.T) {
 	if err := os.WriteFile(feed, []byte("keep.example.com\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds: []string{feed},
 		StatePath:   filepath.Join(dir, "state"),
 	}
-	b := NewBlocklist(cfg, zerolog.Nop())
+	b := New(cfg, zerolog.Nop())
 	b.refresh(t.Context())
 	if got, _ := b.Blocked("keep.example.com", nil); !got {
 		t.Fatal("expected keep.example.com blocked after first refresh")
@@ -322,11 +322,11 @@ func TestOversizedFeedFailsAndKeepsLastGood(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := &BlocklistConfig{
+	cfg := &Config{
 		DomainFeeds: []string{srv.URL},
 		StatePath:   filepath.Join(dir, "state"),
 	}
-	b := NewBlocklist(cfg, zerolog.Nop())
+	b := New(cfg, zerolog.Nop())
 	b.maxBytes = 20 // tiny cap for the test
 
 	b.refresh(t.Context()) // small body, succeeds
@@ -364,7 +364,7 @@ refresh_interval: 30m
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadBlocklistConfig(path)
+	cfg, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,25 +390,8 @@ refresh_interval: 30m
 		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := LoadBlocklistConfig(p); err == nil {
+		if _, err := LoadConfig(p); err == nil {
 			t.Errorf("%s: expected load error, got nil", name)
 		}
-	}
-}
-
-func TestProxyBlocklistPrecedesSandboxAllow(t *testing.T) {
-	dir := t.TempDir()
-	cfg := &BlocklistConfig{
-		CustomDomains: []string{"pool.example.com"},
-		StatePath:     filepath.Join(dir, "state"),
-	}
-	p := NewEgressProxy(0, 0, 0, 0, zerolog.Nop())
-	p.SetBlocklist(NewBlocklist(cfg, zerolog.Nop()))
-
-	// The sandbox explicitly allows the domain — the global blocklist must
-	// still win. handleConn checks the blocklist before isAllowed, so here
-	// we verify the lookup the proxy performs.
-	if blocked, dim := p.blocklist.Blocked("pool.example.com", net.ParseIP("8.8.8.8")); !blocked || dim != "domain" {
-		t.Errorf("Blocked() = (%v, %q), want (true, domain)", blocked, dim)
 	}
 }

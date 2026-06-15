@@ -19,8 +19,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	yaml "go.yaml.in/yaml/v3"
 
+	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/egresspolicy"
 	"github.com/superserve-ai/sandbox/internal/secretsproxy"
@@ -90,9 +90,12 @@ func run() error {
 		}
 	}()
 
-	blockedPorts, err := loadBlockedPorts(cfg.BlocklistConfigPath)
-	if err != nil {
-		log.Warn().Err(err).Msg("could not load blocked egress ports; port policy disabled")
+	// Enforce the operator blocklist on the proxied path too, so a secrets
+	// sandbox gets the same containment as direct traffic through the firewall.
+	egressBlocklist, blockedPorts := loadEgressBlocklist(rootCtx, cfg.BlocklistConfigPath)
+	var blEnforcer secretsproxy.EgressBlocklist
+	if egressBlocklist != nil {
+		blEnforcer = egressBlocklist
 	}
 
 	dnsResolver := buildPolicyResolver(cfg.UpstreamResolverAddr)
@@ -105,16 +108,14 @@ func run() error {
 		Revoker:             revoker,
 		SandboxFacingHost:   cfg.SandboxFacingHost,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
-		UpstreamTransport:   buildUpstreamTransport(dnsResolver),
+		UpstreamTransport:   buildUpstreamTransport(dnsResolver, egressBlocklist),
 		BlockedPorts:        blockedPorts,
 		BlockInternalAddrs:  true,
 		DNSResolver:         dnsResolver,
+		Blocklist:           blEnforcer,
 	})
 	if cfg.UpstreamResolverAddr != "" {
 		log.Info().Str("resolver", cfg.UpstreamResolverAddr).Msg("upstream name resolution routed through policy resolver")
-	}
-	if len(blockedPorts) > 0 {
-		log.Info().Int("count", len(blockedPorts)).Msg("egress port policy loaded")
 	}
 	proxyErrCh := make(chan error, 1)
 	go func() { proxyErrCh <- proxy.ListenAndServe() }()
@@ -166,23 +167,40 @@ func droppedCount(sink secretsproxy.AuditSink) int64 {
 	return 0
 }
 
-// loadBlockedPorts reads blocked_egress_ports from the operator egress-blocklist
-// YAML. An empty path yields no blocked ports.
-func loadBlockedPorts(path string) ([]int, error) {
+// loadEgressBlocklist loads the operator blocklist and starts its refresh loop,
+// returning the live matcher and the blocked egress ports. An unset or
+// unparseable path returns (nil, nil) with enforcement disabled and logged,
+// rather than silently passing traffic the operator expects to be blocked.
+func loadEgressBlocklist(ctx context.Context, path string) (*blocklist.Blocklist, []int) {
 	if path == "" {
+		log.Warn().Msg("SECRETSPROXY_BLOCKLIST_CONFIG unset; proxied-path egress blocklist enforcement disabled")
 		return nil, nil
 	}
-	data, err := os.ReadFile(path)
+	cfg, err := blocklist.LoadConfig(path)
 	if err != nil {
-		return nil, fmt.Errorf("read blocklist config: %w", err)
+		log.Error().Err(err).Str("path", path).Msg("egress blocklist failed to load; proxied-path blocklist enforcement DISABLED")
+		return nil, nil
 	}
-	var doc struct {
-		BlockedEgressPorts []int `yaml:"blocked_egress_ports"`
+	bl := blocklist.New(cfg, log.Logger)
+	go func() { _ = bl.Start(ctx) }()
+	log.Info().
+		Int("feeds", len(cfg.DomainFeeds)).
+		Int("pinned_domains", len(cfg.CustomDomains)).
+		Int("pinned_cidrs", len(cfg.CustomCIDRs)).
+		Int("blocked_ports", len(cfg.BlockedEgressPorts)).
+		Msg("egress blocklist enforced on proxied path")
+	return bl, portsToInt(cfg.BlockedEgressPorts)
+}
+
+func portsToInt(ports []uint16) []int {
+	if len(ports) == 0 {
+		return nil
 	}
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return nil, fmt.Errorf("parse blocklist config %s: %w", path, err)
+	out := make([]int, len(ports))
+	for i, p := range ports {
+		out[i] = int(p)
 	}
-	return doc.BlockedEgressPorts, nil
+	return out
 }
 
 // buildPolicyResolver returns a resolver that sends queries to resolverAddr so
@@ -202,12 +220,12 @@ func buildPolicyResolver(resolverAddr string) *net.Resolver {
 }
 
 // buildUpstreamTransport builds the upstream transport, resolving through res
-// and applying the internal-IP guard on every dial.
-func buildUpstreamTransport(res *net.Resolver) *http.Transport {
+// and applying the internal-IP and blocklist-CIDR guards on every dial.
+func buildUpstreamTransport(res *net.Resolver, bl *blocklist.Blocklist) *http.Transport {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Control:   denyInternalDial,
+		Control:   dialGuard(bl),
 		Resolver:  res,
 	}
 	return &http.Transport{
@@ -221,17 +239,30 @@ func buildUpstreamTransport(res *net.Resolver) *http.Transport {
 	}
 }
 
-// denyInternalDial rejects dials to internal ranges. Running on the resolved
-// address, it catches IP-literal targets and hostnames that resolve internally.
-func denyInternalDial(_, address string, _ syscall.RawConn) error {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return err
+// dialGuard rejects dials to internal ranges and to operator-blocklisted CIDRs.
+// Running on the resolved address, it catches IP-literal targets and hostnames
+// that resolve into a denied range (the domain blocklist is enforced earlier, at
+// CONNECT, where the hostname is known). A nil bl skips the blocklist check.
+func dialGuard(bl *blocklist.Blocklist) func(string, string, syscall.RawConn) error {
+	return func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return nil
+		}
+		if egresspolicy.IsIPDenied(ip) {
+			return fmt.Errorf("blocked: internal address %s", ip)
+		}
+		if bl != nil {
+			if blocked, _ := bl.Blocked("", ip); blocked {
+				return fmt.Errorf("blocked: egress blocklist %s", ip)
+			}
+		}
+		return nil
 	}
-	if ip := net.ParseIP(host); ip != nil && egresspolicy.IsIPDenied(ip) {
-		return fmt.Errorf("blocked: internal address %s", ip)
-	}
-	return nil
 }
 
 type config struct {

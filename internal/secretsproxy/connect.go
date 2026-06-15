@@ -77,6 +77,16 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Operator egress blocklist by hostname and IP-literal target. A hostname
+	// that resolves to a blocklisted CIDR is caught by the upstream dialer.
+	if p.blocklist != nil {
+		if blocked, dim := p.blocklist.Blocked(host, net.ParseIP(host)); blocked {
+			p.logger.Warn("blocked by egress blocklist", "sandbox", scope.SandboxID, "host", host, "match", dim)
+			http.Error(w, "destination blocked by policy", http.StatusForbidden)
+			return
+		}
+	}
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "internal proxy error", http.StatusInternalServerError)
