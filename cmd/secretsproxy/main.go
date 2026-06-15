@@ -256,13 +256,28 @@ func buildUpstreamTransport(res *net.Resolver, bl *blocklist.Blocklist) *http.Tr
 		Resolver:  res,
 	}
 	return &http.Transport{
-		DialContext:           dialer.DialContext,
+		DialContext:           pinnedDialContext(dialer),
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ForceAttemptHTTP2:     false,
+	}
+}
+
+// pinnedDialContext dials the IP pinned on the request context (the address the
+// CIDR policy was evaluated against) instead of re-resolving the host, so policy
+// and connection always use the same IP. The dialer's Control guard still runs
+// on the final address. Falls back to normal resolution when nothing is pinned.
+func pinnedDialContext(d *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if ip := secretsproxy.PinnedDialIP(ctx); ip != nil {
+			if _, port, err := net.SplitHostPort(addr); err == nil {
+				addr = net.JoinHostPort(ip.String(), port)
+			}
+		}
+		return d.DialContext(ctx, network, addr)
 	}
 }
 
