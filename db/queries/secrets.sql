@@ -57,6 +57,13 @@ RETURNING *;
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
 VALUES ($1, $2, $3);
 
+-- name: AddSandboxSecrets :exec
+-- Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
+-- the secret_ids and env_keys arrays are paired by position.
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
+SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i]
+FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i);
+
 -- name: ListSandboxSecrets :many
 -- Secret rows plus the env_key each is bound under for this sandbox.
 SELECT s.*, ss.env_key

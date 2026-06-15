@@ -29,6 +29,25 @@ func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretPara
 	return err
 }
 
+const addSandboxSecrets = `-- name: AddSandboxSecrets :exec
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
+SELECT $1::uuid, ($2::uuid[])[i], ($3::text[])[i]
+FROM generate_subscripts($2::uuid[], 1) AS g(i)
+`
+
+type AddSandboxSecretsParams struct {
+	SandboxID uuid.UUID   `json:"sandbox_id"`
+	SecretIds []uuid.UUID `json:"secret_ids"`
+	EnvKeys   []string    `json:"env_keys"`
+}
+
+// Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
+// the secret_ids and env_keys arrays are paired by position.
+func (q *Queries) AddSandboxSecrets(ctx context.Context, arg AddSandboxSecretsParams) error {
+	_, err := q.db.Exec(ctx, addSandboxSecrets, arg.SandboxID, arg.SecretIds, arg.EnvKeys)
+	return err
+}
+
 const createSecret = `-- name: CreateSecret :one
 INSERT INTO secret (
     team_id, name, auth_type, auth_config, provider_shortcut, hosts,
