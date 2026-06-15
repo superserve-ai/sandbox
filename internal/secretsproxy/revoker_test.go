@@ -78,3 +78,21 @@ func idString(i int) string {
 	}
 	return string(b[n:])
 }
+
+func TestReconcileIsAddOnly(t *testing.T) {
+	r := NewRevoker()
+	r.RevokeSandbox("pushed-1") // arrived via push
+
+	// A reconcile that doesn't include pushed-1 must NOT drop it (no race
+	// un-revoke), and must add the entries it does carry.
+	r.Reconcile([]string{"fetched-1", "fetched-2"})
+
+	for _, id := range []string{"pushed-1", "fetched-1", "fetched-2"} {
+		if !r.IsSandboxRevoked(id) {
+			t.Errorf("%q should be revoked after reconcile", id)
+		}
+	}
+	if r.IsSandboxRevoked("never") {
+		t.Error("unrelated id should not be revoked")
+	}
+}

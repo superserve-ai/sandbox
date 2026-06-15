@@ -37,3 +37,16 @@ func (r *Revoker) Bootstrap(sandboxIDs []string) {
 	r.sandboxes = next
 	r.mu.Unlock()
 }
+
+// Reconcile merges sandboxIDs into the revoked set without removing existing
+// entries. Used by the periodic backstop so a dropped revocation push is picked
+// up on the next fetch. Add-only on purpose: a blind replace could race a
+// just-arrived push and briefly un-revoke a sandbox, and a revoked sandbox is
+// never legitimately un-revoked (a destroyed one's stale entry is harmless).
+func (r *Revoker) Reconcile(sandboxIDs []string) {
+	r.mu.Lock()
+	for _, id := range sandboxIDs {
+		r.sandboxes[id] = struct{}{}
+	}
+	r.mu.Unlock()
+}

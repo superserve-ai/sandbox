@@ -79,6 +79,7 @@ func run() error {
 	}
 	revoker.Bootstrap(revoked)
 	log.Info().Int("revoked_sandboxes", len(revoked)).Msg("revocations loaded from control plane")
+	go reconcileRevocations(rootCtx, revoker, cfg.ControlPlaneURL, cfg.DaemonAuthToken)
 
 	auditSink, dbCleanup, err := buildAuditSink(rootCtx, cfg)
 	if err != nil {
@@ -190,6 +191,32 @@ func loadEgressBlocklist(ctx context.Context, path string) (*blocklist.Blocklist
 		Int("blocked_ports", len(cfg.BlockedEgressPorts)).
 		Msg("egress blocklist enforced on proxied path")
 	return bl, portsToInt(cfg.BlockedEgressPorts)
+}
+
+// revocationReconcileInterval bounds how long a dropped revocation push can go
+// unnoticed: the push is the instant path, this periodic fetch is the backstop.
+const revocationReconcileInterval = 60 * time.Second
+
+// reconcileRevocations periodically merges the control plane's revoked set into
+// the local one, so a revocation whose push was lost is still applied within the
+// interval. A fetch error keeps the current set (last-known-good) — a transient
+// outage never un-revokes a sandbox.
+func reconcileRevocations(ctx context.Context, revoker *secretsproxy.Revoker, baseURL, token string) {
+	ticker := time.NewTicker(revocationReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			revoked, err := secretsproxy.FetchRevokedSandboxes(ctx, baseURL, token)
+			if err != nil {
+				log.Warn().Err(err).Msg("revocation reconcile failed; keeping last-known-good set")
+				continue
+			}
+			revoker.Reconcile(revoked)
+		}
+	}
 }
 
 func portsToInt(ports []uint16) []int {
