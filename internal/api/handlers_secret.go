@@ -1017,8 +1017,10 @@ func validateSecretsRefs(refs map[string]string) error {
 	if len(refs) == 0 {
 		return nil
 	}
-	if len(refs) > envVarsMaxKeys {
-		return fmt.Errorf("secrets has %d entries, max is %d", len(refs), envVarsMaxKeys)
+	// Each secret becomes one JWT binding; cap at that limit here (before boot)
+	// rather than failing later at JWT mint, after the VM is already restored.
+	if len(refs) > SecretsBindingsCap {
+		return fmt.Errorf("secrets has %d entries, max is %d", len(refs), SecretsBindingsCap)
 	}
 	for envKey, name := range refs {
 		if !envKeyRE.MatchString(envKey) {
