@@ -55,22 +55,28 @@ func TestHasCIDR(t *testing.T) {
 }
 
 func TestEvalEgress(t *testing.T) {
-	priv := net.ParseIP("10.1.2.3")
-	pub := net.ParseIP("8.8.8.8")
+	priv := net.ParseIP("10.1.2.3") // reserved/internal
+	pub := net.ParseIP("8.8.8.8")   // routable
+	pub2 := net.ParseIP("1.1.1.1")  // routable, outside the test CIDR
+
+	// Reserved internal ranges are denied even when a user allow matches them.
+	if ok, reason := EvalEgress("api.internal", priv, []string{"10.0.0.0/8"}, nil, "passthrough"); ok || reason != "internal_address_denied" {
+		t.Errorf("user allow must not override reserved-range deny; ok=%v reason=%q", ok, reason)
+	}
 
 	// CIDR allow: in-range allowed, out-of-range denied (allowlist mode).
-	if ok, _ := EvalEgress("api.internal", priv, []string{"10.0.0.0/8"}, nil, "passthrough"); !ok {
+	if ok, _ := EvalEgress("api.public", pub, []string{"8.8.8.0/24"}, nil, "passthrough"); !ok {
 		t.Error("CIDR allow should permit in-range IP")
 	}
-	if ok, reason := EvalEgress("api.public", pub, []string{"10.0.0.0/8"}, nil, "passthrough"); ok || reason != "host_not_allowed" {
+	if ok, reason := EvalEgress("api.public", pub2, []string{"8.8.8.0/24"}, nil, "passthrough"); ok || reason != "host_not_allowed" {
 		t.Errorf("CIDR allow should deny out-of-range; ok=%v reason=%q", ok, reason)
 	}
 
 	// CIDR deny: in-range blocked; out-of-range unaffected.
-	if ok, reason := EvalEgress("api.internal", priv, nil, []string{"10.0.0.0/8"}, "passthrough"); ok || reason != "host_denied" {
+	if ok, reason := EvalEgress("api.public", pub, nil, []string{"8.8.8.0/24"}, "passthrough"); ok || reason != "host_denied" {
 		t.Errorf("CIDR deny should block in-range; ok=%v reason=%q", ok, reason)
 	}
-	if ok, _ := EvalEgress("api.public", pub, nil, []string{"10.0.0.0/8"}, "passthrough"); !ok {
+	if ok, _ := EvalEgress("api.public", pub2, nil, []string{"8.8.8.0/24"}, "passthrough"); !ok {
 		t.Error("CIDR deny should not affect out-of-range")
 	}
 
