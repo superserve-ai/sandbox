@@ -144,7 +144,8 @@ type GetSecretByIDForDecryptParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Daemon decrypt path. Team-scoped; excludes soft-deleted.
+// Daemon decrypt path. Team-scoped; excludes soft-deleted. Separate from
+// GetSecretByID so it can diverge later (audit, caching) without touching API reads.
 func (q *Queries) GetSecretByIDForDecrypt(ctx context.Context, arg GetSecretByIDForDecryptParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, getSecretByIDForDecrypt, arg.ID, arg.TeamID)
 	var i Secret
@@ -241,7 +242,7 @@ FROM proxy_audit pa
 LEFT JOIN sandbox sb ON sb.id = pa.sandbox_id
 WHERE pa.secret_id = $1
   AND pa.team_id = $2
-  AND ($3::bigint = 0 OR pa.id < $3)
+  AND ($3::bigint IS NULL OR pa.id < $3::bigint)
   AND pa.status >= $4::int
   AND pa.status <= $5::int
 ORDER BY pa.id DESC
@@ -249,12 +250,12 @@ LIMIT $6
 `
 
 type ListAuditForSecretParams struct {
-	SecretID pgtype.UUID `json:"secret_id"`
-	TeamID   uuid.UUID   `json:"team_id"`
-	Column3  int64       `json:"column_3"`
-	Column4  int32       `json:"column_4"`
-	Column5  int32       `json:"column_5"`
-	Limit    int32       `json:"limit"`
+	SecretID  pgtype.UUID `json:"secret_id"`
+	TeamID    uuid.UUID   `json:"team_id"`
+	CursorID  *int64      `json:"cursor_id"`
+	StatusMin int32       `json:"status_min"`
+	StatusMax int32       `json:"status_max"`
+	RowLimit  int32       `json:"row_limit"`
 }
 
 type ListAuditForSecretRow struct {
@@ -273,18 +274,17 @@ type ListAuditForSecretRow struct {
 	SandboxName    *string     `json:"sandbox_name"`
 }
 
-// Per-secret audit with LEFT JOIN sandbox so the UI can render readable
-// sandbox names; null when the sandbox was deleted.
-// $3=0 returns the most recent rows; otherwise rows older than that id.
-// $4/$5 status bounds: 0/9999 = unfiltered.
+// Per-secret audit with LEFT JOIN sandbox so the UI can render readable sandbox
+// names; null when the sandbox was deleted. A null cursor returns the most
+// recent rows; otherwise rows older than that id.
 func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecretParams) ([]ListAuditForSecretRow, error) {
 	rows, err := q.db.Query(ctx, listAuditForSecret,
 		arg.SecretID,
 		arg.TeamID,
-		arg.Column3,
-		arg.Column4,
-		arg.Column5,
-		arg.Limit,
+		arg.CursorID,
+		arg.StatusMin,
+		arg.StatusMax,
+		arg.RowLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -674,11 +674,16 @@ func (q *Queries) SoftDeleteSecretByName(ctx context.Context, arg SoftDeleteSecr
 const touchSecretLastUsed = `-- name: TouchSecretLastUsed :exec
 UPDATE secret
 SET last_used_at = now()
-WHERE id = $1
+WHERE id = $1 AND team_id = $2
 `
 
-func (q *Queries) TouchSecretLastUsed(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, touchSecretLastUsed, id)
+type TouchSecretLastUsedParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) TouchSecretLastUsed(ctx context.Context, arg TouchSecretLastUsedParams) error {
+	_, err := q.db.Exec(ctx, touchSecretLastUsed, arg.ID, arg.TeamID)
 	return err
 }
 

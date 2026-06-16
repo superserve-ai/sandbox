@@ -6,6 +6,8 @@
 CREATE TABLE IF NOT EXISTS net_flow (
     id            bigserial PRIMARY KEY,
     ts            timestamptz NOT NULL DEFAULT now(),
+    -- No FK on team_id/sandbox_id: net_flow is an append-only audit log that
+    -- must outlive sandbox/team hard-deletes (sandboxes have no soft-delete).
     team_id       uuid NOT NULL,
     sandbox_id    uuid NOT NULL,
     -- 'http' (port 80), 'tls' (port 443), or 'other' (raw TCP).

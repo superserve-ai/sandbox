@@ -1004,7 +1004,7 @@ func (h *Handlers) DecryptSecret(c *gin.Context) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = h.DB.TouchSecretLastUsed(ctx, secretID)
+		_ = h.DB.TouchSecretLastUsed(ctx, db.TouchSecretLastUsedParams{ID: secretID, TeamID: teamID})
 	}()
 
 	c.JSON(http.StatusOK, decryptSecretResponse{Value: string(plaintext)})
@@ -1344,13 +1344,17 @@ func (h *Handlers) GetSecretAudit(c *gin.Context) {
 		return
 	}
 
+	var cursorID *int64
+	if before > 0 {
+		cursorID = &before
+	}
 	rows, err := h.DB.ListAuditForSecret(c.Request.Context(), db.ListAuditForSecretParams{
-		SecretID: pgtype.UUID{Bytes: secret.ID, Valid: true},
-		TeamID:   teamID,
-		Column3:  before,
-		Column4:  minStatus,
-		Column5:  maxStatus,
-		Limit:    limit,
+		SecretID:  pgtype.UUID{Bytes: secret.ID, Valid: true},
+		TeamID:    teamID,
+		CursorID:  cursorID,
+		StatusMin: minStatus,
+		StatusMax: maxStatus,
+		RowLimit:  limit,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("name", name).Msg("DB ListAuditForSecret failed")
