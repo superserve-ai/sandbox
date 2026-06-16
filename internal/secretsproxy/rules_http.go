@@ -35,8 +35,8 @@ type egressRulesResponse struct {
 }
 
 // FetchRules resolves sandboxID to its current egress rules. A 404 (sandbox
-// gone) yields empty rules so the dispatcher treats it as no policy rather than
-// erroring; transient 5xx are surfaced so the cache serves last-known-good.
+// gone) fails closed with a deny-all policy so a still-valid JWT cannot egress
+// unrestricted; transient 5xx are surfaced so the cache serves last-known-good.
 func (c *HTTPRulesClient) FetchRules(ctx context.Context, sandboxID string) (EgressRules, error) {
 	u := c.baseURL + "/internal/sandboxes/" + url.PathEscape(sandboxID) + "/egress_rules"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -54,7 +54,9 @@ func (c *HTTPRulesClient) FetchRules(ctx context.Context, sandboxID string) (Egr
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		return EgressRules{}, nil
+		// Deny-all, not empty (which EvalEgress treats as passthrough). nil error
+		// so the cache stores the deny authoritatively, not stale last-known-good.
+		return EgressRules{UnmatchedHostPolicy: "deny"}, nil
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return EgressRules{}, fmt.Errorf("control plane rejected daemon auth (%d)", resp.StatusCode)
 	default:
