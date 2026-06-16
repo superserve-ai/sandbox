@@ -106,6 +106,7 @@ SET vcpu_seconds = EXCLUDED.vcpu_seconds,
     storage_mib_seconds = EXCLUDED.storage_mib_seconds,
     updated_at = now()
 WHERE team_billing_usage.finalized_at IS NULL
+  AND team_billing_usage.exported_at IS NULL
 RETURNING *;
 
 -- name: UpsertTeamBillingUsageHour :one
@@ -191,7 +192,11 @@ VALUES (
     sqlc.arg(status)
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
-SET status = EXCLUDED.status,
+SET status = CASE
+        WHEN team_billing_period.status IN ('approved', 'exported')
+            THEN team_billing_period.status
+        ELSE EXCLUDED.status
+    END,
     updated_at = now()
 WHERE team_billing_period.finalized_at IS NULL
 RETURNING *;
@@ -233,17 +238,33 @@ WHERE team_billing_period.team_id = sqlc.arg(team_id)
 RETURNING *;
 
 -- name: MarkTeamBillingPeriodExported :one
-UPDATE team_billing_period
-SET status = 'exported',
-    exported_at = now(),
-    updated_at = now()
-WHERE team_billing_period.team_id = sqlc.arg(team_id)
-  AND team_billing_period.period_start = sqlc.arg(period_start)
-  AND team_billing_period.period_end = sqlc.arg(period_end)
-  AND team_billing_period.status = 'approved'
-  AND team_billing_period.finalized_at IS NULL
-  AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
-RETURNING *;
+WITH exported_period AS (
+    UPDATE team_billing_period
+    SET status = 'exported',
+        exported_at = now(),
+        updated_at = now()
+    WHERE team_billing_period.team_id = sqlc.arg(team_id)
+      AND team_billing_period.period_start = sqlc.arg(period_start)
+      AND team_billing_period.period_end = sqlc.arg(period_end)
+      AND team_billing_period.status = 'approved'
+      AND team_billing_period.finalized_at IS NULL
+      AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
+    RETURNING *
+),
+exported_usage AS (
+    UPDATE team_billing_usage u
+    SET exported_at = exported_period.exported_at,
+        updated_at = now()
+    FROM exported_period
+    WHERE u.team_id = exported_period.team_id
+      AND u.period_start = exported_period.period_start
+      AND u.period_end = exported_period.period_end
+      AND u.exported_at IS NULL
+      AND u.finalized_at IS NULL
+    RETURNING u.team_id
+)
+SELECT *
+FROM exported_period;
 
 -- name: FinalizeTeamBillingPeriod :one
 WITH finalized_period AS (
