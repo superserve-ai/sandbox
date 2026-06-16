@@ -16,7 +16,8 @@ SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
 -- name: GetSecretByIDForDecrypt :one
--- Daemon decrypt path. Team-scoped; excludes soft-deleted.
+-- Daemon decrypt path. Team-scoped; excludes soft-deleted. Separate from
+-- GetSecretByID so it can diverge later (audit, caching) without touching API reads.
 SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
@@ -38,7 +39,7 @@ RETURNING *;
 -- name: TouchSecretLastUsed :exec
 UPDATE secret
 SET last_used_at = now()
-WHERE id = $1;
+WHERE id = $1 AND team_id = $2;
 
 -- name: SoftDeleteSecret :one
 -- Setting deleted_at both revokes and hides from new-binding listings.
@@ -118,17 +119,16 @@ ORDER BY ts DESC, id DESC
 LIMIT sqlc.arg('row_limit');
 
 -- name: ListAuditForSecret :many
--- Per-secret audit with LEFT JOIN sandbox so the UI can render readable
--- sandbox names; null when the sandbox was deleted.
--- $3=0 returns the most recent rows; otherwise rows older than that id.
--- $4/$5 status bounds: 0/9999 = unfiltered.
+-- Per-secret audit with LEFT JOIN sandbox so the UI can render readable sandbox
+-- names; null when the sandbox was deleted. A null cursor returns the most
+-- recent rows; otherwise rows older than that id.
 SELECT pa.*, sb.name AS sandbox_name
 FROM proxy_audit pa
 LEFT JOIN sandbox sb ON sb.id = pa.sandbox_id
-WHERE pa.secret_id = $1
-  AND pa.team_id = $2
-  AND ($3::bigint = 0 OR pa.id < $3)
-  AND pa.status >= $4::int
-  AND pa.status <= $5::int
+WHERE pa.secret_id = sqlc.arg('secret_id')
+  AND pa.team_id = sqlc.arg('team_id')
+  AND (sqlc.narg('cursor_id')::bigint IS NULL OR pa.id < sqlc.narg('cursor_id')::bigint)
+  AND pa.status >= sqlc.arg('status_min')::int
+  AND pa.status <= sqlc.arg('status_max')::int
 ORDER BY pa.id DESC
-LIMIT $6;
+LIMIT sqlc.arg('row_limit');
