@@ -98,12 +98,17 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		return
 	}
 
-	// CORS: allow browser-based file uploads from permitted origins.
+	// CORS: allow browser-based file uploads and downloads from permitted
+	// origins. Expose Content-Disposition so the console can read the archive
+	// filename (e.g. "<dir>.zip") off a cross-origin download response — it is
+	// not a CORS-safelisted response header, so without this it stays invisible
+	// to JS even though boxd sends it.
 	if origin := r.Header.Get("Origin"); origin != "" {
 		if h.originAllowed(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type")
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 			w.Header().Set("Access-Control-Max-Age", "3600")
 		}
 		if r.Method == http.MethodOptions {

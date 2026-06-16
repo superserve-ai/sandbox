@@ -393,3 +393,58 @@ func TestFiles_SharedHost_ForwardsToUpstream(t *testing.T) {
 		t.Error("X-Superserve-Sandbox-Id was forwarded to upstream — should be scrubbed")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Directory download (format=zip). The console reads the archive filename from
+// Content-Disposition, which cross-origin JS can only see when it is exposed.
+// ---------------------------------------------------------------------------
+
+func TestFiles_CORS_ExposesContentDisposition(t *testing.T) {
+	env := newFilesTestEnv(t)
+	req := env.buildRequest(http.MethodOptions, "/home/u/project", "", nil)
+	req.Header.Set("Origin", "https://console.superserve.ai")
+	w := httptest.NewRecorder()
+
+	env.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, "Content-Disposition") {
+		t.Errorf("Access-Control-Expose-Headers = %q, want it to include Content-Disposition "+
+			"(so the console can read the zip filename cross-origin)", got)
+	}
+}
+
+func TestFiles_FormatZip_ForwardedAndStreamedBack(t *testing.T) {
+	env := newFilesTestEnv(t)
+	tok := env.validToken()
+
+	q := url.Values{}
+	q.Set("path", "/home/u/project")
+	q.Set("format", "zip")
+	req := httptest.NewRequest(http.MethodGet, "http://unused/files?"+q.Encode(), nil)
+	req.Host = "boxd-" + env.sandboxID + "." + env.domain
+	req.Header.Set("X-Access-Token", tok)
+
+	w := httptest.NewRecorder()
+	env.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	// The format=zip flag must reach boxd untouched, alongside the path.
+	if !env.lastReq.received {
+		t.Fatal("upstream never received the request")
+	}
+	if !strings.Contains(env.lastReq.rawQuery, "format=zip") {
+		t.Errorf("upstream query missing format=zip: %q", env.lastReq.rawQuery)
+	}
+	if !strings.Contains(env.lastReq.rawQuery, "path=%2Fhome%2Fu%2Fproject") {
+		t.Errorf("upstream query missing path: %q", env.lastReq.rawQuery)
+	}
+	// And the upstream's response streams back to the caller.
+	if body := w.Body.String(); body != `{"ok":true}` {
+		t.Errorf("response body = %q, want the upstream body to pass through", body)
+	}
+}

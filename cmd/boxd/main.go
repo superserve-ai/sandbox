@@ -1,11 +1,13 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -164,16 +166,10 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 	}
 }
 
-// setHostname sets the kernel hostname and writes /etc/hostname.
-func setHostname(name string) error {
-	if err := syscall.Sethostname([]byte(name)); err != nil {
-		return fmt.Errorf("sethostname: %w", err)
-	}
-	if err := os.WriteFile("/etc/hostname", []byte(name+"\n"), 0o644); err != nil {
-		return fmt.Errorf("write /etc/hostname: %w", err)
-	}
-	return nil
-}
+// setHostname is defined per-platform — see hostname_linux.go (the real
+// syscall.Sethostname implementation) and hostname_other.go (a stub so the
+// package stays buildable and unit-testable on non-Linux dev machines). boxd
+// only runs inside a Linux microVM in production.
 
 // ---------------------------------------------------------------------------
 // Process service (Connect RPC)
@@ -860,7 +856,15 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 	if info.IsDir() {
-		http.Error(w, `{"error":"use FilesystemService.ListDir for directories"}`, http.StatusBadRequest)
+		// A directory is only downloadable when the caller explicitly opts in to
+		// an archive via ?format=zip. Without the flag we keep the original 400,
+		// so the SDK's files.read()/readText() (which never send it) still throw
+		// on a directory, exactly as before.
+		if r.URL.Query().Get("format") != "zip" {
+			http.Error(w, `{"error":"use FilesystemService.ListDir for directories"}`, http.StatusBadRequest)
+			return
+		}
+		serveDirAsZip(w, path)
 		return
 	}
 
@@ -874,6 +878,108 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filepath.Base(path)))
 	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
+}
+
+// serveDirAsZip streams a ZIP archive of dirPath's contents. Entry names are
+// relative to dirPath and prefixed with its base name, so the archive expands
+// to `<base>/...`. Symlinks are skipped (never followed — that would let the
+// archive escape the tree or walk a loop), and safePath is re-applied to every
+// descendant so the blocklist (/proc, /sys, /dev, the boxd binary, ...) is
+// enforced below the top-level argument too.
+//
+// Validation that can fail cleanly (directory readable) happens before the
+// first byte. Once the archive starts streaming the HTTP status is already
+// committed, so a per-file error mid-walk is logged and skipped rather than
+// aborting the whole download. The walk writes entries as it goes — constant
+// memory, no temp file.
+func serveDirAsZip(w http.ResponseWriter, dirPath string) {
+	// Confirm the directory is openable before committing a 200 + headers, so a
+	// bad request can still surface as a clean error.
+	if d, err := os.Open(dirPath); err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		return
+	} else {
+		d.Close()
+	}
+
+	base := filepath.Base(dirPath)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipDownloadFilename(base)))
+
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	_ = filepath.WalkDir(dirPath, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// Unreadable entry mid-walk: log and skip, keep the archive going.
+			log.Printf("files: zip walk skip %q: %v", p, walkErr)
+			return nil
+		}
+		// Never follow symlinks — they could escape the tree or loop.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		// Enforce the blocklist on descendants, not just the top-level path.
+		if _, err := safePath(p); err != nil {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		rel, err := filepath.Rel(dirPath, p)
+		if err != nil {
+			log.Printf("files: zip rel %q: %v", p, err)
+			return nil
+		}
+		if rel == "." {
+			return nil // the directory itself; entries carry the base prefix
+		}
+		name := filepath.Join(base, rel)
+
+		if d.IsDir() {
+			// Trailing slash marks a directory entry; preserves empty dirs.
+			if _, err := zw.Create(name + "/"); err != nil {
+				log.Printf("files: zip create dir %q: %v", name, err)
+			}
+			return nil
+		}
+
+		f, err := os.Open(p)
+		if err != nil {
+			log.Printf("files: zip skip %q: %v", p, err)
+			return nil
+		}
+		fw, err := zw.Create(name)
+		if err != nil {
+			f.Close()
+			log.Printf("files: zip create %q: %v", name, err)
+			return nil
+		}
+		if _, err := io.Copy(fw, f); err != nil {
+			log.Printf("files: zip copy %q: %v", p, err)
+		}
+		f.Close()
+		return nil
+	})
+}
+
+// zipDownloadFilename builds the quoted Content-Disposition filename for a
+// directory archive. The base name comes from the filesystem and can contain a
+// literal double-quote, which would break the quoted-string, or control bytes;
+// strip those. (Go's header writer already rejects CR/LF.)
+func zipDownloadFilename(base string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || r < 0x20 {
+			return -1
+		}
+		return r
+	}, base)
+	if cleaned == "" {
+		cleaned = "download"
+	}
+	return cleaned + ".zip"
 }
 
 // storageFullResponse is the canonical 507 body we return whenever a
