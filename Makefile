@@ -58,14 +58,33 @@ generate-proto:
 		--go-grpc_out=. --go-grpc_opt=module=github.com/superserve-ai/sandbox \
 		proto/*.proto
 
-## Database (migrations run automatically on controlplane startup)
+## Database
 
-migrate-up:
-	psql "$(DATABASE_URL)" -f db/migrations/001_initial.sql
-	psql "$(DATABASE_URL)" -f db/migrations/002_add_stopped_status.sql
+DB_CONTAINER ?= sandbox-postgres
+DB_PORT ?= 5432
+DATABASE_URL ?= postgres://postgres:postgres@localhost:$(DB_PORT)/sandbox_test?sslmode=disable
+
+db-up:
+	docker run --name $(DB_CONTAINER) \
+		-e POSTGRES_USER=postgres \
+		-e POSTGRES_PASSWORD=postgres \
+		-e POSTGRES_DB=sandbox_test \
+		-p $(DB_PORT):5432 \
+		-d postgres:16
+
+db-down:
+	docker rm -f $(DB_CONTAINER) || true
+
+db-reset: db-down db-up
+
+db-wait:
+	until docker exec $(DB_CONTAINER) pg_isready -U postgres -d sandbox_test; do sleep 1; done
 
 seed-apikey:
 	go run ./cmd/seed-apikey
+
+migrate-local:
+	for f in $$(ls supabase/migrations/*.sql | sort); do psql "$(DATABASE_URL)" -f $$f; done
 
 ## Docker
 
@@ -93,8 +112,8 @@ test:
 test-short:
 	go test ./... -short -count=1
 
-test-integration:
-	go test -tags integration ./internal/integration/ -v -count=1 -timeout 10m
+test-integration: db-reset db-wait
+	DATABASE_URL="$(DATABASE_URL)" go test -tags integration ./internal/integration/ -v -count=1 -timeout 10m
 
 ## Lint
 
