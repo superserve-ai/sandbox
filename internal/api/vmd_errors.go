@@ -71,6 +71,15 @@ func isVMDInvalidArgument(err error) bool {
 	return status.Code(err) == codes.InvalidArgument
 }
 
+// isVMDUnimplemented reports whether vmd lacks the called RPC (gRPC
+// Unimplemented) — e.g. a host that predates InjectSandboxEnv.
+func isVMDUnimplemented(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Unimplemented
+}
+
 // vmdErrorMessage returns the gRPC message from a vmd error, stripping
 // gRPC/transport framing so the string is safe to surface to API callers.
 func vmdErrorMessage(err error) string {
@@ -99,4 +108,21 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async mark-failed write failed")
 		}
 	}()
+}
+
+// failSandboxAfterBoot destroys a running VM and marks the sandbox row as failed.
+// Used by CreateSandbox when a post-restore step (env injection, JWT mint)
+// fails — the VM is already running but unusable, so we tear it down and
+// surface the failure to the customer.
+func (h *Handlers) failSandboxAfterBoot(ctx context.Context, sandboxID, teamID uuid.UUID, instanceID string) {
+	if err := h.VMD.DestroyInstance(ctx, instanceID, true); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy after failed boot")
+	}
+	if err := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+		ID:     sandboxID,
+		Status: db.SandboxStatusFailed,
+		TeamID: teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("mark-failed after destroy")
+	}
 }

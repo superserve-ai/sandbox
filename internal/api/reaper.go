@@ -73,6 +73,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	runTick := func() {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
+		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
 	}
 
 	// Run once immediately so a control plane restart does not delay
@@ -102,6 +103,20 @@ func (h *Handlers) sweepOrphanedIntervals(ctx context.Context) {
 	}
 	if n > 0 {
 		log.Warn().Int64("closed", n).Msg("reaper: closed orphaned active intervals")
+	}
+}
+
+// cleanupExpiredRevocations deletes sandbox_revocation rows past their TTL.
+func (h *Handlers) cleanupExpiredRevocations(ctx context.Context) {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	n, err := h.DB.DeleteExpiredSandboxRevocations(queryCtx)
+	if err != nil {
+		log.Warn().Err(err).Msg("reaper: cleanup revocations failed")
+		return
+	}
+	if n > 0 {
+		log.Info().Int64("reaped", n).Msg("reaper: deleted expired sandbox revocations")
 	}
 }
 
@@ -241,7 +256,9 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	}
 
 	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath, nil)
+	// Reaper rollback resume: brings the VM back up after a pause-DB-write
+	// failure, before the customer ever sees the transition.
+	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath)
 	vmdCancel()
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")

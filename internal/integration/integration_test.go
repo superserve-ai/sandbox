@@ -31,10 +31,6 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// ---------------------------------------------------------------------------
-// Test infrastructure
-// ---------------------------------------------------------------------------
-
 var (
 	testPool         *pgxpool.Pool
 	testQueries      *db.Queries
@@ -166,11 +162,14 @@ func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { r
 func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
+}
+func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
+	return nil
 }
 func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
 	return "hello\n", "", 0, nil
@@ -183,7 +182,10 @@ func (s *stubVMD) ExecCommandStream(_ context.Context, _, _ string, _ []string, 
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
-func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error { return nil }
+func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { return nil }
+func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error           { return nil }
+func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error  { return nil }
+func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error    { return nil }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
 func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {
@@ -280,7 +282,6 @@ func newRouter(t *testing.T) *gin.Engine {
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 
-
 func do(r *gin.Engine, method, path, apiKey, body string) *httptest.ResponseRecorder {
 	var bodyReader io.Reader
 	if body != "" {
@@ -315,10 +316,6 @@ func mustJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{}
 	}
 	return m
 }
-
-// ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
 
 func TestIntegration_Auth_HealthNoKeyRequired(t *testing.T) {
 	w := do(newRouter(t), "GET", "/health", "", "")
@@ -361,10 +358,6 @@ func TestIntegration_Auth_RevokedKey(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes
-// ---------------------------------------------------------------------------
-
 func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
@@ -399,10 +392,6 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 		t.Errorf("memory_mib = %d, want 1024", sb.MemoryMib)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// GET /sandboxes and GET /sandboxes/:id
-// ---------------------------------------------------------------------------
 
 func TestIntegration_ListSandboxes(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
@@ -505,10 +494,6 @@ func TestIntegration_CreateSandbox_ValidationError(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes/:id/pause
-// ---------------------------------------------------------------------------
-
 func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
@@ -568,10 +553,6 @@ func TestIntegration_PauseSandbox_AlreadyPaused(t *testing.T) {
 		t.Fatalf("expected 409 on double-pause, got %d: %s", w.Code, w.Body.String())
 	}
 }
-
-// ---------------------------------------------------------------------------
-// POST /sandboxes/:id/resume
-// ---------------------------------------------------------------------------
 
 func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	ctx := context.Background()
@@ -828,10 +809,6 @@ func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes/:id/exec
-// ---------------------------------------------------------------------------
-
 func TestIntegration_ExecSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	_, apiKey := seedTeamAndKey(t)
@@ -967,10 +944,6 @@ func TestIntegration_ExecSandboxStream_PausedAutoResume(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Team isolation
-// ---------------------------------------------------------------------------
-
 func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 	_, apiKeyA := seedTeamAndKey(t)
 	_, apiKeyB := seedTeamAndKey(t)
@@ -1012,10 +985,6 @@ func TestIntegration_TeamIsolation_Exec(t *testing.T) {
 		t.Fatalf("expected 404 (team isolation on exec), got %d: %s", ew.Code, ew.Body.String())
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Activity logging
-// ---------------------------------------------------------------------------
 
 func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 	ctx := context.Background()
@@ -1169,10 +1138,6 @@ func TestIntegration_ActivityLog_ActorNullWhenKeyHasNoCreator(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent sandbox creation via API
-// ---------------------------------------------------------------------------
-
 func TestIntegration_ConcurrentCreate(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
@@ -1216,10 +1181,6 @@ func TestIntegration_ConcurrentCreate(t *testing.T) {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// PATCH /sandboxes/:id
-// ---------------------------------------------------------------------------
 
 func TestIntegration_PatchSandbox_Network_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
@@ -1337,10 +1298,6 @@ func TestIntegration_PatchSandbox_UnknownField(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes with network config
-// ---------------------------------------------------------------------------
-
 func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
@@ -1355,10 +1312,6 @@ func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 		t.Errorf("expected status=active, got %v", body["status"])
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Security headers
-// ---------------------------------------------------------------------------
 
 func TestIntegration_SecurityHeaders(t *testing.T) {
 	r := newRouter(t)
@@ -1377,10 +1330,6 @@ func TestIntegration_SecurityHeaders(t *testing.T) {
 		t.Error("missing Strict-Transport-Security")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Sandbox metadata
-// ---------------------------------------------------------------------------
 
 func TestIntegration_CreateSandbox_WithMetadata(t *testing.T) {
 	ctx := context.Background()
@@ -1618,10 +1567,6 @@ func TestIntegration_ListSandboxes_FilterRejectsAdversarial(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Rate limiting
-// ---------------------------------------------------------------------------
-
 func TestIntegration_RateLimit_Headers(t *testing.T) {
 	r := newRouter(t)
 
@@ -1636,10 +1581,6 @@ func TestIntegration_RateLimit_Headers(t *testing.T) {
 		t.Error("missing RateLimit-Remaining header")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Templates
-// ---------------------------------------------------------------------------
 
 // TestIntegration_CreateTemplate_NameReusableAfterDelete verifies the partial
 // unique index on (team_id, name) WHERE deleted_at IS NULL: once a template
