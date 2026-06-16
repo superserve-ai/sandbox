@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -214,5 +215,66 @@ func TestFileDownload_Zip_FilenameSanitized(t *testing.T) {
 	}
 	if !strings.HasSuffix(strings.TrimSuffix(cd, `"`), `.zip`) {
 		t.Errorf("Content-Disposition should end with .zip before the closing quote: %q", cd)
+	}
+}
+
+// Non-regular files (FIFOs, sockets, device nodes) must be skipped before any
+// open — opening a FIFO O_RDONLY would otherwise block the download forever.
+func TestFileDownload_Zip_SkipsNonRegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Base(dir)
+	if err := os.WriteFile(filepath.Join(dir, "real.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "pipe"), 0o644); err != nil {
+		t.Skipf("mkfifo unsupported on this platform: %v", err)
+	}
+
+	// Must complete, not block on the FIFO.
+	w := zipFilesGet(t, dir, "zip")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	entries := readZipEntries(t, w.Body.Bytes())
+	if _, ok := entries[base+"/pipe"]; ok {
+		t.Errorf("FIFO should be skipped, but it is in the archive (entries: %v)", zipEntryNames(entries))
+	}
+	if _, ok := entries[base+"/real.txt"]; !ok {
+		t.Errorf("real.txt should still be archived (entries: %v)", zipEntryNames(entries))
+	}
+}
+
+// A symlink whose target is outside the requested directory is skipped — its
+// target content never lands in the archive (no escape via symlink).
+func TestFileDownload_Zip_SymlinkEscapeNotArchived(t *testing.T) {
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOPSECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	base := filepath.Base(dir)
+	if err := os.WriteFile(filepath.Join(dir, "ok.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dir, "escape")); err != nil {
+		t.Skipf("symlinks unsupported on this platform: %v", err)
+	}
+
+	w := zipFilesGet(t, dir, "zip")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	entries := readZipEntries(t, w.Body.Bytes())
+	if _, ok := entries[base+"/escape"]; ok {
+		t.Errorf("escaping symlink should not be archived (entries: %v)", zipEntryNames(entries))
+	}
+	for name, data := range entries {
+		if strings.Contains(string(data), "TOPSECRET") {
+			t.Errorf("secret content leaked via symlink in entry %q", name)
+		}
+	}
+	if _, ok := entries[base+"/ok.txt"]; !ok {
+		t.Errorf("ok.txt should be archived (entries: %v)", zipEntryNames(entries))
 	}
 }

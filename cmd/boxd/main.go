@@ -882,26 +882,42 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 
 // serveDirAsZip streams a ZIP archive of dirPath's contents. Entry names are
 // relative to dirPath and prefixed with its base name, so the archive expands
-// to `<base>/...`. Symlinks are skipped (never followed — that would let the
-// archive escape the tree or walk a loop), and safePath is re-applied to every
-// descendant so the blocklist (/proc, /sys, /dev, the boxd binary, ...) is
-// enforced below the top-level argument too.
+// to `<base>/...`.
 //
-// Validation that can fail cleanly (directory readable) happens before the
-// first byte. Once the archive starts streaming the HTTP status is already
-// committed, so a per-file error mid-walk is logged and skipped rather than
-// aborting the whole download. The walk writes entries as it goes — constant
-// memory, no temp file.
+// The directory's contents are attacker-controlled and can change mid-walk (the
+// sandbox runs untrusted code), so the walk is hardened against it:
+//
+//   - The whole walk and every file open go through an os.Root anchored at
+//     dirPath. os.Root errors on any path that resolves outside the root, so no
+//     entry — including one reached through a symlink swapped in mid-walk — can
+//     escape the requested directory.
+//   - Only directories and regular files are archived. Symlinks, FIFOs, sockets
+//     and device nodes are skipped, so a named pipe can't block the download and
+//     special files never land in the archive. (os.Root on its own does not
+//     exclude /proc or device files, hence this filter plus the safePath check.)
+//   - Each file is opened through the root with O_NOFOLLOW (a regular file
+//     swapped for a symlink fails with ELOOP instead of being followed) and
+//     O_NONBLOCK (a swap for a FIFO can't block the open); the open fd is then
+//     re-stat'd and skipped unless it is still a regular file, closing the
+//     time-of-check/time-of-use window.
+//   - safePath is re-applied to every descendant so the blocklist (/proc, /sys,
+//     /dev, the boxd binary, ...) is enforced below the top-level argument too.
+//
+// os.OpenRoot validates the directory before the first byte, so a bad request
+// still gets a clean error. Once the archive starts streaming the HTTP status is
+// committed, so per-file errors are logged and skipped rather than aborting the
+// whole download. Entries are written as the walk proceeds — constant memory,
+// no temp file.
 func serveDirAsZip(w http.ResponseWriter, dirPath string) {
-	// Confirm the directory is openable before committing a 200 + headers, so a
-	// bad request can still surface as a clean error.
-	if d, err := os.Open(dirPath); err != nil {
+	// Anchor every subsequent open to this directory. Opening the root also
+	// validates the directory before we commit a 200 + headers.
+	root, err := os.OpenRoot(dirPath)
+	if err != nil {
 		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
-	} else {
-		d.Close()
 	}
+	defer root.Close()
 
 	base := filepath.Base(dirPath)
 	w.Header().Set("Content-Type", "application/zip")
@@ -910,32 +926,25 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 	zw := zip.NewWriter(w)
 	defer zw.Close()
 
-	_ = filepath.WalkDir(dirPath, func(p string, d fs.DirEntry, walkErr error) error {
+	// Walking root.FS() confines traversal to the tree and never follows
+	// symlinks while descending; rel is a slash path relative to dirPath.
+	_ = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// Unreadable entry mid-walk: log and skip, keep the archive going.
-			log.Printf("files: zip walk skip %q: %v", p, walkErr)
-			return nil
-		}
-		// Never follow symlinks — they could escape the tree or loop.
-		if d.Type()&fs.ModeSymlink != 0 {
-			return nil
-		}
-		// Enforce the blocklist on descendants, not just the top-level path.
-		if _, err := safePath(p); err != nil {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		rel, err := filepath.Rel(dirPath, p)
-		if err != nil {
-			log.Printf("files: zip rel %q: %v", p, err)
+			log.Printf("files: zip walk skip %q: %v", rel, walkErr)
 			return nil
 		}
 		if rel == "." {
 			return nil // the directory itself; entries carry the base prefix
 		}
+		// Enforce the blocklist on descendants, not just the top-level path.
+		if _, err := safePath(filepath.Join(dirPath, rel)); err != nil {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
 		name := filepath.Join(base, rel)
 
 		if d.IsDir() {
@@ -945,10 +954,24 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 			}
 			return nil
 		}
+		// Only regular files are archived — skip symlinks, FIFOs, sockets and
+		// device nodes before opening anything.
+		if !d.Type().IsRegular() {
+			return nil
+		}
 
-		f, err := os.Open(p)
+		// Open through the root (can't escape) with no-follow + non-blocking, so
+		// a TOCTOU swap to a symlink or FIFO can't be followed or block us.
+		f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if err != nil {
-			log.Printf("files: zip skip %q: %v", p, err)
+			log.Printf("files: zip skip %q: %v", rel, err)
+			return nil
+		}
+		// Re-check the opened descriptor: only copy if it is still a regular
+		// file (defeats a swap that happened between WalkDir and the open).
+		if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+			f.Close()
+			log.Printf("files: zip skip non-regular %q", rel)
 			return nil
 		}
 		fw, err := zw.Create(name)
@@ -958,7 +981,7 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 			return nil
 		}
 		if _, err := io.Copy(fw, f); err != nil {
-			log.Printf("files: zip copy %q: %v", p, err)
+			log.Printf("files: zip copy %q: %v", rel, err)
 		}
 		f.Close()
 		return nil
