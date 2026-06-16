@@ -175,10 +175,10 @@ CREATE INDEX idx_ssi_team_open
     ON sandbox_storage_interval(team_id, sandbox_id)
     WHERE ended_at IS NULL;
 
--- Existing non-failed sandboxes have retained their disk since creation.
--- Deleted sandboxes receive a closed interval; live sandboxes receive an open
--- interval. Failed sandboxes are omitted because artifact retention is not
--- guaranteed by that state transition.
+-- Existing successfully activated sandboxes have retained their disk
+-- since creation. Deleted sandboxes receive a closed interval; live sandboxes
+-- receive an open interval. Starting and failed sandboxes are omitted because
+-- artifact retention is not guaranteed until first successful activation.
 INSERT INTO sandbox_storage_interval (
     sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
 )
@@ -190,7 +190,7 @@ SELECT
     destroyed_at,
     CASE WHEN destroyed_at IS NOT NULL THEN 'deleted' END
 FROM sandbox
-WHERE status != 'failed';
+WHERE status IN ('active', 'pausing', 'paused', 'resuming', 'deleted');
 
 -- Durable period rollups. Raw interval data remains the source of truth;
 -- these rows are suitable for finalized invoice/export bookkeeping.

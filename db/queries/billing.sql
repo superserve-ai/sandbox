@@ -193,7 +193,7 @@ VALUES (
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
 SET status = CASE
-        WHEN team_billing_period.status IN ('approved', 'exported')
+        WHEN team_billing_period.status IN ('blocked', 'approved', 'exported')
             THEN team_billing_period.status
         ELSE EXCLUDED.status
     END,
