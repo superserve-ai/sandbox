@@ -426,17 +426,33 @@ func (q *Queries) ListUnresolvedBillingPeriodAnomalies(ctx context.Context, arg 
 }
 
 const markTeamBillingPeriodExported = `-- name: MarkTeamBillingPeriodExported :one
-UPDATE team_billing_period
-SET status = 'exported',
-    exported_at = now(),
-    updated_at = now()
-WHERE team_billing_period.team_id = $1
-  AND team_billing_period.period_start = $2
-  AND team_billing_period.period_end = $3
-  AND team_billing_period.status = 'approved'
-  AND team_billing_period.finalized_at IS NULL
-  AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
-RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at
+WITH exported_period AS (
+    UPDATE team_billing_period
+    SET status = 'exported',
+        exported_at = now(),
+        updated_at = now()
+    WHERE team_billing_period.team_id = $1
+      AND team_billing_period.period_start = $2
+      AND team_billing_period.period_end = $3
+      AND team_billing_period.status = 'approved'
+      AND team_billing_period.finalized_at IS NULL
+      AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
+    RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at
+),
+exported_usage AS (
+    UPDATE team_billing_usage u
+    SET exported_at = exported_period.exported_at,
+        updated_at = now()
+    FROM exported_period
+    WHERE u.team_id = exported_period.team_id
+      AND u.period_start = exported_period.period_start
+      AND u.period_end = exported_period.period_end
+      AND u.exported_at IS NULL
+      AND u.finalized_at IS NULL
+    RETURNING u.team_id
+)
+SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at
+FROM exported_period
 `
 
 type MarkTeamBillingPeriodExportedParams struct {
@@ -445,9 +461,24 @@ type MarkTeamBillingPeriodExportedParams struct {
 	PeriodEnd   time.Time `json:"period_end"`
 }
 
-func (q *Queries) MarkTeamBillingPeriodExported(ctx context.Context, arg MarkTeamBillingPeriodExportedParams) (TeamBillingPeriod, error) {
+type MarkTeamBillingPeriodExportedRow struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	PeriodStart   time.Time          `json:"period_start"`
+	PeriodEnd     time.Time          `json:"period_end"`
+	Status        string             `json:"status"`
+	BlockedReason *string            `json:"blocked_reason"`
+	BlockedAt     pgtype.Timestamptz `json:"blocked_at"`
+	ApprovedBy    pgtype.UUID        `json:"approved_by"`
+	ApprovedAt    pgtype.Timestamptz `json:"approved_at"`
+	ExportedAt    pgtype.Timestamptz `json:"exported_at"`
+	FinalizedAt   pgtype.Timestamptz `json:"finalized_at"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+}
+
+func (q *Queries) MarkTeamBillingPeriodExported(ctx context.Context, arg MarkTeamBillingPeriodExportedParams) (MarkTeamBillingPeriodExportedRow, error) {
 	row := q.db.QueryRow(ctx, markTeamBillingPeriodExported, arg.TeamID, arg.PeriodStart, arg.PeriodEnd)
-	var i TeamBillingPeriod
+	var i MarkTeamBillingPeriodExportedRow
 	err := row.Scan(
 		&i.TeamID,
 		&i.PeriodStart,
@@ -564,7 +595,11 @@ VALUES (
     $4
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
-SET status = EXCLUDED.status,
+SET status = CASE
+        WHEN team_billing_period.status IN ('approved', 'exported')
+            THEN team_billing_period.status
+        ELSE EXCLUDED.status
+    END,
     updated_at = now()
 WHERE team_billing_period.finalized_at IS NULL
 RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at
@@ -664,6 +699,7 @@ SET vcpu_seconds = EXCLUDED.vcpu_seconds,
     storage_mib_seconds = EXCLUDED.storage_mib_seconds,
     updated_at = now()
 WHERE team_billing_usage.finalized_at IS NULL
+  AND team_billing_usage.exported_at IS NULL
 RETURNING team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at
 `
 
