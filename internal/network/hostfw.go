@@ -34,9 +34,10 @@ const dnsRedirectChain = "SANDBOX_DNS_REDIRECT"
 // through the host: UDP/443 DROP (kills QUIC bypass of the SNI allowlist),
 // operator-configured egress port DROPs, MSS clamp, FORWARD ACCEPT between
 // veth+ and the host iface, MASQUERADE for vmIPRange to the host iface,
-// REDIRECT HTTP/HTTPS from veth+ to the egress proxy, and an optional
-// REDIRECT of all guest DNS to an operator-run resolver. All operations are
-// idempotent.
+// REDIRECT HTTP/HTTPS from veth+ to the egress proxy, an optional REDIRECT
+// of all guest DNS to an operator-run resolver, and (when secretsProxyPort > 0)
+// REDIRECT secretsProxyDst:secretsProxyPort to the local secretsproxy daemon.
+// All operations are idempotent.
 //
 // blockedPorts come from the operator blocklist config — only ports 80/443
 // are redirected through the egress proxy, so anything else a VM dials goes
@@ -51,7 +52,7 @@ const dnsRedirectChain = "SANDBOX_DNS_REDIRECT"
 // (SANDBOX_EGRESS_PORTS, SANDBOX_DNS_REDIRECT): only the vmd daemon
 // reconciles them. Auxiliary managers pass false so a concurrent template
 // build does not flush the daemon's rules.
-func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPort uint16, blockedPorts []uint16, manageOwnedChains bool, log zerolog.Logger) error {
+func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPort uint16, secretsProxyDst string, secretsProxyPort uint16, blockedPorts []uint16, manageOwnedChains bool, log zerolog.Logger) error {
 	_, ipnet, err := net.ParseCIDR(vmIPRange)
 	if err != nil {
 		return fmt.Errorf("vmIPRange %s invalid: %w", vmIPRange, err)
@@ -168,13 +169,26 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		rules = append(rules, rule{"nat", "PREROUTING",
 			[]string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort)}})
 	}
+	if secretsProxyPort > 0 {
+		if ip := net.ParseIP(secretsProxyDst); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("invalid secretsProxyDst %q (must be IPv4)", secretsProxyDst)
+		}
+		// -d narrows the match so we don't intercept unrelated dport-9443 traffic.
+		rules = append(rules, rule{"nat", "PREROUTING",
+			[]string{"-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort),
+				"-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort)}})
+	}
 	for _, r := range rules {
 		if err := ipt.AppendUnique(r.table, r.chain, r.args...); err != nil {
 			return fmt.Errorf("add %s/%s rule: %w", r.table, r.chain, err)
 		}
 	}
 
-	log.Info().Str("host_iface", hostIface).Msg("host firewall ready (static prefix rules)")
+	log.Info().
+		Str("host_iface", hostIface).
+		Str("secrets_proxy_dst", secretsProxyDst).
+		Uint16("secrets_proxy_port", secretsProxyPort).
+		Msg("host firewall ready (static prefix rules)")
 	return nil
 }
 

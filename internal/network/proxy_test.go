@@ -265,7 +265,7 @@ func TestMatchDomain(t *testing.T) {
 		{"API.OPENAI.COM", "api.openai.com", true},
 		{"api.openai.com", "API.OPENAI.COM", true},
 		{"api.openai.com", "*.openai.com", true},
-		{"deep.api.openai.com", "*.openai.com", true},
+		{"deep.api.openai.com", "*.openai.com", true}, // egress wildcard matches any depth
 		{"openai.com", "*.openai.com", false},
 		{"api.openai.com", "*.example.com", false},
 		{"anything.com", "*", false},
