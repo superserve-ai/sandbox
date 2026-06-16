@@ -166,6 +166,8 @@ type Activity struct {
 	CreatedAt    time.Time   `json:"created_at"`
 	TemplateID   pgtype.UUID `json:"template_id"`
 	ResourceType string      `json:"resource_type"`
+	SecretID     pgtype.UUID `json:"secret_id"`
+	SecretName   *string     `json:"secret_name"`
 }
 
 type AnalyticsWeeklyUserMetric struct {
@@ -226,6 +228,22 @@ type Host struct {
 	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
+type NetFlow struct {
+	ID         int64      `json:"id"`
+	Ts         time.Time  `json:"ts"`
+	TeamID     uuid.UUID  `json:"team_id"`
+	SandboxID  uuid.UUID  `json:"sandbox_id"`
+	Protocol   string     `json:"protocol"`
+	Host       *string    `json:"host"`
+	DstIp      netip.Addr `json:"dst_ip"`
+	DstPort    int32      `json:"dst_port"`
+	Verdict    string     `json:"verdict"`
+	MatchRule  *string    `json:"match_rule"`
+	BytesSent  *int64     `json:"bytes_sent"`
+	BytesRecv  *int64     `json:"bytes_recv"`
+	DurationMs *int32     `json:"duration_ms"`
+}
+
 type Profile struct {
 	ID                uuid.UUID `json:"id"`
 	Email             string    `json:"email"`
@@ -237,6 +255,21 @@ type Profile struct {
 	StorageUsedBytes  int64     `json:"storage_used_bytes"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+type ProxyAudit struct {
+	ID             int64       `json:"id"`
+	Ts             time.Time   `json:"ts"`
+	TeamID         uuid.UUID   `json:"team_id"`
+	SandboxID      uuid.UUID   `json:"sandbox_id"`
+	SecretID       pgtype.UUID `json:"secret_id"`
+	Method         string      `json:"method"`
+	Host           string      `json:"host"`
+	Path           string      `json:"path"`
+	Status         int32       `json:"status"`
+	UpstreamStatus *int32      `json:"upstream_status"`
+	LatencyMs      *int32      `json:"latency_ms"`
+	ErrorCode      *string     `json:"error_code"`
 }
 
 type QuotaAlertState struct {
@@ -291,6 +324,35 @@ type SandboxActiveInterval struct {
 	EndReason *string            `json:"end_reason"`
 }
 
+type SandboxRevocation struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	RevokedAt time.Time `json:"revoked_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type SandboxSecret struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	SecretID  uuid.UUID `json:"secret_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+type Secret struct {
+	ID               uuid.UUID          `json:"id"`
+	TeamID           uuid.UUID          `json:"team_id"`
+	Name             string             `json:"name"`
+	AuthType         string             `json:"auth_type"`
+	AuthConfig       []byte             `json:"auth_config"`
+	ProviderShortcut *string            `json:"provider_shortcut"`
+	Hosts            []string           `json:"hosts"`
+	Ciphertext       []byte             `json:"ciphertext"`
+	EncryptedDek     []byte             `json:"encrypted_dek"`
+	KekID            string             `json:"kek_id"`
+	CreatedAt        time.Time          `json:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at"`
+	LastUsedAt       pgtype.Timestamptz `json:"last_used_at"`
+	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
+}
+
 type Snapshot struct {
 	ID        uuid.UUID `json:"id"`
 	SandboxID uuid.UUID `json:"sandbox_id"`
@@ -303,17 +365,20 @@ type Snapshot struct {
 }
 
 type Team struct {
-	ID                   uuid.UUID `json:"id"`
-	Name                 string    `json:"name"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
-	BuildConcurrency     int32     `json:"build_concurrency"`
-	MaxTemplateVcpu      *int32    `json:"max_template_vcpu"`
-	MaxTemplateMemoryMib *int32    `json:"max_template_memory_mib"`
-	MaxTemplateDiskMib   *int32    `json:"max_template_disk_mib"`
-	MaxTemplates         *int32    `json:"max_templates"`
-	MaxSandboxes         int32     `json:"max_sandboxes"`
-	ActiveSandboxCount   int32     `json:"active_sandbox_count"`
+	ID                    uuid.UUID `json:"id"`
+	Name                  string    `json:"name"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	BuildConcurrency      int32     `json:"build_concurrency"`
+	MaxTemplateVcpu       *int32    `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib  *int32    `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib    *int32    `json:"max_template_disk_mib"`
+	MaxTemplates          *int32    `json:"max_templates"`
+	MaxSandboxes          int32     `json:"max_sandboxes"`
+	ActiveSandboxCount    int32     `json:"active_sandbox_count"`
+	CredentialStoreKind   string    `json:"credential_store_kind"`
+	CredentialStoreConfig []byte    `json:"credential_store_config"`
+	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
 }
 
 type TeamMember struct {

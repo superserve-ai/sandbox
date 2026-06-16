@@ -577,6 +577,25 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 	return i, err
 }
 
+const getSandboxEgressContext = `-- name: GetSandboxEgressContext :one
+SELECT s.network_config, t.unmatched_host_policy
+FROM sandbox s
+JOIN team t ON s.team_id = t.id
+WHERE s.id = $1 AND s.destroyed_at IS NULL
+`
+
+type GetSandboxEgressContextRow struct {
+	NetworkConfig       []byte `json:"network_config"`
+	UnmatchedHostPolicy string `json:"unmatched_host_policy"`
+}
+
+func (q *Queries) GetSandboxEgressContext(ctx context.Context, id uuid.UUID) (GetSandboxEgressContextRow, error) {
+	row := q.db.QueryRow(ctx, getSandboxEgressContext, id)
+	var i GetSandboxEgressContextRow
+	err := row.Scan(&i.NetworkConfig, &i.UnmatchedHostPolicy)
+	return i, err
+}
+
 const getSandboxNetworkConfig = `-- name: GetSandboxNetworkConfig :one
 SELECT network_config FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
