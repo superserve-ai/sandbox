@@ -1114,6 +1114,31 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 	return meta, nil
 }
 
+// applySecretBindings mints the secrets JWT for meta and injects it, with the secret
+// env vars, into a live sandbox. Empty meta injects no JWT. InjectSandboxEnv merges,
+// so it can add or update an env var but not remove one.
+func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, meta []SecretBindingMeta) error {
+	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
+	if err != nil {
+		return fmt.Errorf("resolve vmd for host: %w", err)
+	}
+	var jwt string
+	if len(meta) > 0 {
+		sourceIP := ""
+		if sandbox.IpAddress != nil {
+			sourceIP = sandbox.IpAddress.String()
+		}
+		jwt, err = h.mintSecretsJWT(sandbox.ID.String(), sandbox.TeamID.String(), sourceIP, meta)
+		if err != nil {
+			return fmt.Errorf("mint secrets jwt: %w", err)
+		}
+	}
+	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), mergeEnvVarsWithSecrets(nil, meta), jwt); err != nil {
+		return fmt.Errorf("inject sandbox env: %w", err)
+	}
+	return nil
+}
+
 // mintSecretsJWT builds the per-sandbox secrets JWT. Returns the signed JWT
 // string. The sandbox's veth source IP binds the token; egress rules are not
 // carried here — the proxy fetches them live from GetSandboxEgressRules.
