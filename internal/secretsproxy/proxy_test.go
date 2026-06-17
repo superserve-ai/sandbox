@@ -211,6 +211,26 @@ func TestProxyConnectAndForward(t *testing.T) {
 	}
 }
 
+// CIDR-pinned requests are routed to a separate keep-alive-disabled transport
+// so they always dial fresh through the guard instead of riding a pooled
+// connection to a different IP. Pin that the wiring is in place.
+func TestNewProxyPinnedTransportDisablesReuse(t *testing.T) {
+	base := &http.Transport{MaxIdleConns: 100}
+	p := NewProxy("127.0.0.1:0", Options{UpstreamTransport: base})
+	if p.upstreamPinned == nil {
+		t.Fatal("pinned transport was not created")
+	}
+	if p.upstreamPinned == p.upstream {
+		t.Error("pinned transport must be a distinct instance from the pooled one")
+	}
+	if !p.upstreamPinned.DisableKeepAlives {
+		t.Error("pinned transport must disable keep-alives so CIDR-pinned requests dial fresh")
+	}
+	if p.upstream.DisableKeepAlives {
+		t.Error("the pooled transport must keep reuse enabled")
+	}
+}
+
 // toggleBlocklist flips a single host from allowed to blocked at runtime,
 // standing in for a feed refresh that blocklists a host after CONNECT.
 type toggleBlocklist struct {

@@ -68,6 +68,7 @@ type Proxy struct {
 	httpServer          *http.Server
 	tlsConfig           *tls.Config
 	upstream            *http.Transport
+	upstreamPinned      *http.Transport
 	isListening         atomic.Bool
 	sandboxFacingHost   string
 	maxRequestBodyBytes int64
@@ -141,6 +142,11 @@ func NewProxy(addr string, opts Options) *Proxy {
 			ForceAttemptHTTP2:     false,
 		}
 	}
+	// A CIDR-pinned request must dial fresh so its policy-evaluated IP goes
+	// through the dial guard; the pooling transport could otherwise satisfy it
+	// from an idle connection to a different IP for the same host. Reuse off.
+	upstreamPinned := upstream.Clone()
+	upstreamPinned.DisableKeepAlives = true
 	audit := opts.Audit
 	if audit == nil {
 		audit = NewNopAuditSink()
@@ -166,6 +172,7 @@ func NewProxy(addr string, opts Options) *Proxy {
 		revoker:             opts.Revoker,
 		logger:              logger,
 		upstream:            upstream,
+		upstreamPinned:      upstreamPinned,
 		sandboxFacingHost:   opts.SandboxFacingHost,
 		maxRequestBodyBytes: maxBody,
 		blockedPorts:        blockedPorts,

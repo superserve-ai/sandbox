@@ -271,6 +271,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 		outReq.Host = forwardedHostHeader(target, host)
 
 		// Pipeline runs when both Vault and a non-empty Scope are wired; otherwise pass through.
+		transport := p.upstream
 		var matchedSecretIDs []string
 		if scope != nil && p.vault != nil {
 			rules, ok := p.fetchEgressRules(ctx, scope.SandboxID)
@@ -288,6 +289,9 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 				// Dial the IP the policy was evaluated against, not a re-resolved one.
 				if upstreamIP != nil {
 					outReq = outReq.WithContext(WithPinnedDialIP(outReq.Context(), upstreamIP))
+					// Use the no-reuse transport so a pooled connection can't serve
+					// this request over a different IP than policy approved.
+					transport = p.upstreamPinned
 				}
 			}
 			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP, rules)
@@ -311,7 +315,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			}
 		}
 
-		resp, err := p.upstream.RoundTrip(outReq)
+		resp, err := transport.RoundTrip(outReq)
 		if err != nil {
 			// Body-size overflow surfaces here as RoundTrip returning a
 			// MaxBytesError wrapped by the transport; distinguish it from
