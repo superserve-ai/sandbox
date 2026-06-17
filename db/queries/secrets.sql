@@ -55,14 +55,14 @@ WHERE team_id = $1 AND name = $2 AND deleted_at IS NULL
 RETURNING *;
 
 -- name: AddSandboxSecret :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
-VALUES ($1, $2, $3);
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+VALUES ($1, $2, $3, $4);
 
 -- name: AddSandboxSecrets :exec
 -- Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
--- the secret_ids and env_keys arrays are paired by position.
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
-SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i]
+-- the secret_ids, env_keys, and proxy_tokens arrays are paired by position.
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
 FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i);
 
 -- name: DeleteSandboxSecrets :exec

@@ -1429,14 +1429,18 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			}
 			secretIDs := make([]uuid.UUID, len(secretBindings))
 			envKeys := make([]string, len(secretBindings))
+			proxyTokens := make([]string, len(secretBindings))
 			for i := range secretBindings {
 				secretIDs[i] = secretBindings[i].SecretID
 				envKeys[i] = secretBindings[i].EnvKey
+				// secretMeta is index-aligned with secretBindings; persist its token.
+				proxyTokens[i] = secretMeta[i].ProxyToken
 			}
 			if err := q.AddSandboxSecrets(insertCtx, db.AddSandboxSecretsParams{
-				SandboxID: sandboxID,
-				SecretIds: secretIDs,
-				EnvKeys:   envKeys,
+				SandboxID:   sandboxID,
+				SecretIds:   secretIDs,
+				EnvKeys:     envKeys,
+				ProxyTokens: proxyTokens,
 			}); err != nil {
 				return db.Sandbox{}, fmt.Errorf("insert secret bindings: %w", err)
 			}
