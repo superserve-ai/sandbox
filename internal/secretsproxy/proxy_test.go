@@ -376,21 +376,60 @@ func TestCopyForwardableHeadersStripsHopByHop(t *testing.T) {
 	}
 }
 
-// recordingAudit captures every event the proxy emits.
+// recordingAudit captures every event the proxy emits. The zero value is ready
+// to use; cond is created lazily so &recordingAudit{} stays valid.
 type recordingAudit struct {
 	mu     sync.Mutex
+	cond   *sync.Cond
 	events []AuditEvent
+}
+
+// condLocked returns the broadcast condition, creating it on first use. Caller holds mu.
+func (r *recordingAudit) condLocked() *sync.Cond {
+	if r.cond == nil {
+		r.cond = sync.NewCond(&r.mu)
+	}
+	return r.cond
 }
 
 func (r *recordingAudit) Emit(ev AuditEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, ev)
+	r.condLocked().Broadcast()
 }
 func (r *recordingAudit) Shutdown(_ context.Context) error { return nil }
 func (r *recordingAudit) snapshot() []AuditEvent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	out := make([]AuditEvent, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+// waitForEvents blocks until at least n events are emitted or the timeout
+// elapses, then snapshots. The proxy emits the audit row after forwarding the
+// response, which can land just after the client's headers-only ReadResponse
+// returns — so a single snapshot races the emit. The watchdog wakes the waiter
+// on timeout, leaving a missing event to fail the caller's assertion.
+func (r *recordingAudit) waitForEvents(t *testing.T, n int) []AuditEvent {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cond := r.condLocked()
+
+	timedOut := false
+	timer := time.AfterFunc(2*time.Second, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		timedOut = true
+		cond.Broadcast()
+	})
+	defer timer.Stop()
+
+	for len(r.events) < n && !timedOut {
+		cond.Wait()
+	}
 	out := make([]AuditEvent, len(r.events))
 	copy(out, r.events)
 	return out
@@ -508,7 +547,7 @@ func TestProxyInjectsBearerEndToEnd(t *testing.T) {
 		t.Errorf("upstream received %q, want %q", got, "Bearer sk-ant-REAL")
 	}
 
-	events := audit.snapshot()
+	events := audit.waitForEvents(t, 1)
 	if len(events) != 1 {
 		t.Fatalf("audit: want 1 event, got %d (%+v)", len(events), events)
 	}
@@ -586,7 +625,7 @@ func TestProxyDeniesHostNotInCredentialAllowlist(t *testing.T) {
 		t.Errorf("reason: want credential_host_mismatch, got %q", reason)
 	}
 
-	events := audit.snapshot()
+	events := audit.waitForEvents(t, 1)
 	if len(events) != 1 {
 		t.Fatalf("audit: want 1 deny event, got %d (%+v)", len(events), events)
 	}

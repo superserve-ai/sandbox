@@ -11,10 +11,23 @@ import (
 	"time"
 )
 
+// shortSocketPath returns a socket path under the macOS sun_path limit (104
+// bytes). t.TempDir() embeds the test name and can overflow it, failing
+// net.Listen; a short MkdirTemp dir stays under the limit on every OS.
+func shortSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ssp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, name)
+}
+
 // startControlServerOnSocket binds the control server to a temp unix socket.
 func startControlServerOnSocket(t *testing.T, cv *cachedVault, cr *cachedRules) (*http.Client, *ControlServer, *Revoker) {
 	t.Helper()
-	sockPath := filepath.Join(t.TempDir(), "control.sock")
+	sockPath := shortSocketPath(t, "control.sock")
 	rev := NewRevoker()
 	cs := NewControlServer(sockPath, cv, cr, rev)
 
@@ -182,7 +195,7 @@ func TestControlHealth(t *testing.T) {
 }
 
 func TestControlSocketIsModeRestricted(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "ctl.sock")
+	sockPath := shortSocketPath(t, "ctl.sock")
 	cs := NewControlServer(sockPath, nil, nil, nil)
 	go func() { _ = cs.ListenAndServe() }()
 	t.Cleanup(func() { _ = cs.Shutdown(context.Background()) })
