@@ -73,7 +73,8 @@ CREATE TABLE team_credit_grant (
     CONSTRAINT team_credit_grant_amount_positive CHECK (amount_usd > 0),
     CONSTRAINT team_credit_grant_remaining_valid
         CHECK (remaining_usd >= 0 AND remaining_usd <= amount_usd),
-    CONSTRAINT team_credit_grant_currency_valid CHECK (currency = 'USD')
+    CONSTRAINT team_credit_grant_currency_valid CHECK (currency = 'USD'),
+    CONSTRAINT team_credit_grant_id_team_unique UNIQUE (id, team_id)
 );
 
 CREATE INDEX idx_team_credit_grant_active
@@ -83,7 +84,7 @@ CREATE INDEX idx_team_credit_grant_active
 CREATE TABLE team_credit_ledger (
     id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id              uuid NOT NULL REFERENCES team(id),
-    grant_id             uuid REFERENCES team_credit_grant(id),
+    grant_id             uuid,
     billing_period_start timestamptz,
     billing_period_end   timestamptz,
     amount_usd           numeric(20, 6) NOT NULL,
@@ -98,7 +99,10 @@ CREATE TABLE team_credit_ledger (
         OR (billing_period_start IS NOT NULL
             AND billing_period_end IS NOT NULL
             AND billing_period_end > billing_period_start)
-    )
+    ),
+    CONSTRAINT team_credit_ledger_grant_team_fk
+        FOREIGN KEY (grant_id, team_id)
+        REFERENCES team_credit_grant(id, team_id)
 );
 
 CREATE INDEX idx_team_credit_ledger_team_created

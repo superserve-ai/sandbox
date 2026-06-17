@@ -1150,7 +1150,7 @@ func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
 	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
 	hourEnd := hourStart.Add(time.Hour)
 	staleLockedUntil := time.Now().UTC().Add(-time.Minute)
-	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "running", "stale-worker", staleLockedUntil, 1)
+	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "running", "stale-worker", staleLockedUntil, 5)
 
 	cfg := billing.HourlyRollupConfig{
 		BatchSize:    1,
@@ -1183,8 +1183,8 @@ func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
 	if lockedBy != "replacement-worker" {
 		t.Fatalf("locked_by = %q, want replacement-worker", lockedBy)
 	}
-	if attemptCount != 2 {
-		t.Fatalf("attempt_count = %d, want 2", attemptCount)
+	if attemptCount != 5 {
+		t.Fatalf("attempt_count = %d, want 5", attemptCount)
 	}
 }
 
@@ -1237,6 +1237,33 @@ func insertBillingRollupJob(
 		t.Fatalf("insert billing rollup job: %v", err)
 	}
 	return jobID
+}
+
+func TestIntegration_TeamCreditLedgerRejectsCrossTeamGrant(t *testing.T) {
+	ctx := context.Background()
+	grantTeamID, _ := seedTeamAndKey(t)
+	ledgerTeamID, _ := seedTeamAndKey(t)
+
+	var grantID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO team_credit_grant (
+			team_id, amount_usd, remaining_usd, reason
+		)
+		VALUES ($1, 10.00, 10.00, 'test grant')
+		RETURNING id
+	`, grantTeamID).Scan(&grantID); err != nil {
+		t.Fatalf("insert credit grant: %v", err)
+	}
+
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_ledger (
+			team_id, grant_id, amount_usd, reason
+		)
+		VALUES ($1, $2, -1.00, 'cross-team attribution should fail')
+	`, ledgerTeamID, grantID)
+	if err == nil {
+		t.Fatal("expected cross-team credit ledger grant reference to fail")
+	}
 }
 
 func numericFloat64(t *testing.T, n pgtype.Numeric) float64 {

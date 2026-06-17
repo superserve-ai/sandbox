@@ -261,12 +261,16 @@ func claimJobs(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupConfig, 
 WITH candidate AS (
     SELECT id
     FROM billing_rollup_job
-    WHERE status IN ('pending', 'failed', 'running')
-      AND next_attempt_at <= now()
-      AND attempt_count < $1
-      AND (
-          status <> 'running'
-          OR locked_until <= now()
+    WHERE (
+          (
+              status IN ('pending', 'failed')
+              AND next_attempt_at <= now()
+              AND attempt_count < $1
+          )
+          OR (
+              status = 'running'
+              AND locked_until <= now()
+          )
       )
     ORDER BY hour_start ASC, updated_at ASC
     LIMIT $2
@@ -274,7 +278,10 @@ WITH candidate AS (
 )
 UPDATE billing_rollup_job j
 SET status = 'running',
-    attempt_count = j.attempt_count + 1,
+    attempt_count = CASE
+        WHEN j.status = 'running' AND j.locked_until <= now() THEN j.attempt_count
+        ELSE j.attempt_count + 1
+    END,
     locked_by = $3,
     locked_until = $4,
     updated_at = now()
