@@ -203,8 +203,8 @@ func TestE2E_JWTPathInjectsCredentialEndToEnd(t *testing.T) {
 	if got := resp.Header.Get("X-Upstream-Auth"); got != "Bearer sk-ant-REAL" {
 		t.Errorf("upstream Authorization: want %q, got %q", "Bearer sk-ant-REAL", got)
 	}
-	if len(d.audit.snapshot()) != 1 {
-		t.Errorf("want exactly 1 audit event, got %d", len(d.audit.snapshot()))
+	if events := d.audit.waitForEvents(t, 1); len(events) != 1 {
+		t.Errorf("want exactly 1 audit event, got %d", len(events))
 	}
 }
 
