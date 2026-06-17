@@ -93,13 +93,21 @@ func run() error {
 
 	// Enforce the operator blocklist on the proxied path too, so a secrets
 	// sandbox gets the same containment as direct traffic through the firewall.
-	egressBlocklist, blockedPorts := loadEgressBlocklist(rootCtx, cfg.BlocklistConfigPath)
+	egressBlocklist, blockedPorts := loadEgressBlocklist(cfg.BlocklistConfigPath)
 	var blEnforcer secretsproxy.EgressBlocklist
 	if egressBlocklist != nil {
 		blEnforcer = egressBlocklist
 	}
 
 	dnsResolver := buildPolicyResolver(cfg.UpstreamResolverAddr)
+	upstreamTransport := buildUpstreamTransport(dnsResolver, egressBlocklist)
+	if egressBlocklist != nil {
+		// dialGuard runs only on new dials, but the transport pools keep-alive
+		// connections; drop idle ones when the blocklist gains a CIDR so the next
+		// request re-dials through the guard. Sink must be set before Start.
+		egressBlocklist.SetCIDRSink(func([]string) { upstreamTransport.CloseIdleConnections() })
+		go func() { _ = egressBlocklist.Start(rootCtx) }()
+	}
 	proxy := secretsproxy.NewProxy(cfg.ProxyAddr, secretsproxy.Options{
 		CA:                  ca,
 		Resolver:            resolver,
@@ -109,7 +117,7 @@ func run() error {
 		Revoker:             revoker,
 		SandboxFacingHost:   cfg.SandboxFacingHost,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
-		UpstreamTransport:   buildUpstreamTransport(dnsResolver, egressBlocklist),
+		UpstreamTransport:   upstreamTransport,
 		BlockedPorts:        blockedPorts,
 		BlockInternalAddrs:  true,
 		DNSResolver:         dnsResolver,
@@ -168,13 +176,13 @@ func droppedCount(sink secretsproxy.AuditSink) int64 {
 	return 0
 }
 
-// loadEgressBlocklist loads the operator blocklist and starts its refresh loop,
-// returning the live matcher and the blocked egress ports. An unset or
-// unparseable path returns (nil, nil) with enforcement disabled and logged,
-// rather than silently passing traffic the operator expects to be blocked.
-func loadEgressBlocklist(ctx context.Context, path string) (*blocklist.Blocklist, []int) {
+// loadEgressBlocklist seeds the operator blocklist (config entries plus any
+// persisted state) but does not start it: the caller must register a CIDR sink
+// before Start. An unset or unparseable path returns (nil, nil), enforcement
+// disabled and logged.
+func loadEgressBlocklist(path string) (*blocklist.Blocklist, []int) {
 	if path == "" {
-		log.Warn().Msg("SECRETSPROXY_BLOCKLIST_CONFIG unset; proxied-path egress blocklist enforcement disabled")
+		log.Warn().Msg("no egress blocklist configured (SECRETSPROXY_BLOCKLIST_CONFIG / VMD_EGRESS_BLOCKLIST_CONFIG); proxied-path blocklist enforcement disabled")
 		return nil, nil
 	}
 	cfg, err := blocklist.LoadConfig(path)
@@ -183,7 +191,6 @@ func loadEgressBlocklist(ctx context.Context, path string) (*blocklist.Blocklist
 		return nil, nil
 	}
 	bl := blocklist.New(cfg, log.Logger)
-	go func() { _ = bl.Start(ctx) }()
 	log.Info().
 		Int("feeds", len(cfg.DomainFeeds)).
 		Int("pinned_domains", len(cfg.CustomDomains)).
@@ -334,8 +341,9 @@ type config struct {
 	// guest traffic.
 	UpstreamResolverAddr string
 
-	// BlocklistConfigPath points at the operator egress-blocklist YAML. Its
-	// blocked_egress_ports are refused at CONNECT, matching the host firewall.
+	// BlocklistConfigPath is the operator egress-blocklist YAML, from
+	// SECRETSPROXY_BLOCKLIST_CONFIG or, failing that, VMD_EGRESS_BLOCKLIST_CONFIG
+	// so a host configured only for vmd still enforces it on the proxied path.
 	BlocklistConfigPath string
 }
 
@@ -357,7 +365,7 @@ func loadConfig() (*config, error) {
 		AuditFlushEvery:      250 * time.Millisecond,
 		MaxRequestBodyBytes:  parseInt64Bytes(os.Getenv("SECRETSPROXY_MAX_BODY_BYTES"), 256*1024*1024),
 		UpstreamResolverAddr: strings.TrimSpace(os.Getenv("SECRETSPROXY_DNS_RESOLVER")),
-		BlocklistConfigPath:  strings.TrimSpace(os.Getenv("SECRETSPROXY_BLOCKLIST_CONFIG")),
+		BlocklistConfigPath:  strings.TrimSpace(envOr("SECRETSPROXY_BLOCKLIST_CONFIG", os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG"))),
 	}
 	flag.StringVar(&c.ProxyAddr, "listen", c.ProxyAddr, "proxy listener address (host:port)")
 	flag.StringVar(&c.ControlSocketPath, "socket", c.ControlSocketPath, "control RPC unix socket path")

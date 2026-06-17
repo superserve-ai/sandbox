@@ -2,9 +2,15 @@ package main
 
 import (
 	"context"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -54,11 +60,8 @@ func TestDialGuardBlocklistCIDR(t *testing.T) {
 }
 
 func TestLoadEgressBlocklist(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// Unset path: enforcement disabled, no matcher, no ports.
-	if bl, ports := loadEgressBlocklist(ctx, ""); bl != nil || ports != nil {
+	if bl, ports := loadEgressBlocklist(""); bl != nil || ports != nil {
 		t.Errorf("empty path: bl=%v ports=%v", bl, ports)
 	}
 
@@ -68,7 +71,7 @@ func TestLoadEgressBlocklist(t *testing.T) {
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bl, ports := loadEgressBlocklist(ctx, path)
+	bl, ports := loadEgressBlocklist(path)
 	if bl == nil {
 		t.Fatal("expected a live blocklist matcher")
 	}
@@ -80,5 +83,47 @@ func TestLoadEgressBlocklist(t *testing.T) {
 	}
 	if blocked, _ := bl.Blocked("pool.evil.example", nil); !blocked {
 		t.Error("a subdomain of a pinned domain must be blocked")
+	}
+}
+
+// The CIDR sink wired in main relies on CloseIdleConnections forcing the next
+// request to re-dial (and re-hit the guard); pin that it drops pooled conns.
+func TestCloseIdleConnsForcesRedial(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var dials int32
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			atomic.AddInt32(&dials, 1)
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+		MaxIdleConns:    10,
+		IdleConnTimeout: 90 * time.Second,
+	}
+	client := &http.Client{Transport: tr}
+
+	do := func() {
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	do() // opens and pools a connection
+	do() // reuses the pooled connection: no new dial
+	if got := atomic.LoadInt32(&dials); got != 1 {
+		t.Fatalf("expected the second request to reuse the pooled conn (1 dial), got %d", got)
+	}
+
+	tr.CloseIdleConnections() // what the blocklist CIDR sink triggers
+
+	do() // the pooled conn is gone, so this must re-dial (and hit the guard)
+	if got := atomic.LoadInt32(&dials); got != 2 {
+		t.Fatalf("expected a re-dial after CloseIdleConnections, got %d dials", got)
 	}
 }
