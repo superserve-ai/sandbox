@@ -13,18 +13,27 @@ import (
 )
 
 const closeOrphanedActiveIntervals = `-- name: CloseOrphanedActiveIntervals :execrows
-UPDATE sandbox_active_interval sai
+WITH closed_active AS (
+  UPDATE sandbox_active_interval sai
+  SET ended_at = now(),
+      end_reason = CASE s.status
+          WHEN 'failed'  THEN 'failed'
+          WHEN 'deleted' THEN 'deleted'
+          ELSE 'paused'
+      END
+  FROM sandbox s
+  WHERE sai.sandbox_id = s.id
+    AND sai.ended_at IS NULL
+    AND s.status IN ('paused', 'failed', 'deleted')
+    AND s.updated_at < now() - interval '5 minutes'
+  RETURNING sai.sandbox_id, sai.end_reason
+)
+UPDATE sandbox_compute_billing_interval bi
 SET ended_at = now(),
-    end_reason = CASE s.status
-        WHEN 'failed'  THEN 'failed'
-        WHEN 'deleted' THEN 'deleted'
-        ELSE 'paused'
-    END
-FROM sandbox s
-WHERE sai.sandbox_id = s.id
-  AND sai.ended_at IS NULL
-  AND s.status IN ('paused', 'failed', 'deleted')
-  AND s.updated_at < now() - interval '5 minutes'
+    end_reason = ca.end_reason
+FROM closed_active ca
+WHERE bi.sandbox_id = ca.sandbox_id
+  AND bi.ended_at IS NULL
 `
 
 // Defense-in-depth sweep: close interval rows left open while their sandbox is
@@ -40,16 +49,24 @@ func (q *Queries) CloseOrphanedActiveIntervals(ctx context.Context) (int64, erro
 }
 
 const closeSandboxActiveInterval = `-- name: CloseSandboxActiveInterval :exec
-UPDATE sandbox_active_interval
+WITH closed_active AS (
+    UPDATE sandbox_active_interval
+    SET ended_at = now(),
+        end_reason = $1::text
+    WHERE sandbox_id = $2::uuid
+      AND ended_at IS NULL
+    RETURNING sandbox_id
+)
+UPDATE sandbox_compute_billing_interval
 SET ended_at = now(),
-    end_reason = $2
-WHERE sandbox_id = $1
+    end_reason = $1::text
+WHERE sandbox_id = $2::uuid
   AND ended_at IS NULL
 `
 
 type CloseSandboxActiveIntervalParams struct {
+	EndReason string    `json:"end_reason"`
 	SandboxID uuid.UUID `json:"sandbox_id"`
-	EndReason *string   `json:"end_reason"`
 }
 
 // Closes the currently-open interval for a sandbox. The WHERE ended_at IS NULL
@@ -58,7 +75,7 @@ type CloseSandboxActiveIntervalParams struct {
 // only the first call closes the row — the second is a no-op so we don't
 // over-report active time.
 func (q *Queries) CloseSandboxActiveInterval(ctx context.Context, arg CloseSandboxActiveIntervalParams) error {
-	_, err := q.db.Exec(ctx, closeSandboxActiveInterval, arg.SandboxID, arg.EndReason)
+	_, err := q.db.Exec(ctx, closeSandboxActiveInterval, arg.EndReason, arg.SandboxID)
 	return err
 }
 
@@ -83,8 +100,27 @@ func (q *Queries) GetMostRecentClosedSandboxIntervalActor(ctx context.Context, s
 }
 
 const openSandboxActiveInterval = `-- name: OpenSandboxActiveInterval :exec
-INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
-VALUES ($1, $2, $3, now())
+WITH target AS (
+    SELECT s.id, s.team_id, s.vcpu_count, s.memory_mib
+    FROM sandbox s
+    WHERE s.id = $1
+      AND s.team_id = $2
+      AND s.destroyed_at IS NULL
+),
+opened_active AS (
+    INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+    SELECT t.id, t.team_id, $3, now()
+    FROM target t
+    ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+    RETURNING sandbox_id
+)
+INSERT INTO sandbox_compute_billing_interval (
+    sandbox_id, team_id, vcpu_count, memory_mib, started_at
+)
+SELECT t.id, t.team_id, t.vcpu_count, t.memory_mib, now()
+FROM opened_active oa
+JOIN target t ON t.id = oa.sandbox_id
+WHERE feature_enabled('billing_metrics_write', t.team_id)
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
 `
 

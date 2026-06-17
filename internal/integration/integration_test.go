@@ -616,6 +616,497 @@ func countOpenIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) 
 	return n
 }
 
+func countOpenStorageIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&n); err != nil {
+		t.Fatalf("count open storage intervals: %v", err)
+	}
+	return n
+}
+
+func countOpenComputeBillingIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_compute_billing_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&n); err != nil {
+		t.Fatalf("count open compute billing intervals: %v", err)
+	}
+	return n
+}
+
+func TestIntegration_SandboxBillingIntervalsLifecycle(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-lifecycle"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	var vcpu, memoryMib, diskMib int
+	if err := testPool.QueryRow(ctx, `
+		SELECT c.vcpu_count, c.memory_mib, s.disk_mib
+		FROM sandbox_compute_billing_interval c
+		JOIN sandbox_storage_interval s USING (sandbox_id)
+		WHERE c.sandbox_id = $1 AND c.ended_at IS NULL AND s.ended_at IS NULL
+	`, sandboxID).Scan(&vcpu, &memoryMib, &diskMib); err != nil {
+		t.Fatalf("read opened billing intervals: %v", err)
+	}
+	if vcpu != 1 || memoryMib != 1024 || diskMib != 4096 {
+		t.Fatalf("opened dimensions = vcpu:%d memory:%d disk:%d, want 1/1024/4096", vcpu, memoryMib, diskMib)
+	}
+
+	if pw := do(r, "POST", "/sandboxes/"+sandboxID.String()+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute intervals after pause = %d, want 0", open)
+	}
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute billing intervals after pause = %d, want 0", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open storage intervals after pause = %d, want 1", open)
+	}
+
+	if dw := do(r, "DELETE", "/sandboxes/"+sandboxID.String(), apiKey, ""); dw.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", dw.Code, dw.Body.String())
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open storage intervals after delete = %d, want 0", open)
+	}
+}
+
+func TestIntegration_BillingMetricsWriteFeatureFlag(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_metrics_write', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing_metrics_write: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-flag-off"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("active interval should still open when billing write flag is off; got %d", open)
+	}
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute billing intervals with flag off = %d, want 0", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open storage intervals with flag off = %d, want 0", open)
+	}
+}
+
+func TestIntegration_BillingPeriodRollupFuturePeriodIsZero(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"future-rollup"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+
+	periodStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(time.Hour)
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("future get usage: %v", err)
+	}
+	if got := numericFloat64(t, usage.VcpuSeconds); got != 0 {
+		t.Fatalf("future vcpu seconds = %v, want 0", got)
+	}
+
+	rollup, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("future upsert usage: %v", err)
+	}
+	if got := numericFloat64(t, rollup.VcpuSeconds); got != 0 {
+		t.Fatalf("future rollup vcpu seconds = %v, want 0", got)
+	}
+}
+
+func TestIntegration_HourlyRollupFeatureFlagDoesNotOverwriteWithZero(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"hourly-flag-gate"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage_hourly (
+			team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, 123, 456, 789)
+	`, teamID, hourStart, hourEnd); err != nil {
+		t.Fatalf("seed hourly row: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_hourly_rollups', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable hourly rollups: %v", err)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
+		TeamID:    teamID,
+		HourStart: pgtype.Timestamptz{Time: hourStart, Valid: true},
+		HourEnd:   pgtype.Timestamptz{Time: hourEnd, Valid: true},
+	}); err == nil {
+		t.Fatal("expected no hourly row returned while billing_hourly_rollups is disabled")
+	}
+
+	var vcpu int
+	if err := testPool.QueryRow(ctx, `
+		SELECT vcpu_seconds::int
+		FROM team_billing_usage_hourly
+		WHERE team_id = $1 AND hour_start = $2
+	`, teamID, hourStart).Scan(&vcpu); err != nil {
+		t.Fatalf("read hourly row: %v", err)
+	}
+	if vcpu != 123 {
+		t.Fatalf("hourly row was overwritten while flag disabled: got %d", vcpu)
+	}
+}
+
+func TestIntegration_FinalizeBillingPeriodFinalizesUsage(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	periodStart := time.Now().UTC().Truncate(time.Hour).Add(-24 * time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage (
+			team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, 1, 2, 3)
+	`, teamID, periodStart, periodEnd); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "approved",
+	}); err != nil {
+		t.Fatalf("upsert period: %v", err)
+	}
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("export period: %v", err)
+	}
+	if _, err := testQueries.FinalizeTeamBillingPeriod(ctx, db.FinalizeTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("finalize period: %v", err)
+	}
+
+	var finalizedAt *time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT finalized_at
+		FROM team_billing_usage
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, periodStart, periodEnd).Scan(&finalizedAt); err != nil {
+		t.Fatalf("read usage finalized_at: %v", err)
+	}
+	if finalizedAt == nil {
+		t.Fatal("team_billing_usage.finalized_at is NULL after period finalization")
+	}
+}
+
+func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	periodStart := time.Now().UTC().Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "approved",
+	}); err != nil {
+		t.Fatalf("upsert billing period: %v", err)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	}); err != nil {
+		t.Fatalf("upsert billing usage before export: %v", err)
+	}
+
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err == nil {
+		t.Fatal("expected billing export to be gated off by default")
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing_export_enabled: %v", err)
+	}
+
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("expected billing export after enabling flag: %v", err)
+	}
+}
+
+func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'tenant_usage_dashboard', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable tenant dashboard: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"hourly-open-bound"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	hourStart := time.Now().UTC().Truncate(time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	startedAt := time.Now().UTC().Add(-5 * time.Minute)
+	if startedAt.Before(hourStart) {
+		startedAt = hourStart
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = NULL, end_reason = NULL,
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, startedAt); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = NULL, end_reason = NULL,
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, startedAt); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
+	row, err := testQueries.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
+		TeamID:    teamID,
+		HourStart: pgtype.Timestamptz{Time: hourStart, Valid: true},
+		HourEnd:   pgtype.Timestamptz{Time: hourEnd, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("upsert hourly usage: %v", err)
+	}
+
+	vcpuSeconds := numericFloat64(t, row.VcpuSeconds)
+	if vcpuSeconds >= 3600 {
+		t.Fatalf("current-hour open interval was charged to hour_end: got %v seconds", vcpuSeconds)
+	}
+	if vcpuSeconds <= 0 {
+		t.Fatalf("current-hour open interval should have positive elapsed usage, got %v", vcpuSeconds)
+	}
+}
+
+func TestIntegration_SandboxBillingIntervalsStorageStaysOpenOnFailed(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-failed"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open compute billing intervals before fail = %d, want 1", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open storage intervals before fail = %d, want 1", open)
+	}
+
+	if err := testQueries.MarkSandboxFailedInTeam(ctx, db.MarkSandboxFailedInTeamParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	}); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute billing intervals after fail = %d, want 0", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open storage intervals after fail = %d, want 1 because failed sandboxes retain disk", open)
+	}
+}
+
+func TestIntegration_BillingIntervalsEnforceSandboxTenant(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	otherTeamID, _ := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-tenant-fk"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib
+		)
+		VALUES ($1, $2, 1, 1024)
+	`, sandboxID, otherTeamID)
+	if err == nil {
+		t.Fatal("expected cross-team compute billing interval to violate FK")
+	}
+
+	_, err = testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib)
+		VALUES ($1, $2, 4096)
+	`, sandboxID, otherTeamID)
+	if err == nil {
+		t.Fatal("expected cross-team storage interval to violate FK")
+	}
+}
+
+func TestIntegration_GetTeamBillingUsage(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-aggregate"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	periodEnd := periodStart.Add(100 * time.Second)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 2, memory_mib = 2048
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(10*time.Second), periodStart.Add(40*time.Second)); err != nil {
+		t.Fatalf("set deterministic compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 4096
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(5*time.Second), periodStart.Add(65*time.Second)); err != nil {
+		t.Fatalf("set deterministic storage interval: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+
+	vcpuSeconds := numericFloat64(t, usage.VcpuSeconds)
+	memoryGibSeconds := numericFloat64(t, usage.MemoryGibSeconds)
+	storageGibSeconds := numericFloat64(t, usage.StorageGibSeconds)
+	if vcpuSeconds != 60 || memoryGibSeconds != 60 || storageGibSeconds != 240 {
+		t.Fatalf("usage = vcpu:%v memory:%v storage:%v, want 60/60/240",
+			vcpuSeconds, memoryGibSeconds, storageGibSeconds)
+	}
+
+	rollup, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("upsert team billing usage: %v", err)
+	}
+	if got := numericFloat64(t, rollup.VcpuSeconds); got != 60 {
+		t.Fatalf("rollup vcpu seconds = %v, want 60", got)
+	}
+	if got := numericFloat64(t, rollup.MemoryMibSeconds); got != 61_440 {
+		t.Fatalf("rollup memory MiB seconds = %v, want 61440", got)
+	}
+	if got := numericFloat64(t, rollup.StorageMibSeconds); got != 245_760 {
+		t.Fatalf("rollup storage MiB seconds = %v, want 245760", got)
+	}
+}
+
+func numericFloat64(t *testing.T, n pgtype.Numeric) float64 {
+	t.Helper()
+	v, err := n.Float64Value()
+	if err != nil {
+		t.Fatalf("convert numeric: %v", err)
+	}
+	if !v.Valid {
+		t.Fatal("numeric is null")
+	}
+	return v.Float64
+}
+
 // waitForSandboxStatus polls until the sandbox reaches want (or fails), rather
 // than sleeping a fixed interval that goes flaky under load.
 func waitForSandboxStatus(t *testing.T, ctx context.Context, id, teamID uuid.UUID, want db.SandboxStatus) {

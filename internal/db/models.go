@@ -196,6 +196,20 @@ type ApiKey struct {
 	CreatedAt  time.Time          `json:"created_at"`
 }
 
+type BillingPeriodAnomaly struct {
+	ID          uuid.UUID          `json:"id"`
+	TeamID      uuid.UUID          `json:"team_id"`
+	PeriodStart time.Time          `json:"period_start"`
+	PeriodEnd   time.Time          `json:"period_end"`
+	Severity    string             `json:"severity"`
+	Kind        string             `json:"kind"`
+	SandboxID   pgtype.UUID        `json:"sandbox_id"`
+	Details     []byte             `json:"details"`
+	DetectedAt  time.Time          `json:"detected_at"`
+	ResolvedAt  pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedBy  pgtype.UUID        `json:"resolved_by"`
+}
+
 type DeviceCode struct {
 	ID         uuid.UUID   `json:"id"`
 	DeviceCode string      `json:"device_code"`
@@ -213,6 +227,14 @@ type EarlyAccessRequest struct {
 	Company   *string   `json:"company"`
 	Message   *string   `json:"message"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type FeatureFlag struct {
+	Key         string    `json:"key"`
+	Enabled     bool      `json:"enabled"`
+	Description *string   `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Host struct {
@@ -312,6 +334,7 @@ type Sandbox struct {
 	MemPath      *string     `json:"mem_path"`
 	BasePath     *string     `json:"base_path"`
 	DeltaPath    *string     `json:"delta_path"`
+	DiskMib      int32       `json:"disk_mib"`
 }
 
 type SandboxActiveInterval struct {
@@ -319,6 +342,17 @@ type SandboxActiveInterval struct {
 	SandboxID uuid.UUID          `json:"sandbox_id"`
 	TeamID    uuid.UUID          `json:"team_id"`
 	ActorID   pgtype.UUID        `json:"actor_id"`
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
+	EndReason *string            `json:"end_reason"`
+}
+
+type SandboxComputeBillingInterval struct {
+	ID        uuid.UUID          `json:"id"`
+	SandboxID uuid.UUID          `json:"sandbox_id"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	VcpuCount int32              `json:"vcpu_count"`
+	MemoryMib int32              `json:"memory_mib"`
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
@@ -334,6 +368,16 @@ type SandboxSecret struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	SecretID  uuid.UUID `json:"secret_id"`
 	EnvKey    string    `json:"env_key"`
+}
+
+type SandboxStorageInterval struct {
+	ID        uuid.UUID          `json:"id"`
+	SandboxID uuid.UUID          `json:"sandbox_id"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	DiskMib   int32              `json:"disk_mib"`
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
+	EndReason *string            `json:"end_reason"`
 }
 
 type Secret struct {
@@ -379,6 +423,51 @@ type Team struct {
 	CredentialStoreKind   string    `json:"credential_store_kind"`
 	CredentialStoreConfig []byte    `json:"credential_store_config"`
 	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
+}
+
+type TeamBillingPeriod struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	PeriodStart   time.Time          `json:"period_start"`
+	PeriodEnd     time.Time          `json:"period_end"`
+	Status        string             `json:"status"`
+	BlockedReason *string            `json:"blocked_reason"`
+	BlockedAt     pgtype.Timestamptz `json:"blocked_at"`
+	ApprovedBy    pgtype.UUID        `json:"approved_by"`
+	ApprovedAt    pgtype.Timestamptz `json:"approved_at"`
+	ExportedAt    pgtype.Timestamptz `json:"exported_at"`
+	FinalizedAt   pgtype.Timestamptz `json:"finalized_at"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+}
+
+type TeamBillingUsage struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	PeriodStart       time.Time          `json:"period_start"`
+	PeriodEnd         time.Time          `json:"period_end"`
+	VcpuSeconds       pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric     `json:"storage_mib_seconds"`
+	FinalizedAt       pgtype.Timestamptz `json:"finalized_at"`
+	ExportedAt        pgtype.Timestamptz `json:"exported_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+type TeamBillingUsageHourly struct {
+	TeamID            uuid.UUID      `json:"team_id"`
+	HourStart         time.Time      `json:"hour_start"`
+	HourEnd           time.Time      `json:"hour_end"`
+	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+type TeamFeatureFlag struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	Key       string    `json:"key"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type TeamMember struct {
