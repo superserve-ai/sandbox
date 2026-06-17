@@ -93,7 +93,10 @@ func run() error {
 
 	// Enforce the operator blocklist on the proxied path too, so a secrets
 	// sandbox gets the same containment as direct traffic through the firewall.
-	egressBlocklist, blockedPorts := loadEgressBlocklist(cfg.BlocklistConfigPath)
+	egressBlocklist, blockedPorts, blErr := loadEgressBlocklist(cfg.BlocklistConfigPath)
+	if blErr != nil {
+		return blErr
+	}
 	var blEnforcer secretsproxy.EgressBlocklist
 	if egressBlocklist != nil {
 		blEnforcer = egressBlocklist
@@ -187,15 +190,16 @@ func droppedCount(sink secretsproxy.AuditSink) int64 {
 // persisted state) but does not start it: the caller must register a CIDR sink
 // before Start. An unset or unparseable path returns (nil, nil), enforcement
 // disabled and logged.
-func loadEgressBlocklist(path string) (*blocklist.Blocklist, []int) {
+func loadEgressBlocklist(path string) (*blocklist.Blocklist, []int, error) {
 	if path == "" {
 		log.Warn().Msg("no egress blocklist configured (SECRETSPROXY_BLOCKLIST_CONFIG / VMD_EGRESS_BLOCKLIST_CONFIG); proxied-path blocklist enforcement disabled")
-		return nil, nil
+		return nil, nil, nil
 	}
 	cfg, err := blocklist.LoadConfig(path)
 	if err != nil {
-		log.Error().Err(err).Str("path", path).Msg("egress blocklist failed to load; proxied-path blocklist enforcement DISABLED")
-		return nil, nil
+		// Fail closed: a configured blocklist that won't load aborts startup
+		// rather than silently serving with no containment, matching vmd.
+		return nil, nil, fmt.Errorf("load egress blocklist %q: %w", path, err)
 	}
 	bl := blocklist.New(cfg, log.Logger)
 	log.Info().
@@ -204,7 +208,7 @@ func loadEgressBlocklist(path string) (*blocklist.Blocklist, []int) {
 		Int("pinned_cidrs", len(cfg.CustomCIDRs)).
 		Int("blocked_ports", len(cfg.BlockedEgressPorts)).
 		Msg("egress blocklist enforced on proxied path")
-	return bl, portsToInt(cfg.BlockedEgressPorts)
+	return bl, portsToInt(cfg.BlockedEgressPorts), nil
 }
 
 // revocationReconcileInterval bounds how long a dropped revocation push can go

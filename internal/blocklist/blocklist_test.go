@@ -192,6 +192,46 @@ func TestRefreshLoadsFeedSynchronously(t *testing.T) {
 	}
 }
 
+func TestBlockedHonorsIPv6CIDR(t *testing.T) {
+	dir := t.TempDir()
+	b := New(&Config{
+		CustomCIDRs: []string{"2001:db8::/32"},
+		StatePath:   filepath.Join(dir, "state"),
+	}, zerolog.Nop())
+
+	if blocked, _ := b.Blocked("", net.ParseIP("2001:db8::1")); !blocked {
+		t.Error("an IPv6 address inside a pinned IPv6 CIDR must be blocked")
+	}
+	if blocked, _ := b.Blocked("", net.ParseIP("2001:dead::1")); blocked {
+		t.Error("an IPv6 address outside the CIDR must not be blocked")
+	}
+	// IPv4 matching must still work.
+	b4 := New(&Config{CustomCIDRs: []string{"203.0.113.0/24"}, StatePath: filepath.Join(dir, "s4")}, zerolog.Nop())
+	if blocked, _ := b4.Blocked("", net.ParseIP("203.0.113.5")); !blocked {
+		t.Error("IPv4 CIDR matching regressed")
+	}
+}
+
+func TestLoadConfigRejectsNonPositiveRefreshInterval(t *testing.T) {
+	dir := t.TempDir()
+	for _, bad := range []string{"0s", "-5s"} {
+		path := filepath.Join(dir, "bad.yaml")
+		if err := os.WriteFile(path, []byte("refresh_interval: "+bad+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(path); err == nil {
+			t.Errorf("LoadConfig must reject non-positive refresh_interval %q (NewTicker would panic)", bad)
+		}
+	}
+	path := filepath.Join(dir, "ok.yaml")
+	if err := os.WriteFile(path, []byte("refresh_interval: 30s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err != nil {
+		t.Errorf("LoadConfig rejected a valid interval: %v", err)
+	}
+}
+
 func TestCIDRSinkInvokedOnRefresh(t *testing.T) {
 	dir := t.TempDir()
 	feed := filepath.Join(dir, "feed.txt")
