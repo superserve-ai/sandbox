@@ -227,8 +227,7 @@ func (b *Blocklist) Blocked(hostname string, dstIP net.IP) (bool, string) {
 		return true, "domain"
 	}
 	if dstIP != nil {
-		// AddrFromSlice + Unmap handles both IPv4 and IPv6 (and v4-mapped-v6);
-		// To4() alone would drop every IPv6 destination.
+		// AddrFromSlice + Unmap matches both IPv4 and IPv6 (including v4-mapped).
 		if addr, ok := netip.AddrFromSlice(dstIP); ok {
 			addr = addr.Unmap()
 			for _, p := range snap.nets {

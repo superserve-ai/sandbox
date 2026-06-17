@@ -211,9 +211,8 @@ func TestProxyConnectAndForward(t *testing.T) {
 	}
 }
 
-// CIDR-pinned requests are routed to a separate keep-alive-disabled transport
-// so they always dial fresh through the guard instead of riding a pooled
-// connection to a different IP. Pin that the wiring is in place.
+// CIDR-pinned requests use a separate keep-alive-disabled transport so each
+// dials through the guard. Pin that the wiring is in place.
 func TestNewProxyPinnedTransportDisablesReuse(t *testing.T) {
 	base := &http.Transport{MaxIdleConns: 100}
 	p := NewProxy("127.0.0.1:0", Options{UpstreamTransport: base})
@@ -250,8 +249,8 @@ func (b *toggleBlocklist) Blocked(host string, _ net.IP) (bool, string) {
 	return false, ""
 }
 
-// A host blocklisted by a feed refresh after CONNECT must be refused on the next
-// request over the same keep-alive tunnel, not reachable until it idles out.
+// A host blocklisted after CONNECT must be refused on the next request over the
+// same tunnel (the blocklist is re-checked per request, not only at CONNECT).
 func TestProxyRechecksBlocklistMidTunnel(t *testing.T) {
 	const testJWT = "test-jwt-string"
 	resolver := &stubResolver{wantJWT: testJWT, scopeOut: &Scope{SandboxID: "sandbox-1", TeamID: "team-1"}}

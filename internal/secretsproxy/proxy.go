@@ -142,9 +142,8 @@ func NewProxy(addr string, opts Options) *Proxy {
 			ForceAttemptHTTP2:     false,
 		}
 	}
-	// A CIDR-pinned request must dial fresh so its policy-evaluated IP goes
-	// through the dial guard; the pooling transport could otherwise satisfy it
-	// from an idle connection to a different IP for the same host. Reuse off.
+	// Reuse-disabled transport for CIDR-pinned requests, so each dials the
+	// policy-evaluated IP through the guard.
 	upstreamPinned := upstream.Clone()
 	upstreamPinned.DisableKeepAlives = true
 	audit := opts.Audit

@@ -105,13 +105,11 @@ func run() error {
 	dnsResolver := buildPolicyResolver(cfg.UpstreamResolverAddr)
 	upstreamTransport := buildUpstreamTransport(dnsResolver, egressBlocklist)
 	if egressBlocklist != nil {
-		// dialGuard runs only on new dials, but the transport pools keep-alive
-		// connections; drop idle ones when the blocklist gains a CIDR so the next
-		// request re-dials through the guard. Sink must be set before Start.
+		// Drop pooled upstream connections when the blocklist's CIDR set changes
+		// so reuse re-evaluates against the dial guard. Sink must be set before Start.
 		egressBlocklist.SetCIDRSink(func([]string) { upstreamTransport.CloseIdleConnections() })
-		// Load feeds synchronously before serving so feed-sourced entries are
-		// enforced from the first request, not just the pinned/state entries
-		// already seeded. Bound it so a slow feed can't stall startup; the
+		// Load the blocklist before serving so it is fully populated from the
+		// first request. Bound it so a slow feed can't stall startup; the
 		// background refresh still picks it up.
 		loadCtx, cancelLoad := context.WithTimeout(rootCtx, 5*time.Second)
 		egressBlocklist.Refresh(loadCtx)
@@ -352,9 +350,9 @@ type config struct {
 	// guest traffic.
 	UpstreamResolverAddr string
 
-	// BlocklistConfigPath is the operator egress-blocklist YAML, from
-	// SECRETSPROXY_BLOCKLIST_CONFIG or, failing that, VMD_EGRESS_BLOCKLIST_CONFIG
-	// so a host configured only for vmd still enforces it on the proxied path.
+	// BlocklistConfigPath is the operator egress-blocklist YAML:
+	// SECRETSPROXY_BLOCKLIST_CONFIG, or the conventional path when present, so a
+	// standard host enforces it on the proxied path without extra config.
 	BlocklistConfigPath string
 }
 
@@ -376,7 +374,7 @@ func loadConfig() (*config, error) {
 		AuditFlushEvery:      250 * time.Millisecond,
 		MaxRequestBodyBytes:  parseInt64Bytes(os.Getenv("SECRETSPROXY_MAX_BODY_BYTES"), 256*1024*1024),
 		UpstreamResolverAddr: strings.TrimSpace(os.Getenv("SECRETSPROXY_DNS_RESOLVER")),
-		BlocklistConfigPath:  strings.TrimSpace(envOr("SECRETSPROXY_BLOCKLIST_CONFIG", os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG"))),
+		BlocklistConfigPath:  blocklistConfigPath(),
 	}
 	flag.StringVar(&c.ProxyAddr, "listen", c.ProxyAddr, "proxy listener address (host:port)")
 	flag.StringVar(&c.ControlSocketPath, "socket", c.ControlSocketPath, "control RPC unix socket path")
@@ -411,6 +409,20 @@ func envOr(k, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// blocklistConfigPath resolves the operator egress-blocklist YAML: an explicit
+// SECRETSPROXY_BLOCKLIST_CONFIG, else the conventional path when it exists.
+// Empty means no blocklist is configured.
+func blocklistConfigPath() string {
+	if p := strings.TrimSpace(os.Getenv("SECRETSPROXY_BLOCKLIST_CONFIG")); p != "" {
+		return p
+	}
+	const conventional = "/etc/sandbox/egress-blocklist.yaml"
+	if _, err := os.Stat(conventional); err == nil {
+		return conventional
+	}
+	return ""
 }
 
 func parseDur(raw string, fallback time.Duration) time.Duration {
