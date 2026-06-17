@@ -3,33 +3,60 @@ package billing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 const (
-	defaultHourlyRollupInterval      = 5 * time.Minute
-	defaultHourlyRollupLookbackHours = 6
-	defaultHourlyRollupTickTimeout   = 2 * time.Minute
+	defaultHourlyRollupSchedulerInterval = 5 * time.Minute
+	defaultHourlyRollupWorkerPoll        = 10 * time.Second
+	defaultHourlyRollupLookbackHours     = 24
+	defaultHourlyRollupLeaseDuration     = 2 * time.Minute
+	defaultHourlyRollupLockDuration      = 5 * time.Minute
+	defaultHourlyRollupBatchSize         = 100
+	defaultHourlyRollupMaxAttempts       = 5
+	defaultHourlyRollupWorkers           = 1
 )
 
 type HourlyRollupConfig struct {
-	Interval      time.Duration
-	LookbackHours int
-	TickTimeout   time.Duration
+	SchedulerInterval time.Duration
+	WorkerPoll        time.Duration
+	LookbackHours     int
+	LeaseDuration     time.Duration
+	LockDuration      time.Duration
+	BatchSize         int
+	MaxAttempts       int
+	Workers           int
+}
+
+type rollupJob struct {
+	ID           uuid.UUID
+	TeamID       uuid.UUID
+	HourStart    time.Time
+	HourEnd      time.Time
+	AttemptCount int
 }
 
 func DefaultHourlyRollupConfig() HourlyRollupConfig {
 	return HourlyRollupConfig{
-		Interval:      durationFromEnv("BILLING_HOURLY_ROLLUP_INTERVAL", defaultHourlyRollupInterval),
-		LookbackHours: intFromEnv("BILLING_HOURLY_ROLLUP_LOOKBACK_HOURS", defaultHourlyRollupLookbackHours),
-		TickTimeout:   durationFromEnv("BILLING_HOURLY_ROLLUP_TICK_TIMEOUT", defaultHourlyRollupTickTimeout),
+		SchedulerInterval: durationFromEnv("BILLING_HOURLY_ROLLUP_INTERVAL", defaultHourlyRollupSchedulerInterval),
+		WorkerPoll:        durationFromEnv("BILLING_HOURLY_ROLLUP_WORKER_POLL", defaultHourlyRollupWorkerPoll),
+		LookbackHours:     intFromEnv("BILLING_HOURLY_ROLLUP_LOOKBACK_HOURS", defaultHourlyRollupLookbackHours),
+		LeaseDuration:     durationFromEnv("BILLING_HOURLY_ROLLUP_LEASE_DURATION", defaultHourlyRollupLeaseDuration),
+		LockDuration:      durationFromEnv("BILLING_HOURLY_ROLLUP_LOCK_DURATION", defaultHourlyRollupLockDuration),
+		BatchSize:         intFromEnv("BILLING_HOURLY_ROLLUP_BATCH_SIZE", defaultHourlyRollupBatchSize),
+		MaxAttempts:       intFromEnv("BILLING_HOURLY_ROLLUP_MAX_ATTEMPTS", defaultHourlyRollupMaxAttempts),
+		Workers:           intFromEnv("BILLING_HOURLY_ROLLUP_WORKERS", defaultHourlyRollupWorkers),
 	}
 }
 
@@ -38,88 +65,270 @@ func HourlyRollupDisabledFromEnv() bool {
 		os.Getenv("BILLING_HOURLY_ROLLUP_DISABLED") == "true"
 }
 
-func StartHourlyRollupWorker(ctx context.Context, q *db.Queries, cfg HourlyRollupConfig) {
+func StartHourlyRollupService(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg HourlyRollupConfig) {
 	cfg = normalizeConfig(cfg)
-	go func() {
-		log.Info().
-			Dur("interval", cfg.Interval).
-			Int("lookback_hours", cfg.LookbackHours).
-			Dur("tick_timeout", cfg.TickTimeout).
-			Msg("billing hourly rollup worker started")
+	workerID := workerID()
 
-		runRollupTick(ctx, q, cfg)
+	log.Info().
+		Str("worker_id", workerID).
+		Dur("scheduler_interval", cfg.SchedulerInterval).
+		Dur("worker_poll", cfg.WorkerPoll).
+		Int("lookback_hours", cfg.LookbackHours).
+		Int("workers", cfg.Workers).
+		Int("batch_size", cfg.BatchSize).
+		Msg("billing hourly rollup service starting")
 
-		ticker := time.NewTicker(cfg.Interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				log.Info().Msg("billing hourly rollup worker stopped")
-				return
-			case <-ticker.C:
-				runRollupTick(ctx, q, cfg)
-			}
-		}
-	}()
+	go runScheduler(ctx, pool, cfg, workerID)
+	for i := 0; i < cfg.Workers; i++ {
+		go runWorker(ctx, pool, q, cfg, fmt.Sprintf("%s-%d", workerID, i))
+	}
 }
 
-func RunHourlyRollup(ctx context.Context, q *db.Queries, cfg HourlyRollupConfig, now time.Time) error {
-	cfg = normalizeConfig(cfg)
+func runScheduler(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupConfig, workerID string) {
+	runSchedulerTick(ctx, pool, cfg, workerID)
 
-	var joined error
-	totalTeams := 0
-	totalHours := 0
+	ticker := time.NewTicker(cfg.SchedulerInterval)
+	defer ticker.Stop()
 
-	for _, hourStart := range rollupHours(now, cfg.LookbackHours) {
-		hourEnd := hourStart.Add(time.Hour)
-		teamIDs, err := q.ListTeamsForHourlyBillingRollup(ctx, db.ListTeamsForHourlyBillingRollupParams{
-			HourStart: hourStart,
-			HourEnd:   hourEnd,
-		})
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Str("worker_id", workerID).Msg("billing hourly rollup scheduler stopped")
+			return
+		case <-ticker.C:
+			runSchedulerTick(ctx, pool, cfg, workerID)
+		}
+	}
+}
+
+func runSchedulerTick(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupConfig, workerID string) {
+	claimed, err := claimSchedulerLease(ctx, pool, workerID, time.Now().UTC().Add(cfg.LeaseDuration))
+	if err != nil {
+		log.Warn().Err(err).Str("worker_id", workerID).Msg("claim billing rollup scheduler lease failed")
+		return
+	}
+	if !claimed {
+		return
+	}
+
+	total := int64(0)
+	for _, hourStart := range rollupHours(time.Now().UTC(), cfg.LookbackHours) {
+		enqueued, err := enqueueHour(ctx, pool, hourStart, hourStart.Add(time.Hour))
 		if err != nil {
-			joined = errors.Join(joined, err)
-			log.Error().Err(err).Time("hour_start", hourStart).Msg("list teams for billing hourly rollup failed")
+			log.Error().Err(err).Time("hour_start", hourStart).Msg("enqueue billing hourly rollup jobs failed")
 			continue
 		}
-
-		totalHours++
-		totalTeams += len(teamIDs)
-		for _, teamID := range teamIDs {
-			_, err := q.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
-				TeamID:    teamID,
-				HourStart: hourStart,
-				HourEnd:   hourEnd,
-			})
-			if errors.Is(err, pgx.ErrNoRows) {
-				// The team flag may have changed between listing and upsert.
-				continue
-			}
-			if err != nil {
-				joined = errors.Join(joined, err)
-				log.Error().
-					Err(err).
-					Str("team_id", teamID.String()).
-					Time("hour_start", hourStart).
-					Msg("billing hourly rollup upsert failed")
-			}
-		}
+		total += enqueued
 	}
 
 	log.Info().
-		Int("hours", totalHours).
-		Int("team_hour_rollups", totalTeams).
-		Msg("billing hourly rollup tick completed")
-	return joined
+		Str("worker_id", workerID).
+		Int64("jobs_enqueued_or_refreshed", total).
+		Int("lookback_hours", cfg.LookbackHours).
+		Msg("billing hourly rollup scheduler tick completed")
 }
 
-func runRollupTick(ctx context.Context, q *db.Queries, cfg HourlyRollupConfig) {
-	tickCtx, cancel := context.WithTimeout(ctx, cfg.TickTimeout)
-	defer cancel()
+func runWorker(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg HourlyRollupConfig, workerID string) {
+	processJobs(ctx, pool, q, cfg, workerID)
 
-	if err := RunHourlyRollup(tickCtx, q, cfg, time.Now().UTC()); err != nil {
-		log.Warn().Err(err).Msg("billing hourly rollup tick completed with errors")
+	ticker := time.NewTicker(cfg.WorkerPoll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Str("worker_id", workerID).Msg("billing hourly rollup worker stopped")
+			return
+		case <-ticker.C:
+			processJobs(ctx, pool, q, cfg, workerID)
+		}
 	}
+}
+
+func processJobs(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg HourlyRollupConfig, workerID string) {
+	jobs, err := claimJobs(ctx, pool, cfg, workerID, time.Now().UTC().Add(cfg.LockDuration))
+	if err != nil {
+		log.Warn().Err(err).Str("worker_id", workerID).Msg("claim billing hourly rollup jobs failed")
+		return
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	for _, job := range jobs {
+		if err := processJob(ctx, pool, q, cfg, workerID, job); err != nil {
+			log.Warn().
+				Err(err).
+				Str("worker_id", workerID).
+				Str("job_id", job.ID.String()).
+				Str("team_id", job.TeamID.String()).
+				Time("hour_start", job.HourStart).
+				Msg("billing hourly rollup job failed")
+		}
+	}
+}
+
+func processJob(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg HourlyRollupConfig, workerID string, job rollupJob) error {
+	_, err := q.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
+		TeamID:    job.TeamID,
+		HourStart: timestamptz(job.HourStart),
+		HourEnd:   timestamptz(job.HourEnd),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The team flag may have been disabled after the scheduler enqueued the job.
+		err = nil
+	}
+	if err != nil {
+		nextAttemptAt := time.Now().UTC().Add(backoff(job.AttemptCount))
+		if failErr := failJob(ctx, pool, job.ID, workerID, cfg.MaxAttempts, nextAttemptAt, err.Error()); failErr != nil {
+			return errors.Join(err, failErr)
+		}
+		return err
+	}
+
+	if err := completeJob(ctx, pool, job.ID, workerID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func claimSchedulerLease(ctx context.Context, pool *pgxpool.Pool, workerID string, lockedUntil time.Time) (bool, error) {
+	const query = `
+INSERT INTO billing_rollup_scheduler_lease (name, locked_by, locked_until)
+VALUES ('hourly', $1, $2)
+ON CONFLICT (name) DO UPDATE
+SET locked_by = EXCLUDED.locked_by,
+    locked_until = EXCLUDED.locked_until,
+    updated_at = now()
+WHERE billing_rollup_scheduler_lease.locked_until <= now()
+   OR billing_rollup_scheduler_lease.locked_by = EXCLUDED.locked_by
+RETURNING true`
+
+	var claimed bool
+	err := pool.QueryRow(ctx, query, workerID, lockedUntil).Scan(&claimed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return claimed, err
+}
+
+func enqueueHour(ctx context.Context, pool *pgxpool.Pool, hourStart, hourEnd time.Time) (int64, error) {
+	const query = `
+WITH candidate_teams AS (
+    SELECT DISTINCT team_id
+    FROM (
+        SELECT i.team_id
+        FROM sandbox_compute_billing_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+
+        UNION
+
+        SELECT i.team_id
+        FROM sandbox_storage_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+    ) billing_teams
+    WHERE feature_enabled('billing_hourly_rollups', billing_teams.team_id)
+)
+INSERT INTO billing_rollup_job (team_id, hour_start, hour_end, status, next_attempt_at)
+SELECT team_id, $1, $2, 'pending', now()
+FROM candidate_teams
+ON CONFLICT (team_id, hour_start) DO UPDATE
+SET hour_end = EXCLUDED.hour_end,
+    status = 'pending',
+    locked_by = NULL,
+    locked_until = NULL,
+    last_error = NULL,
+    next_attempt_at = now(),
+    attempt_count = CASE
+        WHEN billing_rollup_job.status = 'completed' THEN 0
+        ELSE billing_rollup_job.attempt_count
+    END,
+    completed_at = NULL,
+    updated_at = now()
+WHERE billing_rollup_job.status IN ('pending', 'completed')
+   OR (billing_rollup_job.status = 'running' AND billing_rollup_job.locked_until <= now())`
+
+	tag, err := pool.Exec(ctx, query, hourStart, hourEnd)
+	return tag.RowsAffected(), err
+}
+
+func claimJobs(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupConfig, workerID string, lockedUntil time.Time) ([]rollupJob, error) {
+	const query = `
+WITH candidate AS (
+    SELECT id
+    FROM billing_rollup_job
+    WHERE status IN ('pending', 'failed', 'running')
+      AND next_attempt_at <= now()
+      AND attempt_count < $1
+      AND (
+          status <> 'running'
+          OR locked_until <= now()
+      )
+    ORDER BY hour_start ASC, updated_at ASC
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE billing_rollup_job j
+SET status = 'running',
+    attempt_count = j.attempt_count + 1,
+    locked_by = $3,
+    locked_until = $4,
+    updated_at = now()
+FROM candidate
+WHERE j.id = candidate.id
+RETURNING j.id, j.team_id, j.hour_start, j.hour_end, j.attempt_count`
+
+	rows, err := pool.Query(ctx, query, cfg.MaxAttempts, cfg.BatchSize, workerID, lockedUntil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	jobs := make([]rollupJob, 0, cfg.BatchSize)
+	for rows.Next() {
+		var job rollupJob
+		if err := rows.Scan(&job.ID, &job.TeamID, &job.HourStart, &job.HourEnd, &job.AttemptCount); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func completeJob(ctx context.Context, pool *pgxpool.Pool, jobID uuid.UUID, workerID string) error {
+	const query = `
+UPDATE billing_rollup_job
+SET status = 'completed',
+    locked_by = NULL,
+    locked_until = NULL,
+    last_error = NULL,
+    completed_at = now(),
+    updated_at = now()
+WHERE id = $1
+  AND locked_by = $2`
+
+	_, err := pool.Exec(ctx, query, jobID, workerID)
+	return err
+}
+
+func failJob(ctx context.Context, pool *pgxpool.Pool, jobID uuid.UUID, workerID string, maxAttempts int, nextAttemptAt time.Time, message string) error {
+	const query = `
+UPDATE billing_rollup_job
+SET status = CASE WHEN attempt_count >= $3 THEN 'failed' ELSE 'pending' END,
+    locked_by = NULL,
+    locked_until = NULL,
+    next_attempt_at = $4,
+    last_error = left($5, 2000),
+    updated_at = now()
+WHERE id = $1
+  AND locked_by = $2`
+
+	_, err := pool.Exec(ctx, query, jobID, workerID, maxAttempts, nextAttemptAt, message)
+	return err
 }
 
 func rollupHours(now time.Time, lookbackHours int) []time.Time {
@@ -134,16 +343,54 @@ func rollupHours(now time.Time, lookbackHours int) []time.Time {
 }
 
 func normalizeConfig(cfg HourlyRollupConfig) HourlyRollupConfig {
-	if cfg.Interval <= 0 {
-		cfg.Interval = defaultHourlyRollupInterval
+	if cfg.SchedulerInterval <= 0 {
+		cfg.SchedulerInterval = defaultHourlyRollupSchedulerInterval
+	}
+	if cfg.WorkerPoll <= 0 {
+		cfg.WorkerPoll = defaultHourlyRollupWorkerPoll
 	}
 	if cfg.LookbackHours <= 0 {
 		cfg.LookbackHours = defaultHourlyRollupLookbackHours
 	}
-	if cfg.TickTimeout <= 0 {
-		cfg.TickTimeout = defaultHourlyRollupTickTimeout
+	if cfg.LeaseDuration <= 0 {
+		cfg.LeaseDuration = defaultHourlyRollupLeaseDuration
+	}
+	if cfg.LockDuration <= 0 {
+		cfg.LockDuration = defaultHourlyRollupLockDuration
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = defaultHourlyRollupBatchSize
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = defaultHourlyRollupMaxAttempts
+	}
+	if cfg.Workers < 0 {
+		cfg.Workers = defaultHourlyRollupWorkers
 	}
 	return cfg
+}
+
+func timestamptz(t time.Time) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+}
+
+func backoff(attemptCount int) time.Duration {
+	if attemptCount <= 0 {
+		return 30 * time.Second
+	}
+	delay := time.Duration(attemptCount*attemptCount) * 30 * time.Second
+	if delay > time.Hour {
+		return time.Hour
+	}
+	return delay
+}
+
+func workerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
 func durationFromEnv(key string, fallback time.Duration) time.Duration {
@@ -165,7 +412,7 @@ func intFromEnv(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(raw)
-	if err != nil || parsed <= 0 {
+	if err != nil || parsed < 0 {
 		log.Warn().Str("key", key).Str("value", raw).Msg("invalid integer env; using default")
 		return fallback
 	}

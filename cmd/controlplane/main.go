@@ -217,7 +217,7 @@ func run() error {
 	if billing.HourlyRollupDisabledFromEnv() {
 		log.Info().Msg("billing hourly rollup worker disabled (BILLING_HOURLY_ROLLUP_DISABLED set)")
 	} else {
-		billing.StartHourlyRollupWorker(ctx, queries, billing.DefaultHourlyRollupConfig())
+		billing.StartHourlyRollupService(ctx, dbPool, queries, billing.DefaultHourlyRollupConfig())
 	}
 
 	// Quota watcher: alerts (Slack) when a team crosses 80% of a resource limit.

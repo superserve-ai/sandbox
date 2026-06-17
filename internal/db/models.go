@@ -210,6 +210,29 @@ type BillingPeriodAnomaly struct {
 	ResolvedBy  pgtype.UUID        `json:"resolved_by"`
 }
 
+type BillingRollupJob struct {
+	ID            uuid.UUID          `json:"id"`
+	TeamID        uuid.UUID          `json:"team_id"`
+	HourStart     time.Time          `json:"hour_start"`
+	HourEnd       time.Time          `json:"hour_end"`
+	Status        string             `json:"status"`
+	AttemptCount  int32              `json:"attempt_count"`
+	NextAttemptAt time.Time          `json:"next_attempt_at"`
+	LockedBy      *string            `json:"locked_by"`
+	LockedUntil   pgtype.Timestamptz `json:"locked_until"`
+	LastError     *string            `json:"last_error"`
+	EnqueuedAt    time.Time          `json:"enqueued_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+}
+
+type BillingRollupSchedulerLease struct {
+	Name        string    `json:"name"`
+	LockedBy    string    `json:"locked_by"`
+	LockedUntil time.Time `json:"locked_until"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type DeviceCode struct {
 	ID         uuid.UUID   `json:"id"`
 	DeviceCode string      `json:"device_code"`
