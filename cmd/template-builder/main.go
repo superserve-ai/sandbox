@@ -192,11 +192,17 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 
 	emitUser("system", "Pulling image %s", cfg.spec.From)
-	// Default to the daemon's CA path so templates trust the MITM CA even when
-	// SECRETSPROXY_CA_CERT is not set explicitly in the build environment.
+	// Default to the daemon's CA path, but only when it exists, so a host that
+	// doesn't run secretsproxy still builds templates. An explicit but missing
+	// SECRETSPROXY_CA_CERT still errors downstream, surfacing the misconfig.
 	proxyCA := os.Getenv("SECRETSPROXY_CA_CERT")
 	if proxyCA == "" {
-		proxyCA = "/var/lib/secretsproxy/ca.crt"
+		const defaultProxyCA = "/var/lib/secretsproxy/ca.crt"
+		if _, err := os.Stat(defaultProxyCA); err == nil {
+			proxyCA = defaultProxyCA
+		} else {
+			emitUser("system", "secretsproxy CA not found at %s; building without proxy CA trust", defaultProxyCA)
+		}
 	}
 	b, err := builder.NewBuilder(builder.Config{
 		BoxdBinaryPath:           cfg.boxdBin,
