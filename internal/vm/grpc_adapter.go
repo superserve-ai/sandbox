@@ -16,12 +16,22 @@ import (
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
 type GRPCAdapter struct {
 	vmdpb.UnimplementedVMDaemonServer
-	mgr *Manager
+	mgr             *Manager
+	secrets         *SecretsBrokerClient
+	sandboxProxyURL string // SECRETSPROXY_SANDBOX_ADDR — empty disables HTTPS_PROXY injection
 }
 
 // NewGRPCAdapter creates a new adapter that bridges the proto interface to the Manager.
 func NewGRPCAdapter(mgr *Manager) *GRPCAdapter {
-	return &GRPCAdapter{mgr: mgr}
+	return &GRPCAdapter{mgr: mgr, secrets: NewSecretsBrokerClient("")}
+}
+
+// WithSecretsBroker enables the secretsproxy integration; empty socketPath disables it.
+// sandboxProxyURL is the host:port the sandbox writes into HTTPS_PROXY.
+func (a *GRPCAdapter) WithSecretsBroker(socketPath, sandboxProxyURL string) *GRPCAdapter {
+	a.secrets = NewSecretsBrokerClient(socketPath)
+	a.sandboxProxyURL = sandboxProxyURL
+	return a
 }
 
 func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest) (*vmdpb.DestroyVMResponse, error) {
@@ -41,7 +51,7 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 		return nil, err
 	}
 	return &vmdpb.PauseVMResponse{
-		VmId:        req.GetVmId(),
+		VmId:         req.GetVmId(),
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 	}, nil
@@ -53,6 +63,8 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, err
 	}
 
+	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
+	// per-binding proxy tokens are in the snapshot and don't need re-injection.
 	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); err != nil {
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
@@ -109,14 +121,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, err
 	}
 
-	// Apply caller env vars and the per-sandbox hostname.
-	if initErr := postBoxdInit(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); initErr != nil {
-		// Tear the VM down — a sandbox whose env vars weren't applied
-		// would silently serve stale/missing secrets to the user.
-		_ = a.mgr.DestroyVM(ctx, inst.ID, true)
-		return nil, status.Errorf(codes.Internal, "post-restore init failed: %v", initErr)
-	}
-
+	// Env vars are pushed in a separate InjectSandboxEnv call so the control
+	// plane can mint a JWT against the now-known source IP before injection.
 	return &vmdpb.RestoreSnapshotResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
@@ -127,6 +133,32 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			MemoryMib: inst.Config.MemoryMiB,
 		},
 	}, nil
+}
+
+// InjectSandboxEnv pushes env vars and the sandbox's hostname into the running
+// boxd. When secrets_jwt is non-empty vmd builds the HTTPS_PROXY URL from its
+// configured daemon address and adds it to env_vars before sending.
+func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSandboxEnvRequest) (*vmdpb.InjectSandboxEnvResponse, error) {
+	vmID := req.GetVmId()
+	if vmID == "" {
+		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+	inst, err := a.mgr.GetVMInfo(ctx, vmID)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "vm %s: %v", vmID, err)
+	}
+	envVars := req.GetEnvVars()
+	jwt := req.GetSecretsJwt()
+	if err := RequireProxyForJWT(jwt, a.sandboxProxyURL); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	if jwt != "" {
+		envVars = InjectHTTPSProxyEnvWithJWT(envVars, a.sandboxProxyURL, jwt)
+	}
+	if err := postBoxdInit(ctx, inst.IP, envVars, vmHostname(vmID)); err != nil {
+		return nil, status.Errorf(codes.Internal, "post-init failed: %v", err)
+	}
+	return &vmdpb.InjectSandboxEnvResponse{VmId: vmID}, nil
 }
 
 // DeleteSnapshot unlinks the vmstate + memory files for a previous snapshot.
@@ -297,11 +329,47 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 				AllowedCIDRs:   egress.GetAllowedCidrs(),
 				DeniedCIDRs:    egress.GetDeniedCidrs(),
 				AllowedDomains: egress.GetAllowedDomains(),
+				SandboxID:      vmID,
 			})
 		}
 	}
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
+}
+
+// InvalidateSecret forwards the invalidate call to the local secretsproxy daemon.
+// Returns OK when the daemon is disabled on this host.
+func (a *GRPCAdapter) InvalidateSecret(ctx context.Context, req *vmdpb.InvalidateSecretRequest) (*vmdpb.InvalidateSecretResponse, error) {
+	if req.GetSecretId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "secret_id is required")
+	}
+	if err := a.secrets.InvalidateSecret(ctx, req.GetSecretId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "secretsproxy invalidate: %v", err)
+	}
+	return &vmdpb.InvalidateSecretResponse{}, nil
+}
+
+// RevokeSandbox forwards the revoke to the local secretsproxy daemon.
+func (a *GRPCAdapter) RevokeSandbox(ctx context.Context, req *vmdpb.RevokeSandboxRequest) (*vmdpb.RevokeSandboxResponse, error) {
+	if req.GetSandboxId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
+	}
+	if err := a.secrets.RevokeSandbox(ctx, req.GetSandboxId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "secretsproxy revoke: %v", err)
+	}
+	return &vmdpb.RevokeSandboxResponse{}, nil
+}
+
+// InvalidateSandboxRules forwards the egress-rules invalidation to the local
+// secretsproxy daemon. Returns OK when the daemon is disabled on this host.
+func (a *GRPCAdapter) InvalidateSandboxRules(ctx context.Context, req *vmdpb.InvalidateSandboxRulesRequest) (*vmdpb.InvalidateSandboxRulesResponse, error) {
+	if req.GetSandboxId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
+	}
+	if err := a.secrets.InvalidateSandboxRules(ctx, req.GetSandboxId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "secretsproxy invalidate rules: %v", err)
+	}
+	return &vmdpb.InvalidateSandboxRulesResponse{}, nil
 }
 
 func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplateRequest) (*vmdpb.BuildTemplateResponse, error) {

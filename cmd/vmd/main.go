@@ -53,6 +53,18 @@ type Config struct {
 	// the heartbeat goroutine to POST liveness. Optional — if unset,
 	// heartbeat is disabled.
 	ControlPlaneURL string
+
+	// SecretsProxySocket is the local secretsproxy daemon's control-RPC unix-socket path.
+	// When empty, broker registration is skipped.
+	SecretsProxySocket string
+
+	// SecretsProxySandboxAddr is the host:port the sandbox writes into HTTPS_PROXY
+	// to reach the local secretsproxy daemon. When empty, no proxy env var is injected.
+	SecretsProxySandboxAddr string
+
+	// Parsed form of SecretsProxySandboxAddr; wires the host firewall REDIRECT.
+	SecretsProxySandboxDst  string
+	SecretsProxySandboxPort uint16
 }
 
 func loadConfig() (Config, error) {
@@ -62,19 +74,21 @@ func loadConfig() (Config, error) {
 	}
 
 	cfg := Config{
-		FirecrackerBin: envOrDefault("FIRECRACKER_BIN", "/usr/local/bin/firecracker"),
-		JailerBin:      envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
-		KernelPath:     requireEnv("KERNEL_PATH"),
-		BaseRootfsPath: requireEnv("BASE_ROOTFS_PATH"),
-		SnapshotDir:    envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
-		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
-		GRPCPort:       port,
-		HostInterface:      envOrDefault("HOST_INTERFACE", "eth0"),
-		TemplateBuilderBin: envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
-		BoxdBinaryPath:     envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
-		HostID:          envOrDefault("HOST_ID", "default"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
+		FirecrackerBin:          envOrDefault("FIRECRACKER_BIN", "/usr/local/bin/firecracker"),
+		JailerBin:               envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
+		KernelPath:              requireEnv("KERNEL_PATH"),
+		BaseRootfsPath:          requireEnv("BASE_ROOTFS_PATH"),
+		SnapshotDir:             envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
+		RunDir:                  envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
+		GRPCPort:                port,
+		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
+		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
+		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
+		HostID:                  envOrDefault("HOST_ID", "default"),
+		DatabaseURL:             os.Getenv("DATABASE_URL"),
+		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
+		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
+		SecretsProxySandboxAddr: os.Getenv("SECRETSPROXY_SANDBOX_ADDR"),
 	}
 
 	if cfg.KernelPath == "" {
@@ -84,7 +98,33 @@ func loadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("BASE_ROOTFS_PATH environment variable is required")
 	}
 
+	if cfg.SecretsProxySandboxAddr != "" {
+		host, port, err := parseSecretsProxyAddr(cfg.SecretsProxySandboxAddr)
+		if err != nil {
+			return Config{}, fmt.Errorf("SECRETSPROXY_SANDBOX_ADDR %q: %w", cfg.SecretsProxySandboxAddr, err)
+		}
+		cfg.SecretsProxySandboxDst = host
+		cfg.SecretsProxySandboxPort = port
+	}
+
 	return cfg, nil
+}
+
+// parseSecretsProxyAddr parses host:port; host must be an IPv4 literal because
+// the nat REDIRECT rule it feeds can't resolve DNS.
+func parseSecretsProxyAddr(addr string) (string, uint16, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, err
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		return "", 0, fmt.Errorf("host %q must be an IPv4 literal", host)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || port == 0 {
+		return "", 0, fmt.Errorf("port %q must be 1-65535", portStr)
+	}
+	return host, uint16(port), nil
 }
 
 func envOrDefault(key, fallback string) string {
@@ -292,6 +332,8 @@ func main() {
 	}
 
 	// ---- Network manager + host firewall ----
+	netMgrOpts = append(netMgrOpts,
+		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
 	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
@@ -403,6 +445,15 @@ func main() {
 			return nil
 		})
 		log.Info().Msg("reconciler DB connection ready")
+
+		// Per-connection egress logging. Drops on a full buffer rather than
+		// back-pressuring the proxy's data path.
+		flowSink := network.NewSQLFlowSink(reconcilerDB, network.SQLFlowSinkOptions{})
+		egressProxy.SetFlowSink(flowSink)
+		lc.addCloser("net_flow sink", func(closeCtx context.Context) error {
+			return flowSink.Shutdown(closeCtx)
+		})
+		log.Info().Msg("egress flow logging enabled")
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
 	}
@@ -459,7 +510,15 @@ func main() {
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(64 << 20), // 64 MiB
 	)
-	vmdpb.RegisterVMDaemonServer(grpcServer, vm.NewGRPCAdapter(mgr))
+	adapter := vm.NewGRPCAdapter(mgr).
+		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
+	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
+	if cfg.SecretsProxySocket != "" {
+		log.Info().
+			Str("socket", cfg.SecretsProxySocket).
+			Str("sandbox_addr", cfg.SecretsProxySandboxAddr).
+			Msg("secretsproxy daemon integration enabled")
+	}
 	lc.start("grpc server", func() error {
 		log.Info().Int("port", cfg.GRPCPort).Msg("gRPC server listening")
 		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {

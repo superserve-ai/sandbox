@@ -88,6 +88,10 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 	}
 	logger.Info().Int64("boxd_bytes", boxdBytes).Msg("boxd injected")
 
+	if err := injectProxyCA(scratch, b.cfg.ProxyCACertPath, &logger); err != nil {
+		return BuildRootfsResult{}, fmt.Errorf("inject proxy CA: %w", err)
+	}
+
 	if err := makeExt4(ctx, scratch, destPath, sizeMiB); err != nil {
 		return BuildRootfsResult{}, fmt.Errorf("make ext4: %w", err)
 	}

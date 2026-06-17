@@ -195,6 +195,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	b, err := builder.NewBuilder(builder.Config{
 		BoxdBinaryPath:           cfg.boxdBin,
 		MaxUncompressedSizeBytes: int64(cfg.diskMiB) * 1024 * 1024,
+		ProxyCACertPath:          os.Getenv("SECRETSPROXY_CA_CERT"),
 	})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)

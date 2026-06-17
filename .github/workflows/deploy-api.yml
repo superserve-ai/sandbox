@@ -33,6 +33,7 @@ on:
       - 'internal/db/**'
       - 'internal/hostreg/**'
       - 'internal/scheduler/**'
+      - 'internal/secrets/**'
       - 'internal/supervisor/**'
       - 'internal/vmdclient/**'
       - 'proto/**'
