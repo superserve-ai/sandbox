@@ -616,10 +616,12 @@ paths:
         - $ref: "#/components/parameters/AuditLimit"
         - name: before
           in: query
-          description: Return rows strictly older than this RFC3339 timestamp. Also the pagination cursor.
+          description: >-
+            Pagination cursor or time filter. Pass the previous response's
+            opaque `next_cursor` to page through results, or an RFC3339
+            timestamp to return rows strictly older than that time.
           schema:
             type: string
-            format: date-time
         - name: since
           in: query
           description: Return rows at or newer than this RFC3339 timestamp.
@@ -1974,9 +1976,10 @@ components:
             $ref: "#/components/schemas/NetworkEvent"
         next_cursor:
           type: string
-          format: date-time
           nullable: true
-          description: Pass as `before` to fetch the next page. Null when has_more is false.
+          description: >-
+            Opaque pagination cursor. Pass it verbatim as `before` to fetch the
+            next page; do not parse it. Null when has_more is false.
         has_more:
           type: boolean
           description: Whether more rows exist beyond this page.
