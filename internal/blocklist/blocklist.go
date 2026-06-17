@@ -190,6 +190,10 @@ func (b *Blocklist) CIDRs() []string {
 	return out
 }
 
+// Refresh fetches all feeds once, synchronously, so a caller can enforce
+// feed-sourced entries before it starts serving.
+func (b *Blocklist) Refresh(ctx context.Context) { b.refresh(ctx) }
+
 // Start fetches all feeds immediately, then refreshes on the configured
 // interval. Blocks until ctx is cancelled.
 func (b *Blocklist) Start(ctx context.Context) error {
