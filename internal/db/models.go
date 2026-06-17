@@ -266,6 +266,26 @@ type NetFlow struct {
 	DurationMs *int32     `json:"duration_ms"`
 }
 
+type PricingPlan struct {
+	Key       string    `json:"key"`
+	Name      string    `json:"name"`
+	Currency  string    `json:"currency"`
+	Active    bool      `json:"active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type PricingRate struct {
+	ID            uuid.UUID          `json:"id"`
+	PlanKey       string             `json:"plan_key"`
+	Resource      string             `json:"resource"`
+	Unit          string             `json:"unit"`
+	PriceUsd      pgtype.Numeric     `json:"price_usd"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
+	CreatedAt     time.Time          `json:"created_at"`
+}
+
 type Profile struct {
 	ID                uuid.UUID `json:"id"`
 	Email             string    `json:"email"`
@@ -462,6 +482,31 @@ type TeamBillingUsageHourly struct {
 	UpdatedAt         time.Time      `json:"updated_at"`
 }
 
+type TeamCreditGrant struct {
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	AmountUsd    pgtype.Numeric     `json:"amount_usd"`
+	RemainingUsd pgtype.Numeric     `json:"remaining_usd"`
+	Currency     string             `json:"currency"`
+	Reason       *string            `json:"reason"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	CreatedBy    pgtype.UUID        `json:"created_by"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+}
+
+type TeamCreditLedger struct {
+	ID                 uuid.UUID          `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	GrantID            pgtype.UUID        `json:"grant_id"`
+	BillingPeriodStart pgtype.Timestamptz `json:"billing_period_start"`
+	BillingPeriodEnd   pgtype.Timestamptz `json:"billing_period_end"`
+	AmountUsd          pgtype.Numeric     `json:"amount_usd"`
+	Reason             string             `json:"reason"`
+	CreatedBy          pgtype.UUID        `json:"created_by"`
+	CreatedAt          time.Time          `json:"created_at"`
+}
+
 type TeamFeatureFlag struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	Key       string    `json:"key"`
@@ -475,6 +520,15 @@ type TeamMember struct {
 	ProfileID uuid.UUID `json:"profile_id"`
 	Role      string    `json:"role"`
 	JoinedAt  time.Time `json:"joined_at"`
+}
+
+type TeamPricingPlan struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	PlanKey       string             `json:"plan_key"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
+	AssignedBy    pgtype.UUID        `json:"assigned_by"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 type Template struct {
