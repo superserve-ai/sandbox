@@ -1543,6 +1543,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
 		})
+		// Bindings are written before RestoreSnapshot, so a restore failure
+		// leaves them; clear them or this dead sandbox still shows as bound.
+		_ = h.DB.DeleteSandboxSecrets(failCtx, sandbox.ID)
 		// FailedPrecondition from vmd = snapshot/mem file missing on host.
 		// Surfaces on the from_template restore path; map to 503 so the
 		// user understands this is ops-side, not a bad request.

@@ -238,9 +238,8 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			return
 		}
 
-		// Re-check the operator blocklist per request: a feed refresh may have
-		// blocklisted this host after the tunnel's CONNECT was accepted, which a
-		// keep-alive tunnel would otherwise keep reaching until it idles out.
+		// Re-check the operator blocklist on every request, not only at CONNECT,
+		// so blocklist updates apply within an already-open tunnel.
 		if p.blocklist != nil {
 			if blocked, dim := p.blocklist.Blocked(host, net.ParseIP(host)); blocked {
 				p.logger.Warn("blocked by egress blocklist", "sandbox", scope.SandboxID, "host", host, "match", dim)
@@ -289,8 +288,8 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 				// Dial the IP the policy was evaluated against, not a re-resolved one.
 				if upstreamIP != nil {
 					outReq = outReq.WithContext(WithPinnedDialIP(outReq.Context(), upstreamIP))
-					// Use the no-reuse transport so a pooled connection can't serve
-					// this request over a different IP than policy approved.
+					// Use the no-reuse transport so a CIDR-pinned request dials the
+					// policy-evaluated IP through the guard.
 					transport = p.upstreamPinned
 				}
 			}
