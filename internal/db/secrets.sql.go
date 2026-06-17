@@ -102,6 +102,16 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) (Sec
 	return i, err
 }
 
+const deleteSandboxSecrets = `-- name: DeleteSandboxSecrets :exec
+DELETE FROM sandbox_secret WHERE sandbox_id = $1
+`
+
+// Drop every secret binding for a sandbox (e.g. cleaning up a failed create).
+func (q *Queries) DeleteSandboxSecrets(ctx context.Context, sandboxID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteSandboxSecrets, sandboxID)
+	return err
+}
+
 const getSecretByID = `-- name: GetSecretByID :one
 SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
