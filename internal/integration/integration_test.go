@@ -1146,11 +1146,39 @@ func TestIntegration_BillingRollupWorkersProcessDistinctJobs(t *testing.T) {
 
 func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
 	ctx := context.Background()
-	teamID, _ := seedTeamAndKey(t)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
 	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
 	hourEnd := hourStart.Add(time.Hour)
 	staleLockedUntil := time.Now().UTC().Add(-time.Minute)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-rollup-reclaim"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
 	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "running", "stale-worker", staleLockedUntil, 5)
+	if _, err := billing.EnqueueHourForTest(ctx, testPool, hourStart, hourEnd); err != nil {
+		t.Fatalf("enqueue hour with stale running job: %v", err)
+	}
 
 	cfg := billing.HourlyRollupConfig{
 		BatchSize:    1,

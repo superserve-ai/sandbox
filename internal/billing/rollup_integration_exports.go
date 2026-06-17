@@ -40,6 +40,10 @@ func ClaimJobsForTest(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupC
 	return out, nil
 }
 
+func EnqueueHourForTest(ctx context.Context, pool *pgxpool.Pool, hourStart time.Time, hourEnd time.Time) (int64, error) {
+	return enqueueHour(ctx, pool, hourStart, hourEnd)
+}
+
 func ProcessJobsForTest(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg HourlyRollupConfig, workerID string) {
 	cfg = normalizeConfig(cfg)
 	processJobs(ctx, pool, q, cfg, workerID)

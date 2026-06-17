@@ -249,8 +249,7 @@ SET hour_end = EXCLUDED.hour_end,
     END,
     completed_at = NULL,
     updated_at = now()
-WHERE billing_rollup_job.status IN ('pending', 'completed')
-   OR (billing_rollup_job.status = 'running' AND billing_rollup_job.locked_until <= now())`
+WHERE billing_rollup_job.status IN ('pending', 'completed')`
 
 	tag, err := pool.Exec(ctx, query, hourStart, hourEnd)
 	return tag.RowsAffected(), err
