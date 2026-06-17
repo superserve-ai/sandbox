@@ -44,12 +44,8 @@ info:
     name: Proprietary
 
 servers:
-  - url: https://api-staging.superserve.ai
-    description: Staging
   - url: https://api.superserve.ai
     description: Production
-  - url: http://localhost:8080
-    description: Local development
 
 paths:
   /health:
