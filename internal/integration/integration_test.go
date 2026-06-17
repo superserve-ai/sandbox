@@ -298,6 +298,21 @@ func do(r *gin.Engine, method, path, apiKey, body string) *httptest.ResponseReco
 	return w
 }
 
+func doInternal(r *gin.Engine, method, path, token, body string) *httptest.ResponseRecorder {
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, bodyReader)
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
 func doBinary(r *gin.Engine, method, path, apiKey string, body []byte) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -1213,6 +1228,68 @@ func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
 	}
 	if attemptCount != 5 {
 		t.Fatalf("attempt_count = %d, want 5", attemptCount)
+	}
+}
+
+func TestIntegration_BackfillBillingRollups(t *testing.T) {
+	ctx := context.Background()
+	token := "internal-" + uuid.New().String()
+	t.Setenv("INTERNAL_API_TOKEN", token)
+
+	teamID, apiKey := seedTeamAndKey(t)
+	enableBillingHourlyRollups(t, ctx, teamID)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"backfill-rollup"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-3 * time.Hour)
+	hourEnd := hourStart.Add(2 * time.Hour)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused'
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(15*time.Minute), hourStart.Add(75*time.Minute)); err != nil {
+		t.Fatalf("set deterministic compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted'
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(15*time.Minute), hourStart.Add(75*time.Minute)); err != nil {
+		t.Fatalf("set deterministic storage interval: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"start":%q,"end":%q}`, hourStart.Format(time.RFC3339), hourEnd.Format(time.RFC3339))
+	w := doInternal(r, "POST", "/internal/billing/rollups/backfill", token, body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	resp := mustJSON(t, w)
+	if resp["hours"] != float64(2) {
+		t.Fatalf("hours = %v, want 2", resp["hours"])
+	}
+	if resp["jobs_enqueued_or_refreshed"] != float64(2) {
+		t.Fatalf("jobs_enqueued_or_refreshed = %v, want 2", resp["jobs_enqueued_or_refreshed"])
+	}
+
+	var jobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+		  AND hour_start >= $2
+		  AND hour_start < $3
+		  AND status = 'pending'
+	`, teamID, hourStart, hourEnd).Scan(&jobs); err != nil {
+		t.Fatalf("count rollup jobs: %v", err)
+	}
+	if jobs != 2 {
+		t.Fatalf("rollup jobs = %d, want 2", jobs)
 	}
 }
 

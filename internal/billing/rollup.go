@@ -47,6 +47,13 @@ type rollupJob struct {
 	AttemptCount int
 }
 
+type HourlyRollupBackfillResult struct {
+	Start                   time.Time
+	End                     time.Time
+	Hours                   int
+	JobsEnqueuedOrRefreshed int64
+}
+
 func DefaultHourlyRollupConfig() HourlyRollupConfig {
 	return HourlyRollupConfig{
 		SchedulerInterval: durationFromEnv("BILLING_HOURLY_ROLLUP_INTERVAL", defaultHourlyRollupSchedulerInterval),
@@ -58,6 +65,34 @@ func DefaultHourlyRollupConfig() HourlyRollupConfig {
 		MaxAttempts:       intFromEnv("BILLING_HOURLY_ROLLUP_MAX_ATTEMPTS", defaultHourlyRollupMaxAttempts),
 		Workers:           intFromEnv("BILLING_HOURLY_ROLLUP_WORKERS", defaultHourlyRollupWorkers),
 	}
+}
+
+func EnqueueHourlyRollupBackfill(ctx context.Context, pool *pgxpool.Pool, start, end time.Time) (HourlyRollupBackfillResult, error) {
+	start = start.UTC()
+	end = end.UTC()
+	if start.IsZero() || end.IsZero() {
+		return HourlyRollupBackfillResult{}, fmt.Errorf("start and end are required")
+	}
+	if !start.Equal(start.Truncate(time.Hour)) || !end.Equal(end.Truncate(time.Hour)) {
+		return HourlyRollupBackfillResult{}, fmt.Errorf("start and end must be aligned to hour boundaries")
+	}
+	if !end.After(start) {
+		return HourlyRollupBackfillResult{}, fmt.Errorf("end must be after start")
+	}
+
+	result := HourlyRollupBackfillResult{
+		Start: start,
+		End:   end,
+		Hours: int(end.Sub(start) / time.Hour),
+	}
+	for hourStart := start; hourStart.Before(end); hourStart = hourStart.Add(time.Hour) {
+		enqueued, err := enqueueHour(ctx, pool, hourStart, hourStart.Add(time.Hour))
+		if err != nil {
+			return HourlyRollupBackfillResult{}, err
+		}
+		result.JobsEnqueuedOrRefreshed += enqueued
+	}
+	return result, nil
 }
 
 func HourlyRollupDisabledFromEnv() bool {
