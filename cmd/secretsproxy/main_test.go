@@ -60,9 +60,15 @@ func TestDialGuardBlocklistCIDR(t *testing.T) {
 }
 
 func TestLoadEgressBlocklist(t *testing.T) {
-	// Unset path: enforcement disabled, no matcher, no ports.
-	if bl, ports := loadEgressBlocklist(""); bl != nil || ports != nil {
-		t.Errorf("empty path: bl=%v ports=%v", bl, ports)
+	// Unset path: enforcement disabled, no matcher, no ports, no error.
+	if bl, ports, err := loadEgressBlocklist(""); bl != nil || ports != nil || err != nil {
+		t.Errorf("empty path: bl=%v ports=%v err=%v", bl, ports, err)
+	}
+
+	// A configured-but-unreadable path must fail closed (error), not silently
+	// disable enforcement.
+	if _, _, err := loadEgressBlocklist(filepath.Join(t.TempDir(), "does-not-exist.yaml")); err == nil {
+		t.Error("a configured but missing blocklist path must abort startup, not return nil")
 	}
 
 	dir := t.TempDir()
@@ -71,7 +77,10 @@ func TestLoadEgressBlocklist(t *testing.T) {
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bl, ports := loadEgressBlocklist(path)
+	bl, ports, err := loadEgressBlocklist(path)
+	if err != nil {
+		t.Fatalf("valid config: %v", err)
+	}
 	if bl == nil {
 		t.Fatal("expected a live blocklist matcher")
 	}

@@ -81,8 +81,13 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse blocklist config %s: %w", path, err)
 	}
 	if cfg.RefreshInterval != "" {
-		if _, err := time.ParseDuration(cfg.RefreshInterval); err != nil {
+		d, err := time.ParseDuration(cfg.RefreshInterval)
+		if err != nil {
 			return nil, fmt.Errorf("invalid refresh_interval %q: %w", cfg.RefreshInterval, err)
+		}
+		// time.NewTicker panics on a non-positive duration; reject it here.
+		if d <= 0 {
+			return nil, fmt.Errorf("refresh_interval must be positive, got %q", cfg.RefreshInterval)
 		}
 	}
 	for _, c := range cfg.CustomCIDRs {
@@ -110,7 +115,7 @@ func (c *Config) refreshInterval() time.Duration {
 		return defaultBlocklistRefresh
 	}
 	d, err := time.ParseDuration(c.RefreshInterval)
-	if err != nil {
+	if err != nil || d <= 0 {
 		return defaultBlocklistRefresh
 	}
 	return d
@@ -222,7 +227,10 @@ func (b *Blocklist) Blocked(hostname string, dstIP net.IP) (bool, string) {
 		return true, "domain"
 	}
 	if dstIP != nil {
-		if addr, ok := netip.AddrFromSlice(dstIP.To4()); ok {
+		// AddrFromSlice + Unmap handles both IPv4 and IPv6 (and v4-mapped-v6);
+		// To4() alone would drop every IPv6 destination.
+		if addr, ok := netip.AddrFromSlice(dstIP); ok {
+			addr = addr.Unmap()
 			for _, p := range snap.nets {
 				if p.Contains(addr) {
 					return true, "ip"
