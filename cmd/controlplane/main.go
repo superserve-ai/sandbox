@@ -25,6 +25,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
@@ -210,6 +211,14 @@ func run() error {
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
 	// excludes unhealthy hosts from placement.
 	go api.StartHostDetector(ctx, queries)
+
+	// Billing dashboard rollups are provisional and recomputable from raw
+	// interval rows. Team-level feature flags decide which tenants roll up.
+	if billing.HourlyRollupDisabledFromEnv() {
+		log.Info().Msg("billing hourly rollup worker disabled (BILLING_HOURLY_ROLLUP_DISABLED set)")
+	} else {
+		billing.StartHourlyRollupService(ctx, dbPool, queries, billing.DefaultHourlyRollupConfig())
+	}
 
 	// Quota watcher: alerts (Slack) when a team crosses 80% of a resource limit.
 	// Only runs when a webhook is configured.

@@ -210,6 +210,35 @@ type BillingPeriodAnomaly struct {
 	ResolvedBy  pgtype.UUID        `json:"resolved_by"`
 }
 
+type BillingRollupBackfillState struct {
+	Name          string    `json:"name"`
+	NextHourStart time.Time `json:"next_hour_start"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type BillingRollupJob struct {
+	ID            uuid.UUID          `json:"id"`
+	TeamID        uuid.UUID          `json:"team_id"`
+	HourStart     time.Time          `json:"hour_start"`
+	HourEnd       time.Time          `json:"hour_end"`
+	Status        string             `json:"status"`
+	AttemptCount  int32              `json:"attempt_count"`
+	NextAttemptAt time.Time          `json:"next_attempt_at"`
+	LockedBy      *string            `json:"locked_by"`
+	LockedUntil   pgtype.Timestamptz `json:"locked_until"`
+	LastError     *string            `json:"last_error"`
+	EnqueuedAt    time.Time          `json:"enqueued_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+}
+
+type BillingRollupSchedulerLease struct {
+	Name        string    `json:"name"`
+	LockedBy    string    `json:"locked_by"`
+	LockedUntil time.Time `json:"locked_until"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type DeviceCode struct {
 	ID         uuid.UUID   `json:"id"`
 	DeviceCode string      `json:"device_code"`
@@ -264,6 +293,26 @@ type NetFlow struct {
 	BytesSent  *int64     `json:"bytes_sent"`
 	BytesRecv  *int64     `json:"bytes_recv"`
 	DurationMs *int32     `json:"duration_ms"`
+}
+
+type PricingPlan struct {
+	Key       string    `json:"key"`
+	Name      string    `json:"name"`
+	Currency  string    `json:"currency"`
+	Active    bool      `json:"active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type PricingRate struct {
+	ID            uuid.UUID          `json:"id"`
+	PlanKey       string             `json:"plan_key"`
+	Resource      string             `json:"resource"`
+	Unit          string             `json:"unit"`
+	PriceUsd      pgtype.Numeric     `json:"price_usd"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 type Profile struct {
@@ -462,6 +511,31 @@ type TeamBillingUsageHourly struct {
 	UpdatedAt         time.Time      `json:"updated_at"`
 }
 
+type TeamCreditGrant struct {
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	AmountUsd    pgtype.Numeric     `json:"amount_usd"`
+	RemainingUsd pgtype.Numeric     `json:"remaining_usd"`
+	Currency     string             `json:"currency"`
+	Reason       *string            `json:"reason"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	CreatedBy    pgtype.UUID        `json:"created_by"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+}
+
+type TeamCreditLedger struct {
+	ID                 uuid.UUID          `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	GrantID            pgtype.UUID        `json:"grant_id"`
+	BillingPeriodStart pgtype.Timestamptz `json:"billing_period_start"`
+	BillingPeriodEnd   pgtype.Timestamptz `json:"billing_period_end"`
+	AmountUsd          pgtype.Numeric     `json:"amount_usd"`
+	Reason             string             `json:"reason"`
+	CreatedBy          pgtype.UUID        `json:"created_by"`
+	CreatedAt          time.Time          `json:"created_at"`
+}
+
 type TeamFeatureFlag struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	Key       string    `json:"key"`
@@ -475,6 +549,15 @@ type TeamMember struct {
 	ProfileID uuid.UUID `json:"profile_id"`
 	Role      string    `json:"role"`
 	JoinedAt  time.Time `json:"joined_at"`
+}
+
+type TeamPricingPlan struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	PlanKey       string             `json:"plan_key"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
+	AssignedBy    pgtype.UUID        `json:"assigned_by"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 type Template struct {
