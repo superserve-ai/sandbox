@@ -65,6 +65,11 @@ INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
 SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
 FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i);
 
+-- name: DeleteSandboxSecretBinding :one
+-- Remove one binding by env_key, returning its proxy token.
+DELETE FROM sandbox_secret WHERE sandbox_id = $1 AND env_key = $2
+RETURNING proxy_token;
+
 -- name: DeleteSandboxSecrets :exec
 -- Drop every secret binding for a sandbox (e.g. cleaning up a failed create).
 DELETE FROM sandbox_secret WHERE sandbox_id = $1;
