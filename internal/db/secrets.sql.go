@@ -29,6 +29,25 @@ func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretPara
 	return err
 }
 
+const addSandboxSecrets = `-- name: AddSandboxSecrets :exec
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
+SELECT $1::uuid, ($2::uuid[])[i], ($3::text[])[i]
+FROM generate_subscripts($2::uuid[], 1) AS g(i)
+`
+
+type AddSandboxSecretsParams struct {
+	SandboxID uuid.UUID   `json:"sandbox_id"`
+	SecretIds []uuid.UUID `json:"secret_ids"`
+	EnvKeys   []string    `json:"env_keys"`
+}
+
+// Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
+// the secret_ids and env_keys arrays are paired by position.
+func (q *Queries) AddSandboxSecrets(ctx context.Context, arg AddSandboxSecretsParams) error {
+	_, err := q.db.Exec(ctx, addSandboxSecrets, arg.SandboxID, arg.SecretIds, arg.EnvKeys)
+	return err
+}
+
 const createSecret = `-- name: CreateSecret :one
 INSERT INTO secret (
     team_id, name, auth_type, auth_config, provider_shortcut, hosts,
@@ -83,6 +102,16 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) (Sec
 	return i, err
 }
 
+const deleteSandboxSecrets = `-- name: DeleteSandboxSecrets :exec
+DELETE FROM sandbox_secret WHERE sandbox_id = $1
+`
+
+// Drop every secret binding for a sandbox (e.g. cleaning up a failed create).
+func (q *Queries) DeleteSandboxSecrets(ctx context.Context, sandboxID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteSandboxSecrets, sandboxID)
+	return err
+}
+
 const getSecretByID = `-- name: GetSecretByID :one
 SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -125,7 +154,8 @@ type GetSecretByIDForDecryptParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Daemon decrypt path. Team-scoped; excludes soft-deleted.
+// Daemon decrypt path. Team-scoped; excludes soft-deleted. Separate from
+// GetSecretByID so it can diverge later (audit, caching) without touching API reads.
 func (q *Queries) GetSecretByIDForDecrypt(ctx context.Context, arg GetSecretByIDForDecryptParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, getSecretByIDForDecrypt, arg.ID, arg.TeamID)
 	var i Secret
@@ -222,7 +252,7 @@ FROM proxy_audit pa
 LEFT JOIN sandbox sb ON sb.id = pa.sandbox_id
 WHERE pa.secret_id = $1
   AND pa.team_id = $2
-  AND ($3::bigint = 0 OR pa.id < $3)
+  AND ($3::bigint IS NULL OR pa.id < $3::bigint)
   AND pa.status >= $4::int
   AND pa.status <= $5::int
 ORDER BY pa.id DESC
@@ -230,12 +260,12 @@ LIMIT $6
 `
 
 type ListAuditForSecretParams struct {
-	SecretID pgtype.UUID `json:"secret_id"`
-	TeamID   uuid.UUID   `json:"team_id"`
-	Column3  int64       `json:"column_3"`
-	Column4  int32       `json:"column_4"`
-	Column5  int32       `json:"column_5"`
-	Limit    int32       `json:"limit"`
+	SecretID  pgtype.UUID `json:"secret_id"`
+	TeamID    uuid.UUID   `json:"team_id"`
+	CursorID  *int64      `json:"cursor_id"`
+	StatusMin int32       `json:"status_min"`
+	StatusMax int32       `json:"status_max"`
+	RowLimit  int32       `json:"row_limit"`
 }
 
 type ListAuditForSecretRow struct {
@@ -254,18 +284,17 @@ type ListAuditForSecretRow struct {
 	SandboxName    *string     `json:"sandbox_name"`
 }
 
-// Per-secret audit with LEFT JOIN sandbox so the UI can render readable
-// sandbox names; null when the sandbox was deleted.
-// $3=0 returns the most recent rows; otherwise rows older than that id.
-// $4/$5 status bounds: 0/9999 = unfiltered.
+// Per-secret audit with LEFT JOIN sandbox so the UI can render readable sandbox
+// names; null when the sandbox was deleted. A null cursor returns the most
+// recent rows; otherwise rows older than that id.
 func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecretParams) ([]ListAuditForSecretRow, error) {
 	rows, err := q.db.Query(ctx, listAuditForSecret,
 		arg.SecretID,
 		arg.TeamID,
-		arg.Column3,
-		arg.Column4,
-		arg.Column5,
-		arg.Limit,
+		arg.CursorID,
+		arg.StatusMin,
+		arg.StatusMax,
+		arg.RowLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -302,27 +331,32 @@ func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecret
 const listProxyAuditEvents = `-- name: ListProxyAuditEvents :many
 SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
 WHERE sandbox_id = $1
-  AND ($2::timestamptz IS NULL OR ts < $2::timestamptz)
-  AND ($3::timestamptz IS NULL OR ts >= $3::timestamptz)
-ORDER BY ts DESC
-LIMIT $4
+  AND ($2::timestamptz IS NULL OR ts >= $2::timestamptz)
+  AND ($3::timestamptz IS NULL
+       OR (ts, 'request', id) < ($3::timestamptz, $4::text, $5::bigint))
+ORDER BY ts DESC, id DESC
+LIMIT $6
 `
 
 type ListProxyAuditEventsParams struct {
-	SandboxID uuid.UUID          `json:"sandbox_id"`
-	Before    pgtype.Timestamptz `json:"before"`
-	Since     pgtype.Timestamptz `json:"since"`
-	RowLimit  int32              `json:"row_limit"`
+	SandboxID  uuid.UUID          `json:"sandbox_id"`
+	Since      pgtype.Timestamptz `json:"since"`
+	CursorTs   pgtype.Timestamptz `json:"cursor_ts"`
+	CursorKind *string            `json:"cursor_kind"`
+	CursorID   *int64             `json:"cursor_id"`
+	RowLimit   int32              `json:"row_limit"`
 }
 
-// Request rows for the unified per-sandbox network log, filtered by an optional
-// time window (before/since); before doubles as the pagination cursor. Merged
-// with net_flow connection rows in the handler.
+// Request rows for the unified per-sandbox network log. Keyset-paginated by the
+// (ts, kind, id) cursor; 'request' is this source's kind. The handler merges
+// these with net_flow connection rows under the same total order.
 func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEventsParams) ([]ProxyAudit, error) {
 	rows, err := q.db.Query(ctx, listProxyAuditEvents,
 		arg.SandboxID,
-		arg.Before,
 		arg.Since,
+		arg.CursorTs,
+		arg.CursorKind,
+		arg.CursorID,
 		arg.RowLimit,
 	)
 	if err != nil {
@@ -650,11 +684,16 @@ func (q *Queries) SoftDeleteSecretByName(ctx context.Context, arg SoftDeleteSecr
 const touchSecretLastUsed = `-- name: TouchSecretLastUsed :exec
 UPDATE secret
 SET last_used_at = now()
-WHERE id = $1
+WHERE id = $1 AND team_id = $2
 `
 
-func (q *Queries) TouchSecretLastUsed(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, touchSecretLastUsed, id)
+type TouchSecretLastUsedParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) TouchSecretLastUsed(ctx context.Context, arg TouchSecretLastUsedParams) error {
+	_, err := q.db.Exec(ctx, touchSecretLastUsed, arg.ID, arg.TeamID)
 	return err
 }
 

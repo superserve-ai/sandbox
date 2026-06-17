@@ -1415,11 +1415,57 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			DeltaPath:      nil,
 		})
 	}
+	// insertWithBindings writes the sandbox row, and its secret bindings in the
+	// same transaction when any are attached, so a successful create never leaves
+	// a binding unrecorded. With no secrets it is a plain insert — no transaction.
+	insertWithBindings := func() (db.Sandbox, error) {
+		if len(secretBindings) == 0 {
+			return runInsert(h.DB)
+		}
+		runBoth := func(q *db.Queries) (db.Sandbox, error) {
+			sb, err := runInsert(q)
+			if err != nil {
+				return db.Sandbox{}, err
+			}
+			secretIDs := make([]uuid.UUID, len(secretBindings))
+			envKeys := make([]string, len(secretBindings))
+			for i := range secretBindings {
+				secretIDs[i] = secretBindings[i].SecretID
+				envKeys[i] = secretBindings[i].EnvKey
+			}
+			if err := q.AddSandboxSecrets(insertCtx, db.AddSandboxSecretsParams{
+				SandboxID: sandboxID,
+				SecretIds: secretIDs,
+				EnvKeys:   envKeys,
+			}); err != nil {
+				return db.Sandbox{}, fmt.Errorf("insert secret bindings: %w", err)
+			}
+			return sb, nil
+		}
+		// No pool (DBTX-mocked unit tests): fall back to a direct insert.
+		if h.Pool == nil {
+			return runBoth(h.DB)
+		}
+		tx, err := h.Pool.Begin(insertCtx)
+		if err != nil {
+			return db.Sandbox{}, err
+		}
+		defer tx.Rollback(insertCtx)
+		sb, err := runBoth(h.DB.WithTx(tx))
+		if err != nil {
+			return db.Sandbox{}, err
+		}
+		if err := tx.Commit(insertCtx); err != nil {
+			return db.Sandbox{}, err
+		}
+		return sb, nil
+	}
+
 	var tInsertStart, tInsertEnd time.Time
 	go func() {
 		tInsertStart = time.Now()
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
-		sb, err := runInsert(h.DB)
+		sb, err := insertWithBindings()
 		tInsertEnd = time.Now()
 		insertCh <- insertResult{sandbox: sb, err: err}
 	}()
@@ -1497,6 +1543,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
 		})
+		// Bindings are written before RestoreSnapshot, so a restore failure
+		// leaves them; clear them or this dead sandbox still shows as bound.
+		_ = h.DB.DeleteSandboxSecrets(failCtx, sandbox.ID)
 		// FailedPrecondition from vmd = snapshot/mem file missing on host.
 		// Surfaces on the from_template restore path; map to 503 so the
 		// user understands this is ops-side, not a bad request.
@@ -1534,7 +1583,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, secretMeta)
 		if jerr != nil {
 			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
-			h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
 			respondError(c, ErrInternal)
 			return
 		}
@@ -1547,7 +1596,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
 		} else {
 			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-			h.failSandboxAfterBoot(postCtx, sandbox.ID, teamID, sandboxID.String())
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
 			respondError(c, ErrInternal)
 			return
 		}
@@ -1616,22 +1665,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 		}
 	}()
-
-	if len(secretBindings) > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range secretBindings {
-				secretBindings[i].SandboxID = sandbox.ID
-				if err := h.DB.AddSandboxSecret(postCtx, secretBindings[i]); err != nil {
-					log.Error().Err(err).
-						Str("sandbox_id", sandbox.ID.String()).
-						Str("env_key", secretBindings[i].EnvKey).
-						Msg("DB AddSandboxSecret failed")
-				}
-			}
-		}()
-	}
 
 	if hasNetworkRules {
 		wg.Add(1)

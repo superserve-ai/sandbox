@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/egresspolicy"
@@ -73,6 +74,16 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if ip := net.ParseIP(host); ip != nil && egresspolicy.IsIPDenied(ip) {
 			p.logger.Warn("blocked internal address", "sandbox", scope.SandboxID, "host", host)
 			http.Error(w, "destination address blocked by policy", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Operator egress blocklist by hostname and IP-literal target. A hostname
+	// that resolves to a blocklisted CIDR is caught by the upstream dialer.
+	if p.blocklist != nil {
+		if blocked, dim := p.blocklist.Blocked(host, net.ParseIP(host)); blocked {
+			p.logger.Warn("blocked by egress blocklist", "sandbox", scope.SandboxID, "host", host, "match", dim)
+			http.Error(w, "destination blocked by policy", http.StatusForbidden)
 			return
 		}
 	}
@@ -218,6 +229,26 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			}
 		}
 
+		// Re-check revocation per request, not only at CONNECT: an open
+		// keep-alive tunnel must stop injecting as soon as the sandbox is
+		// revoked, without waiting for the tunnel to idle out.
+		if p.revoker != nil && scope != nil && p.revoker.IsSandboxRevoked(scope.SandboxID) {
+			writeBrokerError(w, http.StatusForbidden, "sandbox_revoked", "sandbox access revoked")
+			finalize(http.StatusForbidden, nil, nil, "sandbox_revoked")
+			return
+		}
+
+		// Re-check the operator blocklist on every request, not only at CONNECT,
+		// so blocklist updates apply within an already-open tunnel.
+		if p.blocklist != nil {
+			if blocked, dim := p.blocklist.Blocked(host, net.ParseIP(host)); blocked {
+				p.logger.Warn("blocked by egress blocklist", "sandbox", scope.SandboxID, "host", host, "match", dim)
+				writeBrokerError(w, http.StatusForbidden, "egress_blocked", "destination blocked by policy")
+				finalize(http.StatusForbidden, nil, nil, "egress_blocked")
+				return
+			}
+		}
+
 		// Rebuild against the captured host so a Host-header rewrite cannot redirect mid-stream.
 		upstreamURL := *r.URL
 		upstreamURL.Scheme = "https"
@@ -236,9 +267,10 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			return
 		}
 		copyForwardableHeaders(r.Header, outReq.Header)
-		outReq.Host = host
+		outReq.Host = forwardedHostHeader(target, host)
 
 		// Pipeline runs when both Vault and a non-empty Scope are wired; otherwise pass through.
+		transport := p.upstream
 		var matchedSecretIDs []string
 		if scope != nil && p.vault != nil {
 			rules, ok := p.fetchEgressRules(ctx, scope.SandboxID)
@@ -253,6 +285,13 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			var upstreamIP net.IP
 			if egresspolicy.HasCIDR(rules.Allow) || egresspolicy.HasCIDR(rules.Deny) {
 				upstreamIP = p.resolveUpstreamIP(ctx, host)
+				// Dial the IP the policy was evaluated against, not a re-resolved one.
+				if upstreamIP != nil {
+					outReq = outReq.WithContext(WithPinnedDialIP(outReq.Context(), upstreamIP))
+					// Use the no-reuse transport so a CIDR-pinned request dials the
+					// policy-evaluated IP through the guard.
+					transport = p.upstreamPinned
+				}
 			}
 			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP, rules)
 			if ierr != nil {
@@ -275,7 +314,7 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			}
 		}
 
-		resp, err := p.upstream.RoundTrip(outReq)
+		resp, err := transport.RoundTrip(outReq)
 		if err != nil {
 			// Body-size overflow surfaces here as RoundTrip returning a
 			// MaxBytesError wrapped by the transport; distinguish it from
@@ -315,16 +354,62 @@ func writeBrokerError(w http.ResponseWriter, status int, reason, msg string) {
 	_, _ = w.Write([]byte(msg))
 }
 
-// copyForwardableHeaders copies headers skipping hop-by-hop ones.
+// copyForwardableHeaders copies headers, skipping both the fixed hop-by-hop set
+// and any header names the message lists in its own Connection header (RFC 7230
+// §6.1), which are scoped to this hop and must not be forwarded.
 func copyForwardableHeaders(src, dst http.Header) {
+	perMsg := connectionHopByHop(src)
 	for k, vv := range src {
-		if hopByHop[http.CanonicalHeaderKey(k)] {
+		ck := http.CanonicalHeaderKey(k)
+		if hopByHop[ck] || perMsg[ck] {
 			continue
 		}
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// forwardedHostHeader returns the Host header value for the upstream request:
+// the CONNECT authority, with the port kept when it is not the default 443 so
+// custom-port virtual hosts route correctly.
+func forwardedHostHeader(target, host string) string {
+	if _, port, err := net.SplitHostPort(target); err == nil && port != "443" {
+		return target
+	}
+	return host
+}
+
+// pinnedDialIPKey carries the upstream IP the dial must use; see WithPinnedDialIP.
+type pinnedDialIPKey struct{}
+
+// WithPinnedDialIP pins the upstream dial to ip, so the address used for CIDR
+// policy evaluation is the address actually connected to — closing the gap where
+// a second DNS lookup at dial time could resolve to a different IP.
+func WithPinnedDialIP(ctx context.Context, ip net.IP) context.Context {
+	return context.WithValue(ctx, pinnedDialIPKey{}, ip)
+}
+
+// PinnedDialIP returns the pinned upstream IP, or nil when none was set.
+func PinnedDialIP(ctx context.Context) net.IP {
+	ip, _ := ctx.Value(pinnedDialIPKey{}).(net.IP)
+	return ip
+}
+
+// connectionHopByHop returns the header names listed in the Connection header.
+func connectionHopByHop(h http.Header) map[string]bool {
+	var set map[string]bool
+	for _, v := range h.Values("Connection") {
+		for _, name := range strings.Split(v, ",") {
+			if name = http.CanonicalHeaderKey(strings.TrimSpace(name)); name != "" {
+				if set == nil {
+					set = make(map[string]bool)
+				}
+				set[name] = true
+			}
+		}
+	}
+	return set
 }
 
 // streamWithFlush copies src → dst, flushing after each read for SSE / chunked transfers.

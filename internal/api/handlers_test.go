@@ -2244,3 +2244,30 @@ func TestCreateSandbox_MetadataValidationRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestFailSandboxAfterBootDestroysOnSandboxHost(t *testing.T) {
+	var defaultDestroyed, hostDestroyed string
+	defaultVMD := &stubVMD{destroyFn: func(_ context.Context, id string, _ bool) error {
+		defaultDestroyed = id
+		return nil
+	}}
+	hostVMD := &stubVMD{destroyFn: func(_ context.Context, id string, _ bool) error {
+		hostDestroyed = id
+		return nil
+	}}
+	mock := &mockDBTX{
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag(""), nil
+		},
+	}
+	h := &Handlers{VMD: defaultVMD, DB: db.New(mock)}
+
+	h.failSandboxAfterBoot(context.Background(), hostVMD, uuid.New(), uuid.New(), "instance-xyz")
+
+	if hostDestroyed != "instance-xyz" {
+		t.Errorf("destroy routed to host client = %q, want instance-xyz", hostDestroyed)
+	}
+	if defaultDestroyed != "" {
+		t.Errorf("default client must not destroy; got %q", defaultDestroyed)
+	}
+}

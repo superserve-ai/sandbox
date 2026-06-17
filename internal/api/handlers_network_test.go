@@ -99,3 +99,36 @@ func TestParseNetworkVerdict(t *testing.T) {
 		t.Error("invalid verdict should error")
 	}
 }
+
+func TestNetworkCursorRoundTrip(t *testing.T) {
+	ts := time.Date(2026, 6, 15, 1, 2, 3, 456789000, time.UTC)
+	tok := encodeNetworkCursor(ts, "request", 42)
+
+	// Opaque token round-trips back to the same (ts, kind, id).
+	c, err := parseNetworkCursor(tok)
+	if err != nil {
+		t.Fatalf("parse token: %v", err)
+	}
+	if !c.ts.Time.Equal(ts) || c.kind == nil || *c.kind != "request" || c.id == nil || *c.id != 42 {
+		t.Errorf("round-trip mismatch: ts=%v kind=%v id=%v", c.ts.Time, c.kind, c.id)
+	}
+}
+
+func TestParseNetworkCursorForms(t *testing.T) {
+	// Empty -> unset keyset.
+	if c, err := parseNetworkCursor(""); err != nil || c.ts.Valid {
+		t.Errorf("empty: %+v %v", c, err)
+	}
+	// RFC3339 time bound -> keyset (t, "", 0): strictly older than t.
+	c, err := parseNetworkCursor("2026-06-15T01:02:03Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ts.Valid || c.kind == nil || *c.kind != "" || c.id == nil || *c.id != 0 {
+		t.Errorf("time bound -> wrong keyset: %+v", c)
+	}
+	// Garbage that is neither RFC3339 nor a valid token -> error.
+	if _, err := parseNetworkCursor("not-a-time-or-token!!"); err == nil {
+		t.Error("expected error for malformed before")
+	}
+}

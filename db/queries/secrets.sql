@@ -16,7 +16,8 @@ SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
 -- name: GetSecretByIDForDecrypt :one
--- Daemon decrypt path. Team-scoped; excludes soft-deleted.
+-- Daemon decrypt path. Team-scoped; excludes soft-deleted. Separate from
+-- GetSecretByID so it can diverge later (audit, caching) without touching API reads.
 SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
@@ -38,7 +39,7 @@ RETURNING *;
 -- name: TouchSecretLastUsed :exec
 UPDATE secret
 SET last_used_at = now()
-WHERE id = $1;
+WHERE id = $1 AND team_id = $2;
 
 -- name: SoftDeleteSecret :one
 -- Setting deleted_at both revokes and hides from new-binding listings.
@@ -56,6 +57,17 @@ RETURNING *;
 -- name: AddSandboxSecret :exec
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
 VALUES ($1, $2, $3);
+
+-- name: AddSandboxSecrets :exec
+-- Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
+-- the secret_ids and env_keys arrays are paired by position.
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
+SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i]
+FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i);
+
+-- name: DeleteSandboxSecrets :exec
+-- Drop every secret binding for a sandbox (e.g. cleaning up a failed create).
+DELETE FROM sandbox_secret WHERE sandbox_id = $1;
 
 -- name: ListSandboxSecrets :many
 -- Secret rows plus the env_key each is bound under for this sandbox.
@@ -99,28 +111,28 @@ INSERT INTO proxy_audit (
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
 
 -- name: ListProxyAuditEvents :many
--- Request rows for the unified per-sandbox network log, filtered by an optional
--- time window (before/since); before doubles as the pagination cursor. Merged
--- with net_flow connection rows in the handler.
+-- Request rows for the unified per-sandbox network log. Keyset-paginated by the
+-- (ts, kind, id) cursor; 'request' is this source's kind. The handler merges
+-- these with net_flow connection rows under the same total order.
 SELECT * FROM proxy_audit
 WHERE sandbox_id = sqlc.arg('sandbox_id')
-  AND (sqlc.narg('before')::timestamptz IS NULL OR ts < sqlc.narg('before')::timestamptz)
   AND (sqlc.narg('since')::timestamptz IS NULL OR ts >= sqlc.narg('since')::timestamptz)
-ORDER BY ts DESC
+  AND (sqlc.narg('cursor_ts')::timestamptz IS NULL
+       OR (ts, 'request', id) < (sqlc.narg('cursor_ts')::timestamptz, sqlc.narg('cursor_kind')::text, sqlc.narg('cursor_id')::bigint))
+ORDER BY ts DESC, id DESC
 LIMIT sqlc.arg('row_limit');
 
 -- name: ListAuditForSecret :many
--- Per-secret audit with LEFT JOIN sandbox so the UI can render readable
--- sandbox names; null when the sandbox was deleted.
--- $3=0 returns the most recent rows; otherwise rows older than that id.
--- $4/$5 status bounds: 0/9999 = unfiltered.
+-- Per-secret audit with LEFT JOIN sandbox so the UI can render readable sandbox
+-- names; null when the sandbox was deleted. A null cursor returns the most
+-- recent rows; otherwise rows older than that id.
 SELECT pa.*, sb.name AS sandbox_name
 FROM proxy_audit pa
 LEFT JOIN sandbox sb ON sb.id = pa.sandbox_id
-WHERE pa.secret_id = $1
-  AND pa.team_id = $2
-  AND ($3::bigint = 0 OR pa.id < $3)
-  AND pa.status >= $4::int
-  AND pa.status <= $5::int
+WHERE pa.secret_id = sqlc.arg('secret_id')
+  AND pa.team_id = sqlc.arg('team_id')
+  AND (sqlc.narg('cursor_id')::bigint IS NULL OR pa.id < sqlc.narg('cursor_id')::bigint)
+  AND pa.status >= sqlc.arg('status_min')::int
+  AND pa.status <= sqlc.arg('status_max')::int
 ORDER BY pa.id DESC
-LIMIT $6;
+LIMIT sqlc.arg('row_limit');

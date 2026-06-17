@@ -68,12 +68,22 @@ type Proxy struct {
 	httpServer          *http.Server
 	tlsConfig           *tls.Config
 	upstream            *http.Transport
+	upstreamPinned      *http.Transport
 	isListening         atomic.Bool
 	sandboxFacingHost   string
 	maxRequestBodyBytes int64
 	blockedPorts        map[int]bool
 	blockInternalAddrs  bool
 	dnsResolver         *net.Resolver
+	blocklist           EgressBlocklist
+}
+
+// EgressBlocklist reports whether a destination is on the operator egress
+// blocklist, by hostname (domain feeds / pinned domains) and/or resolved IP
+// (pinned CIDRs). A blocklist hit is refused regardless of a sandbox's own
+// allow rules, mirroring the host firewall on the direct path.
+type EgressBlocklist interface {
+	Blocked(host string, ip net.IP) (bool, string)
 }
 
 // Options carries Proxy dependencies. Nil Logger, Vault, Audit, and UpstreamTransport
@@ -105,6 +115,11 @@ type Options struct {
 	// DNSResolver resolves upstream hosts for CIDR egress rules. Nil uses the
 	// default resolver.
 	DNSResolver *net.Resolver
+
+	// Blocklist enforces the operator egress blocklist on the proxied path.
+	// Nil disables blocklist enforcement (the host firewall still covers
+	// direct traffic).
+	Blocklist EgressBlocklist
 }
 
 const defaultMaxRequestBodyBytes int64 = 256 * 1024 * 1024
@@ -127,6 +142,10 @@ func NewProxy(addr string, opts Options) *Proxy {
 			ForceAttemptHTTP2:     false,
 		}
 	}
+	// Reuse-disabled transport for CIDR-pinned requests, so each dials the
+	// policy-evaluated IP through the guard.
+	upstreamPinned := upstream.Clone()
+	upstreamPinned.DisableKeepAlives = true
 	audit := opts.Audit
 	if audit == nil {
 		audit = NewNopAuditSink()
@@ -152,11 +171,13 @@ func NewProxy(addr string, opts Options) *Proxy {
 		revoker:             opts.Revoker,
 		logger:              logger,
 		upstream:            upstream,
+		upstreamPinned:      upstreamPinned,
 		sandboxFacingHost:   opts.SandboxFacingHost,
 		maxRequestBodyBytes: maxBody,
 		blockedPorts:        blockedPorts,
 		blockInternalAddrs:  opts.BlockInternalAddrs,
 		dnsResolver:         opts.DNSResolver,
+		blocklist:           opts.Blocklist,
 	}
 
 	p.tlsConfig = &tls.Config{
