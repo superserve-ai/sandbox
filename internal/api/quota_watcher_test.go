@@ -13,14 +13,14 @@ func ptrInt32(v int32) *int32 { return &v }
 func TestComputeQuotaAlerts(t *testing.T) {
 	atThreshold := uuid.New()  // sandboxes 80/100 = 80% -> alert
 	below := uuid.New()        // sandboxes 79/100 = 79% -> no
-	tmplDefault := uuid.New()  // templates 40/50 via default 50 = 80% -> alert
+	tmplDefault := uuid.New()  // templates 8/10 via default 10 = 80% -> alert
 	tmplOverride := uuid.New() // templates 10/200 (override) = 5% -> no
 	zeroLimit := uuid.New()    // max 0 -> must not alert or panic
 
 	rows := []db.ListTeamQuotaUsageRow{
 		{ID: atThreshold, Name: "at", ActiveSandboxCount: 80, MaxSandboxes: 100},
 		{ID: below, Name: "below", ActiveSandboxCount: 79, MaxSandboxes: 100, TemplateCount: 1},
-		{ID: tmplDefault, Name: "tdefault", MaxSandboxes: 100, TemplateCount: 40}, // MaxTemplates nil -> default
+		{ID: tmplDefault, Name: "tdefault", MaxSandboxes: 100, TemplateCount: 8}, // MaxTemplates nil -> default
 		{ID: tmplOverride, Name: "toverride", MaxSandboxes: 100, MaxTemplates: ptrInt32(200), TemplateCount: 10},
 		{ID: zeroLimit, Name: "zero", ActiveSandboxCount: 5, MaxSandboxes: 0},
 	}

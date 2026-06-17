@@ -262,15 +262,19 @@ func run() error {
 	return nil
 }
 
-// reconcileSystemTeamQuota lifts the system team's max_sandboxes above any
-// realistic cap so the sandbox_quota_on_insert trigger never rejects it.
+// reconcileSystemTeamQuota lifts the system team's max_sandboxes and
+// max_templates so the quota trigger and template-count check never block it.
 func reconcileSystemTeamQuota(ctx context.Context, pool *pgxpool.Pool, systemTeamID string) {
 	if systemTeamID == "" {
 		return
 	}
 	tag, err := pool.Exec(ctx,
-		`UPDATE team SET max_sandboxes = $1
-		 WHERE id = $2 AND (max_sandboxes IS NULL OR max_sandboxes < $1)`,
+		`UPDATE team
+		 SET max_sandboxes = $1,
+		     max_templates = $1
+		 WHERE id = $2
+		   AND (max_sandboxes IS NULL OR max_sandboxes < $1
+		     OR max_templates IS NULL OR max_templates < $1)`,
 		math.MaxInt32, systemTeamID,
 	)
 	if err != nil {
