@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -1093,6 +1094,149 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 	if got := numericFloat64(t, rollup.StorageMibSeconds); got != 245_760 {
 		t.Fatalf("rollup storage MiB seconds = %v, want 245760", got)
 	}
+}
+
+func TestIntegration_BillingRollupWorkersProcessDistinctJobs(t *testing.T) {
+	ctx := context.Background()
+	teamA, _ := seedTeamAndKey(t)
+	teamB, _ := seedTeamAndKey(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamA)
+	enableBillingHourlyRollups(t, ctx, teamB)
+	insertBillingRollupJob(t, ctx, teamA, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+	insertBillingRollupJob(t, ctx, teamB, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-a")
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-b")
+
+	var completed int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+		  AND status = 'completed'
+	`, teamA, teamB, hourStart).Scan(&completed); err != nil {
+		t.Fatalf("count completed rollup jobs: %v", err)
+	}
+	if completed != 2 {
+		t.Fatalf("completed rollup jobs = %d, want 2", completed)
+	}
+
+	var hourlyRows int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM team_billing_usage_hourly
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+	`, teamA, teamB, hourStart).Scan(&hourlyRows); err != nil {
+		t.Fatalf("count hourly usage rows: %v", err)
+	}
+	if hourlyRows != 2 {
+		t.Fatalf("hourly usage rows = %d, want 2", hourlyRows)
+	}
+}
+
+func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	staleLockedUntil := time.Now().UTC().Add(-time.Minute)
+	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "running", "stale-worker", staleLockedUntil, 1)
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	jobs, err := billing.ClaimJobsForTest(ctx, testPool, cfg, "replacement-worker")
+	if err != nil {
+		t.Fatalf("claim stale rollup job: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(jobs))
+	}
+	if jobs[0].ID != jobID {
+		t.Fatalf("claimed job id = %s, want %s", jobs[0].ID, jobID)
+	}
+
+	var status, lockedBy string
+	var attemptCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, locked_by, attempt_count
+		FROM billing_rollup_job
+		WHERE id = $1
+	`, jobID).Scan(&status, &lockedBy, &attemptCount); err != nil {
+		t.Fatalf("read claimed stale job: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status = %q, want running", status)
+	}
+	if lockedBy != "replacement-worker" {
+		t.Fatalf("locked_by = %q, want replacement-worker", lockedBy)
+	}
+	if attemptCount != 2 {
+		t.Fatalf("attempt_count = %d, want 2", attemptCount)
+	}
+}
+
+func enableBillingHourlyRollups(t *testing.T, ctx context.Context, teamID uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_hourly_rollups', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing_hourly_rollups: %v", err)
+	}
+}
+
+func insertBillingRollupJob(
+	t *testing.T,
+	ctx context.Context,
+	teamID uuid.UUID,
+	hourStart time.Time,
+	hourEnd time.Time,
+	status string,
+	lockedBy string,
+	lockedUntil time.Time,
+	attemptCount int,
+) uuid.UUID {
+	t.Helper()
+
+	var jobID uuid.UUID
+	if status == "running" {
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO billing_rollup_job (
+				team_id, hour_start, hour_end, status, attempt_count,
+				locked_by, locked_until, next_attempt_at
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, now() - interval '1 minute')
+			RETURNING id
+		`, teamID, hourStart, hourEnd, status, attemptCount, lockedBy, lockedUntil).Scan(&jobID); err != nil {
+			t.Fatalf("insert running billing rollup job: %v", err)
+		}
+		return jobID
+	}
+
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO billing_rollup_job (
+			team_id, hour_start, hour_end, status, attempt_count, next_attempt_at
+		)
+		VALUES ($1, $2, $3, $4, $5, now() - interval '1 minute')
+		RETURNING id
+	`, teamID, hourStart, hourEnd, status, attemptCount).Scan(&jobID); err != nil {
+		t.Fatalf("insert billing rollup job: %v", err)
+	}
+	return jobID
 }
 
 func numericFloat64(t *testing.T, n pgtype.Numeric) float64 {
