@@ -126,4 +126,10 @@ func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sand
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("mark-failed after destroy")
 	}
+	// A failed sandbox keeps status=failed with destroyed_at NULL, and the
+	// secret-binding queries filter only on destroyed_at, so clear the bindings
+	// here or a never-usable sandbox would still report as bound to its secrets.
+	if err := h.DB.DeleteSandboxSecrets(ctx, sandboxID); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("clear secret bindings after failed boot")
+	}
 }

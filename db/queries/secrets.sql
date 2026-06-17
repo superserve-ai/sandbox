@@ -65,6 +65,10 @@ INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
 SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i]
 FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i);
 
+-- name: DeleteSandboxSecrets :exec
+-- Drop every secret binding for a sandbox (e.g. cleaning up a failed create).
+DELETE FROM sandbox_secret WHERE sandbox_id = $1;
+
 -- name: ListSandboxSecrets :many
 -- Secret rows plus the env_key each is bound under for this sandbox.
 SELECT s.*, ss.env_key
