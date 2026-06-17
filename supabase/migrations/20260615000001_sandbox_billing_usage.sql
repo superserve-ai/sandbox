@@ -264,7 +264,10 @@ CREATE TABLE team_billing_period (
         status IN ('open', 'validating', 'blocked', 'approved', 'exported', 'finalized')
     ),
     CONSTRAINT team_billing_period_block_fields CHECK (
-        (status = 'blocked') = (blocked_at IS NOT NULL)
+        (status = 'blocked') = (
+            blocked_at IS NOT NULL
+            AND blocked_reason IS NOT NULL
+        )
     ),
     CONSTRAINT team_billing_period_approval_fields CHECK (
         (approved_at IS NULL AND approved_by IS NULL)

@@ -871,6 +871,14 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 		t.Fatalf("upsert billing period: %v", err)
 	}
 
+	if _, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	}); err != nil {
+		t.Fatalf("upsert billing usage before export: %v", err)
+	}
+
 	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,

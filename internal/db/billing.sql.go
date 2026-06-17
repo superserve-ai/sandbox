@@ -79,6 +79,7 @@ SET status = 'blocked',
 WHERE team_billing_period.team_id = $2
   AND team_billing_period.period_start = $3
   AND team_billing_period.period_end = $4
+  AND team_billing_period.status IN ('open', 'validating', 'blocked')
   AND team_billing_period.finalized_at IS NULL
 RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at
 `
@@ -436,6 +437,15 @@ WITH exported_period AS (
       AND team_billing_period.period_end = $3
       AND team_billing_period.status = 'approved'
       AND team_billing_period.finalized_at IS NULL
+      AND EXISTS (
+          SELECT 1
+          FROM team_billing_usage u
+          WHERE u.team_id = team_billing_period.team_id
+            AND u.period_start = team_billing_period.period_start
+            AND u.period_end = team_billing_period.period_end
+            AND u.exported_at IS NULL
+            AND u.finalized_at IS NULL
+      )
       AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
     RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at
 ),
@@ -680,27 +690,70 @@ usage AS (
         compute.memory_mib_seconds,
         storage.storage_mib_seconds
     FROM compute, storage
+),
+upserted AS (
+    INSERT INTO team_billing_usage (
+        team_id, period_start, period_end,
+        vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+    )
+    SELECT
+        usage.team_id,
+        usage.period_start,
+        usage.period_end,
+        usage.vcpu_seconds,
+        usage.memory_mib_seconds,
+        usage.storage_mib_seconds
+    FROM usage
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM team_billing_period p
+        WHERE p.team_id = usage.team_id
+          AND p.period_start = usage.period_start
+          AND p.period_end = usage.period_end
+          AND (
+              p.status IN ('exported', 'finalized')
+              OR p.exported_at IS NOT NULL
+              OR p.finalized_at IS NOT NULL
+          )
+    )
+    ON CONFLICT (team_id, period_start, period_end) DO UPDATE
+    SET vcpu_seconds = EXCLUDED.vcpu_seconds,
+        memory_mib_seconds = EXCLUDED.memory_mib_seconds,
+        storage_mib_seconds = EXCLUDED.storage_mib_seconds,
+        updated_at = now()
+    WHERE team_billing_usage.finalized_at IS NULL
+      AND team_billing_usage.exported_at IS NULL
+    RETURNING
+        team_id, period_start, period_end,
+        vcpu_seconds, memory_mib_seconds, storage_mib_seconds,
+        finalized_at, exported_at, updated_at
+),
+immutable_existing AS (
+    SELECT
+        existing.team_id,
+        existing.period_start,
+        existing.period_end,
+        existing.vcpu_seconds,
+        existing.memory_mib_seconds,
+        existing.storage_mib_seconds,
+        existing.finalized_at,
+        existing.exported_at,
+        existing.updated_at
+    FROM team_billing_usage existing
+    JOIN usage
+      ON usage.team_id = existing.team_id
+     AND usage.period_start = existing.period_start
+     AND usage.period_end = existing.period_end
+    WHERE NOT EXISTS (SELECT 1 FROM upserted)
+      AND (
+          existing.exported_at IS NOT NULL
+          OR existing.finalized_at IS NOT NULL
+      )
 )
-INSERT INTO team_billing_usage (
-    team_id, period_start, period_end,
-    vcpu_seconds, memory_mib_seconds, storage_mib_seconds
-)
-SELECT
-    usage.team_id,
-    usage.period_start,
-    usage.period_end,
-    usage.vcpu_seconds,
-    usage.memory_mib_seconds,
-    usage.storage_mib_seconds
-FROM usage
-ON CONFLICT (team_id, period_start, period_end) DO UPDATE
-SET vcpu_seconds = EXCLUDED.vcpu_seconds,
-    memory_mib_seconds = EXCLUDED.memory_mib_seconds,
-    storage_mib_seconds = EXCLUDED.storage_mib_seconds,
-    updated_at = now()
-WHERE team_billing_usage.finalized_at IS NULL
-  AND team_billing_usage.exported_at IS NULL
-RETURNING team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at
+SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at FROM upserted
+UNION ALL
+SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at FROM immutable_existing
+LIMIT 1
 `
 
 type UpsertTeamBillingUsageParams struct {
@@ -709,11 +762,23 @@ type UpsertTeamBillingUsageParams struct {
 	TeamID      uuid.UUID          `json:"team_id"`
 }
 
-// Recomputes a team's period rollup from raw intervals. Finalized rows are
-// immutable so a billing export cannot be silently rewritten afterward.
-func (q *Queries) UpsertTeamBillingUsage(ctx context.Context, arg UpsertTeamBillingUsageParams) (TeamBillingUsage, error) {
+type UpsertTeamBillingUsageRow struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	PeriodStart       time.Time          `json:"period_start"`
+	PeriodEnd         time.Time          `json:"period_end"`
+	VcpuSeconds       pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric     `json:"storage_mib_seconds"`
+	FinalizedAt       pgtype.Timestamptz `json:"finalized_at"`
+	ExportedAt        pgtype.Timestamptz `json:"exported_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+// Recomputes a team's period rollup from raw intervals. Exported/finalized
+// rows are immutable so a billing export cannot be silently rewritten.
+func (q *Queries) UpsertTeamBillingUsage(ctx context.Context, arg UpsertTeamBillingUsageParams) (UpsertTeamBillingUsageRow, error) {
 	row := q.db.QueryRow(ctx, upsertTeamBillingUsage, arg.PeriodEnd, arg.PeriodStart, arg.TeamID)
-	var i TeamBillingUsage
+	var i UpsertTeamBillingUsageRow
 	err := row.Scan(
 		&i.TeamID,
 		&i.PeriodStart,

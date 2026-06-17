@@ -118,7 +118,8 @@ INSERT INTO sandbox_compute_billing_interval (
     sandbox_id, team_id, vcpu_count, memory_mib, started_at
 )
 SELECT t.id, t.team_id, t.vcpu_count, t.memory_mib, now()
-FROM target t
+FROM opened_active oa
+JOIN target t ON t.id = oa.sandbox_id
 WHERE feature_enabled('billing_metrics_write', t.team_id)
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
 `
