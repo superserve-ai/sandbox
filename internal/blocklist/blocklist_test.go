@@ -171,6 +171,27 @@ func TestRefreshKeepsFailedFeedFromCache(t *testing.T) {
 	}
 }
 
+func TestRefreshLoadsFeedSynchronously(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.txt")
+	if err := os.WriteFile(feed, []byte("pool.evil.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := New(&Config{
+		DomainFeeds: []string{feed},
+		StatePath:   filepath.Join(dir, "state"),
+	}, zerolog.Nop())
+
+	// New seeds only pinned/state entries; feed entries are not loaded yet.
+	if blocked, _ := b.Blocked("pool.evil.example", nil); blocked {
+		t.Fatal("feed entry must not be enforced before Refresh")
+	}
+	b.Refresh(t.Context())
+	if blocked, _ := b.Blocked("pool.evil.example", nil); !blocked {
+		t.Error("Refresh must load feed entries synchronously")
+	}
+}
+
 func TestCIDRSinkInvokedOnRefresh(t *testing.T) {
 	dir := t.TempDir()
 	feed := filepath.Join(dir, "feed.txt")

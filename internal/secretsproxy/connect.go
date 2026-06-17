@@ -238,6 +238,18 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 			return
 		}
 
+		// Re-check the operator blocklist per request: a feed refresh may have
+		// blocklisted this host after the tunnel's CONNECT was accepted, which a
+		// keep-alive tunnel would otherwise keep reaching until it idles out.
+		if p.blocklist != nil {
+			if blocked, dim := p.blocklist.Blocked(host, net.ParseIP(host)); blocked {
+				p.logger.Warn("blocked by egress blocklist", "sandbox", scope.SandboxID, "host", host, "match", dim)
+				writeBrokerError(w, http.StatusForbidden, "egress_blocked", "destination blocked by policy")
+				finalize(http.StatusForbidden, nil, nil, "egress_blocked")
+				return
+			}
+		}
+
 		// Rebuild against the captured host so a Host-header rewrite cannot redirect mid-stream.
 		upstreamURL := *r.URL
 		upstreamURL.Scheme = "https"

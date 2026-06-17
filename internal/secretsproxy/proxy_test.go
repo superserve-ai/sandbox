@@ -211,6 +211,73 @@ func TestProxyConnectAndForward(t *testing.T) {
 	}
 }
 
+// toggleBlocklist flips a single host from allowed to blocked at runtime,
+// standing in for a feed refresh that blocklists a host after CONNECT.
+type toggleBlocklist struct {
+	host string
+	mu   sync.Mutex
+	on   bool
+}
+
+func (b *toggleBlocklist) block() { b.mu.Lock(); b.on = true; b.mu.Unlock() }
+
+func (b *toggleBlocklist) Blocked(host string, _ net.IP) (bool, string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.on && host == b.host {
+		return true, "domain"
+	}
+	return false, ""
+}
+
+// A host blocklisted by a feed refresh after CONNECT must be refused on the next
+// request over the same keep-alive tunnel, not reachable until it idles out.
+func TestProxyRechecksBlocklistMidTunnel(t *testing.T) {
+	const testJWT = "test-jwt-string"
+	resolver := &stubResolver{wantJWT: testJWT, scopeOut: &Scope{SandboxID: "sandbox-1", TeamID: "team-1"}}
+	bl := &toggleBlocklist{host: "127.0.0.1"}
+	proxyAddr, upstream, ca, _ := setupProxy(t, resolver, func(o *Options) { o.Blocklist = bl })
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	conn := dialProxy(t, proxyAddr, ca)
+	defer conn.Close()
+
+	target := upstreamURL.Host
+	if status, ok := sendConnect(t, conn, target, testJWT); !ok {
+		t.Fatalf("CONNECT failed: %q", status)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(ca.RootPEM())
+	host, _, _ := net.SplitHostPort(target)
+	tlsClient := tls.Client(conn, &tls.Config{ServerName: host, RootCAs: pool, MinVersion: tls.VersionTLS12})
+	if err := tlsClient.Handshake(); err != nil {
+		t.Fatalf("inner TLS handshake: %v", err)
+	}
+	br := bufio.NewReader(tlsClient)
+
+	doReq := func() int {
+		if _, err := tlsClient.Write([]byte(fmt.Sprintf("GET /p HTTP/1.1\r\nHost: %s\r\n\r\n", target))); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := doReq(); code != http.StatusOK {
+		t.Fatalf("first request (host allowed): want 200, got %d", code)
+	}
+	bl.block() // a feed refresh blocklists the host mid-tunnel
+	if code := doReq(); code != http.StatusForbidden {
+		t.Fatalf("after mid-tunnel blocklist: want 403, got %d", code)
+	}
+}
+
 func TestProxyRejectsMissingProxyAuth(t *testing.T) {
 	resolver := &stubResolver{wantJWT: "x", scopeOut: &Scope{}}
 	proxyAddr, upstream, ca, _ := setupProxy(t, resolver)

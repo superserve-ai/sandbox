@@ -106,6 +106,13 @@ func run() error {
 		// connections; drop idle ones when the blocklist gains a CIDR so the next
 		// request re-dials through the guard. Sink must be set before Start.
 		egressBlocklist.SetCIDRSink(func([]string) { upstreamTransport.CloseIdleConnections() })
+		// Load feeds synchronously before serving so feed-sourced entries are
+		// enforced from the first request, not just the pinned/state entries
+		// already seeded. Bound it so a slow feed can't stall startup; the
+		// background refresh still picks it up.
+		loadCtx, cancelLoad := context.WithTimeout(rootCtx, 5*time.Second)
+		egressBlocklist.Refresh(loadCtx)
+		cancelLoad()
 		go func() { _ = egressBlocklist.Start(rootCtx) }()
 	}
 	proxy := secretsproxy.NewProxy(cfg.ProxyAddr, secretsproxy.Options{
