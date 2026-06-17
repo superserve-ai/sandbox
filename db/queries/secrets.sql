@@ -85,6 +85,16 @@ JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1
 ORDER BY ss.env_key;
 
+-- name: ListSandboxSecretBindingMeta :many
+-- Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
+-- soft-deleted secrets.
+SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+FROM sandbox_secret ss
+JOIN secret s ON s.id = ss.secret_id
+WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
+ORDER BY ss.env_key;
+
 -- name: ListSandboxesForSecret :many
 -- Returns (sandbox_id, host_id) for non-destroyed sandboxes bound to this secret.
 SELECT sb.id, sb.host_id

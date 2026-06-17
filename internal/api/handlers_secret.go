@@ -1081,6 +1081,39 @@ func (h *Handlers) resolveSecretBindingsForCreate(
 	return bindings, meta, nil
 }
 
+// loadSecretBindingMeta rebuilds a sandbox's binding metadata from the DB, minting a
+// token for any binding stored before proxy tokens were persisted.
+func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]SecretBindingMeta, error) {
+	rows, err := h.DB.ListSandboxSecretBindingMeta(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	meta := make([]SecretBindingMeta, 0, len(rows))
+	for _, r := range rows {
+		token := ""
+		if r.ProxyToken != nil {
+			token = *r.ProxyToken
+		}
+		if token == "" {
+			t, terr := mintProxyToken(r.ProviderShortcut)
+			if terr != nil {
+				return nil, terr
+			}
+			token = t
+		}
+		meta = append(meta, SecretBindingMeta{
+			SecretID:         r.SecretID,
+			EnvKey:           r.EnvKey,
+			AuthType:         r.AuthType,
+			AuthConfig:       r.AuthConfig,
+			ProviderShortcut: r.ProviderShortcut,
+			Hosts:            r.Hosts,
+			ProxyToken:       token,
+		})
+	}
+	return meta, nil
+}
+
 // mintSecretsJWT builds the per-sandbox secrets JWT. Returns the signed JWT
 // string. The sandbox's veth source IP binds the token; egress rules are not
 // carried here — the proxy fetches them live from GetSandboxEgressRules.

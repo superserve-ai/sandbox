@@ -402,6 +402,55 @@ func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEv
 	return items, nil
 }
 
+const listSandboxSecretBindingMeta = `-- name: ListSandboxSecretBindingMeta :many
+SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+FROM sandbox_secret ss
+JOIN secret s ON s.id = ss.secret_id
+WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
+ORDER BY ss.env_key
+`
+
+type ListSandboxSecretBindingMetaRow struct {
+	SecretID         uuid.UUID `json:"secret_id"`
+	EnvKey           string    `json:"env_key"`
+	ProxyToken       *string   `json:"proxy_token"`
+	AuthType         string    `json:"auth_type"`
+	AuthConfig       []byte    `json:"auth_config"`
+	ProviderShortcut *string   `json:"provider_shortcut"`
+	Hosts            []string  `json:"hosts"`
+}
+
+// Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
+// soft-deleted secrets.
+func (q *Queries) ListSandboxSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretBindingMetaRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxSecretBindingMeta, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxSecretBindingMetaRow{}
+	for rows.Next() {
+		var i ListSandboxSecretBindingMetaRow
+		if err := rows.Scan(
+			&i.SecretID,
+			&i.EnvKey,
+			&i.ProxyToken,
+			&i.AuthType,
+			&i.AuthConfig,
+			&i.ProviderShortcut,
+			&i.Hosts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxSecretBindings = `-- name: ListSandboxSecretBindings :many
 SELECT ss.env_key, s.name AS secret_name, (s.deleted_at IS NOT NULL)::bool AS secret_revoked
 FROM sandbox_secret ss
