@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -713,6 +714,165 @@ func TestIntegration_BillingMetricsWriteFeatureFlag(t *testing.T) {
 	}
 }
 
+func TestIntegration_PricingRatesUseNewestEffectiveVersion(t *testing.T) {
+	ctx := context.Background()
+	planKey := "test-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'vcpu', 'second', 0.000022, $3),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert pricing rates: %v", err)
+	}
+
+	rates, err := testQueries.ListActivePricingRates(ctx, planKey)
+	if err != nil {
+		t.Fatalf("list active pricing rates: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("rates length = %d, want 3", len(rates))
+	}
+	wantPrices := map[string]float64{
+		"vcpu":        0.000022,
+		"memory_gib":  0.0000045,
+		"storage_gib": 0.00000003,
+	}
+	seen := map[string]bool{}
+	for _, rate := range rates {
+		want, ok := wantPrices[rate.Resource]
+		if !ok {
+			t.Errorf("unexpected pricing resource %q", rate.Resource)
+			continue
+		}
+		seen[rate.Resource] = true
+		if got := numericFloat64(t, rate.PriceUsd); got != want {
+			t.Errorf("%s price = %v, want %v", rate.Resource, got, want)
+		}
+	}
+	for resource := range wantPrices {
+		if !seen[resource] {
+			t.Errorf("missing pricing rate for %s", resource)
+		}
+	}
+}
+
+func TestIntegration_PricingRatesForPlanAtUseRequestedTime(t *testing.T) {
+	ctx := context.Background()
+	planKey := "test-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'vcpu', 'second', 0.000022, $3),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-2*time.Hour), now.Add(time.Hour)); err != nil {
+		t.Fatalf("insert pricing rates: %v", err)
+	}
+
+	rates, err := testQueries.ListPricingRatesForPlanAt(ctx, db.ListPricingRatesForPlanAtParams{
+		PlanKey:     planKey,
+		EffectiveAt: now,
+	})
+	if err != nil {
+		t.Fatalf("list pricing rates for time: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("rates length = %d, want 3", len(rates))
+	}
+	wantPrices := map[string]float64{
+		"vcpu":        0.000011,
+		"memory_gib":  0.0000045,
+		"storage_gib": 0.00000003,
+	}
+	seen := map[string]bool{}
+	for _, rate := range rates {
+		want, ok := wantPrices[rate.Resource]
+		if !ok {
+			t.Errorf("unexpected pricing resource %q", rate.Resource)
+			continue
+		}
+		seen[rate.Resource] = true
+		if got := numericFloat64(t, rate.PriceUsd); got != want {
+			t.Errorf("%s price = %v, want %v", rate.Resource, got, want)
+		}
+	}
+	for resource := range wantPrices {
+		if !seen[resource] {
+			t.Errorf("missing pricing rate for %s", resource)
+		}
+	}
+}
+
+func TestIntegration_PricingRatesForPlanAtIncludesInactivePlan(t *testing.T) {
+	ctx := context.Background()
+	planKey := "inactive-historical-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	insertPricingPlanForTest(t, ctx, planKey, false)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert inactive historical pricing rates: %v", err)
+	}
+
+	rates, err := testQueries.ListPricingRatesForPlanAt(ctx, db.ListPricingRatesForPlanAtParams{
+		PlanKey:     planKey,
+		EffectiveAt: now,
+	})
+	if err != nil {
+		t.Fatalf("list pricing rates for inactive plan: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("rates length = %d, want 3 for historical inactive plan", len(rates))
+	}
+}
+
+func TestIntegration_InactiveTeamPricingPlanFallsBackToPayg(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	planKey := "inactive-plan-" + uuid.New().String()
+
+	insertPricingPlanForTest(t, ctx, planKey, false)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, now() - interval '1 hour')
+	`, teamID, planKey); err != nil {
+		t.Fatalf("assign inactive pricing plan: %v", err)
+	}
+
+	resolved, err := testQueries.GetTeamActivePricingPlan(ctx, teamID)
+	if err != nil {
+		t.Fatalf("get team active pricing plan: %v", err)
+	}
+	if resolved != "payg" {
+		t.Fatalf("pricing plan = %q, want payg fallback", resolved)
+	}
+}
+
+func insertPricingPlanForTest(t *testing.T, ctx context.Context, planKey string, active bool) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Integration test pricing', 'USD', $2)
+	`, planKey, active); err != nil {
+		t.Fatalf("insert pricing plan: %v", err)
+	}
+}
+
 func TestIntegration_BillingPeriodRollupFuturePeriodIsZero(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
@@ -1092,6 +1252,421 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 	}
 	if got := numericFloat64(t, rollup.StorageMibSeconds); got != 245_760 {
 		t.Fatalf("rollup storage MiB seconds = %v, want 245760", got)
+	}
+}
+
+func TestIntegration_BillingRollupWorkersProcessDistinctJobs(t *testing.T) {
+	ctx := context.Background()
+	teamA, _ := seedTeamAndKey(t)
+	teamB, _ := seedTeamAndKey(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamA)
+	enableBillingHourlyRollups(t, ctx, teamB)
+	insertBillingRollupJob(t, ctx, teamA, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+	insertBillingRollupJob(t, ctx, teamB, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-a")
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-b")
+
+	var completed int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+		  AND status = 'completed'
+	`, teamA, teamB, hourStart).Scan(&completed); err != nil {
+		t.Fatalf("count completed rollup jobs: %v", err)
+	}
+	if completed != 2 {
+		t.Fatalf("completed rollup jobs = %d, want 2", completed)
+	}
+
+	var hourlyRows int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM team_billing_usage_hourly
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+	`, teamA, teamB, hourStart).Scan(&hourlyRows); err != nil {
+		t.Fatalf("count hourly usage rows: %v", err)
+	}
+	if hourlyRows != 2 {
+		t.Fatalf("hourly usage rows = %d, want 2", hourlyRows)
+	}
+}
+
+func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	staleLockedUntil := time.Now().UTC().Add(-time.Minute)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-rollup-reclaim"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
+	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "running", "stale-worker", staleLockedUntil, 5)
+	if _, err := billing.EnqueueHourForTest(ctx, testPool, hourStart, hourEnd); err != nil {
+		t.Fatalf("enqueue hour with stale running job: %v", err)
+	}
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	jobs, err := billing.ClaimJobsForTest(ctx, testPool, cfg, "replacement-worker")
+	if err != nil {
+		t.Fatalf("claim stale rollup job: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(jobs))
+	}
+	if jobs[0].ID != jobID {
+		t.Fatalf("claimed job id = %s, want %s", jobs[0].ID, jobID)
+	}
+
+	var status, lockedBy string
+	var attemptCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, locked_by, attempt_count
+		FROM billing_rollup_job
+		WHERE id = $1
+	`, jobID).Scan(&status, &lockedBy, &attemptCount); err != nil {
+		t.Fatalf("read claimed stale job: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status = %q, want running", status)
+	}
+	if lockedBy != "replacement-worker" {
+		t.Fatalf("locked_by = %q, want replacement-worker", lockedBy)
+	}
+	if attemptCount != 5 {
+		t.Fatalf("attempt_count = %d, want 5", attemptCount)
+	}
+}
+
+func TestIntegration_BillingRollupSchedulerPreservesPendingRetryBackoff(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	nextAttemptAt := time.Now().UTC().Add(30 * time.Minute)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-preserve-backoff"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_rollup_job (
+			team_id, hour_start, hour_end, status, attempt_count, next_attempt_at, last_error
+		)
+		VALUES ($1, $2, $3, 'pending', 2, $4, 'temporary failure')
+	`, teamID, hourStart, hourEnd, nextAttemptAt); err != nil {
+		t.Fatalf("insert pending retry job: %v", err)
+	}
+	if _, err := billing.EnqueueHourForTest(ctx, testPool, hourStart, hourEnd); err != nil {
+		t.Fatalf("enqueue hour with pending retry job: %v", err)
+	}
+
+	var gotNextAttemptAt time.Time
+	var gotLastError string
+	var gotAttemptCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT next_attempt_at, last_error, attempt_count
+		FROM billing_rollup_job
+		WHERE team_id = $1 AND hour_start = $2
+	`, teamID, hourStart).Scan(&gotNextAttemptAt, &gotLastError, &gotAttemptCount); err != nil {
+		t.Fatalf("read pending retry job: %v", err)
+	}
+	if gotNextAttemptAt.Before(nextAttemptAt.Add(-time.Second)) {
+		t.Fatalf("next_attempt_at = %s, want preserved near %s", gotNextAttemptAt, nextAttemptAt)
+	}
+	if gotLastError != "temporary failure" {
+		t.Fatalf("last_error = %q, want preserved", gotLastError)
+	}
+	if gotAttemptCount != 2 {
+		t.Fatalf("attempt_count = %d, want 2", gotAttemptCount)
+	}
+}
+
+func TestIntegration_BillingRollupBackfillDoesNotRestartAfterCatchUp(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	now := time.Now().UTC().Truncate(time.Hour)
+	rollingStart := now.Add(-23 * time.Hour)
+	backfillStart := now.Add(-72 * time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_rollup_backfill_state (name, next_hour_start)
+		VALUES ('hourly', $1)
+		ON CONFLICT (name) DO UPDATE
+		SET next_hour_start = EXCLUDED.next_hour_start
+	`, rollingStart); err != nil {
+		t.Fatalf("seed caught-up backfill cursor: %v", err)
+	}
+
+	hours, err := billing.NextBackfillHoursForTest(ctx, testPool, backfillStart, rollingStart, 24)
+	if err != nil {
+		t.Fatalf("read next backfill hours: %v", err)
+	}
+	if len(hours) != 0 {
+		t.Fatalf("backfill hours = %d, want 0 after catch-up", len(hours))
+	}
+
+	var cursor time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT next_hour_start
+		FROM billing_rollup_backfill_state
+		WHERE name = 'hourly'
+	`).Scan(&cursor); err != nil {
+		t.Fatalf("read backfill cursor: %v", err)
+	}
+	if !cursor.Equal(rollingStart) {
+		t.Fatalf("cursor = %s, want preserved at %s", cursor, rollingStart)
+	}
+}
+
+func TestIntegration_BillingRollupBackfillCursorAdvancesAfterEnqueue(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+	backfillStart := now.Add(-48 * time.Hour)
+	firstHourEnd := backfillStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-backfill-cursor"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, backfillStart.Add(5*time.Second), backfillStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_rollup_backfill_state (name, next_hour_start)
+		VALUES ('hourly', $1)
+		ON CONFLICT (name) DO UPDATE
+		SET next_hour_start = EXCLUDED.next_hour_start
+	`, backfillStart); err != nil {
+		t.Fatalf("seed backfill cursor: %v", err)
+	}
+
+	enqueued, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    1,
+	}, now)
+	if err != nil {
+		t.Fatalf("enqueue backfill: %v", err)
+	}
+	if enqueued == 0 {
+		t.Fatal("expected backfill to enqueue at least one job")
+	}
+
+	var cursor time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT next_hour_start
+		FROM billing_rollup_backfill_state
+		WHERE name = 'hourly'
+	`).Scan(&cursor); err != nil {
+		t.Fatalf("read backfill cursor: %v", err)
+	}
+	if !cursor.Equal(firstHourEnd) {
+		t.Fatalf("cursor = %s, want advanced to %s after successful enqueue", cursor, firstHourEnd)
+	}
+}
+
+func TestIntegration_BillingRollupBackfillEnqueuesBeforeRollingWindow(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+	oldHourStart := now.Add(-48 * time.Hour)
+	oldHourEnd := oldHourStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-backfill-old-hour"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, oldHourStart.Add(5*time.Second), oldHourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, oldHourStart.Add(5*time.Second), oldHourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
+	enqueued, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    72,
+	}, now)
+	if err != nil {
+		t.Fatalf("enqueue backfill: %v", err)
+	}
+	if enqueued == 0 {
+		t.Fatal("expected backfill to enqueue at least one old rollup job")
+	}
+
+	var jobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+		  AND hour_start = $2
+		  AND hour_end = $3
+	`, teamID, oldHourStart, oldHourEnd).Scan(&jobs); err != nil {
+		t.Fatalf("count backfilled jobs: %v", err)
+	}
+	if jobs != 1 {
+		t.Fatalf("backfilled jobs = %d, want 1", jobs)
+	}
+}
+
+func resetBillingRollupBackfillState(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `DELETE FROM billing_rollup_backfill_state WHERE name = 'hourly'`); err != nil {
+		t.Fatalf("reset billing rollup backfill state: %v", err)
+	}
+}
+
+func enableBillingHourlyRollups(t *testing.T, ctx context.Context, teamID uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_hourly_rollups', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing_hourly_rollups: %v", err)
+	}
+}
+
+func insertBillingRollupJob(
+	t *testing.T,
+	ctx context.Context,
+	teamID uuid.UUID,
+	hourStart time.Time,
+	hourEnd time.Time,
+	status string,
+	lockedBy string,
+	lockedUntil time.Time,
+	attemptCount int,
+) uuid.UUID {
+	t.Helper()
+
+	var jobID uuid.UUID
+	if status == "running" {
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO billing_rollup_job (
+				team_id, hour_start, hour_end, status, attempt_count,
+				locked_by, locked_until, next_attempt_at
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, now() - interval '1 minute')
+			RETURNING id
+		`, teamID, hourStart, hourEnd, status, attemptCount, lockedBy, lockedUntil).Scan(&jobID); err != nil {
+			t.Fatalf("insert running billing rollup job: %v", err)
+		}
+		return jobID
+	}
+
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO billing_rollup_job (
+			team_id, hour_start, hour_end, status, attempt_count, next_attempt_at
+		)
+		VALUES ($1, $2, $3, $4, $5, now() - interval '1 minute')
+		RETURNING id
+	`, teamID, hourStart, hourEnd, status, attemptCount).Scan(&jobID); err != nil {
+		t.Fatalf("insert billing rollup job: %v", err)
+	}
+	return jobID
+}
+
+func TestIntegration_TeamCreditLedgerRejectsCrossTeamGrant(t *testing.T) {
+	ctx := context.Background()
+	grantTeamID, _ := seedTeamAndKey(t)
+	ledgerTeamID, _ := seedTeamAndKey(t)
+
+	var grantID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO team_credit_grant (
+			team_id, amount_usd, remaining_usd, reason
+		)
+		VALUES ($1, 10.00, 10.00, 'test grant')
+		RETURNING id
+	`, grantTeamID).Scan(&grantID); err != nil {
+		t.Fatalf("insert credit grant: %v", err)
+	}
+
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_ledger (
+			team_id, grant_id, amount_usd, reason
+		)
+		VALUES ($1, $2, -1.00, 'cross-team attribution should fail')
+	`, ledgerTeamID, grantID)
+	if err == nil {
+		t.Fatal("expected cross-team credit ledger grant reference to fail")
 	}
 }
 
