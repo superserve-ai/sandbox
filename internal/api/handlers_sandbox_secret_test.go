@@ -283,7 +283,12 @@ func TestAttachSandboxSecret_EnvKeyCollision_Conflict(t *testing.T) {
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusActive, HostID: "host-1"}
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "GetSecretByName") {
+				return secretRow(db.Secret{ID: uuid.New(), TeamID: teamID, Name: "anthropic-prod", AuthType: "bearer"})
+			}
+			return sandboxRow(sb)
+		},
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			return &scanRows{rows: []func(...any) error{bindingRow("ANTHROPIC_API_KEY", "other")}}, nil
 		},

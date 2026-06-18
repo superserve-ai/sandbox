@@ -30,6 +30,13 @@ func lockSandboxSecrets(sandboxID uuid.UUID) func() {
 	return mu.Unlock
 }
 
+// Sentinels so the attach insert (run inside a transaction) can map validation
+// outcomes back to HTTP statuses after the transaction closes.
+var (
+	errBindingExists     = errors.New("env key already bound on sandbox")
+	errBindingCapReached = errors.New("sandbox binding cap reached")
+)
+
 type attachSecretRequest struct {
 	EnvKey     string `json:"env_key"`
 	SecretName string `json:"secret_name"`
@@ -81,23 +88,6 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		return
 	}
 
-	existing, err := h.DB.ListSandboxSecretBindings(ctx, sandboxID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListSandboxSecretBindings during attach")
-		respondError(c, ErrInternal)
-		return
-	}
-	for _, b := range existing {
-		if b.EnvKey == req.EnvKey {
-			respondErrorMsg(c, "conflict", fmt.Sprintf("env-var key %q is already bound on this sandbox", req.EnvKey), http.StatusConflict)
-			return
-		}
-	}
-	if len(existing) >= SecretsBindingsCap {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("sandbox already has the max %d secret bindings", SecretsBindingsCap), http.StatusBadRequest)
-		return
-	}
-
 	secret, err := h.DB.GetSecretByName(ctx, db.GetSecretByNameParams{TeamID: teamID, Name: req.SecretName})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -115,12 +105,55 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		return
 	}
 
-	if err := h.DB.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
-		SandboxID:  sandboxID,
-		SecretID:   secret.ID,
-		EnvKey:     req.EnvKey,
-		ProxyToken: &token,
-	}); err != nil {
+	// Check the cap and insert under a transaction-scoped advisory lock so two
+	// attaches to the same sandbox on different API instances can't both pass the
+	// cap and exceed it — which would later wedge re-minting. The in-process lock
+	// only covers one instance. Env-key collisions are caught by the PK.
+	insertBinding := func(q *db.Queries) error {
+		if h.Pool != nil {
+			if lerr := q.LockSandboxForSecretWrites(ctx, sandboxID.String()); lerr != nil {
+				return lerr
+			}
+		}
+		existing, lerr := q.ListSandboxSecretBindings(ctx, sandboxID)
+		if lerr != nil {
+			return lerr
+		}
+		for _, b := range existing {
+			if b.EnvKey == req.EnvKey {
+				return errBindingExists
+			}
+		}
+		if len(existing) >= SecretsBindingsCap {
+			return errBindingCapReached
+		}
+		return q.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+			SandboxID:  sandboxID,
+			SecretID:   secret.ID,
+			EnvKey:     req.EnvKey,
+			ProxyToken: &token,
+		})
+	}
+
+	if h.Pool == nil {
+		err = insertBinding(h.DB)
+	} else {
+		var tx pgx.Tx
+		if tx, err = h.Pool.Begin(ctx); err == nil {
+			defer tx.Rollback(ctx)
+			if err = insertBinding(h.DB.WithTx(tx)); err == nil {
+				err = tx.Commit(ctx)
+			}
+		}
+	}
+	switch {
+	case errors.Is(err, errBindingExists):
+		respondErrorMsg(c, "conflict", fmt.Sprintf("env-var key %q is already bound on this sandbox", req.EnvKey), http.StatusConflict)
+		return
+	case errors.Is(err, errBindingCapReached):
+		respondErrorMsg(c, "bad_request", fmt.Sprintf("sandbox already has the max %d secret bindings", SecretsBindingsCap), http.StatusBadRequest)
+		return
+	case err != nil:
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("insert sandbox secret binding")
 		respondError(c, ErrInternal)
 		return

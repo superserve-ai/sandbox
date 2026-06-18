@@ -696,6 +696,17 @@ func (q *Queries) ListSecretsForTeam(ctx context.Context, teamID uuid.UUID) ([]S
 	return items, nil
 }
 
+const lockSandboxForSecretWrites = `-- name: LockSandboxForSecretWrites :exec
+SELECT pg_advisory_xact_lock(hashtext($1)::bigint)
+`
+
+// Transaction-scoped advisory lock keyed on the sandbox so the binding-count cap
+// check and insert serialize across API instances, not just the in-process lock.
+func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext string) error {
+	_, err := q.db.Exec(ctx, lockSandboxForSecretWrites, hashtext)
+	return err
+}
+
 const softDeleteSecret = `-- name: SoftDeleteSecret :one
 UPDATE secret
 SET deleted_at = now(), updated_at = now()

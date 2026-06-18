@@ -54,6 +54,11 @@ SET deleted_at = now(), updated_at = now()
 WHERE team_id = $1 AND name = $2 AND deleted_at IS NULL
 RETURNING *;
 
+-- name: LockSandboxForSecretWrites :exec
+-- Transaction-scoped advisory lock keyed on the sandbox so the binding-count cap
+-- check and insert serialize across API instances, not just the in-process lock.
+SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
+
 -- name: AddSandboxSecret :exec
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
 VALUES ($1, $2, $3, $4);
