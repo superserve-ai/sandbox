@@ -718,54 +718,6 @@ func (q *Queries) ListTeamCreditGrants(ctx context.Context, teamID uuid.UUID) ([
 	return items, nil
 }
 
-const listTeamsForHourlyBillingRollup = `-- name: ListTeamsForHourlyBillingRollup :many
-SELECT DISTINCT team_id
-FROM (
-    SELECT i.team_id
-    FROM sandbox_compute_billing_interval i
-    WHERE i.started_at < $1
-      AND $2 < LEAST(now(), $1)
-      AND COALESCE(i.ended_at, LEAST(now(), $1)) > $2
-
-    UNION
-
-    SELECT i.team_id
-    FROM sandbox_storage_interval i
-    WHERE i.started_at < $1
-      AND $2 < LEAST(now(), $1)
-      AND COALESCE(i.ended_at, LEAST(now(), $1)) > $2
-) billing_teams
-WHERE feature_enabled('billing_hourly_rollups', billing_teams.team_id)
-ORDER BY team_id
-`
-
-type ListTeamsForHourlyBillingRollupParams struct {
-	HourEnd   time.Time   `json:"hour_end"`
-	HourStart interface{} `json:"hour_start"`
-}
-
-// Teams with raw billing intervals overlapping an hour. The feature flag keeps
-// rollout tenant-scoped while avoiding scans over teams with no recent usage.
-func (q *Queries) ListTeamsForHourlyBillingRollup(ctx context.Context, arg ListTeamsForHourlyBillingRollupParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listTeamsForHourlyBillingRollup, arg.HourEnd, arg.HourStart)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []uuid.UUID{}
-	for rows.Next() {
-		var team_id uuid.UUID
-		if err := rows.Scan(&team_id); err != nil {
-			return nil, err
-		}
-		items = append(items, team_id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listUnresolvedBillingPeriodAnomalies = `-- name: ListUnresolvedBillingPeriodAnomalies :many
 SELECT id, team_id, period_start, period_end, severity, kind, sandbox_id, details, detected_at, resolved_at, resolved_by
 FROM billing_period_anomaly

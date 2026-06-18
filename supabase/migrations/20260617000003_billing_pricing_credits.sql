@@ -38,8 +38,7 @@ CREATE TABLE pricing_rate (
 );
 
 CREATE INDEX idx_pricing_rate_active
-    ON pricing_rate(plan_key, resource, unit, effective_from DESC)
-    WHERE effective_to IS NULL;
+    ON pricing_rate(plan_key, resource, unit, effective_from DESC);
 
 CREATE TABLE team_pricing_plan (
     team_id         uuid NOT NULL REFERENCES team(id),

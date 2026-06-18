@@ -278,7 +278,14 @@ SET hour_end = EXCLUDED.hour_end,
     completed_at = NULL,
     updated_at = now()
 WHERE billing_rollup_job.status = 'pending'
-   OR ($3::boolean AND billing_rollup_job.status = 'completed')`
+   OR (
+       $3::boolean
+       AND billing_rollup_job.status = 'completed'
+       AND (
+           billing_rollup_job.hour_end > now()
+           OR billing_rollup_job.completed_at < now() - interval '1 hour'
+       )
+   )`
 
 	tag, err := pool.Exec(ctx, query, hourStart, hourEnd, refreshCompleted)
 	return tag.RowsAffected(), err
@@ -313,6 +320,12 @@ func enqueueBackfill(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupCo
 	}
 
 	if err := advanceBackfillCursor(ctx, pool, hours[0], hours[len(hours)-1].Add(time.Hour)); err != nil {
+		log.Warn().
+			Err(err).
+			Int64("jobs_enqueued", total).
+			Time("from_hour", hours[0]).
+			Time("to_hour", hours[len(hours)-1].Add(time.Hour)).
+			Msg("advance billing rollup backfill cursor failed after enqueue")
 		return total, err
 	}
 	return total, nil
@@ -491,7 +504,7 @@ func normalizeConfig(cfg HourlyRollupConfig) HourlyRollupConfig {
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultHourlyRollupMaxAttempts
 	}
-	if cfg.Workers < 0 {
+	if cfg.Workers <= 0 {
 		cfg.Workers = defaultHourlyRollupWorkers
 	}
 	return cfg

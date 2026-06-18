@@ -152,29 +152,6 @@ UNION ALL
 SELECT * FROM immutable_existing
 LIMIT 1;
 
--- name: ListTeamsForHourlyBillingRollup :many
--- Teams with raw billing intervals overlapping an hour. The feature flag keeps
--- rollout tenant-scoped while avoiding scans over teams with no recent usage.
-SELECT DISTINCT team_id
-FROM (
-    SELECT i.team_id
-    FROM sandbox_compute_billing_interval i
-    WHERE i.started_at < sqlc.arg(hour_end)
-      AND sqlc.arg(hour_start) < LEAST(now(), sqlc.arg(hour_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
-
-    UNION
-
-    SELECT i.team_id
-    FROM sandbox_storage_interval i
-    WHERE i.started_at < sqlc.arg(hour_end)
-      AND sqlc.arg(hour_start) < LEAST(now(), sqlc.arg(hour_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
-) billing_teams
-WHERE feature_enabled('billing_hourly_rollups', billing_teams.team_id)
-ORDER BY team_id;
-
-
 -- name: UpsertTeamBillingUsageHour :one
 WITH compute AS (
     SELECT

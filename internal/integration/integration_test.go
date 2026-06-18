@@ -738,15 +738,28 @@ func TestIntegration_PricingRatesUseNewestEffectiveVersion(t *testing.T) {
 	if len(rates) != 3 {
 		t.Fatalf("rates length = %d, want 3", len(rates))
 	}
+	wantPrices := map[string]float64{
+		"vcpu":        0.000022,
+		"memory_gib":  0.0000045,
+		"storage_gib": 0.00000003,
+	}
+	seen := map[string]bool{}
 	for _, rate := range rates {
-		if rate.Resource == "vcpu" {
-			if got := numericFloat64(t, rate.PriceUsd); got != 0.000022 {
-				t.Fatalf("vcpu price = %v, want newest effective price", got)
-			}
-			return
+		want, ok := wantPrices[rate.Resource]
+		if !ok {
+			t.Errorf("unexpected pricing resource %q", rate.Resource)
+			continue
+		}
+		seen[rate.Resource] = true
+		if got := numericFloat64(t, rate.PriceUsd); got != want {
+			t.Errorf("%s price = %v, want %v", rate.Resource, got, want)
 		}
 	}
-	t.Fatal("missing vcpu pricing rate")
+	for resource := range wantPrices {
+		if !seen[resource] {
+			t.Errorf("missing pricing rate for %s", resource)
+		}
+	}
 }
 
 func TestIntegration_PricingRatesForPlanAtUseRequestedTime(t *testing.T) {
@@ -776,15 +789,28 @@ func TestIntegration_PricingRatesForPlanAtUseRequestedTime(t *testing.T) {
 	if len(rates) != 3 {
 		t.Fatalf("rates length = %d, want 3", len(rates))
 	}
+	wantPrices := map[string]float64{
+		"vcpu":        0.000011,
+		"memory_gib":  0.0000045,
+		"storage_gib": 0.00000003,
+	}
+	seen := map[string]bool{}
 	for _, rate := range rates {
-		if rate.Resource == "vcpu" {
-			if got := numericFloat64(t, rate.PriceUsd); got != 0.000011 {
-				t.Fatalf("vcpu price = %v, want price effective at requested time", got)
-			}
-			return
+		want, ok := wantPrices[rate.Resource]
+		if !ok {
+			t.Errorf("unexpected pricing resource %q", rate.Resource)
+			continue
+		}
+		seen[rate.Resource] = true
+		if got := numericFloat64(t, rate.PriceUsd); got != want {
+			t.Errorf("%s price = %v, want %v", rate.Resource, got, want)
 		}
 	}
-	t.Fatal("missing vcpu pricing rate")
+	for resource := range wantPrices {
+		if !seen[resource] {
+			t.Errorf("missing pricing rate for %s", resource)
+		}
+	}
 }
 
 func TestIntegration_InactiveTeamPricingPlanFallsBackToPayg(t *testing.T) {
