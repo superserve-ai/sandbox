@@ -278,3 +278,37 @@ func TestFileDownload_Zip_SymlinkEscapeNotArchived(t *testing.T) {
 		t.Errorf("ok.txt should be archived (entries: %v)", zipEntryNames(entries))
 	}
 }
+
+// A top-level requested path that is itself a symlink to a directory must be
+// refused for a ZIP download. handleFileDownload's os.Stat (dir-vs-file) and a
+// plain os.OpenRoot both follow the final-component symlink, so a request for
+// "export" where export -> outsideDir would otherwise make the archive root the
+// symlink target — escaping the requested directory and bypassing safePath's
+// blocklist. The request must be rejected and the target's contents must never
+// appear in any archive.
+func TestFileDownload_Zip_TopLevelSymlinkRejected(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("TOPSECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parent := t.TempDir()
+	link := filepath.Join(parent, "export")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unsupported on this platform: %v", err)
+	}
+
+	w := zipFilesGet(t, link, "zip")
+
+	// Whatever the status, the symlink target's contents must never stream back.
+	if w.Code == http.StatusOK {
+		entries := readZipEntries(t, w.Body.Bytes())
+		for name, data := range entries {
+			if strings.Contains(string(data), "TOPSECRET") {
+				t.Fatalf("top-level symlink escape: secret leaked via entry %q", name)
+			}
+		}
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (refused top-level symlink); body %s", w.Code, w.Body.String())
+	}
+}

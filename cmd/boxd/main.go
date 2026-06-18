@@ -909,17 +909,47 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 // whole download. Entries are written as the walk proceeds — constant memory,
 // no temp file.
 func serveDirAsZip(w http.ResponseWriter, dirPath string) {
-	// Anchor every subsequent open to this directory. Opening the root also
-	// validates the directory before we commit a 200 + headers.
-	root, err := os.OpenRoot(dirPath)
+	// Open the requested directory WITHOUT following a symlink at its final
+	// component. handleFileDownload's os.Stat and a plain os.OpenRoot(dirPath)
+	// both follow a symlink at dirPath, so a request for "/home/user/export"
+	// where export -> /etc (or /, /proc) would make the archive root the symlink
+	// target — escaping the requested directory and bypassing safePath's
+	// blocklist. Anchor at the parent and reach the leaf through the parent's
+	// Root: a no-follow Lstat refuses a symlinked leaf, and Root.OpenRoot
+	// resolves it relative to the parent's open fd, so there is no
+	// Lstat-then-open TOCTOU window and a leaf swapped for an escaping symlink is
+	// rejected rather than followed.
+	parent, err := os.OpenRoot(filepath.Dir(dirPath))
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		return
+	}
+	defer parent.Close()
+
+	base := filepath.Base(dirPath)
+	if li, err := parent.Lstat(base); err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		} else {
+			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+			http.Error(w, string(errJSON), http.StatusInternalServerError)
+		}
+		return
+	} else if li.Mode()&fs.ModeSymlink != 0 {
+		http.Error(w, `{"error":"refusing to archive a symlinked directory"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Anchor every subsequent open to the real directory. OpenRoot also
+	// validates it before we commit a 200 + headers and confines the walk.
+	root, err := parent.OpenRoot(base)
 	if err != nil {
 		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
 	defer root.Close()
-
-	base := filepath.Base(dirPath)
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipDownloadFilename(base)))
 
