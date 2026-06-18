@@ -408,6 +408,18 @@ func TestDetachSandboxSecret_Paused_NoInject(t *testing.T) {
 	}
 }
 
+func TestAttachSandboxSecret_NoSignerReturns500(t *testing.T) {
+	// With an encryptor but no signer, a binding can never be minted into a JWT,
+	// so attach must reject up front (active or paused) rather than bank it.
+	teamID := uuid.New()
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(&mockDBTX{}), Encryptor: noopEncryptor{}, Signer: nil}
+	w := httptest.NewRecorder()
+	setupSecretRouter(h, teamID.String()).ServeHTTP(w, attachReq(uuid.New().String(), `{"env_key":"ANTHROPIC_API_KEY","secret_name":"anthropic-prod"}`))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestLoadSecretBindingMeta_PersistsMintedTokenForLegacyRow(t *testing.T) {
 	sandboxID := uuid.New()
 	secretID := uuid.New()

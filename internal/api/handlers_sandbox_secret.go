@@ -49,6 +49,14 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	if !h.requireEncryptor(c) {
 		return
 	}
+	// A binding can only be honored once it's minted into a JWT (now if active, on
+	// resume if paused). Reject up front when no signer is configured rather than
+	// bank a paused binding that would later fail to mint.
+	if h.Signer == nil {
+		log.Error().Msg("secret attach requested but no secrets signer configured")
+		respondError(c, ErrInternal)
+		return
+	}
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
