@@ -190,54 +190,58 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		return
 	}
 
-	deleted, err := h.DB.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
+	// Delete the binding and revoke its token in one transaction, on a detached
+	// context so a client disconnect can't half-commit. A 204 therefore guarantees
+	// the detached token is recorded as revoked — the proxy refuses it on its next
+	// poll regardless of the live re-mint below.
+	mutCtx, mutCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer mutCancel()
+
+	deleteAndRevoke := func(q *db.Queries) error {
+		deleted, derr := q.DeleteSandboxSecretBinding(mutCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
+		if derr != nil {
+			return derr
+		}
+		if deleted.ProxyToken == "" {
+			return nil
+		}
+		return q.InsertRevokedProxyToken(mutCtx, db.InsertRevokedProxyTokenParams{
+			SandboxID:  sandboxID,
+			ProxyToken: deleted.ProxyToken,
+			ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
+		})
+	}
+
+	if h.Pool == nil {
+		// No pool (DBTX-mocked unit tests): run the two writes directly.
+		err = deleteAndRevoke(h.DB)
+	} else {
+		var tx pgx.Tx
+		if tx, err = h.Pool.Begin(mutCtx); err == nil {
+			defer tx.Rollback(mutCtx)
+			if err = deleteAndRevoke(h.DB.WithTx(tx)); err == nil {
+				err = tx.Commit(mutCtx)
+			}
+		}
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			respondErrorMsg(c, "not_found", fmt.Sprintf("no secret bound under env-var key %q on this sandbox", envKey), http.StatusNotFound)
 			return
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("delete sandbox secret binding")
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("detach secret binding")
 		respondError(c, ErrInternal)
 		return
 	}
 
-	// A running sandbox is updated now; a paused one picks it up on resume. Fail
-	// closed: restore the row if the reduced set can't be re-minted/injected.
+	// Re-mint the reduced set so a running sandbox's new processes stop seeing the
+	// stand-in var; a paused one re-mints on resume. Best-effort: the revocation
+	// above already enforces the detach, so a re-mint failure is not fatal.
 	if sandbox.Status == db.SandboxStatusActive {
-		meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID)
-		if lerr == nil {
-			lerr = h.applySecretBindings(ctx, sandbox, meta)
-		}
-		if lerr != nil {
-			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("apply secret bindings on detach")
-			// Restore on a detached context: a client disconnect may be what failed
-			// the apply, so the compensating write must not ride the same cancelled
-			// context — otherwise the binding is gone but the live JWT still honors it.
-			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer rbCancel()
-			_ = h.DB.AddSandboxSecret(rbCtx, db.AddSandboxSecretParams{
-				SandboxID:  sandboxID,
-				SecretID:   deleted.SecretID,
-				EnvKey:     envKey,
-				ProxyToken: deleted.ProxyToken,
-			})
-			respondError(c, ErrInternal)
-			return
-		}
-	}
-
-	// Record the detached token as revoked so the proxy refuses it for a process
-	// still holding the old JWT. Detached from the request context so a client
-	// disconnect mid-call doesn't skip the write.
-	if deleted.ProxyToken != "" {
-		revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer revokeCancel()
-		if err := h.DB.InsertRevokedProxyToken(revokeCtx, db.InsertRevokedProxyTokenParams{
-			SandboxID:  sandboxID,
-			ProxyToken: deleted.ProxyToken,
-			ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
-		}); err != nil {
-			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertRevokedProxyToken failed")
+		if meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID); lerr != nil {
+			log.Warn().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings after detach")
+		} else if aerr := h.applySecretBindings(ctx, sandbox, meta); aerr != nil {
+			log.Warn().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("re-mint secret bindings after detach")
 		}
 	}
 

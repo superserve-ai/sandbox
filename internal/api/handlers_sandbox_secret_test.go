@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -419,6 +420,37 @@ func TestDetachSandboxSecret_BindingNotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDetachSandboxSecret_RevocationFailureReturns500(t *testing.T) {
+	// Fail closed: if the token can't be recorded as revoked, detach must not
+	// report success — otherwise a running process keeps the detached credential.
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusPaused, HostID: "host-1"}
+	tok := "ssrv_proxy_gone"
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "DeleteSandboxSecretBinding") {
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = uuid.New()
+					*dest[1].(*string) = tok
+					return nil
+				}}
+			}
+			return sandboxRow(sb)
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.CommandTag{}, errors.New("insert revoked token failed")
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Encryptor: noopEncryptor{}, Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupSecretRouter(h, teamID.String()).ServeHTTP(w, detachReq(sandboxID.String(), "ANTHROPIC_API_KEY"))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
 	}
 }
 
