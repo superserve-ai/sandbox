@@ -434,8 +434,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
-	// per-binding proxy tokens are in the snapshot.
+	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
+	// tokens as they were at pause; the current binding set is re-applied below
+	// once the VM is up, so a mutation made while paused takes effect.
 	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 	if err != nil {
 		if isVMDNotFound(err) {
@@ -523,6 +524,25 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		pauseAndRevert()
 		respondError(c, ErrInternal)
 		return false
+	}
+
+	// Re-apply the current binding set before committing to 'active', so a secret
+	// attached or detached while paused takes effect — the snapshot froze the old
+	// JWT. Skipped when there are no bindings, keeping the secret-less resume a
+	// single round trip. The fresh IP binds the re-minted JWT.
+	sandbox.IpAddress = ipAddr
+	if meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID); merr != nil {
+		log.Error().Err(merr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings on resume failed")
+		pauseAndRevert()
+		respondError(c, ErrInternal)
+		return false
+	} else if len(meta) > 0 {
+		if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
+			log.Error().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("reapply secret bindings on resume failed")
+			pauseAndRevert()
+			respondError(c, ErrInternal)
+			return false
+		}
 	}
 
 	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{

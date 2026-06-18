@@ -616,6 +616,63 @@ func TestResumeSandbox_Success(t *testing.T) {
 	}
 }
 
+func TestResumeSandbox_ReappliesSecretBindings(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	secretID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	var injectedJWT string
+	var injectCalled bool
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string) (string, error) { return "10.0.0.5", nil },
+		injectEnvFn: func(_ context.Context, _ string, _ map[string]string, jwt string) error {
+			injectCalled, injectedJWT = true, jwt
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "ListSandboxSecretBindingMeta") {
+				return &scanRows{rows: []func(...any) error{bindingMetaRow(secretID, "ANTHROPIC_API_KEY", "bearer", "ssrv_proxy_x")}}, nil
+			}
+			return &scanRows{}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if !injectCalled {
+		t.Fatal("resume must re-apply the binding set when the sandbox has bindings")
+	}
+	if injectedJWT == "" {
+		t.Error("re-applied JWT should be signed for a non-empty binding set")
+	}
+}
+
 func TestResumeSandbox_InvalidUUID(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
