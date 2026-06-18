@@ -396,10 +396,10 @@ paths:
       tags: [Sandboxes]
       summary: Detach a secret from a sandbox
       description: |
-        Removes a secret binding from an existing sandbox. New processes no
-        longer see the stand-in token, and a process already running loses the
-        credential's access within about a minute. A paused sandbox applies the
-        change on resume.
+        Removes a secret binding from an existing sandbox and revokes its
+        stand-in token, so requests that use it are refused — for an
+        already-running process, within about a minute. A paused sandbox applies
+        the change on resume.
       security:
         - apiKey: []
       responses:
