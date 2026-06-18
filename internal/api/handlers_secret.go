@@ -879,19 +879,33 @@ func (h *Handlers) fanoutInvalidate(ctx context.Context, secretID uuid.UUID) {
 	wg.Wait()
 }
 
-// ListSandboxRevocations returns the active sandbox-revocation set for daemon bootstrap.
+// ListSandboxRevocations returns the active revocation set for daemon bootstrap:
+// whole sandboxes and individual detached proxy tokens.
 func (h *Handlers) ListSandboxRevocations(c *gin.Context) {
-	rows, err := h.DB.ListActiveSandboxRevocations(c.Request.Context())
+	ctx := c.Request.Context()
+	rows, err := h.DB.ListActiveSandboxRevocations(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("DB ListActiveSandboxRevocations failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	out := make([]string, 0, len(rows))
+	sandboxes := make([]string, 0, len(rows))
 	for _, id := range rows {
-		out = append(out, id.String())
+		sandboxes = append(sandboxes, id.String())
 	}
-	c.JSON(http.StatusOK, gin.H{"sandboxes": out})
+
+	tokenRows, err := h.DB.ListActiveRevokedProxyTokens(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("DB ListActiveRevokedProxyTokens failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	tokens := make([]gin.H, 0, len(tokenRows))
+	for _, t := range tokenRows {
+		tokens = append(tokens, gin.H{"sandbox_id": t.SandboxID.String(), "proxy_token": t.ProxyToken})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"sandboxes": sandboxes, "proxy_tokens": tokens})
 }
 
 // GetSandboxEgressRules serves a sandbox's current egress rules to the secrets

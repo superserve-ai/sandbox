@@ -346,6 +346,9 @@ func TestDetachSandboxSecret_Active_Success(t *testing.T) {
 			}
 		},
 		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) { return &scanRows{}, nil },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock), Encryptor: noopEncryptor{}, Signer: newTestSigner(t, "v1")}
@@ -384,6 +387,9 @@ func TestDetachSandboxSecret_Paused_NoInject(t *testing.T) {
 			default:
 				return activityRow()
 			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
 		},
 	}
 

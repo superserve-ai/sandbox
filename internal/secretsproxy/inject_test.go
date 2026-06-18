@@ -116,7 +116,7 @@ func TestBearerInjectionEndToEnd(t *testing.T) {
 		"User-Agent":    "agent/1.0",
 	})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,6 +131,38 @@ func TestBearerInjectionEndToEnd(t *testing.T) {
 	}
 	if req.Header.Get("User-Agent") != "agent/1.0" {
 		t.Errorf("unrelated headers should pass through")
+	}
+}
+
+func TestInjectionRefusesRevokedProxyToken(t *testing.T) {
+	binding := Binding{
+		SecretID:   "sec-anthropic",
+		EnvKey:     "ANTHROPIC_API_KEY",
+		AuthType:   "bearer",
+		AuthConfig: map[string]any{},
+		Hosts:      []string{"api.anthropic.com"},
+	}
+	st := sandboxWithBindings(map[string]Binding{"proxy-tok-anth": binding})
+	vault := &stubVault{values: map[string]string{"sec-anthropic": "sk-ant-REAL-KEY"}}
+
+	req := newReq("POST", "api.anthropic.com", map[string]string{
+		"Authorization": "Bearer proxy-tok-anth",
+	})
+
+	revoked := func(tok string) bool { return tok == "proxy-tok-anth" }
+	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com", nil, EgressRules{}, revoked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Action != revokedAction {
+		t.Fatalf("want revoked, got %+v", out)
+	}
+	if out.Reason != "proxy_token_revoked" {
+		t.Errorf("reason = %q, want proxy_token_revoked", out.Reason)
+	}
+	// The stand-in token must NOT be swapped for the real credential.
+	if got := req.Header.Get("Authorization"); got != "Bearer proxy-tok-anth" {
+		t.Errorf("revoked request must not be swapped: got %q", got)
 	}
 }
 
@@ -151,7 +183,7 @@ func TestBasicInjectionMatchesPasswordAndPreservesUser(t *testing.T) {
 		"Authorization": clientAuth,
 	})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "yoursite.atlassian.net", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "yoursite.atlassian.net", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +208,7 @@ func TestBasicMatchRejectsWrongPassword(t *testing.T) {
 	wrong := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:other-tok"))
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": wrong})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +232,7 @@ func TestBasicInjectionFallsBackToXUserWhenAgentSendsNoUser(t *testing.T) {
 
 	emptyUser := "Basic " + base64.StdEncoding.EncodeToString([]byte(":"+tok))
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": emptyUser})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{}, nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -249,7 +281,7 @@ func TestAPIKeyInjectionUsesConfiguredHeader(t *testing.T) {
 	req := newReq("POST", "api.anthropic.com", map[string]string{
 		"x-api-key": "sk-ant-proxy-aaa",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.anthropic.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +304,7 @@ func TestAPIKeyInjectionWithPrefix(t *testing.T) {
 	vault := &stubVault{values: map[string]string{"sec-x": "REAL"}}
 
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": "ApiKey prox-tok"})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +334,7 @@ func TestCustomInjectionSetsMultipleHeaders(t *testing.T) {
 	req := newReq("POST", "api.acme.internal", map[string]string{
 		"X-Api-Key": "Bearer proxy-acme",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.acme.internal", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.acme.internal", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +365,7 @@ func TestStripThenSetStripsClientPlantedHeader(t *testing.T) {
 	})
 	req.Header.Add("Authorization", "Bearer planted-evil-key")
 
-	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +393,7 @@ func TestCustomTemplateRejectsCRLFInResolvedValue(t *testing.T) {
 	vault := &stubVault{values: map[string]string{"sec-bad": "innocent\r\nX-Evil: planted"}}
 
 	req := newReq("GET", "api.bad.example", map[string]string{"X-Token": "Bearer proxy-bad"})
-	_, err := injectRequest(context.Background(), st, vault, req, "api.bad.example", nil, EgressRules{})
+	_, err := injectRequest(context.Background(), st, vault, req, "api.bad.example", nil, EgressRules{}, nil)
 	if err == nil {
 		t.Fatal("want CRLF-guard error")
 	}
@@ -374,7 +406,7 @@ func TestNoMatchingBindingFallsThroughToPassthrough(t *testing.T) {
 	req := newReq("GET", "api.openai.com", map[string]string{
 		"Authorization": "Bearer client-managed-key",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.openai.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +431,7 @@ func TestCredentialHostMismatchDenied(t *testing.T) {
 	req := newReq("POST", "evil.example.com", map[string]string{
 		"Authorization": "Bearer proxy-openai-aaa",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "evil.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "evil.example.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +457,7 @@ func TestRevokedCredentialSurfacesAsRevoked(t *testing.T) {
 	vault := &stubVault{err: ErrCredentialRevoked}
 
 	req := newReq("GET", "api.example.com", map[string]string{"Authorization": "Bearer proxy-tok"})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +592,7 @@ func TestPerHostDispatchPicksBearerForRESTHost(t *testing.T) {
 	req := newReq("GET", "api.github.com", map[string]string{
 		"Authorization": "Bearer " + proxyTok,
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.github.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.github.com", nil, EgressRules{}, nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -580,7 +612,7 @@ func TestPerHostDispatchPicksBasicForGitHost(t *testing.T) {
 	inbound := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+proxyTok))
 	req := newReq("GET", "github.com", map[string]string{"Authorization": inbound})
 
-	out, err := injectRequest(context.Background(), st, vault, req, "github.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "github.com", nil, EgressRules{}, nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -606,7 +638,7 @@ func TestPerHostBasicUsernameOverridesInbound(t *testing.T) {
 
 	inbound := "Basic " + base64.StdEncoding.EncodeToString([]byte("agent-picked:"+tok))
 	req := newReq("GET", "git.example.com", map[string]string{"Authorization": inbound})
-	out, err := injectRequest(context.Background(), st, vault, req, "git.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "git.example.com", nil, EgressRules{}, nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -636,7 +668,7 @@ func TestPerHostNoMatchingRuleDeniesAsHostMismatch(t *testing.T) {
 	req := newReq("GET", "raw.githubusercontent.com", map[string]string{
 		"Authorization": "Bearer " + tok,
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "raw.githubusercontent.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "raw.githubusercontent.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -659,13 +691,13 @@ func TestPerHostScannerMatchesBasicShapeOnRuleBindings(t *testing.T) {
 	vault := &stubVault{values: map[string]string{"sec-gh": "github_pat_REAL"}}
 
 	bearReq := newReq("GET", "api.github.com", map[string]string{"Authorization": "Bearer " + tok})
-	if out, _ := injectRequest(context.Background(), st, vault, bearReq, "api.github.com", nil, EgressRules{}); out.Action != "allow" {
+	if out, _ := injectRequest(context.Background(), st, vault, bearReq, "api.github.com", nil, EgressRules{}, nil); out.Action != "allow" {
 		t.Errorf("bearer-shaped request must match bearer rule, got %+v", out)
 	}
 
 	basicHdr := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+tok))
 	basicReq := newReq("GET", "github.com", map[string]string{"Authorization": basicHdr})
-	if out, _ := injectRequest(context.Background(), st, vault, basicReq, "github.com", nil, EgressRules{}); out.Action != "allow" {
+	if out, _ := injectRequest(context.Background(), st, vault, basicReq, "github.com", nil, EgressRules{}, nil); out.Action != "allow" {
 		t.Errorf("basic-shaped request must match basic rule, got %+v", out)
 	}
 }
@@ -704,7 +736,7 @@ func TestMultiBindingSwapsAllMatchedHeaders(t *testing.T) {
 		"X-Header-A": tokA,
 		"X-Header-B": tokB,
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{}, nil)
 	if err != nil || out.Action != "allow" {
 		t.Fatalf("want allow, got %+v err=%v", out, err)
 	}
@@ -737,7 +769,7 @@ func TestMultiBindingDeterministicOrder(t *testing.T) {
 			"Authorization": "Bearer proxy-A",
 			"X-B":           "proxy-B",
 		})
-		out, _ := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{})
+		out, _ := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{}, nil)
 		if len(out.MatchedSecretIDs) != 2 ||
 			out.MatchedSecretIDs[0] != "sec-A" || out.MatchedSecretIDs[1] != "sec-B" {
 			t.Fatalf("iteration %d: matched IDs not sorted: %v", i, out.MatchedSecretIDs)
@@ -769,7 +801,7 @@ func TestMultiBindingRevocationAbortsRequest(t *testing.T) {
 		"X-A": "proxy-A",
 		"X-B": "proxy-B",
 	})
-	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{})
+	out, err := injectRequest(context.Background(), st, vault, req, "api.example.com", nil, EgressRules{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

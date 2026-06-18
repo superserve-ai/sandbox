@@ -310,6 +310,13 @@ type ReconcilerLog struct {
 	CreatedAt time.Time   `json:"created_at"`
 }
 
+type RevokedProxyToken struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	ProxyToken string    `json:"proxy_token"`
+	RevokedAt  time.Time `json:"revoked_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
 type Sandbox struct {
 	ID            uuid.UUID          `json:"id"`
 	TeamID        uuid.UUID          `json:"team_id"`

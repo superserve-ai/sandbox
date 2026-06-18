@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -212,6 +214,21 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 			})
 			respondError(c, ErrInternal)
 			return
+		}
+	}
+
+	// Record the detached token as revoked so the proxy refuses it for a process
+	// still holding the old JWT. Best-effort, detached from the request context: a
+	// missed row only delays cut-off to the JWT's expiry; the binding is already gone.
+	if deleted.ProxyToken != nil && *deleted.ProxyToken != "" {
+		revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer revokeCancel()
+		if err := h.DB.InsertRevokedProxyToken(revokeCtx, db.InsertRevokedProxyTokenParams{
+			SandboxID:  sandboxID,
+			ProxyToken: *deleted.ProxyToken,
+			ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
+		}); err != nil {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertRevokedProxyToken failed")
 		}
 	}
 

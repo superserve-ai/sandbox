@@ -12,6 +12,19 @@ import (
 	"github.com/google/uuid"
 )
 
+const deleteExpiredRevokedProxyTokens = `-- name: DeleteExpiredRevokedProxyTokens :execrows
+DELETE FROM revoked_proxy_token
+WHERE expires_at < NOW()
+`
+
+func (q *Queries) DeleteExpiredRevokedProxyTokens(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredRevokedProxyTokens)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteExpiredSandboxRevocations = `-- name: DeleteExpiredSandboxRevocations :execrows
 DELETE FROM sandbox_revocation
 WHERE expires_at < NOW()
@@ -23,6 +36,24 @@ func (q *Queries) DeleteExpiredSandboxRevocations(ctx context.Context) (int64, e
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const insertRevokedProxyToken = `-- name: InsertRevokedProxyToken :exec
+INSERT INTO revoked_proxy_token (sandbox_id, proxy_token, expires_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (sandbox_id, proxy_token) DO NOTHING
+`
+
+type InsertRevokedProxyTokenParams struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	ProxyToken string    `json:"proxy_token"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+// Idempotent: detaching the same binding twice is a no-op on the second call.
+func (q *Queries) InsertRevokedProxyToken(ctx context.Context, arg InsertRevokedProxyTokenParams) error {
+	_, err := q.db.Exec(ctx, insertRevokedProxyToken, arg.SandboxID, arg.ProxyToken, arg.ExpiresAt)
+	return err
 }
 
 const insertSandboxRevocation = `-- name: InsertSandboxRevocation :exec
@@ -40,6 +71,36 @@ type InsertSandboxRevocationParams struct {
 func (q *Queries) InsertSandboxRevocation(ctx context.Context, arg InsertSandboxRevocationParams) error {
 	_, err := q.db.Exec(ctx, insertSandboxRevocation, arg.SandboxID, arg.ExpiresAt)
 	return err
+}
+
+const listActiveRevokedProxyTokens = `-- name: ListActiveRevokedProxyTokens :many
+SELECT sandbox_id, proxy_token FROM revoked_proxy_token
+WHERE expires_at > NOW()
+`
+
+type ListActiveRevokedProxyTokensRow struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	ProxyToken string    `json:"proxy_token"`
+}
+
+func (q *Queries) ListActiveRevokedProxyTokens(ctx context.Context) ([]ListActiveRevokedProxyTokensRow, error) {
+	rows, err := q.db.Query(ctx, listActiveRevokedProxyTokens)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveRevokedProxyTokensRow{}
+	for rows.Next() {
+		var i ListActiveRevokedProxyTokensRow
+		if err := rows.Scan(&i.SandboxID, &i.ProxyToken); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listActiveSandboxRevocations = `-- name: ListActiveSandboxRevocations :many

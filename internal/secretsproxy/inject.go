@@ -43,6 +43,7 @@ func injectRequest(
 	upstreamHost string,
 	upstreamIP net.IP,
 	rules EgressRules,
+	tokenRevoked func(proxyToken string) bool,
 ) (InjectOutcome, error) {
 	if allowed, reason := hostAllowedByEgress(upstreamHost, upstreamIP, rules); !allowed {
 		return InjectOutcome{Action: denyAction, Reason: reason}, nil
@@ -51,6 +52,20 @@ func injectRequest(
 	matches := findAllMatchingBindings(req, scope)
 	if len(matches) == 0 {
 		return InjectOutcome{Action: allowAction}, nil
+	}
+
+	// A request carrying a detached binding's token is refused, even though the
+	// JWT it authenticated with still lists the binding.
+	if tokenRevoked != nil {
+		for _, m := range matches {
+			if tokenRevoked(m.proxyToken) {
+				return InjectOutcome{
+					Action:           revokedAction,
+					Reason:           "proxy_token_revoked",
+					MatchedSecretIDs: []string{m.binding.SecretID},
+				}, nil
+			}
+		}
 	}
 
 	// Phase 1: resolve every match before mutating headers, so a failure
@@ -62,7 +77,8 @@ func injectRequest(
 		value      string
 	}
 	swaps := make([]resolvedSwap, 0, len(matches))
-	for _, binding := range matches {
+	for _, m := range matches {
+		binding := m.binding
 		if !hostMatchesCredential(upstreamHost, binding.Hosts) {
 			return InjectOutcome{
 				Action:           denyAction,
@@ -150,26 +166,33 @@ func hostMatchesCredential(host string, allowed []string) bool {
 	return false
 }
 
+// matchedBinding pairs a matched binding with the proxy token that matched it,
+// so the caller can check the token against the revoked set.
+type matchedBinding struct {
+	binding    Binding
+	proxyToken string
+}
+
 // findAllMatchingBindings returns every binding whose proxy token appears in
 // the request. Multi-rule bindings are scanned against every rule's shape.
 // Output is sorted by SecretID for deterministic ordering across runs.
-func findAllMatchingBindings(req *http.Request, scope *Scope) []Binding {
-	var out []Binding
+func findAllMatchingBindings(req *http.Request, scope *Scope) []matchedBinding {
+	var out []matchedBinding
 	for proxyToken, binding := range scope.Bindings {
 		if len(binding.Rules) > 0 {
 			for _, r := range binding.Rules {
 				if shapeHasToken(req, r.AuthType, r.AuthConfig, proxyToken) {
-					out = append(out, binding)
+					out = append(out, matchedBinding{binding: binding, proxyToken: proxyToken})
 					break
 				}
 			}
 			continue
 		}
 		if shapeHasToken(req, binding.AuthType, binding.AuthConfig, proxyToken) {
-			out = append(out, binding)
+			out = append(out, matchedBinding{binding: binding, proxyToken: proxyToken})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].SecretID < out[j].SecretID })
+	sort.Slice(out, func(i, j int) bool { return out[i].binding.SecretID < out[j].binding.SecretID })
 	return out
 }
 

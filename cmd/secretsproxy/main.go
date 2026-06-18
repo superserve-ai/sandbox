@@ -73,12 +73,13 @@ func run() error {
 	cachedRules := secretsproxy.NewCachedRules(httpRules, secretsproxy.RulesCacheOptions{})
 
 	revoker := secretsproxy.NewRevoker()
-	revoked, err := secretsproxy.FetchRevokedSandboxes(rootCtx, cfg.ControlPlaneURL, cfg.DaemonAuthToken)
+	revoked, revokedTokens, err := secretsproxy.FetchRevokedSandboxes(rootCtx, cfg.ControlPlaneURL, cfg.DaemonAuthToken)
 	if err != nil {
 		return fmt.Errorf("bootstrap revocations: %w", err)
 	}
 	revoker.Bootstrap(revoked)
-	log.Info().Int("revoked_sandboxes", len(revoked)).Msg("revocations loaded from control plane")
+	revoker.BootstrapProxyTokens(revokedTokens)
+	log.Info().Int("revoked_sandboxes", len(revoked)).Int("revoked_proxy_tokens", len(revokedTokens)).Msg("revocations loaded from control plane")
 	go reconcileRevocations(rootCtx, revoker, cfg.ControlPlaneURL, cfg.DaemonAuthToken)
 
 	auditSink, dbCleanup, err := buildAuditSink(rootCtx, cfg)
@@ -225,12 +226,13 @@ func reconcileRevocations(ctx context.Context, revoker *secretsproxy.Revoker, ba
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			revoked, err := secretsproxy.FetchRevokedSandboxes(ctx, baseURL, token)
+			revoked, tokens, err := secretsproxy.FetchRevokedSandboxes(ctx, baseURL, token)
 			if err != nil {
 				log.Warn().Err(err).Msg("revocation reconcile failed; keeping last-known-good set")
 				continue
 			}
 			revoker.Reconcile(revoked)
+			revoker.ReconcileProxyTokens(tokens)
 		}
 	}
 }

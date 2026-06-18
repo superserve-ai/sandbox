@@ -293,7 +293,10 @@ func (p *Proxy) forwardHandler(target, host string, scope *Scope) http.Handler {
 					transport = p.upstreamPinned
 				}
 			}
-			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP, rules)
+			tokenRevoked := func(proxyToken string) bool {
+				return p.revoker != nil && p.revoker.IsProxyTokenRevoked(scope.SandboxID, proxyToken)
+			}
+			out, ierr := injectRequest(ctx, scope, p.vault, outReq, host, upstreamIP, rules, tokenRevoked)
 			if ierr != nil {
 				p.logger.Warn("inject pipeline failed",
 					"host", host, "sandbox", scope.SandboxID, "err", ierr.Error())
