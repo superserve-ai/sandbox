@@ -119,7 +119,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		SandboxID:  sandboxID,
 		SecretID:   secret.ID,
 		EnvKey:     req.EnvKey,
-		ProxyToken: &token,
+		ProxyToken: token,
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("insert sandbox secret binding")
 		respondError(c, ErrInternal)
@@ -220,12 +220,12 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	// Record the detached token as revoked so the proxy refuses it for a process
 	// still holding the old JWT. Best-effort, detached from the request context: a
 	// missed row only delays cut-off to the JWT's expiry; the binding is already gone.
-	if deleted.ProxyToken != nil && *deleted.ProxyToken != "" {
+	if deleted.ProxyToken != "" {
 		revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer revokeCancel()
 		if err := h.DB.InsertRevokedProxyToken(revokeCtx, db.InsertRevokedProxyTokenParams{
 			SandboxID:  sandboxID,
-			ProxyToken: *deleted.ProxyToken,
+			ProxyToken: deleted.ProxyToken,
 			ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
 		}); err != nil {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertRevokedProxyToken failed")
