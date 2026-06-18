@@ -376,6 +376,13 @@ func TestIntegration_GetBillingPricing(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
+	if got := w.Header().Get("Cache-Control"); got != "private, max-age=60" {
+		t.Fatalf("Cache-Control = %q, want private, max-age=60", got)
+	}
+	if got := w.Header().Get("Vary"); got != "Authorization" {
+		t.Fatalf("Vary = %q, want Authorization", got)
+	}
+
 	body := decodeBillingPricingResponse(t, w)
 	assertPaygPricingResponse(t, body)
 }
@@ -384,6 +391,13 @@ func TestIntegration_GetPublicBillingPricing(t *testing.T) {
 	w := do(newRouter(t), "GET", "/billing/pricing/public", "", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if got := w.Header().Get("Cache-Control"); got != "public, max-age=300, s-maxage=300" {
+		t.Fatalf("Cache-Control = %q, want public, max-age=300, s-maxage=300", got)
+	}
+	if got := w.Header().Get("Vary"); got != "" {
+		t.Fatalf("Vary = %q, want empty", got)
 	}
 
 	body := decodeBillingPricingResponse(t, w)

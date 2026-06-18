@@ -10,7 +10,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const publicPricingPlanKey = "payg"
+const (
+	publicPricingPlanKey       = "payg"
+	publicPricingCacheControl  = "public, max-age=300, s-maxage=300"
+	privatePricingCacheControl = "private, max-age=60"
+)
 
 var requiredPricingResources = map[string]struct{}{
 	"memory_gib":  {},
@@ -34,7 +38,7 @@ type billingPricingResponse struct {
 }
 
 func (h *Handlers) GetPublicBillingPricing(c *gin.Context) {
-	h.writeBillingPricing(c, publicPricingPlanKey, "public")
+	h.writeBillingPricing(c, publicPricingPlanKey, "public", publicPricingCacheControl)
 }
 
 func (h *Handlers) GetBillingPricing(c *gin.Context) {
@@ -51,10 +55,10 @@ func (h *Handlers) GetBillingPricing(c *gin.Context) {
 		return
 	}
 
-	h.writeBillingPricing(c, planKey, teamID.String())
+	h.writeBillingPricing(c, planKey, teamID.String(), privatePricingCacheControl)
 }
 
-func (h *Handlers) writeBillingPricing(c *gin.Context, planKey string, subject string) {
+func (h *Handlers) writeBillingPricing(c *gin.Context, planKey string, subject string, cacheControl string) {
 	rates, err := h.DB.ListActivePricingRates(c.Request.Context(), planKey)
 	if err != nil {
 		log.Error().Err(err).Str("subject", subject).Str("plan_key", planKey).Msg("DB ListActivePricingRates failed")
@@ -122,6 +126,10 @@ func (h *Handlers) writeBillingPricing(c *gin.Context, planKey string, subject s
 		}
 	}
 
+	c.Header("Cache-Control", cacheControl)
+	if cacheControl == privatePricingCacheControl {
+		c.Header("Vary", "Authorization")
+	}
 	c.JSON(http.StatusOK, out)
 }
 
