@@ -218,10 +218,10 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 
 // DetachSandboxSecret removes a secret binding from an existing sandbox.
 // DELETE /sandboxes/{id}/secrets/{env_key}.
+//
+// Not gated on the encryptor: revocation must stay available even when the
+// encryptor is down, and detach touches no secret material.
 func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
-	if !h.requireEncryptor(c) {
-		return
-	}
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return

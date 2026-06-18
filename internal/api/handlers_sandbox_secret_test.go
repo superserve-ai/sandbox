@@ -408,6 +408,49 @@ func TestDetachSandboxSecret_Paused_NoInject(t *testing.T) {
 	}
 }
 
+func TestDetachSandboxSecret_NoEncryptor_Succeeds(t *testing.T) {
+	// Revocation must work with neither encryptor nor signer configured.
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusPaused, HostID: "host-1"}
+
+	tok := "ssrv_proxy_gone"
+	var revoked bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "GetSandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "DeleteSandboxSecretBinding"):
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = uuid.New()
+					*dest[1].(**string) = &tok
+					return nil
+				}}
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "InsertRevokedProxyToken") {
+				revoked = true
+			}
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Encryptor: nil, Signer: nil}
+	w := httptest.NewRecorder()
+	setupSecretRouter(h, teamID.String()).ServeHTTP(w, detachReq(sandboxID.String(), "ANTHROPIC_API_KEY"))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	if !revoked {
+		t.Error("detach must record the binding's token as revoked")
+	}
+}
+
 func TestAttachSandboxSecret_NoSignerReturns500(t *testing.T) {
 	// With an encryptor but no signer, a binding can never be minted into a JWT,
 	// so attach must reject up front (active or paused) rather than bank it.
