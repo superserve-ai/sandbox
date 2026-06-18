@@ -813,6 +813,34 @@ func TestIntegration_PricingRatesForPlanAtUseRequestedTime(t *testing.T) {
 	}
 }
 
+func TestIntegration_PricingRatesForPlanAtIncludesInactivePlan(t *testing.T) {
+	ctx := context.Background()
+	planKey := "inactive-historical-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	insertPricingPlanForTest(t, ctx, planKey, false)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert inactive historical pricing rates: %v", err)
+	}
+
+	rates, err := testQueries.ListPricingRatesForPlanAt(ctx, db.ListPricingRatesForPlanAtParams{
+		PlanKey:     planKey,
+		EffectiveAt: now,
+	})
+	if err != nil {
+		t.Fatalf("list pricing rates for inactive plan: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("rates length = %d, want 3 for historical inactive plan", len(rates))
+	}
+}
+
 func TestIntegration_InactiveTeamPricingPlanFallsBackToPayg(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)

@@ -454,7 +454,6 @@ WITH ranked_rates AS (
     FROM pricing_rate r
     JOIN pricing_plan p ON p.key = r.plan_key
     WHERE r.plan_key = sqlc.arg(plan_key)
-      AND p.active
       AND r.effective_from <= sqlc.arg(effective_at)::timestamptz
       AND (r.effective_to IS NULL OR r.effective_to > sqlc.arg(effective_at)::timestamptz)
 )

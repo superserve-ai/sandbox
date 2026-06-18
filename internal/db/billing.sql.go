@@ -576,7 +576,6 @@ WITH ranked_rates AS (
     FROM pricing_rate r
     JOIN pricing_plan p ON p.key = r.plan_key
     WHERE r.plan_key = $1
-      AND p.active
       AND r.effective_from <= $2::timestamptz
       AND (r.effective_to IS NULL OR r.effective_to > $2::timestamptz)
 )
