@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -291,6 +292,21 @@ func do(r *gin.Engine, method, path, apiKey, body string) *httptest.ResponseReco
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("X-API-Key", apiKey)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func doInternal(r *gin.Engine, method, path, token, body string) *httptest.ResponseRecorder {
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, bodyReader)
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -1092,6 +1108,266 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 	}
 	if got := numericFloat64(t, rollup.StorageMibSeconds); got != 245_760 {
 		t.Fatalf("rollup storage MiB seconds = %v, want 245760", got)
+	}
+}
+
+func TestIntegration_BillingRollupWorkersProcessDistinctJobs(t *testing.T) {
+	ctx := context.Background()
+	teamA, _ := seedTeamAndKey(t)
+	teamB, _ := seedTeamAndKey(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamA)
+	enableBillingHourlyRollups(t, ctx, teamB)
+	insertBillingRollupJob(t, ctx, teamA, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+	insertBillingRollupJob(t, ctx, teamB, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-a")
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-b")
+
+	var completed int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+		  AND status = 'completed'
+	`, teamA, teamB, hourStart).Scan(&completed); err != nil {
+		t.Fatalf("count completed rollup jobs: %v", err)
+	}
+	if completed != 2 {
+		t.Fatalf("completed rollup jobs = %d, want 2", completed)
+	}
+
+	var hourlyRows int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM team_billing_usage_hourly
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+	`, teamA, teamB, hourStart).Scan(&hourlyRows); err != nil {
+		t.Fatalf("count hourly usage rows: %v", err)
+	}
+	if hourlyRows != 2 {
+		t.Fatalf("hourly usage rows = %d, want 2", hourlyRows)
+	}
+}
+
+func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	staleLockedUntil := time.Now().UTC().Add(-time.Minute)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-rollup-reclaim"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
+	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "running", "stale-worker", staleLockedUntil, 5)
+	if _, err := billing.EnqueueHourForTest(ctx, testPool, hourStart, hourEnd); err != nil {
+		t.Fatalf("enqueue hour with stale running job: %v", err)
+	}
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	jobs, err := billing.ClaimJobsForTest(ctx, testPool, cfg, "replacement-worker")
+	if err != nil {
+		t.Fatalf("claim stale rollup job: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(jobs))
+	}
+	if jobs[0].ID != jobID {
+		t.Fatalf("claimed job id = %s, want %s", jobs[0].ID, jobID)
+	}
+
+	var status, lockedBy string
+	var attemptCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, locked_by, attempt_count
+		FROM billing_rollup_job
+		WHERE id = $1
+	`, jobID).Scan(&status, &lockedBy, &attemptCount); err != nil {
+		t.Fatalf("read claimed stale job: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status = %q, want running", status)
+	}
+	if lockedBy != "replacement-worker" {
+		t.Fatalf("locked_by = %q, want replacement-worker", lockedBy)
+	}
+	if attemptCount != 5 {
+		t.Fatalf("attempt_count = %d, want 5", attemptCount)
+	}
+}
+
+func TestIntegration_BackfillBillingRollups(t *testing.T) {
+	ctx := context.Background()
+	token := "internal-" + uuid.New().String()
+	t.Setenv("INTERNAL_API_TOKEN", token)
+
+	teamID, apiKey := seedTeamAndKey(t)
+	enableBillingHourlyRollups(t, ctx, teamID)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"backfill-rollup"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-3 * time.Hour)
+	hourEnd := hourStart.Add(2 * time.Hour)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused'
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(15*time.Minute), hourStart.Add(75*time.Minute)); err != nil {
+		t.Fatalf("set deterministic compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted'
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(15*time.Minute), hourStart.Add(75*time.Minute)); err != nil {
+		t.Fatalf("set deterministic storage interval: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"start":%q,"end":%q}`, hourStart.Format(time.RFC3339), hourEnd.Format(time.RFC3339))
+	w := doInternal(r, "POST", "/internal/billing/rollups/backfill", token, body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	resp := mustJSON(t, w)
+	if resp["hours"] != float64(2) {
+		t.Fatalf("hours = %v, want 2", resp["hours"])
+	}
+	if resp["jobs_enqueued_or_refreshed"] != float64(2) {
+		t.Fatalf("jobs_enqueued_or_refreshed = %v, want 2", resp["jobs_enqueued_or_refreshed"])
+	}
+
+	var jobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+		  AND hour_start >= $2
+		  AND hour_start < $3
+		  AND status = 'pending'
+	`, teamID, hourStart, hourEnd).Scan(&jobs); err != nil {
+		t.Fatalf("count rollup jobs: %v", err)
+	}
+	if jobs != 2 {
+		t.Fatalf("rollup jobs = %d, want 2", jobs)
+	}
+}
+
+func enableBillingHourlyRollups(t *testing.T, ctx context.Context, teamID uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_hourly_rollups', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing_hourly_rollups: %v", err)
+	}
+}
+
+func insertBillingRollupJob(
+	t *testing.T,
+	ctx context.Context,
+	teamID uuid.UUID,
+	hourStart time.Time,
+	hourEnd time.Time,
+	status string,
+	lockedBy string,
+	lockedUntil time.Time,
+	attemptCount int,
+) uuid.UUID {
+	t.Helper()
+
+	var jobID uuid.UUID
+	if status == "running" {
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO billing_rollup_job (
+				team_id, hour_start, hour_end, status, attempt_count,
+				locked_by, locked_until, next_attempt_at
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, now() - interval '1 minute')
+			RETURNING id
+		`, teamID, hourStart, hourEnd, status, attemptCount, lockedBy, lockedUntil).Scan(&jobID); err != nil {
+			t.Fatalf("insert running billing rollup job: %v", err)
+		}
+		return jobID
+	}
+
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO billing_rollup_job (
+			team_id, hour_start, hour_end, status, attempt_count, next_attempt_at
+		)
+		VALUES ($1, $2, $3, $4, $5, now() - interval '1 minute')
+		RETURNING id
+	`, teamID, hourStart, hourEnd, status, attemptCount).Scan(&jobID); err != nil {
+		t.Fatalf("insert billing rollup job: %v", err)
+	}
+	return jobID
+}
+
+func TestIntegration_TeamCreditLedgerRejectsCrossTeamGrant(t *testing.T) {
+	ctx := context.Background()
+	grantTeamID, _ := seedTeamAndKey(t)
+	ledgerTeamID, _ := seedTeamAndKey(t)
+
+	var grantID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO team_credit_grant (
+			team_id, amount_usd, remaining_usd, reason
+		)
+		VALUES ($1, 10.00, 10.00, 'test grant')
+		RETURNING id
+	`, grantTeamID).Scan(&grantID); err != nil {
+		t.Fatalf("insert credit grant: %v", err)
+	}
+
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_ledger (
+			team_id, grant_id, amount_usd, reason
+		)
+		VALUES ($1, $2, -1.00, 'cross-team attribution should fail')
+	`, ledgerTeamID, grantID)
+	if err == nil {
+		t.Fatal("expected cross-team credit ledger grant reference to fail")
 	}
 }
 
