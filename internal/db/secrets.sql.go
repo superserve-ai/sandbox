@@ -116,7 +116,7 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) (Sec
 
 const deleteSandboxSecretBinding = `-- name: DeleteSandboxSecretBinding :one
 DELETE FROM sandbox_secret WHERE sandbox_id = $1 AND env_key = $2
-RETURNING proxy_token
+RETURNING secret_id, proxy_token
 `
 
 type DeleteSandboxSecretBindingParams struct {
@@ -124,12 +124,17 @@ type DeleteSandboxSecretBindingParams struct {
 	EnvKey    string    `json:"env_key"`
 }
 
-// Remove one binding by env_key, returning its proxy token.
-func (q *Queries) DeleteSandboxSecretBinding(ctx context.Context, arg DeleteSandboxSecretBindingParams) (*string, error) {
+type DeleteSandboxSecretBindingRow struct {
+	SecretID   uuid.UUID `json:"secret_id"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+// Remove one binding by env_key; returns the secret_id and proxy token for re-mint.
+func (q *Queries) DeleteSandboxSecretBinding(ctx context.Context, arg DeleteSandboxSecretBindingParams) (DeleteSandboxSecretBindingRow, error) {
 	row := q.db.QueryRow(ctx, deleteSandboxSecretBinding, arg.SandboxID, arg.EnvKey)
-	var proxy_token *string
-	err := row.Scan(&proxy_token)
-	return proxy_token, err
+	var i DeleteSandboxSecretBindingRow
+	err := row.Scan(&i.SecretID, &i.ProxyToken)
+	return i, err
 }
 
 const deleteSandboxSecrets = `-- name: DeleteSandboxSecrets :exec

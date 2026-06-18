@@ -381,6 +381,37 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/{sandbox_id}/secrets/{env_key}:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - name: env_key
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Environment variable the secret is bound under.
+
+    delete:
+      operationId: detachSandboxSecret
+      tags: [Sandboxes]
+      summary: Detach a secret from a sandbox
+      description: |
+        Removes a secret binding from an existing sandbox. Takes effect for
+        processes started after this call; a paused sandbox applies it on resume.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Secret detached
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}/exec:
     parameters:
       - $ref: "#/components/parameters/SandboxId"

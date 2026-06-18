@@ -142,3 +142,79 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	h.logSandboxActivity(ctx, sandboxID, teamID, actorIDFromContext(c), "secret", "attached", "success", &sandbox.Name, nil, nil)
 	c.JSON(http.StatusCreated, gin.H{"env_key": req.EnvKey, "secret_name": req.SecretName})
 }
+
+// DetachSandboxSecret removes a secret binding from an existing sandbox.
+// DELETE /sandboxes/{id}/secrets/{env_key}.
+func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
+	if !h.requireEncryptor(c) {
+		return
+	}
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return
+	}
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+	envKey := c.Param("env_key")
+	if envKey == "" {
+		respondErrorMsg(c, "bad_request", "env_key is required", http.StatusBadRequest)
+		return
+	}
+
+	unlock := lockSandboxSecrets(sandboxID)
+	defer unlock()
+
+	ctx := c.Request.Context()
+	sandbox, err := h.DB.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "not_found", "Sandbox not found", http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox during secret detach")
+		respondError(c, ErrInternal)
+		return
+	}
+	switch sandbox.Status {
+	case db.SandboxStatusActive, db.SandboxStatusPaused:
+	default:
+		respondErrorMsg(c, "conflict", "sandbox is not in a state that accepts secret changes", http.StatusConflict)
+		return
+	}
+
+	deleted, err := h.DB.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "not_found", fmt.Sprintf("no secret bound under env-var key %q on this sandbox", envKey), http.StatusNotFound)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("delete sandbox secret binding")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	// A running sandbox is updated now; a paused one picks it up on resume. Fail
+	// closed: restore the row if the reduced set can't be re-minted/injected.
+	if sandbox.Status == db.SandboxStatusActive {
+		meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID)
+		if lerr == nil {
+			lerr = h.applySecretBindings(ctx, sandbox, meta)
+		}
+		if lerr != nil {
+			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("apply secret bindings on detach")
+			_ = h.DB.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+				SandboxID:  sandboxID,
+				SecretID:   deleted.SecretID,
+				EnvKey:     envKey,
+				ProxyToken: deleted.ProxyToken,
+			})
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+
+	h.logSandboxActivity(ctx, sandboxID, teamID, actorIDFromContext(c), "secret", "detached", "success", &sandbox.Name, nil, nil)
+	c.Status(http.StatusNoContent)
+}
