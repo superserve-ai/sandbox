@@ -473,8 +473,7 @@ func TestDetachSandboxSecret_BindingNotFound(t *testing.T) {
 }
 
 func TestDetachSandboxSecret_RevocationFailureReturns500(t *testing.T) {
-	// Fail closed: if the token can't be recorded as revoked, detach must not
-	// report success — otherwise a running process keeps the detached credential.
+	// Fail closed: a revocation-insert failure must surface as 500, not 204.
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusPaused, HostID: "host-1"}

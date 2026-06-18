@@ -192,9 +192,8 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer rbCancel()
 			_, _ = h.DB.DeleteSandboxSecretBinding(rbCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
-			// boxd may have committed the env/JWT before the apply errored (e.g. a
-			// timeout on the response), so revoke the token too — otherwise a partial
-			// apply leaves a usable credential after the row is gone.
+			// boxd may have committed the env/JWT before the apply errored, so revoke
+			// the token too — the binding's credential must not outlive its row.
 			_ = h.DB.InsertRevokedProxyToken(rbCtx, db.InsertRevokedProxyTokenParams{
 				SandboxID:  sandboxID,
 				ProxyToken: token,
@@ -252,8 +251,7 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 
 	// Delete the binding and revoke its token in one transaction, on a detached
 	// context so a client disconnect can't half-commit. A 204 therefore guarantees
-	// the detached token is recorded as revoked — the proxy refuses it on its next
-	// poll regardless of the live re-mint below.
+	// the token is recorded as revoked, independent of the re-mint below.
 	mutCtx, mutCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer mutCancel()
 
@@ -262,8 +260,8 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		if derr != nil {
 			return derr
 		}
-		// A binding stored before tokens were persisted has no token to revoke;
-		// its credential isn't individually revocable until it's re-attached.
+		// A binding stored before tokens were persisted has no stored token to
+		// record here.
 		if deleted.ProxyToken == nil || *deleted.ProxyToken == "" {
 			return nil
 		}
@@ -296,9 +294,9 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		return
 	}
 
-	// Re-mint the reduced set so a running sandbox's new processes stop seeing the
-	// stand-in var; a paused one re-mints on resume. Best-effort: the revocation
-	// above already enforces the detach, so a re-mint failure is not fatal.
+	// Re-mint the reduced set for a running sandbox; a paused one re-mints on
+	// resume. Best-effort — the revocation above already enforces the detach, so a
+	// re-mint failure is not fatal.
 	if sandbox.Status == db.SandboxStatusActive {
 		if meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID); lerr != nil {
 			log.Warn().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings after detach")
