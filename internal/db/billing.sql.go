@@ -13,6 +13,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const applyTeamCreditGrant = `-- name: ApplyTeamCreditGrant :one
+UPDATE team_credit_grant
+SET remaining_usd = remaining_usd - $1,
+    updated_at = now()
+WHERE id = $2
+  AND team_id = $3
+  AND $1 > 0
+  AND remaining_usd >= $1
+  AND (expires_at IS NULL OR expires_at > now())
+RETURNING id, team_id, amount_usd, remaining_usd, currency, reason, expires_at, created_by, created_at, updated_at
+`
+
+type ApplyTeamCreditGrantParams struct {
+	AmountUsd pgtype.Numeric `json:"amount_usd"`
+	GrantID   uuid.UUID      `json:"grant_id"`
+	TeamID    uuid.UUID      `json:"team_id"`
+}
+
+func (q *Queries) ApplyTeamCreditGrant(ctx context.Context, arg ApplyTeamCreditGrantParams) (TeamCreditGrant, error) {
+	row := q.db.QueryRow(ctx, applyTeamCreditGrant, arg.AmountUsd, arg.GrantID, arg.TeamID)
+	var i TeamCreditGrant
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.AmountUsd,
+		&i.RemainingUsd,
+		&i.Currency,
+		&i.Reason,
+		&i.ExpiresAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const approveTeamBillingPeriod = `-- name: ApproveTeamBillingPeriod :one
 UPDATE team_billing_period
 SET status = 'approved',
@@ -66,6 +102,46 @@ func (q *Queries) ApproveTeamBillingPeriod(ctx context.Context, arg ApproveTeamB
 		&i.FinalizedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const assignTeamPricingPlan = `-- name: AssignTeamPricingPlan :one
+INSERT INTO team_pricing_plan (team_id, plan_key, effective_from, effective_to, assigned_by)
+VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    $5
+)
+RETURNING team_id, plan_key, effective_from, effective_to, assigned_by, created_at
+`
+
+type AssignTeamPricingPlanParams struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	PlanKey       string             `json:"plan_key"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
+	AssignedBy    pgtype.UUID        `json:"assigned_by"`
+}
+
+func (q *Queries) AssignTeamPricingPlan(ctx context.Context, arg AssignTeamPricingPlanParams) (TeamPricingPlan, error) {
+	row := q.db.QueryRow(ctx, assignTeamPricingPlan,
+		arg.TeamID,
+		arg.PlanKey,
+		arg.EffectiveFrom,
+		arg.EffectiveTo,
+		arg.AssignedBy,
+	)
+	var i TeamPricingPlan
+	err := row.Scan(
+		&i.TeamID,
+		&i.PlanKey,
+		&i.EffectiveFrom,
+		&i.EffectiveTo,
+		&i.AssignedBy,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -238,6 +314,27 @@ func (q *Queries) FinalizeTeamBillingPeriod(ctx context.Context, arg FinalizeTea
 	return i, err
 }
 
+const getTeamActivePricingPlan = `-- name: GetTeamActivePricingPlan :one
+SELECT COALESCE((
+    SELECT tpp.plan_key
+    FROM team_pricing_plan tpp
+    JOIN pricing_plan p ON p.key = tpp.plan_key
+    WHERE tpp.team_id = $1
+      AND p.active
+      AND tpp.effective_from <= now()
+      AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
+    ORDER BY tpp.effective_from DESC
+    LIMIT 1
+), 'payg')::text AS plan_key
+`
+
+func (q *Queries) GetTeamActivePricingPlan(ctx context.Context, teamID uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getTeamActivePricingPlan, teamID)
+	var plan_key string
+	err := row.Scan(&plan_key)
+	return plan_key, err
+}
+
 const getTeamBillingUsage = `-- name: GetTeamBillingUsage :one
 WITH compute AS (
     SELECT
@@ -312,6 +409,68 @@ func (q *Queries) GetTeamBillingUsage(ctx context.Context, arg GetTeamBillingUsa
 	return i, err
 }
 
+const getTeamCreditBalance = `-- name: GetTeamCreditBalance :one
+SELECT COALESCE(SUM(remaining_usd), 0)::numeric AS balance_usd
+FROM team_credit_grant
+WHERE team_id = $1
+  AND remaining_usd > 0
+  AND (expires_at IS NULL OR expires_at > now())
+`
+
+func (q *Queries) GetTeamCreditBalance(ctx context.Context, teamID uuid.UUID) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, getTeamCreditBalance, teamID)
+	var balance_usd pgtype.Numeric
+	err := row.Scan(&balance_usd)
+	return balance_usd, err
+}
+
+const grantTeamCredit = `-- name: GrantTeamCredit :one
+INSERT INTO team_credit_grant (
+    team_id, amount_usd, remaining_usd, reason, expires_at, created_by
+)
+VALUES (
+    $1,
+    $2,
+    $2,
+    $3,
+    $4,
+    $5
+)
+RETURNING id, team_id, amount_usd, remaining_usd, currency, reason, expires_at, created_by, created_at, updated_at
+`
+
+type GrantTeamCreditParams struct {
+	TeamID    uuid.UUID          `json:"team_id"`
+	AmountUsd pgtype.Numeric     `json:"amount_usd"`
+	Reason    *string            `json:"reason"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	CreatedBy pgtype.UUID        `json:"created_by"`
+}
+
+func (q *Queries) GrantTeamCredit(ctx context.Context, arg GrantTeamCreditParams) (TeamCreditGrant, error) {
+	row := q.db.QueryRow(ctx, grantTeamCredit,
+		arg.TeamID,
+		arg.AmountUsd,
+		arg.Reason,
+		arg.ExpiresAt,
+		arg.CreatedBy,
+	)
+	var i TeamCreditGrant
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.AmountUsd,
+		&i.RemainingUsd,
+		&i.Currency,
+		&i.Reason,
+		&i.ExpiresAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const isFeatureEnabledForTeam = `-- name: IsFeatureEnabledForTeam :one
 SELECT feature_enabled($1, $2)::boolean AS enabled
 `
@@ -326,6 +485,154 @@ func (q *Queries) IsFeatureEnabledForTeam(ctx context.Context, arg IsFeatureEnab
 	var enabled bool
 	err := row.Scan(&enabled)
 	return enabled, err
+}
+
+const listActivePricingRates = `-- name: ListActivePricingRates :many
+WITH ranked_rates AS (
+    SELECT
+        r.plan_key,
+        p.name AS plan_name,
+        p.currency,
+        r.resource,
+        r.unit,
+        r.price_usd,
+        r.effective_from,
+        row_number() OVER (
+            PARTITION BY r.resource, r.unit
+            ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
+        ) AS rate_rank
+    FROM pricing_rate r
+    JOIN pricing_plan p ON p.key = r.plan_key
+    WHERE r.plan_key = $1
+      AND p.active
+      AND r.effective_from <= now()
+      AND (r.effective_to IS NULL OR r.effective_to > now())
+)
+SELECT
+    plan_key,
+    plan_name,
+    currency,
+    resource,
+    unit,
+    price_usd,
+    effective_from
+FROM ranked_rates
+WHERE rate_rank = 1
+ORDER BY resource, unit
+`
+
+type ListActivePricingRatesRow struct {
+	PlanKey       string         `json:"plan_key"`
+	PlanName      string         `json:"plan_name"`
+	Currency      string         `json:"currency"`
+	Resource      string         `json:"resource"`
+	Unit          string         `json:"unit"`
+	PriceUsd      pgtype.Numeric `json:"price_usd"`
+	EffectiveFrom time.Time      `json:"effective_from"`
+}
+
+func (q *Queries) ListActivePricingRates(ctx context.Context, planKey string) ([]ListActivePricingRatesRow, error) {
+	rows, err := q.db.Query(ctx, listActivePricingRates, planKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActivePricingRatesRow{}
+	for rows.Next() {
+		var i ListActivePricingRatesRow
+		if err := rows.Scan(
+			&i.PlanKey,
+			&i.PlanName,
+			&i.Currency,
+			&i.Resource,
+			&i.Unit,
+			&i.PriceUsd,
+			&i.EffectiveFrom,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPricingRatesForPlanAt = `-- name: ListPricingRatesForPlanAt :many
+WITH ranked_rates AS (
+    SELECT
+        r.plan_key,
+        p.name AS plan_name,
+        p.currency,
+        r.resource,
+        r.unit,
+        r.price_usd,
+        r.effective_from,
+        row_number() OVER (
+            PARTITION BY r.resource, r.unit
+            ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
+        ) AS rate_rank
+    FROM pricing_rate r
+    JOIN pricing_plan p ON p.key = r.plan_key
+    WHERE r.plan_key = $1
+      AND r.effective_from <= $2::timestamptz
+      AND (r.effective_to IS NULL OR r.effective_to > $2::timestamptz)
+)
+SELECT
+    plan_key,
+    plan_name,
+    currency,
+    resource,
+    unit,
+    price_usd,
+    effective_from
+FROM ranked_rates
+WHERE rate_rank = 1
+ORDER BY resource, unit
+`
+
+type ListPricingRatesForPlanAtParams struct {
+	PlanKey     string    `json:"plan_key"`
+	EffectiveAt time.Time `json:"effective_at"`
+}
+
+type ListPricingRatesForPlanAtRow struct {
+	PlanKey       string         `json:"plan_key"`
+	PlanName      string         `json:"plan_name"`
+	Currency      string         `json:"currency"`
+	Resource      string         `json:"resource"`
+	Unit          string         `json:"unit"`
+	PriceUsd      pgtype.Numeric `json:"price_usd"`
+	EffectiveFrom time.Time      `json:"effective_from"`
+}
+
+func (q *Queries) ListPricingRatesForPlanAt(ctx context.Context, arg ListPricingRatesForPlanAtParams) ([]ListPricingRatesForPlanAtRow, error) {
+	rows, err := q.db.Query(ctx, listPricingRatesForPlanAt, arg.PlanKey, arg.EffectiveAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPricingRatesForPlanAtRow{}
+	for rows.Next() {
+		var i ListPricingRatesForPlanAtRow
+		if err := rows.Scan(
+			&i.PlanKey,
+			&i.PlanName,
+			&i.Currency,
+			&i.Resource,
+			&i.Unit,
+			&i.PriceUsd,
+			&i.EffectiveFrom,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listTeamBillingUsageHourly = `-- name: ListTeamBillingUsageHourly :many
@@ -360,6 +667,44 @@ func (q *Queries) ListTeamBillingUsageHourly(ctx context.Context, arg ListTeamBi
 			&i.VcpuSeconds,
 			&i.MemoryMibSeconds,
 			&i.StorageMibSeconds,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTeamCreditGrants = `-- name: ListTeamCreditGrants :many
+SELECT id, team_id, amount_usd, remaining_usd, currency, reason, expires_at, created_by, created_at, updated_at
+FROM team_credit_grant
+WHERE team_id = $1
+ORDER BY created_at DESC
+`
+
+func (q *Queries) ListTeamCreditGrants(ctx context.Context, teamID uuid.UUID) ([]TeamCreditGrant, error) {
+	rows, err := q.db.Query(ctx, listTeamCreditGrants, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TeamCreditGrant{}
+	for rows.Next() {
+		var i TeamCreditGrant
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.AmountUsd,
+			&i.RemainingUsd,
+			&i.Currency,
+			&i.Reason,
+			&i.ExpiresAt,
+			&i.CreatedBy,
+			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -502,6 +847,63 @@ func (q *Queries) MarkTeamBillingPeriodExported(ctx context.Context, arg MarkTea
 		&i.FinalizedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const recordTeamCreditLedgerEntry = `-- name: RecordTeamCreditLedgerEntry :one
+INSERT INTO team_credit_ledger (
+    team_id,
+    grant_id,
+    billing_period_start,
+    billing_period_end,
+    amount_usd,
+    reason,
+    created_by
+)
+VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    $7
+)
+RETURNING id, team_id, grant_id, billing_period_start, billing_period_end, amount_usd, reason, created_by, created_at
+`
+
+type RecordTeamCreditLedgerEntryParams struct {
+	TeamID             uuid.UUID          `json:"team_id"`
+	GrantID            pgtype.UUID        `json:"grant_id"`
+	BillingPeriodStart pgtype.Timestamptz `json:"billing_period_start"`
+	BillingPeriodEnd   pgtype.Timestamptz `json:"billing_period_end"`
+	AmountUsd          pgtype.Numeric     `json:"amount_usd"`
+	Reason             string             `json:"reason"`
+	CreatedBy          pgtype.UUID        `json:"created_by"`
+}
+
+func (q *Queries) RecordTeamCreditLedgerEntry(ctx context.Context, arg RecordTeamCreditLedgerEntryParams) (TeamCreditLedger, error) {
+	row := q.db.QueryRow(ctx, recordTeamCreditLedgerEntry,
+		arg.TeamID,
+		arg.GrantID,
+		arg.BillingPeriodStart,
+		arg.BillingPeriodEnd,
+		arg.AmountUsd,
+		arg.Reason,
+		arg.CreatedBy,
+	)
+	var i TeamCreditLedger
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.GrantID,
+		&i.BillingPeriodStart,
+		&i.BillingPeriodEnd,
+		&i.AmountUsd,
+		&i.Reason,
+		&i.CreatedBy,
+		&i.CreatedAt,
 	)
 	return i, err
 }

@@ -403,3 +403,151 @@ ON CONFLICT (team_id, key) DO UPDATE
 SET enabled = EXCLUDED.enabled,
     updated_at = now()
 RETURNING *;
+
+-- name: ListActivePricingRates :many
+WITH ranked_rates AS (
+    SELECT
+        r.plan_key,
+        p.name AS plan_name,
+        p.currency,
+        r.resource,
+        r.unit,
+        r.price_usd,
+        r.effective_from,
+        row_number() OVER (
+            PARTITION BY r.resource, r.unit
+            ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
+        ) AS rate_rank
+    FROM pricing_rate r
+    JOIN pricing_plan p ON p.key = r.plan_key
+    WHERE r.plan_key = sqlc.arg(plan_key)
+      AND p.active
+      AND r.effective_from <= now()
+      AND (r.effective_to IS NULL OR r.effective_to > now())
+)
+SELECT
+    plan_key,
+    plan_name,
+    currency,
+    resource,
+    unit,
+    price_usd,
+    effective_from
+FROM ranked_rates
+WHERE rate_rank = 1
+ORDER BY resource, unit;
+
+-- name: ListPricingRatesForPlanAt :many
+WITH ranked_rates AS (
+    SELECT
+        r.plan_key,
+        p.name AS plan_name,
+        p.currency,
+        r.resource,
+        r.unit,
+        r.price_usd,
+        r.effective_from,
+        row_number() OVER (
+            PARTITION BY r.resource, r.unit
+            ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
+        ) AS rate_rank
+    FROM pricing_rate r
+    JOIN pricing_plan p ON p.key = r.plan_key
+    WHERE r.plan_key = sqlc.arg(plan_key)
+      AND r.effective_from <= sqlc.arg(effective_at)::timestamptz
+      AND (r.effective_to IS NULL OR r.effective_to > sqlc.arg(effective_at)::timestamptz)
+)
+SELECT
+    plan_key,
+    plan_name,
+    currency,
+    resource,
+    unit,
+    price_usd,
+    effective_from
+FROM ranked_rates
+WHERE rate_rank = 1
+ORDER BY resource, unit;
+
+-- name: GetTeamActivePricingPlan :one
+SELECT COALESCE((
+    SELECT tpp.plan_key
+    FROM team_pricing_plan tpp
+    JOIN pricing_plan p ON p.key = tpp.plan_key
+    WHERE tpp.team_id = sqlc.arg(team_id)
+      AND p.active
+      AND tpp.effective_from <= now()
+      AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
+    ORDER BY tpp.effective_from DESC
+    LIMIT 1
+), 'payg')::text AS plan_key;
+
+-- name: AssignTeamPricingPlan :one
+INSERT INTO team_pricing_plan (team_id, plan_key, effective_from, effective_to, assigned_by)
+VALUES (
+    sqlc.arg(team_id),
+    sqlc.arg(plan_key),
+    sqlc.arg(effective_from),
+    sqlc.narg(effective_to),
+    sqlc.narg(assigned_by)
+)
+RETURNING *;
+
+-- name: GrantTeamCredit :one
+INSERT INTO team_credit_grant (
+    team_id, amount_usd, remaining_usd, reason, expires_at, created_by
+)
+VALUES (
+    sqlc.arg(team_id),
+    sqlc.arg(amount_usd),
+    sqlc.arg(amount_usd),
+    sqlc.narg(reason),
+    sqlc.narg(expires_at),
+    sqlc.narg(created_by)
+)
+RETURNING *;
+
+-- name: GetTeamCreditBalance :one
+SELECT COALESCE(SUM(remaining_usd), 0)::numeric AS balance_usd
+FROM team_credit_grant
+WHERE team_id = sqlc.arg(team_id)
+  AND remaining_usd > 0
+  AND (expires_at IS NULL OR expires_at > now());
+
+-- name: ListTeamCreditGrants :many
+SELECT *
+FROM team_credit_grant
+WHERE team_id = sqlc.arg(team_id)
+ORDER BY created_at DESC;
+
+-- name: ApplyTeamCreditGrant :one
+UPDATE team_credit_grant
+SET remaining_usd = remaining_usd - sqlc.arg(amount_usd),
+    updated_at = now()
+WHERE id = sqlc.arg(grant_id)
+  AND team_id = sqlc.arg(team_id)
+  AND sqlc.arg(amount_usd) > 0
+  AND remaining_usd >= sqlc.arg(amount_usd)
+  AND (expires_at IS NULL OR expires_at > now())
+RETURNING *;
+
+-- name: RecordTeamCreditLedgerEntry :one
+INSERT INTO team_credit_ledger (
+    team_id,
+    grant_id,
+    billing_period_start,
+    billing_period_end,
+    amount_usd,
+    reason,
+    created_by
+)
+VALUES (
+    sqlc.arg(team_id),
+    sqlc.narg(grant_id),
+    sqlc.narg(billing_period_start),
+    sqlc.narg(billing_period_end),
+    sqlc.arg(amount_usd),
+    sqlc.arg(reason),
+    sqlc.narg(created_by)
+)
+RETURNING *;
