@@ -1431,43 +1431,6 @@ func TestIntegration_BillingRollupSchedulerPreservesPendingRetryBackoff(t *testi
 	}
 }
 
-func TestIntegration_BillingRollupBackfillDoesNotRestartAfterCatchUp(t *testing.T) {
-	ctx := context.Background()
-	resetBillingRollupBackfillState(t, ctx)
-	now := time.Now().UTC().Truncate(time.Hour)
-	rollingStart := now.Add(-23 * time.Hour)
-	backfillStart := now.Add(-72 * time.Hour)
-
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO billing_rollup_backfill_state (name, next_hour_start)
-		VALUES ('hourly', $1)
-		ON CONFLICT (name) DO UPDATE
-		SET next_hour_start = EXCLUDED.next_hour_start
-	`, rollingStart); err != nil {
-		t.Fatalf("seed caught-up backfill cursor: %v", err)
-	}
-
-	hours, err := billing.NextBackfillHoursForTest(ctx, testPool, backfillStart, rollingStart, 24)
-	if err != nil {
-		t.Fatalf("read next backfill hours: %v", err)
-	}
-	if len(hours) != 0 {
-		t.Fatalf("backfill hours = %d, want 0 after catch-up", len(hours))
-	}
-
-	var cursor time.Time
-	if err := testPool.QueryRow(ctx, `
-		SELECT next_hour_start
-		FROM billing_rollup_backfill_state
-		WHERE name = 'hourly'
-	`).Scan(&cursor); err != nil {
-		t.Fatalf("read backfill cursor: %v", err)
-	}
-	if !cursor.Equal(rollingStart) {
-		t.Fatalf("cursor = %s, want preserved at %s", cursor, rollingStart)
-	}
-}
-
 func TestIntegration_BillingRollupBackfillCursorAdvancesAfterEnqueue(t *testing.T) {
 	ctx := context.Background()
 	resetBillingRollupBackfillState(t, ctx)
@@ -1483,22 +1446,15 @@ func TestIntegration_BillingRollupBackfillCursorAdvancesAfterEnqueue(t *testing.
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
-	if _, err := testPool.Exec(ctx, `
-		UPDATE sandbox_compute_billing_interval
-		SET started_at = $2, ended_at = $3, end_reason = 'paused',
-		    vcpu_count = 1, memory_mib = 1024
-		WHERE sandbox_id = $1 AND ended_at IS NULL
-	`, sandboxID, backfillStart.Add(5*time.Second), backfillStart.Add(30*time.Second)); err != nil {
-		t.Fatalf("set compute interval: %v", err)
-	}
+	seedComputeBillingInterval(t, ctx, sandboxID, teamID, backfillStart.Add(5*time.Second), backfillStart.Add(30*time.Second))
 
 	if _, err := testPool.Exec(ctx, `
-		INSERT INTO billing_rollup_backfill_state (name, next_hour_start)
-		VALUES ('hourly', $1)
-		ON CONFLICT (name) DO UPDATE
+		INSERT INTO billing_rollup_team_backfill_state (team_id, next_hour_start)
+		VALUES ($1, $2)
+		ON CONFLICT (team_id) DO UPDATE
 		SET next_hour_start = EXCLUDED.next_hour_start
-	`, backfillStart); err != nil {
-		t.Fatalf("seed backfill cursor: %v", err)
+	`, teamID, backfillStart); err != nil {
+		t.Fatalf("seed team backfill cursor: %v", err)
 	}
 
 	enqueued, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
@@ -1516,13 +1472,132 @@ func TestIntegration_BillingRollupBackfillCursorAdvancesAfterEnqueue(t *testing.
 	var cursor time.Time
 	if err := testPool.QueryRow(ctx, `
 		SELECT next_hour_start
-		FROM billing_rollup_backfill_state
-		WHERE name = 'hourly'
-	`).Scan(&cursor); err != nil {
-		t.Fatalf("read backfill cursor: %v", err)
+		FROM billing_rollup_team_backfill_state
+		WHERE team_id = $1
+	`, teamID).Scan(&cursor); err != nil {
+		t.Fatalf("read team backfill cursor: %v", err)
 	}
 	if !cursor.Equal(firstHourEnd) {
 		t.Fatalf("cursor = %s, want advanced to %s after successful enqueue", cursor, firstHourEnd)
+	}
+}
+
+func TestIntegration_BillingRollupTeamBackfillCursorAdvanceToleratesConcurrentAdvance(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, _ := seedTeamAndKey(t)
+	fromHour := time.Now().UTC().Truncate(time.Hour).Add(-48 * time.Hour)
+	toHour := fromHour.Add(24 * time.Hour)
+	concurrentCursor := fromHour.Add(time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_rollup_team_backfill_state (team_id, next_hour_start)
+		VALUES ($1, $2)
+	`, teamID, concurrentCursor); err != nil {
+		t.Fatalf("seed concurrent team backfill cursor: %v", err)
+	}
+	if err := billing.AdvanceTeamBackfillCursorForTest(ctx, testPool, teamID, fromHour, toHour); err != nil {
+		t.Fatalf("advance team cursor after concurrent progress: %v", err)
+	}
+
+	var cursor time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT next_hour_start
+		FROM billing_rollup_team_backfill_state
+		WHERE team_id = $1
+	`, teamID).Scan(&cursor); err != nil {
+		t.Fatalf("read team backfill cursor: %v", err)
+	}
+	if !cursor.Equal(toHour) {
+		t.Fatalf("cursor = %s, want advanced to %s", cursor, toHour)
+	}
+	if err := billing.AdvanceTeamBackfillCursorForTest(ctx, testPool, teamID, fromHour, toHour); err != nil {
+		t.Fatalf("advance team cursor should be idempotent once already advanced: %v", err)
+	}
+}
+
+func TestIntegration_BillingRollupBackfillDoesNotAdvanceDisabledTeamCursor(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+	oldHourStart := now.Add(-48 * time.Hour)
+	oldHourEnd := oldHourStart.Add(time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES
+			($1, 'billing_metrics_write', true),
+			($1, 'billing_hourly_rollups', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("configure billing feature flags: %v", err)
+	}
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-backfill-disabled-team"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedComputeBillingInterval(t, ctx, sandboxID, teamID, oldHourStart.Add(5*time.Second), oldHourStart.Add(30*time.Second))
+
+	if _, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    72,
+	}, now); err != nil {
+		t.Fatalf("enqueue disabled backfill: %v", err)
+	}
+
+	var disabledTeamJobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+	`, teamID).Scan(&disabledTeamJobs); err != nil {
+		t.Fatalf("count disabled team backfill jobs: %v", err)
+	}
+	if disabledTeamJobs != 0 {
+		t.Fatalf("disabled team backfill jobs = %d, want 0", disabledTeamJobs)
+	}
+
+	var cursorRows int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_team_backfill_state
+		WHERE team_id = $1
+	`, teamID).Scan(&cursorRows); err != nil {
+		t.Fatalf("count disabled team backfill cursor rows: %v", err)
+	}
+	if cursorRows != 0 {
+		t.Fatalf("disabled team backfill cursor rows = %d, want 0", cursorRows)
+	}
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	enqueued, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    72,
+	}, now)
+	if err != nil {
+		t.Fatalf("enqueue enabled backfill: %v", err)
+	}
+	if enqueued == 0 {
+		t.Fatal("expected newly enabled team to enqueue historical backfill job")
+	}
+
+	var jobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+		  AND hour_start = $2
+		  AND hour_end = $3
+	`, teamID, oldHourStart, oldHourEnd).Scan(&jobs); err != nil {
+		t.Fatalf("count newly enabled team backfill jobs: %v", err)
+	}
+	if jobs != 1 {
+		t.Fatalf("newly enabled team backfill jobs = %d, want 1", jobs)
 	}
 }
 
@@ -1590,16 +1665,39 @@ func resetBillingRollupBackfillState(t *testing.T, ctx context.Context) {
 	if _, err := testPool.Exec(ctx, `DELETE FROM billing_rollup_backfill_state WHERE name = 'hourly'`); err != nil {
 		t.Fatalf("reset billing rollup backfill state: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM billing_rollup_team_backfill_state`); err != nil {
+		t.Fatalf("reset billing rollup team backfill state: %v", err)
+	}
+}
+
+func seedComputeBillingInterval(t *testing.T, ctx context.Context, sandboxID uuid.UUID, teamID uuid.UUID, startedAt time.Time, endedAt time.Time) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		DELETE FROM sandbox_compute_billing_interval
+		WHERE sandbox_id = $1
+	`, sandboxID); err != nil {
+		t.Fatalf("clear compute billing intervals: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 1, 1024, $3, $4, 'paused')
+	`, sandboxID, teamID, startedAt, endedAt); err != nil {
+		t.Fatalf("insert compute billing interval: %v", err)
+	}
 }
 
 func enableBillingHourlyRollups(t *testing.T, ctx context.Context, teamID uuid.UUID) {
 	t.Helper()
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_feature_flag (team_id, key, enabled)
-		VALUES ($1, 'billing_hourly_rollups', true)
+		VALUES
+			($1, 'billing_metrics_write', true),
+			($1, 'billing_hourly_rollups', true)
 		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
 	`, teamID); err != nil {
-		t.Fatalf("enable billing_hourly_rollups: %v", err)
+		t.Fatalf("enable billing rollup feature flags: %v", err)
 	}
 }
 
@@ -2112,24 +2210,25 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
-		Limit:     20,
-	})
-	if err != nil {
-		t.Fatalf("list activities: %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
+			SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
+			Limit:     20,
+		})
+		if err != nil {
+			t.Fatalf("list activities: %v", err)
+		}
+
+		for _, a := range activities {
+			if a.Category == "sandbox" && a.Action == "paused" {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 
-	var found bool
-	for _, a := range activities {
-		if a.Category == "sandbox" && a.Action == "paused" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("no 'sandbox/paused' activity record after pause")
-	}
+	t.Error("no 'sandbox/paused' activity record after pause")
 }
 
 func TestIntegration_ActivityLog_ActorAttributedToKeyCreator(t *testing.T) {

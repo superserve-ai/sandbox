@@ -49,8 +49,8 @@ func EnqueueBackfillForTest(ctx context.Context, pool *pgxpool.Pool, cfg HourlyR
 	return enqueueBackfill(ctx, pool, cfg, now)
 }
 
-func NextBackfillHoursForTest(ctx context.Context, pool *pgxpool.Pool, startHour time.Time, endHour time.Time, batchHours int) ([]time.Time, error) {
-	return nextBackfillHours(ctx, pool, startHour, endHour, batchHours)
+func AdvanceTeamBackfillCursorForTest(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, fromHour time.Time, toHour time.Time) error {
+	return advanceTeamBackfillCursor(ctx, pool, teamID, fromHour, toHour)
 }
 
 func ProcessJobsForTest(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg HourlyRollupConfig, workerID string) {
