@@ -365,10 +365,18 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	// Serialize the paused→resuming claim with attach/detach, which take the same
+	// per-sandbox lock before reading status. Without it, a mutation reading a
+	// stale 'paused' could insert a binding after this resume loads the set,
+	// leaving it in the DB but absent from the re-minted JWT. Once the claim flips
+	// status to 'resuming', those handlers reject with 409, so the lock only needs
+	// to cover the claim, not the whole resume.
+	unlockSecrets := lockSandboxSecrets(sandboxID)
 	claimed, err := h.DB.BeginResume(c.Request.Context(), db.BeginResumeParams{
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
+	unlockSecrets()
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
