@@ -218,8 +218,8 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	}
 
 	// Record the detached token as revoked so the proxy refuses it for a process
-	// still holding the old JWT. Best-effort, detached from the request context: a
-	// missed row only delays cut-off to the JWT's expiry; the binding is already gone.
+	// still holding the old JWT. Detached from the request context so a client
+	// disconnect mid-call doesn't skip the write.
 	if deleted.ProxyToken != "" {
 		revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer revokeCancel()
