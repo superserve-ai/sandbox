@@ -365,10 +365,34 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
-	claimed, err := h.DB.BeginResume(c.Request.Context(), db.BeginResumeParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
+	// Serialize the paused→resuming claim with attach/detach via a DB advisory
+	// lock (held only for the claim). Both take the same lock and re-read status
+	// under it, so across API instances a mutation can't read a stale 'paused' and
+	// land a binding this resume won't pick up. Once the claim flips status to
+	// 'resuming', those handlers see it under the lock and reject with 409.
+	claimResume := func(q *db.Queries) (db.Sandbox, error) {
+		if h.Pool != nil {
+			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), sandboxID.String()); lerr != nil {
+				return db.Sandbox{}, lerr
+			}
+		}
+		return q.BeginResume(c.Request.Context(), db.BeginResumeParams{ID: sandboxID, TeamID: teamID})
+	}
+	var (
+		claimed db.Sandbox
+		err     error
+	)
+	if h.Pool == nil {
+		claimed, err = claimResume(h.DB)
+	} else {
+		var tx pgx.Tx
+		if tx, err = h.Pool.Begin(c.Request.Context()); err == nil {
+			defer tx.Rollback(c.Request.Context())
+			if claimed, err = claimResume(h.DB.WithTx(tx)); err == nil {
+				err = tx.Commit(c.Request.Context())
+			}
+		}
+	}
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
@@ -434,8 +458,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
-	// per-binding proxy tokens are in the snapshot.
+	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
+	// tokens as they were at pause; the current binding set is re-applied below
+	// once the VM is up, so a mutation made while paused takes effect.
 	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 	if err != nil {
 		if isVMDNotFound(err) {
@@ -523,6 +548,25 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		pauseAndRevert()
 		respondError(c, ErrInternal)
 		return false
+	}
+
+	// Re-apply the current binding set before committing to 'active', so a secret
+	// attached or detached while paused takes effect — the snapshot froze the old
+	// JWT. Skipped when there are no bindings, keeping the secret-less resume a
+	// single round trip. The fresh IP binds the re-minted JWT.
+	sandbox.IpAddress = ipAddr
+	if meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID); merr != nil {
+		log.Error().Err(merr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings on resume failed")
+		pauseAndRevert()
+		respondError(c, ErrInternal)
+		return false
+	} else if len(meta) > 0 {
+		if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
+			log.Error().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("reapply secret bindings on resume failed")
+			pauseAndRevert()
+			respondError(c, ErrInternal)
+			return false
+		}
 	}
 
 	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
@@ -1429,14 +1473,18 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			}
 			secretIDs := make([]uuid.UUID, len(secretBindings))
 			envKeys := make([]string, len(secretBindings))
+			proxyTokens := make([]string, len(secretBindings))
 			for i := range secretBindings {
 				secretIDs[i] = secretBindings[i].SecretID
 				envKeys[i] = secretBindings[i].EnvKey
+				// secretMeta is index-aligned with secretBindings; persist its token.
+				proxyTokens[i] = secretMeta[i].ProxyToken
 			}
 			if err := q.AddSandboxSecrets(insertCtx, db.AddSandboxSecretsParams{
-				SandboxID: sandboxID,
-				SecretIds: secretIDs,
-				EnvKeys:   envKeys,
+				SandboxID:   sandboxID,
+				SecretIds:   secretIDs,
+				EnvKeys:     envKeys,
+				ProxyTokens: proxyTokens,
 			}); err != nil {
 				return db.Sandbox{}, fmt.Errorf("insert secret bindings: %w", err)
 			}

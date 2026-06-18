@@ -879,19 +879,33 @@ func (h *Handlers) fanoutInvalidate(ctx context.Context, secretID uuid.UUID) {
 	wg.Wait()
 }
 
-// ListSandboxRevocations returns the active sandbox-revocation set for daemon bootstrap.
+// ListSandboxRevocations returns the active revocation set for daemon bootstrap:
+// whole sandboxes and individual detached proxy tokens.
 func (h *Handlers) ListSandboxRevocations(c *gin.Context) {
-	rows, err := h.DB.ListActiveSandboxRevocations(c.Request.Context())
+	ctx := c.Request.Context()
+	rows, err := h.DB.ListActiveSandboxRevocations(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("DB ListActiveSandboxRevocations failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	out := make([]string, 0, len(rows))
+	sandboxes := make([]string, 0, len(rows))
 	for _, id := range rows {
-		out = append(out, id.String())
+		sandboxes = append(sandboxes, id.String())
 	}
-	c.JSON(http.StatusOK, gin.H{"sandboxes": out})
+
+	tokenRows, err := h.DB.ListActiveRevokedProxyTokens(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("DB ListActiveRevokedProxyTokens failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	tokens := make([]gin.H, 0, len(tokenRows))
+	for _, t := range tokenRows {
+		tokens = append(tokens, gin.H{"sandbox_id": t.SandboxID.String(), "proxy_token": t.ProxyToken})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"sandboxes": sandboxes, "proxy_tokens": tokens})
 }
 
 // GetSandboxEgressRules serves a sandbox's current egress rules to the secrets
@@ -1079,6 +1093,77 @@ func (h *Handlers) resolveSecretBindingsForCreate(
 		})
 	}
 	return bindings, meta, nil
+}
+
+// loadSecretBindingMeta rebuilds a sandbox's binding metadata from the DB. The
+// stored proxy token is reused so re-minting a JWT doesn't rotate stand-ins; a
+// binding stored before tokens were persisted gets one minted on the fly.
+func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]SecretBindingMeta, error) {
+	rows, err := h.DB.ListSandboxSecretBindingMeta(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	meta := make([]SecretBindingMeta, 0, len(rows))
+	for _, r := range rows {
+		token := ""
+		if r.ProxyToken != nil {
+			token = *r.ProxyToken
+		}
+		if token == "" {
+			t, terr := mintProxyToken(r.ProviderShortcut)
+			if terr != nil {
+				return nil, terr
+			}
+			// Persist-or-adopt: the returned token is the authoritative stored one
+			// (ours, or a concurrent writer's via COALESCE), so the token we ship in
+			// the JWT/env below always matches what detach can revoke.
+			stored, perr := h.DB.ClaimSandboxSecretProxyToken(ctx, db.ClaimSandboxSecretProxyTokenParams{
+				SandboxID: sandboxID, EnvKey: r.EnvKey, ProxyToken: &t,
+			})
+			if perr != nil {
+				return nil, fmt.Errorf("persist minted proxy token for %q: %w", r.EnvKey, perr)
+			}
+			if stored == nil {
+				return nil, fmt.Errorf("persist minted proxy token for %q: no token returned", r.EnvKey)
+			}
+			token = *stored
+		}
+		meta = append(meta, SecretBindingMeta{
+			SecretID:         r.SecretID,
+			EnvKey:           r.EnvKey,
+			AuthType:         r.AuthType,
+			AuthConfig:       r.AuthConfig,
+			ProviderShortcut: r.ProviderShortcut,
+			Hosts:            r.Hosts,
+			ProxyToken:       token,
+		})
+	}
+	return meta, nil
+}
+
+// applySecretBindings mints the secrets JWT for meta and injects it, with the secret
+// env vars, into a live sandbox. Empty meta injects no JWT. InjectSandboxEnv merges,
+// so it can add or update an env var but not remove one.
+func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, meta []SecretBindingMeta) error {
+	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
+	if err != nil {
+		return fmt.Errorf("resolve vmd for host: %w", err)
+	}
+	var jwt string
+	if len(meta) > 0 {
+		sourceIP := ""
+		if sandbox.IpAddress != nil {
+			sourceIP = sandbox.IpAddress.String()
+		}
+		jwt, err = h.mintSecretsJWT(sandbox.ID.String(), sandbox.TeamID.String(), sourceIP, meta)
+		if err != nil {
+			return fmt.Errorf("mint secrets jwt: %w", err)
+		}
+	}
+	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), mergeEnvVarsWithSecrets(nil, meta), jwt); err != nil {
+		return fmt.Errorf("inject sandbox env: %w", err)
+	}
+	return nil
 }
 
 // mintSecretsJWT builds the per-sandbox secrets JWT. Returns the signed JWT

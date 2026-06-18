@@ -41,6 +41,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
+		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
+		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 
 		// Sandbox operations. Sandbox must already be active — paused
 		// sandboxes must be resumed explicitly via /resume.

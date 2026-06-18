@@ -329,6 +329,91 @@ paths:
           $ref: "#/components/responses/InternalError"
 
 
+  /sandboxes/{sandbox_id}/secrets:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    post:
+      operationId: attachSandboxSecret
+      tags: [Sandboxes]
+      summary: Attach a secret to a sandbox
+      description: |
+        Binds a stored secret to an existing sandbox under an env var. The
+        sandbox sees a stand-in token; the credential is swapped in for outbound
+        requests to its allowed hosts. Takes effect for processes started after
+        this call; a paused sandbox applies it on resume.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [env_key, secret_name]
+              properties:
+                env_key:
+                  type: string
+                  description: Environment variable the stand-in token is exposed under.
+                secret_name:
+                  type: string
+                  description: Name of the team secret to bind.
+      responses:
+        "201":
+          description: Secret attached
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  env_key:
+                    type: string
+                  secret_name:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/secrets/{env_key}:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - name: env_key
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Environment variable the secret is bound under.
+
+    delete:
+      operationId: detachSandboxSecret
+      tags: [Sandboxes]
+      summary: Detach a secret from a sandbox
+      description: |
+        Removes a secret binding from an existing sandbox and revokes its
+        stand-in token, so requests that use it are refused — for an
+        already-running process, within about a minute. A paused sandbox applies
+        the change on resume.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Secret detached
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}/exec:
     parameters:
       - $ref: "#/components/parameters/SandboxId"

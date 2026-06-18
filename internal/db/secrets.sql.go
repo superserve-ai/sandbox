@@ -14,38 +14,73 @@ import (
 )
 
 const addSandboxSecret = `-- name: AddSandboxSecret :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
-VALUES ($1, $2, $3)
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+VALUES ($1, $2, $3, $4)
 `
 
 type AddSandboxSecretParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	SecretID  uuid.UUID `json:"secret_id"`
-	EnvKey    string    `json:"env_key"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	SecretID   uuid.UUID `json:"secret_id"`
+	EnvKey     string    `json:"env_key"`
+	ProxyToken *string   `json:"proxy_token"`
 }
 
 func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) error {
-	_, err := q.db.Exec(ctx, addSandboxSecret, arg.SandboxID, arg.SecretID, arg.EnvKey)
+	_, err := q.db.Exec(ctx, addSandboxSecret,
+		arg.SandboxID,
+		arg.SecretID,
+		arg.EnvKey,
+		arg.ProxyToken,
+	)
 	return err
 }
 
 const addSandboxSecrets = `-- name: AddSandboxSecrets :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
-SELECT $1::uuid, ($2::uuid[])[i], ($3::text[])[i]
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+SELECT $1::uuid, ($2::uuid[])[i], ($3::text[])[i], ($4::text[])[i]
 FROM generate_subscripts($2::uuid[], 1) AS g(i)
 `
 
 type AddSandboxSecretsParams struct {
-	SandboxID uuid.UUID   `json:"sandbox_id"`
-	SecretIds []uuid.UUID `json:"secret_ids"`
-	EnvKeys   []string    `json:"env_keys"`
+	SandboxID   uuid.UUID   `json:"sandbox_id"`
+	SecretIds   []uuid.UUID `json:"secret_ids"`
+	EnvKeys     []string    `json:"env_keys"`
+	ProxyTokens []string    `json:"proxy_tokens"`
 }
 
 // Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
-// the secret_ids and env_keys arrays are paired by position.
+// the secret_ids, env_keys, and proxy_tokens arrays are paired by position.
 func (q *Queries) AddSandboxSecrets(ctx context.Context, arg AddSandboxSecretsParams) error {
-	_, err := q.db.Exec(ctx, addSandboxSecrets, arg.SandboxID, arg.SecretIds, arg.EnvKeys)
+	_, err := q.db.Exec(ctx, addSandboxSecrets,
+		arg.SandboxID,
+		arg.SecretIds,
+		arg.EnvKeys,
+		arg.ProxyTokens,
+	)
 	return err
+}
+
+const claimSandboxSecretProxyToken = `-- name: ClaimSandboxSecretProxyToken :one
+UPDATE sandbox_secret SET proxy_token = COALESCE(proxy_token, $3)
+WHERE sandbox_id = $1 AND env_key = $2
+RETURNING proxy_token
+`
+
+type ClaimSandboxSecretProxyTokenParams struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	EnvKey     string    `json:"env_key"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+// Persist a proxy token minted on the fly for a legacy (NULL-token) binding.
+// COALESCE keeps an existing token if a concurrent writer already set one; the
+// row lock serializes the two, and RETURNING gives whichever token is now stored
+// — so every caller injects the same revocable token, never a local unstored mint.
+func (q *Queries) ClaimSandboxSecretProxyToken(ctx context.Context, arg ClaimSandboxSecretProxyTokenParams) (*string, error) {
+	row := q.db.QueryRow(ctx, claimSandboxSecretProxyToken, arg.SandboxID, arg.EnvKey, arg.ProxyToken)
+	var proxy_token *string
+	err := row.Scan(&proxy_token)
+	return proxy_token, err
 }
 
 const createSecret = `-- name: CreateSecret :one
@@ -99,6 +134,29 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) (Sec
 		&i.LastUsedAt,
 		&i.DeletedAt,
 	)
+	return i, err
+}
+
+const deleteSandboxSecretBinding = `-- name: DeleteSandboxSecretBinding :one
+DELETE FROM sandbox_secret WHERE sandbox_id = $1 AND env_key = $2
+RETURNING secret_id, proxy_token
+`
+
+type DeleteSandboxSecretBindingParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+type DeleteSandboxSecretBindingRow struct {
+	SecretID   uuid.UUID `json:"secret_id"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+// Remove one binding by env_key; returns the secret_id and proxy token for re-mint.
+func (q *Queries) DeleteSandboxSecretBinding(ctx context.Context, arg DeleteSandboxSecretBindingParams) (DeleteSandboxSecretBindingRow, error) {
+	row := q.db.QueryRow(ctx, deleteSandboxSecretBinding, arg.SandboxID, arg.EnvKey)
+	var i DeleteSandboxSecretBindingRow
+	err := row.Scan(&i.SecretID, &i.ProxyToken)
 	return i, err
 }
 
@@ -390,6 +448,55 @@ func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEv
 	return items, nil
 }
 
+const listSandboxSecretBindingMeta = `-- name: ListSandboxSecretBindingMeta :many
+SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+FROM sandbox_secret ss
+JOIN secret s ON s.id = ss.secret_id
+WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
+ORDER BY ss.env_key
+`
+
+type ListSandboxSecretBindingMetaRow struct {
+	SecretID         uuid.UUID `json:"secret_id"`
+	EnvKey           string    `json:"env_key"`
+	ProxyToken       *string   `json:"proxy_token"`
+	AuthType         string    `json:"auth_type"`
+	AuthConfig       []byte    `json:"auth_config"`
+	ProviderShortcut *string   `json:"provider_shortcut"`
+	Hosts            []string  `json:"hosts"`
+}
+
+// Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
+// soft-deleted secrets.
+func (q *Queries) ListSandboxSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretBindingMetaRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxSecretBindingMeta, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxSecretBindingMetaRow{}
+	for rows.Next() {
+		var i ListSandboxSecretBindingMetaRow
+		if err := rows.Scan(
+			&i.SecretID,
+			&i.EnvKey,
+			&i.ProxyToken,
+			&i.AuthType,
+			&i.AuthConfig,
+			&i.ProviderShortcut,
+			&i.Hosts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxSecretBindings = `-- name: ListSandboxSecretBindings :many
 SELECT ss.env_key, s.name AS secret_name, (s.deleted_at IS NOT NULL)::bool AS secret_revoked
 FROM sandbox_secret ss
@@ -610,6 +717,17 @@ func (q *Queries) ListSecretsForTeam(ctx context.Context, teamID uuid.UUID) ([]S
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockSandboxForSecretWrites = `-- name: LockSandboxForSecretWrites :exec
+SELECT pg_advisory_xact_lock(hashtext($1)::bigint)
+`
+
+// Transaction-scoped advisory lock keyed on the sandbox so the binding-count cap
+// check and insert serialize across API instances, not just the in-process lock.
+func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext string) error {
+	_, err := q.db.Exec(ctx, lockSandboxForSecretWrites, hashtext)
+	return err
 }
 
 const softDeleteSecret = `-- name: SoftDeleteSecret :one

@@ -106,7 +106,8 @@ func (h *Handlers) sweepOrphanedIntervals(ctx context.Context) {
 	}
 }
 
-// cleanupExpiredRevocations deletes sandbox_revocation rows past their TTL.
+// cleanupExpiredRevocations deletes sandbox_revocation and revoked_proxy_token
+// rows past their TTL — once no live JWT can carry them, the entries are moot.
 func (h *Handlers) cleanupExpiredRevocations(ctx context.Context) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -117,6 +118,15 @@ func (h *Handlers) cleanupExpiredRevocations(ctx context.Context) {
 	}
 	if n > 0 {
 		log.Info().Int64("reaped", n).Msg("reaper: deleted expired sandbox revocations")
+	}
+
+	tn, err := h.DB.DeleteExpiredRevokedProxyTokens(queryCtx)
+	if err != nil {
+		log.Warn().Err(err).Msg("reaper: cleanup revoked proxy tokens failed")
+		return
+	}
+	if tn > 0 {
+		log.Info().Int64("reaped", tn).Msg("reaper: deleted expired revoked proxy tokens")
 	}
 }
 

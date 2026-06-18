@@ -54,16 +54,35 @@ SET deleted_at = now(), updated_at = now()
 WHERE team_id = $1 AND name = $2 AND deleted_at IS NULL
 RETURNING *;
 
+-- name: LockSandboxForSecretWrites :exec
+-- Transaction-scoped advisory lock keyed on the sandbox so the binding-count cap
+-- check and insert serialize across API instances, not just the in-process lock.
+SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
+
 -- name: AddSandboxSecret :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
-VALUES ($1, $2, $3);
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+VALUES ($1, $2, $3, $4);
+
+-- name: ClaimSandboxSecretProxyToken :one
+-- Persist a proxy token minted on the fly for a legacy (NULL-token) binding.
+-- COALESCE keeps an existing token if a concurrent writer already set one; the
+-- row lock serializes the two, and RETURNING gives whichever token is now stored
+-- — so every caller injects the same revocable token, never a local unstored mint.
+UPDATE sandbox_secret SET proxy_token = COALESCE(proxy_token, $3)
+WHERE sandbox_id = $1 AND env_key = $2
+RETURNING proxy_token;
 
 -- name: AddSandboxSecrets :exec
 -- Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
--- the secret_ids and env_keys arrays are paired by position.
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
-SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i]
+-- the secret_ids, env_keys, and proxy_tokens arrays are paired by position.
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
 FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i);
+
+-- name: DeleteSandboxSecretBinding :one
+-- Remove one binding by env_key; returns the secret_id and proxy token for re-mint.
+DELETE FROM sandbox_secret WHERE sandbox_id = $1 AND env_key = $2
+RETURNING secret_id, proxy_token;
 
 -- name: DeleteSandboxSecrets :exec
 -- Drop every secret binding for a sandbox (e.g. cleaning up a failed create).
@@ -83,6 +102,16 @@ SELECT ss.env_key, s.name AS secret_name, (s.deleted_at IS NOT NULL)::bool AS se
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1
+ORDER BY ss.env_key;
+
+-- name: ListSandboxSecretBindingMeta :many
+-- Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
+-- soft-deleted secrets.
+SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+FROM sandbox_secret ss
+JOIN secret s ON s.id = ss.secret_id
+WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
 ORDER BY ss.env_key;
 
 -- name: ListSandboxesForSecret :many

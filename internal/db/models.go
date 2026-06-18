@@ -359,6 +359,13 @@ type ReconcilerLog struct {
 	CreatedAt time.Time   `json:"created_at"`
 }
 
+type RevokedProxyToken struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	ProxyToken string    `json:"proxy_token"`
+	RevokedAt  time.Time `json:"revoked_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
 type Sandbox struct {
 	ID            uuid.UUID          `json:"id"`
 	TeamID        uuid.UUID          `json:"team_id"`
@@ -414,9 +421,10 @@ type SandboxRevocation struct {
 }
 
 type SandboxSecret struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	SecretID  uuid.UUID `json:"secret_id"`
-	EnvKey    string    `json:"env_key"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	SecretID   uuid.UUID `json:"secret_id"`
+	EnvKey     string    `json:"env_key"`
+	ProxyToken *string   `json:"proxy_token"`
 }
 
 type SandboxStorageInterval struct {
