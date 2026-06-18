@@ -22,7 +22,7 @@ type AddSandboxSecretParams struct {
 	SandboxID  uuid.UUID `json:"sandbox_id"`
 	SecretID   uuid.UUID `json:"secret_id"`
 	EnvKey     string    `json:"env_key"`
-	ProxyToken string    `json:"proxy_token"`
+	ProxyToken *string   `json:"proxy_token"`
 }
 
 func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) error {
@@ -126,7 +126,7 @@ type DeleteSandboxSecretBindingParams struct {
 
 type DeleteSandboxSecretBindingRow struct {
 	SecretID   uuid.UUID `json:"secret_id"`
-	ProxyToken string    `json:"proxy_token"`
+	ProxyToken *string   `json:"proxy_token"`
 }
 
 // Remove one binding by env_key; returns the secret_id and proxy token for re-mint.
@@ -437,7 +437,7 @@ ORDER BY ss.env_key
 type ListSandboxSecretBindingMetaRow struct {
 	SecretID         uuid.UUID `json:"secret_id"`
 	EnvKey           string    `json:"env_key"`
-	ProxyToken       string    `json:"proxy_token"`
+	ProxyToken       *string   `json:"proxy_token"`
 	AuthType         string    `json:"auth_type"`
 	AuthConfig       []byte    `json:"auth_config"`
 	ProviderShortcut *string   `json:"provider_shortcut"`

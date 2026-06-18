@@ -375,7 +375,7 @@ type SandboxSecret struct {
 	SandboxID  uuid.UUID `json:"sandbox_id"`
 	SecretID   uuid.UUID `json:"secret_id"`
 	EnvKey     string    `json:"env_key"`
-	ProxyToken string    `json:"proxy_token"`
+	ProxyToken *string   `json:"proxy_token"`
 }
 
 type SandboxStorageInterval struct {

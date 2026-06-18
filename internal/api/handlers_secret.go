@@ -1096,7 +1096,8 @@ func (h *Handlers) resolveSecretBindingsForCreate(
 }
 
 // loadSecretBindingMeta rebuilds a sandbox's binding metadata from the DB. The
-// stored proxy token is reused so re-minting a JWT doesn't rotate stand-ins.
+// stored proxy token is reused so re-minting a JWT doesn't rotate stand-ins; a
+// binding stored before tokens were persisted gets one minted on the fly.
 func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]SecretBindingMeta, error) {
 	rows, err := h.DB.ListSandboxSecretBindingMeta(ctx, sandboxID)
 	if err != nil {
@@ -1104,6 +1105,17 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 	}
 	meta := make([]SecretBindingMeta, 0, len(rows))
 	for _, r := range rows {
+		token := ""
+		if r.ProxyToken != nil {
+			token = *r.ProxyToken
+		}
+		if token == "" {
+			t, terr := mintProxyToken(r.ProviderShortcut)
+			if terr != nil {
+				return nil, terr
+			}
+			token = t
+		}
 		meta = append(meta, SecretBindingMeta{
 			SecretID:         r.SecretID,
 			EnvKey:           r.EnvKey,
@@ -1111,7 +1123,7 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 			AuthConfig:       r.AuthConfig,
 			ProviderShortcut: r.ProviderShortcut,
 			Hosts:            r.Hosts,
-			ProxyToken:       r.ProxyToken,
+			ProxyToken:       token,
 		})
 	}
 	return meta, nil

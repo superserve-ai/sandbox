@@ -72,7 +72,8 @@ func bindingMetaRow(secretID uuid.UUID, envKey, authType string, token string) f
 	return func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = secretID
 		*dest[1].(*string) = envKey
-		*dest[2].(*string) = token
+		tok := token
+		*dest[2].(**string) = &tok
 		*dest[3].(*string) = authType
 		*dest[4].(*[]byte) = nil
 		*dest[5].(**string) = nil
@@ -338,7 +339,7 @@ func TestDetachSandboxSecret_Active_Success(t *testing.T) {
 			case strings.Contains(sql, "DeleteSandboxSecretBinding"):
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*uuid.UUID) = uuid.New()
-					*dest[1].(*string) = tok
+					*dest[1].(**string) = &tok
 					return nil
 				}}
 			default:
@@ -381,7 +382,7 @@ func TestDetachSandboxSecret_Paused_NoInject(t *testing.T) {
 			case strings.Contains(sql, "DeleteSandboxSecretBinding"):
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*uuid.UUID) = uuid.New()
-					*dest[1].(*string) = tok
+					*dest[1].(**string) = &tok
 					return nil
 				}}
 			default:
@@ -435,7 +436,7 @@ func TestDetachSandboxSecret_RevocationFailureReturns500(t *testing.T) {
 			if strings.Contains(sql, "DeleteSandboxSecretBinding") {
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*uuid.UUID) = uuid.New()
-					*dest[1].(*string) = tok
+					*dest[1].(**string) = &tok
 					return nil
 				}}
 			}

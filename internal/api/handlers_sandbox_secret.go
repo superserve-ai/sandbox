@@ -119,7 +119,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		SandboxID:  sandboxID,
 		SecretID:   secret.ID,
 		EnvKey:     req.EnvKey,
-		ProxyToken: token,
+		ProxyToken: &token,
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("insert sandbox secret binding")
 		respondError(c, ErrInternal)
@@ -202,12 +202,14 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		if derr != nil {
 			return derr
 		}
-		if deleted.ProxyToken == "" {
+		// A binding stored before tokens were persisted has no token to revoke;
+		// its credential isn't individually revocable until it's re-attached.
+		if deleted.ProxyToken == nil || *deleted.ProxyToken == "" {
 			return nil
 		}
 		return q.InsertRevokedProxyToken(mutCtx, db.InsertRevokedProxyTokenParams{
 			SandboxID:  sandboxID,
-			ProxyToken: deleted.ProxyToken,
+			ProxyToken: *deleted.ProxyToken,
 			ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
 		})
 	}
