@@ -135,7 +135,11 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		}
 		if lerr != nil {
 			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("apply secret bindings on attach")
-			_, _ = h.DB.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
+			// Detached context so a client disconnect can't fail both the apply and
+			// its rollback, leaving the row behind after a 500.
+			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer rbCancel()
+			_, _ = h.DB.DeleteSandboxSecretBinding(rbCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
 			respondError(c, ErrInternal)
 			return
 		}
@@ -206,7 +210,12 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		}
 		if lerr != nil {
 			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("apply secret bindings on detach")
-			_ = h.DB.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+			// Restore on a detached context: a client disconnect may be what failed
+			// the apply, so the compensating write must not ride the same cancelled
+			// context — otherwise the binding is gone but the live JWT still honors it.
+			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer rbCancel()
+			_ = h.DB.AddSandboxSecret(rbCtx, db.AddSandboxSecretParams{
 				SandboxID:  sandboxID,
 				SecretID:   deleted.SecretID,
 				EnvKey:     envKey,
