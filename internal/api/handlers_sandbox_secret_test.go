@@ -426,11 +426,16 @@ func TestLoadSecretBindingMeta_PersistsMintedTokenForLegacyRow(t *testing.T) {
 				return nil
 			}}}, nil
 		},
-		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-			if strings.Contains(sql, "SetSandboxSecretProxyToken") {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "ClaimSandboxSecretProxyToken") {
 				persisted = true
+				tok, _ := args[2].(*string) // the minted token passed in; echo it back
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(**string) = tok
+					return nil
+				}}
 			}
-			return pgconn.NewCommandTag("UPDATE 1"), nil
+			return notFoundRow()
 		},
 	}
 	h := &Handlers{DB: db.New(mock)}

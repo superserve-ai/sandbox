@@ -60,6 +60,29 @@ func (q *Queries) AddSandboxSecrets(ctx context.Context, arg AddSandboxSecretsPa
 	return err
 }
 
+const claimSandboxSecretProxyToken = `-- name: ClaimSandboxSecretProxyToken :one
+UPDATE sandbox_secret SET proxy_token = COALESCE(proxy_token, $3)
+WHERE sandbox_id = $1 AND env_key = $2
+RETURNING proxy_token
+`
+
+type ClaimSandboxSecretProxyTokenParams struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	EnvKey     string    `json:"env_key"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+// Persist a proxy token minted on the fly for a legacy (NULL-token) binding.
+// COALESCE keeps an existing token if a concurrent writer already set one; the
+// row lock serializes the two, and RETURNING gives whichever token is now stored
+// — so every caller injects the same revocable token, never a local unstored mint.
+func (q *Queries) ClaimSandboxSecretProxyToken(ctx context.Context, arg ClaimSandboxSecretProxyTokenParams) (*string, error) {
+	row := q.db.QueryRow(ctx, claimSandboxSecretProxyToken, arg.SandboxID, arg.EnvKey, arg.ProxyToken)
+	var proxy_token *string
+	err := row.Scan(&proxy_token)
+	return proxy_token, err
+}
+
 const createSecret = `-- name: CreateSecret :one
 INSERT INTO secret (
     team_id, name, auth_type, auth_config, provider_shortcut, hosts,
@@ -704,25 +727,6 @@ SELECT pg_advisory_xact_lock(hashtext($1)::bigint)
 // check and insert serialize across API instances, not just the in-process lock.
 func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext string) error {
 	_, err := q.db.Exec(ctx, lockSandboxForSecretWrites, hashtext)
-	return err
-}
-
-const setSandboxSecretProxyToken = `-- name: SetSandboxSecretProxyToken :exec
-UPDATE sandbox_secret SET proxy_token = $3
-WHERE sandbox_id = $1 AND env_key = $2 AND proxy_token IS NULL
-`
-
-type SetSandboxSecretProxyTokenParams struct {
-	SandboxID  uuid.UUID `json:"sandbox_id"`
-	EnvKey     string    `json:"env_key"`
-	ProxyToken *string   `json:"proxy_token"`
-}
-
-// Persist a proxy token minted on the fly for a legacy (NULL-token) binding, so
-// it stays stable across re-mints and can be revoked on detach. The IS NULL
-// guard makes it a no-op if another writer already set one.
-func (q *Queries) SetSandboxSecretProxyToken(ctx context.Context, arg SetSandboxSecretProxyTokenParams) error {
-	_, err := q.db.Exec(ctx, setSandboxSecretProxyToken, arg.SandboxID, arg.EnvKey, arg.ProxyToken)
 	return err
 }
 

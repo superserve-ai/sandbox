@@ -1114,14 +1114,19 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 			if terr != nil {
 				return nil, terr
 			}
-			// Persist it: this exact token is shipped in the JWT/env below, so it
-			// must survive (stable across re-mints) and be revocable on detach.
-			if perr := h.DB.SetSandboxSecretProxyToken(ctx, db.SetSandboxSecretProxyTokenParams{
+			// Persist-or-adopt: the returned token is the authoritative stored one
+			// (ours, or a concurrent writer's via COALESCE), so the token we ship in
+			// the JWT/env below always matches what detach can revoke.
+			stored, perr := h.DB.ClaimSandboxSecretProxyToken(ctx, db.ClaimSandboxSecretProxyTokenParams{
 				SandboxID: sandboxID, EnvKey: r.EnvKey, ProxyToken: &t,
-			}); perr != nil {
+			})
+			if perr != nil {
 				return nil, fmt.Errorf("persist minted proxy token for %q: %w", r.EnvKey, perr)
 			}
-			token = t
+			if stored == nil {
+				return nil, fmt.Errorf("persist minted proxy token for %q: no token returned", r.EnvKey)
+			}
+			token = *stored
 		}
 		meta = append(meta, SecretBindingMeta{
 			SecretID:         r.SecretID,

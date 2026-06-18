@@ -192,6 +192,14 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer rbCancel()
 			_, _ = h.DB.DeleteSandboxSecretBinding(rbCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
+			// boxd may have committed the env/JWT before the apply errored (e.g. a
+			// timeout on the response), so revoke the token too — otherwise a partial
+			// apply leaves a usable credential after the row is gone.
+			_ = h.DB.InsertRevokedProxyToken(rbCtx, db.InsertRevokedProxyTokenParams{
+				SandboxID:  sandboxID,
+				ProxyToken: token,
+				ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
+			})
 			respondError(c, ErrInternal)
 			return
 		}
