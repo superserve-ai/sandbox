@@ -239,6 +239,12 @@ type BillingRollupSchedulerLease struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type BillingRollupTeamBackfillState struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	NextHourStart time.Time `json:"next_hour_start"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 type DeviceCode struct {
 	ID         uuid.UUID   `json:"id"`
 	DeviceCode string      `json:"device_code"`

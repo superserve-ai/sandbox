@@ -43,6 +43,13 @@ type HourlyRollupConfig struct {
 	Workers               int
 }
 
+type teamBackfillBatch struct {
+	TeamID     uuid.UUID
+	FromHour   time.Time
+	ToHour     time.Time
+	HourStarts []time.Time
+}
+
 type rollupJob struct {
 	ID           uuid.UUID
 	TeamID       uuid.UUID
@@ -302,85 +309,229 @@ func enqueueBackfill(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupCo
 		return 0, nil
 	}
 
-	hours, err := nextBackfillHours(ctx, pool, backfillStart, rollingStart, cfg.BackfillBatchHours)
+	batches, err := nextTeamBackfillBatches(ctx, pool, backfillStart, rollingStart, cfg.BackfillBatchHours, cfg.BatchSize)
 	if err != nil {
 		return 0, err
 	}
-	if len(hours) == 0 {
+	if len(batches) == 0 {
 		return 0, nil
 	}
 
 	total := int64(0)
-	for _, hourStart := range hours {
-		enqueued, err := enqueueHour(ctx, pool, hourStart, hourStart.Add(time.Hour), false)
+	for _, batch := range batches {
+		batchTotal := int64(0)
+		for _, hourStart := range batch.HourStarts {
+			enqueued, err := enqueueTeamHour(ctx, pool, batch.TeamID, hourStart, hourStart.Add(time.Hour), false)
+			if err != nil {
+				return total, err
+			}
+			batchTotal += enqueued
+		}
+		total += batchTotal
+
+		enabled, err := teamFeatureEnabled(ctx, pool, batch.TeamID, "billing_hourly_rollups")
 		if err != nil {
 			return total, err
 		}
-		total += enqueued
-	}
+		if !enabled {
+			log.Info().
+				Str("team_id", batch.TeamID.String()).
+				Time("from_hour", batch.FromHour).
+				Time("to_hour", batch.ToHour).
+				Msg("billing hourly rollup backfill cursor not advanced because team flag is disabled")
+			continue
+		}
 
-	if err := advanceBackfillCursor(ctx, pool, hours[0], hours[len(hours)-1].Add(time.Hour)); err != nil {
-		log.Warn().
-			Err(err).
-			Int64("jobs_enqueued", total).
-			Time("from_hour", hours[0]).
-			Time("to_hour", hours[len(hours)-1].Add(time.Hour)).
-			Msg("advance billing rollup backfill cursor failed after enqueue")
-		return total, err
+		if err := advanceTeamBackfillCursor(ctx, pool, batch.TeamID, batch.FromHour, batch.ToHour); err != nil {
+			log.Warn().
+				Err(err).
+				Str("team_id", batch.TeamID.String()).
+				Int64("jobs_enqueued", batchTotal).
+				Time("from_hour", batch.FromHour).
+				Time("to_hour", batch.ToHour).
+				Msg("advance billing rollup team backfill cursor failed after enqueue")
+			return total, err
+		}
 	}
 	return total, nil
 }
 
-func nextBackfillHours(ctx context.Context, pool *pgxpool.Pool, startHour, endHour time.Time, batchHours int) ([]time.Time, error) {
+func enqueueTeamHour(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, hourStart, hourEnd time.Time, refreshCompleted bool) (int64, error) {
 	const query = `
-INSERT INTO billing_rollup_backfill_state (name, next_hour_start)
-VALUES ('hourly', $1)
-ON CONFLICT (name) DO UPDATE
-SET next_hour_start = CASE
-        WHEN billing_rollup_backfill_state.next_hour_start < $1 THEN $1
-        ELSE billing_rollup_backfill_state.next_hour_start
+INSERT INTO billing_rollup_job (team_id, hour_start, hour_end, status, next_attempt_at)
+SELECT $1, $2, $3, 'pending', now()
+WHERE feature_enabled('billing_hourly_rollups', $1)
+  AND EXISTS (
+      SELECT 1
+      FROM sandbox_compute_billing_interval i
+      WHERE i.team_id = $1
+        AND i.started_at < $3
+        AND $2 < LEAST(now(), $3)
+        AND COALESCE(i.ended_at, LEAST(now(), $3)) > $2
+
+      UNION
+
+      SELECT 1
+      FROM sandbox_storage_interval i
+      WHERE i.team_id = $1
+        AND i.started_at < $3
+        AND $2 < LEAST(now(), $3)
+        AND COALESCE(i.ended_at, LEAST(now(), $3)) > $2
+  )
+ON CONFLICT (team_id, hour_start) DO UPDATE
+SET hour_end = EXCLUDED.hour_end,
+    status = 'pending',
+    locked_by = NULL,
+    locked_until = NULL,
+    last_error = CASE
+        WHEN billing_rollup_job.status = 'pending'
+         AND billing_rollup_job.next_attempt_at > now()
+            THEN billing_rollup_job.last_error
+        ELSE NULL
     END,
-    updated_at = CASE
-        WHEN billing_rollup_backfill_state.next_hour_start < $1 THEN now()
-        ELSE billing_rollup_backfill_state.updated_at
-    END
-RETURNING next_hour_start`
+    next_attempt_at = CASE
+        WHEN billing_rollup_job.status = 'pending'
+         AND billing_rollup_job.next_attempt_at > now()
+            THEN billing_rollup_job.next_attempt_at
+        ELSE now()
+    END,
+    attempt_count = CASE
+        WHEN billing_rollup_job.status = 'completed' THEN 0
+        ELSE billing_rollup_job.attempt_count
+    END,
+    completed_at = NULL,
+    updated_at = now()
+WHERE billing_rollup_job.status = 'pending'
+   OR (
+       $4::boolean
+       AND billing_rollup_job.status = 'completed'
+       AND (
+           billing_rollup_job.hour_end > now()
+           OR billing_rollup_job.completed_at < now() - interval '1 hour'
+       )
+   )`
 
-	var cursor time.Time
-	if err := pool.QueryRow(ctx, query, startHour).Scan(&cursor); err != nil {
-		return nil, err
-	}
-
-	if !cursor.Before(endHour) {
-		return nil, nil
-	}
-	batchEnd := cursor.Add(time.Duration(batchHours) * time.Hour)
-	if batchEnd.After(endHour) {
-		batchEnd = endHour
-	}
-
-	hours := make([]time.Time, 0, int(batchEnd.Sub(cursor)/time.Hour))
-	for hour := cursor; hour.Before(batchEnd); hour = hour.Add(time.Hour) {
-		hours = append(hours, hour)
-	}
-	return hours, nil
+	tag, err := pool.Exec(ctx, query, teamID, hourStart, hourEnd, refreshCompleted)
+	return tag.RowsAffected(), err
 }
 
-func advanceBackfillCursor(ctx context.Context, pool *pgxpool.Pool, fromHour, toHour time.Time) error {
+func nextTeamBackfillBatches(ctx context.Context, pool *pgxpool.Pool, startHour, endHour time.Time, batchHours int, teamLimit int) ([]teamBackfillBatch, error) {
+	if teamLimit <= 0 {
+		teamLimit = defaultHourlyRollupBatchSize
+	}
+
+	const query = `
+WITH interval_teams AS (
+    SELECT DISTINCT team_id
+    FROM (
+        SELECT i.team_id
+        FROM sandbox_compute_billing_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+
+        UNION
+
+        SELECT i.team_id
+        FROM sandbox_storage_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+    ) billing_teams
+    WHERE feature_enabled('billing_hourly_rollups', billing_teams.team_id)
+),
+eligible_team_cursors AS (
+    SELECT
+        interval_teams.team_id,
+        COALESCE(state.next_hour_start, $1) AS next_hour_start
+    FROM interval_teams
+    LEFT JOIN billing_rollup_team_backfill_state state
+      ON state.team_id = interval_teams.team_id
+    WHERE COALESCE(state.next_hour_start, $1) < $2
+),
+candidate_teams AS (
+    SELECT team_id, next_hour_start
+    FROM eligible_team_cursors
+    ORDER BY next_hour_start, team_id
+    LIMIT $3
+),
+upserted AS (
+    INSERT INTO billing_rollup_team_backfill_state (team_id, next_hour_start)
+    SELECT team_id, next_hour_start
+    FROM candidate_teams
+    ON CONFLICT (team_id) DO UPDATE
+    SET next_hour_start = CASE
+            WHEN billing_rollup_team_backfill_state.next_hour_start < $1 THEN $1
+            ELSE billing_rollup_team_backfill_state.next_hour_start
+        END,
+        updated_at = CASE
+            WHEN billing_rollup_team_backfill_state.next_hour_start < $1 THEN now()
+            ELSE billing_rollup_team_backfill_state.updated_at
+        END
+    RETURNING team_id, next_hour_start
+)
+SELECT team_id, next_hour_start
+FROM upserted
+ORDER BY next_hour_start, team_id`
+
+	rows, err := pool.Query(ctx, query, startHour, endHour, teamLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	batches := make([]teamBackfillBatch, 0, teamLimit)
+	for rows.Next() {
+		var batch teamBackfillBatch
+		if err := rows.Scan(&batch.TeamID, &batch.FromHour); err != nil {
+			return nil, err
+		}
+		batch.ToHour = batch.FromHour.Add(time.Duration(batchHours) * time.Hour)
+		if batch.ToHour.After(endHour) {
+			batch.ToHour = endHour
+		}
+		for hour := batch.FromHour; hour.Before(batch.ToHour); hour = hour.Add(time.Hour) {
+			batch.HourStarts = append(batch.HourStarts, hour)
+		}
+		batches = append(batches, batch)
+	}
+	return batches, rows.Err()
+}
+
+func advanceTeamBackfillCursor(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, fromHour, toHour time.Time) error {
 	tag, err := pool.Exec(ctx, `
-UPDATE billing_rollup_backfill_state
-SET next_hour_start = $2,
+UPDATE billing_rollup_team_backfill_state
+SET next_hour_start = $3,
     updated_at = now()
-WHERE name = 'hourly'
-  AND next_hour_start = $1
-`, fromHour, toHour)
+WHERE team_id = $1
+  AND next_hour_start >= $2
+  AND next_hour_start <= $3
+`, teamID, fromHour, toHour)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("billing rollup backfill cursor changed before advance from %s to %s", fromHour, toHour)
+	if tag.RowsAffected() > 0 {
+		return nil
 	}
-	return nil
+
+	var current time.Time
+	if err := pool.QueryRow(ctx, `
+SELECT next_hour_start
+FROM billing_rollup_team_backfill_state
+WHERE team_id = $1
+`, teamID).Scan(&current); err != nil {
+		return err
+	}
+	if !current.Before(toHour) {
+		return nil
+	}
+	return fmt.Errorf("billing rollup team backfill cursor moved backward before advance for team %s from %s to %s; current cursor is %s", teamID, fromHour, toHour, current)
+}
+
+func teamFeatureEnabled(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, key string) (bool, error) {
+	var enabled bool
+	err := pool.QueryRow(ctx, `SELECT feature_enabled($1, $2)`, key, teamID).Scan(&enabled)
+	return enabled, err
 }
 
 func claimJobs(ctx context.Context, pool *pgxpool.Pool, cfg HourlyRollupConfig, workerID string, lockedUntil time.Time) ([]rollupJob, error) {
