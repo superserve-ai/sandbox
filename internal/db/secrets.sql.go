@@ -707,6 +707,25 @@ func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext strin
 	return err
 }
 
+const setSandboxSecretProxyToken = `-- name: SetSandboxSecretProxyToken :exec
+UPDATE sandbox_secret SET proxy_token = $3
+WHERE sandbox_id = $1 AND env_key = $2 AND proxy_token IS NULL
+`
+
+type SetSandboxSecretProxyTokenParams struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	EnvKey     string    `json:"env_key"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+// Persist a proxy token minted on the fly for a legacy (NULL-token) binding, so
+// it stays stable across re-mints and can be revoked on detach. The IS NULL
+// guard makes it a no-op if another writer already set one.
+func (q *Queries) SetSandboxSecretProxyToken(ctx context.Context, arg SetSandboxSecretProxyTokenParams) error {
+	_, err := q.db.Exec(ctx, setSandboxSecretProxyToken, arg.SandboxID, arg.EnvKey, arg.ProxyToken)
+	return err
+}
+
 const softDeleteSecret = `-- name: SoftDeleteSecret :one
 UPDATE secret
 SET deleted_at = now(), updated_at = now()

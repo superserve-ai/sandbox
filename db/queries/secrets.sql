@@ -63,6 +63,13 @@ SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
 VALUES ($1, $2, $3, $4);
 
+-- name: SetSandboxSecretProxyToken :exec
+-- Persist a proxy token minted on the fly for a legacy (NULL-token) binding, so
+-- it stays stable across re-mints and can be revoked on detach. The IS NULL
+-- guard makes it a no-op if another writer already set one.
+UPDATE sandbox_secret SET proxy_token = $3
+WHERE sandbox_id = $1 AND env_key = $2 AND proxy_token IS NULL;
+
 -- name: AddSandboxSecrets :exec
 -- Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
 -- the secret_ids, env_keys, and proxy_tokens arrays are paired by position.

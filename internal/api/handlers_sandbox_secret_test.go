@@ -408,6 +408,44 @@ func TestDetachSandboxSecret_Paused_NoInject(t *testing.T) {
 	}
 }
 
+func TestLoadSecretBindingMeta_PersistsMintedTokenForLegacyRow(t *testing.T) {
+	sandboxID := uuid.New()
+	secretID := uuid.New()
+	var persisted bool
+	mock := &mockDBTX{
+		queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+			return &scanRows{rows: []func(...any) error{func(dest ...any) error {
+				*dest[0].(*uuid.UUID) = secretID
+				*dest[1].(*string) = "ANTHROPIC_API_KEY"
+				*dest[2].(**string) = nil // legacy: NULL proxy_token
+				*dest[3].(*string) = "api-key"
+				*dest[4].(*[]byte) = nil
+				sc := "anthropic"
+				*dest[5].(**string) = &sc
+				*dest[6].(*[]string) = []string{"api.anthropic.com"}
+				return nil
+			}}}, nil
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "SetSandboxSecretProxyToken") {
+				persisted = true
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+	meta, err := h.loadSecretBindingMeta(context.Background(), sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta) != 1 || meta[0].ProxyToken == "" {
+		t.Fatalf("expected one binding with a minted token, got %+v", meta)
+	}
+	if !persisted {
+		t.Error("a token minted for a legacy NULL row must be persisted so detach can revoke it")
+	}
+}
+
 func TestDetachSandboxSecret_BindingNotFound(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
