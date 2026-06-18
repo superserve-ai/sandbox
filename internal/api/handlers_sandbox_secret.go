@@ -33,8 +33,9 @@ func lockSandboxSecrets(sandboxID uuid.UUID) func() {
 // Sentinels so the attach insert (run inside a transaction) can map validation
 // outcomes back to HTTP statuses after the transaction closes.
 var (
-	errBindingExists     = errors.New("env key already bound on sandbox")
-	errBindingCapReached = errors.New("sandbox binding cap reached")
+	errBindingExists        = errors.New("env key already bound on sandbox")
+	errBindingCapReached    = errors.New("sandbox binding cap reached")
+	errSandboxMidTransition = errors.New("sandbox not in a mutable state")
 )
 
 type attachSecretRequest struct {
@@ -109,12 +110,26 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// attaches to the same sandbox on different API instances can't both pass the
 	// cap and exceed it — which would later wedge re-minting. The in-process lock
 	// only covers one instance. Env-key collisions are caught by the PK.
+	var liveSandbox db.Sandbox
 	insertBinding := func(q *db.Queries) error {
 		if h.Pool != nil {
 			if lerr := q.LockSandboxForSecretWrites(ctx, sandboxID.String()); lerr != nil {
 				return lerr
 			}
 		}
+		// Re-read status under the lock: a resume on another instance may have
+		// flipped it since the early read. The live status decides whether we
+		// inject now, so an attach can't skip injection on a stale 'paused'.
+		sb, lerr := q.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+		if lerr != nil {
+			return lerr
+		}
+		switch sb.Status {
+		case db.SandboxStatusActive, db.SandboxStatusPaused:
+		default:
+			return errSandboxMidTransition
+		}
+		liveSandbox = sb
 		existing, lerr := q.ListSandboxSecretBindings(ctx, sandboxID)
 		if lerr != nil {
 			return lerr
@@ -153,18 +168,22 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	case errors.Is(err, errBindingCapReached):
 		respondErrorMsg(c, "bad_request", fmt.Sprintf("sandbox already has the max %d secret bindings", SecretsBindingsCap), http.StatusBadRequest)
 		return
+	case errors.Is(err, errSandboxMidTransition):
+		respondErrorMsg(c, "conflict", "sandbox is not in a state that accepts secret changes", http.StatusConflict)
+		return
 	case err != nil:
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("insert sandbox secret binding")
 		respondError(c, ErrInternal)
 		return
 	}
 
-	// A running sandbox is updated now; a paused one picks it up on resume. Fail
-	// closed: roll back the row if the proxy JWT can't be re-minted/injected.
-	if sandbox.Status == db.SandboxStatusActive {
+	// A running sandbox is updated now; a paused one picks it up on resume. The
+	// status read under the lock is authoritative. Fail closed: roll back the row
+	// if the proxy JWT can't be re-minted/injected.
+	if liveSandbox.Status == db.SandboxStatusActive {
 		meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID)
 		if lerr == nil {
-			lerr = h.applySecretBindings(ctx, sandbox, meta)
+			lerr = h.applySecretBindings(ctx, liveSandbox, meta)
 		}
 		if lerr != nil {
 			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("apply secret bindings on attach")

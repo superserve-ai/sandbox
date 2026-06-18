@@ -365,18 +365,34 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
-	// Serialize the paused→resuming claim with attach/detach, which take the same
-	// per-sandbox lock before reading status. Without it, a mutation reading a
-	// stale 'paused' could insert a binding after this resume loads the set,
-	// leaving it in the DB but absent from the re-minted JWT. Once the claim flips
-	// status to 'resuming', those handlers reject with 409, so the lock only needs
-	// to cover the claim, not the whole resume.
-	unlockSecrets := lockSandboxSecrets(sandboxID)
-	claimed, err := h.DB.BeginResume(c.Request.Context(), db.BeginResumeParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	unlockSecrets()
+	// Serialize the paused→resuming claim with attach/detach via a DB advisory
+	// lock (held only for the claim). Both take the same lock and re-read status
+	// under it, so across API instances a mutation can't read a stale 'paused' and
+	// land a binding this resume won't pick up. Once the claim flips status to
+	// 'resuming', those handlers see it under the lock and reject with 409.
+	claimResume := func(q *db.Queries) (db.Sandbox, error) {
+		if h.Pool != nil {
+			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), sandboxID.String()); lerr != nil {
+				return db.Sandbox{}, lerr
+			}
+		}
+		return q.BeginResume(c.Request.Context(), db.BeginResumeParams{ID: sandboxID, TeamID: teamID})
+	}
+	var (
+		claimed db.Sandbox
+		err     error
+	)
+	if h.Pool == nil {
+		claimed, err = claimResume(h.DB)
+	} else {
+		var tx pgx.Tx
+		if tx, err = h.Pool.Begin(c.Request.Context()); err == nil {
+			defer tx.Rollback(c.Request.Context())
+			if claimed, err = claimResume(h.DB.WithTx(tx)); err == nil {
+				err = tx.Commit(c.Request.Context())
+			}
+		}
+	}
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
