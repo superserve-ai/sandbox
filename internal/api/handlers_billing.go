@@ -50,12 +50,9 @@ func (h *Handlers) GetBillingPricing(c *gin.Context) {
 		return
 	}
 
-	rates, err := h.DB.ListActivePricingRatesForTeam(c.Request.Context(), db.ListActivePricingRatesForTeamParams{
-		TeamID:      teamID,
-		EffectiveAt: time.Now().UTC(),
-	})
+	rates, err := h.DB.ListActivePricingRatesForTeamCurrent(c.Request.Context(), teamID)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB ListActivePricingRatesForTeam failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB ListActivePricingRatesForTeamCurrent failed")
 		respondError(c, ErrInternal)
 		return
 	}
