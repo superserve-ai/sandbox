@@ -488,3 +488,50 @@ func TestFileDownload_JSON_BlocklistedRejected(t *testing.T) {
 		}
 	}
 }
+
+// Security (PR #114, Amit): safePath is lexical, so a directory that resolves
+// through a symlink into a blocklisted path (/proc, /sys, /dev) must still be
+// refused — otherwise os.ReadDir/os.Stat follow the link and enumerate it,
+// bypassing the blocklist. /dev exists on Linux and macOS and is blocklisted.
+
+func TestFilesystemService_ListDir_SymlinkToBlocklistRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink("/dev", filepath.Join(dir, "devlink")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	svc := &filesystemService{}
+	_, err := svc.ListDir(context.Background(),
+		connect.NewRequest(&pb.ListDirRequest{Path: filepath.Join(dir, "devlink")}))
+	if err == nil {
+		t.Fatal("ListDir followed a symlink to /dev and listed it — blocklist bypassed")
+	}
+	if got := connect.CodeOf(err); got != connect.CodeInvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", got)
+	}
+}
+
+func TestFileDownload_JSON_SymlinkToBlocklistRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink("/dev", filepath.Join(dir, "devlink")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	w := zipFilesGet(t, filepath.Join(dir, "devlink"), "json")
+	if w.Code == http.StatusOK {
+		t.Fatalf("format=json followed a symlink to /dev (status %d) — blocklist bypassed", w.Code)
+	}
+}
+
+// The zip path must refuse an INTERMEDIATE symlink that escapes into a
+// blocklisted dir: `root -> /`, then path=…/root/dev resolves to /dev. The old
+// os.OpenRoot(parent) anchored outside the requested tree and the literal-string
+// descendant check never matched /dev.
+func TestFileDownload_Zip_IntermediateSymlinkToBlocklistRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink("/", filepath.Join(dir, "root")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	w := zipFilesGet(t, filepath.Join(dir, "root", "dev"), "zip")
+	if w.Code == http.StatusOK {
+		t.Fatalf("format=zip walked /dev through an intermediate symlink (status %d) — blocklist bypassed", w.Code)
+	}
+}

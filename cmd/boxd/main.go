@@ -39,20 +39,58 @@ const (
 // dangerousPaths are paths that must never be modified via the filesystem API.
 var dangerousPaths = []string{"/proc", "/sys", "/dev", "/sbin/init", "/usr/local/bin/boxd"}
 
+// blockedPath returns an error if p is, or lives under, a blocklisted directory
+// (/proc, /sys, /dev, init, the boxd binary). p must already be cleaned.
+func blockedPath(p string) error {
+	for _, d := range dangerousPaths {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return fmt.Errorf("access denied: %s", d)
+		}
+	}
+	return nil
+}
+
 // safePath validates and cleans a filesystem path. It rejects paths that could
 // damage the VM's ability to function (init, boxd, /proc, /sys, /dev) and
 // prevents path traversal to root.
+//
+// NOTE: this is purely lexical — it does NOT resolve symlinks, so a path whose
+// components symlink into a blocklisted location still passes here. Directory
+// listing/archiving must additionally resolve the real path
+// (resolveWithinBlocklist) before reading it.
 func safePath(raw string) (string, error) {
 	p := filepath.Clean(raw)
 	if p == "/" || p == "." {
 		return "", fmt.Errorf("cannot operate on root directory")
 	}
-	for _, d := range dangerousPaths {
-		if p == d || strings.HasPrefix(p, d+"/") {
-			return "", fmt.Errorf("access denied: %s", d)
-		}
+	if err := blockedPath(p); err != nil {
+		return "", err
 	}
 	return p, nil
+}
+
+// resolveWithinBlocklist resolves every symlink in cleanPath (already
+// safePath-cleaned) and re-applies the blocklist to the real path. safePath is
+// lexical, so a symlinked component — a leaf (`export -> /proc`) or an
+// intermediate (`a -> /`, then `a/proc`) — passes its string check, after which
+// os.ReadDir / os.Stat / os.OpenRoot would follow it and enumerate the target.
+// Reading the returned (fully resolved, blocklist-verified) path closes that
+// bypass. EvalSymlinks requires the path to exist; a missing path returns an
+// os.IsNotExist error the caller maps to NotFound.
+//
+// A symlink swapped in between this resolution and the subsequent read is a
+// residual TOCTOU, accepted here because listing exposes only entry names the
+// sandbox occupant can already read via /exec; the byte-streaming zip path adds
+// O_NOFOLLOW per-file opens on top.
+func resolveWithinBlocklist(cleanPath string) (string, error) {
+	real, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		return "", err
+	}
+	if err := blockedPath(real); err != nil {
+		return "", err
+	}
+	return real, nil
 }
 
 func main() {
@@ -752,7 +790,16 @@ func (s *filesystemService) ListDir(ctx context.Context, req *connect.Request[pb
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	entries, err := os.ReadDir(path)
+	// Resolve symlinks and re-check the blocklist so a symlinked component
+	// (e.g. export -> /proc) can't be followed past safePath's lexical check.
+	realPath, err := resolveWithinBlocklist(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, connect.NewError(connect.CodeNotFound, err)
+		}
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	entries, err := os.ReadDir(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
@@ -902,7 +949,20 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 // via /exec. safePath has already gated the requested path against the blocklist,
 // and the access token scopes the request to this one sandbox.
 func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
-	entries, err := os.ReadDir(dirPath)
+	// Resolve symlinks and re-check the blocklist: handleFiles' safePath is
+	// lexical and its os.Stat already followed dirPath, so a symlinked directory
+	// (export -> /proc, /sys, /dev) would otherwise be listed wholesale.
+	realPath, err := resolveWithinBlocklist(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		} else {
+			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+			http.Error(w, string(errJSON), http.StatusBadRequest)
+		}
+		return
+	}
+	entries, err := os.ReadDir(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
@@ -985,7 +1045,31 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 	// resolves it relative to the parent's open fd, so there is no
 	// Lstat-then-open TOCTOU window and a leaf swapped for an escaping symlink is
 	// rejected rather than followed.
-	parent, err := os.OpenRoot(filepath.Dir(dirPath))
+	// Resolve the parent's real path first so an INTERMEDIATE symlink
+	// (a -> /, then a/proc) can't anchor the archive root outside the requested
+	// tree: os.OpenRoot follows symlinks while opening its own root, and safePath
+	// is lexical, so without this the walk escapes past the blocklist.
+	realParent, err := filepath.EvalSymlinks(filepath.Dir(dirPath))
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		} else {
+			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+			http.Error(w, string(errJSON), http.StatusInternalServerError)
+		}
+		return
+	}
+	base := filepath.Base(dirPath)
+	// Re-apply the blocklist to the resolved real directory (realParent/base) so
+	// e.g. a -> / then a/dev (→ /dev) is refused.
+	realDir := filepath.Join(realParent, base)
+	if err := blockedPath(realDir); err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+		http.Error(w, string(errJSON), http.StatusBadRequest)
+		return
+	}
+
+	parent, err := os.OpenRoot(realParent)
 	if err != nil {
 		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
@@ -993,7 +1077,6 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 	}
 	defer parent.Close()
 
-	base := filepath.Base(dirPath)
 	if li, err := parent.Lstat(base); err != nil {
 		if os.IsNotExist(err) {
 			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
@@ -1034,7 +1117,10 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 			return nil // the directory itself; entries carry the base prefix
 		}
 		// Enforce the blocklist on descendants, not just the top-level path.
-		if _, err := safePath(filepath.Join(dirPath, rel)); err != nil {
+		// Join against the RESOLVED realDir (not the literal dirPath) so the
+		// check reflects where the walk actually reads — an intermediate symlink
+		// can't make a real /proc path look like a benign string.
+		if err := blockedPath(filepath.Join(realDir, rel)); err != nil {
 			if d.IsDir() {
 				return fs.SkipDir
 			}
