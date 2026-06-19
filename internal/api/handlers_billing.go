@@ -57,7 +57,7 @@ func (h *Handlers) GetBillingPricing(c *gin.Context) {
 		return
 	}
 
-	h.writeBillingPricingRates(c, pricingRatesFromTeamRows(rates), teamID.String(), privatePricingCacheControl)
+	h.writeBillingPricingRates(c, pricingRatesFromTeamCurrentRows(rates), teamID.String(), privatePricingCacheControl)
 }
 
 func (h *Handlers) writeBillingPricing(c *gin.Context, planKey string, subject string, cacheControl string) {
@@ -97,7 +97,7 @@ func pricingRatesFromActiveRows(rows []db.ListActivePricingRatesRow) []billingPr
 	return out
 }
 
-func pricingRatesFromTeamRows(rows []db.ListActivePricingRatesForTeamRow) []billingPricingRate {
+func pricingRatesFromTeamCurrentRows(rows []db.ListActivePricingRatesForTeamCurrentRow) []billingPricingRate {
 	out := make([]billingPricingRate, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, billingPricingRate{
