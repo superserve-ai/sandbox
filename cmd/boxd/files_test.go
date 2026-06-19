@@ -535,3 +535,52 @@ func TestFileDownload_Zip_IntermediateSymlinkToBlocklistRefused(t *testing.T) {
 		t.Fatalf("format=zip walked /dev through an intermediate symlink (status %d) — blocklist bypassed", w.Code)
 	}
 }
+
+// #4 (Amit): the zip walk caps entry count so attacker-staged "millions of small
+// files" can't stream unbounded — with the cap lowered, an over-cap directory
+// yields a truncated but valid archive.
+func TestFileDownload_Zip_EntryCapTruncates(t *testing.T) {
+	orig := maxZipEntries
+	maxZipEntries = 2
+	defer func() { maxZipEntries = orig }()
+
+	dir := t.TempDir()
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		if err := os.WriteFile(filepath.Join(dir, n+".txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := zipFilesGet(t, dir, "zip")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	zr, err := zip.NewReader(bytes.NewReader(w.Body.Bytes()), int64(w.Body.Len()))
+	if err != nil {
+		t.Fatalf("read zip: %v", err)
+	}
+	if len(zr.File) > maxZipEntries {
+		t.Errorf("archive has %d entries, want <= cap %d", len(zr.File), maxZipEntries)
+	}
+	if len(zr.File) >= 5 {
+		t.Errorf("archive has %d entries; the cap should have truncated below the 5 staged files", len(zr.File))
+	}
+}
+
+// #4: cappedWriter bounds total output bytes so a few multi-GB files can't pin a
+// connection — it writes up to the limit, then signals errZipLimit.
+func TestCappedWriter(t *testing.T) {
+	var buf bytes.Buffer
+	cw := &cappedWriter{w: &buf, limit: 5}
+	if n, err := cw.Write([]byte("abc")); n != 3 || err != nil {
+		t.Fatalf("under-limit write: n=%d err=%v", n, err)
+	}
+	if _, err := cw.Write([]byte("defg")); err != errZipLimit {
+		t.Errorf("over-limit err = %v, want errZipLimit", err)
+	}
+	if buf.String() != "abcde" {
+		t.Errorf("buf = %q, want %q (truncated at limit)", buf.String(), "abcde")
+	}
+	if _, err := cw.Write([]byte("h")); err != errZipLimit {
+		t.Errorf("post-limit err = %v, want errZipLimit", err)
+	}
+}

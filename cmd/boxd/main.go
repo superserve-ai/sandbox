@@ -799,7 +799,7 @@ func (s *filesystemService) ListDir(ctx context.Context, req *connect.Request[pb
 		}
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	entries, err := os.ReadDir(realPath)
+	entries, err := collectDirEntries(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
@@ -807,20 +807,13 @@ func (s *filesystemService) ListDir(ctx context.Context, req *connect.Request[pb
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	var result []*pb.FileEntry
+	result := make([]*pb.FileEntry, 0, len(entries))
 	for _, e := range entries {
-		info, _ := e.Info()
-		size := int64(0)
-		var modUnix int64
-		if info != nil {
-			size = info.Size()
-			modUnix = info.ModTime().Unix()
-		}
 		result = append(result, &pb.FileEntry{
-			Name:         e.Name(),
-			IsDir:        e.IsDir(),
-			Size:         size,
-			ModifiedUnix: modUnix,
+			Name:         e.Name,
+			IsDir:        e.IsDir,
+			Size:         e.Size,
+			ModifiedUnix: e.ModifiedUnix,
 		})
 	}
 
@@ -955,55 +948,108 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 	realPath, err := resolveWithinBlocklist(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			http.Error(w, string(errJSON), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 		}
 		return
 	}
-	entries, err := os.ReadDir(realPath)
+	entries, err := collectDirEntries(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			http.Error(w, string(errJSON), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
-	}
-
-	type fileEntry struct {
-		Name         string `json:"name"`
-		IsDir        bool   `json:"is_dir"`
-		Size         int64  `json:"size"`
-		ModifiedUnix int64  `json:"modified_unix"`
-	}
-	// Non-nil slice so an empty directory marshals as "entries":[] rather than
-	// "entries":null — the console iterates it without a nil guard.
-	out := make([]fileEntry, 0, len(entries))
-	for _, e := range entries {
-		fe := fileEntry{Name: e.Name(), IsDir: e.IsDir()}
-		// Info is a per-entry lstat that can fail if the entry was removed
-		// mid-listing (the sandbox runs concurrently). Degrade to zero
-		// size/mtime rather than dropping the entry — the name still lists.
-		if info, err := e.Info(); err == nil {
-			fe.Size = info.Size()
-			fe.ModifiedUnix = info.ModTime().Unix()
-		}
-		out = append(out, fe)
 	}
 
 	body, err := json.Marshal(struct {
-		Entries []fileEntry `json:"entries"`
-	}{Entries: out})
+		Entries []dirEntryMeta `json:"entries"`
+	}{Entries: entries})
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(body)
+}
+
+// writeJSONError writes a JSON error body with the correct content type.
+// http.Error would force text/plain even though the body is JSON, so the file
+// listing/download surfaces use this for a consistent {"error":...} shape.
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body, _ := json.Marshal(map[string]string{"error": msg})
+	_, _ = w.Write(body)
+}
+
+// dirEntryMeta is one directory entry's metadata, shared by the JSON listing
+// (serveDirAsJSON) and the gRPC listing (FilesystemService.ListDir) so the two
+// surfaces can't drift in which entries appear or how they degrade.
+type dirEntryMeta struct {
+	Name         string `json:"name"`
+	IsDir        bool   `json:"is_dir"`
+	Size         int64  `json:"size"`
+	ModifiedUnix int64  `json:"modified_unix"`
+}
+
+// collectDirEntries lists one level of dirPath. Per-entry Info() is an lstat
+// that can fail if the entry was removed mid-listing (the sandbox runs
+// concurrently); such entries degrade to zero size/mtime rather than being
+// dropped, so the name still lists. The slice is non-nil even when empty, so it
+// marshals as [] rather than null.
+func collectDirEntries(dirPath string) ([]dirEntryMeta, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dirEntryMeta, 0, len(entries))
+	for _, e := range entries {
+		m := dirEntryMeta{Name: e.Name(), IsDir: e.IsDir()}
+		if info, err := e.Info(); err == nil {
+			m.Size = info.Size()
+			m.ModifiedUnix = info.ModTime().Unix()
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// maxZipEntries / maxZipBytes bound a directory archive so attacker-staged
+// content (millions of files, or a few multi-GB files) can't stream unbounded
+// and pin a proxy connection. Vars, not consts, so tests can lower them.
+var (
+	maxZipEntries = 100_000
+	maxZipBytes   = int64(2) << 30 // 2 GiB
+)
+
+// errZipLimit halts the zip walk when maxZipBytes is reached.
+var errZipLimit = errors.New("archive size limit exceeded")
+
+// cappedWriter stops the underlying writer once limit bytes have been written,
+// returning errZipLimit so an oversized archive aborts instead of streaming
+// indefinitely.
+type cappedWriter struct {
+	w     io.Writer
+	n     int64
+	limit int64
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if c.n >= c.limit {
+		return 0, errZipLimit
+	}
+	if c.n+int64(len(p)) > c.limit {
+		avail := c.limit - c.n
+		n, _ := c.w.Write(p[:avail])
+		c.n += int64(n)
+		return n, errZipLimit
+	}
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // serveDirAsZip streams a ZIP archive of dirPath's contents. Entry names are
@@ -1035,27 +1081,18 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 // whole download. Entries are written as the walk proceeds — constant memory,
 // no temp file.
 func serveDirAsZip(w http.ResponseWriter, dirPath string) {
-	// Open the requested directory WITHOUT following a symlink at its final
-	// component. handleFileDownload's os.Stat and a plain os.OpenRoot(dirPath)
-	// both follow a symlink at dirPath, so a request for "/home/user/export"
-	// where export -> /etc (or /, /proc) would make the archive root the symlink
-	// target — escaping the requested directory and bypassing safePath's
-	// blocklist. Anchor at the parent and reach the leaf through the parent's
-	// Root: a no-follow Lstat refuses a symlinked leaf, and Root.OpenRoot
-	// resolves it relative to the parent's open fd, so there is no
-	// Lstat-then-open TOCTOU window and a leaf swapped for an escaping symlink is
-	// rejected rather than followed.
-	// Resolve the parent's real path first so an INTERMEDIATE symlink
-	// (a -> /, then a/proc) can't anchor the archive root outside the requested
-	// tree: os.OpenRoot follows symlinks while opening its own root, and safePath
-	// is lexical, so without this the walk escapes past the blocklist.
+	// Resolve the parent's real path first so a symlinked component — a leaf, or
+	// an INTERMEDIATE one (a -> /, then a/proc) — can't anchor the archive root
+	// outside the requested tree: os.OpenRoot follows symlinks while opening its
+	// own root and safePath is lexical, so without this the walk escapes past the
+	// blocklist. Then anchor os.Root at the resolved parent, refuse a symlinked
+	// leaf via a no-follow Lstat, and re-check the blocklist on the real dir.
 	realParent, err := filepath.EvalSymlinks(filepath.Dir(dirPath))
 	if err != nil {
 		if os.IsNotExist(err) {
-			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			http.Error(w, string(errJSON), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
@@ -1064,29 +1101,26 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 	// e.g. a -> / then a/dev (→ /dev) is refused.
 	realDir := filepath.Join(realParent, base)
 	if err := blockedPath(realDir); err != nil {
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(errJSON), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	parent, err := os.OpenRoot(realParent)
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer parent.Close()
 
 	if li, err := parent.Lstat(base); err != nil {
 		if os.IsNotExist(err) {
-			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			http.Error(w, string(errJSON), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	} else if li.Mode()&fs.ModeSymlink != 0 {
-		http.Error(w, `{"error":"refusing to archive a symlinked directory"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "refusing to archive a symlinked directory")
 		return
 	}
 
@@ -1094,16 +1128,20 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 	// validates it before we commit a 200 + headers and confines the walk.
 	root, err := parent.OpenRoot(base)
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer root.Close()
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipDownloadFilename(base)))
 
-	zw := zip.NewWriter(w)
+	// Bound the archive so attacker-staged content can't stream unbounded and
+	// pin a proxy connection (boxd runs with WriteTimeout: 0): cappedWriter caps
+	// total output bytes; entryCount caps the entry count in the walk below.
+	cw := &cappedWriter{w: w, limit: maxZipBytes}
+	zw := zip.NewWriter(cw)
 	defer zw.Close()
+	entryCount := 0
 
 	// Walking root.FS() confines traversal to the tree and never follows
 	// symlinks while descending; rel is a slash path relative to dirPath.
@@ -1125,6 +1163,12 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 				return fs.SkipDir
 			}
 			return nil
+		}
+
+		entryCount++
+		if entryCount > maxZipEntries {
+			log.Printf("files: zip entry cap (%d) reached for %q — archive truncated", maxZipEntries, dirPath)
+			return fs.SkipAll
 		}
 
 		name := filepath.Join(base, rel)
@@ -1163,7 +1207,13 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 			return nil
 		}
 		if _, err := io.Copy(fw, f); err != nil {
+			f.Close()
+			if errors.Is(err, errZipLimit) {
+				log.Printf("files: zip byte cap (%d) reached — archive truncated", maxZipBytes)
+				return fs.SkipAll
+			}
 			log.Printf("files: zip copy %q: %v", rel, err)
+			return nil
 		}
 		f.Close()
 		return nil
