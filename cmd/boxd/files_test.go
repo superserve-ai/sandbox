@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -310,5 +311,138 @@ func TestFileDownload_Zip_TopLevelSymlinkRejected(t *testing.T) {
 	}
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (refused top-level symlink); body %s", w.Code, w.Body.String())
+	}
+}
+
+// jsonListing mirrors the format=json response shape the console consumes.
+type jsonListing struct {
+	Entries []struct {
+		Name         string `json:"name"`
+		IsDir        bool   `json:"is_dir"`
+		Size         int64  `json:"size"`
+		ModifiedUnix int64  `json:"modified_unix"`
+	} `json:"entries"`
+}
+
+func parseListing(t *testing.T, b []byte) jsonListing {
+	t.Helper()
+	var out jsonListing
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("parse json listing: %v (body %q)", err, string(b))
+	}
+	return out
+}
+
+// New: a directory with format=json returns a structured listing of its
+// immediate children (non-recursive), with name/is_dir/size per entry.
+func TestFileDownload_Directory_JSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	w := zipFilesGet(t, dir, "json")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	listing := parseListing(t, w.Body.Bytes())
+	byName := map[string]struct {
+		isDir bool
+		size  int64
+	}{}
+	for _, e := range listing.Entries {
+		byName[e.Name] = struct {
+			isDir bool
+			size  int64
+		}{e.IsDir, e.Size}
+	}
+
+	if len(listing.Entries) != 2 {
+		t.Fatalf("got %d entries, want 2: %+v", len(listing.Entries), listing.Entries)
+	}
+	if f, ok := byName["a.txt"]; !ok || f.isDir || f.size != 3 {
+		t.Errorf("a.txt entry = %+v (ok=%v), want {isDir:false size:3}", f, ok)
+	}
+	if d, ok := byName["sub"]; !ok || !d.isDir {
+		t.Errorf("sub entry = %+v (ok=%v), want isDir:true", d, ok)
+	}
+
+	// Listing must be non-recursive — the child of sub/ must not appear.
+	if _, ok := byName["b.txt"]; ok {
+		t.Errorf("listing leaked a nested entry; should be one level only: %+v", listing.Entries)
+	}
+}
+
+// New: an entry carries a plausible modified_unix (set from the filesystem),
+// so the console can show modified times.
+func TestFileDownload_JSON_ModifiedUnixPopulated(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := zipFilesGet(t, dir, "json")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	listing := parseListing(t, w.Body.Bytes())
+	if len(listing.Entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(listing.Entries))
+	}
+	if listing.Entries[0].ModifiedUnix <= 0 {
+		t.Errorf("modified_unix = %d, want a positive unix timestamp", listing.Entries[0].ModifiedUnix)
+	}
+}
+
+// New: an empty directory yields {"entries":[]} — an empty array, never null,
+// so the console can iterate without a nil guard.
+func TestFileDownload_JSON_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	w := zipFilesGet(t, dir, "json")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	body := strings.ReplaceAll(w.Body.String(), " ", "")
+	if !strings.Contains(body, `"entries":[]`) {
+		t.Errorf("empty dir body = %q, want entries to be an empty array []", w.Body.String())
+	}
+	listing := parseListing(t, w.Body.Bytes())
+	if len(listing.Entries) != 0 {
+		t.Errorf("got %d entries, want 0", len(listing.Entries))
+	}
+}
+
+// New (clarification): a single file requested with format=json is returned
+// as-is, not as a listing — mirrors format=zip's file handling. The console
+// only sends format=json for directories.
+func TestFileDownload_File_JSON_ReturnedAsIs(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "data.txt")
+	if err := os.WriteFile(p, []byte("rawbytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := zipFilesGet(t, p, "json")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "rawbytes" {
+		t.Errorf("body = %q, want the file content %q", got, "rawbytes")
+	}
+}
+
+// Blocklisted paths are rejected before any listing, even with format=json —
+// safePath gates the top-level argument in handleFiles.
+func TestFileDownload_JSON_BlocklistedRejected(t *testing.T) {
+	for _, p := range []string{"/proc", "/sys/kernel", "/dev"} {
+		w := zipFilesGet(t, p, "json")
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("path %q: status = %d, want 400 (blocklisted); body %s", p, w.Code, w.Body.String())
+		}
 	}
 }

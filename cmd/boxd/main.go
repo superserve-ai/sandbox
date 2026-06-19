@@ -856,15 +856,21 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 	if info.IsDir() {
-		// A directory is only downloadable when the caller explicitly opts in to
-		// an archive via ?format=zip. Without the flag we keep the original 400,
-		// so the SDK's files.read()/readText() (which never send it) still throw
-		// on a directory, exactly as before.
-		if r.URL.Query().Get("format") != "zip" {
+		// A directory has no single byte stream, so it is only returned when the
+		// caller explicitly opts in to a representation via ?format=:
+		//   zip  → an archive of its contents      (serveDirAsZip)
+		//   json → a one-level listing of its names (serveDirAsJSON)
+		// Without a format flag we keep the original 400, so the SDK's
+		// files.read()/readText() (which never send one) still throw on a
+		// directory, exactly as before.
+		switch r.URL.Query().Get("format") {
+		case "zip":
+			serveDirAsZip(w, path)
+		case "json":
+			serveDirAsJSON(w, path)
+		default:
 			http.Error(w, `{"error":"use FilesystemService.ListDir for directories"}`, http.StatusBadRequest)
-			return
 		}
-		serveDirAsZip(w, path)
 		return
 	}
 
@@ -878,6 +884,63 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filepath.Base(path)))
 	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
+}
+
+// serveDirAsJSON writes a one-level JSON listing of dirPath's entries. It is the
+// browser/console-facing surface of the same os.ReadDir that
+// FilesystemService.ListDir exposes internally, reached through the existing
+// /files allow-list via ?format=json — the proxy forwards the query untouched,
+// exactly as it does for ?format=zip, so no proxy change is needed.
+//
+// Unlike serveDirAsZip this never opens or streams file contents; it reports only
+// names, sizes, and modification times. So it deliberately skips the zip path's
+// symlink/TOCTOU hardening: the worst a symlink can do is have the listing follow
+// it like `ls` would, exposing entry names the sandbox occupant can already read
+// via /exec. safePath has already gated the requested path against the blocklist,
+// and the access token scopes the request to this one sandbox.
+func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		} else {
+			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+			http.Error(w, string(errJSON), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	type fileEntry struct {
+		Name         string `json:"name"`
+		IsDir        bool   `json:"is_dir"`
+		Size         int64  `json:"size"`
+		ModifiedUnix int64  `json:"modified_unix"`
+	}
+	// Non-nil slice so an empty directory marshals as "entries":[] rather than
+	// "entries":null — the console iterates it without a nil guard.
+	out := make([]fileEntry, 0, len(entries))
+	for _, e := range entries {
+		fe := fileEntry{Name: e.Name(), IsDir: e.IsDir()}
+		// Info is a per-entry lstat that can fail if the entry was removed
+		// mid-listing (the sandbox runs concurrently). Degrade to zero
+		// size/mtime rather than dropping the entry — the name still lists.
+		if info, err := e.Info(); err == nil {
+			fe.Size = info.Size()
+			fe.ModifiedUnix = info.ModTime().Unix()
+		}
+		out = append(out, fe)
+	}
+
+	body, err := json.Marshal(struct {
+		Entries []fileEntry `json:"entries"`
+	}{Entries: out})
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
 }
 
 // serveDirAsZip streams a ZIP archive of dirPath's contents. Entry names are
