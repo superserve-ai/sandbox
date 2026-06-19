@@ -51,6 +51,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		return
 	}
 	r.Header.Del(accessTokenHeader)
+	r.Header.Del(headerSandboxID)
 	w.Header().Set("Referrer-Policy", "no-referrer")
 
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
@@ -59,6 +60,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		fail.write(w)
 		return
 	}
+	h.captureUsage(instanceID, "command_run", info)
 
 	transport := h.transports.get(instanceID, info)
 	target := &url.URL{

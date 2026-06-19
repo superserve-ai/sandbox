@@ -166,6 +166,21 @@ type Activity struct {
 	CreatedAt    time.Time   `json:"created_at"`
 	TemplateID   pgtype.UUID `json:"template_id"`
 	ResourceType string      `json:"resource_type"`
+	SecretID     pgtype.UUID `json:"secret_id"`
+	SecretName   *string     `json:"secret_name"`
+}
+
+type AnalyticsWeeklyUserMetric struct {
+	WeekStart       pgtype.Date `json:"week_start"`
+	Signups         int64       `json:"signups"`
+	SignupsWow      int32       `json:"signups_wow"`
+	SignupsWowPct   interface{} `json:"signups_wow_pct"`
+	Wau             int64       `json:"wau"`
+	WauWow          int32       `json:"wau_wow"`
+	WauWowPct       interface{} `json:"wau_wow_pct"`
+	ReturningUsers  int64       `json:"returning_users"`
+	ReturningWow    int32       `json:"returning_wow"`
+	ReturningWowPct interface{} `json:"returning_wow_pct"`
 }
 
 type ApiKey struct {
@@ -179,6 +194,55 @@ type ApiKey struct {
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	CreatedAt  time.Time          `json:"created_at"`
+}
+
+type BillingPeriodAnomaly struct {
+	ID          uuid.UUID          `json:"id"`
+	TeamID      uuid.UUID          `json:"team_id"`
+	PeriodStart time.Time          `json:"period_start"`
+	PeriodEnd   time.Time          `json:"period_end"`
+	Severity    string             `json:"severity"`
+	Kind        string             `json:"kind"`
+	SandboxID   pgtype.UUID        `json:"sandbox_id"`
+	Details     []byte             `json:"details"`
+	DetectedAt  time.Time          `json:"detected_at"`
+	ResolvedAt  pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedBy  pgtype.UUID        `json:"resolved_by"`
+}
+
+type BillingRollupBackfillState struct {
+	Name          string    `json:"name"`
+	NextHourStart time.Time `json:"next_hour_start"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type BillingRollupJob struct {
+	ID            uuid.UUID          `json:"id"`
+	TeamID        uuid.UUID          `json:"team_id"`
+	HourStart     time.Time          `json:"hour_start"`
+	HourEnd       time.Time          `json:"hour_end"`
+	Status        string             `json:"status"`
+	AttemptCount  int32              `json:"attempt_count"`
+	NextAttemptAt time.Time          `json:"next_attempt_at"`
+	LockedBy      *string            `json:"locked_by"`
+	LockedUntil   pgtype.Timestamptz `json:"locked_until"`
+	LastError     *string            `json:"last_error"`
+	EnqueuedAt    time.Time          `json:"enqueued_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+}
+
+type BillingRollupSchedulerLease struct {
+	Name        string    `json:"name"`
+	LockedBy    string    `json:"locked_by"`
+	LockedUntil time.Time `json:"locked_until"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type BillingRollupTeamBackfillState struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	NextHourStart time.Time `json:"next_hour_start"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type DeviceCode struct {
@@ -200,6 +264,14 @@ type EarlyAccessRequest struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type FeatureFlag struct {
+	Key         string    `json:"key"`
+	Enabled     bool      `json:"enabled"`
+	Description *string   `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type Host struct {
 	ID                string             `json:"id"`
 	VmdAddr           string             `json:"vmd_addr"`
@@ -211,6 +283,42 @@ type Host struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+type NetFlow struct {
+	ID         int64      `json:"id"`
+	Ts         time.Time  `json:"ts"`
+	TeamID     uuid.UUID  `json:"team_id"`
+	SandboxID  uuid.UUID  `json:"sandbox_id"`
+	Protocol   string     `json:"protocol"`
+	Host       *string    `json:"host"`
+	DstIp      netip.Addr `json:"dst_ip"`
+	DstPort    int32      `json:"dst_port"`
+	Verdict    string     `json:"verdict"`
+	MatchRule  *string    `json:"match_rule"`
+	BytesSent  *int64     `json:"bytes_sent"`
+	BytesRecv  *int64     `json:"bytes_recv"`
+	DurationMs *int32     `json:"duration_ms"`
+}
+
+type PricingPlan struct {
+	Key       string    `json:"key"`
+	Name      string    `json:"name"`
+	Currency  string    `json:"currency"`
+	Active    bool      `json:"active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type PricingRate struct {
+	ID            uuid.UUID          `json:"id"`
+	PlanKey       string             `json:"plan_key"`
+	Resource      string             `json:"resource"`
+	Unit          string             `json:"unit"`
+	PriceUsd      pgtype.Numeric     `json:"price_usd"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 type Profile struct {
@@ -226,6 +334,27 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type ProxyAudit struct {
+	ID             int64       `json:"id"`
+	Ts             time.Time   `json:"ts"`
+	TeamID         uuid.UUID   `json:"team_id"`
+	SandboxID      uuid.UUID   `json:"sandbox_id"`
+	SecretID       pgtype.UUID `json:"secret_id"`
+	Method         string      `json:"method"`
+	Host           string      `json:"host"`
+	Path           string      `json:"path"`
+	Status         int32       `json:"status"`
+	UpstreamStatus *int32      `json:"upstream_status"`
+	LatencyMs      *int32      `json:"latency_ms"`
+	ErrorCode      *string     `json:"error_code"`
+}
+
+type QuotaAlertState struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	QuotaType string    `json:"quota_type"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type ReconcilerLog struct {
 	ID        int64       `json:"id"`
 	HostID    string      `json:"host_id"`
@@ -234,6 +363,13 @@ type ReconcilerLog struct {
 	Reason    string      `json:"reason"`
 	DriftKind *string     `json:"drift_kind"`
 	CreatedAt time.Time   `json:"created_at"`
+}
+
+type RevokedProxyToken struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	ProxyToken string    `json:"proxy_token"`
+	RevokedAt  time.Time `json:"revoked_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 type Sandbox struct {
@@ -260,6 +396,68 @@ type Sandbox struct {
 	MemPath      *string     `json:"mem_path"`
 	BasePath     *string     `json:"base_path"`
 	DeltaPath    *string     `json:"delta_path"`
+	DiskMib      int32       `json:"disk_mib"`
+}
+
+type SandboxActiveInterval struct {
+	ID        uuid.UUID          `json:"id"`
+	SandboxID uuid.UUID          `json:"sandbox_id"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	ActorID   pgtype.UUID        `json:"actor_id"`
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
+	EndReason *string            `json:"end_reason"`
+}
+
+type SandboxComputeBillingInterval struct {
+	ID        uuid.UUID          `json:"id"`
+	SandboxID uuid.UUID          `json:"sandbox_id"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	VcpuCount int32              `json:"vcpu_count"`
+	MemoryMib int32              `json:"memory_mib"`
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
+	EndReason *string            `json:"end_reason"`
+}
+
+type SandboxRevocation struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	RevokedAt time.Time `json:"revoked_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type SandboxSecret struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	SecretID   uuid.UUID `json:"secret_id"`
+	EnvKey     string    `json:"env_key"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+type SandboxStorageInterval struct {
+	ID        uuid.UUID          `json:"id"`
+	SandboxID uuid.UUID          `json:"sandbox_id"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	DiskMib   int32              `json:"disk_mib"`
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
+	EndReason *string            `json:"end_reason"`
+}
+
+type Secret struct {
+	ID               uuid.UUID          `json:"id"`
+	TeamID           uuid.UUID          `json:"team_id"`
+	Name             string             `json:"name"`
+	AuthType         string             `json:"auth_type"`
+	AuthConfig       []byte             `json:"auth_config"`
+	ProviderShortcut *string            `json:"provider_shortcut"`
+	Hosts            []string           `json:"hosts"`
+	Ciphertext       []byte             `json:"ciphertext"`
+	EncryptedDek     []byte             `json:"encrypted_dek"`
+	KekID            string             `json:"kek_id"`
+	CreatedAt        time.Time          `json:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at"`
+	LastUsedAt       pgtype.Timestamptz `json:"last_used_at"`
+	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
 }
 
 type Snapshot struct {
@@ -274,17 +472,90 @@ type Snapshot struct {
 }
 
 type Team struct {
-	ID                   uuid.UUID `json:"id"`
-	Name                 string    `json:"name"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
-	BuildConcurrency     int32     `json:"build_concurrency"`
-	MaxTemplateVcpu      *int32    `json:"max_template_vcpu"`
-	MaxTemplateMemoryMib *int32    `json:"max_template_memory_mib"`
-	MaxTemplateDiskMib   *int32    `json:"max_template_disk_mib"`
-	MaxTemplates         *int32    `json:"max_templates"`
-	MaxSandboxes         int32     `json:"max_sandboxes"`
-	ActiveSandboxCount   int32     `json:"active_sandbox_count"`
+	ID                    uuid.UUID `json:"id"`
+	Name                  string    `json:"name"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	BuildConcurrency      int32     `json:"build_concurrency"`
+	MaxTemplateVcpu       *int32    `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib  *int32    `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib    *int32    `json:"max_template_disk_mib"`
+	MaxTemplates          *int32    `json:"max_templates"`
+	MaxSandboxes          int32     `json:"max_sandboxes"`
+	ActiveSandboxCount    int32     `json:"active_sandbox_count"`
+	CredentialStoreKind   string    `json:"credential_store_kind"`
+	CredentialStoreConfig []byte    `json:"credential_store_config"`
+	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
+}
+
+type TeamBillingPeriod struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	PeriodStart   time.Time          `json:"period_start"`
+	PeriodEnd     time.Time          `json:"period_end"`
+	Status        string             `json:"status"`
+	BlockedReason *string            `json:"blocked_reason"`
+	BlockedAt     pgtype.Timestamptz `json:"blocked_at"`
+	ApprovedBy    pgtype.UUID        `json:"approved_by"`
+	ApprovedAt    pgtype.Timestamptz `json:"approved_at"`
+	ExportedAt    pgtype.Timestamptz `json:"exported_at"`
+	FinalizedAt   pgtype.Timestamptz `json:"finalized_at"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+}
+
+type TeamBillingUsage struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	PeriodStart       time.Time          `json:"period_start"`
+	PeriodEnd         time.Time          `json:"period_end"`
+	VcpuSeconds       pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric     `json:"storage_mib_seconds"`
+	FinalizedAt       pgtype.Timestamptz `json:"finalized_at"`
+	ExportedAt        pgtype.Timestamptz `json:"exported_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+type TeamBillingUsageHourly struct {
+	TeamID            uuid.UUID      `json:"team_id"`
+	HourStart         time.Time      `json:"hour_start"`
+	HourEnd           time.Time      `json:"hour_end"`
+	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+type TeamCreditGrant struct {
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	AmountUsd    pgtype.Numeric     `json:"amount_usd"`
+	RemainingUsd pgtype.Numeric     `json:"remaining_usd"`
+	Currency     string             `json:"currency"`
+	Reason       *string            `json:"reason"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	CreatedBy    pgtype.UUID        `json:"created_by"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+}
+
+type TeamCreditLedger struct {
+	ID                 uuid.UUID          `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	GrantID            pgtype.UUID        `json:"grant_id"`
+	BillingPeriodStart pgtype.Timestamptz `json:"billing_period_start"`
+	BillingPeriodEnd   pgtype.Timestamptz `json:"billing_period_end"`
+	AmountUsd          pgtype.Numeric     `json:"amount_usd"`
+	Reason             string             `json:"reason"`
+	CreatedBy          pgtype.UUID        `json:"created_by"`
+	CreatedAt          time.Time          `json:"created_at"`
+}
+
+type TeamFeatureFlag struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	Key       string    `json:"key"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type TeamMember struct {
@@ -292,6 +563,15 @@ type TeamMember struct {
 	ProfileID uuid.UUID `json:"profile_id"`
 	Role      string    `json:"role"`
 	JoinedAt  time.Time `json:"joined_at"`
+}
+
+type TeamPricingPlan struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	PlanKey       string             `json:"plan_key"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
+	AssignedBy    pgtype.UUID        `json:"assigned_by"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 type Template struct {

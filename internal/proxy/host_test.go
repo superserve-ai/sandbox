@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/http"
 	"testing"
 )
 
@@ -133,5 +134,119 @@ func TestParseHost(t *testing.T) {
 				t.Errorf("instanceID: got %q, want %q", instanceID, tt.wantInstanceID)
 			}
 		})
+	}
+}
+
+func TestParseRequest(t *testing.T) {
+	const sandboxID = "b150ee22-4956-4f5b-926a-f921ed8c37d6"
+
+	tests := []struct {
+		name           string
+		host           string
+		headerID       string
+		wantPort       int
+		wantInstanceID string
+		wantErr        bool
+	}{
+		// Shared-host routes via header.
+		{
+			name:           "shared-host with header",
+			host:           testDomain,
+			headerID:       sandboxID,
+			wantPort:       boxdPort,
+			wantInstanceID: sandboxID,
+		},
+		{
+			name:           "shared-host with :443 suffix",
+			host:           testDomain + ":443",
+			headerID:       sandboxID,
+			wantPort:       boxdPort,
+			wantInstanceID: sandboxID,
+		},
+		{
+			name:    "shared-host missing header",
+			host:    testDomain,
+			wantErr: true,
+		},
+		{
+			name:     "shared-host with path traversal in header",
+			host:     testDomain,
+			headerID: "../etc",
+			wantErr:  true,
+		},
+		{
+			name:     "shared-host with underscore in header",
+			host:     testDomain,
+			headerID: "abc_def",
+			wantErr:  true,
+		},
+
+		// Subdomain path unchanged.
+		{
+			name:           "subdomain still routes",
+			host:           "boxd-" + sandboxID + "." + testDomain,
+			wantPort:       boxdPort,
+			wantInstanceID: sandboxID,
+		},
+		{
+			name:           "subdomain on user app port",
+			host:           "3000-mybox." + testDomain,
+			wantPort:       3000,
+			wantInstanceID: "mybox",
+		},
+		{
+			name:           "subdomain header ignored when not on shared host",
+			host:           "boxd-" + sandboxID + "." + testDomain,
+			headerID:       "different-sandbox",
+			wantPort:       boxdPort,
+			wantInstanceID: sandboxID,
+		},
+		{
+			name:    "off-domain host with header",
+			host:    "sandbox.attacker.com",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := http.Header{}
+			if tt.headerID != "" {
+				headers.Set(headerSandboxID, tt.headerID)
+			}
+			port, instanceID, err := ParseRequest(tt.host, headers, testDomain)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got port=%d instanceID=%q", port, instanceID)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if port != tt.wantPort {
+				t.Errorf("port: got %d, want %d", port, tt.wantPort)
+			}
+			if instanceID != tt.wantInstanceID {
+				t.Errorf("instanceID: got %q, want %q", instanceID, tt.wantInstanceID)
+			}
+		})
+	}
+}
+
+// On a subdomain Host, the routing header is ignored — the subdomain wins.
+func TestParseRequest_HeaderRoutingRequiresSharedHost(t *testing.T) {
+	const targetID = "b150ee22-4956-4f5b-926a-f921ed8c37d6"
+	const attackerID = "deadbeef"
+
+	headers := http.Header{}
+	headers.Set(headerSandboxID, attackerID)
+
+	_, gotID, err := ParseRequest("boxd-"+targetID+"."+testDomain, headers, testDomain)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotID != targetID {
+		t.Errorf("header overrode subdomain routing: got id %q, want %q", gotID, targetID)
 	}
 }

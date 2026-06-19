@@ -1,0 +1,39 @@
+# Example egress blocklist config for vmd.
+#
+# Point VMD_EGRESS_BLOCKLIST_CONFIG at a file with this schema. The real
+# config is deployment-specific — do not commit actual feed URLs or block
+# entries to the repository. This example uses placeholder values only.
+#
+# Entries from all sources are merged into one denylist. Enforcement:
+#   - Domains: matched on proxied HTTP/TLS via Host header / SNI.
+#   - IPs/CIDRs: matched on proxied web traffic AND dropped at the host
+#     firewall on every port and protocol.
+#   - Ports: dropped at the host firewall for all sandbox traffic.
+# The denylist takes precedence over per-sandbox allow rules. A failed feed
+# fetch falls back to that feed's last good copy; the merged list is persisted
+# to state_path so restarts are seeded before the first fetch.
+
+# Plain-text feeds: one entry per line, '#' comments. Entries may be
+# domains, IPs, IP:port pairs, or CIDRs. URLs or local file paths.
+domain_feeds:
+  - https://threat-intel.example.com/bad-domains.txt
+  - /etc/sandbox/extra-blocked.txt
+
+# Pinned entries, always blocked regardless of feed contents.
+custom_domains:
+  - blocked.example.com
+custom_cidrs:
+  - 192.0.2.0/24
+
+# Destination ports dropped (TCP and UDP) for all sandbox traffic. Ports 80
+# and 443 are rejected here — they are REDIRECTed to the egress proxy before
+# the drop would apply, so web traffic is governed by the domain blocklist
+# and the proxy, not by port drops.
+blocked_egress_ports: [12345]
+
+# How often feeds are re-fetched. Go duration syntax. Default 6h.
+refresh_interval: 6h
+
+# Where the last good merged list is persisted. Defaults to
+# "blocklist.state" next to this config file.
+state_path: /var/lib/sandbox/blocklist.state

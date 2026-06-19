@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/analytics"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // Timeout constants.
@@ -78,6 +81,9 @@ type Handler struct {
 	// allowedOrigins is the set of browser origins allowed for CORS on
 	// data-plane endpoints (/files). Shared with the terminal origin check.
 	allowedOrigins []string
+
+	// analytics emits data-plane usage events; set via WithAnalytics, nil no-ops.
+	analytics *analytics.Client
 }
 
 // originAllowed checks whether the given Origin header matches one of the
@@ -120,11 +126,26 @@ func NewHandler(domain string, resolver Resolver, log zerolog.Logger) *Handler {
 	return h
 }
 
+// WithAnalytics enables data-plane usage events (exec/files).
+func (h *Handler) WithAnalytics(a *analytics.Client) *Handler {
+	h.analytics = a
+	return h
+}
+
+// captureUsage emits a data-plane usage event attributed to the sandbox owner.
+func (h *Handler) captureUsage(instanceID, event string, info InstanceInfo) {
+	if h.analytics == nil {
+		return
+	}
+	h.analytics.Capture(info.OwnerID, info.TeamID, event, map[string]any{"sandbox_id": instanceID})
+}
+
 // StartSweeper launches a background goroutine that periodically closes
 // transports for sandboxes that haven't been seen in transportMaxAge.
 // It stops when ctx is cancelled.
 func (h *Handler) StartSweeper(ctx context.Context) {
 	go func() {
+		defer sentrylog.Recover("transport-sweeper")
 		t := time.NewTicker(transportSweepInterval)
 		defer t.Stop()
 		for {
@@ -140,7 +161,7 @@ func (h *Handler) StartSweeper(ctx context.Context) {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	port, instanceID, err := ParseHost(r.Host, h.domain)
+	port, instanceID, err := ParseRequest(r.Host, r.Header, h.domain)
 	if err != nil {
 		h.log.Warn().Err(err).Str("host", r.Host).Msg("bad host")
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)

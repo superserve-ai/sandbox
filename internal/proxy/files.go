@@ -77,6 +77,8 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 		h.serveExec(w, r, instanceID)
 	case execStreamPath:
 		h.serveExecStream(w, r, instanceID)
+	case execConnectPath:
+		h.serveExecWS(w, r, instanceID)
 	default:
 		http.NotFound(w, r)
 	}
@@ -122,7 +124,6 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	}
 
-
 	// Path traversal rejection. boxd's own safePath runs filepath.Clean,
 	// which silently resolves `..` segments instead of refusing them —
 	// `/home/user/../../../etc/x` quietly becomes `/etc/x` and gets
@@ -156,6 +157,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 
 	// Scrub the token before forwarding to boxd.
 	r.Header.Del(accessTokenHeader)
+	r.Header.Del(headerSandboxID)
 
 	w.Header().Set("Referrer-Policy", "no-referrer")
 
@@ -165,6 +167,11 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		fail.write(w)
 		return
 	}
+	fileEvent := "file_read" // only GET/POST reach here; POST is a write
+	if r.Method == http.MethodPost {
+		fileEvent = "file_write"
+	}
+	h.captureUsage(instanceID, fileEvent, info)
 
 	// From here on it's just a transparent reverse proxy to boxd.
 	// Reuse the lifecycle-keyed transport cache for the same reasons
@@ -220,4 +227,3 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	}
 	rp.ServeHTTP(w, r)
 }
-

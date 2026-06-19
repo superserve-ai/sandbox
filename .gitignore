@@ -62,3 +62,6 @@ docs/
 /seed-templates
 /seed-apikey
 /template-builder
+
+# misc artifacts
+*:Zone.Identifier

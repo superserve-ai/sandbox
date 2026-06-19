@@ -46,9 +46,10 @@ var seedentropyBinary []byte
 // Must be called AFTER pullAndFlatten — operates on the extracted tree.
 //
 // Layout produced:
-//   /usr/bin/boxd              (0755)  — the guest agent binary
-//   /usr/local/bin/tini        (0755)  — PID 1 helper, embedded at build
-//   /sbin/init                 (0755)  — shell wrapper that execs tini
+//
+//	/usr/bin/boxd              (0755)  — the guest agent binary
+//	/usr/local/bin/tini        (0755)  — PID 1 helper, embedded at build
+//	/sbin/init                 (0755)  — shell wrapper that execs tini
 //
 // Returns the byte count of the boxd binary copied, for observability.
 func injectGuestAgent(rootfsDir, boxdBinaryPath string, logger *zerolog.Logger) (int64, error) {
@@ -153,6 +154,55 @@ const aptRewriteHeader = `# Rewritten by Superserve template builder.
 # nova.clouds.archive.ubuntu.com is Canonical's cloud-targeted mirror and
 # serves the same archive contents over a separate, healthy sync path.
 `
+
+// injectProxyCA writes the secretsproxy CA into the rootfs trust store.
+// No-op when caCertPath is empty.
+func injectProxyCA(rootfsDir, caCertPath string, logger *zerolog.Logger) error {
+	if caCertPath == "" {
+		return nil
+	}
+	cert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return fmt.Errorf("read proxy CA: %w", err)
+	}
+
+	additionalDir := filepath.Join(rootfsDir, "usr/local/share/ca-certificates")
+	if err := os.MkdirAll(additionalDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", additionalDir, err)
+	}
+	additionalCert := filepath.Join(additionalDir, "superserve-proxy.crt")
+	if err := os.WriteFile(additionalCert, cert, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", additionalCert, err)
+	}
+
+	// Append to the bundle so tools trust the cert without running update-ca-certificates.
+	bundlePath := filepath.Join(rootfsDir, "etc/ssl/certs/ca-certificates.crt")
+	bf, err := os.OpenFile(bundlePath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Minimal image with no system bundle: create it from the proxy CA,
+			// since the injected SSL_CERT_FILE/CURL_CA_BUNDLE env vars point here.
+			if mkErr := os.MkdirAll(filepath.Dir(bundlePath), 0o755); mkErr != nil {
+				return fmt.Errorf("mkdir %s: %w", filepath.Dir(bundlePath), mkErr)
+			}
+			if wErr := os.WriteFile(bundlePath, cert, 0o644); wErr != nil {
+				return fmt.Errorf("write %s: %w", bundlePath, wErr)
+			}
+			return nil
+		}
+		return fmt.Errorf("open %s: %w", bundlePath, err)
+	}
+	defer bf.Close()
+	// Defensive newline so an existing bundle without a trailing newline
+	// doesn't run the appended cert's BEGIN line into the previous line.
+	if _, err := bf.Write([]byte("\n")); err != nil {
+		return fmt.Errorf("append separator to %s: %w", bundlePath, err)
+	}
+	if _, err := bf.Write(cert); err != nil {
+		return fmt.Errorf("append to %s: %w", bundlePath, err)
+	}
+	return nil
+}
 
 // rewriteAptSources rewrites http:// and https:// references to
 // canonicalUbuntuMirrors in /etc/apt/sources.list and

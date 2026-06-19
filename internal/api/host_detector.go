@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 const (
@@ -35,7 +36,7 @@ func StartHostDetector(ctx context.Context, queries *db.Queries) {
 	ticker := time.NewTicker(detectorInterval)
 	defer ticker.Stop()
 
-	detectOnce(ctx, queries)
+	sentrylog.RunSafe("host-detector", func() { detectOnce(ctx, queries) })
 
 	for {
 		select {
@@ -44,7 +45,7 @@ func StartHostDetector(ctx context.Context, queries *db.Queries) {
 			return
 		case <-ticker.C:
 			runCtx, cancel := context.WithTimeout(ctx, detectorRunTimeout)
-			detectOnce(runCtx, queries)
+			sentrylog.RunSafe("host-detector", func() { detectOnce(runCtx, queries) })
 			cancel()
 		}
 	}

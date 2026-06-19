@@ -3,6 +3,7 @@ package network
 import (
 	"fmt"
 	"net/netip"
+	"sort"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
@@ -352,6 +353,14 @@ func (fw *Firewall) installNATRules() {
 	hostIP := mustParseAddr(fw.hostIP)
 
 	// POSTROUTING: SNAT outbound from VM IP → host IP.
+	//
+	// INVARIANT: this SNAT happens inside the namespace, so sandbox egress
+	// already appears sourced from hostIP (within vmIPRange) by the time it
+	// reaches the host FORWARD hook. The host egress-block drop relies on
+	// that to scope itself with `ip saddr vmIPRange` (see
+	// internal/network/egressblock.go). If SNAT ever moves to the host,
+	// packets would still carry the VM IP at FORWARD and that drop would
+	// silently stop matching — update both sites together.
 	fw.conn.AddRule(&nftables.Rule{
 		Table: fw.table,
 		Chain: fw.postChain,
@@ -687,7 +696,7 @@ func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 		}
 	}
 
-	var elems []nftables.SetElement
+	var prefixes []netip.Prefix
 	for _, cidr := range cidrs {
 		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
@@ -696,7 +705,19 @@ func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 		if !prefix.Addr().Is4() {
 			continue
 		}
-		s4 := prefix.Masked().Addr().As4()
+		prefixes = append(prefixes, prefix.Masked())
+	}
+
+	// Coalesce before emitting: nftables interval sets reject overlapping
+	// elements, and aggregated feeds routinely contain a prefix alongside
+	// one it already covers (e.g. 203.0.113.0/24 and 203.0.113.7/32). A
+	// single rejected element fails the whole flush, so without this the
+	// host drop set would silently stay empty.
+	prefixes = coalescePrefixes(prefixes)
+
+	var elems []nftables.SetElement
+	for _, prefix := range prefixes {
+		s4 := prefix.Addr().As4()
 		e4 := prefixEnd(prefix)
 		elems = append(elems,
 			nftables.SetElement{Key: s4[:]},
@@ -704,6 +725,35 @@ func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 		)
 	}
 	return elems, nil
+}
+
+// coalescePrefixes drops any prefix fully contained within another, plus exact
+// duplicates. Two CIDR prefixes are always either disjoint or nested, so
+// removing contained prefixes eliminates every overlap nftables would reject.
+// Input prefixes must already be masked.
+func coalescePrefixes(prefixes []netip.Prefix) []netip.Prefix {
+	// Broader blocks (shorter prefix length) first, so a covering prefix is
+	// always seen before the entries it covers.
+	sort.Slice(prefixes, func(i, j int) bool {
+		if prefixes[i].Bits() != prefixes[j].Bits() {
+			return prefixes[i].Bits() < prefixes[j].Bits()
+		}
+		return prefixes[i].Addr().Less(prefixes[j].Addr())
+	})
+	var kept []netip.Prefix
+	for _, p := range prefixes {
+		covered := false
+		for _, k := range kept {
+			if k.Bits() <= p.Bits() && k.Contains(p.Addr()) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			kept = append(kept, p)
+		}
+	}
+	return kept
 }
 
 // prefixEnd returns the first address past the prefix range as a 4-byte IPv4.

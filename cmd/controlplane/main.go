@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	kms "cloud.google.com/go/kms/apiv1"
+	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -21,11 +23,15 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
+	"github.com/superserve-ai/sandbox/internal/secrets"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/supervisor"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
@@ -49,8 +55,11 @@ const vmdRetryServiceConfig = `{
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
-		With().Timestamp().Caller().Logger()
+	multi := zerolog.MultiLevelWriter(
+		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
+		&sentrylog.Writer{},
+	)
+	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
 
 	if err := run(); err != nil {
 		log.Fatal().Err(err).Msg("controlplane exited with error")
@@ -63,6 +72,14 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	log.Info().Str("port", cfg.Port).Str("vmd_address", cfg.VMDAddress).Msg("configuration loaded")
+
+	if cfg.SentryDSN != "" {
+		if err := sentry.Init(sentry.ClientOptions{Dsn: cfg.SentryDSN, EnableLogs: true}); err != nil {
+			return fmt.Errorf("sentry init: %w", err)
+		}
+		defer sentry.Flush(2 * time.Second)
+		log.Info().Msg("sentry initialized")
+	}
 
 	// Root context — cancelled on shutdown so background goroutines
 	// (rate limiter cleanup, etc.) exit cleanly.
@@ -110,6 +127,40 @@ func run() error {
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
 
+	// Product-usage analytics — no-op when POSTHOG_KEY is unset.
+	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log.Logger)
+	if err != nil {
+		log.Fatal().Err(err).Msg("init analytics")
+	}
+	defer analyticsClient.Close()
+	handlers.Analytics = analyticsClient
+
+	// /secrets endpoints require KMS_KEY_RESOURCE; otherwise they remain disabled.
+	if cfg.KMSKeyResource != "" {
+		kmsClient, kerr := kms.NewKeyManagementClient(ctx)
+		if kerr != nil {
+			log.Warn().Err(kerr).Msg("KMS init failed; /secrets endpoints disabled")
+		} else {
+			handlers.Encryptor = secrets.NewKMSEncryptor(kmsClient, cfg.KMSKeyResource)
+			log.Info().Str("kek", cfg.KMSKeyResource).Msg("KMS encryptor wired for /secrets")
+		}
+	} else {
+		log.Info().Msg("KMS_KEY_RESOURCE empty; /secrets endpoints disabled")
+	}
+
+	// Sandbox JWT signer requires SECRETS_SIGNING_KEY; empty disables minting.
+	if cfg.SecretsSigningKey != "" {
+		signer, serr := api.NewSecretsSigner(cfg.SecretsSigningKey, cfg.SecretsSigningKeyID)
+		if serr != nil {
+			log.Warn().Err(serr).Msg("SECRETS_SIGNING_KEY init failed; JWT signing disabled")
+		} else {
+			handlers.Signer = signer
+			log.Info().Str("kid", cfg.SecretsSigningKeyID).Msg("JWT signer wired for /internal/jwks and sandbox secrets")
+		}
+	} else {
+		log.Info().Msg("SECRETS_SIGNING_KEY empty; JWT signing disabled (sandboxes with `secrets:` will fail)")
+	}
+
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
 	// Interceptors below fire onDead on codes.Unavailable so the registry
 	// drops stale cached clients.
@@ -154,12 +205,28 @@ func run() error {
 		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
 		queries,
 		buildResolver,
-	).Start(ctx)
+	).WithAnalytics(analyticsClient).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
 	// excludes unhealthy hosts from placement.
 	go api.StartHostDetector(ctx, queries)
+
+	// Billing dashboard rollups are provisional and recomputable from raw
+	// interval rows. Team-level feature flags decide which tenants roll up.
+	if billing.HourlyRollupDisabledFromEnv() {
+		log.Info().Msg("billing hourly rollup worker disabled (BILLING_HOURLY_ROLLUP_DISABLED set)")
+	} else {
+		billing.StartHourlyRollupService(ctx, dbPool, queries, billing.DefaultHourlyRollupConfig())
+	}
+
+	// Quota watcher: alerts (Slack) when a team crosses 80% of a resource limit.
+	// Only runs when a webhook is configured.
+	if webhook := os.Getenv("SLACK_QUOTA_ALERT_WEBHOOK"); webhook != "" {
+		go api.StartQuotaWatcher(ctx, queries, api.NewSlackQuotaNotifier(webhook))
+	} else {
+		log.Info().Msg("quota watcher disabled (SLACK_QUOTA_ALERT_WEBHOOK not set)")
+	}
 
 	// Start HTTP server.
 	srv := &http.Server{
@@ -204,15 +271,19 @@ func run() error {
 	return nil
 }
 
-// reconcileSystemTeamQuota lifts the system team's max_sandboxes above any
-// realistic cap so the sandbox_quota_on_insert trigger never rejects it.
+// reconcileSystemTeamQuota lifts the system team's max_sandboxes and
+// max_templates so the quota trigger and template-count check never block it.
 func reconcileSystemTeamQuota(ctx context.Context, pool *pgxpool.Pool, systemTeamID string) {
 	if systemTeamID == "" {
 		return
 	}
 	tag, err := pool.Exec(ctx,
-		`UPDATE team SET max_sandboxes = $1
-		 WHERE id = $2 AND (max_sandboxes IS NULL OR max_sandboxes < $1)`,
+		`UPDATE team
+		 SET max_sandboxes = $1,
+		     max_templates = $1
+		 WHERE id = $2
+		   AND (max_sandboxes IS NULL OR max_sandboxes < $1
+		     OR max_templates IS NULL OR max_templates < $1)`,
 		math.MaxInt32, systemTeamID,
 	)
 	if err != nil {
@@ -262,12 +333,11 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 	return resp.SnapshotPath, resp.MemFilePath, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
 	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
-		EnvVars:      envVars,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
@@ -281,16 +351,18 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 }
 
 // RestoreSnapshot is the stateless restore path — VMD creates a fresh VM
-// instance from the snapshot files, bypassing any in-memory state. Used as
-// a fallback when ResumeInstance returns NotFound (e.g. after VMD lost its
-// map to a crash but the snapshot files are still on disk).
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir string, envVars map[string]string) (string, uint32, uint32, error) {
+// instance from the snapshot files, bypassing any in-memory state. For
+// sandboxes with secrets the caller passes envVars=nil and pushes env via
+// InjectSandboxEnv after minting a JWT against the returned source IP.
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 		BasePath:     basePath,
 		DeltaDir:     deltaDir,
+		TeamId:       teamID,
+		OwnerId:      ownerID,
 		EnvVars:      envVars,
 	})
 	if err != nil {
@@ -302,6 +374,18 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		mem = rl.GetMemoryMib()
 	}
 	return resp.IpAddress, vcpu, mem, nil
+}
+
+func (c *grpcVMDClient) InjectSandboxEnv(ctx context.Context, vmID string, envVars map[string]string, secretsJWT string) error {
+	_, err := c.client.InjectSandboxEnv(ctx, &vmdpb.InjectSandboxEnvRequest{
+		VmId:       vmID,
+		EnvVars:    envVars,
+		SecretsJwt: secretsJWT,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC InjectSandboxEnv: %w", err)
+	}
+	return nil
 }
 
 // DeleteSnapshot removes the on-disk snapshot artifacts for a previous pause.
@@ -367,6 +451,30 @@ func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, a
 	})
 	if err != nil {
 		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) InvalidateSecret(ctx context.Context, secretID string) error {
+	_, err := c.client.InvalidateSecret(ctx, &vmdpb.InvalidateSecretRequest{SecretId: secretID})
+	if err != nil {
+		return fmt.Errorf("gRPC InvalidateSecret: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) RevokeSandbox(ctx context.Context, sandboxID string) error {
+	_, err := c.client.RevokeSandbox(ctx, &vmdpb.RevokeSandboxRequest{SandboxId: sandboxID})
+	if err != nil {
+		return fmt.Errorf("gRPC RevokeSandbox: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) InvalidateSandboxRules(ctx context.Context, sandboxID string) error {
+	_, err := c.client.InvalidateSandboxRules(ctx, &vmdpb.InvalidateSandboxRulesRequest{SandboxId: sandboxID})
+	if err != nil {
+		return fmt.Errorf("gRPC InvalidateSandboxRules: %w", err)
 	}
 	return nil
 }

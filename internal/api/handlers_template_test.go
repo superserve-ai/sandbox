@@ -1,9 +1,22 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // These tests cover the purely-functional helpers in handlers_template.go
@@ -149,5 +162,157 @@ func TestCanonicalSpecHash_DistinctForDifferentSpecs(t *testing.T) {
 	hb, _ := canonicalSpecHash(b)
 	if ha == hb {
 		t.Fatalf("different specs produced same hash: %s", ha)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Template-cache tests
+// ---------------------------------------------------------------------------
+
+func clearTemplateCache() {
+	templateCache.Range(func(k, _ any) bool {
+		templateCache.Delete(k)
+		return true
+	})
+}
+
+type templateCacheTestEnv struct {
+	h            *Handlers
+	c            *gin.Context
+	w            *httptest.ResponseRecorder
+	systemTeamID uuid.UUID
+	dbCalls      *atomic.Int64
+	tplReturned  db.Template
+	tplErr       error
+}
+
+func newTemplateCacheTestEnv(t *testing.T) *templateCacheTestEnv {
+	clearTemplateCache()
+	env := &templateCacheTestEnv{
+		systemTeamID: uuid.New(),
+		dbCalls:      &atomic.Int64{},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM template") {
+				env.dbCalls.Add(1)
+				if env.tplErr != nil {
+					return errorRow(env.tplErr)
+				}
+				return templateRow(env.tplReturned)
+			}
+			t.Fatalf("unexpected SQL: %s", sql)
+			return nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag(""), nil
+		},
+	}
+	env.h = &Handlers{
+		DB:     db.New(mock),
+		Config: &config.Config{SystemTeamID: env.systemTeamID.String()},
+	}
+	env.w = httptest.NewRecorder()
+	env.c, _ = gin.CreateTestContext(env.w)
+	env.c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	return env
+}
+
+func TestTemplateCache_SystemTemplate_CachedAcrossCalls(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	env.tplReturned = db.Template{
+		ID:     uuid.New(),
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+
+	callerTeam := uuid.New()
+	for i := 0; i < 5; i++ {
+		tpl, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base")
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i, err)
+		}
+		if tpl.ID != env.tplReturned.ID {
+			t.Errorf("call %d: wrong template returned", i)
+		}
+	}
+	if got := env.dbCalls.Load(); got != 1 {
+		t.Errorf("DB calls = %d, want 1 (subsequent reads should hit cache)", got)
+	}
+}
+
+func TestTemplateCache_TeamOwnedTemplate_NotCached(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	customerTeam := uuid.New()
+	env.tplReturned = db.Template{
+		ID:     uuid.New(),
+		TeamID: customerTeam, // <-- not the system team
+		Name:   "my-custom-template",
+		Status: db.TemplateStatusReady,
+	}
+
+	for i := 0; i < 3; i++ {
+		_, err := env.h.lookupTemplateForCreate(env.c, customerTeam, "my-custom-template")
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i, err)
+		}
+	}
+	if got := env.dbCalls.Load(); got != 3 {
+		t.Errorf("DB calls = %d, want 3 (team-owned templates must skip the cache)", got)
+	}
+}
+
+func TestTemplateCache_ExpiredEntry_RefetchedFromDB(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	env.tplReturned = db.Template{
+		ID:     uuid.New(),
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+
+	callerTeam := uuid.New()
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("initial lookup: %v", err)
+	}
+	if got := env.dbCalls.Load(); got != 1 {
+		t.Fatalf("after first call: db_calls=%d, want 1", got)
+	}
+
+	// Reach into the cache and backdate the entry so it appears expired
+	// without waiting in real time.
+	key := templateCacheKey{teamID: callerTeam, ref: "superserve/base"}
+	v, ok := templateCache.Load(key)
+	if !ok {
+		t.Fatalf("expected entry present after first call")
+	}
+	v.(*templateCacheEntry).expiry = time.Now().Add(-time.Second)
+
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("second lookup: %v", err)
+	}
+	if got := env.dbCalls.Load(); got != 2 {
+		t.Errorf("after expired entry: db_calls=%d, want 2", got)
+	}
+}
+
+func TestTemplateCache_NotFound_NotCached(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	env.tplErr = pgx.ErrNoRows
+
+	callerTeam := uuid.New()
+	for i := 0; i < 3; i++ {
+		_, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "does-not-exist")
+		if err == nil {
+			t.Fatalf("call %d: expected error, got nil", i)
+		}
+		// Reset recorder so the next call's 404 doesn't conflict with the prior.
+		env.w = httptest.NewRecorder()
+		env.c, _ = gin.CreateTestContext(env.w)
+		env.c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	}
+	if got := env.dbCalls.Load(); got != 3 {
+		t.Errorf("DB calls = %d, want 3 (not-found results must not be cached)", got)
 	}
 }

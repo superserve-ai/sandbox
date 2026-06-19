@@ -400,8 +400,10 @@ func (r *Reconciler) clearDrift(key string) {
 // can't consume the whole run's budget.
 const dbQueryTimeout = 5 * time.Second
 
-// markFailedInDB writes status=failed for the given sandbox ID. No-op if
-// the DB is not configured.
+// markFailedInDB writes status=failed for the given sandbox ID. The
+// underlying MarkSandboxFailed query is a CTE that also closes any open
+// sandbox_active_interval row atomically, so a crash/timeout between the
+// two writes is unreachable. No-op if the DB is not configured.
 func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
 	if r.cfg.DB == nil {
 		return

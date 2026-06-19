@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // PoolConfig controls the pre-allocated network slot pool.
@@ -81,7 +83,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	p.log.Info().Int("fresh", filled).Int("target", newSize).Int("recycle_cap", recycleSize).Msg("network pool ready")
 
 	p.wg.Add(1)
-	go p.refillLoop(ctx)
+	go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
 
 	m.pool = p
 	return p

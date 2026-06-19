@@ -80,6 +80,8 @@ type instanceResponse struct {
 	VMIP      string `json:"vm_ip"`
 	Status    string `json:"status"`
 	StartedAt int64  `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
+	TeamID    string `json:"team_id,omitempty"`
+	OwnerID   string `json:"owner_id,omitempty"`
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -106,6 +108,8 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		VMIP:      info.VMIP,
 		Status:    info.Status.String(),
 		StartedAt: info.CreatedAt.UnixNano(),
+		TeamID:    info.TeamID,
+		OwnerID:   info.OwnerID,
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
 	}

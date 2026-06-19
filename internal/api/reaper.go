@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // ReaperConfig controls the timeout reaper loop.
@@ -69,9 +70,15 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
+	runTick := func() {
+		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
+		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
+		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
+	}
+
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
-	h.reapOnce(ctx, cfg.BatchSize, parallelism)
+	runTick()
 
 	for {
 		select {
@@ -79,8 +86,47 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			log.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
-			h.reapOnce(ctx, cfg.BatchSize, parallelism)
+			runTick()
 		}
+	}
+}
+
+// sweepOrphanedIntervals closes intervals left open on no-longer-active
+// sandboxes — defense-in-depth for WAU accuracy, off the request path.
+func (h *Handlers) sweepOrphanedIntervals(ctx context.Context) {
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	n, err := h.DB.CloseOrphanedActiveIntervals(qctx)
+	if err != nil {
+		log.Error().Err(err).Msg("reaper: CloseOrphanedActiveIntervals failed")
+		return
+	}
+	if n > 0 {
+		log.Warn().Int64("closed", n).Msg("reaper: closed orphaned active intervals")
+	}
+}
+
+// cleanupExpiredRevocations deletes sandbox_revocation and revoked_proxy_token
+// rows past their TTL — once no live JWT can carry them, the entries are moot.
+func (h *Handlers) cleanupExpiredRevocations(ctx context.Context) {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	n, err := h.DB.DeleteExpiredSandboxRevocations(queryCtx)
+	if err != nil {
+		log.Warn().Err(err).Msg("reaper: cleanup revocations failed")
+		return
+	}
+	if n > 0 {
+		log.Info().Int64("reaped", n).Msg("reaper: deleted expired sandbox revocations")
+	}
+
+	tn, err := h.DB.DeleteExpiredRevokedProxyTokens(queryCtx)
+	if err != nil {
+		log.Warn().Err(err).Msg("reaper: cleanup revoked proxy tokens failed")
+		return
+	}
+	if tn > 0 {
+		log.Info().Int64("reaped", tn).Msg("reaper: deleted expired revoked proxy tokens")
 	}
 }
 
@@ -153,6 +199,10 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Str("name", sbx.Name).
 		Logger()
 
+	// ClaimExpiredSandboxes's CTE atomically closed the open active
+	// interval together with the status transition; nothing to do here.
+	// Reverts below reopen a new interval if the sandbox returns to active.
+
 	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
@@ -188,6 +238,8 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	}
 
 	l.Info().Msg("reaper: sandbox paused due to timeout")
+	// Interval was already closed at the top of pauseExpired; FinalizePause
+	// is the end of the VMD pause work, not the leave-active moment.
 	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
 }
 
@@ -214,7 +266,9 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	}
 
 	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath, nil)
+	// Reaper rollback resume: brings the VM back up after a pause-DB-write
+	// failure, before the customer ever sees the transition.
+	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath)
 	vmdCancel()
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")
@@ -235,6 +289,12 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		return
 	}
 
+	// Reopen the interval that pauseExpired closed at the top — sandbox
+	// is back to active and should resume being counted as such.
+	// actor_id is nil because this is a system-initiated revert, not a
+	// user action.
+	h.openSandboxIntervalInheritActor(ctx, sbx.ID, sbx.TeamID)
+
 	rl.Warn().Msg("reaper: rolled back failed pause, sandbox is active again — will retry next tick")
 }
 
@@ -254,7 +314,11 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 	}); err != nil {
 		l.Error().Err(err).AnErr("cause", cause).Msg("reaper: revert to active failed (after VMD pause error)")
 		h.markSandboxFailed(ctx, sbx, "revert to active failed after VMD pause error", l.With().AnErr("cause", cause).Logger())
+		return
 	}
+	// Reopen the interval that pauseExpired closed at the top — sandbox
+	// is back to active. System-initiated revert, so actor_id is nil.
+	h.openSandboxIntervalInheritActor(ctx, sbx.ID, sbx.TeamID)
 }
 
 // markSandboxFailed sets the sandbox to 'failed' as a terminal state for
@@ -268,9 +332,10 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, reason string, l zerolog.Logger) {
 	failCtx, failCancel := context.WithTimeout(ctx, asyncTimeout)
 	defer failCancel()
-	if err := h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
+	// MarkSandboxFailedInTeam's CTE bundles the active-interval close into
+	// the same statement; no separate close call needed.
+	if err := h.DB.MarkSandboxFailedInTeam(failCtx, db.MarkSandboxFailedInTeamParams{
 		ID:     sbx.ID,
-		Status: db.SandboxStatusFailed,
 		TeamID: sbx.TeamID,
 	}); err != nil {
 		l.Error().Err(err).Str("reason", reason).Msg("reaper: TERMINAL — sandbox stuck in 'pausing', mark-failed also failed, manual recovery required")

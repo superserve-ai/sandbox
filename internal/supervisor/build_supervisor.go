@@ -15,17 +15,22 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/puddle/v2"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -58,6 +63,10 @@ type BuildSupervisorConfig struct {
 	// vmd.CancelBuild and mark failed.
 	BuildTimeout time.Duration
 
+	// RegisterGrace is how long after dispatch a vmd "not found" is tolerated
+	// before being treated as terminal (covers the poll-before-register race).
+	RegisterGrace time.Duration
+
 	// ReapBatchSize caps how many stale rows ReapStaleBuilds touches per
 	// tick. Mirrors BatchSize's bounding rationale.
 	ReapBatchSize int32
@@ -80,6 +89,7 @@ func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 		HostID:                    hostID,
 		PendingTimeout:            2 * time.Minute,
 		BuildTimeout:              30 * time.Minute,
+		RegisterGrace:             60 * time.Second,
 		ReapBatchSize:             20,
 		ReconcileInterval:         5 * time.Minute,
 		MaxDeletesPerReconcile:    50,
@@ -93,10 +103,11 @@ type Resolver func(ctx context.Context, hostID string) (vmdclient.Client, error)
 // state lives in the DB. Safe to instantiate once at controlplane boot and
 // Start() with the process-lifetime context.
 type BuildSupervisor struct {
-	cfg     BuildSupervisorConfig
-	q       *db.Queries
-	resolve Resolver
-	log     zerolog.Logger
+	cfg       BuildSupervisorConfig
+	q         *db.Queries
+	resolve   Resolver
+	log       zerolog.Logger
+	analytics *analytics.Client // when set, emits build-outcome events; nil is a no-op
 }
 
 // NewBuildSupervisor constructs a supervisor.
@@ -107,6 +118,33 @@ func NewBuildSupervisor(cfg BuildSupervisorConfig, q *db.Queries, resolve Resolv
 		resolve: resolve,
 		log:     log.With().Str("component", "build_supervisor").Logger(),
 	}
+}
+
+// WithAnalytics enables build-outcome events (succeeded/failed).
+func (s *BuildSupervisor) WithAnalytics(a *analytics.Client) *BuildSupervisor {
+	s.analytics = a
+	return s
+}
+
+// logTickErr keeps only shutdown and dropped-connection blips below error level;
+// timeouts, connection-refused, and query errors stay at error (they may be real).
+func (s *BuildSupervisor) logTickErr(err error, msg string) {
+	switch {
+	case errors.Is(err, puddle.ErrClosedPool), errors.Is(err, context.Canceled):
+		s.log.Debug().Err(err).Msg(msg)
+	case isConnDroppedErr(err):
+		s.log.Warn().Err(err).Msg(msg)
+	default:
+		s.log.Error().Err(err).Msg(msg)
+	}
+}
+
+// isConnDroppedErr reports whether an established DB connection was dropped mid-use.
+func isConnDroppedErr(err error) bool {
+	m := err.Error()
+	return strings.Contains(m, "connection reset") ||
+		strings.Contains(m, "broken pipe") ||
+		strings.Contains(m, "unexpected EOF")
 }
 
 // Start launches the ticker goroutine. Exits cleanly when ctx is cancelled.
@@ -130,7 +168,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.Interval)
 	defer ticker.Stop()
 
-	s.tick(ctx)
+	sentrylog.RunSafe("build-supervisor", func() { s.tick(ctx) })
 
 	for {
 		select {
@@ -138,7 +176,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 			s.log.Info().Msg("build supervisor exiting")
 			return
 		case <-ticker.C:
-			s.tick(ctx)
+			sentrylog.RunSafe("build-supervisor", func() { s.tick(ctx) })
 		}
 	}
 }
@@ -165,7 +203,7 @@ func (s *BuildSupervisor) reapStale(ctx context.Context) {
 		BuildTimeoutSeconds:   int32(s.cfg.BuildTimeout / time.Second),
 	})
 	if err != nil {
-		s.log.Error().Err(err).Msg("reap stale builds failed")
+		s.logTickErr(err, "reap stale builds failed")
 		return
 	}
 	for _, r := range reaped {
@@ -203,7 +241,7 @@ func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
 	// picked up next tick and the budget cap keeps us bounded.
 	inflightGlobal, err := s.countInflightGlobal(queryCtx)
 	if err != nil {
-		s.log.Error().Err(err).Msg("count in-flight builds failed")
+		s.logTickErr(err, "count in-flight builds failed")
 		return
 	}
 	if inflightGlobal >= int64(s.cfg.GlobalMaxConcurrentBuilds) {
@@ -214,7 +252,7 @@ func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
 
 	pending, err := s.q.ListPendingBuildsOrdered(queryCtx, s.cfg.BatchSize)
 	if err != nil {
-		s.log.Error().Err(err).Msg("list pending builds failed")
+		s.logTickErr(err, "list pending builds failed")
 		return
 	}
 
@@ -327,7 +365,7 @@ func (s *BuildSupervisor) pollActive(ctx context.Context) {
 	active, err := s.q.ListActiveBuilds(queryCtx)
 	cancel()
 	if err != nil {
-		s.log.Error().Err(err).Msg("list active builds failed")
+		s.logTickErr(err, "list active builds failed")
 		return
 	}
 
@@ -365,14 +403,19 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		rowLog.Warn().Err(err).Msg("GetBuildStatus failed")
 		return
 	}
-	if res.NotFound {
-		// vmd lost this build (restart, or never dispatched). Mark failed
-		// so the user can retry rather than waiting indefinitely.
-		rowLog.Warn().Msg("vmd has no record of build; marking failed")
-		s.failBuild(ctx, row.ID, "vmd has no record of this build (likely vmd restarted)")
+	switch classifyNotFound(res, row.StartedAt.Time, row.StartedAt.Valid, time.Now(), s.cfg.RegisterGrace) {
+	case nfWait:
+		// Within grace of dispatch, NotFound is the poll-before-register race,
+		// not a lost build — retry next tick.
+		rowLog.Debug().Msg("vmd has no record yet; within register grace, retrying next tick")
+		return
+	case nfFail:
+		rowLog.Warn().Dur("grace", s.cfg.RegisterGrace).Msg("vmd has no record of build after dispatch grace; marking failed")
+		s.failBuild(ctx, row.ID, "build was not found on the build host after dispatch (it may have been lost to a host restart); retry the build")
 		return
 	}
 
+	// nfProceed: vmd has the build — act on its reported status.
 	switch res.Status {
 	case "running":
 		// No transition needed; we're already 'building' in DB.
@@ -410,6 +453,10 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			DeltaPath:    deltaPathArg,
 		})
 		cancel()
+		if errors.Is(err, pgx.ErrNoRows) {
+			rowLog.Debug().Msg("build already finalized by a concurrent tick; skipping")
+			return
+		}
 		if err != nil {
 			rowLog.Error().Err(err).Msg("finalize build")
 			return
@@ -432,6 +479,37 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		rowLog.Info().Str("status", res.Status).Str("error", res.ErrorMessage).Msg("build terminal")
 		s.logBuildCompleted(ctx, row, "error", res.ErrorMessage, "")
 	}
+}
+
+// notFoundDecision is what a vmd GetBuildStatus result implies for the poll.
+type notFoundDecision int
+
+const (
+	nfProceed notFoundDecision = iota // vmd has the build — act on res.Status
+	nfWait                            // NotFound, but still within register grace
+	nfFail                            // NotFound past grace — treat as lost
+)
+
+// classifyNotFound decides how pollOne should handle a GetBuildStatus result.
+// Pure so the decision is unit-testable without DB or gRPC.
+func classifyNotFound(res vmdclient.BuildStatusResult, startedAt time.Time, startedValid bool, now time.Time, grace time.Duration) notFoundDecision {
+	if !res.NotFound {
+		return nfProceed
+	}
+	if notFoundIsTerminal(startedAt, startedValid, now, grace) {
+		return nfFail
+	}
+	return nfWait
+}
+
+// notFoundIsTerminal reports whether a vmd "not found" is a permanent failure:
+// true only once the build has been dispatched longer than grace. With no valid
+// dispatch time it returns false (the stale-build reaper is the backstop).
+func notFoundIsTerminal(startedAt time.Time, startedValid bool, now time.Time, grace time.Duration) bool {
+	if !startedValid || startedAt.IsZero() {
+		return false
+	}
+	return now.Sub(startedAt) >= grace
 }
 
 // logBuildCompleted writes a template/build_completed activity row so user
@@ -459,6 +537,18 @@ func (s *BuildSupervisor) logBuildCompleted(ctx context.Context, row db.Template
 		Metadata:     metaJSON,
 	}); err != nil {
 		s.log.Error().Err(err).Str("build_id", row.ID.String()).Msg("activity log build_completed")
+	}
+
+	if s.analytics != nil {
+		event := "template_build_succeeded"
+		if status != "success" {
+			event = "template_build_failed"
+		}
+		// The build row carries no creator, so attribution is team-scoped.
+		s.analytics.Capture("", row.TeamID.String(), event, map[string]any{
+			"template_id": row.TemplateID.String(),
+			"build_id":    row.ID.String(),
+		})
 	}
 }
 
@@ -516,13 +606,13 @@ func specStepsToVMD(steps []builder.BuildStep) []vmdclient.BuildStep {
 func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
 	t := time.NewTicker(s.cfg.ReconcileInterval)
 	defer t.Stop()
-	s.reconcileOrphanBuilds(ctx)
+	sentrylog.RunSafe("build-supervisor-reconcile", func() { s.reconcileOrphanBuilds(ctx) })
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.reconcileOrphanBuilds(ctx)
+			sentrylog.RunSafe("build-supervisor-reconcile", func() { s.reconcileOrphanBuilds(ctx) })
 		}
 	}
 }

@@ -69,19 +69,19 @@ func main() {
 	}()
 
 	err := runBuild(ctx, buildConfig{
-		templateID: *templateID,
-		buildID:    *buildID,
-		spec:       spec,
-		vcpu:       uint32(*vcpu),
-		memoryMiB:  uint32(*memory),
-		diskMiB:    uint32(*disk),
-		runDir:     *runDir,
+		templateID:  *templateID,
+		buildID:     *buildID,
+		spec:        spec,
+		vcpu:        uint32(*vcpu),
+		memoryMiB:   uint32(*memory),
+		diskMiB:     uint32(*disk),
+		runDir:      *runDir,
 		snapshotDir: *snapshotDir,
-		kernelPath: *kernelPath,
-		fcBin:      *fcBin,
-		boxdBin:    *boxdBin,
-		hostIface:  *hostIface,
-		slotIndex:  *slotIndex,
+		kernelPath:  *kernelPath,
+		fcBin:       *fcBin,
+		boxdBin:     *boxdBin,
+		hostIface:   *hostIface,
+		slotIndex:   *slotIndex,
 	})
 	if err != nil {
 		// Emit a user-visible error (stable code + user-friendly message)
@@ -105,8 +105,9 @@ func classifyBuildError(err error) (code, userMsg string) {
 	// Specific-cause cases must come before the broad "build rootfs" / "pull "
 	// match below, which would otherwise swallow them as registry failures.
 
-	case strings.Contains(raw, "flattened image exceeds"):
-		return "image_too_large", "image is too large for the requested disk_mib; increase disk_mib"
+	case strings.Contains(raw, "flattened image exceeds"),
+		strings.Contains(raw, "while populating file system"):
+		return "image_too_large", "image is too large for the requested disk; increase disk_mib or use a smaller base image"
 
 	case strings.Contains(raw, "parse image reference"):
 		return "bad_reference", "image reference is malformed; check the format like 'python:3.11' or 'ghcr.io/org/image:tag'"
@@ -191,9 +192,22 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 
 	emitUser("system", "Pulling image %s", cfg.spec.From)
+	// Default to the daemon's CA path, but only when it exists, so a host that
+	// doesn't run secretsproxy still builds templates. An explicit but missing
+	// SECRETSPROXY_CA_CERT still errors downstream, surfacing the misconfig.
+	proxyCA := os.Getenv("SECRETSPROXY_CA_CERT")
+	if proxyCA == "" {
+		const defaultProxyCA = "/var/lib/secretsproxy/ca.crt"
+		if _, err := os.Stat(defaultProxyCA); err == nil {
+			proxyCA = defaultProxyCA
+		} else {
+			emitUser("system", "secretsproxy CA not found at %s; building without proxy CA trust", defaultProxyCA)
+		}
+	}
 	b, err := builder.NewBuilder(builder.Config{
 		BoxdBinaryPath:           cfg.boxdBin,
 		MaxUncompressedSizeBytes: int64(cfg.diskMiB) * 1024 * 1024,
+		ProxyCACertPath:          proxyCA,
 	})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
@@ -559,6 +573,8 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec)
 			"TERM":  "xterm",
 			"LANG":  "C.UTF-8",
 			"SHELL": "/bin/sh",
+			// Builds are non-interactive; keep apt/debconf from prompting.
+			"DEBIAN_FRONTEND": "noninteractive",
 		},
 	}
 

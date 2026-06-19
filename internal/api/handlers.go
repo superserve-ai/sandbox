@@ -20,9 +20,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/secrets"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -63,8 +66,27 @@ type Handlers struct {
 	DB        *db.Queries
 	Pool      *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
 	Config    *config.Config
-	Hosts     HostRegistry // when set, routes VMD calls via host_id
-	Scheduler Scheduler    // when set, picks host on create
+	Hosts     HostRegistry      // when set, routes VMD calls via host_id
+	Scheduler Scheduler         // when set, picks host on create
+	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
+	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
+	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
+}
+
+// capture emits a usage event attributed to the API key's owner and team.
+func (h *Handlers) capture(c *gin.Context, event string, props map[string]any) {
+	if h.Analytics == nil {
+		return
+	}
+	var actor string
+	if a := actorIDFromContext(c); a != nil {
+		actor = a.String()
+	}
+	var team string
+	if t, err := teamIDFromContext(c); err == nil {
+		team = t.String()
+	}
+	h.Analytics.Capture(actor, team, event, props)
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -110,6 +132,7 @@ const asyncTimeout = 5 * time.Second
 func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID uuid.UUID, actorID *uuid.UUID, category, action, status string, sandboxName *string, durationMs *int32, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
+		defer sentrylog.Recover("activity-log")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
@@ -130,11 +153,38 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 	}()
 }
 
+// logSecretActivity writes a secret-scoped activity record. secretName is a
+// denormalized snapshot stored at write time so the row stays readable even
+// after the underlying secret is hard-deleted.
+func (h *Handlers) logSecretActivity(reqCtx context.Context, secretID, teamID uuid.UUID, actorID *uuid.UUID, action, status, secretName string, metadata []byte) {
+	asyncCtx := context.WithoutCancel(reqCtx)
+	go func() {
+		defer sentrylog.Recover("secret-activity-log")
+		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
+		defer cancel()
+		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+			SecretID:     pgtype.UUID{Bytes: secretID, Valid: true},
+			SecretName:   &secretName,
+			ResourceType: "secret",
+			TeamID:       teamID,
+			ActorID:      actorUUID(actorID),
+			Category:     "secret",
+			Action:       action,
+			Status:       &status,
+			Metadata:     metadata,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("secret_id", secretID.String()).Msgf("async secret/%s activity log failed", action)
+		}
+	}()
+}
+
 // logTemplateActivity writes a template-scoped activity record. Same async
 // semantics as logSandboxActivity.
 func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamID uuid.UUID, actorID *uuid.UUID, category, action, status string, metadata []byte) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
+		defer sentrylog.Recover("template-activity-log")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
@@ -158,6 +208,73 @@ func actorUUID(actorID *uuid.UUID) pgtype.UUID {
 		return pgtype.UUID{}
 	}
 	return pgtype.UUID{Bytes: *actorID, Valid: true}
+}
+
+// openSandboxInterval records the start of an active period in
+// sandbox_active_interval. Called when a sandbox transitions into 'active'
+// (created or resumed). Run synchronously rather than in a goroutine so the
+// DB-side partial unique index on open rows is the single arbiter of
+// per-sandbox open/close ordering; an async goroutine could race a quickly-
+// following close. Cancellation is stripped from reqCtx so a client
+// disconnect after the status update can't leave us with an active sandbox
+// and no open interval row. Best-effort: failures are logged but do not
+// fail the request — losing an interval row degrades metrics, not the user
+// flow.
+func (h *Handlers) openSandboxInterval(reqCtx context.Context, sandboxID, teamID uuid.UUID, actorID *uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		ActorID:   actorUUID(actorID),
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval failed")
+	}
+}
+
+// openSandboxIntervalInheritActor opens an interval after a system-initiated
+// revert (e.g. reaper's pause-then-rollback) where the original actor was
+// lost. Looks up the most recently closed interval's actor and uses it as
+// the new open's actor_id; this keeps the sandbox contributing to WAU
+// across a brief outage instead of getting dropped by the view's "actor_id
+// IS NOT NULL" filter. Falls back to NULL if no prior closed interval
+// exists.
+//
+// Only the reaper revert paths use this. The user-facing handler paths
+// always have an explicit actor from the request context, so they call
+// openSandboxInterval directly.
+func (h *Handlers) openSandboxIntervalInheritActor(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	var actorID *uuid.UUID
+	if prior, err := h.DB.GetMostRecentClosedSandboxIntervalActor(ctx, sandboxID); err == nil && prior.Valid {
+		a := uuid.UUID(prior.Bytes)
+		actorID = &a
+	}
+	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+		ActorID:   actorUUID(actorID),
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval (inherit) failed")
+	}
+}
+
+// closeSandboxInterval closes the currently-open interval for a sandbox.
+// reason is one of paused / timeout_paused / deleted / failed. Idempotent:
+// if no interval is open (e.g. delete-after-pause), the UPDATE matches zero
+// rows and the call is a no-op — this is what prevents a long paused
+// window from being counted as active time. Cancellation and best-effort
+// semantics match openSandboxInterval.
+func (h *Handlers) closeSandboxInterval(reqCtx context.Context, sandboxID uuid.UUID, reason string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	if err := h.DB.CloseSandboxActiveInterval(ctx, db.CloseSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		EndReason: reason,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Str("reason", reason).Msg("close sandbox_active_interval failed")
+	}
 }
 
 // loadActiveSandbox fetches a sandbox by ID, verifies team ownership, and
@@ -248,10 +365,34 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
-	claimed, err := h.DB.BeginResume(c.Request.Context(), db.BeginResumeParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
+	// Serialize the paused→resuming claim with attach/detach via a DB advisory
+	// lock (held only for the claim). Both take the same lock and re-read status
+	// under it, so across API instances a mutation can't read a stale 'paused' and
+	// land a binding this resume won't pick up. Once the claim flips status to
+	// 'resuming', those handlers see it under the lock and reject with 409.
+	claimResume := func(q *db.Queries) (db.Sandbox, error) {
+		if h.Pool != nil {
+			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), sandboxID.String()); lerr != nil {
+				return db.Sandbox{}, lerr
+			}
+		}
+		return q.BeginResume(c.Request.Context(), db.BeginResumeParams{ID: sandboxID, TeamID: teamID})
+	}
+	var (
+		claimed db.Sandbox
+		err     error
+	)
+	if h.Pool == nil {
+		claimed, err = claimResume(h.DB)
+	} else {
+		var tx pgx.Tx
+		if tx, err = h.Pool.Begin(c.Request.Context()); err == nil {
+			defer tx.Rollback(c.Request.Context())
+			if claimed, err = claimResume(h.DB.WithTx(tx)); err == nil {
+				err = tx.Commit(c.Request.Context())
+			}
+		}
+	}
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
@@ -317,7 +458,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath, nil)
+	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
+	// tokens as they were at pause; the current binding set is re-applied below
+	// once the VM is up, so a mutation made while paused takes effect.
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
@@ -325,7 +469,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -363,22 +507,66 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	destroyAndRevert := func() {
-		dctx, dcancel := context.WithTimeout(revertCtx, vmdTimeout)
-		defer dcancel()
-		if err := vmd.DestroyInstance(dctx, sandboxID.String(), true); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy VM after resume failure failed")
+	// Once the VM is up, a failed finalize step must NOT destroy it —
+	// DestroyInstance deletes the overlay (the sandbox's disk). Re-pause
+	// instead: snapshotting preserves the overlay and returns it to a clean,
+	// resumable 'paused' state. Prefer leak over loss.
+	pauseAndRevert := func() {
+		pctx, pcancel := context.WithTimeout(revertCtx, vmdTimeout)
+		snapPath, memPath, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
+		pcancel()
+		if perr != nil {
+			// VM unreachable — nothing to preserve; mark failed rather than
+			// wedge in 'resuming' (the CTE also closes any open interval).
+			log.Error().Err(perr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: PauseInstance failed, marking sandbox failed")
+			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID)
+			return
 		}
-		revertToPaused()
+		// Fresh deadline so a slow snapshot above can't starve the DB write.
+		// Overlay preserved; flip resuming → paused via FinalizePause.
+		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
+		defer fcancel()
+		if _, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
+			ID:        sandboxID,
+			TeamID:    teamID,
+			Path:      snapPath,
+			MemPath:   &memPath,
+			SizeBytes: 0, // snapshot size isn't tracked for pauses (matches PauseSandbox)
+			Trigger:   "resume_revert",
+		}); ferr != nil {
+			// VM is safely paused; only bookkeeping failed. Best-effort status
+			// flip — the reconciler is the backstop.
+			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
+			revertToPaused()
+		}
 	}
 
 	// Apply egress rules before committing to 'active' so "active ⇒ rules
 	// applied" holds by construction.
 	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
-		destroyAndRevert()
+		pauseAndRevert()
 		respondError(c, ErrInternal)
 		return false
+	}
+
+	// Re-apply the current binding set before committing to 'active', so a secret
+	// attached or detached while paused takes effect — the snapshot froze the old
+	// JWT. Skipped when there are no bindings, keeping the secret-less resume a
+	// single round trip. The fresh IP binds the re-minted JWT.
+	sandbox.IpAddress = ipAddr
+	if meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID); merr != nil {
+		log.Error().Err(merr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings on resume failed")
+		pauseAndRevert()
+		respondError(c, ErrInternal)
+		return false
+	} else if len(meta) > 0 {
+		if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
+			log.Error().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("reapply secret bindings on resume failed")
+			pauseAndRevert()
+			respondError(c, ErrInternal)
+			return false
+		}
 	}
 
 	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
@@ -387,9 +575,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		MemoryMib: int32(actualMemMiB),
 		IpAddress: ipAddr,
 		TeamID:    teamID,
+		ActorID:   actorUUID(actorIDFromContext(c)),
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
-		destroyAndRevert()
+		pauseAndRevert()
 		respondError(c, ErrInternal)
 		return false
 	}
@@ -398,7 +587,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
+	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
+	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
 	return true
 }
 
@@ -419,6 +610,26 @@ type persistedEgressConfig struct {
 		DeniedCIDRs    []string `json:"denied_cidrs"`
 		AllowedDomains []string `json:"allowed_domains"`
 	} `json:"egress"`
+}
+
+// egressConfigJSON splits the request's egress entries into CIDRs and domains
+// and marshals the network_config jsonb shape persisted on the sandbox row.
+func egressConfigJSON(network *networkConfigRequest) (allowedCIDRs, allowedDomains []string, raw []byte) {
+	for _, entry := range network.AllowOut {
+		if isIPOrCIDR(entry) {
+			allowedCIDRs = append(allowedCIDRs, entry)
+		} else {
+			allowedDomains = append(allowedDomains, entry)
+		}
+	}
+	raw, _ = json.Marshal(map[string]any{
+		"egress": map[string]any{
+			"allowed_cidrs":   allowedCIDRs,
+			"denied_cidrs":    network.DenyOut,
+			"allowed_domains": allowedDomains,
+		},
+	})
+	return allowedCIDRs, allowedDomains, raw
 }
 
 // reapplyNetworkConfig reads the sandbox's persisted egress config and pushes
@@ -502,6 +713,14 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+// ownerIDFromContext returns the actor's UUID as a string, or "" when unknown.
+func ownerIDFromContext(c *gin.Context) string {
+	if a := actorIDFromContext(c); a != nil {
+		return a.String()
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +845,21 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
+	// Record the revocation so daemons can refuse the JWT, and fan out the
+	// notification to the host. Detach from the request context so a client
+	// disconnect mid-DELETE doesn't strand a destroyed sandbox without its
+	// revocation row. Bootstrap-on-restart still recovers if fanout fails.
+	revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer revokeCancel()
+	if err := h.DB.InsertSandboxRevocation(revokeCtx, db.InsertSandboxRevocationParams{
+		SandboxID: sandboxID,
+		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
+	}); err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertSandboxRevocation failed")
+	} else {
+		go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+	}
+
 	// Best-effort cleanup of pause snapshots. Failures are logged but
 	// don't fail the delete — manual cleanup may be required if vmd was
 	// unreachable.
@@ -635,8 +869,9 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// last reference and the template has since moved to a newer build.
 	h.gcOldBuildArtifacts(c.Request.Context(), sandbox)
 
-	// Async activity log.
+	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
+	h.capture(c, "sandbox_deleted", map[string]any{"sandbox_id": sandboxID.String()})
 
 	c.Status(http.StatusNoContent)
 }
@@ -766,20 +1001,34 @@ type createSandboxRequest struct {
 	// they live in boxd's memory for the sandbox's lifetime and survive
 	// pause/resume via snapshot.
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+
+	// Secrets binds team-stored credentials to env-var names; the agent sees a
+	// per-binding proxy token, swapped for the real value at egress.
+	Secrets map[string]string `json:"secrets,omitempty"`
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID             `json:"id"`
-	Name           string                `json:"name"`
-	Status         string                `json:"status"`
-	VcpuCount      int32                 `json:"vcpu_count"`
-	MemoryMib      int32                 `json:"memory_mib"`
-	AccessToken    string                `json:"access_token,omitempty"`
-	SnapshotID     *uuid.UUID            `json:"snapshot_id,omitempty"`
-	CreatedAt      time.Time             `json:"created_at"`
-	TimeoutSeconds *int32                `json:"timeout_seconds,omitempty"`
-	Network        *networkConfigRequest `json:"network,omitempty"`
-	Metadata       map[string]string     `json:"metadata"`
+	ID             uuid.UUID              `json:"id"`
+	Name           string                 `json:"name"`
+	Status         string                 `json:"status"`
+	VcpuCount      int32                  `json:"vcpu_count"`
+	MemoryMib      int32                  `json:"memory_mib"`
+	AccessToken    string                 `json:"access_token,omitempty"`
+	SnapshotID     *uuid.UUID             `json:"snapshot_id,omitempty"`
+	CreatedAt      time.Time              `json:"created_at"`
+	TimeoutSeconds *int32                 `json:"timeout_seconds,omitempty"`
+	Network        *networkConfigRequest  `json:"network,omitempty"`
+	Metadata       map[string]string      `json:"metadata"`
+	Secrets        []sandboxSecretBinding `json:"secrets,omitempty"`
+}
+
+// sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
+// `revoked` is true when the underlying secret has been soft-deleted —
+// the binding row stays but the daemon refuses to swap on use.
+type sandboxSecretBinding struct {
+	EnvKey     string `json:"env_key"`
+	SecretName string `json:"secret_name"`
+	Revoked    bool   `json:"revoked,omitempty"`
 }
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
@@ -960,7 +1209,32 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(sandbox))
+	resp := h.sandboxToResponseWithToken(sandbox)
+	resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
+	c.JSON(http.StatusOK, resp)
+}
+
+// fetchSandboxSecretBindings is a best-effort read of the sandbox's secret
+// bindings for the detail response. A DB failure is logged but doesn't fail
+// the request — the sandbox shape is still useful without the bindings list.
+func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uuid.UUID) []sandboxSecretBinding {
+	rows, err := h.DB.ListSandboxSecretBindings(ctx, sandboxID)
+	if err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListSandboxSecretBindings failed")
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]sandboxSecretBinding, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, sandboxSecretBinding{
+			EnvKey:     r.EnvKey,
+			SecretName: r.SecretName,
+			Revoked:    r.SecretRevoked,
+		})
+	}
+	return out
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
@@ -1011,6 +1285,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateSecretsRefs(req.Secrets); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	// env_vars and secrets share the env-var namespace; 400 on collision.
+	for k := range req.Secrets {
+		if _, dup := req.EnvVars[k]; dup {
+			respondErrorMsg(c, "bad_request",
+				fmt.Sprintf("env-var key %q appears in both env_vars and secrets; pick one", k),
+				http.StatusBadRequest)
+			return
+		}
+	}
 	// Marshal once into the canonical jsonb shape. Empty / nil maps are
 	// stored as the empty object so the column is never NULL.
 	metadataJSON, err := json.Marshal(req.Metadata)
@@ -1027,6 +1314,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+
+	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
+	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
+	if appErr != nil {
+		respondError(c, appErr)
 		return
 	}
 
@@ -1165,11 +1459,61 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			DeltaPath:      nil,
 		})
 	}
+	// insertWithBindings writes the sandbox row, and its secret bindings in the
+	// same transaction when any are attached, so a successful create never leaves
+	// a binding unrecorded. With no secrets it is a plain insert — no transaction.
+	insertWithBindings := func() (db.Sandbox, error) {
+		if len(secretBindings) == 0 {
+			return runInsert(h.DB)
+		}
+		runBoth := func(q *db.Queries) (db.Sandbox, error) {
+			sb, err := runInsert(q)
+			if err != nil {
+				return db.Sandbox{}, err
+			}
+			secretIDs := make([]uuid.UUID, len(secretBindings))
+			envKeys := make([]string, len(secretBindings))
+			proxyTokens := make([]string, len(secretBindings))
+			for i := range secretBindings {
+				secretIDs[i] = secretBindings[i].SecretID
+				envKeys[i] = secretBindings[i].EnvKey
+				// secretMeta is index-aligned with secretBindings; persist its token.
+				proxyTokens[i] = secretMeta[i].ProxyToken
+			}
+			if err := q.AddSandboxSecrets(insertCtx, db.AddSandboxSecretsParams{
+				SandboxID:   sandboxID,
+				SecretIds:   secretIDs,
+				EnvKeys:     envKeys,
+				ProxyTokens: proxyTokens,
+			}); err != nil {
+				return db.Sandbox{}, fmt.Errorf("insert secret bindings: %w", err)
+			}
+			return sb, nil
+		}
+		// No pool (DBTX-mocked unit tests): fall back to a direct insert.
+		if h.Pool == nil {
+			return runBoth(h.DB)
+		}
+		tx, err := h.Pool.Begin(insertCtx)
+		if err != nil {
+			return db.Sandbox{}, err
+		}
+		defer tx.Rollback(insertCtx)
+		sb, err := runBoth(h.DB.WithTx(tx))
+		if err != nil {
+			return db.Sandbox{}, err
+		}
+		if err := tx.Commit(insertCtx); err != nil {
+			return db.Sandbox{}, err
+		}
+		return sb, nil
+	}
+
 	var tInsertStart, tInsertEnd time.Time
 	go func() {
 		tInsertStart = time.Now()
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
-		sb, err := runInsert(h.DB)
+		sb, err := insertWithBindings()
 		tInsertEnd = time.Now()
 		insertCh <- insertResult{sandbox: sb, err: err}
 	}()
@@ -1181,15 +1525,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
 
-	// RestoreSnapshot (not ResumeInstance) for the from_template path:
-	// ResumeInstance assumes the VM already exists in vmd's in-memory map
-	// (the pause→resume contract), which is fine for a paused sandbox but
-	// not for a fresh one we're creating now. Restore takes snapshot paths
-	// and boots a new VM from them statelessly. Caller env vars are merged
-	// on top of the template's baked defaults by vmd (boxd resumes with
-	// template context, then the restore RPC posts these on top).
+	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
+
+	// Phase 1: RestoreSnapshot boots the VM with the caller's env vars and
+	// returns its source IP. For sandboxes with secrets, a follow-up
+	// InjectSandboxEnv pushes the env again together with the JWT minted
+	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -1248,6 +1591,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
 		})
+		// Bindings are written before RestoreSnapshot, so a restore failure
+		// leaves them; clear them or this dead sandbox still shows as bound.
+		_ = h.DB.DeleteSandboxSecrets(failCtx, sandbox.ID)
 		// FailedPrecondition from vmd = snapshot/mem file missing on host.
 		// Surfaces on the from_template restore path; map to 503 so the
 		// user understands this is ops-side, not a bad request.
@@ -1259,11 +1605,63 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Past this point the VM is running. Detach from cancellation so a
-	// client disconnect cannot lose the state transition, but preserve
-	// the trace/span context so post-VMD writes stay in the request trace.
+	// Phase 2: with the source IP known, mint the per-sandbox secrets JWT
+	// (when secrets are configured) and push env vars to the running boxd.
+	// If injection fails, tear the VM down and mark the row failed — a
+	// sandbox that boots without its env vars is unusable.
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
+
+	// Persist egress rules before injecting the env, so the secrets proxy's live
+	// rule fetch sees them before the agent can issue a proxied request. The
+	// nftables push happens later (it needs the booted VM); the DB write does not.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		_, _, networkConfig := egressConfigJSON(req.Network)
+		if err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
+			ID:            sandbox.ID,
+			NetworkConfig: networkConfig,
+			TeamID:        teamID,
+		}); err != nil {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("persist network_config before env inject failed")
+		}
+	}
+
+	var secretsJWT string
+	if len(secretMeta) > 0 {
+		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, secretMeta)
+		if jerr != nil {
+			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
+			respondError(c, ErrInternal)
+			return
+		}
+		secretsJWT = jwt
+	}
+	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+		// A vmd without this RPC already applied these env vars during
+		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
+		if secretsJWT == "" && isVMDUnimplemented(injErr) {
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
+		} else {
+			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+
+	// Prime the secrets proxy's egress-rules cache so the agent's first proxied
+	// request hits a warm cache (covers a control-plane blip right after create).
+	// Best-effort; the on-demand fetch + TTL is the fallback.
+	if len(secretMeta) > 0 {
+		go func() {
+			pctx, pcancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer pcancel()
+			if err := vmd.InvalidateSandboxRules(pctx, sandboxID.String()); err != nil {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("prime egress rules cache failed (fetch fallback)")
+			}
+		}()
+	}
 
 	// Single atomic transition: starting → active with real resources
 	// and IP. VMD's response is the source of truth for vcpu/memory
@@ -1296,6 +1694,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// max(activate, network) instead of activate + network.
 	hasNetworkRules := req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0)
 
+	// Capture before goroutine — gin.Context is recycled after ServeHTTP
+	// returns. The CTE inside ActivateSandbox uses this to open the
+	// matching sandbox_active_interval row in the same statement.
+	actorID := actorIDFromContext(c)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -1306,6 +1708,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			MemoryMib: int32(actualMemMiB),
 			IpAddress: ipAddr,
 			TeamID:    teamID,
+			ActorID:   actorUUID(actorID),
 		}); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
 		}
@@ -1315,31 +1718,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var allowedCIDRs, allowedDomains []string
-			for _, entry := range req.Network.AllowOut {
-				if isIPOrCIDR(entry) {
-					allowedCIDRs = append(allowedCIDRs, entry)
-				} else {
-					allowedDomains = append(allowedDomains, entry)
-				}
-			}
-
+			// network_config was persisted above (before env injection); this
+			// only pushes the nftables rules, which need the booted VM.
+			allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
 			if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
-				return
 			}
-			networkConfig, _ := json.Marshal(map[string]any{
-				"egress": map[string]any{
-					"allowed_cidrs":   allowedCIDRs,
-					"denied_cidrs":    req.Network.DenyOut,
-					"allowed_domains": allowedDomains,
-				},
-			})
-			_ = h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
-				ID:            sandbox.ID,
-				NetworkConfig: networkConfig,
-				TeamID:        teamID,
-			})
 		}()
 	}
 	wg.Wait()
@@ -1352,7 +1736,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			"template_id":   fromTemplateID,
 		})
 	}
-	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
+	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
+	h.capture(c, "sandbox_created", map[string]any{
+		"sandbox_id":  sandbox.ID.String(),
+		"template_id": fromTemplateID,
+	})
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
@@ -1419,6 +1808,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
+	// BeginPause's CTE atomically closed the open active interval together
+	// with the status transition; nothing to do here. If the pause
+	// subsequently fails, the revert paths reopen a new interval.
+
 	// Resolve the VMD client for this sandbox's host.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
@@ -1447,6 +1840,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		// the revert survives client disconnect, but keep trace context
 		// so the revert is linked to the original pause request.
 		revertCtx := context.WithoutCancel(c.Request.Context())
+		actorID := actorIDFromContext(c)
 		go func() {
 			ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
 			defer cancel()
@@ -1456,6 +1850,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 				TeamID: teamID,
 			}); revertErr != nil {
 				log.Error().Err(revertErr).Str("sandbox_id", sandboxID.String()).Msg("async revert to active failed")
+				return
+			}
+			// Reopen the interval we closed at BeginPause — sandbox is
+			// back to 'active' and should resume being counted as such.
+			if openErr := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+				SandboxID: sandboxID,
+				TeamID:    teamID,
+				ActorID:   actorUUID(actorID),
+			}); openErr != nil {
+				log.Error().Err(openErr).Str("sandbox_id", sandboxID.String()).Msg("async reopen interval after revert failed")
 			}
 		}()
 		respondError(c, ErrInternal)
@@ -1503,8 +1907,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Async observability.
+	// Interval was already closed at BeginPause; FinalizePause is the
+	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
+	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
 
 	c.Status(http.StatusNoContent)
 }
@@ -1637,6 +2043,19 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		}
 
 		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "network", "updated", "success", &sandbox.Name, nil, networkConfig)
+		h.capture(c, "sandbox_network_updated", map[string]any{"sandbox_id": sandboxID.String()})
+
+		// Push the egress-rules invalidation so the secrets proxy re-fetches the
+		// new rules immediately; the daemon's cache TTL is the fallback if this
+		// best-effort push fails. Detached context — the gin.Context is recycled
+		// once the handler returns.
+		go func() {
+			ictx, icancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer icancel()
+			if err := vmd.InvalidateSandboxRules(ictx, sandboxID.String()); err != nil {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("PATCH: invalidate sandbox rules failed (TTL fallback)")
+			}
+		}()
 	}
 
 	if body.Metadata != nil {

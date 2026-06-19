@@ -17,15 +17,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
-
-// ---------------------------------------------------------------------------
-// Mock VMDClient
-// ---------------------------------------------------------------------------
 
 type stubVMD struct {
 	destroyFn        func(ctx context.Context, id string, force bool) error
@@ -34,6 +32,7 @@ type stubVMD struct {
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 }
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
@@ -48,14 +47,14 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (st
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, envVars map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
 		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -79,6 +78,15 @@ func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, 
 	}
 	return nil
 }
+func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error       { return nil }
+func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error          { return nil }
+func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) InjectSandboxEnv(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error {
+	if s.injectEnvFn != nil {
+		return s.injectEnvFn(ctx, id, envVars, secretsJWT)
+	}
+	return nil
+}
 
 // Template build methods — no-op stubs. Handler tests don't exercise
 // the build pipeline; supervisor integration tests are the right place
@@ -95,10 +103,6 @@ func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Mock DBTX — drives db.Queries without a real database
-// ---------------------------------------------------------------------------
-
 type mockRow struct {
 	scanFn func(dest ...any) error
 }
@@ -108,6 +112,8 @@ func (r *mockRow) Scan(dest ...any) error { return r.scanFn(dest...) }
 type mockDBTX struct {
 	queryRowFn func(ctx context.Context, sql string, args ...any) pgx.Row
 	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	// queryFn is optional; nil falls back to an empty rows iterator.
+	queryFn func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
@@ -118,13 +124,25 @@ func (m *mockDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	return m.execFn(ctx, sql, args...)
 }
 
-func (m *mockDBTX) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, fmt.Errorf("Query not expected")
+func (m *mockDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if m.queryFn != nil {
+		return m.queryFn(ctx, sql, args...)
+	}
+	return emptyRows{}, nil
 }
 
-// ---------------------------------------------------------------------------
-// Row helpers
-// ---------------------------------------------------------------------------
+// emptyRows is a no-row pgx.Rows implementation.
+type emptyRows struct{}
+
+func (emptyRows) Close()                                       {}
+func (emptyRows) Err() error                                   { return nil }
+func (emptyRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (emptyRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (emptyRows) Next() bool                                   { return false }
+func (emptyRows) Scan(...any) error                            { return fmt.Errorf("emptyRows.Scan") }
+func (emptyRows) Values() ([]any, error)                       { return nil, nil }
+func (emptyRows) RawValues() [][]byte                          { return nil }
+func (emptyRows) Conn() *pgx.Conn                              { return nil }
 
 // sandboxRow returns a mockRow that populates a Sandbox from GetSandbox's Scan
 // call (16 destination pointers matching the column order in sqlc-generated
@@ -204,6 +222,15 @@ func errorRow(err error) *mockRow {
 	return &mockRow{scanFn: func(...any) error { return err }}
 }
 
+// uuidRow returns a mockRow for a query that RETURNs a single uuid (e.g.
+// FinalizePause's snapshot_id).
+func uuidRow(id uuid.UUID) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = id
+		return nil
+	}}
+}
+
 // activityRow returns a mockRow for CreateActivity's Scan (14 fields).
 func activityRow() *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
@@ -224,10 +251,6 @@ func activityRow() *mockRow {
 		return nil
 	}}
 }
-
-// ---------------------------------------------------------------------------
-// Router / request helpers
-// ---------------------------------------------------------------------------
 
 func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
@@ -250,10 +273,6 @@ func deleteRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodDelete, "/sandboxes/"+sandboxID, nil)
 }
 
-func sandboxExecReq(sandboxID, body string) *http.Request {
-	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/exec", strings.NewReader(body))
-}
-
 func parseJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	var body map[string]any
@@ -268,10 +287,6 @@ func errorCode(body map[string]any) string {
 	code, _ := errObj["code"].(string)
 	return code
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 func TestDeleteSandbox_Success(t *testing.T) {
 	sandboxID := uuid.New()
@@ -462,10 +477,6 @@ func TestDeleteSandbox_ActivityLogFailure_StillReturns204(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// ResumeSandbox tests
-// ---------------------------------------------------------------------------
-
 // snapshotRow returns a mockRow that populates a Snapshot from GetSnapshot's
 // Scan call (9 destination pointers matching the column order).
 func snapshotRow(s db.Snapshot) *mockRow {
@@ -585,6 +596,63 @@ func TestResumeSandbox_Success(t *testing.T) {
 	}
 	if body["id"] != sandboxID.String() {
 		t.Errorf("id = %q, want %q", body["id"], sandboxID)
+	}
+}
+
+func TestResumeSandbox_ReappliesSecretBindings(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	secretID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	var injectedJWT string
+	var injectCalled bool
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string) (string, error) { return "10.0.0.5", nil },
+		injectEnvFn: func(_ context.Context, _ string, _ map[string]string, jwt string) error {
+			injectCalled, injectedJWT = true, jwt
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "ListSandboxSecretBindingMeta") {
+				return &scanRows{rows: []func(...any) error{bindingMetaRow(secretID, "ANTHROPIC_API_KEY", "bearer", "ssrv_proxy_x")}}, nil
+			}
+			return &scanRows{}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if !injectCalled {
+		t.Fatal("resume must re-apply the binding set when the sandbox has bindings")
+	}
+	if injectedJWT == "" {
+		t.Error("re-applied JWT should be signed for a non-empty binding set")
 	}
 }
 
@@ -730,7 +798,9 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 
 // Network-reapply failure after VMD resume must destroy the VM, revert DB to
 // paused, and never flip status to active.
-func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
+// A resume that gets the VM up but then fails to reapply egress rules must
+// re-pause the VM (preserving the overlay), never destroy it.
+func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -741,7 +811,7 @@ func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
-	var destroyCalled, updateNetworkCalled int32
+	var destroyCalled, pauseCalled, updateNetworkCalled, finalizeCalled, activateCalled int32
 	vmd := &stubVMD{
 		resumeFn: func(context.Context, string, string, string) (string, error) {
 			return "10.0.0.5", nil
@@ -750,31 +820,34 @@ func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
 			atomic.AddInt32(&destroyCalled, 1)
 			return nil
 		},
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			atomic.AddInt32(&pauseCalled, 1)
+			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+		},
 		updateNetworkFn: func(context.Context, string, []string, []string, []string) error {
 			atomic.AddInt32(&updateNetworkCalled, 1)
 			return fmt.Errorf("nftables push failed")
 		},
 	}
 
-	var activateCalled, revertCalled int32
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "FROM sandbox"):
-				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
+				atomic.AddInt32(&finalizeCalled, 1)
+				return uuidRow(snapshotID)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
 			}
 			return activityRow()
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 			if strings.Contains(sql, "'active'") {
 				atomic.AddInt32(&activateCalled, 1)
-			}
-			if strings.Contains(sql, "SET status = 'paused'") {
-				atomic.AddInt32(&revertCalled, 1)
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
@@ -790,19 +863,24 @@ func TestResumeSandbox_NetworkReapplyFailure_DestroysAndReverts(t *testing.T) {
 	if got := atomic.LoadInt32(&updateNetworkCalled); got != 1 {
 		t.Errorf("reapplyNetworkConfig calls = %d, want 1", got)
 	}
-	if got := atomic.LoadInt32(&destroyCalled); got != 1 {
-		t.Errorf("DestroyInstance calls = %d, want 1 (on failure)", got)
+	// Must never destroy a resumed VM — that deletes the overlay.
+	if got := atomic.LoadInt32(&destroyCalled); got != 0 {
+		t.Errorf("DestroyInstance calls = %d, want 0 (must not destroy a resumed VM)", got)
+	}
+	if got := atomic.LoadInt32(&pauseCalled); got != 1 {
+		t.Errorf("PauseInstance calls = %d, want 1 (re-pause preserves overlay)", got)
+	}
+	if got := atomic.LoadInt32(&finalizeCalled); got != 1 {
+		t.Errorf("FinalizePause calls = %d, want 1 (revert to paused)", got)
 	}
 	if got := atomic.LoadInt32(&activateCalled); got != 0 {
 		t.Errorf("ActivateSandbox calls = %d, want 0 (network failed before commit)", got)
 	}
-	if got := atomic.LoadInt32(&revertCalled); got != 1 {
-		t.Errorf("RevertResumeToPaused calls = %d, want 1", got)
-	}
 }
 
-// DB activate failure after network reapply must also destroy the VM + revert.
-func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
+// A DB activate failure after the VM is up must re-pause (preserve the
+// overlay), never destroy — the path that previously bricked a sandbox.
+func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -812,7 +890,7 @@ func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
-	var destroyCalled int32
+	var destroyCalled, pauseCalled, finalizeCalled int32
 	vmd := &stubVMD{
 		resumeFn: func(context.Context, string, string, string) (string, error) {
 			return "10.0.0.5", nil
@@ -821,27 +899,30 @@ func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
 			atomic.AddInt32(&destroyCalled, 1)
 			return nil
 		},
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			atomic.AddInt32(&pauseCalled, 1)
+			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+		},
 	}
 
-	var revertCalled int32
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "FROM sandbox"):
-				return sandboxRow(sb)
+			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
+				atomic.AddInt32(&finalizeCalled, 1)
+				return uuidRow(snapshotID)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
 			}
 			return activityRow()
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 			if strings.Contains(sql, "'active'") {
 				return pgconn.CommandTag{}, fmt.Errorf("db connection lost")
-			}
-			if strings.Contains(sql, "SET status = 'paused'") {
-				atomic.AddInt32(&revertCalled, 1)
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
@@ -854,20 +935,16 @@ func TestResumeSandbox_ActivateFailure_DestroysAndReverts(t *testing.T) {
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
 	}
-	if got := atomic.LoadInt32(&destroyCalled); got != 1 {
-		t.Errorf("DestroyInstance calls = %d, want 1", got)
+	if got := atomic.LoadInt32(&destroyCalled); got != 0 {
+		t.Errorf("DestroyInstance calls = %d, want 0 (must not destroy a resumed VM)", got)
 	}
-	if got := atomic.LoadInt32(&revertCalled); got != 1 {
-		t.Errorf("RevertResumeToPaused calls = %d, want 1", got)
+	if got := atomic.LoadInt32(&pauseCalled); got != 1 {
+		t.Errorf("PauseInstance calls = %d, want 1 (re-pause preserves overlay)", got)
+	}
+	if got := atomic.LoadInt32(&finalizeCalled); got != 1 {
+		t.Errorf("FinalizePause calls = %d, want 1 (revert to paused)", got)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// ActivateSandbox tests — idempotent "make this sandbox usable" endpoint.
-// Reuses loadActiveOrResumeSandbox under the hood; the tests focus on the
-// edge case ResumeSandbox doesn't cover (already-active sandbox returns 200
-// with a token, no VMD call).
-// ---------------------------------------------------------------------------
 
 func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 	sandboxID := uuid.New()
@@ -1021,3 +1098,827 @@ func TestActivateSandbox_InvalidUUID(t *testing.T) {
 	}
 }
 
+func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	vmd := &stubVMD{
+		destroyFn: func(context.Context, string, bool) error { return nil },
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			return "10.0.0.5", nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return errorRow(fmt.Errorf("activity table locked"))
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+func createSandboxReq(body string) *http.Request {
+	return httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+}
+
+func TestCreateSandbox_Success(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	// Even though the request omits from_template, the handler defaults it
+	// to "superserve/base" and routes through RestoreSnapshot. The stub returns
+	// VMD-reported resources (1 vcpu, 1024 MiB — stubVMD's defaults).
+	vmd := &stubVMD{}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "my-sandbox",
+					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	// Creation is synchronous — sandbox is active on return.
+	body := parseJSON(t, w)
+	if body["name"] != "my-sandbox" {
+		t.Errorf("name = %q, want %q", body["name"], "my-sandbox")
+	}
+	if body["status"] != "active" {
+		t.Errorf("status = %q, want active", body["status"])
+	}
+	// Resources should reflect what VMD reported, not the initial INSERT placeholders.
+	if v := body["vcpu_count"].(float64); v == 0 {
+		t.Error("vcpu_count is 0 — VMD's reported value was not propagated to the response")
+	}
+	if v := body["memory_mib"].(float64); v == 0 {
+		t.Error("memory_mib is 0 — VMD's reported value was not propagated to the response")
+	}
+}
+
+func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	// A vmd that predates InjectSandboxEnv returns Unimplemented. With no
+	// secrets bound, the env vars were already applied during RestoreSnapshot,
+	// so creation should still succeed.
+	vmd := &stubVMD{
+		injectEnvFn: func(context.Context, string, map[string]string, string) error {
+			return status.Error(codes.Unimplemented, "unknown method InjectSandboxEnv")
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if body := parseJSON(t, w); body["status"] != "active" {
+		t.Errorf("status = %q, want active", body["status"])
+	}
+}
+
+func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	// A real injection failure (not Unimplemented) has no fallback: the VM is
+	// torn down and the request fails.
+	var destroyed bool
+	vmd := &stubVMD{
+		injectEnvFn: func(context.Context, string, map[string]string, string) error {
+			return status.Error(codes.Internal, "post-init failed")
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed = true
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+	if !destroyed {
+		t.Error("VM was not torn down after injection failure")
+	}
+}
+
+func TestCreateSandbox_InvalidBody(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, createSandboxReq(`{}`))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateSandbox_MissingTeamID(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, "").ServeHTTP(w, createSandboxReq(`{"name":"test"}`))
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestCreateSandbox_QuotaExceeded(t *testing.T) {
+	teamID := uuid.New()
+	vmd := &stubVMD{}
+
+	// SS001 is what the sandbox_quota_on_insert trigger raises on over-quota.
+	var destroyCalled bool
+	vmd.destroyFn = func(_ context.Context, _ string, _ bool) error {
+		destroyCalled = true
+		return nil
+	}
+
+	quotaErr := &pgconn.PgError{Code: "SS001", Message: "sandbox quota exceeded"}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return errorRow(quotaErr)
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			// GetTeam lookup in respondQuotaExceeded falls back to the
+			// code default when this errs.
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"x"}`))
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusTooManyRequests, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["code"] != "too_many_sandboxes" {
+		t.Errorf("error code = %v, want too_many_sandboxes", errObj["code"])
+	}
+	if !destroyCalled {
+		t.Error("orphan VM was not destroyed after quota rejection")
+	}
+}
+
+func TestCreateSandbox_VMDError(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	// With the superserve/base default, CreateSandbox routes through
+	// RestoreSnapshot. Fail it to exercise the VMD-error branch.
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			return "", fmt.Errorf("vmd unreachable")
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	// Creation is synchronous — VMD error returns 500.
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+func pauseRequest(sandboxID string) *http.Request {
+	return httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/pause", nil)
+}
+
+func TestPauseSandbox_Success(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+
+	var pauseCalled bool
+	vmd := &stubVMD{
+		pauseFn: func(_ context.Context, id, _ string) (string, string, error) {
+			pauseCalled = true
+			if id != sandboxID.String() {
+				t.Errorf("PauseInstance id = %q, want %q", id, sandboxID)
+			}
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		},
+	}
+
+	snapshotID := uuid.New()
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'pausing'"):
+				// BeginPause: atomic transition active → pausing, returns *
+				return sandboxRow(sb)
+			case strings.Contains(sql, "upserted AS"):
+				// FinalizePause: CTE upsert + update, returns snapshot_id
+				return finalizePauseRow(snapshotID)
+			case strings.Contains(sql, "INSERT INTO snapshot"):
+				// Belt-and-braces: FinalizePause contains an INSERT inside
+				// the upserted CTE; match that too in case the SQL text
+				// routing misses the CTE alias.
+				return finalizePauseRow(snapshotID)
+			case strings.Contains(sql, "FROM sandbox"):
+				// Generic GetSandbox (fallback from BeginPause)
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	// Pause now returns 204 No Content — no response body.
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if !pauseCalled {
+		t.Error("VMD.PauseInstance was not called")
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("expected empty body on 204, got: %s", w.Body.String())
+	}
+}
+
+func TestPauseSandbox_NotActive(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+
+	// BeginPause's WHERE status = 'active' clause excludes a paused
+	// sandbox → 0 rows. The handler falls back to SandboxExists to
+	// disambiguate 404 vs 409; since the row exists (just in the wrong
+	// state), we return 409 Conflict.
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'pausing'") {
+				return notFoundRow() // BeginPause: no active row matched
+			}
+			if strings.Contains(sql, "EXISTS") {
+				return boolRow(true) // fallback: row exists, but not active
+			}
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+	vmd := &stubVMD{}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+}
+
+func TestPauseSandbox_NotFound(t *testing.T) {
+	// BeginPause returns 0 rows (sandbox doesn't exist), and the
+	// SandboxExists fallback also returns false → 404.
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'pausing'") {
+				return notFoundRow()
+			}
+			if strings.Contains(sql, "EXISTS") {
+				return boolRow(false)
+			}
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+	vmd := &stubVMD{}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, pauseRequest(uuid.New().String()))
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestPauseSandbox_VMDError(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "", "", fmt.Errorf("vmd unreachable")
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestPauseSandbox_MissingTeamID(t *testing.T) {
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
+		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, "").ServeHTTP(w, pauseRequest(uuid.New().String()))
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestParseSandboxID_Valid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "sandbox_id", Value: uuid.New().String()}}
+	if _, err := parseSandboxID(c); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestParseSandboxID_Invalid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "sandbox_id", Value: "bad"}}
+	if _, err := parseSandboxID(c); err == nil {
+		t.Fatal("expected error for invalid UUID")
+	}
+}
+
+func TestTeamIDFromContext_Valid(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	teamID := uuid.New().String()
+	c.Set("team_id", teamID)
+	got, err := teamIDFromContext(c)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if got.String() != teamID {
+		t.Errorf("expected %s, got %s", teamID, got.String())
+	}
+}
+
+func TestTeamIDFromContext_Missing(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	if _, err := teamIDFromContext(c); err == nil {
+		t.Fatal("expected error for missing team_id")
+	}
+}
+
+func TestTeamIDFromContext_InvalidUUID(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("team_id", "not-a-uuid")
+	if _, err := teamIDFromContext(c); err == nil {
+		t.Fatal("expected error for invalid team_id UUID")
+	}
+}
+
+func TestValidateMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		md      map[string]string
+		wantErr bool
+		errSub  string // substring expected in the error message
+	}{
+		{name: "nil ok", md: nil},
+		{name: "empty ok", md: map[string]string{}},
+		{name: "happy path", md: map[string]string{"env": "prod", "owner": "agent-7"}},
+		{
+			name:    "too many keys",
+			md:      makeMetadata(metadataMaxKeys+1, "k", "v"),
+			wantErr: true,
+			errSub:  "max is 64",
+		},
+		{
+			name:    "key too long",
+			md:      map[string]string{strings.Repeat("k", metadataMaxKeyLen+1): "v"},
+			wantErr: true,
+			errSub:  "max is 256",
+		},
+		{
+			name:    "value too long",
+			md:      map[string]string{"k": strings.Repeat("v", metadataMaxValueLen+1)},
+			wantErr: true,
+			errSub:  "max is 2048",
+		},
+		{
+			name:    "empty key",
+			md:      map[string]string{"": "v"},
+			wantErr: true,
+			errSub:  "cannot be empty",
+		},
+		{
+			name:    "reserved prefix lower",
+			md:      map[string]string{"superserve.tier": "gold"},
+			wantErr: true,
+			errSub:  "reserved prefix",
+		},
+		{
+			name:    "reserved prefix upper",
+			md:      map[string]string{"SUPERSERVE.tier": "gold"},
+			wantErr: true,
+			errSub:  "reserved prefix",
+		},
+		{
+			name:    "reserved underscore",
+			md:      map[string]string{"_superserve_internal": "x"},
+			wantErr: true,
+			errSub:  "reserved prefix",
+		},
+		{
+			name:    "total bytes exceeded",
+			md:      map[string]string{"a": strings.Repeat("v", metadataMaxValueLen), "b": strings.Repeat("v", metadataMaxValueLen), "c": strings.Repeat("v", metadataMaxValueLen), "d": strings.Repeat("v", metadataMaxValueLen), "e": strings.Repeat("v", metadataMaxValueLen), "f": strings.Repeat("v", metadataMaxValueLen), "g": strings.Repeat("v", metadataMaxValueLen), "h": strings.Repeat("v", metadataMaxValueLen), "i": strings.Repeat("v", metadataMaxValueLen)},
+			wantErr: true,
+			errSub:  "16384 bytes total",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMetadata(tc.md)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.errSub)
+				}
+				if tc.errSub != "" && !strings.Contains(err.Error(), tc.errSub) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tc.errSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// makeMetadata builds a metadata map with n entries — used to exercise the
+// max-keys check without typing out 65 literals.
+func makeMetadata(n int, keyPrefix, val string) map[string]string {
+	out := make(map[string]string, n)
+	for i := 0; i < n; i++ {
+		out[fmt.Sprintf("%s%d", keyPrefix, i)] = val
+	}
+	return out
+}
+
+func TestParseMetadataFilter(t *testing.T) {
+	t.Run("no filters", func(t *testing.T) {
+		got, err := parseMetadataFilter(map[string][]string{"page": {"1"}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("expected empty filter, got %v", got)
+		}
+	})
+
+	t.Run("multiple filters", func(t *testing.T) {
+		got, err := parseMetadataFilter(map[string][]string{
+			"metadata.env":   {"prod"},
+			"metadata.owner": {"agent-7"},
+			"page":           {"1"},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got["env"] != "prod" || got["owner"] != "agent-7" {
+			t.Fatalf("got %v, want env=prod owner=agent-7", got)
+		}
+	})
+
+	t.Run("empty key after prefix rejected", func(t *testing.T) {
+		_, err := parseMetadataFilter(map[string][]string{"metadata.": {"x"}})
+		if err == nil {
+			t.Fatal("expected error for empty filter key")
+		}
+	})
+
+	t.Run("repeated value rejected", func(t *testing.T) {
+		_, err := parseMetadataFilter(map[string][]string{"metadata.k": {"a", "b"}})
+		if err == nil {
+			t.Fatal("expected error for repeated filter value")
+		}
+	})
+
+	t.Run("filter values inherit metadata limits", func(t *testing.T) {
+		_, err := parseMetadataFilter(map[string][]string{
+			"metadata.k": {strings.Repeat("v", metadataMaxValueLen+1)},
+		})
+		if err == nil {
+			t.Fatal("expected error for oversized filter value")
+		}
+	})
+}
+
+func TestCreateSandbox_WithMetadata(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	var capturedMetadata []byte
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				// Positional args (0-indexed): id, team_id, name, status,
+				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[11].([]byte); ok {
+					capturedMetadata = b
+				}
+				// Echo metadata back through the row so the response carries it.
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "tagged",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 512,
+					CreatedAt: time.Now(),
+					Metadata:  capturedMetadata,
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	body := `{"name":"tagged","metadata":{"env":"prod","owner":"agent-7"}}`
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(body))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if string(capturedMetadata) == "" {
+		t.Fatal("metadata was not passed to CreateSandbox params")
+	}
+	// Verify the captured jsonb decodes back to our map.
+	var roundTrip map[string]string
+	if err := json.Unmarshal(capturedMetadata, &roundTrip); err != nil {
+		t.Fatalf("decode captured metadata: %v", err)
+	}
+	if roundTrip["env"] != "prod" || roundTrip["owner"] != "agent-7" {
+		t.Fatalf("round-trip metadata = %v, want env=prod owner=agent-7", roundTrip)
+	}
+
+	// Response should echo metadata.
+	resp := parseJSON(t, w)
+	mdResp, _ := resp["metadata"].(map[string]any)
+	if mdResp["env"] != "prod" || mdResp["owner"] != "agent-7" {
+		t.Fatalf("response metadata = %v, want env=prod owner=agent-7", mdResp)
+	}
+}
+
+func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	var capturedMetadata []byte
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				// Positional args (0-indexed): id, team_id, name, status,
+				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[11].([]byte); ok {
+					capturedMetadata = b
+				}
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "no-md",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 512,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"no-md"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if string(capturedMetadata) != "{}" {
+		t.Fatalf("metadata sent to DB = %q, want %q", string(capturedMetadata), "{}")
+	}
+
+	// Response should serialize metadata as `{}`, not `null`.
+	if !strings.Contains(w.Body.String(), `"metadata":{}`) {
+		t.Fatalf("response body should contain \"metadata\":{}, got %s", w.Body.String())
+	}
+}
+
+func TestCreateSandbox_MetadataValidationRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "reserved prefix", body: `{"name":"x","metadata":{"superserve.tier":"gold"}}`},
+		{name: "key too long", body: fmt.Sprintf(`{"name":"x","metadata":{%q:"v"}}`, strings.Repeat("k", metadataMaxKeyLen+1))},
+		{name: "value too long", body: fmt.Sprintf(`{"name":"x","metadata":{"k":%q}}`, strings.Repeat("v", metadataMaxValueLen+1))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vmd := &stubVMD{}
+			mock := &mockDBTX{
+				queryRowFn: func(context.Context, string, ...any) pgx.Row {
+					t.Fatal("DB should not be called when validation fails")
+					return notFoundRow()
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					t.Fatal("DB should not be called when validation fails")
+					return pgconn.NewCommandTag(""), nil
+				},
+			}
+			h := &Handlers{VMD: vmd, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, uuid.New().String()).ServeHTTP(w, createSandboxReq(tc.body))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestFailSandboxAfterBootDestroysOnSandboxHost(t *testing.T) {
+	var defaultDestroyed, hostDestroyed string
+	defaultVMD := &stubVMD{destroyFn: func(_ context.Context, id string, _ bool) error {
+		defaultDestroyed = id
+		return nil
+	}}
+	hostVMD := &stubVMD{destroyFn: func(_ context.Context, id string, _ bool) error {
+		hostDestroyed = id
+		return nil
+	}}
+	mock := &mockDBTX{
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag(""), nil
+		},
+	}
+	h := &Handlers{VMD: defaultVMD, DB: db.New(mock)}
+
+	h.failSandboxAfterBoot(context.Background(), hostVMD, uuid.New(), uuid.New(), "instance-xyz")
+
+	if hostDestroyed != "instance-xyz" {
+		t.Errorf("destroy routed to host client = %q, want instance-xyz", hostDestroyed)
+	}
+	if defaultDestroyed != "" {
+		t.Errorf("default client must not destroy; got %q", defaultDestroyed)
+	}
+}

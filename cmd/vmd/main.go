@@ -14,12 +14,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
+	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -51,6 +54,18 @@ type Config struct {
 	// the heartbeat goroutine to POST liveness. Optional — if unset,
 	// heartbeat is disabled.
 	ControlPlaneURL string
+
+	// SecretsProxySocket is the local secretsproxy daemon's control-RPC unix-socket path.
+	// When empty, broker registration is skipped.
+	SecretsProxySocket string
+
+	// SecretsProxySandboxAddr is the host:port the sandbox writes into HTTPS_PROXY
+	// to reach the local secretsproxy daemon. When empty, no proxy env var is injected.
+	SecretsProxySandboxAddr string
+
+	// Parsed form of SecretsProxySandboxAddr; wires the host firewall REDIRECT.
+	SecretsProxySandboxDst  string
+	SecretsProxySandboxPort uint16
 }
 
 func loadConfig() (Config, error) {
@@ -60,19 +75,21 @@ func loadConfig() (Config, error) {
 	}
 
 	cfg := Config{
-		FirecrackerBin: envOrDefault("FIRECRACKER_BIN", "/usr/local/bin/firecracker"),
-		JailerBin:      envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
-		KernelPath:     requireEnv("KERNEL_PATH"),
-		BaseRootfsPath: requireEnv("BASE_ROOTFS_PATH"),
-		SnapshotDir:    envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
-		RunDir:         envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
-		GRPCPort:       port,
-		HostInterface:      envOrDefault("HOST_INTERFACE", "eth0"),
-		TemplateBuilderBin: envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
-		BoxdBinaryPath:     envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
-		HostID:          envOrDefault("HOST_ID", "default"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		ControlPlaneURL: os.Getenv("CONTROL_PLANE_URL"),
+		FirecrackerBin:          envOrDefault("FIRECRACKER_BIN", "/usr/local/bin/firecracker"),
+		JailerBin:               envOrDefault("JAILER_BIN", "/usr/bin/jailer"),
+		KernelPath:              requireEnv("KERNEL_PATH"),
+		BaseRootfsPath:          requireEnv("BASE_ROOTFS_PATH"),
+		SnapshotDir:             envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
+		RunDir:                  envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
+		GRPCPort:                port,
+		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
+		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
+		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
+		HostID:                  envOrDefault("HOST_ID", "default"),
+		DatabaseURL:             os.Getenv("DATABASE_URL"),
+		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
+		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
+		SecretsProxySandboxAddr: os.Getenv("SECRETSPROXY_SANDBOX_ADDR"),
 	}
 
 	if cfg.KernelPath == "" {
@@ -82,7 +99,33 @@ func loadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("BASE_ROOTFS_PATH environment variable is required")
 	}
 
+	if cfg.SecretsProxySandboxAddr != "" {
+		host, port, err := parseSecretsProxyAddr(cfg.SecretsProxySandboxAddr)
+		if err != nil {
+			return Config{}, fmt.Errorf("SECRETSPROXY_SANDBOX_ADDR %q: %w", cfg.SecretsProxySandboxAddr, err)
+		}
+		cfg.SecretsProxySandboxDst = host
+		cfg.SecretsProxySandboxPort = port
+	}
+
 	return cfg, nil
+}
+
+// parseSecretsProxyAddr parses host:port; host must be an IPv4 literal because
+// the nat REDIRECT rule it feeds can't resolve DNS.
+func parseSecretsProxyAddr(addr string) (string, uint16, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, err
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		return "", 0, fmt.Errorf("host %q must be an IPv4 literal", host)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || port == 0 {
+		return "", 0, fmt.Errorf("port %q must be 1-65535", portStr)
+	}
+	return host, uint16(port), nil
 }
 
 func envOrDefault(key, fallback string) string {
@@ -203,10 +246,19 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 func main() {
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log := zerolog.New(os.Stdout).With().
+	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
+	log := zerolog.New(multi).With().
 		Timestamp().
 		Str("service", "vmd").
 		Logger()
+
+	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
+		if err := sentry.Init(sentry.ClientOptions{Dsn: dsn, EnableLogs: true}); err != nil {
+			log.Warn().Err(err).Msg("sentry.Init failed")
+		} else {
+			defer sentry.Flush(2 * time.Second)
+		}
+	}
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -239,8 +291,51 @@ func main() {
 
 	lc := newLifecycle(log)
 
+	// ---- Egress blocklist (optional) ----
+	// VMD_EGRESS_BLOCKLIST_CONFIG points at the operator-supplied config
+	// (feeds, pinned domains/CIDRs, blocked ports). Unset = no global
+	// blocklist.
+	var blockList *blocklist.Blocklist
+	// vmd is the daemon, so it owns and reconciles the shared egress port
+	// chain even when no ports are configured (so disabling the feature
+	// clears stale drops). template-builder must not pass this.
+	netMgrOpts := []network.ManagerOption{network.WithEgressPortChainOwner()}
+	if path := os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG"); path != "" {
+		blCfg, err := blocklist.LoadConfig(path)
+		if err != nil {
+			log.Fatal().Err(err).Str("path", path).Msg("failed to load egress blocklist config")
+		}
+		blockList = blocklist.New(blCfg, log)
+		netMgrOpts = append(netMgrOpts, network.WithBlockedEgressPorts(blCfg.BlockedEgressPorts))
+		log.Info().Str("path", path).Int("feeds", len(blCfg.DomainFeeds)).Int("blocked_ports", len(blCfg.BlockedEgressPorts)).Msg("egress blocklist configured")
+	} else {
+		// Feature disabled — drop any host egress-block table a previous run
+		// installed so its CIDR drops stop affecting sandbox egress. The
+		// per-VM port-drop chain self-heals: installHostFirewall always runs
+		// and ClearChain empties it when no ports are configured.
+		if err := network.RemoveHostEgressBlock(); err != nil {
+			log.Debug().Err(err).Msg("removing stale host egress block table")
+		}
+	}
+
+	// ---- Guest DNS redirect (optional) ----
+	// VMD_DNS_REDIRECT_PORT routes all sandbox DNS (TCP+UDP/53) to a
+	// resolver the operator runs on that host port, regardless of the
+	// nameservers configured inside the guest. Unset = guest DNS goes
+	// out unmodified.
+	if v := os.Getenv("VMD_DNS_REDIRECT_PORT"); v != "" {
+		port, err := strconv.ParseUint(v, 10, 16)
+		if err != nil || port == 0 {
+			log.Fatal().Str("value", v).Msg("VMD_DNS_REDIRECT_PORT must be a port number (1-65535)")
+		}
+		netMgrOpts = append(netMgrOpts, network.WithDNSRedirectPort(uint16(port)))
+		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
+	}
+
 	// ---- Network manager + host firewall ----
-	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log)
+	netMgrOpts = append(netMgrOpts,
+		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
+	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
 	}
@@ -284,6 +379,23 @@ func main() {
 	)
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
+	if blockList != nil {
+		egressProxy.SetBlocklist(blockList)
+		// Mirror IP/CIDR entries into a host-level nftables drop set so they
+		// are enforced on every port, not just the proxied web ports.
+		hostBlock, err := network.NewHostEgressBlock(log)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to install host egress block table")
+		}
+		blockList.SetCIDRSink(hostBlock.UpdateCIDRs)
+		// Seed the host drop set from the state-seeded snapshot now, before
+		// the first feed fetch (which may block up to feedFetchTimeout per
+		// feed). Otherwise seeded CIDRs go unenforced on non-proxied ports
+		// during the startup window.
+		hostBlock.UpdateCIDRs(blockList.CIDRs())
+		lc.addCloser("host egress block", func(_ context.Context) error { return hostBlock.Close() })
+		lc.start("egress blocklist", func() error { return blockList.Start(ctx) })
+	}
 	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
 
 	// ---- BoltDB state store ----
@@ -334,6 +446,15 @@ func main() {
 			return nil
 		})
 		log.Info().Msg("reconciler DB connection ready")
+
+		// Per-connection egress logging. Drops on a full buffer rather than
+		// back-pressuring the proxy's data path.
+		flowSink := network.NewSQLFlowSink(reconcilerDB, network.SQLFlowSinkOptions{})
+		egressProxy.SetFlowSink(flowSink)
+		lc.addCloser("net_flow sink", func(closeCtx context.Context) error {
+			return flowSink.Shutdown(closeCtx)
+		})
+		log.Info().Msg("egress flow logging enabled")
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
 	}
@@ -390,7 +511,15 @@ func main() {
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(64 << 20), // 64 MiB
 	)
-	vmdpb.RegisterVMDaemonServer(grpcServer, vm.NewGRPCAdapter(mgr))
+	adapter := vm.NewGRPCAdapter(mgr).
+		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
+	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
+	if cfg.SecretsProxySocket != "" {
+		log.Info().
+			Str("socket", cfg.SecretsProxySocket).
+			Str("sandbox_addr", cfg.SecretsProxySandboxAddr).
+			Msg("secretsproxy daemon integration enabled")
+	}
 	lc.start("grpc server", func() error {
 		log.Info().Int("port", cfg.GRPCPort).Msg("gRPC server listening")
 		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {

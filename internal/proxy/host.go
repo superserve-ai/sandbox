@@ -3,6 +3,7 @@ package proxy
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -11,6 +12,40 @@ import (
 // validInstanceID restricts instance IDs to alphanumeric + hyphen, max 64 chars.
 // Prevents path traversal (%2f, ..) from reaching the VMD resolver URL.
 var validInstanceID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$`)
+
+const headerSandboxID = "X-Superserve-Sandbox-Id"
+
+// ParseRequest resolves the target sandbox + port from an incoming request.
+// Two routing modes:
+//
+//   - Shared-host: Host equals the configured domain and the
+//     X-Superserve-Sandbox-Id header carries the ID. Always boxdPort.
+//
+//   - Subdomain: Host is "{label}-{id}.{domain}", same as ParseHost.
+//
+// A subdomain-form Host is never overridden by a routing header.
+func ParseRequest(host string, headers http.Header, domain string) (port int, instanceID string, err error) {
+	if isSharedHost(host, domain) {
+		id := headers.Get(headerSandboxID)
+		if id == "" {
+			return 0, "", fmt.Errorf("proxy: shared host %q requires %s header", host, headerSandboxID)
+		}
+		if !validInstanceID.MatchString(id) {
+			return 0, "", fmt.Errorf("proxy: invalid sandbox ID in %s header", headerSandboxID)
+		}
+		return boxdPort, id, nil
+	}
+	return ParseHost(host, domain)
+}
+
+// isSharedHost reports whether host (with any :port stripped) equals the configured domain.
+func isSharedHost(host, domain string) bool {
+	hostname, _, err := net.SplitHostPort(host)
+	if err != nil {
+		hostname = host
+	}
+	return hostname == domain
+}
 
 // boxdHostLabel is the reserved left-most label that addresses boxd's
 // own HTTP endpoint on the edge proxy. We deliberately do NOT let

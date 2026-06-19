@@ -33,6 +33,9 @@ message StartRequest {
   // User to run the command as. Empty falls back to boxd's default user
   // (set by the template or root).
   string user = 7;
+  // If true, attach a stdin pipe (interactive, for SendInput). False leaves
+  // stdin at /dev/null/EOF so non-interactive tools (apt/debconf) don't hang.
+  bool stdin = 8;
 }
 
 message PtyConfig {
@@ -77,6 +80,9 @@ message KeepAlive {}
 message SendInputRequest {
   uint32 pid = 1;
   bytes data = 2;
+  // When true, close the process's stdin after writing data, signalling EOF.
+  // Applies to non-PTY processes; ignored in PTY mode.
+  bool eof = 3;
 }
 
 message SendInputResponse {}

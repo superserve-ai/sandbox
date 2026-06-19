@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // ErrSandboxGone is returned when a handler detects that the underlying VM
@@ -70,6 +71,15 @@ func isVMDInvalidArgument(err error) bool {
 	return status.Code(err) == codes.InvalidArgument
 }
 
+// isVMDUnimplemented reports whether vmd lacks the called RPC (gRPC
+// Unimplemented) — e.g. a host that predates InjectSandboxEnv.
+func isVMDUnimplemented(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Unimplemented
+}
+
 // vmdErrorMessage returns the gRPC message from a vmd error, stripping
 // gRPC/transport framing so the string is safe to surface to API callers.
 func vmdErrorMessage(err error) string {
@@ -79,21 +89,47 @@ func vmdErrorMessage(err error) string {
 	return err.Error()
 }
 
-// markSandboxFailedAsync writes status=failed in a detached goroutine.
-// Used when a handler discovers (via VMD NotFound) that the VM is gone.
-// Detaches cancellation so the state transition survives client disconnect,
-// but keeps the request's trace context so the write appears in the same span.
+// markSandboxFailedAsync writes status=failed in a detached goroutine. The
+// underlying MarkSandboxFailedInTeam query is a CTE that also closes any
+// open sandbox_active_interval row atomically, so a crash/timeout between
+// the two writes is unreachable. Detaches cancellation so the state
+// transition survives client disconnect, but keeps the request's trace
+// context so the write appears in the same span.
 func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
 	asyncCtx := context.WithoutCancel(reqCtx)
 	go func() {
+		defer sentrylog.Recover("mark-failed-async")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
-		if err := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+		if err := h.DB.MarkSandboxFailedInTeam(ctx, db.MarkSandboxFailedInTeamParams{
 			ID:     sandboxID,
-			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
 		}); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async mark-failed write failed")
 		}
 	}()
+}
+
+// failSandboxAfterBoot destroys a running VM and marks the sandbox row as failed.
+// Used by CreateSandbox when a post-restore step (env injection, JWT mint) fails:
+// the VM is already running but unusable. vmd must be the client for the host the
+// VM booted on — destroying through the default client would leave the VM running
+// on a non-default host.
+func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sandboxID, teamID uuid.UUID, instanceID string) {
+	if err := vmd.DestroyInstance(ctx, instanceID, true); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy after failed boot")
+	}
+	if err := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+		ID:     sandboxID,
+		Status: db.SandboxStatusFailed,
+		TeamID: teamID,
+	}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("mark-failed after destroy")
+	}
+	// A failed sandbox keeps status=failed with destroyed_at NULL, and the
+	// secret-binding queries filter only on destroyed_at, so clear the bindings
+	// here or a never-usable sandbox would still report as bound to its secrets.
+	if err := h.DB.DeleteSandboxSecrets(ctx, sandboxID); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("clear secret bindings after failed boot")
+	}
 }

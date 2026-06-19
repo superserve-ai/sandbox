@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 
+	sentrygin "github.com/getsentry/sentry-go/gin"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -21,6 +22,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),
 		ErrorHandler(),
+		sentrygin.New(sentrygin.Options{Repanic: true}),
 	)
 
 	api := r.Group("/")
@@ -39,6 +41,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
+		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
+		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 
 		// Template lifecycle. Builds run async via the build supervisor;
 		// the POST /templates/:id/builds endpoint just enqueues a row.
@@ -51,6 +55,18 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/templates/:template_id/builds/:build_id", h.GetTemplateBuild)
 		api.DELETE("/templates/:template_id/builds/:build_id", h.CancelTemplateBuild)
 		api.GET("/templates/:template_id/builds/:build_id/logs", h.StreamTemplateBuildLogs)
+
+		api.POST("/secrets", h.CreateSecret)
+		api.GET("/secrets", h.ListSecrets)
+		api.GET("/secrets/:name", h.GetSecret)
+		api.PATCH("/secrets/:name", h.PatchSecret)
+		api.DELETE("/secrets/:name", h.DeleteSecret)
+		api.GET("/secrets/:name/audit", h.GetSecretAudit)
+		api.GET("/secrets/:name/sandboxes", h.GetSecretSandboxes)
+
+		api.GET("/providers", h.ListProviders)
+
+		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)
 	}
 
 	r.GET("/health", h.Health)
@@ -64,6 +80,10 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	internal.Use(InternalAuth())
 	{
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
+		internal.POST("/secrets/decrypt", h.DecryptSecret)
+		internal.GET("/jwks", h.JWKS)
+		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)
+		internal.GET("/sandboxes/:sandbox_id/egress_rules", h.GetSandboxEgressRules)
 	}
 
 	return r

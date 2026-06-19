@@ -10,18 +10,30 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/proxy"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log := zerolog.New(os.Stdout).With().
+	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
+	log := zerolog.New(multi).With().
 		Timestamp().
 		Str("service", "proxy").
 		Logger()
+
+	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
+		if err := sentry.Init(sentry.ClientOptions{Dsn: dsn, EnableLogs: true}); err != nil {
+			log.Warn().Err(err).Msg("sentry.Init failed")
+		} else {
+			defer sentry.Flush(2 * time.Second)
+		}
+	}
 
 	addr := envOrDefault("PROXY_ADDR", ":5007")
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
@@ -40,6 +52,14 @@ func main() {
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domain, resolver, log)
 	proxyHandler.StartSweeper(ctx)
+
+	// Product-usage analytics for exec/files — no-op when POSTHOG_KEY is unset.
+	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log)
+	if err != nil {
+		log.Fatal().Err(err).Msg("init analytics")
+	}
+	defer analyticsClient.Close()
+	proxyHandler.WithAnalytics(analyticsClient)
 
 	// Data-plane auth — the HMAC seed is shared with the control plane.
 	// Both sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).

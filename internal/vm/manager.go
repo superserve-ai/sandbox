@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/fsnotify/fsnotify"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
@@ -94,6 +95,8 @@ type VMInstance struct {
 	MemFilePath  string
 	CreatedAt    time.Time
 	Metadata     map[string]string
+	TeamID       string // owning team; carried for data-plane usage attribution
+	OwnerID      string // creating user; empty when unknown
 
 	mu sync.RWMutex
 }
@@ -248,9 +251,9 @@ func TemplateMagicOverlayPath(runDir string) string {
 type restoreDiskAction int
 
 const (
-	restoreCreateOverlay  restoreDiskAction = iota // overlay clone of a template
-	restoreReuseOverlay                            // existing per-VM overlay (resume)
-	restoreLegacyResolve                           // legacy non-overlay path
+	restoreCreateOverlay restoreDiskAction = iota // overlay clone of a template
+	restoreReuseOverlay                           // existing per-VM overlay (resume)
+	restoreLegacyResolve                          // legacy non-overlay path
 )
 
 // restorePlan is planRestore's output — pure decision, no I/O.
@@ -314,8 +317,8 @@ func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath str
 // <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
 // without needing controlplane to pass it.
 func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
-	parent := filepath.Dir(snapshotPath)            // .../templates/<templateID>
-	templateID := filepath.Base(parent)             // <templateID>
+	parent := filepath.Dir(snapshotPath) // .../templates/<templateID>
+	templateID := filepath.Base(parent)  // <templateID>
 	if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
 		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
 	}
@@ -774,9 +777,9 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
-	resourceLimits VMConfig, netCfg *network.Config,
+	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
 ) (*VMInstance, error) {
-	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "")
+	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
 }
 
 // restoreVMSnapshot is the implementation. recordToPath is empty for normal
@@ -784,7 +787,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 // recording, in which case the in-firecracker UFFD handler writes each served
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
-	resourceLimits VMConfig, netCfg *network.Config, recordToPath string,
+	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -822,6 +825,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Config:       resourceLimits,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
+		TeamID:       teamID,
+		OwnerID:      ownerID,
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -950,6 +955,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// UFFD disabled but fresh restore — File backend with network overrides.
 		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
 	}
+	log.Info().
+		Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).
+		Bool("ok", restoreErr == nil).
+		Msg("snapshot loaded")
 	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before other
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
@@ -967,6 +976,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
+	tBoxdStart := time.Now()
 	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
@@ -976,10 +986,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
+	tBoxdReady := time.Now()
 
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
-	log.Info().Int("pid", pid).Msg("VM restored from snapshot")
+	tPersisted := time.Now()
+
+	log.Info().
+		Int("pid", pid).
+		Int64("wait_boxd_ms", tBoxdReady.Sub(tBoxdStart).Milliseconds()).
+		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
+		Msg("VM restored from snapshot")
 	return inst, nil
 }
 
@@ -1215,6 +1232,8 @@ type InstanceInfo struct {
 	VMIP      string
 	Status    VMStatus
 	CreatedAt time.Time
+	TeamID    string
+	OwnerID   string
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -1233,6 +1252,8 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		VMIP:      inst.IP,
 		Status:    inst.Status,
 		CreatedAt: inst.CreatedAt,
+		TeamID:    inst.TeamID,
+		OwnerID:   inst.OwnerID,
 	}
 	inst.mu.RUnlock()
 	return info, true
@@ -1387,7 +1408,7 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		return nil
 	}
 
-	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, outputPath)
+	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", outputPath)
 	if err != nil {
 		return fmt.Errorf("restore for recording: %w", err)
 	}
@@ -1531,16 +1552,24 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
 
-	// Start the systemd unit.
+	tStartUnit := time.Now()
 	if err := startUnit(ctx, systemdUnitName(vmID)); err != nil {
 		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
+	tStartUnitDone := time.Now()
 
-	// Wait for the Firecracker API socket.
 	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+		status := unitFailureSummary(ctx, systemdUnitName(vmID))
 		_ = stopUnit(ctx, systemdUnitName(vmID))
-		return 0, fmt.Errorf("wait for socket: %w", err)
+		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
 	}
+	tSocketReady := time.Now()
+
+	m.log.Info().
+		Str("vm_id", vmID).
+		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
+		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
+		Msg("fc startup phases")
 
 	// Read the PID asynchronously so the create path isn't slowed down
 	// by the ~15ms dbus roundtrip. The PID is populated in the instance
@@ -1579,7 +1608,53 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 	m.log.Debug().Str("vm_id", vmID).Int("pid", pid).Msg("resolved systemd MainPID")
 }
 
+// waitForSocket blocks until the given socket path appears or the timeout
+// elapses. Falls back to polling if inotify setup fails.
 func waitForSocket(path string, timeout time.Duration) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return waitForSocketPolling(path, timeout)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(filepath.Dir(path)); err != nil {
+		return waitForSocketPolling(path, timeout)
+	}
+
+	// Recheck after the watch is active: the socket could have appeared
+	// in the race window between the stat above and watcher.Add returning.
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+
+	name := filepath.Base(path)
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return waitForSocketPolling(path, timeout)
+			}
+			if (ev.Op&fsnotify.Create) != 0 && filepath.Base(ev.Name) == name {
+				return nil
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok || err != nil {
+				return waitForSocketPolling(path, timeout)
+			}
+		case <-deadline.C:
+			return fmt.Errorf("socket %s did not appear within %s", path, timeout)
+		}
+	}
+}
+
+func waitForSocketPolling(path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
@@ -1593,5 +1668,3 @@ func waitForSocket(path string, timeout time.Duration) error {
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {
 	return waitForHTTPHealth(ctx, vmIP, timeout)
 }
-
-

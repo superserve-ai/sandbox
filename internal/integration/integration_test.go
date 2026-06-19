@@ -26,14 +26,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
-
-// ---------------------------------------------------------------------------
-// Test infrastructure
-// ---------------------------------------------------------------------------
 
 var (
 	testPool         *pgxpool.Pool
@@ -166,24 +163,22 @@ func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { r
 func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
-	return "hello\n", "", 0, nil
-}
-func (s *stubVMD) ExecCommandStream(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32, onChunk func([]byte, []byte, int32, bool)) error {
-	onChunk([]byte("hello\n"), nil, 0, false)
-	onChunk(nil, nil, 0, true)
+func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
 	return nil
 }
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
-func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error { return nil }
+func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { return nil }
+func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error           { return nil }
+func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error  { return nil }
+func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error    { return nil }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
 func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {
@@ -280,7 +275,6 @@ func newRouter(t *testing.T) *gin.Engine {
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 
-
 func do(r *gin.Engine, method, path, apiKey, body string) *httptest.ResponseRecorder {
 	var bodyReader io.Reader
 	if body != "" {
@@ -315,10 +309,6 @@ func mustJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{}
 	}
 	return m
 }
-
-// ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
 
 func TestIntegration_Auth_HealthNoKeyRequired(t *testing.T) {
 	w := do(newRouter(t), "GET", "/health", "", "")
@@ -361,10 +351,6 @@ func TestIntegration_Auth_RevokedKey(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes
-// ---------------------------------------------------------------------------
-
 func TestIntegration_CreateSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
@@ -399,10 +385,6 @@ func TestIntegration_CreateSandbox_Success(t *testing.T) {
 		t.Errorf("memory_mib = %d, want 1024", sb.MemoryMib)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// GET /sandboxes and GET /sandboxes/:id
-// ---------------------------------------------------------------------------
 
 func TestIntegration_ListSandboxes(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
@@ -505,10 +487,6 @@ func TestIntegration_CreateSandbox_ValidationError(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes/:id/pause
-// ---------------------------------------------------------------------------
-
 func TestIntegration_PauseSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
@@ -569,10 +547,6 @@ func TestIntegration_PauseSandbox_AlreadyPaused(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes/:id/resume
-// ---------------------------------------------------------------------------
-
 func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
@@ -624,6 +598,1338 @@ func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	}
 }
 
+func countOpenIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_active_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&n); err != nil {
+		t.Fatalf("count open intervals: %v", err)
+	}
+	return n
+}
+
+func countOpenStorageIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&n); err != nil {
+		t.Fatalf("count open storage intervals: %v", err)
+	}
+	return n
+}
+
+func countOpenComputeBillingIntervals(t *testing.T, ctx context.Context, sandboxID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_compute_billing_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&n); err != nil {
+		t.Fatalf("count open compute billing intervals: %v", err)
+	}
+	return n
+}
+
+func TestIntegration_SandboxBillingIntervalsLifecycle(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-lifecycle"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	var vcpu, memoryMib, diskMib int
+	if err := testPool.QueryRow(ctx, `
+		SELECT c.vcpu_count, c.memory_mib, s.disk_mib
+		FROM sandbox_compute_billing_interval c
+		JOIN sandbox_storage_interval s USING (sandbox_id)
+		WHERE c.sandbox_id = $1 AND c.ended_at IS NULL AND s.ended_at IS NULL
+	`, sandboxID).Scan(&vcpu, &memoryMib, &diskMib); err != nil {
+		t.Fatalf("read opened billing intervals: %v", err)
+	}
+	if vcpu != 1 || memoryMib != 1024 || diskMib != 4096 {
+		t.Fatalf("opened dimensions = vcpu:%d memory:%d disk:%d, want 1/1024/4096", vcpu, memoryMib, diskMib)
+	}
+
+	if pw := do(r, "POST", "/sandboxes/"+sandboxID.String()+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute intervals after pause = %d, want 0", open)
+	}
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute billing intervals after pause = %d, want 0", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open storage intervals after pause = %d, want 1", open)
+	}
+
+	if dw := do(r, "DELETE", "/sandboxes/"+sandboxID.String(), apiKey, ""); dw.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", dw.Code, dw.Body.String())
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open storage intervals after delete = %d, want 0", open)
+	}
+}
+
+func TestIntegration_BillingMetricsWriteFeatureFlag(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_metrics_write', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing_metrics_write: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-flag-off"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("active interval should still open when billing write flag is off; got %d", open)
+	}
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute billing intervals with flag off = %d, want 0", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open storage intervals with flag off = %d, want 0", open)
+	}
+}
+
+func TestIntegration_PricingRatesUseNewestEffectiveVersion(t *testing.T) {
+	ctx := context.Background()
+	planKey := "test-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'vcpu', 'second', 0.000022, $3),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert pricing rates: %v", err)
+	}
+
+	rates, err := testQueries.ListActivePricingRates(ctx, planKey)
+	if err != nil {
+		t.Fatalf("list active pricing rates: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("rates length = %d, want 3", len(rates))
+	}
+	wantPrices := map[string]float64{
+		"vcpu":        0.000022,
+		"memory_gib":  0.0000045,
+		"storage_gib": 0.00000003,
+	}
+	seen := map[string]bool{}
+	for _, rate := range rates {
+		want, ok := wantPrices[rate.Resource]
+		if !ok {
+			t.Errorf("unexpected pricing resource %q", rate.Resource)
+			continue
+		}
+		seen[rate.Resource] = true
+		if got := numericFloat64(t, rate.PriceUsd); got != want {
+			t.Errorf("%s price = %v, want %v", rate.Resource, got, want)
+		}
+	}
+	for resource := range wantPrices {
+		if !seen[resource] {
+			t.Errorf("missing pricing rate for %s", resource)
+		}
+	}
+}
+
+func TestIntegration_PricingRatesForPlanAtUseRequestedTime(t *testing.T) {
+	ctx := context.Background()
+	planKey := "test-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'vcpu', 'second', 0.000022, $3),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-2*time.Hour), now.Add(time.Hour)); err != nil {
+		t.Fatalf("insert pricing rates: %v", err)
+	}
+
+	rates, err := testQueries.ListPricingRatesForPlanAt(ctx, db.ListPricingRatesForPlanAtParams{
+		PlanKey:     planKey,
+		EffectiveAt: now,
+	})
+	if err != nil {
+		t.Fatalf("list pricing rates for time: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("rates length = %d, want 3", len(rates))
+	}
+	wantPrices := map[string]float64{
+		"vcpu":        0.000011,
+		"memory_gib":  0.0000045,
+		"storage_gib": 0.00000003,
+	}
+	seen := map[string]bool{}
+	for _, rate := range rates {
+		want, ok := wantPrices[rate.Resource]
+		if !ok {
+			t.Errorf("unexpected pricing resource %q", rate.Resource)
+			continue
+		}
+		seen[rate.Resource] = true
+		if got := numericFloat64(t, rate.PriceUsd); got != want {
+			t.Errorf("%s price = %v, want %v", rate.Resource, got, want)
+		}
+	}
+	for resource := range wantPrices {
+		if !seen[resource] {
+			t.Errorf("missing pricing rate for %s", resource)
+		}
+	}
+}
+
+func TestIntegration_PricingRatesForPlanAtIncludesInactivePlan(t *testing.T) {
+	ctx := context.Background()
+	planKey := "inactive-historical-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	insertPricingPlanForTest(t, ctx, planKey, false)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert inactive historical pricing rates: %v", err)
+	}
+
+	rates, err := testQueries.ListPricingRatesForPlanAt(ctx, db.ListPricingRatesForPlanAtParams{
+		PlanKey:     planKey,
+		EffectiveAt: now,
+	})
+	if err != nil {
+		t.Fatalf("list pricing rates for inactive plan: %v", err)
+	}
+	if len(rates) != 3 {
+		t.Fatalf("rates length = %d, want 3 for historical inactive plan", len(rates))
+	}
+}
+
+func TestIntegration_InactiveTeamPricingPlanFallsBackToPayg(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	planKey := "inactive-plan-" + uuid.New().String()
+
+	insertPricingPlanForTest(t, ctx, planKey, false)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, now() - interval '1 hour')
+	`, teamID, planKey); err != nil {
+		t.Fatalf("assign inactive pricing plan: %v", err)
+	}
+
+	resolved, err := testQueries.GetTeamActivePricingPlan(ctx, teamID)
+	if err != nil {
+		t.Fatalf("get team active pricing plan: %v", err)
+	}
+	if resolved != "payg" {
+		t.Fatalf("pricing plan = %q, want payg fallback", resolved)
+	}
+}
+
+func insertPricingPlanForTest(t *testing.T, ctx context.Context, planKey string, active bool) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Integration test pricing', 'USD', $2)
+	`, planKey, active); err != nil {
+		t.Fatalf("insert pricing plan: %v", err)
+	}
+}
+
+func TestIntegration_BillingPeriodRollupFuturePeriodIsZero(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"future-rollup"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+
+	periodStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(time.Hour)
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("future get usage: %v", err)
+	}
+	if got := numericFloat64(t, usage.VcpuSeconds); got != 0 {
+		t.Fatalf("future vcpu seconds = %v, want 0", got)
+	}
+
+	rollup, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("future upsert usage: %v", err)
+	}
+	if got := numericFloat64(t, rollup.VcpuSeconds); got != 0 {
+		t.Fatalf("future rollup vcpu seconds = %v, want 0", got)
+	}
+}
+
+func TestIntegration_HourlyRollupFeatureFlagDoesNotOverwriteWithZero(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"hourly-flag-gate"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage_hourly (
+			team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, 123, 456, 789)
+	`, teamID, hourStart, hourEnd); err != nil {
+		t.Fatalf("seed hourly row: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_hourly_rollups', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable hourly rollups: %v", err)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
+		TeamID:    teamID,
+		HourStart: pgtype.Timestamptz{Time: hourStart, Valid: true},
+		HourEnd:   pgtype.Timestamptz{Time: hourEnd, Valid: true},
+	}); err == nil {
+		t.Fatal("expected no hourly row returned while billing_hourly_rollups is disabled")
+	}
+
+	var vcpu int
+	if err := testPool.QueryRow(ctx, `
+		SELECT vcpu_seconds::int
+		FROM team_billing_usage_hourly
+		WHERE team_id = $1 AND hour_start = $2
+	`, teamID, hourStart).Scan(&vcpu); err != nil {
+		t.Fatalf("read hourly row: %v", err)
+	}
+	if vcpu != 123 {
+		t.Fatalf("hourly row was overwritten while flag disabled: got %d", vcpu)
+	}
+}
+
+func TestIntegration_FinalizeBillingPeriodFinalizesUsage(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	periodStart := time.Now().UTC().Truncate(time.Hour).Add(-24 * time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage (
+			team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, 1, 2, 3)
+	`, teamID, periodStart, periodEnd); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "approved",
+	}); err != nil {
+		t.Fatalf("upsert period: %v", err)
+	}
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("export period: %v", err)
+	}
+	if _, err := testQueries.FinalizeTeamBillingPeriod(ctx, db.FinalizeTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("finalize period: %v", err)
+	}
+
+	var finalizedAt *time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT finalized_at
+		FROM team_billing_usage
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, periodStart, periodEnd).Scan(&finalizedAt); err != nil {
+		t.Fatalf("read usage finalized_at: %v", err)
+	}
+	if finalizedAt == nil {
+		t.Fatal("team_billing_usage.finalized_at is NULL after period finalization")
+	}
+}
+
+func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	periodStart := time.Now().UTC().Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "approved",
+	}); err != nil {
+		t.Fatalf("upsert billing period: %v", err)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	}); err != nil {
+		t.Fatalf("upsert billing usage before export: %v", err)
+	}
+
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err == nil {
+		t.Fatal("expected billing export to be gated off by default")
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing_export_enabled: %v", err)
+	}
+
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("expected billing export after enabling flag: %v", err)
+	}
+}
+
+func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'tenant_usage_dashboard', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable tenant dashboard: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"hourly-open-bound"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	hourStart := time.Now().UTC().Truncate(time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	startedAt := time.Now().UTC().Add(-5 * time.Minute)
+	if startedAt.Before(hourStart) {
+		startedAt = hourStart
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = NULL, end_reason = NULL,
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, startedAt); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = NULL, end_reason = NULL,
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, startedAt); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
+	row, err := testQueries.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
+		TeamID:    teamID,
+		HourStart: pgtype.Timestamptz{Time: hourStart, Valid: true},
+		HourEnd:   pgtype.Timestamptz{Time: hourEnd, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("upsert hourly usage: %v", err)
+	}
+
+	vcpuSeconds := numericFloat64(t, row.VcpuSeconds)
+	if vcpuSeconds >= 3600 {
+		t.Fatalf("current-hour open interval was charged to hour_end: got %v seconds", vcpuSeconds)
+	}
+	if vcpuSeconds <= 0 {
+		t.Fatalf("current-hour open interval should have positive elapsed usage, got %v", vcpuSeconds)
+	}
+}
+
+func TestIntegration_SandboxBillingIntervalsStorageStaysOpenOnFailed(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-failed"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open compute billing intervals before fail = %d, want 1", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open storage intervals before fail = %d, want 1", open)
+	}
+
+	if err := testQueries.MarkSandboxFailedInTeam(ctx, db.MarkSandboxFailedInTeamParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	}); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	if open := countOpenComputeBillingIntervals(t, ctx, sandboxID); open != 0 {
+		t.Fatalf("open compute billing intervals after fail = %d, want 0", open)
+	}
+	if open := countOpenStorageIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("open storage intervals after fail = %d, want 1 because failed sandboxes retain disk", open)
+	}
+}
+
+func TestIntegration_BillingIntervalsEnforceSandboxTenant(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	otherTeamID, _ := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-tenant-fk"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib
+		)
+		VALUES ($1, $2, 1, 1024)
+	`, sandboxID, otherTeamID)
+	if err == nil {
+		t.Fatal("expected cross-team compute billing interval to violate FK")
+	}
+
+	_, err = testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib)
+		VALUES ($1, $2, 4096)
+	`, sandboxID, otherTeamID)
+	if err == nil {
+		t.Fatal("expected cross-team storage interval to violate FK")
+	}
+}
+
+func TestIntegration_GetTeamBillingUsage(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-aggregate"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	periodEnd := periodStart.Add(100 * time.Second)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 2, memory_mib = 2048
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(10*time.Second), periodStart.Add(40*time.Second)); err != nil {
+		t.Fatalf("set deterministic compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 4096
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(5*time.Second), periodStart.Add(65*time.Second)); err != nil {
+		t.Fatalf("set deterministic storage interval: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+
+	vcpuSeconds := numericFloat64(t, usage.VcpuSeconds)
+	memoryGibSeconds := numericFloat64(t, usage.MemoryGibSeconds)
+	storageGibSeconds := numericFloat64(t, usage.StorageGibSeconds)
+	if vcpuSeconds != 60 || memoryGibSeconds != 60 || storageGibSeconds != 240 {
+		t.Fatalf("usage = vcpu:%v memory:%v storage:%v, want 60/60/240",
+			vcpuSeconds, memoryGibSeconds, storageGibSeconds)
+	}
+
+	rollup, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
+		TeamID:      teamID,
+		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("upsert team billing usage: %v", err)
+	}
+	if got := numericFloat64(t, rollup.VcpuSeconds); got != 60 {
+		t.Fatalf("rollup vcpu seconds = %v, want 60", got)
+	}
+	if got := numericFloat64(t, rollup.MemoryMibSeconds); got != 61_440 {
+		t.Fatalf("rollup memory MiB seconds = %v, want 61440", got)
+	}
+	if got := numericFloat64(t, rollup.StorageMibSeconds); got != 245_760 {
+		t.Fatalf("rollup storage MiB seconds = %v, want 245760", got)
+	}
+}
+
+func TestIntegration_BillingRollupWorkersProcessDistinctJobs(t *testing.T) {
+	ctx := context.Background()
+	teamA, _ := seedTeamAndKey(t)
+	teamB, _ := seedTeamAndKey(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamA)
+	enableBillingHourlyRollups(t, ctx, teamB)
+	insertBillingRollupJob(t, ctx, teamA, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+	insertBillingRollupJob(t, ctx, teamB, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-a")
+	billing.ProcessJobsForTest(ctx, testPool, testQueries, cfg, "rollup-worker-b")
+
+	var completed int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+		  AND status = 'completed'
+	`, teamA, teamB, hourStart).Scan(&completed); err != nil {
+		t.Fatalf("count completed rollup jobs: %v", err)
+	}
+	if completed != 2 {
+		t.Fatalf("completed rollup jobs = %d, want 2", completed)
+	}
+
+	var hourlyRows int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM team_billing_usage_hourly
+		WHERE team_id IN ($1, $2)
+		  AND hour_start = $3
+	`, teamA, teamB, hourStart).Scan(&hourlyRows); err != nil {
+		t.Fatalf("count hourly usage rows: %v", err)
+	}
+	if hourlyRows != 2 {
+		t.Fatalf("hourly usage rows = %d, want 2", hourlyRows)
+	}
+}
+
+func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	staleLockedUntil := time.Now().UTC().Add(-time.Minute)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-rollup-reclaim"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
+	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "running", "stale-worker", staleLockedUntil, 5)
+	if _, err := billing.EnqueueHourForTest(ctx, testPool, hourStart, hourEnd); err != nil {
+		t.Fatalf("enqueue hour with stale running job: %v", err)
+	}
+
+	cfg := billing.HourlyRollupConfig{
+		BatchSize:    1,
+		MaxAttempts:  5,
+		LockDuration: time.Minute,
+	}
+	jobs, err := billing.ClaimJobsForTest(ctx, testPool, cfg, "replacement-worker")
+	if err != nil {
+		t.Fatalf("claim stale rollup job: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(jobs))
+	}
+	if jobs[0].ID != jobID {
+		t.Fatalf("claimed job id = %s, want %s", jobs[0].ID, jobID)
+	}
+
+	var status, lockedBy string
+	var attemptCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, locked_by, attempt_count
+		FROM billing_rollup_job
+		WHERE id = $1
+	`, jobID).Scan(&status, &lockedBy, &attemptCount); err != nil {
+		t.Fatalf("read claimed stale job: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status = %q, want running", status)
+	}
+	if lockedBy != "replacement-worker" {
+		t.Fatalf("locked_by = %q, want replacement-worker", lockedBy)
+	}
+	if attemptCount != 5 {
+		t.Fatalf("attempt_count = %d, want 5", attemptCount)
+	}
+}
+
+func TestIntegration_BillingRollupSchedulerPreservesPendingRetryBackoff(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	hourEnd := hourStart.Add(time.Hour)
+	nextAttemptAt := time.Now().UTC().Add(30 * time.Minute)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-preserve-backoff"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, hourStart.Add(5*time.Second), hourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_rollup_job (
+			team_id, hour_start, hour_end, status, attempt_count, next_attempt_at, last_error
+		)
+		VALUES ($1, $2, $3, 'pending', 2, $4, 'temporary failure')
+	`, teamID, hourStart, hourEnd, nextAttemptAt); err != nil {
+		t.Fatalf("insert pending retry job: %v", err)
+	}
+	if _, err := billing.EnqueueHourForTest(ctx, testPool, hourStart, hourEnd); err != nil {
+		t.Fatalf("enqueue hour with pending retry job: %v", err)
+	}
+
+	var gotNextAttemptAt time.Time
+	var gotLastError string
+	var gotAttemptCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT next_attempt_at, last_error, attempt_count
+		FROM billing_rollup_job
+		WHERE team_id = $1 AND hour_start = $2
+	`, teamID, hourStart).Scan(&gotNextAttemptAt, &gotLastError, &gotAttemptCount); err != nil {
+		t.Fatalf("read pending retry job: %v", err)
+	}
+	if gotNextAttemptAt.Before(nextAttemptAt.Add(-time.Second)) {
+		t.Fatalf("next_attempt_at = %s, want preserved near %s", gotNextAttemptAt, nextAttemptAt)
+	}
+	if gotLastError != "temporary failure" {
+		t.Fatalf("last_error = %q, want preserved", gotLastError)
+	}
+	if gotAttemptCount != 2 {
+		t.Fatalf("attempt_count = %d, want 2", gotAttemptCount)
+	}
+}
+
+func TestIntegration_BillingRollupBackfillCursorAdvancesAfterEnqueue(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+	backfillStart := now.Add(-48 * time.Hour)
+	firstHourEnd := backfillStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-backfill-cursor"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedComputeBillingInterval(t, ctx, sandboxID, teamID, backfillStart.Add(5*time.Second), backfillStart.Add(30*time.Second))
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_rollup_team_backfill_state (team_id, next_hour_start)
+		VALUES ($1, $2)
+		ON CONFLICT (team_id) DO UPDATE
+		SET next_hour_start = EXCLUDED.next_hour_start
+	`, teamID, backfillStart); err != nil {
+		t.Fatalf("seed team backfill cursor: %v", err)
+	}
+
+	enqueued, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    1,
+	}, now)
+	if err != nil {
+		t.Fatalf("enqueue backfill: %v", err)
+	}
+	if enqueued == 0 {
+		t.Fatal("expected backfill to enqueue at least one job")
+	}
+
+	var cursor time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT next_hour_start
+		FROM billing_rollup_team_backfill_state
+		WHERE team_id = $1
+	`, teamID).Scan(&cursor); err != nil {
+		t.Fatalf("read team backfill cursor: %v", err)
+	}
+	if !cursor.Equal(firstHourEnd) {
+		t.Fatalf("cursor = %s, want advanced to %s after successful enqueue", cursor, firstHourEnd)
+	}
+}
+
+func TestIntegration_BillingRollupTeamBackfillCursorAdvanceToleratesConcurrentAdvance(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, _ := seedTeamAndKey(t)
+	fromHour := time.Now().UTC().Truncate(time.Hour).Add(-48 * time.Hour)
+	toHour := fromHour.Add(24 * time.Hour)
+	concurrentCursor := fromHour.Add(time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_rollup_team_backfill_state (team_id, next_hour_start)
+		VALUES ($1, $2)
+	`, teamID, concurrentCursor); err != nil {
+		t.Fatalf("seed concurrent team backfill cursor: %v", err)
+	}
+	if err := billing.AdvanceTeamBackfillCursorForTest(ctx, testPool, teamID, fromHour, toHour); err != nil {
+		t.Fatalf("advance team cursor after concurrent progress: %v", err)
+	}
+
+	var cursor time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT next_hour_start
+		FROM billing_rollup_team_backfill_state
+		WHERE team_id = $1
+	`, teamID).Scan(&cursor); err != nil {
+		t.Fatalf("read team backfill cursor: %v", err)
+	}
+	if !cursor.Equal(toHour) {
+		t.Fatalf("cursor = %s, want advanced to %s", cursor, toHour)
+	}
+	if err := billing.AdvanceTeamBackfillCursorForTest(ctx, testPool, teamID, fromHour, toHour); err != nil {
+		t.Fatalf("advance team cursor should be idempotent once already advanced: %v", err)
+	}
+}
+
+func TestIntegration_BillingRollupBackfillDoesNotAdvanceDisabledTeamCursor(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+	oldHourStart := now.Add(-48 * time.Hour)
+	oldHourEnd := oldHourStart.Add(time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES
+			($1, 'billing_metrics_write', true),
+			($1, 'billing_hourly_rollups', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("configure billing feature flags: %v", err)
+	}
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-backfill-disabled-team"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedComputeBillingInterval(t, ctx, sandboxID, teamID, oldHourStart.Add(5*time.Second), oldHourStart.Add(30*time.Second))
+
+	if _, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    72,
+	}, now); err != nil {
+		t.Fatalf("enqueue disabled backfill: %v", err)
+	}
+
+	var disabledTeamJobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+	`, teamID).Scan(&disabledTeamJobs); err != nil {
+		t.Fatalf("count disabled team backfill jobs: %v", err)
+	}
+	if disabledTeamJobs != 0 {
+		t.Fatalf("disabled team backfill jobs = %d, want 0", disabledTeamJobs)
+	}
+
+	var cursorRows int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_team_backfill_state
+		WHERE team_id = $1
+	`, teamID).Scan(&cursorRows); err != nil {
+		t.Fatalf("count disabled team backfill cursor rows: %v", err)
+	}
+	if cursorRows != 0 {
+		t.Fatalf("disabled team backfill cursor rows = %d, want 0", cursorRows)
+	}
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	enqueued, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    72,
+	}, now)
+	if err != nil {
+		t.Fatalf("enqueue enabled backfill: %v", err)
+	}
+	if enqueued == 0 {
+		t.Fatal("expected newly enabled team to enqueue historical backfill job")
+	}
+
+	var jobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+		  AND hour_start = $2
+		  AND hour_end = $3
+	`, teamID, oldHourStart, oldHourEnd).Scan(&jobs); err != nil {
+		t.Fatalf("count newly enabled team backfill jobs: %v", err)
+	}
+	if jobs != 1 {
+		t.Fatalf("newly enabled team backfill jobs = %d, want 1", jobs)
+	}
+}
+
+func TestIntegration_BillingRollupBackfillEnqueuesBeforeRollingWindow(t *testing.T) {
+	ctx := context.Background()
+	resetBillingRollupBackfillState(t, ctx)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+	oldHourStart := now.Add(-48 * time.Hour)
+	oldHourEnd := oldHourStart.Add(time.Hour)
+
+	enableBillingHourlyRollups(t, ctx, teamID)
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"rollup-backfill-old-hour"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_compute_billing_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'paused',
+		    vcpu_count = 1, memory_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, oldHourStart.Add(5*time.Second), oldHourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted',
+		    disk_mib = 1024
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, oldHourStart.Add(5*time.Second), oldHourStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage interval: %v", err)
+	}
+
+	enqueued, err := billing.EnqueueBackfillForTest(ctx, testPool, billing.HourlyRollupConfig{
+		LookbackHours:         24,
+		BackfillLookbackHours: 72,
+		BackfillBatchHours:    72,
+	}, now)
+	if err != nil {
+		t.Fatalf("enqueue backfill: %v", err)
+	}
+	if enqueued == 0 {
+		t.Fatal("expected backfill to enqueue at least one old rollup job")
+	}
+
+	var jobs int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM billing_rollup_job
+		WHERE team_id = $1
+		  AND hour_start = $2
+		  AND hour_end = $3
+	`, teamID, oldHourStart, oldHourEnd).Scan(&jobs); err != nil {
+		t.Fatalf("count backfilled jobs: %v", err)
+	}
+	if jobs != 1 {
+		t.Fatalf("backfilled jobs = %d, want 1", jobs)
+	}
+}
+
+func resetBillingRollupBackfillState(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `DELETE FROM billing_rollup_backfill_state WHERE name = 'hourly'`); err != nil {
+		t.Fatalf("reset billing rollup backfill state: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM billing_rollup_team_backfill_state`); err != nil {
+		t.Fatalf("reset billing rollup team backfill state: %v", err)
+	}
+}
+
+func seedComputeBillingInterval(t *testing.T, ctx context.Context, sandboxID uuid.UUID, teamID uuid.UUID, startedAt time.Time, endedAt time.Time) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		DELETE FROM sandbox_compute_billing_interval
+		WHERE sandbox_id = $1
+	`, sandboxID); err != nil {
+		t.Fatalf("clear compute billing intervals: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 1, 1024, $3, $4, 'paused')
+	`, sandboxID, teamID, startedAt, endedAt); err != nil {
+		t.Fatalf("insert compute billing interval: %v", err)
+	}
+}
+
+func enableBillingHourlyRollups(t *testing.T, ctx context.Context, teamID uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES
+			($1, 'billing_metrics_write', true),
+			($1, 'billing_hourly_rollups', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing rollup feature flags: %v", err)
+	}
+}
+
+func insertBillingRollupJob(
+	t *testing.T,
+	ctx context.Context,
+	teamID uuid.UUID,
+	hourStart time.Time,
+	hourEnd time.Time,
+	status string,
+	lockedBy string,
+	lockedUntil time.Time,
+	attemptCount int,
+) uuid.UUID {
+	t.Helper()
+
+	var jobID uuid.UUID
+	if status == "running" {
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO billing_rollup_job (
+				team_id, hour_start, hour_end, status, attempt_count,
+				locked_by, locked_until, next_attempt_at
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, now() - interval '1 minute')
+			RETURNING id
+		`, teamID, hourStart, hourEnd, status, attemptCount, lockedBy, lockedUntil).Scan(&jobID); err != nil {
+			t.Fatalf("insert running billing rollup job: %v", err)
+		}
+		return jobID
+	}
+
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO billing_rollup_job (
+			team_id, hour_start, hour_end, status, attempt_count, next_attempt_at
+		)
+		VALUES ($1, $2, $3, $4, $5, now() - interval '1 minute')
+		RETURNING id
+	`, teamID, hourStart, hourEnd, status, attemptCount).Scan(&jobID); err != nil {
+		t.Fatalf("insert billing rollup job: %v", err)
+	}
+	return jobID
+}
+
+func TestIntegration_TeamCreditLedgerRejectsCrossTeamGrant(t *testing.T) {
+	ctx := context.Background()
+	grantTeamID, _ := seedTeamAndKey(t)
+	ledgerTeamID, _ := seedTeamAndKey(t)
+
+	var grantID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO team_credit_grant (
+			team_id, amount_usd, remaining_usd, reason
+		)
+		VALUES ($1, 10.00, 10.00, 'test grant')
+		RETURNING id
+	`, grantTeamID).Scan(&grantID); err != nil {
+		t.Fatalf("insert credit grant: %v", err)
+	}
+
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_ledger (
+			team_id, grant_id, amount_usd, reason
+		)
+		VALUES ($1, $2, -1.00, 'cross-team attribution should fail')
+	`, ledgerTeamID, grantID)
+	if err == nil {
+		t.Fatal("expected cross-team credit ledger grant reference to fail")
+	}
+}
+
+func numericFloat64(t *testing.T, n pgtype.Numeric) float64 {
+	t.Helper()
+	v, err := n.Float64Value()
+	if err != nil {
+		t.Fatalf("convert numeric: %v", err)
+	}
+	if !v.Valid {
+		t.Fatal("numeric is null")
+	}
+	return v.Float64
+}
+
+// waitForSandboxStatus polls until the sandbox reaches want (or fails), rather
+// than sleeping a fixed interval that goes flaky under load.
+func waitForSandboxStatus(t *testing.T, ctx context.Context, id, teamID uuid.UUID, want db.SandboxStatus) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: id, TeamID: teamID})
+		if err != nil {
+			t.Fatalf("get sandbox: %v", err)
+		}
+		if sb.Status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox status = %q, want %q (timed out)", sb.Status, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A stale OPEN interval (a prior transition that failed to close it) must not
+// break resume: before ON CONFLICT it collided and the handler tore the VM
+// down. Now the open row is reused and resume succeeds.
+func TestIntegration_ResumeSandbox_StaleOpenInterval(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+
+	// Simulate the orphan: open a second interval while the sandbox is paused,
+	// leaving its row dangling exactly as a missed close would.
+	if err := testQueries.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	}); err != nil {
+		t.Fatalf("seed stale interval: %v", err)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Fatalf("setup: open intervals = %d, want 1", open)
+	}
+
+	rw := do(r, "POST", "/sandboxes/"+sid+"/resume", apiKey, "")
+	if rw.Code != http.StatusOK {
+		t.Fatalf("resume with stale interval: expected 200, got %d: %s", rw.Code, rw.Body.String())
+	}
+
+	waitForSandboxStatus(t, ctx, sandboxID, teamID, db.SandboxStatusActive)
+	// ON CONFLICT DO NOTHING reuses the existing open row — no duplicate.
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Errorf("open intervals after resume = %d, want 1", open)
+	}
+}
+
+// The reaper's orphan sweep closes intervals left open while their sandbox is
+// no longer active, but only once the settle window has passed.
+func TestIntegration_CloseOrphanedActiveIntervals(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"orphan-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if err := testQueries.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	}); err != nil {
+		t.Fatalf("seed stale interval: %v", err)
+	}
+
+	// Within the settle window → sweep must leave the fresh transition alone.
+	if _, err := testQueries.CloseOrphanedActiveIntervals(ctx); err != nil {
+		t.Fatalf("sweep (fresh): %v", err)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 1 {
+		t.Errorf("within settle window: open = %d, want 1 (untouched)", open)
+	}
+
+	// Backdate past the settle window → sweep now closes the orphan.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET updated_at = now() - interval '10 minutes' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	n, err := testQueries.CloseOrphanedActiveIntervals(ctx)
+	if err != nil {
+		t.Fatalf("sweep (settled): %v", err)
+	}
+	if n < 1 {
+		t.Errorf("sweep closed %d rows, want >= 1", n)
+	}
+	if open := countOpenIntervals(t, ctx, sandboxID); open != 0 {
+		t.Errorf("after settle window: open = %d, want 0 (closed)", open)
+	}
+}
+
+// pauseAndRevert calls FinalizePause from 'resuming', not 'pausing'. Confirm on
+// real Postgres that it has no source-status precondition: it flips to paused.
+func TestIntegration_FinalizePause_FromResuming(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"finalize-resuming"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+	// Pause first for a deterministic state, then force 'resuming' directly.
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET status = 'resuming' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("force resuming: %v", err)
+	}
+
+	mem := "/snapshots/" + sid + "/mem.snap"
+	snapID, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
+		ID:      sandboxID,
+		TeamID:  teamID,
+		Path:    "/snapshots/" + sid + "/vmstate.snap",
+		MemPath: &mem,
+		Trigger: "resume_revert",
+	})
+	if err != nil {
+		t.Fatalf("FinalizePause from resuming failed (status precondition?): %v", err)
+	}
+	if snapID == uuid.Nil {
+		t.Fatal("FinalizePause returned nil snapshot id")
+	}
+
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sb.Status != db.SandboxStatusPaused {
+		t.Errorf("status after FinalizePause = %q, want paused", sb.Status)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // DELETE /sandboxes/:id
 // ---------------------------------------------------------------------------
@@ -659,149 +1965,6 @@ func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes/:id/exec
-// ---------------------------------------------------------------------------
-
-func TestIntegration_ExecSandbox_Success(t *testing.T) {
-	ctx := context.Background()
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"exec-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello","timeout_s":5}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec: expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-	eb := mustJSON(t, ew)
-	if eb["stdout"] != "hello\n" {
-		t.Errorf("stdout = %q, want hello\\n", eb["stdout"])
-	}
-	if int(eb["exit_code"].(float64)) != 0 {
-		t.Errorf("exit_code = %v, want 0", eb["exit_code"])
-	}
-
-	// Activity logged asynchronously.
-	time.Sleep(100 * time.Millisecond)
-	sandboxID, _ := uuid.Parse(sid)
-	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
-		Limit:     20,
-	})
-	if err != nil {
-		t.Fatalf("list activities: %v", err)
-	}
-	var foundExec bool
-	for _, a := range activities {
-		if a.Category == "exec" && a.Action == "executed" {
-			foundExec = true
-		}
-	}
-	if !foundExec {
-		t.Error("expected exec activity record after exec")
-	}
-}
-
-// Exec on a paused sandbox transparently resumes it, runs the command, and
-// leaves the sandbox active.
-func TestIntegration_ExecSandbox_PausedAutoResume(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusNoContent {
-		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
-	}
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello"}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-
-	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
-	status, _ := mustJSON(t, gw)["status"].(string)
-	if status != "active" {
-		t.Errorf("sandbox status after auto-resume = %q, want %q", status, "active")
-	}
-}
-
-// Baseline: /exec/stream on an active sandbox emits a valid SSE response
-// ending with finished=true and exit_code=0.
-func TestIntegration_ExecSandboxStream_Success(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stream-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec/stream: expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-	body := ew.Body.String()
-	if !strings.HasPrefix(body, "data: ") {
-		t.Errorf("body does not start with SSE data frame; got: %q", body)
-	}
-	if !strings.Contains(body, `"finished":true`) {
-		t.Errorf("SSE body missing finished event; got: %s", body)
-	}
-	if !strings.Contains(body, `"exit_code":0`) {
-		t.Errorf("SSE body missing exit_code=0; got: %s", body)
-	}
-}
-
-// Same auto-resume behavior on the SSE streaming endpoint.
-func TestIntegration_ExecSandboxStream_PausedAutoResume(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-stream-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusNoContent {
-		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
-	}
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec/stream on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-	body := ew.Body.String()
-	if !strings.Contains(body, `"finished":true`) {
-		t.Errorf("SSE body missing finished event; got: %s", body)
-	}
-	if !strings.Contains(body, `"exit_code":0`) {
-		t.Errorf("SSE body missing exit_code=0; got: %s", body)
-	}
-
-	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
-	status, _ := mustJSON(t, gw)["status"].(string)
-	if status != "active" {
-		t.Errorf("sandbox status after stream auto-resume = %q, want %q", status, "active")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Team isolation
-// ---------------------------------------------------------------------------
-
 func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 	_, apiKeyA := seedTeamAndKey(t)
 	_, apiKeyB := seedTeamAndKey(t)
@@ -826,27 +1989,6 @@ func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 		t.Fatalf("expected 204, got %d", dw2.Code)
 	}
 }
-
-func TestIntegration_TeamIsolation_Exec(t *testing.T) {
-	_, apiKeyA := seedTeamAndKey(t)
-	_, apiKeyB := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-exec"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKeyB, `{"command":"id"}`)
-	if ew.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 (team isolation on exec), got %d: %s", ew.Code, ew.Body.String())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Activity logging
-// ---------------------------------------------------------------------------
 
 func TestIntegration_ActivityLog_DeleteRecorded(t *testing.T) {
 	ctx := context.Background()
@@ -908,24 +2050,25 @@ func TestIntegration_ActivityLog_PauseRecorded(t *testing.T) {
 		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
-		Limit:     20,
-	})
-	if err != nil {
-		t.Fatalf("list activities: %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
+			SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
+			Limit:     20,
+		})
+		if err != nil {
+			t.Fatalf("list activities: %v", err)
+		}
+
+		for _, a := range activities {
+			if a.Category == "sandbox" && a.Action == "paused" {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 
-	var found bool
-	for _, a := range activities {
-		if a.Category == "sandbox" && a.Action == "paused" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("no 'sandbox/paused' activity record after pause")
-	}
+	t.Error("no 'sandbox/paused' activity record after pause")
 }
 
 func TestIntegration_ActivityLog_ActorAttributedToKeyCreator(t *testing.T) {
@@ -1000,10 +2143,6 @@ func TestIntegration_ActivityLog_ActorNullWhenKeyHasNoCreator(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent sandbox creation via API
-// ---------------------------------------------------------------------------
-
 func TestIntegration_ConcurrentCreate(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
@@ -1047,10 +2186,6 @@ func TestIntegration_ConcurrentCreate(t *testing.T) {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// PATCH /sandboxes/:id
-// ---------------------------------------------------------------------------
 
 func TestIntegration_PatchSandbox_Network_Success(t *testing.T) {
 	teamID, apiKey := seedTeamAndKey(t)
@@ -1168,10 +2303,6 @@ func TestIntegration_PatchSandbox_UnknownField(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// POST /sandboxes with network config
-// ---------------------------------------------------------------------------
-
 func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
@@ -1186,10 +2317,6 @@ func TestIntegration_CreateSandbox_WithNetworkConfig(t *testing.T) {
 		t.Errorf("expected status=active, got %v", body["status"])
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Security headers
-// ---------------------------------------------------------------------------
 
 func TestIntegration_SecurityHeaders(t *testing.T) {
 	r := newRouter(t)
@@ -1208,10 +2335,6 @@ func TestIntegration_SecurityHeaders(t *testing.T) {
 		t.Error("missing Strict-Transport-Security")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Sandbox metadata
-// ---------------------------------------------------------------------------
 
 func TestIntegration_CreateSandbox_WithMetadata(t *testing.T) {
 	ctx := context.Background()
@@ -1449,10 +2572,6 @@ func TestIntegration_ListSandboxes_FilterRejectsAdversarial(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Rate limiting
-// ---------------------------------------------------------------------------
-
 func TestIntegration_RateLimit_Headers(t *testing.T) {
 	r := newRouter(t)
 
@@ -1467,10 +2586,6 @@ func TestIntegration_RateLimit_Headers(t *testing.T) {
 		t.Error("missing RateLimit-Remaining header")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Templates
-// ---------------------------------------------------------------------------
 
 // TestIntegration_CreateTemplate_NameReusableAfterDelete verifies the partial
 // unique index on (team_id, name) WHERE deleted_at IS NULL: once a template
