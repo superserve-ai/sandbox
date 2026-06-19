@@ -7,8 +7,10 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const listActivePricingRatesForTeamCurrent = `-- name: ListActivePricingRatesForTeamCurrent :many
@@ -64,15 +66,25 @@ WHERE rate_rank = 1
 ORDER BY resource, unit
 `
 
-func (q *Queries) ListActivePricingRatesForTeamCurrent(ctx context.Context, teamID uuid.UUID) ([]ListActivePricingRatesForTeamRow, error) {
+type ListActivePricingRatesForTeamCurrentRow struct {
+	PlanKey       string         `json:"plan_key"`
+	PlanName      string         `json:"plan_name"`
+	Currency      string         `json:"currency"`
+	Resource      string         `json:"resource"`
+	Unit          string         `json:"unit"`
+	PriceUsd      pgtype.Numeric `json:"price_usd"`
+	EffectiveFrom time.Time      `json:"effective_from"`
+}
+
+func (q *Queries) ListActivePricingRatesForTeamCurrent(ctx context.Context, teamID uuid.UUID) ([]ListActivePricingRatesForTeamCurrentRow, error) {
 	rows, err := q.db.Query(ctx, listActivePricingRatesForTeamCurrent, teamID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ListActivePricingRatesForTeamRow{}
+	items := []ListActivePricingRatesForTeamCurrentRow{}
 	for rows.Next() {
-		var i ListActivePricingRatesForTeamRow
+		var i ListActivePricingRatesForTeamCurrentRow
 		if err := rows.Scan(
 			&i.PlanKey,
 			&i.PlanName,
