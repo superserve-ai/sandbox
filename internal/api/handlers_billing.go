@@ -8,6 +8,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 const (
@@ -48,14 +50,17 @@ func (h *Handlers) GetBillingPricing(c *gin.Context) {
 		return
 	}
 
-	planKey, err := h.DB.GetTeamActivePricingPlan(c.Request.Context(), teamID)
+	rates, err := h.DB.ListActivePricingRatesForTeam(c.Request.Context(), db.ListActivePricingRatesForTeamParams{
+		TeamID:      teamID,
+		EffectiveAt: time.Now().UTC(),
+	})
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeamActivePricingPlan failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB ListActivePricingRatesForTeam failed")
 		respondError(c, ErrInternal)
 		return
 	}
 
-	h.writeBillingPricing(c, planKey, teamID.String(), privatePricingCacheControl)
+	h.writeBillingPricingRates(c, pricingRatesFromTeamRows(rates), teamID.String(), privatePricingCacheControl)
 }
 
 func (h *Handlers) writeBillingPricing(c *gin.Context, planKey string, subject string, cacheControl string) {
@@ -65,12 +70,60 @@ func (h *Handlers) writeBillingPricing(c *gin.Context, planKey string, subject s
 		respondError(c, ErrInternal)
 		return
 	}
+
+	h.writeBillingPricingRates(c, pricingRatesFromActiveRows(rates), subject, cacheControl)
+}
+
+type billingPricingRate struct {
+	PlanKey       string
+	PlanName      string
+	Currency      string
+	Resource      string
+	Unit          string
+	PriceUsd      pgtype.Numeric
+	EffectiveFrom time.Time
+}
+
+func pricingRatesFromActiveRows(rows []db.ListActivePricingRatesRow) []billingPricingRate {
+	out := make([]billingPricingRate, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, billingPricingRate{
+			PlanKey:       row.PlanKey,
+			PlanName:      row.PlanName,
+			Currency:      row.Currency,
+			Resource:      row.Resource,
+			Unit:          row.Unit,
+			PriceUsd:      row.PriceUsd,
+			EffectiveFrom: row.EffectiveFrom,
+		})
+	}
+	return out
+}
+
+func pricingRatesFromTeamRows(rows []db.ListActivePricingRatesForTeamRow) []billingPricingRate {
+	out := make([]billingPricingRate, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, billingPricingRate{
+			PlanKey:       row.PlanKey,
+			PlanName:      row.PlanName,
+			Currency:      row.Currency,
+			Resource:      row.Resource,
+			Unit:          row.Unit,
+			PriceUsd:      row.PriceUsd,
+			EffectiveFrom: row.EffectiveFrom,
+		})
+	}
+	return out
+}
+
+func (h *Handlers) writeBillingPricingRates(c *gin.Context, rates []billingPricingRate, subject string, cacheControl string) {
 	if len(rates) == 0 {
-		log.Error().Str("subject", subject).Str("plan_key", planKey).Msg("billing pricing plan has no active rates")
+		log.Error().Str("subject", subject).Msg("billing pricing plan has no active rates")
 		respondPricingUnavailable(c)
 		return
 	}
 
+	planKey := rates[0].PlanKey
 	out := billingPricingResponse{
 		PlanKey:  planKey,
 		PlanName: rates[0].PlanName,
@@ -128,7 +181,7 @@ func (h *Handlers) writeBillingPricing(c *gin.Context, planKey string, subject s
 
 	c.Header("Cache-Control", cacheControl)
 	if cacheControl == privatePricingCacheControl {
-		c.Header("Vary", "Authorization")
+		c.Header("Vary", "X-API-Key")
 	}
 	c.JSON(http.StatusOK, out)
 }

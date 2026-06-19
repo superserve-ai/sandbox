@@ -379,8 +379,8 @@ func TestIntegration_GetBillingPricing(t *testing.T) {
 	if got := w.Header().Get("Cache-Control"); got != "private, max-age=60" {
 		t.Fatalf("Cache-Control = %q, want private, max-age=60", got)
 	}
-	if got := w.Header().Get("Vary"); got != "Authorization" {
-		t.Fatalf("Vary = %q, want Authorization", got)
+	if got := w.Header().Get("Vary"); got != "X-API-Key" {
+		t.Fatalf("Vary = %q, want X-API-Key", got)
 	}
 
 	body := decodeBillingPricingResponse(t, w)
@@ -447,6 +447,93 @@ func TestIntegration_GetBillingPricingUsesNewestEffectiveRate(t *testing.T) {
 	}
 	rates := billingRatesByResource(t, body)
 	assertFloatNear(t, rates["vcpu"].PriceUSD, 0.000022)
+}
+
+func TestIntegration_GetBillingPricingMissingRequiredRateReturns503(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	planKey := "missing-rate-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Missing rate integration pricing', 'USD', true)
+	`, planKey); err != nil {
+		t.Fatalf("insert pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2)
+	`, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert incomplete pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("assign pricing plan: %v", err)
+	}
+
+	w := do(newRouter(t), "GET", "/billing/pricing", apiKey, "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for missing required rate, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetPublicBillingPricingInactivePaygReturns503(t *testing.T) {
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `UPDATE pricing_plan SET active = false WHERE key = 'payg'`); err != nil {
+		t.Fatalf("deactivate payg: %v", err)
+	}
+	defer func() {
+		if _, err := testPool.Exec(context.Background(), `UPDATE pricing_plan SET active = true WHERE key = 'payg'`); err != nil {
+			t.Fatalf("restore payg: %v", err)
+		}
+	}()
+
+	w := do(newRouter(t), "GET", "/billing/pricing/public", "", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for inactive payg pricing, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetBillingPricingInactiveTeamPlanFallsBackToPayg(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	planKey := "inactive-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Inactive integration pricing', 'USD', false)
+	`, planKey); err != nil {
+		t.Fatalf("insert inactive pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000099, $2),
+			($1, 'memory_gib', 'second', 0.000099, $2),
+			($1, 'storage_gib', 'second', 0.000099, $2)
+	`, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert inactive pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("assign inactive pricing plan: %v", err)
+	}
+
+	w := do(newRouter(t), "GET", "/billing/pricing", apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 fallback to payg, got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := decodeBillingPricingResponse(t, w)
+	assertPaygPricingResponse(t, body)
 }
 
 type billingPricingTestResponse struct {
