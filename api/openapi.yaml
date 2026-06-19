@@ -68,6 +68,64 @@ paths:
                     type: string
                     example: "0.1.0"
 
+  /billing/pricing/public:
+    get:
+      operationId: getPublicBillingPricing
+      tags: [Billing]
+      summary: Get public PAYG billing pricing
+      description: |
+        Returns the active public pay-as-you-go pricing plan and current
+        resource rates. This endpoint is unauthenticated so public pricing
+        pages can render from the same pricing data used by billing.
+      responses:
+        "200":
+          description: Public pay-as-you-go pricing plan and rates
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPricingResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          description: Public pricing is not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /billing/pricing:
+    get:
+      operationId: getBillingPricing
+      tags: [Billing]
+      summary: Get billing pricing
+      description: |
+        Returns the authenticated team's active pricing plan and current
+        resource rates for billing UI display. The team is derived from
+        authentication; callers cannot select a team by query parameter.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Active pricing plan and rates
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPricingResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          description: Pricing is not available for the authenticated team's active plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes:
     get:
       operationId: listSandboxes
@@ -2170,6 +2228,53 @@ components:
         token_shape:
           type: string
           description: Prefix-shaped sample of the proxy token issued for this provider (e.g. `sk-ant-api03-...`).
+
+    BillingPricingResponse:
+      type: object
+      required: [plan_key, plan_name, currency, rates]
+      properties:
+        plan_key:
+          type: string
+          description: Active pricing plan key. Authenticated pricing is team-specific; public pricing returns the public PAYG plan.
+          example: payg
+        plan_name:
+          type: string
+          description: Human-readable plan name.
+          example: Pay-as-you-go
+        currency:
+          type: string
+          description: ISO 4217 currency code for all returned rates.
+          example: USD
+        rates:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingPricingRate"
+
+    BillingPricingRate:
+      type: object
+      required: [resource, unit, price_usd, price_usd_hourly, effective_from]
+      properties:
+        resource:
+          type: string
+          enum: [memory_gib, storage_gib, vcpu]
+          description: Metered resource name.
+        unit:
+          type: string
+          enum: [second]
+          description: Billing unit for `price_usd`.
+        price_usd:
+          type: number
+          format: double
+          description: Unit price in USD.
+          example: 0.000014
+        price_usd_hourly:
+          type: number
+          format: double
+          description: Convenience hourly equivalent for UI display.
+          example: 0.0504
+        effective_from:
+          type: string
+          format: date-time
 
     Error:
       type: object

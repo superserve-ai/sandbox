@@ -72,9 +72,13 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/providers", h.ListProviders)
 
 		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)
+
+		api.GET("/billing/pricing", h.GetBillingPricing)
 	}
 
 	r.GET("/health", h.Health)
+	// Public pricing is intentionally unauthenticated so the marketing site can render current PAYG rates from the same source as billing.
+	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
 
 	// Internal endpoints — authenticated via a shared token (not per-team
 	// API keys). Called by infrastructure components (VMD heartbeat) and

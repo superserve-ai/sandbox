@@ -91,14 +91,14 @@ WITH paused AS (
 ),
 closed_interval AS (
   UPDATE sandbox_active_interval
-  SET ended_at = now(), end_reason = 'paused'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
   WHERE sandbox_id IN (SELECT id FROM paused)
     AND ended_at IS NULL
   RETURNING sandbox_id
 ),
 closed_billing_compute AS (
   UPDATE sandbox_compute_billing_interval
-  SET ended_at = now(), end_reason = 'paused'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
   WHERE sandbox_id IN (SELECT id FROM paused)
     AND ended_at IS NULL
   RETURNING sandbox_id
@@ -259,14 +259,14 @@ closed_intervals AS (
   -- this, a crashed claim would leave the interval open forever and the
   -- analytics view would keep counting the actor as active.
   UPDATE sandbox_active_interval
-  SET ended_at = now(), end_reason = 'timeout_paused'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'timeout_paused'
   WHERE sandbox_id IN (SELECT id FROM paused)
     AND ended_at IS NULL
   RETURNING sandbox_id
 ),
 closed_billing_compute AS (
   UPDATE sandbox_compute_billing_interval
-  SET ended_at = now(), end_reason = 'timeout_paused'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'timeout_paused'
   WHERE sandbox_id IN (SELECT id FROM paused)
     AND ended_at IS NULL
   RETURNING sandbox_id
@@ -517,20 +517,20 @@ WITH destroyed AS (
 ),
 closed_compute AS (
   UPDATE sandbox_active_interval
-  SET ended_at = now(), end_reason = 'deleted'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
   WHERE sandbox_id IN (SELECT id FROM destroyed)
     AND ended_at IS NULL
   RETURNING sandbox_id
 ),
 closed_billing_compute AS (
   UPDATE sandbox_compute_billing_interval
-  SET ended_at = now(), end_reason = 'deleted'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
   WHERE sandbox_id IN (SELECT id FROM destroyed)
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
 UPDATE sandbox_storage_interval
-SET ended_at = now(), end_reason = 'deleted'
+SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
 WHERE sandbox_id IN (SELECT id FROM destroyed)
   AND ended_at IS NULL
 `
@@ -881,13 +881,13 @@ WITH failed AS (
 ),
 closed_active AS (
   UPDATE sandbox_active_interval
-  SET ended_at = now(), end_reason = 'failed'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
   WHERE sandbox_id IN (SELECT id FROM failed)
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
 UPDATE sandbox_compute_billing_interval
-SET ended_at = now(), end_reason = 'failed'
+SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL
 `
@@ -911,13 +911,13 @@ WITH failed AS (
 ),
 closed_active AS (
   UPDATE sandbox_active_interval
-  SET ended_at = now(), end_reason = 'failed'
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
   WHERE sandbox_id IN (SELECT id FROM failed)
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
 UPDATE sandbox_compute_billing_interval
-SET ended_at = now(), end_reason = 'failed'
+SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL
 `

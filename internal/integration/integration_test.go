@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -318,6 +319,13 @@ func mustJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{}
 	return m
 }
 
+func assertFloatNear(t *testing.T, got, want float64) {
+	t.Helper()
+	if math.Abs(got-want) > 0.000000000001 {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
 func TestIntegration_Auth_HealthNoKeyRequired(t *testing.T) {
 	w := do(newRouter(t), "GET", "/health", "", "")
 	if w.Code != http.StatusOK {
@@ -357,6 +365,264 @@ func TestIntegration_Auth_RevokedKey(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
+}
+
+func TestIntegration_GetBillingPricing(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	w := do(r, "GET", "/billing/pricing?team_id="+uuid.New().String(), apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if got := w.Header().Get("Cache-Control"); got != "private, max-age=60" {
+		t.Fatalf("Cache-Control = %q, want private, max-age=60", got)
+	}
+	if got := w.Header().Get("Vary"); got != "X-API-Key" {
+		t.Fatalf("Vary = %q, want X-API-Key", got)
+	}
+
+	body := decodeBillingPricingResponse(t, w)
+	assertPaygPricingResponse(t, body)
+}
+
+func TestIntegration_GetPublicBillingPricing(t *testing.T) {
+	w := do(newRouter(t), "GET", "/billing/pricing/public", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if got := w.Header().Get("Cache-Control"); got != "public, max-age=300, s-maxage=300" {
+		t.Fatalf("Cache-Control = %q, want public, max-age=300, s-maxage=300", got)
+	}
+	if got := w.Header().Get("Vary"); got != "" {
+		t.Fatalf("Vary = %q, want empty", got)
+	}
+
+	body := decodeBillingPricingResponse(t, w)
+	assertPaygPricingResponse(t, body)
+}
+
+func TestIntegration_GetBillingPricingUsesNewestEffectiveRate(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	planKey := "test-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Integration test pricing', 'USD', true)
+	`, planKey); err != nil {
+		t.Fatalf("insert pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'vcpu', 'second', 0.000022, $3),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, now.Add(-3*time.Hour)); err != nil {
+		t.Fatalf("assign pricing plan: %v", err)
+	}
+
+	w := do(newRouter(t), "GET", "/billing/pricing", apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := decodeBillingPricingResponse(t, w)
+	if body.PlanKey != planKey {
+		t.Fatalf("plan_key = %q, want %q", body.PlanKey, planKey)
+	}
+	if len(body.Rates) != 3 {
+		t.Fatalf("rates length = %d, want 3", len(body.Rates))
+	}
+	rates := billingRatesByResource(t, body)
+	assertFloatNear(t, rates["vcpu"].PriceUSD, 0.000022)
+}
+
+func TestIntegration_GetBillingPricingMissingRequiredRateReturns503(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	planKey := "missing-rate-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Missing rate integration pricing', 'USD', true)
+	`, planKey); err != nil {
+		t.Fatalf("insert pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2)
+	`, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert incomplete pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("assign pricing plan: %v", err)
+	}
+
+	w := do(newRouter(t), "GET", "/billing/pricing", apiKey, "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for missing required rate, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetPublicBillingPricingInactivePaygReturns503(t *testing.T) {
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `UPDATE pricing_plan SET active = false WHERE key = 'payg'`); err != nil {
+		t.Fatalf("deactivate payg: %v", err)
+	}
+	defer func() {
+		if _, err := testPool.Exec(context.Background(), `UPDATE pricing_plan SET active = true WHERE key = 'payg'`); err != nil {
+			t.Fatalf("restore payg: %v", err)
+		}
+	}()
+
+	w := do(newRouter(t), "GET", "/billing/pricing/public", "", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for inactive payg pricing, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetBillingPricingInactiveTeamPlanFallsBackToPayg(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	planKey := "inactive-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Inactive integration pricing', 'USD', false)
+	`, planKey); err != nil {
+		t.Fatalf("insert inactive pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000099, $2),
+			($1, 'memory_gib', 'second', 0.000099, $2),
+			($1, 'storage_gib', 'second', 0.000099, $2)
+	`, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("insert inactive pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("assign inactive pricing plan: %v", err)
+	}
+
+	w := do(newRouter(t), "GET", "/billing/pricing", apiKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 fallback to payg, got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := decodeBillingPricingResponse(t, w)
+	assertPaygPricingResponse(t, body)
+}
+
+type billingPricingTestResponse struct {
+	PlanKey  string `json:"plan_key"`
+	PlanName string `json:"plan_name"`
+	Currency string `json:"currency"`
+	Rates    []struct {
+		Resource       string  `json:"resource"`
+		Unit           string  `json:"unit"`
+		PriceUSD       float64 `json:"price_usd"`
+		PriceUSDHourly float64 `json:"price_usd_hourly"`
+	} `json:"rates"`
+}
+
+func decodeBillingPricingResponse(t *testing.T, w *httptest.ResponseRecorder) billingPricingTestResponse {
+	t.Helper()
+	var body billingPricingTestResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse pricing response: %v\nbody: %s", err, w.Body.String())
+	}
+	return body
+}
+
+func assertPaygPricingResponse(t *testing.T, body billingPricingTestResponse) {
+	t.Helper()
+	if body.PlanKey != "payg" {
+		t.Fatalf("plan_key = %q, want payg", body.PlanKey)
+	}
+	if body.PlanName != "Pay-as-you-go" {
+		t.Fatalf("plan_name = %q, want Pay-as-you-go", body.PlanName)
+	}
+	if body.Currency != "USD" {
+		t.Fatalf("currency = %q, want USD", body.Currency)
+	}
+	if len(body.Rates) != 3 {
+		t.Fatalf("rates length = %d, want 3", len(body.Rates))
+	}
+
+	rates := billingRatesByResource(t, body)
+	for resource, want := range map[string]struct {
+		price      float64
+		hourlyRate float64
+	}{
+		"vcpu":        {price: 0.000014, hourlyRate: 0.0504},
+		"memory_gib":  {price: 0.0000045, hourlyRate: 0.0162},
+		"storage_gib": {price: 0.00000003, hourlyRate: 0.000108},
+	} {
+		got, ok := rates[resource]
+		if !ok {
+			t.Fatalf("missing pricing rate for %s", resource)
+		}
+		if got.Unit != "second" {
+			t.Fatalf("%s unit = %q, want second", resource, got.Unit)
+		}
+		assertFloatNear(t, got.PriceUSD, want.price)
+		assertFloatNear(t, got.PriceUSDHourly, want.hourlyRate)
+	}
+}
+
+func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[string]struct {
+	Resource       string
+	Unit           string
+	PriceUSD       float64
+	PriceUSDHourly float64
+} {
+	t.Helper()
+	rates := make(map[string]struct {
+		Resource       string
+		Unit           string
+		PriceUSD       float64
+		PriceUSDHourly float64
+	}, len(body.Rates))
+	for _, rate := range body.Rates {
+		if _, exists := rates[rate.Resource]; exists {
+			t.Fatalf("duplicate pricing rate for %s", rate.Resource)
+		}
+		rates[rate.Resource] = struct {
+			Resource       string
+			Unit           string
+			PriceUSD       float64
+			PriceUSDHourly float64
+		}{
+			Resource:       rate.Resource,
+			Unit:           rate.Unit,
+			PriceUSD:       rate.PriceUSD,
+			PriceUSDHourly: rate.PriceUSDHourly,
+		}
+	}
+	return rates
 }
 
 func TestIntegration_CreateSandbox_Success(t *testing.T) {
