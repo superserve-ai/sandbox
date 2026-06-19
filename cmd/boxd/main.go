@@ -917,16 +917,65 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 
-	f, err := os.Open(path)
+	// Single-file download. The path is attacker-controlled and safePath/os.Stat
+	// above are lexical and symlink-following, so a sandbox can symlink it into the
+	// blocklist (export -> /proc/self/environ) or at a special file (FIFO/device).
+	// Resolve the real path and re-check the blocklist (as the zip/json directory
+	// paths do), then open the resolved file no-follow + non-blocking and re-stat
+	// the fd so only a regular file is served — closing the symlink bypass, the
+	// TOCTOU swap, and the FIFO/device block-or-stream-forever holes.
+	realPath, err := resolveWithinBlocklist(path)
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		} else {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	f, fi, err := openRegularNoFollow(realPath)
+	if err != nil {
+		switch {
+		case os.IsNotExist(err):
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		case errors.Is(err, errNotRegularFile):
+			writeJSONError(w, http.StatusBadRequest, "not a regular file")
+		default:
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 	defer f.Close()
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filepath.Base(path)))
-	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
+	http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
+}
+
+// errNotRegularFile marks a resolved download target that is not a regular file
+// (a directory, FIFO, socket, or device node).
+var errNotRegularFile = errors.New("not a regular file")
+
+// openRegularNoFollow opens an already-resolved, blocklist-checked path for
+// reading without following a final-component symlink (O_NOFOLLOW) and without
+// blocking on a FIFO (O_NONBLOCK), then confirms via fstat that the opened
+// descriptor is a regular file. This closes the time-of-check/time-of-use window
+// between symlink resolution and open (a swap to a symlink fails with ELOOP) and
+// refuses special files a hostile sandbox may have staged.
+func openRegularNoFollow(realPath string) (*os.File, os.FileInfo, error) {
+	f, err := os.OpenFile(realPath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, errNotRegularFile
+	}
+	return f, fi, nil
 }
 
 // serveDirAsJSON writes a one-level JSON listing of dirPath's entries. It is the
@@ -1032,12 +1081,21 @@ var errZipLimit = errors.New("archive size limit exceeded")
 // returning errZipLimit so an oversized archive aborts instead of streaming
 // indefinitely.
 type cappedWriter struct {
-	w     io.Writer
-	n     int64
-	limit int64
+	w      io.Writer
+	n      int64
+	limit  int64
+	sealed bool
 }
 
 func (c *cappedWriter) Write(p []byte) (int, error) {
+	// Once sealed, pass writes through unbounded so zip.Writer.Close can flush a
+	// valid central directory even after the byte cap tripped mid-file. Without
+	// this the deferred Close's own writes also fail with errZipLimit, the
+	// end-of-central-directory record is never written, and the archive is a
+	// corrupt byte stream most unzip clients reject outright.
+	if c.sealed {
+		return c.w.Write(p)
+	}
 	if c.n >= c.limit {
 		return 0, errZipLimit
 	}
@@ -1051,6 +1109,11 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 	c.n += int64(n)
 	return n, err
 }
+
+// seal lets the zip writer's final flush (the central directory and
+// end-of-central-directory record) through after the byte cap has been reached,
+// so a size-capped archive is still a valid zip rather than a corrupt stream.
+func (c *cappedWriter) seal() { c.sealed = true }
 
 // serveDirAsZip streams a ZIP archive of dirPath's contents. Entry names are
 // relative to dirPath and prefixed with its base name, so the archive expands
@@ -1140,7 +1203,11 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 	// total output bytes; entryCount caps the entry count in the walk below.
 	cw := &cappedWriter{w: w, limit: maxZipBytes}
 	zw := zip.NewWriter(cw)
+	// Deferred LIFO: cw.seal() runs first so the byte cap stops blocking, then
+	// zw.Close() flushes the central directory — yielding a valid (if truncated)
+	// archive instead of a corrupt stream when the cap tripped mid-file.
 	defer zw.Close()
+	defer cw.seal()
 	entryCount := 0
 
 	// Walking root.FS() confines traversal to the tree and never follows

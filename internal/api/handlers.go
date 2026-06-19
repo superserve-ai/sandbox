@@ -1919,6 +1919,19 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 // Sandbox Files
 // ---------------------------------------------------------------------------
 
+// hasDotDotSegment reports whether any slash-separated component of p is exactly
+// "..". A plain strings.Contains(p, "..") is too aggressive — it rejects
+// legitimate names like "hello..world" — while the real concern is a ".." path
+// segment that could traverse upward.
+func hasDotDotSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 // ListSandboxFiles returns a one-level listing of a directory inside the
 // sandbox: GET /sandboxes/:sandbox_id/files?path=/abs/dir. Listing is metadata,
 // so it goes through the control plane (boxd FilesystemService.ListDir via vmd)
@@ -1936,7 +1949,7 @@ func (h *Handlers) ListSandboxFiles(c *gin.Context) {
 	if path == "" {
 		path = "/"
 	}
-	if !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
+	if !strings.HasPrefix(path, "/") || hasDotDotSegment(path) {
 		respondErrorMsg(c, "bad_request", "path must be absolute and free of '..' segments.", http.StatusBadRequest)
 		return
 	}

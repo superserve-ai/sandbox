@@ -584,3 +584,84 @@ func TestCappedWriter(t *testing.T) {
 		t.Errorf("post-limit err = %v, want errZipLimit", err)
 	}
 }
+
+// #114 (awille): the single-file download path must not follow a sandbox symlink
+// into the blocklist. export -> /dev/null passes safePath's lexical check, but
+// resolving the real path and re-applying the blocklist must refuse it before any
+// bytes stream — the zip path was hardened, this sibling path must match.
+func TestFileDownload_File_SymlinkToBlocklistRefused(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "export")
+	if err := os.Symlink("/dev/null", link); err != nil {
+		t.Skipf("symlinks unsupported on this platform: %v", err)
+	}
+	w := zipFilesGet(t, link, "")
+	if w.Code == http.StatusOK {
+		t.Fatalf("single-file download followed a symlink into the blocklist (status %d); body %q", w.Code, w.Body.String())
+	}
+}
+
+// #114 (awille): a single-file download of a FIFO/special file must be refused,
+// not block forever or stream endlessly. O_NONBLOCK on the open plus a
+// regular-file fstat check close that hole.
+func TestFileDownload_File_SpecialFileRefused(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Skipf("mkfifo unsupported on this platform: %v", err)
+	}
+	// Must complete (not block on the FIFO) and must not serve it.
+	w := zipFilesGet(t, fifo, "")
+	if w.Code == http.StatusOK {
+		t.Fatalf("single-file download served a non-regular file (status %d); want refusal", w.Code)
+	}
+}
+
+// The hardening must not over-block: a legitimate symlink to the user's own
+// regular file is still followed and served.
+func TestFileDownload_File_SymlinkToRegularFollowed(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.txt")
+	if err := os.WriteFile(real, []byte("hello via link"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unsupported on this platform: %v", err)
+	}
+	w := zipFilesGet(t, link, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (legit symlink should be served); body %q", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "hello via link" {
+		t.Errorf("body = %q, want %q", got, "hello via link")
+	}
+}
+
+// #114 (Pavitra): when the byte cap trips the archive must still be a valid zip
+// (central directory + end-of-central-directory record present), not a corrupt
+// stream. cappedWriter.seal() lets zw.Close flush the directory after the cap;
+// before the fix zip.NewReader rejected the body outright.
+func TestFileDownload_Zip_ByteCapValidArchive(t *testing.T) {
+	orig := maxZipBytes
+	maxZipBytes = 64
+	defer func() { maxZipBytes = orig }()
+
+	dir := t.TempDir()
+	// Header + data + central directory exceed the 64-byte cap, so the archive is
+	// truncated mid-stream.
+	if err := os.WriteFile(filepath.Join(dir, "big.dat"), bytes.Repeat([]byte("x"), 5000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := zipFilesGet(t, dir, "zip")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	zr, err := zip.NewReader(bytes.NewReader(w.Body.Bytes()), int64(w.Body.Len()))
+	if err != nil {
+		t.Fatalf("byte-capped archive is not a valid zip: %v (body %d bytes)", err, w.Body.Len())
+	}
+	if len(zr.File) == 0 {
+		t.Errorf("byte-capped archive has no central-directory entries")
+	}
+}
