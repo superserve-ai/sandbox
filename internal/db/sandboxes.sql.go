@@ -225,23 +225,25 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 }
 
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
-WITH expired AS (
-  SELECT id, team_id, name, snapshot_id, host_id
-  FROM sandbox
-  WHERE destroyed_at IS NULL
-    AND timeout_seconds IS NOT NULL
-    AND status = 'active'
-    AND (
-      SELECT max(sai.started_at) FROM sandbox_active_interval sai
-      WHERE sai.sandbox_id = sandbox.id AND sai.ended_at IS NULL
-    ) + (timeout_seconds || ' seconds')::interval < now()
-    AND (
-      SELECT max(sai.started_at) FROM sandbox_active_interval sai
-      WHERE sai.sandbox_id = sandbox.id AND sai.ended_at IS NULL
-    ) < now() - interval '60 seconds'
-  ORDER BY created_at ASC
+WITH open_sessions AS (
+  -- Current session start per sandbox: the open interval, computed once.
+  SELECT sandbox_id, max(started_at) AS session_start
+  FROM sandbox_active_interval
+  WHERE ended_at IS NULL
+  GROUP BY sandbox_id
+),
+expired AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  LEFT JOIN open_sessions os ON os.sandbox_id = s.id
+  WHERE s.destroyed_at IS NULL
+    AND s.timeout_seconds IS NOT NULL
+    AND s.status = 'active'
+    AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
+    AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
+  ORDER BY s.created_at ASC
   LIMIT $1
-  FOR UPDATE SKIP LOCKED
+  FOR UPDATE OF s SKIP LOCKED
 ),
 paused AS (
   UPDATE sandbox
@@ -282,21 +284,20 @@ type ClaimExpiredSandboxesRow struct {
 	HostID     string      `json:"host_id"`
 }
 
-// Atomically claims active sandboxes whose timeout window has elapsed and marks
-// them as 'pausing'. FOR UPDATE SKIP LOCKED lets concurrent reaper replicas
-// skip rows already being processed, so multi-replica Cloud Run deployments
-// do not double-process the same sandbox.
+// Atomically claims active sandboxes past their timeout and marks them 'pausing'.
+// FOR UPDATE OF s SKIP LOCKED lets concurrent reaper replicas skip in-flight rows.
 //
-// The timeout window is measured from the start of the current active session
-// (the open sandbox_active_interval row, which is re-opened on every resume),
-// not from created_at. So each resume re-arms the full timeout_seconds window:
-// a sandbox resumed after pausing gets a fresh window instead of being claimed
-// again immediately on a deadline that already elapsed.
+// timeout_seconds bounds an active session, not total lifetime, so the window is
+// anchored on the current session start (the open sandbox_active_interval row,
+// reopened on resume) — each resume re-arms it. Anchoring on created_at would
+// instead keep a sandbox that ever exceeded its timeout permanently eligible.
 //
-// Only 'active' sandboxes are claimed — paused sandboxes are already stopped,
-// and transient states (starting, pausing) are skipped to avoid racing with
-// in-progress operations. The 60-second grace window prevents reaping a sandbox
-// that was just resumed (or created) with a very short timeout before it settles.
+// COALESCE falls back to created_at when interval bookkeeping (best-effort) leaves
+// an active sandbox with no open interval; otherwise the NULL comparison would
+// silently exempt it from the timeout.
+//
+// Only 'active' rows are eligible; the 60s grace floor spares freshly started or
+// resumed sandboxes with very short timeouts.
 func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]ClaimExpiredSandboxesRow, error) {
 	rows, err := q.db.Query(ctx, claimExpiredSandboxes, limit)
 	if err != nil {
