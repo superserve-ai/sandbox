@@ -33,6 +33,7 @@ type stubVMD struct {
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
+	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
 }
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
@@ -70,6 +71,12 @@ func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath 
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
 func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {
+	return nil, nil
+}
+func (s *stubVMD) ListDir(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error) {
+	if s.listDirFn != nil {
+		return s.listDirFn(ctx, id, path)
+	}
 	return nil, nil
 }
 func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, denied, domains []string) error {
@@ -266,6 +273,7 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	r.POST("/sandboxes/:sandbox_id/activate", h.ActivateSandbox)
 	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
+	r.GET("/sandboxes/:sandbox_id/files", h.ListSandboxFiles)
 	return r
 }
 
@@ -1920,5 +1928,131 @@ func TestFailSandboxAfterBootDestroysOnSandboxHost(t *testing.T) {
 	}
 	if defaultDestroyed != "" {
 		t.Errorf("default client must not destroy; got %q", defaultDestroyed)
+	}
+}
+
+func TestListSandboxFiles_Success(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+
+	var gotPath string
+	vmd := &stubVMD{
+		listDirFn: func(_ context.Context, id, path string) ([]vmdclient.DirEntry, error) {
+			gotPath = path
+			if id != sandboxID.String() {
+				t.Errorf("ListDir id = %q, want %q", id, sandboxID)
+			}
+			return []vmdclient.DirEntry{
+				{Name: "src", IsDir: true, Size: 4096, ModifiedUnix: 1700000000},
+				{Name: "readme.md", IsDir: false, Size: 12, ModifiedUnix: 0},
+			}, nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandboxID.String()+"/files?path=/home/user", nil)
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if gotPath != "/home/user" {
+		t.Errorf("ListDir path = %q, want %q", gotPath, "/home/user")
+	}
+	body := parseJSON(t, w)
+	entries, ok := body["entries"].([]any)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("entries = %v, want 2 items", body["entries"])
+	}
+	first := entries[0].(map[string]any)
+	if first["name"] != "src" || first["is_dir"] != true {
+		t.Errorf("first entry = %v, want src/dir", first)
+	}
+	if first["modified_unix"] != float64(1700000000) {
+		t.Errorf("modified_unix = %v, want 1700000000", first["modified_unix"])
+	}
+}
+
+// A missing directory must surface as 404, never 410 Gone: listing must not
+// mistake a boxd "not found" for a dead VM and mark the sandbox failed.
+func TestListSandboxFiles_NotFoundIsNotFatal(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{
+		listDirFn: func(context.Context, string, string) ([]vmdclient.DirEntry, error) {
+			return nil, status.Error(codes.NotFound, "directory not found")
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandboxID.String()+"/files?path=/nope", nil)
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (a missing dir must be 404, not 410 Gone); body: %s", w.Code, http.StatusNotFound, w.Body.String())
+	}
+}
+
+func TestListSandboxFiles_PathTraversalRejected(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+
+	var listCalled bool
+	vmd := &stubVMD{
+		listDirFn: func(context.Context, string, string) ([]vmdclient.DirEntry, error) {
+			listCalled = true
+			return nil, nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandboxID.String()+"/files?path=/a/../b", nil)
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if listCalled {
+		t.Error("ListDir should not be called for a traversal path")
 	}
 }

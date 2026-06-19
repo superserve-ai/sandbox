@@ -44,6 +44,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
 		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 
+		// Directory listing (metadata) flows through the control plane via
+		// boxd's FilesystemService.ListDir, so it works on every sandbox
+		// regardless of boxd version. Paused sandboxes are resumed transparently.
+		api.GET("/sandboxes/:sandbox_id/files", h.ListSandboxFiles)
+
 		// Template lifecycle. Builds run async via the build supervisor;
 		// the POST /templates/:id/builds endpoint just enqueues a row.
 		api.GET("/templates", h.ListTemplates)

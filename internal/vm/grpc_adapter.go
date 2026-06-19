@@ -210,6 +210,25 @@ func (a *GRPCAdapter) ListBuildArtifacts(ctx context.Context, req *vmdpb.ListBui
 	return resp, nil
 }
 
+// ListDir lists a directory inside a running VM via boxd's
+// FilesystemService.ListDir (see Manager.ListDir).
+func (a *GRPCAdapter) ListDir(ctx context.Context, req *vmdpb.ListDirRequest) (*vmdpb.ListDirResponse, error) {
+	entries, err := a.mgr.ListDir(ctx, req.GetVmId(), req.GetPath())
+	if err != nil {
+		return nil, err
+	}
+	resp := &vmdpb.ListDirResponse{Entries: make([]*vmdpb.ListDirEntry, 0, len(entries))}
+	for _, e := range entries {
+		resp.Entries = append(resp.Entries, &vmdpb.ListDirEntry{
+			Name:         e.Name,
+			IsDir:        e.IsDir,
+			Size:         e.Size,
+			ModifiedUnix: e.ModifiedUnix,
+		})
+	}
+	return resp, nil
+}
+
 // DeleteBuildArtifacts removes a single build's subdir under a template.
 func (a *GRPCAdapter) DeleteBuildArtifacts(ctx context.Context, req *vmdpb.DeleteBuildArtifactsRequest) (*vmdpb.DeleteBuildArtifactsResponse, error) {
 	tplID := req.GetTemplateId()

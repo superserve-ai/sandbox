@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,6 +14,10 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"connectrpc.com/connect"
+
+	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
 // zipFilesGet drives a GET /files request through the real handleFiles entry
@@ -397,6 +402,43 @@ func TestFileDownload_JSON_ModifiedUnixPopulated(t *testing.T) {
 	}
 	if listing.Entries[0].ModifiedUnix <= 0 {
 		t.Errorf("modified_unix = %d, want a positive unix timestamp", listing.Entries[0].ModifiedUnix)
+	}
+}
+
+// The gRPC FilesystemService.ListDir is the control plane's backward-compatible
+// listing path (reached via vmd on every sandbox, regardless of boxd version).
+// It returns a non-recursive listing with name/is_dir/size and a populated
+// modified_unix.
+func TestFilesystemService_ListDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &filesystemService{}
+	resp, err := svc.ListDir(context.Background(), connect.NewRequest(&pb.ListDirRequest{Path: dir}))
+	if err != nil {
+		t.Fatalf("ListDir: %v", err)
+	}
+
+	byName := map[string]*pb.FileEntry{}
+	for _, e := range resp.Msg.GetEntries() {
+		byName[e.GetName()] = e
+	}
+	if len(byName) != 2 {
+		t.Fatalf("got %d entries, want 2: %+v", len(byName), resp.Msg.GetEntries())
+	}
+	if a := byName["a.txt"]; a == nil || a.GetIsDir() || a.GetSize() != 3 {
+		t.Errorf("a.txt = %+v, want {is_dir:false size:3}", a)
+	}
+	if s := byName["sub"]; s == nil || !s.GetIsDir() {
+		t.Errorf("sub = %+v, want is_dir:true", s)
+	}
+	if a := byName["a.txt"]; a != nil && a.GetModifiedUnix() <= 0 {
+		t.Errorf("a.txt modified_unix = %d, want > 0", a.GetModifiedUnix())
 	}
 }
 

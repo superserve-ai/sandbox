@@ -1916,6 +1916,68 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox Files
+// ---------------------------------------------------------------------------
+
+// ListSandboxFiles returns a one-level listing of a directory inside the
+// sandbox: GET /sandboxes/:sandbox_id/files?path=/abs/dir. Listing is metadata,
+// so it goes through the control plane (boxd FilesystemService.ListDir via vmd)
+// rather than the data-plane /files byte-transfer endpoint. That makes it work
+// on every sandbox regardless of boxd version — the backward-compatible path
+// for sandboxes whose boxd predates the data-plane ?format=json handler. Paused
+// sandboxes are resumed transparently, the same as exec.
+func (h *Handlers) ListSandboxFiles(c *gin.Context) {
+	sandbox := h.loadActiveOrResumeSandbox(c)
+	if sandbox == nil {
+		return
+	}
+
+	path := c.Query("path")
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
+		respondErrorMsg(c, "bad_request", "path must be absolute and free of '..' segments.", http.StatusBadRequest)
+		return
+	}
+
+	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for list-dir failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	entries, err := vmd.ListDir(c.Request.Context(), sandbox.ID.String(), path)
+	if err != nil {
+		// A missing directory (boxd NotFound) is a 404, never a gone VM: boxd
+		// replying at all means the VM is alive, so we must not mark it failed.
+		if isDirNotFound(err) {
+			respondErrorMsg(c, "not_found", "Folder not found.", http.StatusNotFound)
+			return
+		}
+		if isVMDInvalidArgument(err) {
+			respondErrorMsg(c, "bad_request", "Path is not a listable directory.", http.StatusBadRequest)
+			return
+		}
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD ListDir failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	out := make([]gin.H, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, gin.H{
+			"name":          e.Name,
+			"is_dir":        e.IsDir,
+			"size":          e.Size,
+			"modified_unix": e.ModifiedUnix,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"entries": out})
+}
+
+// ---------------------------------------------------------------------------
 // Sandbox Patch
 // ---------------------------------------------------------------------------
 

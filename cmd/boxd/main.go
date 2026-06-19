@@ -764,13 +764,16 @@ func (s *filesystemService) ListDir(ctx context.Context, req *connect.Request[pb
 	for _, e := range entries {
 		info, _ := e.Info()
 		size := int64(0)
+		var modUnix int64
 		if info != nil {
 			size = info.Size()
+			modUnix = info.ModTime().Unix()
 		}
 		result = append(result, &pb.FileEntry{
-			Name:  e.Name(),
-			IsDir: e.IsDir(),
-			Size:  size,
+			Name:         e.Name(),
+			IsDir:        e.IsDir(),
+			Size:         size,
+			ModifiedUnix: modUnix,
 		})
 	}
 

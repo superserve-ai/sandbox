@@ -419,6 +419,23 @@ func (c *grpcVMDClient) ListBuildArtifacts(ctx context.Context) ([]vmdclient.Bui
 	return out, nil
 }
 
+func (c *grpcVMDClient) ListDir(ctx context.Context, instanceID, path string) ([]vmdclient.DirEntry, error) {
+	resp, err := c.client.ListDir(ctx, &vmdpb.ListDirRequest{VmId: instanceID, Path: path})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC ListDir: %w", err)
+	}
+	out := make([]vmdclient.DirEntry, 0, len(resp.GetEntries()))
+	for _, e := range resp.GetEntries() {
+		out = append(out, vmdclient.DirEntry{
+			Name:         e.GetName(),
+			IsDir:        e.GetIsDir(),
+			Size:         e.GetSize(),
+			ModifiedUnix: e.GetModifiedUnix(),
+		})
+	}
+	return out, nil
+}
+
 func (c *grpcVMDClient) DeleteBuildArtifacts(ctx context.Context, templateID, buildID string) error {
 	_, err := c.client.DeleteBuildArtifacts(ctx, &vmdpb.DeleteBuildArtifactsRequest{
 		TemplateId: templateID,
