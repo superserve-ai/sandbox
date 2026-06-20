@@ -60,18 +60,18 @@ func TestScanSandboxDirs_UUIDOnly_MergesRoots(t *testing.T) {
 // selectOrphanDirs keeps live and grace-window sandboxes, drops orphans, and
 // ignores dirs newer than the pass snapshot.
 func TestSelectOrphanDirs(t *testing.T) {
-	snapshotTime := time.Unix(1_000_000, 0)
-	old := snapshotTime.Add(-time.Hour)
-	fresh := snapshotTime.Add(time.Hour)
+	cutoff := time.Unix(1_000_000, 0)
+	old := cutoff.Add(-time.Hour)
+	fresh := cutoff.Add(time.Hour)
 
 	onDisk := map[string]sandboxDirInfo{
-		uuidA: {mtime: old},   // not in keep, old → orphan
+		uuidA: {mtime: old},   // not in keep, older than cutoff → orphan
 		uuidB: {mtime: old},   // in keep → kept
-		uuidC: {mtime: fresh}, // not in keep but newer than snapshot → kept
+		uuidC: {mtime: fresh}, // not in keep but within grace (in-flight create) → kept
 	}
 	keep := map[string]struct{}{uuidB: {}}
 
-	got := selectOrphanDirs(onDisk, keep, snapshotTime)
+	got := selectOrphanDirs(onDisk, keep, cutoff)
 	if len(got) != 1 || got[0] != uuidA {
 		t.Fatalf("want [%s], got %v", uuidA, got)
 	}

@@ -155,8 +155,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		return
 	}
 
-	// Captured before any DB read so a dir created after the keep-set query
-	// (mtime > snapshotTime) is never treated as an orphan.
+	// Pass timestamp; the disk scan derives its grace cutoff from it (rows
+	// destroyed within, and dirs touched within, DiskGracePeriod are kept).
 	snapshotTime := time.Now()
 
 	// Source B: active systemd units.
@@ -451,7 +451,7 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 			Msg("disk scan: empty keep-set — reporting all on-disk dirs as orphans (verify before enabling reclamation)")
 	}
 
-	orphans := selectOrphanDirs(onDisk, keep, snapshotTime)
+	orphans := selectOrphanDirs(onDisk, keep, cutoff)
 	if len(orphans) == 0 {
 		log.Info().Int("on_disk", len(onDisk)).Msg("disk scan: no orphan dirs")
 		return
@@ -491,15 +491,17 @@ func liveKeepSet(rows map[string]db.ListSandboxesByHostRow, cutoff time.Time) ma
 }
 
 // selectOrphanDirs returns the sandbox UUIDs whose on-disk dirs have no live or
-// within-grace row and whose newest mtime predates this pass's snapshot. Pure:
-// no DB or filesystem access.
-func selectOrphanDirs(onDisk map[string]sandboxDirInfo, keep map[string]struct{}, snapshotTime time.Time) []string {
+// within-grace row AND whose newest mtime is older than cutoff. The mtime age
+// grace keeps an in-flight create — whose rundir exists before its DB INSERT
+// commits, so it has no visible row yet — from being flagged as an orphan.
+// Pure: no DB or filesystem access.
+func selectOrphanDirs(onDisk map[string]sandboxDirInfo, keep map[string]struct{}, cutoff time.Time) []string {
 	var orphans []string
 	for id, info := range onDisk {
 		if _, live := keep[id]; live {
 			continue
 		}
-		if info.mtime.After(snapshotTime) {
+		if info.mtime.After(cutoff) {
 			continue
 		}
 		orphans = append(orphans, id)
