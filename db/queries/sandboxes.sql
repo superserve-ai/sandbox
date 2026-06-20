@@ -116,16 +116,21 @@ UPDATE sandbox
 SET snapshot_id = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
--- name: DestroySandbox :exec
--- Atomic soft-delete AND close of any open sandbox_active_interval row, so
--- a crash/timeout after the destroy can't leave an open interval that
--- causes weekly_user_metrics to count the actor as active forever. If the
--- WHERE clause matches 0 rows (already-deleted sandbox), the close CTE
--- also matches 0 rows via the empty `destroyed` subquery → no-op.
+-- name: DestroySandbox :one
+-- Atomic, guarded soft-delete that claims the sandbox for deletion ONLY from a
+-- quiescent state (active/paused/failed) — never mid-transition. This is the
+-- serialization point against a concurrent resume/pause: this CAS and resume's
+-- BeginResume both target the same row, so only one wins. Also closes any open
+-- billing/active intervals so a crash after the destroy can't leave an interval
+-- open (which would have weekly_user_metrics count the actor active forever).
+-- Returns the claimed id; 0 rows means the sandbox was already deleted or is in
+-- a transitional state (resuming/pausing/starting) — the caller distinguishes
+-- the two with a re-read.
 WITH destroyed AS (
   UPDATE sandbox
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+    AND sandbox.status IN ('active', 'paused', 'failed')
   RETURNING id
 ),
 closed_compute AS (
@@ -141,11 +146,15 @@ closed_billing_compute AS (
   WHERE sandbox_id IN (SELECT id FROM destroyed)
     AND ended_at IS NULL
   RETURNING sandbox_id
+),
+closed_storage AS (
+  UPDATE sandbox_storage_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
+  WHERE sandbox_id IN (SELECT id FROM destroyed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_storage_interval
-SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
-WHERE sandbox_id IN (SELECT id FROM destroyed)
-  AND ended_at IS NULL;
+SELECT id FROM destroyed;
 
 -- name: SandboxExists :one
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
