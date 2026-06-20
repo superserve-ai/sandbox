@@ -410,9 +410,8 @@ type sandboxDirInfo struct {
 }
 
 // detectDiskOrphans implements Drift 6 in detect-only mode: it logs the
-// per-sandbox dirs it would reclaim and deletes nothing. Fail-closed — without
-// a DB keep-set it does nothing — and it aborts when the keep-set is empty
-// against a non-empty disk, which is almost always a query bug.
+// per-sandbox dirs it would reclaim and deletes nothing. Fail-closed: without
+// a DB keep-set it does nothing.
 func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Time, dbSandboxes map[string]db.ListSandboxesByHostRow) {
 	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_scan").Logger()
 
@@ -445,10 +444,8 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		keep[id.String()] = struct{}{}
 	}
 
-	// An empty keep-set is suspicious — a query bug would also produce it — but
-	// a drained or all-failed host is a legitimate all-orphan case, and
-	// detect-only reporting is harmless. Flag it loudly and still report; the
-	// empty-set guard that aborts belongs on the reclamation step, not here.
+	// A drained or all-failed host legitimately has an empty keep-set; report it
+	// (detect-only is harmless). The hard abort-guard belongs on reclamation.
 	if len(keep) == 0 {
 		log.Warn().Int("on_disk", len(onDisk)).
 			Msg("disk scan: empty keep-set — reporting all on-disk dirs as orphans (verify before enabling reclamation)")
@@ -480,10 +477,8 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		Msg("disk scan (detect-only): orphan per-sandbox dirs would be reclaimed")
 }
 
-// liveKeepSet returns the sandbox IDs whose on-disk dirs must be kept: every
-// host row except terminally-failed ones whose failure settled before cutoff
-// (those can never be resumed, so their dirs are reclaimable). Pure: no DB or
-// filesystem access.
+// liveKeepSet returns the sandbox IDs to keep: every host row except
+// terminally-failed ones settled before cutoff (those can't be resumed). Pure.
 func liveKeepSet(rows map[string]db.ListSandboxesByHostRow, cutoff time.Time) map[string]struct{} {
 	keep := make(map[string]struct{}, len(rows))
 	for id, row := range rows {
