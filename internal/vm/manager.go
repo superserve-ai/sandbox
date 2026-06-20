@@ -462,6 +462,13 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
+	// vmID names the rundir/snapshot dir and the systemd unit. Reject non-leaf
+	// values up front: cleanup runs even without an in-memory instance, so an
+	// empty or "../"-bearing id would let os.RemoveAll escape RunDir.
+	if !isLeafName(vmID) {
+		return status.Error(codes.InvalidArgument, "vm_id must be a non-empty path-safe identifier")
+	}
+
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
 	// that: unit stop and rundir removal are derivable from vmID and must run, or
 	// destroying a paused sandbox leaks its rundir. Process/socket teardown needs
@@ -1372,10 +1379,21 @@ func (m *Manager) createOverlay(dirName, basePath string) (string, error) {
 }
 
 func (m *Manager) cleanupRunDir(dirName string) {
+	if !isLeafName(dirName) {
+		m.log.Error().Str("dir", dirName).Msg("refusing to remove unsafe rundir name")
+		return
+	}
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.RemoveAll(vmDir); err != nil {
 		m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to remove rundir")
 	}
+}
+
+// isLeafName reports whether s is safe as a single path element under a managed
+// directory — non-empty, not "."/"..", and free of separators — so callers
+// cannot escape that directory via filepath.Join + os.RemoveAll.
+func isLeafName(s string) bool {
+	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, `/\`)
 }
 
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore

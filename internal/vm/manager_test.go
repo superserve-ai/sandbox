@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
 )
@@ -345,6 +347,34 @@ func TestDestroyVM_AbsentInstance_CleansRundir(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("rundir %s still present after DestroyVM — leaked", dir)
+	}
+}
+
+// TestDestroyVM_UnsafeVMID_Rejected: a non-path-safe vmID must be rejected
+// before any cleanup runs, so os.RemoveAll can't escape RunDir.
+func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
+	runDir := t.TempDir()
+	sentinel := filepath.Join(runDir, "keep")
+	if err := os.MkdirAll(sentinel, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	mgr := &Manager{
+		cfg:    ManagerConfig{RunDir: runDir},
+		netMgr: &network.Manager{},
+		log:    zerolog.Nop(),
+	}
+
+	for _, vmID := range []string{"", ".", "..", "../escape", "a/b"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := mgr.DestroyVM(ctx, vmID, true)
+		cancel()
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("DestroyVM(%q): want InvalidArgument, got %v", vmID, err)
+		}
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("RunDir contents removed by an unsafe vmID: %v", err)
 	}
 }
 
