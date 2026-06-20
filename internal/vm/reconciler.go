@@ -398,7 +398,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		every = 1
 	}
 	if r.cfg.DiskScanEnabled && r.passCount%uint64(every) == 0 {
-		r.detectDiskOrphans(ctx, snapshotTime, dbSandboxes)
+		r.detectDiskOrphans(ctx, snapshotTime, dbSandboxes, active)
 	}
 }
 
@@ -412,7 +412,7 @@ type sandboxDirInfo struct {
 // detectDiskOrphans implements Drift 6 in detect-only mode: it logs the
 // per-sandbox dirs it would reclaim and deletes nothing. Fail-closed: without
 // a DB keep-set it does nothing.
-func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Time, dbSandboxes map[string]db.ListSandboxesByHostRow) {
+func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Time, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool) {
 	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_scan").Logger()
 
 	if r.cfg.DB == nil || r.cfg.HostID == "" || dbSandboxes == nil {
@@ -427,7 +427,10 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		return
 	}
 
-	// Keep-set: live rows plus rows destroyed within the grace window.
+	// Keep-set: live rows, rows destroyed within the grace window, and any VM
+	// with an active systemd unit (a running VM whose DB row is momentarily
+	// missing — Drift 3 grace, rate limit, or a failed stop — must not be
+	// flagged).
 	cutoff := snapshotTime.Add(-r.cfg.DiskGracePeriod)
 	keep := liveKeepSet(dbSandboxes, cutoff)
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
@@ -442,6 +445,9 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	}
 	for _, id := range recent {
 		keep[id.String()] = struct{}{}
+	}
+	for id := range active {
+		keep[id] = struct{}{}
 	}
 
 	// A drained or all-failed host legitimately has an empty keep-set; report it
