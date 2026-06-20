@@ -481,12 +481,12 @@ paths:
       tags: [Files]
       summary: List a directory inside a sandbox
       description: |
-        Returns a one-level listing of a directory inside the sandbox. Listing
-        is metadata served through the control plane (boxd's
-        FilesystemService.ListDir), so it works on every sandbox regardless of
-        its boxd version. A paused sandbox is resumed automatically before the
-        listing and stays active afterward. `modified_unix` is 0 for entries on
-        sandboxes whose boxd predates that field.
+        Returns a one-level listing of a directory inside the sandbox. The
+        listing is served through the control plane, so it works on every
+        sandbox regardless of when it was created. A paused sandbox is resumed
+        automatically before the listing and stays active afterward.
+        `modified_unix` is 0 for entries on older sandboxes that predate that
+        field.
       security:
         - apiKey: []
       parameters:
@@ -1486,7 +1486,7 @@ components:
         modified_unix:
           type: integer
           format: int64
-          description: Modification time (Unix seconds). 0 when the sandbox's boxd predates this field.
+          description: Modification time (Unix seconds). 0 on older sandboxes that predate this field.
 
     ExecRequest:
       type: object
