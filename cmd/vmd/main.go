@@ -463,6 +463,7 @@ func main() {
 	reconcilerCfg := vm.DefaultReconcilerConfig()
 	reconcilerCfg.HostID = cfg.HostID
 	reconcilerCfg.DB = reconcilerDB
+	reconcilerCfg.DiskScanEnabled = envOrDefault("VMD_DISK_SCAN", "true") != "false"
 	reconciler := vm.NewReconciler(mgr, reconcilerCfg)
 	lc.start("reconciler", func() error { reconciler.Run(ctx); return nil })
 

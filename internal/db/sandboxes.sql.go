@@ -705,6 +705,42 @@ func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 	return items, nil
 }
 
+const listRecentlyDestroyedSandboxIDsByHost = `-- name: ListRecentlyDestroyedSandboxIDsByHost :many
+SELECT id
+FROM sandbox
+WHERE host_id = $1
+  AND destroyed_at IS NOT NULL
+  AND destroyed_at > $2
+`
+
+type ListRecentlyDestroyedSandboxIDsByHostParams struct {
+	HostID         string             `json:"host_id"`
+	DestroyedAfter pgtype.Timestamptz `json:"destroyed_after"`
+}
+
+// Used by the VMD disk reconciler so a sandbox destroyed within the grace
+// window — whose on-disk cleanup may still be in flight — is kept out of the
+// orphan set rather than raced.
+func (q *Queries) ListRecentlyDestroyedSandboxIDsByHost(ctx context.Context, arg ListRecentlyDestroyedSandboxIDsByHostParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listRecentlyDestroyedSandboxIDsByHost, arg.HostID, arg.DestroyedAfter)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
 SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, snap.path AS snapshot_path
 FROM sandbox s

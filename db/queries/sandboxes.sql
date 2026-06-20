@@ -158,6 +158,16 @@ FROM sandbox s
 LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
 
+-- name: ListRecentlyDestroyedSandboxIDsByHost :many
+-- Used by the VMD disk reconciler so a sandbox destroyed within the grace
+-- window — whose on-disk cleanup may still be in flight — is kept out of the
+-- orphan set rather than raced.
+SELECT id
+FROM sandbox
+WHERE host_id = sqlc.arg(host_id)
+  AND destroyed_at IS NOT NULL
+  AND destroyed_at > sqlc.arg(destroyed_after);
+
 -- name: MarkSandboxFailed :exec
 -- Used by the reconciler to mark a sandbox failed when VMD detects it is
 -- actually gone. No team_id filter — the reconciler runs with host scope,
