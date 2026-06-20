@@ -1398,7 +1398,7 @@ func isLeafName(s string) bool {
 // isReservedRunDirName reports whether name is a shared dir under RunDir
 // (template mount target, build tree) rather than a per-VM dir.
 func isReservedRunDirName(name string) bool {
-	return name == templateDirName || name == TemplatesDirName || strings.HasPrefix(name, "build-")
+	return name == templateDirName || name == TemplatesDirName
 }
 
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore

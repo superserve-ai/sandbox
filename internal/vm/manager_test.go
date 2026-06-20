@@ -354,7 +354,7 @@ func TestDestroyVM_AbsentInstance_CleansRundir(t *testing.T) {
 // rejected before cleanup, so it can't escape RunDir or wipe shared dirs.
 func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
 	runDir := t.TempDir()
-	shared := []string{"keep", templateDirName, TemplatesDirName, "build-tmpl1"}
+	shared := []string{"keep", templateDirName, TemplatesDirName}
 	for _, name := range shared {
 		if err := os.MkdirAll(filepath.Join(runDir, name), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", name, err)
@@ -367,7 +367,7 @@ func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
 		log:    zerolog.Nop(),
 	}
 
-	rejected := []string{"", ".", "..", "../escape", "a/b", templateDirName, TemplatesDirName, "build-tmpl1"}
+	rejected := []string{"", ".", "..", "../escape", "a/b", templateDirName, TemplatesDirName}
 	for _, vmID := range rejected {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := mgr.DestroyVM(ctx, vmID, true)
@@ -379,6 +379,16 @@ func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
 	for _, name := range shared {
 		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
 			t.Fatalf("shared dir %q removed by a rejected vmID: %v", name, err)
+		}
+	}
+
+	// Per-VM build/recording ids must remain cleanable, not reserved.
+	for _, vmID := range []string{"build-tmpl1", "build-record-tmpl1"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := mgr.DestroyVM(ctx, vmID, true)
+		cancel()
+		if err != nil {
+			t.Errorf("DestroyVM(%q): want nil, got %v", vmID, err)
 		}
 	}
 }
