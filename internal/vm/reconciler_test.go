@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -77,46 +79,65 @@ func TestSelectOrphanDirs(t *testing.T) {
 	}
 }
 
+// dirSize counts allocated blocks (du-style), not apparent length, so a sparse
+// overlay's huge logical size isn't reported as reclaimable.
 func TestDirSize(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "a"), make([]byte, 100), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "real"), make([]byte, 8192), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sub := filepath.Join(dir, "sub")
-	if err := os.MkdirAll(sub, 0o755); err != nil {
+	// Apparent size 1 GiB, but Truncate allocates no blocks → sparse.
+	f, err := os.Create(filepath.Join(dir, "sparse.ext4"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sub, "b"), make([]byte, 23), 0o600); err != nil {
+	if err := f.Truncate(1 << 30); err != nil {
 		t.Fatal(err)
 	}
-	if got := dirSize(context.Background(), []string{dir}); got != 123 {
-		t.Errorf("dirSize = %d, want 123", got)
+	f.Close()
+
+	got := dirSize(context.Background(), []string{dir})
+	if got == 0 {
+		t.Error("dirSize = 0; the real file's allocated blocks should be counted")
+	}
+	if got >= 1<<30 {
+		t.Errorf("dirSize = %d; want << 1 GiB (sparse apparent size must not be counted)", got)
 	}
 }
 
-// liveKeepSet keeps every status except failures that settled before the
-// cutoff; recently-failed rows stay (grace) so an in-flight cleanup isn't raced.
-func TestLiveKeepSet_ExcludesSettledFailed(t *testing.T) {
+// diskKeepSet is the complete reclaim guard: it must keep a dir live via ANY
+// source — DB row, recently-destroyed grace, or an active unit — and exclude
+// only genuinely-dead ones (settled-failed, and UUIDs in no source at all).
+func TestDiskKeepSet(t *testing.T) {
 	cutoff := time.Unix(1_000_000, 0)
 	row := func(s db.SandboxStatus, updated time.Time) db.ListSandboxesByHostRow {
 		return db.ListSandboxesByHostRow{Sandbox: db.Sandbox{Status: s, UpdatedAt: updated}}
 	}
-	rows := map[string]db.ListSandboxesByHostRow{
-		"active":     row(db.SandboxStatusActive, cutoff.Add(-time.Hour)),
-		"paused":     row(db.SandboxStatusPaused, cutoff.Add(-time.Hour)),
-		"failed-old": row(db.SandboxStatusFailed, cutoff.Add(-time.Hour)), // settled → reclaimable
-		"failed-new": row(db.SandboxStatusFailed, cutoff.Add(time.Hour)),  // within grace → kept
+	const (
+		recentID = "44444444-4444-4444-4444-444444444444" // recently destroyed → kept
+		activeID = "55555555-5555-5555-5555-555555555555" // running unit, no row → kept
+		orphanID = "66666666-6666-6666-6666-666666666666" // in no source → reclaimable
+	)
+	dbSandboxes := map[string]db.ListSandboxesByHostRow{
+		uuidA: row(db.SandboxStatusActive, cutoff.Add(-time.Hour)), // live → kept
+		uuidB: row(db.SandboxStatusPaused, cutoff.Add(-time.Hour)), // live → kept
+		uuidC: row(db.SandboxStatusFailed, cutoff.Add(-time.Hour)), // settled-failed → excluded
+		"new": row(db.SandboxStatusFailed, cutoff.Add(time.Hour)),  // within grace → kept
 	}
+	recent := []uuid.UUID{uuid.MustParse(recentID)}
+	active := map[string]bool{activeID: true}
 
-	keep := liveKeepSet(rows, cutoff)
+	keep := diskKeepSet(dbSandboxes, recent, active, cutoff)
 
-	for _, id := range []string{"active", "paused", "failed-new"} {
+	for _, id := range []string{uuidA, uuidB, "new", recentID, activeID} {
 		if _, ok := keep[id]; !ok {
 			t.Errorf("%s should be in keep-set", id)
 		}
 	}
-	if _, ok := keep["failed-old"]; ok {
-		t.Error("settled-failed sandbox should be excluded from keep-set")
+	for _, id := range []string{uuidC, orphanID} {
+		if _, ok := keep[id]; ok {
+			t.Errorf("%s should NOT be in keep-set (reclaimable)", id)
+		}
 	}
 }
 

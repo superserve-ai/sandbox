@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -427,12 +428,7 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		return
 	}
 
-	// Keep-set: live rows, rows destroyed within the grace window, and any VM
-	// with an active systemd unit (a running VM whose DB row is momentarily
-	// missing — Drift 3 grace, rate limit, or a failed stop — must not be
-	// flagged).
 	cutoff := snapshotTime.Add(-r.cfg.DiskGracePeriod)
-	keep := liveKeepSet(dbSandboxes, cutoff)
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	recent, err := r.cfg.DB.ListRecentlyDestroyedSandboxIDsByHost(qctx, db.ListRecentlyDestroyedSandboxIDsByHostParams{
 		HostID:         r.cfg.HostID,
@@ -443,12 +439,7 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		log.Error().Err(err).Msg("disk scan: recently-destroyed query failed — skipping (fail-closed)")
 		return
 	}
-	for _, id := range recent {
-		keep[id.String()] = struct{}{}
-	}
-	for id := range active {
-		keep[id] = struct{}{}
-	}
+	keep := diskKeepSet(dbSandboxes, recent, active, cutoff)
 
 	// A drained or all-failed host legitimately has an empty keep-set; report it
 	// (detect-only is harmless). The hard abort-guard belongs on reclamation.
@@ -483,14 +474,25 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		Msg("disk scan (detect-only): orphan per-sandbox dirs would be reclaimed")
 }
 
-// liveKeepSet returns the sandbox IDs to keep: every host row except
-// terminally-failed ones settled before cutoff (those can't be resumed). Pure.
-func liveKeepSet(rows map[string]db.ListSandboxesByHostRow, cutoff time.Time) map[string]struct{} {
-	keep := make(map[string]struct{}, len(rows))
-	for id, row := range rows {
+// diskKeepSet is every sandbox UUID whose on-disk dirs must NOT be reclaimed —
+// the union of all signals a dir may be in use: non-destroyed DB rows (minus
+// failures settled before cutoff), rows destroyed within grace, and active
+// systemd units (a running VM whose row is momentarily gone). BoltDB-only UUIDs
+// are excluded on purpose: no row AND no unit means a dead VM (Drift 5's job),
+// so its dir is reclaimable. In-flight creates are caught by the caller's mtime
+// grace, not here. Pure.
+func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid.UUID, active map[string]bool, cutoff time.Time) map[string]struct{} {
+	keep := make(map[string]struct{}, len(dbSandboxes)+len(recent)+len(active))
+	for id, row := range dbSandboxes {
 		if row.Sandbox.Status == db.SandboxStatusFailed && row.Sandbox.UpdatedAt.Before(cutoff) {
 			continue
 		}
+		keep[id] = struct{}{}
+	}
+	for _, id := range recent {
+		keep[id.String()] = struct{}{}
+	}
+	for id := range active {
 		keep[id] = struct{}{}
 	}
 	return keep
@@ -566,8 +568,15 @@ func dirSize(ctx context.Context, paths []string) int64 {
 			if err != nil || d.IsDir() {
 				return nil
 			}
-			if fi, e := d.Info(); e == nil {
-				total += fi.Size()
+			fi, e := d.Info()
+			if e != nil {
+				return nil
+			}
+			// Count allocated blocks (du-style), not apparent length: overlay
+			// images are sparse (createOverlay truncates to the base size), so
+			// fi.Size() would massively overstate the disk a delete frees.
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+				total += st.Blocks * 512 // st_blocks is in 512-byte units
 			}
 			return nil
 		})
