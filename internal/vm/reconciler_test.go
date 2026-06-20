@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 const (
@@ -89,6 +91,32 @@ func TestDirSize(t *testing.T) {
 	}
 	if got := dirSize(context.Background(), []string{dir}); got != 123 {
 		t.Errorf("dirSize = %d, want 123", got)
+	}
+}
+
+// liveKeepSet keeps every status except failures that settled before the
+// cutoff; recently-failed rows stay (grace) so an in-flight cleanup isn't raced.
+func TestLiveKeepSet_ExcludesSettledFailed(t *testing.T) {
+	cutoff := time.Unix(1_000_000, 0)
+	row := func(s db.SandboxStatus, updated time.Time) db.ListSandboxesByHostRow {
+		return db.ListSandboxesByHostRow{Sandbox: db.Sandbox{Status: s, UpdatedAt: updated}}
+	}
+	rows := map[string]db.ListSandboxesByHostRow{
+		"active":     row(db.SandboxStatusActive, cutoff.Add(-time.Hour)),
+		"paused":     row(db.SandboxStatusPaused, cutoff.Add(-time.Hour)),
+		"failed-old": row(db.SandboxStatusFailed, cutoff.Add(-time.Hour)), // settled → reclaimable
+		"failed-new": row(db.SandboxStatusFailed, cutoff.Add(time.Hour)),  // within grace → kept
+	}
+
+	keep := liveKeepSet(rows, cutoff)
+
+	for _, id := range []string{"active", "paused", "failed-new"} {
+		if _, ok := keep[id]; !ok {
+			t.Errorf("%s should be in keep-set", id)
+		}
+	}
+	if _, ok := keep["failed-old"]; ok {
+		t.Error("settled-failed sandbox should be excluded from keep-set")
 	}
 }
 

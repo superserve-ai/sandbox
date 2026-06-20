@@ -429,11 +429,8 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	}
 
 	// Keep-set: live rows plus rows destroyed within the grace window.
-	keep := make(map[string]struct{}, len(dbSandboxes))
-	for id := range dbSandboxes {
-		keep[id] = struct{}{}
-	}
 	cutoff := snapshotTime.Add(-r.cfg.DiskGracePeriod)
+	keep := liveKeepSet(dbSandboxes, cutoff)
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	recent, err := r.cfg.DB.ListRecentlyDestroyedSandboxIDsByHost(qctx, db.ListRecentlyDestroyedSandboxIDsByHostParams{
 		HostID:         r.cfg.HostID,
@@ -478,6 +475,21 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		Int64("orphan_bytes", bytes).
 		Strs("sample", sample).
 		Msg("disk scan (detect-only): orphan per-sandbox dirs would be reclaimed")
+}
+
+// liveKeepSet returns the sandbox IDs whose on-disk dirs must be kept: every
+// host row except terminally-failed ones whose failure settled before cutoff
+// (those can never be resumed, so their dirs are reclaimable). Pure: no DB or
+// filesystem access.
+func liveKeepSet(rows map[string]db.ListSandboxesByHostRow, cutoff time.Time) map[string]struct{} {
+	keep := make(map[string]struct{}, len(rows))
+	for id, row := range rows {
+		if row.Sandbox.Status == db.SandboxStatusFailed && row.Sandbox.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		keep[id] = struct{}{}
+	}
+	return keep
 }
 
 // selectOrphanDirs returns the sandbox UUIDs whose on-disk dirs have no live or
