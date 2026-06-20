@@ -350,13 +350,15 @@ func TestDestroyVM_AbsentInstance_CleansRundir(t *testing.T) {
 	}
 }
 
-// TestDestroyVM_UnsafeVMID_Rejected: a non-path-safe vmID must be rejected
-// before any cleanup runs, so os.RemoveAll can't escape RunDir.
+// TestDestroyVM_UnsafeVMID_Rejected: a non-path-safe or reserved vmID is
+// rejected before cleanup, so it can't escape RunDir or wipe shared dirs.
 func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
 	runDir := t.TempDir()
-	sentinel := filepath.Join(runDir, "keep")
-	if err := os.MkdirAll(sentinel, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	shared := []string{"keep", templateDirName, TemplatesDirName, "build-tmpl1"}
+	for _, name := range shared {
+		if err := os.MkdirAll(filepath.Join(runDir, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
 	}
 
 	mgr := &Manager{
@@ -365,7 +367,8 @@ func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
 		log:    zerolog.Nop(),
 	}
 
-	for _, vmID := range []string{"", ".", "..", "../escape", "a/b"} {
+	rejected := []string{"", ".", "..", "../escape", "a/b", templateDirName, TemplatesDirName, "build-tmpl1"}
+	for _, vmID := range rejected {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := mgr.DestroyVM(ctx, vmID, true)
 		cancel()
@@ -373,8 +376,10 @@ func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
 			t.Errorf("DestroyVM(%q): want InvalidArgument, got %v", vmID, err)
 		}
 	}
-	if _, err := os.Stat(sentinel); err != nil {
-		t.Fatalf("RunDir contents removed by an unsafe vmID: %v", err)
+	for _, name := range shared {
+		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
+			t.Fatalf("shared dir %q removed by a rejected vmID: %v", name, err)
+		}
 	}
 }
 

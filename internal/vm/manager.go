@@ -462,11 +462,10 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
-	// vmID names the rundir/snapshot dir and the systemd unit. Reject non-leaf
-	// values up front: cleanup runs even without an in-memory instance, so an
-	// empty or "../"-bearing id would let os.RemoveAll escape RunDir.
-	if !isLeafName(vmID) {
-		return status.Error(codes.InvalidArgument, "vm_id must be a non-empty path-safe identifier")
+	// Cleanup runs even without an in-memory instance, so a malformed or reserved
+	// vmID could escape RunDir or wipe a shared dir.
+	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
+		return status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
 
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
@@ -1379,8 +1378,8 @@ func (m *Manager) createOverlay(dirName, basePath string) (string, error) {
 }
 
 func (m *Manager) cleanupRunDir(dirName string) {
-	if !isLeafName(dirName) {
-		m.log.Error().Str("dir", dirName).Msg("refusing to remove unsafe rundir name")
+	if !isLeafName(dirName) || isReservedRunDirName(dirName) {
+		m.log.Error().Str("dir", dirName).Msg("refusing to remove unsafe or reserved rundir name")
 		return
 	}
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
@@ -1394,6 +1393,12 @@ func (m *Manager) cleanupRunDir(dirName string) {
 // cannot escape that directory via filepath.Join + os.RemoveAll.
 func isLeafName(s string) bool {
 	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, `/\`)
+}
+
+// isReservedRunDirName reports whether name is a shared dir under RunDir
+// (template mount target, build tree) rather than a per-VM dir.
+func isReservedRunDirName(name string) bool {
+	return name == templateDirName || name == TemplatesDirName || strings.HasPrefix(name, "build-")
 }
 
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
