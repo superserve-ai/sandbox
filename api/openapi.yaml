@@ -472,85 +472,6 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /sandboxes/{sandbox_id}/exec:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-
-    post:
-      operationId: execCommand
-      tags: [Exec]
-      summary: Execute a command inside a sandbox
-      description: |
-        Runs a command inside the sandbox and waits for it to finish, returning
-        stdout, stderr, and exit code. A paused sandbox is resumed automatically
-        before the command runs and stays active afterward.
-      security:
-        - apiKey: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ExecRequest"
-      responses:
-        "200":
-          description: Command executed
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ExecResult"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-  /sandboxes/{sandbox_id}/exec/stream:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-
-    post:
-      operationId: execCommandStream
-      tags: [Exec]
-      summary: Execute a command and stream output via SSE
-      description: |
-        Runs a command and streams stdout/stderr chunks as Server-Sent Events.
-        Each event is a JSON payload. The final event includes `exit_code` and
-        `finished: true`. A paused sandbox is resumed automatically before the
-        command runs and stays active afterward.
-      security:
-        - apiKey: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ExecRequest"
-      responses:
-        "200":
-          description: >
-            SSE stream. Each line starting with `data: ` contains a JSON
-            `ExecStreamEvent`. The final event has `finished: true`.
-          content:
-            text/event-stream:
-              schema:
-                $ref: "#/components/schemas/ExecStreamEvent"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
   /exec/connect:
     servers:
       - url: https://sandbox.superserve.ai
@@ -1496,34 +1417,6 @@ components:
           type: string
           description: Fresh access token; use this instead of the one from create.
 
-    ExecStreamEvent:
-      type: object
-      description: |
-        A single SSE event payload emitted by the exec/stream endpoint.
-        `stdout`/`stderr` are JSON strings — see `ExecResult` for the UTF-8
-        caveat on binary output. The stream also emits SSE comment frames
-        (`: keepalive\n\n`) every 15s to keep proxies from closing idle
-        connections; parsers MUST ignore lines that don't start with `data: `.
-      properties:
-        timestamp:
-          type: string
-          format: date-time
-        stdout:
-          type: string
-          description: Stdout chunk (present when the process wrote to stdout).
-        stderr:
-          type: string
-          description: Stderr chunk (present when the process wrote to stderr).
-        exit_code:
-          type: integer
-          description: Process exit code (present on the final event).
-        finished:
-          type: boolean
-          description: True on the final event.
-        error:
-          type: string
-          description: Error message if the exec itself failed (present on the final event on error).
-
     ExecRequest:
       type: object
       required: [command]
@@ -1549,20 +1442,6 @@ components:
           type: integer
           default: 30
           description: Timeout in seconds.
-
-    ExecResult:
-      type: object
-      description: |
-        `stdout` and `stderr` are JSON strings, which require valid UTF-8.
-        Non-UTF-8 bytes are replaced with U+FFFD. To capture binary output,
-        redirect it to a file in the sandbox and download via the files API.
-      properties:
-        stdout:
-          type: string
-        stderr:
-          type: string
-        exit_code:
-          type: integer
 
     NetworkConfig:
       type: object

@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -222,37 +221,6 @@ func (a *GRPCAdapter) DeleteBuildArtifacts(ctx context.Context, req *vmdpb.Delet
 		return nil, err
 	}
 	return &vmdpb.DeleteBuildArtifactsResponse{Deleted: true}, nil
-}
-
-func (a *GRPCAdapter) ExecCommand(req *vmdpb.ExecCommandRequest, stream grpc.ServerStreamingServer[vmdpb.ExecCommandResponse]) error {
-	if req.GetCommand() == "" {
-		return status.Error(codes.InvalidArgument, "command is required")
-	}
-
-	timeout := time.Duration(req.GetTimeoutSeconds()) * time.Second
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-
-	var opts *ExecOptions
-	if len(req.GetArgs()) > 0 || len(req.GetEnv()) > 0 || req.GetWorkingDir() != "" {
-		opts = &ExecOptions{
-			Args:       req.GetArgs(),
-			Env:        req.GetEnv(),
-			WorkingDir: req.GetWorkingDir(),
-		}
-	}
-
-	return a.mgr.ExecCommandStream(stream.Context(), req.GetVmId(), req.GetCommand(), timeout, opts,
-		func(stdout, stderr []byte, exitCode int32, finished bool) {
-			_ = stream.Send(&vmdpb.ExecCommandResponse{
-				Stdout:   stdout,
-				Stderr:   stderr,
-				ExitCode: exitCode,
-				Finished: finished,
-			})
-		},
-	)
 }
 
 func (a *GRPCAdapter) GetVMInfo(ctx context.Context, req *vmdpb.GetVMInfoRequest) (*vmdpb.GetVMInfoResponse, error) {

@@ -38,8 +38,6 @@ type Client interface {
 	// ListBuildArtifacts returns all per-build dirs on this host's snapshot
 	// storage. Used by the controlplane reconciler.
 	ListBuildArtifacts(ctx context.Context) ([]BuildArtifactEntry, error)
-	ExecCommand(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (stdout, stderr string, exitCode int32, err error)
-	ExecCommandStream(ctx context.Context, instanceID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 
 	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the

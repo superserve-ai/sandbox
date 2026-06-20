@@ -32,9 +32,8 @@ type StartRequest struct {
 	// User to run the command as. Empty falls back to boxd's default user
 	// (set by the template or root).
 	User string `protobuf:"bytes,7,opt,name=user,proto3" json:"user,omitempty"`
-	// Attach a stdin pipe so SendInput can feed the process (interactive).
-	// False leaves stdin at /dev/null (immediate EOF), so non-interactive
-	// tooling like apt/debconf doesn't block on a prompt.
+	// If true, attach a stdin pipe (interactive, for SendInput). False leaves
+	// stdin at /dev/null/EOF so non-interactive tools (apt/debconf) don't hang.
 	Stdin         bool `protobuf:"varint,8,opt,name=stdin,proto3" json:"stdin,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

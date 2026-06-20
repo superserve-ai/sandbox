@@ -173,14 +173,6 @@ func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _ string,
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
 	return nil
 }
-func (s *stubVMD) ExecCommand(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32) (string, string, int32, error) {
-	return "hello\n", "", 0, nil
-}
-func (s *stubVMD) ExecCommandStream(_ context.Context, _, _ string, _ []string, _ map[string]string, _ string, _ uint32, onChunk func([]byte, []byte, int32, bool)) error {
-	onChunk([]byte("hello\n"), nil, 0, false)
-	onChunk(nil, nil, 0, true)
-	return nil
-}
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
@@ -2239,141 +2231,6 @@ func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 	}
 }
 
-func TestIntegration_ExecSandbox_Success(t *testing.T) {
-	ctx := context.Background()
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"exec-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello","timeout_s":5}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec: expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-	eb := mustJSON(t, ew)
-	if eb["stdout"] != "hello\n" {
-		t.Errorf("stdout = %q, want hello\\n", eb["stdout"])
-	}
-	if int(eb["exit_code"].(float64)) != 0 {
-		t.Errorf("exit_code = %v, want 0", eb["exit_code"])
-	}
-
-	// Activity logged asynchronously.
-	time.Sleep(100 * time.Millisecond)
-	sandboxID, _ := uuid.Parse(sid)
-	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
-		Limit:     20,
-	})
-	if err != nil {
-		t.Fatalf("list activities: %v", err)
-	}
-	var foundExec bool
-	for _, a := range activities {
-		if a.Category == "exec" && a.Action == "executed" {
-			foundExec = true
-		}
-	}
-	if !foundExec {
-		t.Error("expected exec activity record after exec")
-	}
-}
-
-// Exec on a paused sandbox transparently resumes it, runs the command, and
-// leaves the sandbox active.
-func TestIntegration_ExecSandbox_PausedAutoResume(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusNoContent {
-		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
-	}
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKey, `{"command":"echo hello"}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-
-	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
-	status, _ := mustJSON(t, gw)["status"].(string)
-	if status != "active" {
-		t.Errorf("sandbox status after auto-resume = %q, want %q", status, "active")
-	}
-}
-
-// Baseline: /exec/stream on an active sandbox emits a valid SSE response
-// ending with finished=true and exit_code=0.
-func TestIntegration_ExecSandboxStream_Success(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stream-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec/stream: expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-	body := ew.Body.String()
-	if !strings.HasPrefix(body, "data: ") {
-		t.Errorf("body does not start with SSE data frame; got: %q", body)
-	}
-	if !strings.Contains(body, `"finished":true`) {
-		t.Errorf("SSE body missing finished event; got: %s", body)
-	}
-	if !strings.Contains(body, `"exit_code":0`) {
-		t.Errorf("SSE body missing exit_code=0; got: %s", body)
-	}
-}
-
-// Same auto-resume behavior on the SSE streaming endpoint.
-func TestIntegration_ExecSandboxStream_PausedAutoResume(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"paused-stream-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusNoContent {
-		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
-	}
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec/stream", apiKey, `{"command":"echo hi"}`)
-	if ew.Code != http.StatusOK {
-		t.Fatalf("exec/stream on paused (auto-resume): expected 200, got %d: %s", ew.Code, ew.Body.String())
-	}
-	body := ew.Body.String()
-	if !strings.Contains(body, `"finished":true`) {
-		t.Errorf("SSE body missing finished event; got: %s", body)
-	}
-	if !strings.Contains(body, `"exit_code":0`) {
-		t.Errorf("SSE body missing exit_code=0; got: %s", body)
-	}
-
-	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
-	status, _ := mustJSON(t, gw)["status"].(string)
-	if status != "active" {
-		t.Errorf("sandbox status after stream auto-resume = %q, want %q", status, "active")
-	}
-}
-
 func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 	_, apiKeyA := seedTeamAndKey(t)
 	_, apiKeyB := seedTeamAndKey(t)
@@ -2396,23 +2253,6 @@ func TestIntegration_TeamIsolation_Delete(t *testing.T) {
 	dw2 := do(r, "DELETE", "/sandboxes/"+sid, apiKeyA, "")
 	if dw2.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", dw2.Code)
-	}
-}
-
-func TestIntegration_TeamIsolation_Exec(t *testing.T) {
-	_, apiKeyA := seedTeamAndKey(t)
-	_, apiKeyB := seedTeamAndKey(t)
-	r := newRouter(t)
-
-	cw := do(r, "POST", "/sandboxes", apiKeyA, `{"name":"iso-exec"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d", cw.Code)
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-
-	ew := do(r, "POST", "/sandboxes/"+sid+"/exec", apiKeyB, `{"command":"id"}`)
-	if ew.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 (team isolation on exec), got %d: %s", ew.Code, ew.Body.String())
 	}
 }
 

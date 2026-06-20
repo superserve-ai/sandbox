@@ -440,67 +440,6 @@ func (c *grpcVMDClient) DeleteTemplateArtifacts(ctx context.Context, templateID 
 	return nil
 }
 
-func (c *grpcVMDClient) ExecCommand(ctx context.Context, vmID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32) (string, string, int32, error) {
-	stream, err := c.client.ExecCommand(ctx, &vmdpb.ExecCommandRequest{
-		VmId:           vmID,
-		Command:        command,
-		Args:           args,
-		Env:            env,
-		WorkingDir:     workingDir,
-		TimeoutSeconds: timeoutS,
-	})
-	if err != nil {
-		return "", "", -1, fmt.Errorf("gRPC ExecCommand: %w", err)
-	}
-
-	var stdout, stderr []byte
-	var exitCode int32
-	for {
-		resp, err := stream.Recv()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return "", "", -1, fmt.Errorf("gRPC ExecCommand stream recv: %w", err)
-		}
-		stdout = append(stdout, resp.Stdout...)
-		stderr = append(stderr, resp.Stderr...)
-		if resp.Finished {
-			exitCode = resp.ExitCode
-			break
-		}
-	}
-	return string(stdout), string(stderr), exitCode, nil
-}
-
-func (c *grpcVMDClient) ExecCommandStream(ctx context.Context, vmID, command string, args []string, env map[string]string, workingDir string, timeoutS uint32, onChunk func(stdout, stderr []byte, exitCode int32, finished bool)) error {
-	stream, err := c.client.ExecCommand(ctx, &vmdpb.ExecCommandRequest{
-		VmId:           vmID,
-		Command:        command,
-		Args:           args,
-		Env:            env,
-		WorkingDir:     workingDir,
-		TimeoutSeconds: timeoutS,
-	})
-	if err != nil {
-		return fmt.Errorf("gRPC ExecCommandStream: %w", err)
-	}
-
-	for {
-		resp, err := stream.Recv()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return fmt.Errorf("gRPC ExecCommandStream recv: %w", err)
-		}
-		onChunk(resp.Stdout, resp.Stderr, resp.ExitCode, resp.Finished)
-		if resp.Finished {
-			return nil
-		}
-	}
-}
-
 func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
 	_, err := c.client.UpdateSandboxNetwork(ctx, &vmdpb.UpdateSandboxNetworkRequest{
 		VmId: vmID,

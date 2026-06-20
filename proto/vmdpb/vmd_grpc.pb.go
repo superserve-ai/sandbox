@@ -29,7 +29,6 @@ const (
 	VMDaemon_DeleteTemplateArtifacts_FullMethodName = "/superserve.vmd.v1.VMDaemon/DeleteTemplateArtifacts"
 	VMDaemon_DeleteBuildArtifacts_FullMethodName    = "/superserve.vmd.v1.VMDaemon/DeleteBuildArtifacts"
 	VMDaemon_ListBuildArtifacts_FullMethodName      = "/superserve.vmd.v1.VMDaemon/ListBuildArtifacts"
-	VMDaemon_ExecCommand_FullMethodName             = "/superserve.vmd.v1.VMDaemon/ExecCommand"
 	VMDaemon_GetVMInfo_FullMethodName               = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
 	VMDaemon_SetupNetwork_FullMethodName            = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
 	VMDaemon_UpdateSandboxNetwork_FullMethodName    = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
@@ -79,8 +78,6 @@ type VMDaemonClient interface {
 	// storage. Used by the controlplane reconciler to identify orphans by
 	// diff against the DB-defined live set.
 	ListBuildArtifacts(ctx context.Context, in *ListBuildArtifactsRequest, opts ...grpc.CallOption) (*ListBuildArtifactsResponse, error)
-	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
-	ExecCommand(ctx context.Context, in *ExecCommandRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecCommandResponse], error)
 	// GetVMInfo returns the current status and metadata of a VM.
 	GetVMInfo(ctx context.Context, in *GetVMInfoRequest, opts ...grpc.CallOption) (*GetVMInfoResponse, error)
 	// SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
@@ -223,25 +220,6 @@ func (c *vMDaemonClient) ListBuildArtifacts(ctx context.Context, in *ListBuildAr
 	return out, nil
 }
 
-func (c *vMDaemonClient) ExecCommand(ctx context.Context, in *ExecCommandRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecCommandResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[0], VMDaemon_ExecCommand_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[ExecCommandRequest, ExecCommandResponse]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type VMDaemon_ExecCommandClient = grpc.ServerStreamingClient[ExecCommandResponse]
-
 func (c *vMDaemonClient) GetVMInfo(ctx context.Context, in *GetVMInfoRequest, opts ...grpc.CallOption) (*GetVMInfoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetVMInfoResponse)
@@ -334,7 +312,7 @@ func (c *vMDaemonClient) CancelBuild(ctx context.Context, in *CancelBuildRequest
 
 func (c *vMDaemonClient) StreamBuildLogs(ctx context.Context, in *StreamBuildLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BuildLogEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[1], VMDaemon_StreamBuildLogs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &VMDaemon_ServiceDesc.Streams[0], VMDaemon_StreamBuildLogs_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -388,8 +366,6 @@ type VMDaemonServer interface {
 	// storage. Used by the controlplane reconciler to identify orphans by
 	// diff against the DB-defined live set.
 	ListBuildArtifacts(context.Context, *ListBuildArtifactsRequest) (*ListBuildArtifactsResponse, error)
-	// ExecCommand runs a command inside a VM and streams stdout/stderr back.
-	ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error
 	// GetVMInfo returns the current status and metadata of a VM.
 	GetVMInfo(context.Context, *GetVMInfoRequest) (*GetVMInfoResponse, error)
 	// SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
@@ -461,9 +437,6 @@ func (UnimplementedVMDaemonServer) DeleteBuildArtifacts(context.Context, *Delete
 }
 func (UnimplementedVMDaemonServer) ListBuildArtifacts(context.Context, *ListBuildArtifactsRequest) (*ListBuildArtifactsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListBuildArtifacts not implemented")
-}
-func (UnimplementedVMDaemonServer) ExecCommand(*ExecCommandRequest, grpc.ServerStreamingServer[ExecCommandResponse]) error {
-	return status.Error(codes.Unimplemented, "method ExecCommand not implemented")
 }
 func (UnimplementedVMDaemonServer) GetVMInfo(context.Context, *GetVMInfoRequest) (*GetVMInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVMInfo not implemented")
@@ -695,17 +668,6 @@ func _VMDaemon_ListBuildArtifacts_Handler(srv interface{}, ctx context.Context, 
 	}
 	return interceptor(ctx, in, info, handler)
 }
-
-func _VMDaemon_ExecCommand_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(ExecCommandRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(VMDaemonServer).ExecCommand(m, &grpc.GenericServerStream[ExecCommandRequest, ExecCommandResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type VMDaemon_ExecCommandServer = grpc.ServerStreamingServer[ExecCommandResponse]
 
 func _VMDaemon_GetVMInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVMInfoRequest)
@@ -965,11 +927,6 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "ExecCommand",
-			Handler:       _VMDaemon_ExecCommand_Handler,
-			ServerStreams: true,
-		},
 		{
 			StreamName:    "StreamBuildLogs",
 			Handler:       _VMDaemon_StreamBuildLogs_Handler,
