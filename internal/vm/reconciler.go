@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,11 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+// trashDirName is the per-root quarantine directory. Orphan dirs are moved to
+// <root>/<trashDirName>/<date>/<uuid> before being removed after the retention
+// soak. It is not a UUID, so the orphan scan never enumerates it.
+const trashDirName = ".trash"
 
 // buildVMIDPrefix marks VMs owned by the template build pipeline. Their
 // lifecycle is managed by buildTemplateWorker, not the reconciler — they
@@ -53,6 +59,17 @@ type ReconcilerConfig struct {
 	// filesystem walk doesn't ride the fast liveness loop. Values < 1 mean
 	// every tick.
 	DiskScanEvery int
+	// DiskReclaimEnabled turns the disk pass from detect-only into reclamation:
+	// orphan dirs are quarantine-moved to <root>/.trash/<date>/ (reversible)
+	// and trash older than DiskTrashRetention is removed. Default false — the
+	// detect-only numbers must be validated on prod before this is flipped on.
+	DiskReclaimEnabled bool
+	// DiskDeleteBudget bounds how many orphan sandboxes one pass quarantines so
+	// a keep-set bug can't move everything at once. Deferred work runs next pass.
+	DiskDeleteBudget int
+	// DiskTrashRetention is how long a quarantined dir soaks under .trash before
+	// it is permanently removed — the window to spot and reverse a bad reclaim.
+	DiskTrashRetention time.Duration
 }
 
 // DefaultReconcilerConfig returns sensible defaults from the design doc.
@@ -64,6 +81,9 @@ func DefaultReconcilerConfig() ReconcilerConfig {
 		DiskScanEnabled:    true,
 		DiskGracePeriod:    24 * time.Hour,
 		DiskScanEvery:      4,
+		DiskReclaimEnabled: false,
+		DiskDeleteBudget:   50,
+		DiskTrashRetention: 72 * time.Hour,
 	}
 }
 
@@ -410,15 +430,22 @@ type sandboxDirInfo struct {
 	paths []string
 }
 
-// detectDiskOrphans implements Drift 6 in detect-only mode: it logs the
-// per-sandbox dirs it would reclaim and deletes nothing. Fail-closed: without
-// a DB keep-set it does nothing.
+// detectDiskOrphans implements Drift 6: it logs the per-sandbox dirs with no
+// live row and, when DiskReclaimEnabled, quarantine-moves them (bounded by
+// DiskDeleteBudget) and sweeps expired quarantine. Fail-closed: without a DB
+// keep-set it does nothing.
 func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Time, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool) {
 	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_scan").Logger()
 
 	if r.cfg.DB == nil || r.cfg.HostID == "" || dbSandboxes == nil {
 		log.Debug().Msg("disk scan skipped — no DB keep-set (fail-closed)")
 		return
+	}
+
+	// When reclamation is on, always sweep expired quarantine — even on a pass
+	// that finds no new orphans.
+	if r.cfg.DiskReclaimEnabled {
+		defer r.sweepTrash(snapshotTime)
 	}
 
 	// Source D: per-sandbox dirs. A name that parses as a UUID excludes the
@@ -471,7 +498,107 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		Int("orphan_dirs", dirCount).
 		Int64("orphan_bytes", bytes).
 		Strs("sample", sample).
-		Msg("disk scan (detect-only): orphan per-sandbox dirs would be reclaimed")
+		Bool("reclaim", r.cfg.DiskReclaimEnabled).
+		Msg("disk scan: orphan per-sandbox dirs detected")
+
+	if r.cfg.DiskReclaimEnabled {
+		// An empty keep-set is almost certainly a query bug; detect-only reports
+		// it, but reclamation must never act on it. This is the abort-guard that
+		// §5/§7 of the design moved off the detect path onto here.
+		if len(keep) == 0 {
+			log.Error().Int("orphans", len(orphans)).
+				Msg("disk reclaim suppressed: empty keep-set")
+			return
+		}
+		r.reclaimDiskOrphans(ctx, snapshotTime, orphans, onDisk)
+	}
+}
+
+// reclaimDiskOrphans quarantine-moves orphan dirs to <root>/.trash/<date>/<uuid>
+// (reversible), bounded by DiskDeleteBudget. Space is freed later by sweepTrash
+// once the retention soak elapses. The caller guarantees a non-empty keep-set.
+func (r *Reconciler) reclaimDiskOrphans(ctx context.Context, snapshotTime time.Time, orphans []string, onDisk map[string]sandboxDirInfo) {
+	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_reclaim").Logger()
+	date := snapshotTime.UTC().Format("2006-01-02")
+
+	var moved, dirCount int
+	var bytes int64
+	for _, id := range orphans {
+		if moved >= r.cfg.DiskDeleteBudget {
+			log.Warn().Int("budget", r.cfg.DiskDeleteBudget).Int("deferred", len(orphans)-moved).
+				Msg("disk reclaim: budget reached, deferring rest to next pass")
+			break
+		}
+		info := onDisk[id]
+		sz := dirSize(ctx, info.paths)
+		any := false
+		for _, p := range info.paths {
+			if err := quarantineDir(p, date); err != nil {
+				log.Error().Err(err).Str("path", p).Msg("disk reclaim: quarantine failed")
+				continue
+			}
+			dirCount++
+			any = true
+		}
+		if any {
+			moved++
+			bytes += sz
+		}
+	}
+	if moved > 0 {
+		log.Warn().Int("quarantined_sandboxes", moved).Int("quarantined_dirs", dirCount).Int64("bytes", bytes).
+			Msg("disk reclaim: orphan dirs quarantined to .trash")
+	}
+}
+
+// quarantineDir moves a per-sandbox dir (<root>/<uuid>) to
+// <root>/.trash/<date>/<uuid>. The dir name must parse as a UUID (so a stray
+// path can't be moved) and the move stays within the same root (same
+// filesystem → atomic rename).
+func quarantineDir(path, date string) error {
+	root := filepath.Dir(path)
+	name := filepath.Base(path)
+	if _, err := uuid.Parse(name); err != nil {
+		return fmt.Errorf("refusing to quarantine non-uuid dir %q", name)
+	}
+	trashDir := filepath.Join(root, trashDirName, date)
+	if err := os.MkdirAll(trashDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir trash: %w", err)
+	}
+	return os.Rename(path, filepath.Join(trashDir, name))
+}
+
+// sweepTrash permanently removes quarantined date dirs older than
+// DiskTrashRetention — the irreversible step, after the soak that gives time to
+// spot a bad reclaim.
+func (r *Reconciler) sweepTrash(now time.Time) {
+	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "trash_sweep").Logger()
+	cutoff := now.Add(-r.cfg.DiskTrashRetention)
+	for _, root := range []string{r.mgr.cfg.RunDir, r.mgr.cfg.SnapshotDir} {
+		if root == "" {
+			continue
+		}
+		trash := filepath.Join(root, trashDirName)
+		entries, err := os.ReadDir(trash)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			d, perr := time.Parse("2006-01-02", e.Name())
+			if perr != nil || !d.Before(cutoff) {
+				continue
+			}
+			p := filepath.Join(trash, e.Name())
+			if err := os.RemoveAll(p); err != nil {
+				log.Warn().Err(err).Str("path", p).Msg("trash sweep: remove failed")
+			} else {
+				log.Info().Str("path", p).Msg("trash sweep: removed expired quarantine")
+			}
+		}
+	}
 }
 
 // diskKeepSet is every sandbox UUID whose on-disk dirs must NOT be reclaimed —

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -138,6 +139,99 @@ func TestDiskKeepSet(t *testing.T) {
 		if _, ok := keep[id]; ok {
 			t.Errorf("%s should NOT be in keep-set (reclaimable)", id)
 		}
+	}
+}
+
+func TestQuarantineDir(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, uuidA)
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "overlay.ext4"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := quarantineDir(src, "2026-06-20"); err != nil {
+		t.Fatalf("quarantineDir: %v", err)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Error("source dir should be gone after quarantine")
+	}
+	if _, err := os.Stat(filepath.Join(root, ".trash", "2026-06-20", uuidA, "overlay.ext4")); err != nil {
+		t.Errorf("dir should be under .trash: %v", err)
+	}
+}
+
+func TestQuarantineDir_RejectsNonUUID(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "templates")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineDir(src, "2026-06-20"); err == nil {
+		t.Error("expected error quarantining a non-uuid dir")
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Error("non-uuid dir must not be moved")
+	}
+}
+
+func TestSweepTrash_RemovesExpiredKeepsRecent(t *testing.T) {
+	runDir := t.TempDir()
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC) // retention 72h → cutoff 06-17 12:00
+	mk := func(date string) string {
+		p := filepath.Join(runDir, ".trash", date)
+		if err := os.MkdirAll(filepath.Join(p, uuidA), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	oldDir := mk("2026-06-15")    // 5 days old → swept
+	recentDir := mk("2026-06-19") // 1 day old → kept
+
+	r := &Reconciler{
+		mgr: &Manager{cfg: ManagerConfig{RunDir: runDir}, log: zerolog.Nop()},
+		cfg: ReconcilerConfig{DiskTrashRetention: 72 * time.Hour},
+	}
+	r.sweepTrash(now)
+
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Error("expired quarantine should be removed")
+	}
+	if _, err := os.Stat(recentDir); err != nil {
+		t.Error("recent quarantine should be kept")
+	}
+}
+
+func TestReclaimDiskOrphans_QuarantinesUpToBudget(t *testing.T) {
+	runDir := t.TempDir()
+	ids := []string{uuidA, uuidB, uuidC}
+	onDisk := map[string]sandboxDirInfo{}
+	for _, id := range ids {
+		p := filepath.Join(runDir, id)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		onDisk[id] = sandboxDirInfo{paths: []string{p}}
+	}
+
+	r := &Reconciler{
+		mgr: &Manager{cfg: ManagerConfig{RunDir: runDir}, log: zerolog.Nop()},
+		cfg: ReconcilerConfig{DiskDeleteBudget: 2},
+	}
+	r.reclaimDiskOrphans(context.Background(), time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC), ids, onDisk)
+
+	// Budget 2: the first two (slice order) move, the third stays.
+	if _, err := os.Stat(filepath.Join(runDir, uuidA)); !os.IsNotExist(err) {
+		t.Error("uuidA should have been quarantined")
+	}
+	if _, err := os.Stat(filepath.Join(runDir, uuidC)); err != nil {
+		t.Error("uuidC should remain (over budget)")
+	}
+	entries, _ := os.ReadDir(filepath.Join(runDir, ".trash", "2026-06-20"))
+	if len(entries) != 2 {
+		t.Errorf(".trash has %d entries, want 2 (budget)", len(entries))
 	}
 }
 

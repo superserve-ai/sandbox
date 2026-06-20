@@ -472,6 +472,9 @@ func main() {
 	reconcilerCfg.HostID = cfg.HostID
 	reconcilerCfg.DB = reconcilerDB
 	reconcilerCfg.DiskScanEnabled = envOrDefault("VMD_DISK_SCAN", "true") != "false"
+	// Reclamation is opt-in: the detect-only numbers must be validated on prod
+	// before this is flipped on. Defaults off.
+	reconcilerCfg.DiskReclaimEnabled = envOrDefault("VMD_DISK_RECLAIM", "false") == "true"
 	reconciler := vm.NewReconciler(mgr, reconcilerCfg)
 	lc.start("reconciler", func() error { reconciler.Run(ctx); return nil })
 
