@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/network"
 )
 
 // TestPlanRestore pins the restore-decision behavior across the four input
@@ -312,6 +314,37 @@ func TestDeleteSnapshotFiles_BothEmpty_Rejected(t *testing.T) {
 	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: t.TempDir()}}
 	if err := mgr.DeleteSnapshotFiles("vm-abc", "", ""); err == nil {
 		t.Error("expected rejection when both paths are empty")
+	}
+}
+
+// TestDestroyVM_AbsentInstance_CleansRundir: destroying a VM that's absent from
+// m.vms (e.g. a paused sandbox) must still remove its rundir, not leak it.
+func TestDestroyVM_AbsentInstance_CleansRundir(t *testing.T) {
+	runDir := t.TempDir()
+	vmID := "11111111-1111-1111-1111-111111111111"
+	dir := filepath.Join(runDir, vmID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "overlay.ext4"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// nil vms → getInstance NotFound (the absent path); zero-value netMgr and
+	// nil state make CleanupVM/deleteState no-ops for an unknown vmID.
+	mgr := &Manager{
+		cfg:    ManagerConfig{RunDir: runDir},
+		netMgr: &network.Manager{},
+		log:    zerolog.Nop(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := mgr.DestroyVM(ctx, vmID, true); err != nil {
+		t.Fatalf("DestroyVM: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("rundir %s still present after DestroyVM — leaked", dir)
 	}
 }
 
