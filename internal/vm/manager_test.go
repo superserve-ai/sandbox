@@ -8,6 +8,10 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/superserve-ai/sandbox/internal/network"
 )
 
 // TestPlanRestore pins the restore-decision behavior across the four input
@@ -312,6 +316,80 @@ func TestDeleteSnapshotFiles_BothEmpty_Rejected(t *testing.T) {
 	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: t.TempDir()}}
 	if err := mgr.DeleteSnapshotFiles("vm-abc", "", ""); err == nil {
 		t.Error("expected rejection when both paths are empty")
+	}
+}
+
+// TestDestroyVM_AbsentInstance_CleansRundir: destroying a VM that's absent from
+// m.vms (e.g. a paused sandbox) must still remove its rundir, not leak it.
+func TestDestroyVM_AbsentInstance_CleansRundir(t *testing.T) {
+	runDir := t.TempDir()
+	vmID := "11111111-1111-1111-1111-111111111111"
+	dir := filepath.Join(runDir, vmID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "overlay.ext4"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// nil vms → getInstance NotFound (the absent path); zero-value netMgr and
+	// nil state make CleanupVM/deleteState no-ops for an unknown vmID.
+	mgr := &Manager{
+		cfg:    ManagerConfig{RunDir: runDir},
+		netMgr: &network.Manager{},
+		log:    zerolog.Nop(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := mgr.DestroyVM(ctx, vmID, true); err != nil {
+		t.Fatalf("DestroyVM: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("rundir %s still present after DestroyVM — leaked", dir)
+	}
+}
+
+// TestDestroyVM_UnsafeVMID_Rejected: a non-path-safe or reserved vmID is
+// rejected before cleanup, so it can't escape RunDir or wipe shared dirs.
+func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
+	runDir := t.TempDir()
+	shared := []string{"keep", templateDirName, TemplatesDirName}
+	for _, name := range shared {
+		if err := os.MkdirAll(filepath.Join(runDir, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+
+	mgr := &Manager{
+		cfg:    ManagerConfig{RunDir: runDir},
+		netMgr: &network.Manager{},
+		log:    zerolog.Nop(),
+	}
+
+	rejected := []string{"", ".", "..", "../escape", "a/b", templateDirName, TemplatesDirName}
+	for _, vmID := range rejected {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := mgr.DestroyVM(ctx, vmID, true)
+		cancel()
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("DestroyVM(%q): want InvalidArgument, got %v", vmID, err)
+		}
+	}
+	for _, name := range shared {
+		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
+			t.Fatalf("shared dir %q removed by a rejected vmID: %v", name, err)
+		}
+	}
+
+	// Per-VM build/recording ids must remain cleanable, not reserved.
+	for _, vmID := range []string{"build-tmpl1", "build-record-tmpl1"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := mgr.DestroyVM(ctx, vmID, true)
+		cancel()
+		if err != nil {
+			t.Errorf("DestroyVM(%q): want nil, got %v", vmID, err)
+		}
 	}
 }
 

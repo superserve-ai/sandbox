@@ -459,13 +459,20 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 
 // DestroyVM terminates a VM and cleans up all its resources.
 func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error {
-	inst, err := m.getInstance(vmID)
-	if err != nil {
-		return err
-	}
-
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
+
+	// Cleanup runs even without an in-memory instance, so a malformed or reserved
+	// vmID could escape RunDir or wipe a shared dir.
+	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
+		return status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
+	}
+
+	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
+	// that: unit stop and rundir removal are derivable from vmID and must run, or
+	// destroying a paused sandbox leaks its rundir. Process/socket teardown needs
+	// the instance, so it's gated below. Destroy is idempotent.
+	inst, instErr := m.getInstance(vmID)
 
 	// Stop the systemd unit if one exists — this is the path for sandbox
 	// VMs launched via startFirecrackerViaSystemd.
@@ -482,31 +489,34 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// Next VM that claims the slot fails with EBUSY ("Open tap device failed:
 	// Resource busy"). See internal/network/manager.go:344 for the pool
 	// return path that assumes the previous owner is dead.
-	inst.mu.RLock()
-	pid := inst.PID
-	inst.mu.RUnlock()
-	if pid > 0 {
-		if proc, err := os.FindProcess(pid); err == nil {
-			// SIGKILL is safe here: we're tearing down, no graceful shutdown
-			// is expected. For systemd-managed VMs this is a no-op because
-			// stopUnit already killed the process.
-			_ = proc.Signal(syscall.SIGKILL)
-			// Give the kernel a moment to actually release fds before we
-			// hand the namespace + TAP back to the pool. 100ms is enough
-			// in practice — Linux process teardown is fast once all fds
-			// are dropped.
-			waitForPIDExit(pid, 500*time.Millisecond)
+	if instErr == nil {
+		inst.mu.RLock()
+		pid := inst.PID
+		sockPath := inst.SocketPath
+		inst.mu.RUnlock()
+		if pid > 0 {
+			if proc, err := os.FindProcess(pid); err == nil {
+				// SIGKILL is safe here: we're tearing down, no graceful shutdown
+				// is expected. For systemd-managed VMs this is a no-op because
+				// stopUnit already killed the process.
+				_ = proc.Signal(syscall.SIGKILL)
+				// Give the kernel a moment to actually release fds before we
+				// hand the namespace + TAP back to the pool. 100ms is enough
+				// in practice — Linux process teardown is fast once all fds
+				// are dropped.
+				waitForPIDExit(pid, 500*time.Millisecond)
+			}
 		}
-	}
-
-	if inst.SocketPath != "" {
-		_ = os.Remove(inst.SocketPath)
+		if sockPath != "" {
+			_ = os.Remove(sockPath)
+		}
 	}
 
 	m.netMgr.CleanupVM(vmID)
 
+	// Fall back to vmID when the instance is absent (RunDirID == vmID anyway).
 	rundirKey := vmID
-	if inst.RunDirID != "" {
+	if instErr == nil && inst.RunDirID != "" {
 		rundirKey = inst.RunDirID
 	}
 	m.cleanupRunDir(rundirKey)
@@ -1368,10 +1378,27 @@ func (m *Manager) createOverlay(dirName, basePath string) (string, error) {
 }
 
 func (m *Manager) cleanupRunDir(dirName string) {
+	if !isLeafName(dirName) || isReservedRunDirName(dirName) {
+		m.log.Error().Str("dir", dirName).Msg("refusing to remove unsafe or reserved rundir name")
+		return
+	}
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.RemoveAll(vmDir); err != nil {
 		m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to remove rundir")
 	}
+}
+
+// isLeafName reports whether s is safe as a single path element under a managed
+// directory — non-empty, not "."/"..", and free of separators — so callers
+// cannot escape that directory via filepath.Join + os.RemoveAll.
+func isLeafName(s string) bool {
+	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, `/\`)
+}
+
+// isReservedRunDirName reports whether name is a shared dir under RunDir
+// (template mount target, build tree) rather than a per-VM dir.
+func isReservedRunDirName(name string) bool {
+	return name == templateDirName || name == TemplatesDirName
 }
 
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
