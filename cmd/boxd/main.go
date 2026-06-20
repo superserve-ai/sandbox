@@ -915,7 +915,7 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		// directory, exactly as before.
 		switch r.URL.Query().Get("format") {
 		case "zip":
-			serveDirAsZip(w, path)
+			serveDirAsZip(r.Context(), w, path)
 		case "json":
 			serveDirAsJSON(w, path)
 		default:
@@ -1184,7 +1184,7 @@ func (c *cappedWriter) seal() { c.sealed = true }
 // committed, so per-file errors are logged and skipped rather than aborting the
 // whole download. Entries are written as the walk proceeds — constant memory,
 // no temp file.
-func serveDirAsZip(w http.ResponseWriter, dirPath string) {
+func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 	// Resolve the parent's real path first so a symlinked component — a leaf, or
 	// an INTERMEDIATE one (a -> /, then a/proc) — can't anchor the archive root
 	// outside the requested tree: os.OpenRoot follows symlinks while opening its
@@ -1253,7 +1253,15 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 
 	// Walking root.FS() confines traversal to the tree and never follows
 	// symlinks while descending; rel is a slash path relative to dirPath.
-	_ = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, walkErr error) error {
+	zipErr := fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, walkErr error) error {
+		// Stop promptly if the client has gone away — the HTTP server cancels the
+		// request context on disconnect. Without this the walk keeps reading and
+		// compressing the entire tree to a dead socket: boxd runs with
+		// WriteTimeout: 0, and once the connection breaks the byte cap stops
+		// advancing, so only the entry cap would bound the wasted work.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			// Unreadable entry mid-walk: log and skip, keep the archive going.
 			log.Printf("files: zip walk skip %q: %v", rel, walkErr)
@@ -1320,12 +1328,25 @@ func serveDirAsZip(w http.ResponseWriter, dirPath string) {
 				log.Printf("files: zip byte cap (%d) reached — archive truncated", maxZipBytes)
 				return fs.SkipAll
 			}
+			// A canceled context means the copy failed because the client went
+			// away (the write to w broke): abort the whole walk rather than read
+			// on to the next file. A copy error with a live context is a per-file
+			// read failure (e.g. the file vanished mid-walk) — skip it and keep
+			// archiving the rest.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			log.Printf("files: zip copy %q: %v", rel, err)
 			return nil
 		}
 		f.Close()
 		return nil
 	})
+	if zipErr != nil {
+		// SkipDir/SkipAll are consumed by WalkDir, so a surfaced error is the
+		// context cancellation returned above — the client disconnected mid-zip.
+		log.Printf("files: zip of %q aborted (client gone): %v", dirPath, zipErr)
+	}
 }
 
 // zipDownloadFilename builds the quoted Content-Disposition filename for a

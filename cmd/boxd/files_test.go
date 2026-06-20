@@ -725,3 +725,33 @@ func TestFilesystemService_ListDir_CapsLargeDirectory(t *testing.T) {
 		t.Fatalf("got %d entries, want 10 (capped at maxListEntries)", got)
 	}
 }
+
+// #114 (review): a directory zip must stop walking when the client disconnects
+// (request context canceled) instead of reading and compressing the whole tree
+// to a dead socket — boxd runs with WriteTimeout: 0, so nothing else bounds it.
+func TestServeDirAsZip_AbortsOnCanceledContext(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 20; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%02d", i)), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Client already gone before the walk starts.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	w := httptest.NewRecorder()
+	serveDirAsZip(ctx, w, dir)
+
+	// The walk should have bailed immediately, leaving a valid-but-empty archive
+	// rather than zipping all 20 files. (Without the context check the walk runs
+	// to completion and the archive holds every file.)
+	zr, err := zip.NewReader(bytes.NewReader(w.Body.Bytes()), int64(w.Body.Len()))
+	if err != nil {
+		t.Fatalf("archive is not a valid zip: %v", err)
+	}
+	if len(zr.File) != 0 {
+		t.Fatalf("zip walk wrote %d entries after the context was canceled; want 0 (aborted)", len(zr.File))
+	}
+}
