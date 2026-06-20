@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -327,6 +328,7 @@ type jsonListing struct {
 		Size         int64  `json:"size"`
 		ModifiedUnix int64  `json:"modified_unix"`
 	} `json:"entries"`
+	Truncated bool `json:"truncated"`
 }
 
 func parseListing(t *testing.T, b []byte) jsonListing {
@@ -371,6 +373,9 @@ func TestFileDownload_Directory_JSON(t *testing.T) {
 
 	if len(listing.Entries) != 2 {
 		t.Fatalf("got %d entries, want 2: %+v", len(listing.Entries), listing.Entries)
+	}
+	if listing.Truncated {
+		t.Errorf("truncated = true for a 2-entry directory, want false")
 	}
 	if f, ok := byName["a.txt"]; !ok || f.isDir || f.size != 3 {
 		t.Errorf("a.txt entry = %+v (ok=%v), want {isDir:false size:3}", f, ok)
@@ -663,5 +668,60 @@ func TestFileDownload_Zip_ByteCapValidArchive(t *testing.T) {
 	}
 	if len(zr.File) == 0 {
 		t.Errorf("byte-capped archive has no central-directory entries")
+	}
+}
+
+// #114 (review): the JSON (data-plane) listing must cap how many entries it reads
+// and flag truncation. Without a cap, a huge or hostile directory makes boxd —
+// and the shared host vmd that buffers the reply — read every entry into memory.
+// The zip path already caps entries; this sibling listing path must match.
+func TestServeDirAsJSON_CapsLargeDirectory(t *testing.T) {
+	orig := maxListEntries
+	maxListEntries = 10
+	defer func() { maxListEntries = orig }()
+
+	dir := t.TempDir()
+	for i := 0; i < 25; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w := zipFilesGet(t, dir, "json")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	listing := parseListing(t, w.Body.Bytes())
+	if len(listing.Entries) != 10 {
+		t.Fatalf("got %d entries, want 10 (capped at maxListEntries)", len(listing.Entries))
+	}
+	if !listing.Truncated {
+		t.Error("truncated = false, want true (25 entries, cap 10)")
+	}
+}
+
+// #114 (review): the gRPC ListDir (control-plane / console) listing shares the
+// same cap, so a huge directory can't make boxd or vmd buffer an unbounded reply
+// (and so the response stays under the control plane's 4 MiB gRPC recv limit
+// instead of erroring).
+func TestFilesystemService_ListDir_CapsLargeDirectory(t *testing.T) {
+	orig := maxListEntries
+	maxListEntries = 10
+	defer func() { maxListEntries = orig }()
+
+	dir := t.TempDir()
+	for i := 0; i < 25; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	svc := &filesystemService{}
+	resp, err := svc.ListDir(context.Background(), connect.NewRequest(&pb.ListDirRequest{Path: dir}))
+	if err != nil {
+		t.Fatalf("ListDir: %v", err)
+	}
+	if got := len(resp.Msg.GetEntries()); got != 10 {
+		t.Fatalf("got %d entries, want 10 (capped at maxListEntries)", got)
 	}
 }

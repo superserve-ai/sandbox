@@ -799,12 +799,19 @@ func (s *filesystemService) ListDir(ctx context.Context, req *connect.Request[pb
 		}
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	entries, err := collectDirEntries(realPath)
+	entries, truncated, err := collectDirEntries(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
 		}
 		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	if truncated {
+		// The ListDirResponse has no truncation flag yet, so log it: a clamped
+		// control-plane / console listing must not be silent (the same reason the
+		// zip path logs its entry cap). A ListDirResponse.truncated field for a
+		// "showing first N of many" banner is a follow-up.
+		log.Printf("files: ListDir of %q truncated to %d entries", realPath, maxListEntries)
 	}
 
 	result := make([]*pb.FileEntry, 0, len(entries))
@@ -1003,7 +1010,7 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 		}
 		return
 	}
-	entries, err := collectDirEntries(realPath)
+	entries, truncated, err := collectDirEntries(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
@@ -1012,10 +1019,14 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 		}
 		return
 	}
+	if truncated {
+		log.Printf("files: json listing of %q truncated to %d entries", dirPath, maxListEntries)
+	}
 
 	body, err := json.Marshal(struct {
-		Entries []dirEntryMeta `json:"entries"`
-	}{Entries: entries})
+		Entries   []dirEntryMeta `json:"entries"`
+		Truncated bool           `json:"truncated"`
+	}{Entries: entries, Truncated: truncated})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1044,16 +1055,46 @@ type dirEntryMeta struct {
 	ModifiedUnix int64  `json:"modified_unix"`
 }
 
-// collectDirEntries lists one level of dirPath. Per-entry Info() is an lstat
-// that can fail if the entry was removed mid-listing (the sandbox runs
-// concurrently); such entries degrade to zero size/mtime rather than being
-// dropped, so the name still lists. The slice is non-nil even when empty, so it
-// marshals as [] rather than null.
-func collectDirEntries(dirPath string) ([]dirEntryMeta, error) {
-	entries, err := os.ReadDir(dirPath)
+// maxListEntries bounds how many entries a single directory listing reads. A
+// hostile or merely huge directory (millions of files) would otherwise make boxd
+// — and the shared host vmd that buffers the whole reply with no message cap —
+// read every entry (plus a per-entry lstat) into memory at once, and overflow
+// the control plane's 4 MiB gRPC recv limit. The zip path already caps entries
+// (maxZipEntries); this is the listing-path counterpart, kept smaller because the
+// reply is buffered upstream and the console renders the rows. Var, not const, so
+// tests can lower it.
+var maxListEntries = 10_000
+
+// collectDirEntries lists one level of dirPath, reading at most maxListEntries
+// entries and reporting truncated=true when the directory held more. Reading a
+// bounded count (via f.ReadDir, which stops early — unlike os.ReadDir, which
+// slurps the whole directory first) keeps memory and lstat counts bounded on a
+// pathological directory. Per-entry Info() is an lstat that can fail if the entry
+// was removed mid-listing (the sandbox runs concurrently); such entries degrade
+// to zero size/mtime rather than being dropped, so the name still lists. Entries
+// come back in directory order (the console sorts client-side). The slice is
+// non-nil even when empty, so it marshals as [] rather than null.
+func collectDirEntries(dirPath string) ([]dirEntryMeta, bool, error) {
+	f, err := os.Open(dirPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	defer f.Close()
+
+	// Read one past the cap so a directory with exactly maxListEntries entries
+	// isn't falsely flagged as truncated. f.ReadDir(n>0) returns io.EOF (with the
+	// entries read so far) only when it hits the end, which for a non-empty
+	// directory means it returned fewer than we asked for — not an error.
+	entries, err := f.ReadDir(maxListEntries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	truncated := false
+	if len(entries) > maxListEntries {
+		entries = entries[:maxListEntries]
+		truncated = true
+	}
+
 	out := make([]dirEntryMeta, 0, len(entries))
 	for _, e := range entries {
 		m := dirEntryMeta{Name: e.Name(), IsDir: e.IsDir()}
@@ -1063,7 +1104,7 @@ func collectDirEntries(dirPath string) ([]dirEntryMeta, error) {
 		}
 		out = append(out, m)
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // maxZipEntries / maxZipBytes bound a directory archive so attacker-staged
