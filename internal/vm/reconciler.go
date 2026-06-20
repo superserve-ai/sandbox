@@ -445,10 +445,13 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		keep[id.String()] = struct{}{}
 	}
 
+	// An empty keep-set is suspicious — a query bug would also produce it — but
+	// a drained or all-failed host is a legitimate all-orphan case, and
+	// detect-only reporting is harmless. Flag it loudly and still report; the
+	// empty-set guard that aborts belongs on the reclamation step, not here.
 	if len(keep) == 0 {
-		log.Error().Int("on_disk", len(onDisk)).
-			Msg("disk scan: empty keep-set with dirs present — aborting pass (guard)")
-		return
+		log.Warn().Int("on_disk", len(onDisk)).
+			Msg("disk scan: empty keep-set — reporting all on-disk dirs as orphans (verify before enabling reclamation)")
 	}
 
 	orphans := selectOrphanDirs(onDisk, keep, snapshotTime)
