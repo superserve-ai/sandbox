@@ -461,6 +461,33 @@ func (m *Manager) CleanupVM(vmID string) {
 	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
 }
 
+// CleanupVMOrNamespace tears down a VM's network slot. When the VM is tracked
+// in devices it delegates to CleanupVM (which may recycle the slot to the
+// pool). When it is not tracked — e.g. a reattached VM whose network state was
+// never restored into devices — it reclaims the slot directly from the
+// namespace so the ns/veth/slot isn't leaked until the next restart sweep.
+// A no-op when the namespace is empty, malformed, or already gone.
+func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
+	m.mu.Lock()
+	_, tracked := m.devices[vmID]
+	m.mu.Unlock()
+	if tracked {
+		m.CleanupVM(vmID)
+		return
+	}
+
+	idx, ok := slotFromNamespace(fallbackNamespace)
+	if !ok || !nsExists(fallbackNamespace) {
+		return
+	}
+	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
+	m.mu.Lock()
+	m.freeSlots = append(m.freeSlots, idx)
+	m.mu.Unlock()
+	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
+		Msg("reclaimed network slot for untracked VM")
+}
+
 // ReattachVM rebinds vmd's view of an already-running VM's network state
 // at startup. After this call: the slot is marked in-use (no SetupVM
 // collisions), devices[vmID] is populated (CleanupVM can tear it down),

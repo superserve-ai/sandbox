@@ -512,7 +512,14 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		}
 	}
 
-	m.netMgr.CleanupVM(vmID)
+	// Reclaim the network slot even if the VM isn't tracked in the devices
+	// map (e.g. a paused VM reattached without network state) — pass the
+	// known namespace so the slot isn't leaked.
+	ns := ""
+	if instErr == nil {
+		ns = inst.Namespace
+	}
+	m.netMgr.CleanupVMOrNamespace(vmID, ns)
 
 	// Fall back to vmID when the instance is absent (RunDirID == vmID anyway).
 	rundirKey := vmID
@@ -1077,6 +1084,14 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 			m.mu.Lock()
 			m.vms[rec.ID] = inst
 			m.mu.Unlock()
+			// Repopulate the network slot like running VMs do, so a paused
+			// sandbox deleted before its next resume can reclaim its slot.
+			// Resume's EnsureVMSlot is idempotent, so this is safe.
+			if inst.Namespace != "" && inst.IP != "" {
+				if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
+					log.Error().Err(err).Msg("reattach: restore paused VM network state failed")
+				}
+			}
 			log.Info().Msg("reattached paused VM")
 			reattached++
 			continue
