@@ -38,9 +38,9 @@ func newTestManager() *Manager {
 
 func TestSlotFromNamespace(t *testing.T) {
 	cases := []struct {
-		in        string
-		wantIdx   int
-		wantOK    bool
+		in      string
+		wantIdx int
+		wantOK  bool
 	}{
 		{"ns-0", 0, true},
 		{"ns-1", 1, true},
@@ -195,5 +195,51 @@ func TestEnsureVMSlot_InvalidNamespace(t *testing.T) {
 	_, err := m.EnsureVMSlot(context.Background(), "vm-x", "garbage", "10.11.0.3", "")
 	if err == nil {
 		t.Fatalf("expected error for invalid namespace, got nil")
+	}
+}
+
+func TestCleanupVMOrNamespace_TrackedDelegates(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.devices["vm-t"] = &VMNetInfo{Namespace: "ns-2", HostIP: "10.11.0.2"}
+
+	m.CleanupVMOrNamespace("vm-t", "")
+
+	if _, ok := m.devices["vm-t"]; ok {
+		t.Error("tracked VM should have been removed from devices via CleanupVM")
+	}
+}
+
+func TestCleanupVMOrNamespace_EmptyAndInvalidNamespaceNoop(t *testing.T) {
+	withTestNetnsDir(t)
+	for _, ns := range []string{"", "garbage"} {
+		m := newTestManager()
+		m.CleanupVMOrNamespace("vm-u", ns)
+		if len(m.freeSlots) != 0 {
+			t.Errorf("ns=%q: freeSlots = %v, want [] (no reclaim)", ns, m.freeSlots)
+		}
+	}
+}
+
+func TestCleanupVMOrNamespace_MissingNamespaceNoop(t *testing.T) {
+	withTestNetnsDir(t) // ns-5 intentionally not touched → nsExists is false
+	m := newTestManager()
+
+	m.CleanupVMOrNamespace("vm-u", "ns-5")
+
+	if len(m.freeSlots) != 0 {
+		t.Errorf("freeSlots = %v, want [] (namespace gone, nothing to reclaim)", m.freeSlots)
+	}
+}
+
+func TestCleanupVMOrNamespace_ReclaimsUntrackedSlot(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-5")
+	m := newTestManager()
+
+	m.CleanupVMOrNamespace("vm-u", "ns-5")
+
+	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
+		t.Errorf("freeSlots = %v, want [5] (slot reclaimed)", m.freeSlots)
 	}
 }
