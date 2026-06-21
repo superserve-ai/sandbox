@@ -241,16 +241,33 @@ func run() error {
 		log.Info().Msg("durable-Actor runtime enabled (/v1/agents) with sandbox-exec delivery + tiered hibernation")
 	}
 
-	// Durable /state versioning (checkpoint/branch/rollback). Enabled when
-	// STATE_DIR is set; backend defaults to the local reference provider,
-	// STATE_BACKEND=archil|mesa selects a SaaS adapter.
-	if stateDir := os.Getenv("STATE_DIR"); stateDir != "" {
-		sp, serr := state.NewProvider(state.Config{Backend: state.Backend(os.Getenv("STATE_BACKEND")), BaseDir: stateDir})
+	// Durable /state versioning (checkpoint/branch/rollback). Enabled when a
+	// local STATE_DIR is set (backend "local" the directory reference, or
+	// "local-block" the ext4-image block reference) or a SaaS backend is selected
+	// (STATE_BACKEND=archil|mesa, which need no local dir).
+	stateBackend := os.Getenv("STATE_BACKEND")
+	stateDir := os.Getenv("STATE_DIR")
+	if stateDir != "" || stateBackend == string(state.BackendArchil) || stateBackend == string(state.BackendMesa) {
+		stateImageMiB, _ := strconv.Atoi(os.Getenv("STATE_IMAGE_MIB"))
+		sp, serr := state.NewProvider(state.Config{
+			Backend:       state.Backend(stateBackend),
+			BaseDir:       stateDir,
+			StateImageMiB: stateImageMiB,
+			Archil: state.ArchilConfig{
+				APIKey: os.Getenv("ARCHIL_API_KEY"),
+				Region: os.Getenv("ARCHIL_REGION"),
+				DiskID: os.Getenv("ARCHIL_DISK_ID"),
+			},
+			Mesa: state.MesaConfig{
+				APIKey: os.Getenv("MESA_API_KEY"),
+				Org:    os.Getenv("MESA_ORG"),
+			},
+		})
 		if serr != nil {
 			log.Warn().Err(serr).Msg("durable /state provider init failed; /state endpoints disabled")
 		} else {
 			handlers.State = sp
-			log.Info().Str("backend", os.Getenv("STATE_BACKEND")).Msg("durable /state versioning enabled")
+			log.Info().Str("backend", stateBackend).Msg("durable /state versioning enabled")
 		}
 	}
 
