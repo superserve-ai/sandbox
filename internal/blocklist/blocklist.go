@@ -148,6 +148,11 @@ type Blocklist struct {
 	// sink, if set, receives the snapshot's CIDRs after every refresh so
 	// downstream enforcers (e.g. the host firewall) can mirror them.
 	sink func([]string)
+
+	// reloadCh carries a config-file path for a SIGHUP-triggered reload,
+	// handled on the single refresh goroutine so it never races feed state.
+	// Buffered and dropped when full, so a burst of reloads coalesces.
+	reloadCh chan string
 }
 
 // New builds a Blocklist seeded from the pinned config entries and
@@ -159,6 +164,7 @@ func New(cfg *Config, log zerolog.Logger) *Blocklist {
 		http:      &http.Client{Timeout: feedFetchTimeout},
 		feedCache: make(map[string]string),
 		maxBytes:  maxFeedBytes,
+		reloadCh:  make(chan string, 1),
 	}
 
 	seed := newSnapshotBuilder()
@@ -199,6 +205,32 @@ func (b *Blocklist) CIDRs() []string {
 // feed-sourced entries before it starts serving.
 func (b *Blocklist) Refresh(ctx context.Context) { b.refresh(ctx) }
 
+// Reload requests that the config at path be re-read on the next Start loop
+// iteration. Non-blocking; coalesces if a reload is already queued. No-op
+// unless Start is running.
+func (b *Blocklist) Reload(path string) {
+	select {
+	case b.reloadCh <- path:
+	default:
+	}
+}
+
+// reloadConfig re-reads the YAML config and rebuilds the snapshot from it plus
+// the cached feeds. Fail-safe: a bad config is logged and the current blocklist
+// is kept, never dropped. Domains and CIDRs are updated (CIDRs re-pushed to the
+// host firewall by refresh); blocked egress ports and refresh_interval are
+// applied once at startup and still need a restart to change.
+func (b *Blocklist) reloadConfig(ctx context.Context, path string) {
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		b.log.Error().Err(err).Str("path", path).Msg("blocklist reload failed; keeping current config")
+		return
+	}
+	b.cfg = cfg
+	b.refresh(ctx)
+	b.log.Info().Str("path", path).Msg("egress blocklist config reloaded")
+}
+
 // Start fetches all feeds immediately, then refreshes on the configured
 // interval. Blocks until ctx is cancelled.
 func (b *Blocklist) Start(ctx context.Context) error {
@@ -211,6 +243,8 @@ func (b *Blocklist) Start(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			b.refresh(ctx)
+		case path := <-b.reloadCh:
+			b.reloadConfig(ctx, path)
 		}
 	}
 }
