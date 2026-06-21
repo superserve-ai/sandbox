@@ -52,6 +52,11 @@ type FirecrackerConfig struct {
 	VsockPath  string
 	VMIP       string
 	GatewayIP  string
+	// StateDiskPath, when non-empty, is the host path to the Actor's durable
+	// /state block device (a pre-formatted ext4 image). It is attached as the
+	// VM's second drive (vdb); boxd mounts it at /state on boot. Empty for
+	// ephemeral sandboxes with no durable state.
+	StateDiskPath string
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +160,24 @@ func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
 			return fmt.Errorf("attach drive rootfs: overlay-mode requires the firecracker fork (feat/block-overlay-cow-v1.15) on this host: %w", err)
 		}
 		return fmt.Errorf("attach drive rootfs: %w", err)
+	}
+
+	// 3b. Attach the durable /state disk as the second drive (vdb), if this VM
+	// has durable state. boxd mounts it at /state on boot. Non-root, read-write.
+	if cfg.StateDiskPath != "" {
+		stateID := "state"
+		if _, err := fc.Operations.PutGuestDriveByID(&operations.PutGuestDriveByIDParams{
+			Context: ctx,
+			DriveID: stateID,
+			Body: &models.Drive{
+				DriveID:      &stateID,
+				PathOnHost:   cfg.StateDiskPath,
+				IsRootDevice: boolPtr(false),
+				IsReadOnly:   false,
+			},
+		}); err != nil {
+			return fmt.Errorf("attach drive state: %w", err)
+		}
 	}
 
 	// 4. Attach network interface.
