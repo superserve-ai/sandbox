@@ -38,9 +38,14 @@ type firecrackerProvider struct {
 	cur    *vmPool
 	curKey string
 
-	// Tier-2 snapshot reused across iterations (created once per mem size).
+	// Tier-2/3 snapshot reused across iterations (created once per mem size).
 	snap    *tier2Snap
 	snapKey string
+
+	// Tier-3 object store and the remote ref of the currently-staged snapshot.
+	// nil objStore means Tier-3 is not configured (wakeTier3 errors clearly).
+	objStore   objectStore
+	snapRemote string
 }
 
 // tier2Snap is a saved Full snapshot (state + memory file) used to measure
@@ -66,6 +71,14 @@ func newFirecrackerProvider(fcBin, kernel, rootfs, runDir string) (*firecrackerP
 	return &firecrackerProvider{fcBin: fcBin, kernel: kernel, rootfs: rootfs, runDir: runDir}, nil
 }
 
+// withObjectStore attaches the Tier-3 snapshot transport. Returns the provider
+// for chaining. Without it, Tier-3 cells error rather than silently degrading to
+// a same-host restore.
+func (p *firecrackerProvider) withObjectStore(s objectStore) *firecrackerProvider {
+	p.objStore = s
+	return p
+}
+
 func (p *firecrackerProvider) Label() string { return "firecracker (REAL — bare pause/resume)" }
 
 // Wake resumes one paused VM in the contention pool, times the PATCH Resumed,
@@ -79,8 +92,10 @@ func (p *firecrackerProvider) Wake(ctx context.Context, params WakeParams) (Phas
 		return p.wakeTier1(ctx, params)
 	case Tier2:
 		return p.wakeTier2(ctx, params)
+	case Tier3:
+		return p.wakeTier3(ctx, params)
 	default:
-		return PhaseTimings{}, fmt.Errorf("firecracker provider implements Tier 1 and Tier 2; got tier %s", params.Cell.Tier)
+		return PhaseTimings{}, fmt.Errorf("firecracker provider implements Tiers 1, 2 and 3; got tier %s", params.Cell.Tier)
 	}
 }
 
@@ -124,6 +139,7 @@ func (p *firecrackerProvider) Close() error {
 		_ = os.RemoveAll(p.snap.dir)
 		p.snap = nil
 	}
+	p.snapRemote = ""
 	return nil
 }
 
@@ -152,6 +168,59 @@ func (p *firecrackerProvider) wakeTier2(ctx context.Context, params WakeParams) 
 	}
 	vm.Close()
 	return PhaseTimings{Load: load}, nil
+}
+
+// wakeTier3 measures a cold cross-host wake: the snapshot is staged in object
+// storage (created + uploaded once per mem size), and each iteration FETCHES it
+// to a fresh local dir before restoring. The fetch is the cross-host long pole —
+// on a real wake a different host pulls these bytes from object storage — and is
+// reported as T_fetch; the subsequent load+resume is T_load. Gate: p50<1s,
+// p99<2s on the total. Each iteration fetches fresh (cold), which is the faithful
+// model: a cross-host restore never has the bytes already local.
+func (p *firecrackerProvider) wakeTier3(ctx context.Context, params WakeParams) (PhaseTimings, error) {
+	if p.objStore == nil {
+		return PhaseTimings{}, fmt.Errorf("tier-3 requires an object store; pass -objstore=gs://bucket[/prefix] (or local:/path for the same-host floor)")
+	}
+	key := strconv.Itoa(params.Cell.MemMiB)
+	if p.snap == nil || p.snapKey != key || p.snapRemote == "" {
+		if p.snap != nil {
+			_ = os.RemoveAll(p.snap.dir)
+			p.snap = nil
+		}
+		p.snapRemote = ""
+		snap, err := createTier2Snapshot(ctx, p, params.Cell.MemMiB)
+		if err != nil {
+			return PhaseTimings{}, fmt.Errorf("create snapshot (mem=%d): %w", params.Cell.MemMiB, err)
+		}
+		ref, err := p.objStore.Upload(ctx, "mem"+key, snap.snapPath, snap.memPath)
+		if err != nil {
+			_ = os.RemoveAll(snap.dir)
+			return PhaseTimings{}, fmt.Errorf("stage snapshot to object store: %w", err)
+		}
+		p.snap = snap
+		p.snapKey = key
+		p.snapRemote = ref
+	}
+
+	fetchDir, err := os.MkdirTemp(p.runDir, "fetch")
+	if err != nil {
+		return PhaseTimings{}, err
+	}
+	defer os.RemoveAll(fetchDir)
+
+	fetchStart := time.Now()
+	snapPath, memPath, err := p.objStore.Download(ctx, p.snapRemote, fetchDir)
+	if err != nil {
+		return PhaseTimings{}, fmt.Errorf("fetch from object store: %w", err)
+	}
+	fetch := time.Since(fetchStart)
+
+	vm, load, err := bootFromSnapshotPaths(ctx, p, snapPath, memPath, params.Iteration)
+	if err != nil {
+		return PhaseTimings{}, fmt.Errorf("restore: %w", err)
+	}
+	vm.Close()
+	return PhaseTimings{Fetch: fetch, Load: load}, nil
 }
 
 // createTier2Snapshot boots a VM, lets it settle, pauses it, and writes a Full
@@ -187,9 +256,16 @@ func createTier2Snapshot(ctx context.Context, p *firecrackerProvider, memMiB int
 	return snap, nil
 }
 
-// bootFromSnapshot starts a fresh Firecracker and loads the snapshot with an
-// eager File mem-backend, resuming the VM. Returns the load+resume duration.
+// bootFromSnapshot starts a fresh Firecracker and loads the Tier-2 snapshot,
+// resuming the VM. Thin wrapper over bootFromSnapshotPaths.
 func bootFromSnapshot(ctx context.Context, p *firecrackerProvider, snap *tier2Snap, idx int) (*fcVM, time.Duration, error) {
+	return bootFromSnapshotPaths(ctx, p, snap.snapPath, snap.memPath, idx)
+}
+
+// bootFromSnapshotPaths starts a fresh Firecracker and loads the snapshot at the
+// given state+mem paths with an eager File mem-backend, resuming the VM. Returns
+// the load+resume duration. Tier-3 passes freshly-fetched paths here.
+func bootFromSnapshotPaths(ctx context.Context, p *firecrackerProvider, snapPath, memPath string, idx int) (*fcVM, time.Duration, error) {
 	id := fmt.Sprintf("bench-r-%d-%d", os.Getpid(), idx)
 	dir := filepath.Join(p.runDir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -218,8 +294,8 @@ func bootFromSnapshot(ctx context.Context, p *firecrackerProvider, snap *tier2Sn
 	}
 	start := time.Now()
 	err := vm.put(ctx, "/snapshot/load", map[string]any{
-		"snapshot_path": snap.snapPath,
-		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": snap.memPath},
+		"snapshot_path": snapPath,
+		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": memPath},
 		"resume_vm":     true,
 	})
 	load := time.Since(start)

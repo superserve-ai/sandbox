@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -52,9 +53,10 @@ func TestNewFirecrackerProviderValidation(t *testing.T) {
 	})
 }
 
-// TestFirecrackerProviderRejectsNonTier1 guards that the Tier-1-only provider
-// errors (rather than silently mismeasuring) if handed a Tier 2/3 cell.
-func TestFirecrackerProviderRejectsNonTier1(t *testing.T) {
+// newTestFCProvider builds a provider over placeholder (non-executable) binaries
+// — enough to exercise the tier-dispatch guards without a KVM host.
+func newTestFCProvider(t *testing.T) *firecrackerProvider {
+	t.Helper()
 	dir := t.TempDir()
 	for _, n := range []string{"vmlinux", "rootfs.ext4", "firecracker"} {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
@@ -67,7 +69,28 @@ func TestFirecrackerProviderRejectsNonTier1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Wake(t.Context(), WakeParams{Cell: Cell{Tier: Tier2}}); err == nil {
-		t.Fatal("expected Tier-2 cell to be rejected by the Tier-1-only provider")
+	return p
+}
+
+// TestFirecrackerProviderRejectsUnknownTier guards the Wake dispatch: an
+// out-of-range tier errors rather than silently mismeasuring.
+func TestFirecrackerProviderRejectsUnknownTier(t *testing.T) {
+	p := newTestFCProvider(t)
+	if _, err := p.Wake(t.Context(), WakeParams{Cell: Cell{Tier: Tier(9)}}); err == nil {
+		t.Fatal("expected an unknown tier to be rejected")
+	}
+}
+
+// TestFirecrackerProviderTier3RequiresObjectStore guards that Tier-3 without a
+// configured object store fails fast with a clear message — never silently
+// degrading to a same-host restore (which would understate the cross-host gate).
+func TestFirecrackerProviderTier3RequiresObjectStore(t *testing.T) {
+	p := newTestFCProvider(t) // no withObjectStore
+	_, err := p.Wake(t.Context(), WakeParams{Cell: Cell{Tier: Tier3, MemMiB: 512}})
+	if err == nil {
+		t.Fatal("expected Tier-3 without an object store to error")
+	}
+	if !strings.Contains(err.Error(), "object store") {
+		t.Errorf("error should mention the missing object store, got: %v", err)
 	}
 }

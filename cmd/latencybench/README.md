@@ -93,7 +93,7 @@ go run ./cmd/latencybench -provider=stub \
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-provider` | `stub` | `stub` (synthetic) or `vmd` (real — not wired) |
+| `-provider` | `stub` | `stub` (synthetic), `firecracker` (real Tiers 1/2/3), or `vmd` (real — not wired) |
 | `-iterations` | `1000` | iterations per matrix cell (plan asks ≥1000) |
 | `-tiers` | `1,2,3` | tiers to sweep |
 | `-mem` | `512,2048,8192` | guest memory sizes (MiB) |
@@ -101,6 +101,45 @@ go run ./cmd/latencybench -provider=stub \
 | `-cache` | `warm,cold` | host page-cache arms |
 | `-contention` | `1,8,32` | paused-VMs-per-core (Tier-1 density test) |
 | `-seed` | `1` | stub RNG seed (deterministic) |
+| `-fc-bin` `-kernel` `-rootfs` | — | firecracker binary / guest vmlinux / read-only rootfs.ext4 (firecracker provider) |
+| `-objstore` | — | Tier-3 snapshot transport: `gs://bucket[/prefix]` (real cross-host fetch) or `local[:/path]` (same-host floor) |
+
+### firecracker provider (real) — Tiers 1, 2 and 3
+
+Requires a Linux KVM host (`/dev/kvm`), the firecracker binary, a guest kernel,
+and a rootfs. Tiers 1 and 2 need no object store; Tier 3 needs `-objstore`.
+
+> **Tiers 2 and 3 vary only with `-mem`** in this provider — the snapshot is
+> reused by mem size, so `-ws`, `-cache`, and `-contention` are not exercised
+> there (only Tier-1 uses `-contention`). Pin them to one value each when sweeping
+> Tiers 2/3, or the default matrix re-runs byte-identical cells under different
+> labels. See `RESULTS.md`.
+
+```sh
+# Tier 1 (bare pause/resume under contention) — contention is the Tier-1 density axis:
+latencybench -provider=firecracker \
+  -fc-bin=/usr/local/bin/firecracker -kernel=<vmlinux> -rootfs=<base.ext4> \
+  -tiers=1 -mem=512 -ws=128 -cache=cold -contention=1,8,32 -iterations=200
+
+# Tier 2 (local snapshot restore) — sweep mem only:
+latencybench -provider=firecracker \
+  -fc-bin=/usr/local/bin/firecracker -kernel=<vmlinux> -rootfs=<base.ext4> \
+  -tiers=2 -mem=512,2048 -ws=128 -cache=cold -contention=1 -iterations=50
+
+# Tier 3 (cold cross-host): stage the snapshot in real object storage and fetch
+# it back each iteration. The host's service account needs roles/storage.objectAdmin
+# on the bucket. Use local:/path instead of gs:// for the same-host restore floor.
+latencybench -provider=firecracker \
+  -fc-bin=/usr/local/bin/firecracker -kernel=<vmlinux> -rootfs=<base.ext4> \
+  -tiers=3 -mem=512,2048 -ws=128 -cache=cold -contention=1 \
+  -objstore=gs://<bucket>/<prefix> -iterations=20
+```
+
+The Tier-3 fetch is an **in-process HTTP GET** (resident client, cached
+metadata-server bearer token), deliberately *not* `gcloud storage cp` — a CLI
+spawn costs ~1.1s and would dominate the measurement. See `RESULTS.md` for the
+measured ~230 MiB/s single-stream ceiling and why eager whole-mem fetch fails the
+<1s gate for realistic VM sizes.
 
 ### vmd provider (real) — not wired yet
 

@@ -52,6 +52,7 @@ func main() {
 		fcKernel = flag.String("kernel", "", "path to the guest kernel (vmlinux) — required for -provider=firecracker")
 		fcRootfs = flag.String("rootfs", "", "path to a rootfs.ext4 mounted read-only — required for -provider=firecracker")
 		fcRunDir = flag.String("fc-rundir", "/tmp/latencybench-run", "scratch dir for per-VM api sockets")
+		objStore = flag.String("objstore", "", "Tier-3 snapshot transport: 'gs://bucket[/prefix]' (real cross-host fetch) or 'local[:/path]' (same-host floor). Required to measure Tier 3 with -provider=firecracker.")
 	)
 	flag.Parse()
 
@@ -64,7 +65,7 @@ func main() {
 	cfg.Iterations = *iterations
 
 	provider, err := selectProvider(*providerName, *seed, fcProviderConfig{
-		bin: *fcBin, kernel: *fcKernel, rootfs: *fcRootfs, runDir: *fcRunDir,
+		bin: *fcBin, kernel: *fcKernel, rootfs: *fcRootfs, runDir: *fcRunDir, objStore: *objStore,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "latencybench: %v\n", err)
@@ -91,6 +92,7 @@ func main() {
 // fcProviderConfig carries the real-firecracker provider's paths from flags.
 type fcProviderConfig struct {
 	bin, kernel, rootfs, runDir string
+	objStore                    string // Tier-3 -objstore spec ("" = Tier 3 disabled)
 }
 
 func selectProvider(name string, seed int64, fc fcProviderConfig) (WakeProvider, error) {
@@ -98,7 +100,18 @@ func selectProvider(name string, seed int64, fc fcProviderConfig) (WakeProvider,
 	case "stub":
 		return newStubProvider(seed), nil
 	case "firecracker":
-		return newFirecrackerProvider(fc.bin, fc.kernel, fc.rootfs, fc.runDir)
+		p, err := newFirecrackerProvider(fc.bin, fc.kernel, fc.rootfs, fc.runDir)
+		if err != nil {
+			return nil, err
+		}
+		if fc.objStore != "" {
+			store, err := parseObjStore(fc.objStore, fc.runDir)
+			if err != nil {
+				return nil, fmt.Errorf("objstore: %w", err)
+			}
+			p.withObjectStore(store)
+		}
+		return p, nil
 	case "vmd":
 		return newVMDProvider(), nil
 	default:
