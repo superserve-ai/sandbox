@@ -218,8 +218,8 @@ func (b *Blocklist) Reload(path string) {
 // reloadConfig re-reads the YAML config and rebuilds the snapshot from it plus
 // the cached feeds. Fail-safe: a bad config is logged and the current blocklist
 // is kept, never dropped. Domains and CIDRs are updated (CIDRs re-pushed to the
-// host firewall by refresh); blocked egress PORTS are fixed at startup and
-// still need a restart to change.
+// host firewall by refresh); blocked egress ports and refresh_interval are
+// applied once at startup and still need a restart to change.
 func (b *Blocklist) reloadConfig(ctx context.Context, path string) {
 	cfg, err := LoadConfig(path)
 	if err != nil {
