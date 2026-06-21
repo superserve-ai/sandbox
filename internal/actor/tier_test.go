@@ -35,9 +35,11 @@ func (d *recordDemoter) count() int { d.mu.Lock(); defer d.mu.Unlock(); return l
 func TestTierControllerRunLoop(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	dem := &recordDemoter{}
-	c := NewTierController(TierPolicy{ToTier1: time.Second}, dem, clk.now)
+	// Deep thresholds are large so only the Tier-1 demotion is eligible — the
+	// second (synchronizing) tick below is then a no-op.
+	c := NewTierController(TierPolicy{ToTier1: time.Second, ToTier2: time.Hour, ToTier3: time.Hour}, dem, clk.now)
 	c.Touch("a")
-	clk.advance(2 * time.Second) // "a" is now idle past ToTier1
+	clk.advance(2 * time.Second) // "a" is now idle past ToTier1 only
 
 	ticks := make(chan time.Time)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -90,17 +92,24 @@ func TestTierStaircase(t *testing.T) {
 		t.Fatalf("expected demote to tier2, tier=%s last=%s", c.Tier("a"), dem.last())
 	}
 
-	// Past ToTier1+ToTier2+ToTier3 (72s) → Tier3.
+	// Past ToTier1+ToTier2+ToTier3 (72s) → Tier3 (terminal: the VM is destroyed).
+	// The demoter is invoked, then the controller FORGETS the Actor — no compute
+	// left to track — so its tracked tier reverts to the cold default.
 	clk.advance(60 * time.Second) // total idle 73s >= 72s
-	c.Tick()
-	if c.Tier("a") != TierPaused3 || dem.last() != "a:tier3" {
-		t.Fatalf("expected demote to tier3, tier=%s last=%s", c.Tier("a"), dem.last())
+	if n := c.Tick(); n != 1 {
+		t.Fatalf("expected one demotion to tier3, got %d", n)
+	}
+	if dem.last() != "a:tier3" {
+		t.Fatalf("expected demote to tier3, last=%s", dem.last())
+	}
+	if c.Tier("a") != TierCold {
+		t.Fatalf("terminal demotion should forget the Actor (cold default), got %s", c.Tier("a"))
 	}
 
-	// Already deepest: no further demotion.
+	// Nothing left to demote — the entry was forgotten, so no leak and no re-demote.
 	clk.advance(time.Hour)
 	if n := c.Tick(); n != 0 {
-		t.Fatalf("no demotion past tier3, got %d", n)
+		t.Fatalf("no demotion after terminal forget, got %d", n)
 	}
 }
 
@@ -155,8 +164,13 @@ func TestTierOneStepPerTick(t *testing.T) {
 	if c.Tier("a") != TierPaused2 {
 		t.Fatalf("second tick → tier2, got %s", c.Tier("a"))
 	}
+	// Third tick demotes to Tier3 (terminal) and forgets the Actor, so its tracked
+	// tier reverts to the cold default — the demoter still recorded the step.
 	c.Tick()
-	if c.Tier("a") != TierPaused3 {
-		t.Fatalf("third tick → tier3, got %s", c.Tier("a"))
+	if dem.last() != "a:tier3" {
+		t.Fatalf("third tick should demote to tier3, last=%s", dem.last())
+	}
+	if c.Tier("a") != TierCold {
+		t.Fatalf("after the terminal step the Actor is forgotten (cold), got %s", c.Tier("a"))
 	}
 }

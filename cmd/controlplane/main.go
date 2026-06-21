@@ -73,6 +73,10 @@ func main() {
 	}
 }
 
+// actorTierTickInterval is how often the TierController scans for idle Actors to
+// demote. Sub-threshold granularity for DefaultTierPolicy (ToTier1 = 2s).
+const actorTierTickInterval = time.Second
+
 func run() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -212,8 +216,29 @@ func run() error {
 		exec := boxddeliver.NewHTTPExecStreamer(http.DefaultClient, execURL, execToken)
 		deliverer := boxddeliver.New(exec, []string{"sh", "-c", "harness-turn"})
 		waker := vmdwaker.New(vmdClient, deliverer, api.AgentTargetResolver(queries, systemTeam))
-		handlers.Agents = actorrt.NewRouter(actorrt.NewRegistry(pgstore.New(queries), nil), waker, cfg.DefaultHostID, 16)
-		log.Info().Msg("durable-Actor runtime enabled (/v1/agents) with sandbox-exec delivery")
+		router := actorrt.NewRouter(actorrt.NewRegistry(pgstore.New(queries), nil), waker, cfg.DefaultHostID, 16)
+
+		// Tiered hibernation: a TierController demotes idle Actors down the
+		// staircase. Its demotions route THROUGH the Router (race-free teardown:
+		// quiesce the inbox before the vmd op, keep the lease for Tier-1
+		// stickiness) and then perform the vmd-side tier op (bare-pause / snapshot
+		// / destroy). Touch on every event keeps a present Actor promoted.
+		vmdDemoter := vmdwaker.NewDemoter(vmdClient, "", nil) // "" → vmd picks the per-VM snapshot dir
+		controller := actorrt.NewTierController(actorrt.DefaultTierPolicy,
+			actorrt.DemoterFunc(func(actorID string, to actorrt.Tier) error {
+				return router.Demote(ctx, actorID, to, func() error {
+					return vmdDemoter.Demote(actorID, to)
+				})
+			}), nil)
+		router.OnActivity(controller.Touch)
+		go func() {
+			if err := controller.Run(ctx, actorTierTickInterval); err != nil && ctx.Err() == nil {
+				log.Warn().Err(err).Msg("tier controller loop stopped")
+			}
+		}()
+
+		handlers.Agents = router
+		log.Info().Msg("durable-Actor runtime enabled (/v1/agents) with sandbox-exec delivery + tiered hibernation")
 	}
 
 	// Durable /state versioning (checkpoint/branch/rollback). Enabled when

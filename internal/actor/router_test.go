@@ -125,26 +125,34 @@ func TestRouterHibernateAndRewake(t *testing.T) {
 		t.Fatal("actor should be live after routing")
 	}
 
+	// Tier-1 is sticky: the VM stays resident on this host, so the lease is KEPT
+	// (the Actor stays pinned here and the next wake bare-resumes locally).
 	r.Hibernate(a.ID, TierPaused1)
 	if r.IsLive(a.ID) {
 		t.Fatal("actor should not be live after hibernate")
 	}
-	// Lease must be released so another host could take over.
 	got, _ := reg.store.Get(context.Background(), a.ID)
-	if got.LeaseHolder != "" {
-		t.Errorf("hibernate should release the lease, holder=%q", got.LeaseHolder)
+	if got.LeaseHolder != "host-A" {
+		t.Errorf("Tier-1 hibernate should KEEP the lease (sticky), holder=%q", got.LeaseHolder)
 	}
 	if got.Tier != TierPaused1 {
 		t.Errorf("tier should be recorded as tier1, got %s", got.Tier)
 	}
 
-	// Next event re-wakes.
+	// Next event re-wakes on the same host (re-acquiring our own lease).
 	if err := r.Route(ctx, "t", "agent", Actor{}, Event{ID: "e2"}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return w.processed() == 2 })
 	if w.wakeCount() != 2 {
 		t.Fatalf("re-wake expected, total wakes %d", w.wakeCount())
+	}
+
+	// A deeper-tier hibernation DOES release the lease for cross-host handoff.
+	r.Hibernate(a.ID, TierCold)
+	got, _ = reg.store.Get(context.Background(), a.ID)
+	if got.LeaseHolder != "" {
+		t.Errorf("Tier-cold hibernate should release the lease, holder=%q", got.LeaseHolder)
 	}
 }
 

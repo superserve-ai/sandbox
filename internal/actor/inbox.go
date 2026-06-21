@@ -34,11 +34,19 @@ var ErrInboxClosed = errors.New("actor: inbox closed")
 // complement to the single-writer lease: the lease guarantees one live instance,
 // the inbox guarantees that instance processes events serially, so an Actor's
 // /state is mutated by exactly one event at a time.
+//
+// Close is safe against concurrent Sends (the hibernation/demotion path closes
+// an inbox while routes may still be arriving): the data channel is never closed
+// under a sender, and no enqueued event is dropped. See Close.
 type Inbox struct {
-	ch      chan Event
-	closeMu sync.Mutex
-	closed  bool
-	done    chan struct{}
+	ch chan Event
+
+	mu       sync.Mutex
+	cond     *sync.Cond // signaled when inflight reaches 0 after close
+	closed   bool
+	inflight int           // in-flight Send calls (counted under mu)
+	done     chan struct{} // closed by Close: stop accepting new events
+	drained  chan struct{} // closed after all in-flight sends settle: Run may drain+exit
 }
 
 // NewInbox creates an inbox with the given queue depth. Send blocks when the
@@ -47,19 +55,41 @@ func NewInbox(depth int) *Inbox {
 	if depth < 0 {
 		depth = 0
 	}
-	return &Inbox{ch: make(chan Event, depth), done: make(chan struct{})}
+	i := &Inbox{
+		ch:      make(chan Event, depth),
+		done:    make(chan struct{}),
+		drained: make(chan struct{}),
+	}
+	i.cond = sync.NewCond(&i.mu)
+	return i
 }
 
 // Send enqueues ev. It blocks if the queue is full until space frees, the inbox
-// closes (ErrInboxClosed), or ctx is cancelled (ctx.Err()).
+// closes (ErrInboxClosed), or ctx is cancelled (ctx.Err()). Safe to call
+// concurrently with Close: an event is either enqueued (and guaranteed drained
+// by Run) or rejected with ErrInboxClosed — never lost, never a panic.
 func (i *Inbox) Send(ctx context.Context, ev Event) error {
-	// Fast path: reject if already closed so we don't block on a dead inbox.
-	i.closeMu.Lock()
-	closed := i.closed
-	i.closeMu.Unlock()
-	if closed {
+	// Register as in-flight under the lock (atomic with the closed check) so
+	// Close's drain wait cannot complete while this Send might still enqueue.
+	i.mu.Lock()
+	if i.closed {
+		i.mu.Unlock()
 		return ErrInboxClosed
 	}
+	i.inflight++
+	i.mu.Unlock()
+	defer func() {
+		i.mu.Lock()
+		i.inflight--
+		if i.closed && i.inflight == 0 {
+			i.cond.Broadcast() // let a waiting Close proceed to drain
+		}
+		i.mu.Unlock()
+	}()
+
+	// The data channel is never closed, so the send case can't panic. On close,
+	// the done case wins and we reject; any event that does land in the buffer is
+	// drained by Run (Close waits for all in-flight Sends before letting Run exit).
 	select {
 	case i.ch <- ev:
 		return nil
@@ -82,10 +112,20 @@ func (i *Inbox) Run(ctx context.Context, h Handler, onErr func(Event, error)) {
 		select {
 		case <-ctx.Done():
 			return
-		case ev, ok := <-i.ch:
-			if !ok {
-				return
+		case <-i.drained:
+			// Close has settled: no more sends can enqueue. Drain whatever is
+			// buffered (in arrival order) and exit — no event is dropped.
+			for {
+				select {
+				case ev := <-i.ch:
+					if err := h(ctx, ev); err != nil && onErr != nil {
+						onErr(ev, err)
+					}
+				default:
+					return
+				}
 			}
+		case ev := <-i.ch:
 			if err := h(ctx, ev); err != nil && onErr != nil {
 				onErr(ev, err)
 			}
@@ -93,18 +133,25 @@ func (i *Inbox) Run(ctx context.Context, h Handler, onErr func(Event, error)) {
 	}
 }
 
-// Close stops accepting new events. In-flight Send calls unblock with
-// ErrInboxClosed; a Run consumer drains remaining queued events then exits when
-// the channel is closed. Idempotent.
+// Close stops accepting new events and lets a Run consumer drain the remaining
+// queue then exit. Idempotent. It closes `done` (so in-flight Sends bail with
+// ErrInboxClosed instead of blocking), waits for every in-flight Send to return,
+// and only then closes `drained` — guaranteeing that when Run drains, no further
+// event can still be racing into the buffer. The data channel itself is never
+// closed, so a concurrent Send can never panic.
 func (i *Inbox) Close() {
-	i.closeMu.Lock()
-	defer i.closeMu.Unlock()
+	i.mu.Lock()
 	if i.closed {
+		i.mu.Unlock()
 		return
 	}
 	i.closed = true
-	close(i.done)
-	close(i.ch)
+	close(i.done) // in-flight Sends blocked on a full buffer now bail
+	for i.inflight > 0 {
+		i.cond.Wait() // released i.mu; reacquired on wake
+	}
+	i.mu.Unlock()
+	close(i.drained) // no Send can enqueue past here; safe for Run to drain+exit
 }
 
 // Depth returns the number of events currently queued (for idle detection: an

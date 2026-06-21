@@ -126,23 +126,54 @@ func (c *TierController) runLoop(ctx context.Context, ticks <-chan time.Time) er
 // path and observers see each transition); call it on a steady cadence. Returns
 // the number of demotions performed.
 func (c *TierController) Tick() int {
+	// Collect the due demotions under the lock, then call the demoter OUTSIDE it:
+	// a demotion can be slow (a Tier-2 snapshot is seconds) and the demoter calls
+	// back into the Router/vmd, while Touch (every routed event) also needs c.mu —
+	// holding it across the demote would stall all routing.
+	type due struct {
+		id string
+		to Tier
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	now := c.now()
-	demotions := 0
+	var todo []due
 	for id, st := range c.state {
-		next := c.nextTier(st.tier, now.Sub(st.lastActive))
-		if next == st.tier {
-			continue
+		if next := c.nextTier(st.tier, now.Sub(st.lastActive)); next != st.tier {
+			todo = append(todo, due{id, next})
 		}
-		if err := c.demoter.Demote(id, next); err != nil {
-			// Leave the state as-is so the next Tick retries the transition.
-			continue
+	}
+	c.mu.Unlock()
+
+	demotions := 0
+	for _, d := range todo {
+		if err := c.demoter.Demote(d.id, d.to); err != nil {
+			continue // leave the state so the next Tick retries the transition
 		}
-		st.tier = next
+		c.mu.Lock()
+		// Only advance if the Actor wasn't re-promoted (Touch'd) while we demoted.
+		// A spurious demote of a just-active Actor is self-correcting — the next
+		// event re-wakes it — so this only avoids recording a stale tier.
+		if st := c.state[d.id]; st != nil && c.nextTier(st.tier, now.Sub(st.lastActive)) == d.to {
+			if isTerminalTier(d.to) {
+				// The VM is destroyed at the cold tier — forget the Actor so its
+				// idle-tracking entry doesn't leak. A later reference re-creates it
+				// (Touch resets it to Live), restarting the staircase.
+				delete(c.state, d.id)
+			} else {
+				st.tier = d.to
+			}
+		}
+		c.mu.Unlock()
 		demotions++
 	}
 	return demotions
+}
+
+// isTerminalTier reports whether a tier means the VM is destroyed (the Demoter
+// maps these to DestroyInstance). The controller forgets an Actor that reaches
+// one, since there is no compute left to track and the staircase can't advance.
+func isTerminalTier(t Tier) bool {
+	return t == TierPaused3 || t == TierCold
 }
 
 // nextTier returns the deepest tier the Actor is eligible for given idle time,
