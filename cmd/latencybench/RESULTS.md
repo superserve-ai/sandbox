@@ -30,6 +30,25 @@ the staging `base.ext4` mounted read-only, no network interface.
 Resume latency is essentially flat vs. contention — packing many paused VMs on a
 host does not slow an individual wake.
 
+## Tier-2 (snapshot restore) — also PASSES
+
+Cold-from-disk restore: a Full snapshot (state + memory file) is created once,
+then each iteration boots a **fresh** Firecracker that loads the snapshot with an
+eager File mem-backend and resumes (RAM reclaimed between iterations).
+
+| mem | iters | p50 | p99 | gate (<50ms) |
+|---|---|---|---|---|
+| 512M  | 50 | 2.13ms | 2.72ms | **PASS** (~18×) |
+| 1024M | 50 | 2.15ms | 2.87ms | **PASS** |
+
+Caveat: the guest here boots `base.ext4` to a small resident set (tens of MB), so
+the mem file loads fast and the number is flat vs. configured mem size. A
+realistic agent with a few hundred MB resident will read a larger mem file on the
+eager path — that is exactly where **UFFD lazy page-in** (Tier-2's optimization,
+the 1.4 A/B) moves the page-in cost off the restore and into the first turn. The
+~2–3ms here is the floor; the UFFD vs eager comparison at large working sets is
+the remaining Tier-2 measurement.
+
 ## What is measured (and why it's faithful)
 
 The measured quantity is the **in-process latency of the `PATCH /vm Resumed` call**.

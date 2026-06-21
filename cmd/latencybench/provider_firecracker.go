@@ -37,6 +37,18 @@ type firecrackerProvider struct {
 
 	cur    *vmPool
 	curKey string
+
+	// Tier-2 snapshot reused across iterations (created once per mem size).
+	snap    *tier2Snap
+	snapKey string
+}
+
+// tier2Snap is a saved Full snapshot (state + memory file) used to measure
+// cold-from-disk restore latency.
+type tier2Snap struct {
+	dir      string
+	snapPath string
+	memPath  string
 }
 
 func newFirecrackerProvider(fcBin, kernel, rootfs, runDir string) (*firecrackerProvider, error) {
@@ -62,9 +74,18 @@ func (p *firecrackerProvider) Label() string { return "firecracker (REAL — bar
 // the first iteration of each (mem, contention) cell and torn down when the cell
 // changes, so the K-1 other VMs stay paused-resident during every measurement.
 func (p *firecrackerProvider) Wake(ctx context.Context, params WakeParams) (PhaseTimings, error) {
-	if params.Cell.Tier != Tier1 {
-		return PhaseTimings{}, fmt.Errorf("firecracker provider only implements Tier 1; got tier %s", params.Cell.Tier)
+	switch params.Cell.Tier {
+	case Tier1:
+		return p.wakeTier1(ctx, params)
+	case Tier2:
+		return p.wakeTier2(ctx, params)
+	default:
+		return PhaseTimings{}, fmt.Errorf("firecracker provider implements Tier 1 and Tier 2; got tier %s", params.Cell.Tier)
 	}
+}
+
+// wakeTier1 measures bare pause→resume of a memory-resident VM under contention.
+func (p *firecrackerProvider) wakeTier1(ctx context.Context, params WakeParams) (PhaseTimings, error) {
 	key := strconv.Itoa(params.Cell.MemMiB) + "/" + strconv.Itoa(params.Cell.Contention)
 	if p.cur == nil || p.curKey != key {
 		if p.cur != nil {
@@ -99,7 +120,114 @@ func (p *firecrackerProvider) Close() error {
 		p.cur.Close()
 		p.cur = nil
 	}
+	if p.snap != nil {
+		_ = os.RemoveAll(p.snap.dir)
+		p.snap = nil
+	}
 	return nil
+}
+
+// wakeTier2 measures cold-from-disk restore: a Full snapshot (state + memory
+// file) is created once per mem size; each iteration boots a FRESH Firecracker
+// that loads the snapshot with an eager File mem-backend and resumes, timing the
+// whole load+resume (the Tier-2 restore cost; gate < 50ms). RAM is reclaimed
+// between iterations (each restore reads the mem file back in).
+func (p *firecrackerProvider) wakeTier2(ctx context.Context, params WakeParams) (PhaseTimings, error) {
+	key := strconv.Itoa(params.Cell.MemMiB)
+	if p.snap == nil || p.snapKey != key {
+		if p.snap != nil {
+			_ = os.RemoveAll(p.snap.dir)
+			p.snap = nil
+		}
+		snap, err := createTier2Snapshot(ctx, p, params.Cell.MemMiB)
+		if err != nil {
+			return PhaseTimings{}, fmt.Errorf("create tier2 snapshot (mem=%d): %w", params.Cell.MemMiB, err)
+		}
+		p.snap = snap
+		p.snapKey = key
+	}
+	vm, load, err := bootFromSnapshot(ctx, p, p.snap, params.Iteration)
+	if err != nil {
+		return PhaseTimings{}, fmt.Errorf("restore: %w", err)
+	}
+	vm.Close()
+	return PhaseTimings{Load: load}, nil
+}
+
+// createTier2Snapshot boots a VM, lets it settle, pauses it, and writes a Full
+// snapshot to disk. The source VM is then killed (defer) — only the snapshot
+// files survive, which is what later restores load.
+func createTier2Snapshot(ctx context.Context, p *firecrackerProvider, memMiB int) (*tier2Snap, error) {
+	vm, err := bootVM(ctx, p, memMiB, 9000)
+	if err != nil {
+		return nil, err
+	}
+	defer vm.Close()
+	select {
+	case <-time.After(1500 * time.Millisecond):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := vm.setState(ctx, "Paused"); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp(p.runDir, "snap")
+	if err != nil {
+		return nil, err
+	}
+	snap := &tier2Snap{dir: dir, snapPath: filepath.Join(dir, "snapshot"), memPath: filepath.Join(dir, "mem")}
+	if err := vm.put(ctx, "/snapshot/create", map[string]any{
+		"snapshot_type": "Full",
+		"snapshot_path": snap.snapPath,
+		"mem_file_path": snap.memPath,
+	}); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	return snap, nil
+}
+
+// bootFromSnapshot starts a fresh Firecracker and loads the snapshot with an
+// eager File mem-backend, resuming the VM. Returns the load+resume duration.
+func bootFromSnapshot(ctx context.Context, p *firecrackerProvider, snap *tier2Snap, idx int) (*fcVM, time.Duration, error) {
+	id := fmt.Sprintf("bench-r-%d-%d", os.Getpid(), idx)
+	dir := filepath.Join(p.runDir, id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, 0, err
+	}
+	sock := filepath.Join(dir, "fc.sock")
+	_ = os.Remove(sock)
+	vm := &fcVM{
+		id: id, dir: dir, sock: sock, logBuf: &bytes.Buffer{},
+		client: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+			},
+		}},
+	}
+	proc := exec.CommandContext(ctx, p.fcBin, "--api-sock", sock, "--id", id)
+	proc.Stdout = vm.logBuf
+	proc.Stderr = vm.logBuf
+	if err := proc.Start(); err != nil {
+		return nil, 0, err
+	}
+	vm.proc = proc
+	if err := waitForSocket(ctx, sock, 5*time.Second); err != nil {
+		vm.Close()
+		return nil, 0, err
+	}
+	start := time.Now()
+	err := vm.put(ctx, "/snapshot/load", map[string]any{
+		"snapshot_path": snap.snapPath,
+		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": snap.memPath},
+		"resume_vm":     true,
+	})
+	load := time.Since(start)
+	if err != nil {
+		vm.Close()
+		return nil, 0, err
+	}
+	return vm, load, nil
 }
 
 func max1(n int) int {
