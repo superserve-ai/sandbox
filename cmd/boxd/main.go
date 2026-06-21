@@ -77,6 +77,10 @@ func main() {
 		log.Fatalf("chmod defaultHome %s: %v", defaultHome, err)
 	}
 
+	// Mount the durable /state block device, if one is attached. Best-effort: a
+	// sandbox without durable state still serves ephemeral work.
+	mountStateDisk()
+
 	mux := http.NewServeMux()
 
 	ctx := &sandboxContext{}
