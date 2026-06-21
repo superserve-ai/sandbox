@@ -12,22 +12,36 @@ import (
 	"github.com/superserve-ai/sandbox/internal/actor"
 )
 
-func TestHTTPExecStreamer(t *testing.T) {
-	var gotToken, gotCommand, gotStdin string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotToken = r.Header.Get(AccessTokenHeader)
-		var req execRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		gotCommand = req.Command
-		gotStdin = req.Stdin
-		// Stream a reply in two writes (flush between) to exercise chunked read.
+// sseExecServer emulates boxd /exec/stream: it records the request and writes an
+// SSE reply (data: {json}\n\n), including a keepalive comment to exercise the
+// decoder's skip path.
+func sseExecServer(t *testing.T, captured *execRequest, tokenOut *string, stdoutChunks ...string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*tokenOut = r.Header.Get(AccessTokenHeader)
+		_ = json.NewDecoder(r.Body).Decode(captured)
+		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
-		_, _ = io.WriteString(w, "hello ")
-		if fl != nil {
-			fl.Flush()
+		writeData := func(v map[string]any) {
+			raw, _ := json.Marshal(v)
+			_, _ = io.WriteString(w, "data: "+string(raw)+"\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
 		}
-		_, _ = io.WriteString(w, "world")
+		_, _ = io.WriteString(w, ": keepalive\n\n") // must be skipped
+		for _, c := range stdoutChunks {
+			writeData(map[string]any{"stdout": c})
+		}
+		writeData(map[string]any{"stderr": "warn: ignored"}) // stderr must not reach the reply
+		writeData(map[string]any{"exit_code": 0, "finished": true})
 	}))
+}
+
+func TestHTTPExecStreamerSSE(t *testing.T) {
+	var got execRequest
+	var token string
+	srv := sseExecServer(t, &got, &token, "hello ", "world")
 	defer srv.Close()
 
 	exec := NewHTTPExecStreamer(srv.Client(),
@@ -36,44 +50,57 @@ func TestHTTPExecStreamer(t *testing.T) {
 	)
 
 	var out strings.Builder
-	err := exec.ExecStream(context.Background(), "sbx-1", []string{"claude", "-p"}, []byte("ping"), func(b []byte) {
+	err := exec.ExecStream(context.Background(), "sbx-1", []string{"sh", "-c", "claude -p"}, []byte("ping"), func(b []byte) {
 		out.Write(b)
 	})
 	if err != nil {
 		t.Fatalf("ExecStream: %v", err)
 	}
 	if out.String() != "hello world" {
-		t.Errorf("streamed output = %q, want %q", out.String(), "hello world")
+		t.Errorf("streamed stdout = %q, want %q (stderr/keepalive must be skipped)", out.String(), "hello world")
 	}
-	if gotToken != "tok-123" {
-		t.Errorf("token = %q, want tok-123", gotToken)
+	if token != "tok-123" {
+		t.Errorf("token = %q", token)
 	}
-	if gotCommand != "claude -p" {
-		t.Errorf("command = %q, want 'claude -p'", gotCommand)
+	if got.Command != "sh" || strings.Join(got.Args, " ") != "-c claude -p" {
+		t.Errorf("command/args = %q %v", got.Command, got.Args)
 	}
-	if gotStdin != "ping" {
-		t.Errorf("stdin = %q, want ping", gotStdin)
+	// The event payload reaches the harness via $ACTOR_EVENT, not stdin.
+	if got.Env[EventEnvVar] != "ping" {
+		t.Errorf("event env %s = %q, want ping", EventEnvVar, got.Env[EventEnvVar])
 	}
 }
 
-func TestHTTPExecStreamerErrorStatus(t *testing.T) {
+func TestHTTPExecStreamerErrorEvent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"error":"command not found","finished":true}`+"\n\n")
+	}))
+	defer srv.Close()
+	exec := NewHTTPExecStreamer(srv.Client(), func(string) string { return srv.URL }, func(string) (string, error) { return "t", nil })
+	if err := exec.ExecStream(context.Background(), "s", []string{"nope"}, nil, func([]byte) {}); err == nil {
+		t.Fatal("an SSE error event should surface as an error")
+	}
+}
+
+func TestHTTPExecStreamerBadStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}))
 	defer srv.Close()
 	exec := NewHTTPExecStreamer(srv.Client(), func(string) string { return srv.URL }, func(string) (string, error) { return "t", nil })
 	if err := exec.ExecStream(context.Background(), "s", []string{"x"}, nil, func([]byte) {}); err == nil {
-		t.Fatal("non-2xx exec should error")
+		t.Fatal("non-2xx should error")
 	}
 }
 
-// TestHTTPExecStreamerEndToEnd: the HTTP exec streamer behind the Deliverer
-// streams a harness reply into the turn's Relay — the full production delivery
-// path (minus the real proxy), exercised over httptest.
-func TestHTTPExecStreamerEndToEnd(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "the answer is 42")
-	}))
+// TestExecSSEToRelayEndToEnd: HTTPExecStreamer behind the Deliverer streams the
+// harness reply into the turn's Relay — the full production delivery path
+// (minus the real proxy), over httptest with boxd's real SSE shape.
+func TestExecSSEToRelayEndToEnd(t *testing.T) {
+	var got execRequest
+	var token string
+	srv := sseExecServer(t, &got, &token, "the ", "answer ", "is 42")
 	defer srv.Close()
 	exec := NewHTTPExecStreamer(srv.Client(), func(string) string { return srv.URL }, func(string) (string, error) { return "t", nil })
 	d := New(exec, []string{"harness"})
@@ -84,17 +111,17 @@ func TestHTTPExecStreamerEndToEnd(t *testing.T) {
 	}
 	relay.Close()
 
-	var got strings.Builder
+	var out strings.Builder
 	cur := int64(0)
 	for {
 		c, ok, err := relay.ReadFrom(context.Background(), cur)
 		if err != nil || !ok {
 			break
 		}
-		got.WriteString(string(c.Data))
+		out.WriteString(string(c.Data))
 		cur = c.Seq
 	}
-	if got.String() != "the answer is 42" {
-		t.Fatalf("end-to-end delivered output = %q", got.String())
+	if out.String() != "the answer is 42" {
+		t.Fatalf("end-to-end output = %q", out.String())
 	}
 }
