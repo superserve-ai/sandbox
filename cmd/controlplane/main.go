@@ -15,6 +15,7 @@ import (
 
 	kms "cloud.google.com/go/kms/apiv1"
 	"github.com/getsentry/sentry-go"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -23,6 +24,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 
+	actorrt "github.com/superserve-ai/sandbox/internal/actor"
+	"github.com/superserve-ai/sandbox/internal/actor/boxddeliver"
+	"github.com/superserve-ai/sandbox/internal/actor/pgstore"
+	"github.com/superserve-ai/sandbox/internal/actor/vmdwaker"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/billing"
@@ -52,6 +57,17 @@ const vmdRetryServiceConfig = `{
     }
   }]
 }`
+
+// notWiredExec is a placeholder boxddeliver.ExecStreamer used until the sandbox
+// exec path (proxy /exec/stream against boxd, with the sandbox access token) is
+// wired into the control plane. It makes the durable-Actor runtime assembly
+// type-check and constructable; live event delivery returns this error until the
+// real ExecStreamer lands.
+type notWiredExec struct{}
+
+func (notWiredExec) ExecStream(context.Context, string, []string, []byte, func([]byte)) error {
+	return fmt.Errorf("actor runtime: sandbox ExecStreamer not wired (implement over proxy /exec/stream)")
+}
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -179,6 +195,22 @@ func run() error {
 	}
 	handlers.Hosts = hostreg.New(queries, dialVMD)
 	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
+
+	// Durable-Actor runtime (client plane, POST /v1/agents/send). Flag-gated and
+	// default-off so it has zero effect on existing behavior. Assembles the
+	// proven runtime: PgStore-backed Registry + single-writer Lease + serial
+	// Inbox + wake-on-reference Router over a vmd-backed Waker, with the boxd
+	// exec/stream Deliverer and the template-snapshot Resolver. The one piece
+	// still to wire for live delivery is a real ExecStreamer over the sandbox
+	// exec path (proxy /exec/stream); the stub below makes the assembly explicit
+	// and the whole graph type-check.
+	if os.Getenv("ACTOR_RUNTIME_ENABLED") == "1" {
+		systemTeam, _ := uuid.Parse(cfg.SystemTeamID)
+		deliverer := boxddeliver.New(notWiredExec{}, []string{"sh", "-c", "harness-turn"})
+		waker := vmdwaker.New(vmdClient, deliverer, api.AgentTargetResolver(queries, systemTeam))
+		handlers.Agents = actorrt.NewRouter(actorrt.NewRegistry(pgstore.New(queries), nil), waker, cfg.DefaultHostID, 16)
+		log.Info().Msg("durable-Actor runtime enabled (/v1/agents); exec delivery pending real ExecStreamer")
+	}
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
