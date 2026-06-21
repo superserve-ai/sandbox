@@ -2,13 +2,53 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"path/filepath"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
 	actorrt "github.com/superserve-ai/sandbox/internal/actor"
+	"github.com/superserve-ai/sandbox/internal/actor/vmdwaker"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+// AgentTargetResolver is the production vmdwaker.Resolver: it maps an Actor to
+// the template snapshot its sandbox boots from. This is the third of the three
+// production seams that wire the Actor runtime to vmd (with the vmd client as
+// SandboxBooter and a boxd exec/stream Deliverer). Wire it in controlplane main:
+//
+//	waker  := vmdwaker.New(vmdClient, boxdDeliverer, AgentTargetResolver(q, systemTeam))
+//	router := actor.NewRouter(actor.NewRegistry(pgstore.New(q), nil), waker, hostID, 16)
+//	handlers.Agents = router
+func AgentTargetResolver(q *db.Queries, systemTeam uuid.UUID) vmdwaker.Resolver {
+	return func(a actorrt.Actor) (vmdwaker.Target, error) {
+		tid, err := uuid.Parse(a.Template)
+		if err != nil {
+			return vmdwaker.Target{}, fmt.Errorf("actor %q has no template binding", a.Name)
+		}
+		team, err := uuid.Parse(a.TeamID)
+		if err != nil {
+			return vmdwaker.Target{}, err
+		}
+		tpl, err := q.GetTemplate(context.Background(), db.GetTemplateParams{ID: tid, TeamID: team, TeamID_2: systemTeam})
+		if err != nil {
+			return vmdwaker.Target{}, fmt.Errorf("resolve template for actor %q: %w", a.Name, err)
+		}
+		if tpl.SnapshotPath == nil || tpl.MemPath == nil {
+			return vmdwaker.Target{}, fmt.Errorf("template for actor %q is not ready (no snapshot)", a.Name)
+		}
+		t := vmdwaker.Target{SnapshotPath: *tpl.SnapshotPath, MemPath: *tpl.MemPath, TeamID: a.TeamID}
+		if tpl.BasePath != nil {
+			t.BasePath = *tpl.BasePath
+		}
+		if tpl.DeltaPath != nil {
+			t.DeltaDir = filepath.Dir(*tpl.DeltaPath)
+		}
+		return t, nil
+	}
+}
 
 type sendAgentRequest struct {
 	Agent   string `json:"agent"`   // durable Actor name (unique per team); created on first reference

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	actorrt "github.com/superserve-ai/sandbox/internal/actor"
 	"github.com/superserve-ai/sandbox/internal/actor/vmdwaker"
@@ -75,5 +76,31 @@ func TestSendAgentEvent_MissingAgent(t *testing.T) {
 	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, agentSendReq(`{"message":"y"}`))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("missing agent should 400, got %d", w.Code)
+	}
+}
+
+func TestAgentTargetResolver(t *testing.T) {
+	tplID := uuid.New()
+	tpl := defaultReadyTemplate() // has SnapshotPath + MemPath
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		if strings.Contains(sql, "FROM template") {
+			return templateRow(tpl)
+		}
+		return notFoundRow()
+	}}
+	resolve := AgentTargetResolver(db.New(mock), uuid.Nil)
+	target, err := resolve(actorrt.Actor{Template: tplID.String(), TeamID: uuid.New().String(), Name: "agent"})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if target.SnapshotPath == "" || target.MemPath == "" {
+		t.Fatalf("resolved target missing snapshot paths: %+v", target)
+	}
+}
+
+func TestAgentTargetResolver_NoTemplateBinding(t *testing.T) {
+	resolve := AgentTargetResolver(db.New(&mockDBTX{}), uuid.Nil)
+	if _, err := resolve(actorrt.Actor{Template: "", TeamID: uuid.New().String(), Name: "x"}); err == nil {
+		t.Fatal("actor with no template binding should error")
 	}
 }
