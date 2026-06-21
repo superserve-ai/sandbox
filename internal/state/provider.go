@@ -48,7 +48,17 @@ type Mount struct {
 	Identity string
 	// Path is the resolved host path at which the identity's live, writable
 	// state is available. The Actor's runtime maps this onto /state.
+	//
+	// When IsBlockDevice is false (directory providers) Path is a directory the
+	// guest bind/NFS-mounts. When IsBlockDevice is true (block providers) Path is
+	// a formatted block-image file that vmd attaches as the VM's /state drive and
+	// boxd mounts at /state — the Firecracker-native durable-disk path.
 	Path string
+
+	// IsBlockDevice reports whether Path is a block-image file (true) or a
+	// directory (false). vmd attaches a block image as a drive; a directory is
+	// shared by a host-side mount.
+	IsBlockDevice bool
 
 	// unmount releases mount resources without touching durable state. It is
 	// supplied by the Provider that produced the Mount.

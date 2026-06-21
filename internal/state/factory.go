@@ -6,8 +6,13 @@ import "fmt"
 type Backend string
 
 const (
-	// BackendLocal is the on-disk reference provider (dev/test). Default.
+	// BackendLocal is the on-disk directory reference provider (dev/test). Default.
 	BackendLocal Backend = "local"
+	// BackendLocalBlock is the on-disk BLOCK-DEVICE reference provider: each
+	// identity is a formatted ext4 image vmd attaches as the /state drive. This
+	// is the Firecracker-native durable-disk path (vs the directory provider,
+	// which has no in-VM transport on Firecracker).
+	BackendLocalBlock Backend = "local-block"
 	// BackendArchil is the Archil NFSv3 adapter (stub until creds land).
 	BackendArchil Backend = "archil"
 	// BackendMesa is the Mesa SDK/FUSE adapter (stub until creds land).
@@ -20,9 +25,13 @@ type Config struct {
 	// Backend selects the implementation. Empty defaults to BackendLocal.
 	Backend Backend
 
-	// BaseDir is the host directory rooting LocalProvider state.
-	// Required for BackendLocal.
+	// BaseDir is the host directory rooting LocalProvider / LocalBlockProvider
+	// state. Required for BackendLocal and BackendLocalBlock.
 	BaseDir string
+
+	// StateImageMiB sizes a fresh /state image for BackendLocalBlock.
+	// <= 0 uses DefaultStateImageMiB.
+	StateImageMiB int
 
 	// Archil holds Archil adapter configuration (BackendArchil).
 	Archil ArchilConfig
@@ -39,6 +48,8 @@ func NewProvider(cfg Config) (Provider, error) {
 	switch cfg.Backend {
 	case "", BackendLocal:
 		return NewLocalProvider(cfg.BaseDir)
+	case BackendLocalBlock:
+		return NewLocalBlockProvider(cfg.BaseDir, cfg.StateImageMiB)
 	case BackendArchil:
 		return NewArchilProvider(cfg.Archil), nil
 	case BackendMesa:
