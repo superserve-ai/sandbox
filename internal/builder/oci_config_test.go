@@ -192,11 +192,14 @@ func TestValidatePlatformConfig(t *testing.T) {
 			t.Fatal("expected arch mismatch error")
 		}
 	})
-	t.Run("alpine-style PATH rejected", func(t *testing.T) {
+	t.Run("alpine-style minimal PATH is accepted (musl boot validated)", func(t *testing.T) {
+		// Alpine/busybox images boot fine — static boxd+tini behind a POSIX-sh
+		// init wrapper, validated on a real Alpine microVM — so a minimal PATH
+		// must NOT be rejected (it used to be).
 		cfg := base()
 		cfg.Config.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin"}
-		if err := validatePlatformConfig(cfg, "linux", "amd64"); err == nil {
-			t.Fatal("expected alpine/busybox rejection")
+		if err := validatePlatformConfig(cfg, "linux", "amd64"); err != nil {
+			t.Fatalf("alpine-style minimal PATH should be accepted, got %v", err)
 		}
 	})
 	t.Run("debian-style PATH passes", func(t *testing.T) {
