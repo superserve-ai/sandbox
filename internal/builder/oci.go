@@ -129,11 +129,21 @@ func parseEnv(env []string) map[string]string {
 	return out
 }
 
-// validatePlatformConfig rejects images that don't match the required OS/arch
-// and rejects known-incompatible bases (alpine, distroless) early with a clear
-// message. Catches configuration mistakes before the slow mkfs.ext4 step.
+// validatePlatformConfig rejects images that don't match the required OS/arch.
 // Operates on an already-fetched config so callers avoid a second network
 // round-trip to read it.
+//
+// It deliberately does NOT reject alpine/musl/busybox-based images: the guest
+// boot chain is a statically-linked boxd + tini behind a POSIX-sh /sbin/init
+// wrapper (the injector os.Removes the base image's init symlink before writing
+// it), which has been validated booting on a real Alpine (musl) microVM — boxd
+// comes up as the init chain unchanged. Minimal-PATH images are therefore fine.
+//
+// The one base the platform genuinely can't boot is a fully distroless image
+// with NO shell at all: the /sbin/init wrapper is #!/bin/sh, so without /bin/sh
+// the VM can't start. That can't be detected cheaply from the image config
+// (which doesn't enumerate files), so it surfaces as a clear boot failure rather
+// than a pre-pull rejection.
 func validatePlatformConfig(cfg *v1.ConfigFile, wantOS, wantArch string) error {
 	if cfg == nil {
 		return fmt.Errorf("read image config: nil config")
@@ -143,17 +153,6 @@ func validatePlatformConfig(cfg *v1.ConfigFile, wantOS, wantArch string) error {
 	}
 	if cfg.Architecture != wantArch {
 		return fmt.Errorf("image architecture is %q, want %q", cfg.Architecture, wantArch)
-	}
-	// Heuristic: look at the config's labels and entrypoint for hints that
-	// this is an alpine / distroless / busybox-only image. Cheap, catches
-	// the common cases before we waste time pulling.
-	for _, env := range cfg.Config.Env {
-		if strings.HasPrefix(strings.ToLower(env), "path=") {
-			if strings.Contains(env, "/sbin:/bin") && !strings.Contains(env, "/usr/sbin") {
-				// Busybox-style layout. Alpine fits this pattern.
-				return fmt.Errorf("image appears to be alpine or busybox-based (PATH looks minimal); use a debian/ubuntu-based image")
-			}
-		}
 	}
 	return nil
 }

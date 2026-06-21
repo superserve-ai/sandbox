@@ -346,7 +346,10 @@ options timeout:2 attempts:2
 //	shell before the exec gets us a working OS environment, then hands off
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
-// POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
+// POSIX sh is assumed — debian/ubuntu ship it, and so does alpine (busybox ash),
+// which is why the chain (this wrapper → tini → boxd, all static) boots
+// unchanged on a musl/alpine rootfs (validated on a real Alpine microVM). The
+// only base this can't handle is one with no /bin/sh at all (fully distroless).
 const initScript = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
