@@ -66,6 +66,24 @@ WHERE status IN ('pending', 'building', 'snapshotting');
 SELECT id, base_path FROM template
 WHERE deleted_at IS NULL AND base_path IS NOT NULL;
 
+-- name: GetReadyTemplateByImageDigest :one
+-- Bring-your-image cache lookup: the newest ready, non-deleted template the
+-- caller's team owns whose base image resolved to this digest. Backs the
+-- POST /v1/sandboxes/from-image fast path — a HIT means the snapshot already
+-- exists and the create is a restore, not a build.
+--
+-- Scoped to team_id only (NOT system-team-visible): the digest cache is a
+-- per-team isolation boundary (§12 decision #4), so one team's build of a
+-- public image is never silently reused by another team. ORDER BY built_at so
+-- if a digest was (re)built multiple times the most recent snapshot wins.
+SELECT * FROM template
+WHERE team_id = $1
+  AND resolved_digest = $2
+  AND status = 'ready'
+  AND deleted_at IS NULL
+ORDER BY built_at DESC NULLS LAST
+LIMIT 1;
+
 -- name: GetTemplateByName :one
 -- Resolve name to a template visible to the caller. Names are unique per
 -- team, so the same name can exist in both the caller's team and the system
@@ -236,6 +254,7 @@ SET status = 'ready',
     base_path = $6,
     delta_path = $7,
     image_config = $8,
+    resolved_digest = $9,
     built_at = now(),
     updated_at = now(),
     error_message = NULL

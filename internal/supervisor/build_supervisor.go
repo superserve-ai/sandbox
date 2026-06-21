@@ -450,15 +450,24 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		if res.ImageConfigJSON != "" {
 			imageConfigArg = []byte(res.ImageConfigJSON)
 		}
+		// Persist the resolved base-image digest so the bring-your-image
+		// one-shot path can cache by (team_id, digest). Empty for builds whose
+		// vmd predates digest reporting → leave the column NULL (that template
+		// is just invisible to the digest cache, not broken).
+		var resolvedDigestArg *string
+		if res.ResolvedDigest != "" {
+			resolvedDigestArg = &res.ResolvedDigest
+		}
 		_, err := s.q.FinalizeBuild(finCtx, db.FinalizeBuildParams{
-			ID:           row.ID,
-			RootfsPath:   &rootfs,
-			SnapshotPath: &snapPath,
-			MemPath:      &memPath,
-			SizeBytes:    &size,
-			BasePath:     basePathArg,
-			DeltaPath:    deltaPathArg,
-			ImageConfig:  imageConfigArg,
+			ID:             row.ID,
+			RootfsPath:     &rootfs,
+			SnapshotPath:   &snapPath,
+			MemPath:        &memPath,
+			SizeBytes:      &size,
+			BasePath:       basePathArg,
+			DeltaPath:      deltaPathArg,
+			ImageConfig:    imageConfigArg,
+			ResolvedDigest: resolvedDigestArg,
 		})
 		cancel()
 		if errors.Is(err, pgx.ErrNoRows) {

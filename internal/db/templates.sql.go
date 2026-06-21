@@ -105,7 +105,7 @@ func (q *Queries) CountInFlightBuildsForTeam(ctx context.Context, teamID uuid.UU
 const createTemplate = `-- name: CreateTemplate :one
 INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config
+RETURNING id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config, resolved_digest
 `
 
 type CreateTemplateParams struct {
@@ -152,6 +152,7 @@ func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) 
 		&i.BasePath,
 		&i.DeltaPath,
 		&i.ImageConfig,
+		&i.ResolvedDigest,
 	)
 	return i, err
 }
@@ -306,7 +307,7 @@ tpl_update AS (
     AND template.status IN ('pending', 'building')
   RETURNING template.id
 )
-SELECT t.id, t.team_id, t.name, t.status, t.build_spec, t.vcpu, t.memory_mib, t.disk_mib, t.rootfs_path, t.snapshot_path, t.mem_path, t.size_bytes, t.error_message, t.created_at, t.updated_at, t.built_at, t.deleted_at, t.base_path, t.delta_path, t.image_config
+SELECT t.id, t.team_id, t.name, t.status, t.build_spec, t.vcpu, t.memory_mib, t.disk_mib, t.rootfs_path, t.snapshot_path, t.mem_path, t.size_bytes, t.error_message, t.created_at, t.updated_at, t.built_at, t.deleted_at, t.base_path, t.delta_path, t.image_config, t.resolved_digest
 FROM target_build tb
 JOIN template t ON t.id = tb.template_id
 `
@@ -343,6 +344,7 @@ func (q *Queries) FailBuild(ctx context.Context, arg FailBuildParams) (Template,
 		&i.BasePath,
 		&i.DeltaPath,
 		&i.ImageConfig,
+		&i.ResolvedDigest,
 	)
 	return i, err
 }
@@ -365,23 +367,25 @@ SET status = 'ready',
     base_path = $6,
     delta_path = $7,
     image_config = $8,
+    resolved_digest = $9,
     built_at = now(),
     updated_at = now(),
     error_message = NULL
 FROM build_done
 WHERE template.id = build_done.template_id
-RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at, template.base_path, template.delta_path, template.image_config
+RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at, template.base_path, template.delta_path, template.image_config, template.resolved_digest
 `
 
 type FinalizeBuildParams struct {
-	ID           uuid.UUID `json:"id"`
-	RootfsPath   *string   `json:"rootfs_path"`
-	SnapshotPath *string   `json:"snapshot_path"`
-	MemPath      *string   `json:"mem_path"`
-	SizeBytes    *int64    `json:"size_bytes"`
-	BasePath     *string   `json:"base_path"`
-	DeltaPath    *string   `json:"delta_path"`
-	ImageConfig  []byte    `json:"image_config"`
+	ID             uuid.UUID `json:"id"`
+	RootfsPath     *string   `json:"rootfs_path"`
+	SnapshotPath   *string   `json:"snapshot_path"`
+	MemPath        *string   `json:"mem_path"`
+	SizeBytes      *int64    `json:"size_bytes"`
+	BasePath       *string   `json:"base_path"`
+	DeltaPath      *string   `json:"delta_path"`
+	ImageConfig    []byte    `json:"image_config"`
+	ResolvedDigest *string   `json:"resolved_digest"`
 }
 
 // Atomically transition template_build → ready and template → ready with
@@ -401,6 +405,7 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (T
 		arg.BasePath,
 		arg.DeltaPath,
 		arg.ImageConfig,
+		arg.ResolvedDigest,
 	)
 	var i Template
 	err := row.Scan(
@@ -424,6 +429,7 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (T
 		&i.BasePath,
 		&i.DeltaPath,
 		&i.ImageConfig,
+		&i.ResolvedDigest,
 	)
 	return i, err
 }
@@ -466,8 +472,61 @@ func (q *Queries) GetExistingInflightBuild(ctx context.Context, arg GetExistingI
 	return i, err
 }
 
+const getReadyTemplateByImageDigest = `-- name: GetReadyTemplateByImageDigest :one
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config, resolved_digest FROM template
+WHERE team_id = $1
+  AND resolved_digest = $2
+  AND status = 'ready'
+  AND deleted_at IS NULL
+ORDER BY built_at DESC NULLS LAST
+LIMIT 1
+`
+
+type GetReadyTemplateByImageDigestParams struct {
+	TeamID         uuid.UUID `json:"team_id"`
+	ResolvedDigest *string   `json:"resolved_digest"`
+}
+
+// Bring-your-image cache lookup: the newest ready, non-deleted template the
+// caller's team owns whose base image resolved to this digest. Backs the
+// POST /v1/sandboxes/from-image fast path — a HIT means the snapshot already
+// exists and the create is a restore, not a build.
+//
+// Scoped to team_id only (NOT system-team-visible): the digest cache is a
+// per-team isolation boundary (§12 decision #4), so one team's build of a
+// public image is never silently reused by another team. ORDER BY built_at so
+// if a digest was (re)built multiple times the most recent snapshot wins.
+func (q *Queries) GetReadyTemplateByImageDigest(ctx context.Context, arg GetReadyTemplateByImageDigestParams) (Template, error) {
+	row := q.db.QueryRow(ctx, getReadyTemplateByImageDigest, arg.TeamID, arg.ResolvedDigest)
+	var i Template
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.BuildSpec,
+		&i.Vcpu,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.RootfsPath,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.SizeBytes,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BuiltAt,
+		&i.DeletedAt,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.ImageConfig,
+		&i.ResolvedDigest,
+	)
+	return i, err
+}
+
 const getTemplate = `-- name: GetTemplate :one
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config, resolved_digest FROM template
 WHERE id = $1
   AND deleted_at IS NULL
   AND (team_id = $2 OR team_id = $3)
@@ -506,6 +565,7 @@ func (q *Queries) GetTemplate(ctx context.Context, arg GetTemplateParams) (Templ
 		&i.BasePath,
 		&i.DeltaPath,
 		&i.ImageConfig,
+		&i.ResolvedDigest,
 	)
 	return i, err
 }
@@ -558,7 +618,7 @@ func (q *Queries) GetTemplateBuild(ctx context.Context, arg GetTemplateBuildPara
 }
 
 const getTemplateByName = `-- name: GetTemplateByName :one
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config, resolved_digest FROM template
 WHERE name = $1
   AND deleted_at IS NULL
   AND (team_id = $2 OR team_id = $3)
@@ -599,12 +659,13 @@ func (q *Queries) GetTemplateByName(ctx context.Context, arg GetTemplateByNamePa
 		&i.BasePath,
 		&i.DeltaPath,
 		&i.ImageConfig,
+		&i.ResolvedDigest,
 	)
 	return i, err
 }
 
 const getTemplateForOwner = `-- name: GetTemplateForOwner :one
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config, resolved_digest FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
 `
 
@@ -639,6 +700,7 @@ func (q *Queries) GetTemplateForOwner(ctx context.Context, arg GetTemplateForOwn
 		&i.BasePath,
 		&i.DeltaPath,
 		&i.ImageConfig,
+		&i.ResolvedDigest,
 	)
 	return i, err
 }
@@ -843,7 +905,7 @@ func (q *Queries) ListPendingBuildsOrdered(ctx context.Context, limit int32) ([]
 }
 
 const listTemplatesForTeam = `-- name: ListTemplatesForTeam :many
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config, resolved_digest FROM template
 WHERE deleted_at IS NULL
   AND (team_id = $1 OR team_id = $2)
 ORDER BY created_at DESC
@@ -886,6 +948,7 @@ func (q *Queries) ListTemplatesForTeam(ctx context.Context, arg ListTemplatesFor
 			&i.BasePath,
 			&i.DeltaPath,
 			&i.ImageConfig,
+			&i.ResolvedDigest,
 		); err != nil {
 			return nil, err
 		}
@@ -898,7 +961,7 @@ func (q *Queries) ListTemplatesForTeam(ctx context.Context, arg ListTemplatesFor
 }
 
 const listTemplatesForTeamFiltered = `-- name: ListTemplatesForTeamFiltered :many
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, image_config, resolved_digest FROM template
 WHERE deleted_at IS NULL
   AND (team_id = $1 OR team_id = $2)
   AND ($3::text IS NULL
@@ -944,6 +1007,7 @@ func (q *Queries) ListTemplatesForTeamFiltered(ctx context.Context, arg ListTemp
 			&i.BasePath,
 			&i.DeltaPath,
 			&i.ImageConfig,
+			&i.ResolvedDigest,
 		); err != nil {
 			return nil, err
 		}

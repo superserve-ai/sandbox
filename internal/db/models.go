@@ -575,26 +575,27 @@ type TeamPricingPlan struct {
 }
 
 type Template struct {
-	ID           uuid.UUID          `json:"id"`
-	TeamID       uuid.UUID          `json:"team_id"`
-	Name         string             `json:"name"`
-	Status       TemplateStatus     `json:"status"`
-	BuildSpec    []byte             `json:"build_spec"`
-	Vcpu         int32              `json:"vcpu"`
-	MemoryMib    int32              `json:"memory_mib"`
-	DiskMib      int32              `json:"disk_mib"`
-	RootfsPath   *string            `json:"rootfs_path"`
-	SnapshotPath *string            `json:"snapshot_path"`
-	MemPath      *string            `json:"mem_path"`
-	SizeBytes    *int64             `json:"size_bytes"`
-	ErrorMessage *string            `json:"error_message"`
-	CreatedAt    time.Time          `json:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at"`
-	BuiltAt      pgtype.Timestamptz `json:"built_at"`
-	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
-	BasePath     *string            `json:"base_path"`
-	DeltaPath    *string            `json:"delta_path"`
-	ImageConfig  []byte             `json:"image_config"`
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Name           string             `json:"name"`
+	Status         TemplateStatus     `json:"status"`
+	BuildSpec      []byte             `json:"build_spec"`
+	Vcpu           int32              `json:"vcpu"`
+	MemoryMib      int32              `json:"memory_mib"`
+	DiskMib        int32              `json:"disk_mib"`
+	RootfsPath     *string            `json:"rootfs_path"`
+	SnapshotPath   *string            `json:"snapshot_path"`
+	MemPath        *string            `json:"mem_path"`
+	SizeBytes      *int64             `json:"size_bytes"`
+	ErrorMessage   *string            `json:"error_message"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	BuiltAt        pgtype.Timestamptz `json:"built_at"`
+	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+	BasePath       *string            `json:"base_path"`
+	DeltaPath      *string            `json:"delta_path"`
+	ImageConfig    []byte             `json:"image_config"`
+	ResolvedDigest *string            `json:"resolved_digest"`
 }
 
 type TemplateBuild struct {
