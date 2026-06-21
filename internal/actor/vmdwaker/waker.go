@@ -19,9 +19,13 @@ import (
 )
 
 // SandboxBooter is the subset of vmd's API the waker needs. The real
-// vmdclient.Client satisfies this shape (RestoreSnapshot / DestroyInstance).
+// vmdclient.Client satisfies this shape (RestoreSnapshot / BareResumeInstance /
+// DestroyInstance).
 type SandboxBooter interface {
 	RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, env map[string]string) (string, uint32, uint32, error)
+	// BareResumeInstance is the Tier-1 wake: unpause a still-resident, bare-paused
+	// VM in place (sub-ms, no snapshot restore).
+	BareResumeInstance(ctx context.Context, id string) (string, uint32, uint32, error)
 	DestroyInstance(ctx context.Context, id string, force bool) error
 }
 
@@ -70,15 +74,27 @@ var _ actor.Waker = (*Waker)(nil)
 // each event into the in-guest harness. The sandbox id is the Actor id — one
 // durable sandbox per Actor identity, so /state and routing stay stable.
 func (w *Waker) Wake(ctx context.Context, a actor.Actor, _ *actor.Lease) (actor.Handler, error) {
-	tgt, err := w.resolve(a)
-	if err != nil {
-		return nil, fmt.Errorf("resolve actor %q: %w", a.Name, err)
+	sandboxID := a.ID // one durable sandbox per Actor identity
+
+	if a.Tier == actor.TierPaused1 {
+		// Tier-1: the VM is still RAM-resident (bare-paused). Wake is a sub-ms
+		// vCPU unpause — no snapshot resolve or restore. /state, netns, and the
+		// in-guest harness are all already up.
+		if _, _, _, err := w.boot.BareResumeInstance(ctx, sandboxID); err != nil {
+			return nil, fmt.Errorf("bare-resume sandbox for actor %q: %w", a.Name, err)
+		}
+	} else {
+		// Tier-2/3/cold: bring the sandbox back from its snapshot (+ /state).
+		tgt, err := w.resolve(a)
+		if err != nil {
+			return nil, fmt.Errorf("resolve actor %q: %w", a.Name, err)
+		}
+		if _, _, _, err := w.boot.RestoreSnapshot(ctx, sandboxID,
+			tgt.SnapshotPath, tgt.MemPath, tgt.BasePath, tgt.DeltaDir, tgt.TeamID, tgt.OwnerID, tgt.Env); err != nil {
+			return nil, fmt.Errorf("restore sandbox for actor %q: %w", a.Name, err)
+		}
 	}
-	sandboxID := a.ID
-	if _, _, _, err := w.boot.RestoreSnapshot(ctx, sandboxID,
-		tgt.SnapshotPath, tgt.MemPath, tgt.BasePath, tgt.DeltaDir, tgt.TeamID, tgt.OwnerID, tgt.Env); err != nil {
-		return nil, fmt.Errorf("restore sandbox for actor %q: %w", a.Name, err)
-	}
+
 	w.mu.Lock()
 	w.live[a.ID] = sandboxID
 	w.mu.Unlock()

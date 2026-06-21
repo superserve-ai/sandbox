@@ -11,10 +11,11 @@ import (
 )
 
 type mockBooter struct {
-	mu         sync.Mutex
-	restoreIDs []string
-	destroyIDs []string
-	restoreErr error
+	mu            sync.Mutex
+	restoreIDs    []string
+	bareResumeIDs []string
+	destroyIDs    []string
+	restoreErr    error
 }
 
 func (m *mockBooter) RestoreSnapshot(_ context.Context, id, _, _, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
@@ -24,6 +25,13 @@ func (m *mockBooter) RestoreSnapshot(_ context.Context, id, _, _, _, _, _, _ str
 		return "", 0, 0, m.restoreErr
 	}
 	m.restoreIDs = append(m.restoreIDs, id)
+	return "10.0.0.5", 1, 1024, nil
+}
+
+func (m *mockBooter) BareResumeInstance(_ context.Context, id string) (string, uint32, uint32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bareResumeIDs = append(m.bareResumeIDs, id)
 	return "10.0.0.5", 1, 1024, nil
 }
 
@@ -77,6 +85,38 @@ func TestWakerRestoresAndDelivers(t *testing.T) {
 	}
 	if len(del.events) != 2 || del.events[0] != "act-7:e1" || del.events[1] != "act-7:e2" {
 		t.Fatalf("events should be delivered to the actor's sandbox in order: %v", del.events)
+	}
+}
+
+// TestWakerTier1BareResumes: a Tier-1 (resident, bare-paused) Actor wakes via a
+// bare vCPU unpause — no snapshot restore and no resolve (the VM never left RAM).
+func TestWakerTier1BareResumes(t *testing.T) {
+	boot := &mockBooter{}
+	// resolve must NOT be called on the Tier-1 path; fail it to prove that.
+	w := New(boot, &mockDeliverer{}, func(actor.Actor) (Target, error) {
+		return Target{}, errors.New("resolve should not be called for Tier-1 wake")
+	})
+	ctx := context.Background()
+
+	a := actor.Actor{ID: "act-1", Name: "agent", Tier: actor.TierPaused1}
+	if _, err := w.Wake(ctx, a, nil); err != nil {
+		t.Fatalf("tier-1 wake should bare-resume, got %v", err)
+	}
+	if len(boot.bareResumeIDs) != 1 || boot.bareResumeIDs[0] != "act-1" {
+		t.Fatalf("tier-1 wake should bare-resume once: %v", boot.bareResumeIDs)
+	}
+	if len(boot.restoreIDs) != 0 {
+		t.Fatalf("tier-1 wake must NOT snapshot-restore: %v", boot.restoreIDs)
+	}
+
+	// A Tier-2 actor (default) still takes the snapshot-restore path.
+	boot2 := &mockBooter{}
+	w2 := New(boot2, &mockDeliverer{}, target)
+	if _, err := w2.Wake(ctx, actor.Actor{ID: "act-2", Name: "x", Tier: actor.TierPaused2}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(boot2.restoreIDs) != 1 || len(boot2.bareResumeIDs) != 0 {
+		t.Fatalf("tier-2 wake should restore, not bare-resume: restore=%v bare=%v", boot2.restoreIDs, boot2.bareResumeIDs)
 	}
 }
 
