@@ -1211,9 +1211,14 @@ func (x *DestroyVMResponse) GetCleanedUp() bool {
 }
 
 type PauseVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
-	SnapshotDir   string                 `protobuf:"bytes,2,opt,name=snapshot_dir,json=snapshotDir,proto3" json:"snapshot_dir,omitempty"` // Directory to store the snapshot artifacts.
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VmId        string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	SnapshotDir string                 `protobuf:"bytes,2,opt,name=snapshot_dir,json=snapshotDir,proto3" json:"snapshot_dir,omitempty"` // Directory to store the snapshot artifacts.
+	// bare = Tier-1 pause: PATCH /vm Paused only — freeze the vCPUs but keep the
+	// VM RAM-resident, netns attached, and process running. No snapshot is taken
+	// and snapshot_dir is ignored; the response's snapshot/mem paths are empty.
+	// This is the sub-ms between-turns hibernation state (latency-validated).
+	Bare          bool `protobuf:"varint,3,opt,name=bare,proto3" json:"bare,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1260,6 +1265,13 @@ func (x *PauseVMRequest) GetSnapshotDir() string {
 		return x.SnapshotDir
 	}
 	return ""
+}
+
+func (x *PauseVMRequest) GetBare() bool {
+	if x != nil {
+		return x.Bare
+	}
+	return false
 }
 
 type PauseVMResponse struct {
@@ -1329,8 +1341,11 @@ type ResumeVMRequest struct {
 	MemFilePath    string                 `protobuf:"bytes,3,opt,name=mem_file_path,json=memFilePath,proto3" json:"mem_file_path,omitempty"`
 	SandboxNetwork *SandboxNetworkConfig  `protobuf:"bytes,4,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"`                                                      // Reapply egress rules after resume.
 	EnvVars        map[string]string      `protobuf:"bytes,5,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Re-inject env vars after resume.
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// bare = Tier-1 resume: PATCH /vm Resumed on a still-resident VM that was
+	// bare-paused. No snapshot restore; snapshot_path/mem_file_path are ignored.
+	Bare          bool `protobuf:"varint,7,opt,name=bare,proto3" json:"bare,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ResumeVMRequest) Reset() {
@@ -1396,6 +1411,13 @@ func (x *ResumeVMRequest) GetEnvVars() map[string]string {
 		return x.EnvVars
 	}
 	return nil
+}
+
+func (x *ResumeVMRequest) GetBare() bool {
+	if x != nil {
+		return x.Bare
+	}
+	return false
 }
 
 type ResumeVMResponse struct {
@@ -3046,20 +3068,22 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x11DestroyVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1d\n" +
 	"\n" +
-	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"H\n" +
+	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\\\n" +
 	"\x0ePauseVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12!\n" +
-	"\fsnapshot_dir\x18\x02 \x01(\tR\vsnapshotDir\"o\n" +
+	"\fsnapshot_dir\x18\x02 \x01(\tR\vsnapshotDir\x12\x12\n" +
+	"\x04bare\x18\x03 \x01(\bR\x04bare\"o\n" +
 	"\x0fPauseVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
-	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\"\xdf\x02\n" +
+	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\"\xf3\x02\n" +
 	"\x0fResumeVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12P\n" +
 	"\x0fsandbox_network\x18\x04 \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x12J\n" +
-	"\benv_vars\x18\x05 \x03(\v2/.superserve.vmd.v1.ResumeVMRequest.EnvVarsEntryR\aenvVars\x1a:\n" +
+	"\benv_vars\x18\x05 \x03(\v2/.superserve.vmd.v1.ResumeVMRequest.EnvVarsEntryR\aenvVars\x12\x12\n" +
+	"\x04bare\x18\a \x01(\bR\x04bare\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\x0esecrets_broker\"\xc5\x01\n" +

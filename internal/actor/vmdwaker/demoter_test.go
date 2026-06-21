@@ -9,11 +9,18 @@ import (
 )
 
 type mockPauser struct {
-	mu        sync.Mutex
-	paused    []string
-	destroyed []string
+	mu         sync.Mutex
+	barePaused []string
+	paused     []string
+	destroyed  []string
 }
 
+func (m *mockPauser) BarePauseInstance(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.barePaused = append(m.barePaused, id)
+	return nil
+}
 func (m *mockPauser) PauseInstance(_ context.Context, id, _ string) (string, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -31,9 +38,13 @@ func TestDemoterTierMapping(t *testing.T) {
 	p := &mockPauser{}
 	d := NewDemoter(p, "/snapshots", nil) // identity sandboxFor
 
-	// Tier 1: bare pause keeps the VM resident — no vmd op.
+	// Tier 1: bare pause — freeze vCPUs, keep resident. Issues BarePauseInstance,
+	// never a snapshot or destroy.
 	if err := d.Demote("act-1", actor.TierPaused1); err != nil {
 		t.Fatal(err)
+	}
+	if len(p.barePaused) != 1 || p.barePaused[0] != "act-1" {
+		t.Fatalf("Tier-1 should BarePauseInstance: %v", p.barePaused)
 	}
 	if len(p.paused) != 0 || len(p.destroyed) != 0 {
 		t.Fatalf("Tier-1 must not snapshot or destroy: paused=%v destroyed=%v", p.paused, p.destroyed)

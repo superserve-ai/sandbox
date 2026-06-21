@@ -399,6 +399,26 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 	return resp.IpAddress, actualVcpu, actualMemMiB, nil
 }
 
+func (c *grpcVMDClient) BarePauseInstance(ctx context.Context, vmID string) error {
+	if _, err := c.client.PauseVM(ctx, &vmdpb.PauseVMRequest{VmId: vmID, Bare: true}); err != nil {
+		return fmt.Errorf("gRPC PauseVM(bare): %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) BareResumeInstance(ctx context.Context, vmID string) (string, uint32, uint32, error) {
+	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{VmId: vmID, Bare: true})
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("gRPC ResumeVM(bare): %w", err)
+	}
+	var actualVcpu, actualMemMiB uint32
+	if rl := resp.GetResourceLimits(); rl != nil {
+		actualVcpu = rl.GetVcpuCount()
+		actualMemMiB = rl.GetMemoryMib()
+	}
+	return resp.IpAddress, actualVcpu, actualMemMiB, nil
+}
+
 // RestoreSnapshot is the stateless restore path — VMD creates a fresh VM
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via

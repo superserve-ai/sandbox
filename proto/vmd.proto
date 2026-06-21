@@ -255,6 +255,11 @@ message DestroyVMResponse {
 message PauseVMRequest {
   string vm_id = 1;
   string snapshot_dir = 2;   // Directory to store the snapshot artifacts.
+  // bare = Tier-1 pause: PATCH /vm Paused only — freeze the vCPUs but keep the
+  // VM RAM-resident, netns attached, and process running. No snapshot is taken
+  // and snapshot_dir is ignored; the response's snapshot/mem paths are empty.
+  // This is the sub-ms between-turns hibernation state (latency-validated).
+  bool bare = 3;
 }
 
 message PauseVMResponse {
@@ -275,6 +280,9 @@ message ResumeVMRequest {
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
   reserved 6;                                 // was secrets_broker (SecretsBrokerConfig)
   reserved "secrets_broker";
+  // bare = Tier-1 resume: PATCH /vm Resumed on a still-resident VM that was
+  // bare-paused. No snapshot restore; snapshot_path/mem_file_path are ignored.
+  bool bare = 7;
 }
 
 message ResumeVMResponse {

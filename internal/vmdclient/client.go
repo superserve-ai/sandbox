@@ -15,6 +15,14 @@ type Client interface {
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
 	// ResumeInstance restores a paused VM.
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// BarePauseInstance is the Tier-1 pause: freeze the VM's vCPUs but keep it
+	// RAM-resident (no snapshot, process stays up). Used by the hibernation
+	// Demoter for idle Actors between turns; BareResumeInstance is the sub-ms wake.
+	BarePauseInstance(ctx context.Context, instanceID string) error
+	// BareResumeInstance is the Tier-1 wake: unpause a bare-paused, still-resident
+	// VM in place (no snapshot restore, no env re-injection). The wake-path
+	// counterpart to BarePauseInstance.
+	BareResumeInstance(ctx context.Context, instanceID string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +

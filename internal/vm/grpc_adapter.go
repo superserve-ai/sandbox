@@ -46,6 +46,14 @@ func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest
 }
 
 func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*vmdpb.PauseVMResponse, error) {
+	// Bare Tier-1 pause: freeze vCPUs, keep resident, no snapshot. Response
+	// snapshot/mem paths are empty (there is no snapshot).
+	if req.GetBare() {
+		if err := a.mgr.PauseVMBare(ctx, req.GetVmId()); err != nil {
+			return nil, err
+		}
+		return &vmdpb.PauseVMResponse{VmId: req.GetVmId()}, nil
+	}
 	snapshotPath, memPath, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir())
 	if err != nil {
 		return nil, err
@@ -58,6 +66,26 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 }
 
 func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) (*vmdpb.ResumeVMResponse, error) {
+	// Bare Tier-1 resume: the VM never left memory, so just unpause its vCPUs in
+	// place. No snapshot restore, and no env re-injection — the agent's env,
+	// HTTPS_PROXY/JWT, and per-binding tokens are all still resident.
+	if req.GetBare() {
+		inst, err := a.mgr.ResumeVMBare(ctx, req.GetVmId())
+		if err != nil {
+			return nil, err
+		}
+		return &vmdpb.ResumeVMResponse{
+			VmId:       inst.ID,
+			SocketPath: inst.SocketPath,
+			IpAddress:  inst.IP,
+			Pid:        uint32(inst.PID),
+			ResourceLimits: &vmdpb.ResourceLimits{
+				VcpuCount: inst.Config.VCPU,
+				MemoryMib: inst.Config.MemoryMiB,
+			},
+		}, nil
+	}
+
 	inst, err := a.mgr.ResumeVM(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath())
 	if err != nil {
 		return nil, err
@@ -503,7 +531,12 @@ func vmStatusToProto(s VMStatus) vmdpb.VMStatus {
 		return vmdpb.VMStatus_VM_STATUS_CREATING
 	case StatusRunning:
 		return vmdpb.VMStatus_VM_STATUS_RUNNING
-	case StatusPaused:
+	case StatusPaused, StatusPausedResident:
+		// Both report as PAUSED over the wire. They need different wake primitives
+		// (snapshot restore vs bare resume), but no caller selects a wake path off
+		// this field — the actor TierController drives wake from its own tier
+		// state, not GetVMInfo — so collapsing them is safe today. Add a distinct
+		// VM_STATUS_PAUSED_RESIDENT before keying any wake decision off this.
 		return vmdpb.VMStatus_VM_STATUS_PAUSED
 	case StatusStopped:
 		return vmdpb.VMStatus_VM_STATUS_STOPPED

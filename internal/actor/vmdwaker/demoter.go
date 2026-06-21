@@ -9,15 +9,15 @@ import (
 // Pauser is the vmd subset the tiered Demoter needs (mockable; the real
 // vmdclient.Client satisfies it).
 type Pauser interface {
+	BarePauseInstance(ctx context.Context, id string) error
 	PauseInstance(ctx context.Context, id, snapshotDir string) (string, string, error)
 	DestroyInstance(ctx context.Context, id string, force bool) error
 }
 
 // Demoter implements actor.Demoter over vmd, the production backing for the
 // TierController:
-//   - Tier 1 (paused-in-RAM): the bare Firecracker pause (latency-validated,
-//     sub-ms wake) keeps the VM resident — no snapshot op, so this is a no-op at
-//     the vmd level (the bare pause is issued on the same-host wake path).
+//   - Tier 1 (paused-in-RAM): vmd BarePauseInstance freezes the vCPUs but keeps
+//     the VM RAM-resident (latency-validated, sub-ms wake) — no snapshot.
 //   - Tier 2 (local snapshot): vmd PauseInstance snapshots to disk and frees RAM.
 //   - Tier 3 / cold: vmd DestroyInstance frees the host (after /state is durable).
 type Demoter struct {
@@ -43,7 +43,7 @@ func (d *Demoter) Demote(actorID string, to actor.Tier) error {
 	ctx := context.Background()
 	switch to {
 	case actor.TierPaused1:
-		return nil // bare pause keeps the VM resident; no vmd snapshot op
+		return d.vmd.BarePauseInstance(ctx, sid) // freeze vCPUs, keep resident
 	case actor.TierPaused2:
 		_, _, err := d.vmd.PauseInstance(ctx, sid, d.snapshotDir)
 		return err

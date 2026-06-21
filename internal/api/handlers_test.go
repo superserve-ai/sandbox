@@ -54,6 +54,10 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
+func (s *stubVMD) BarePauseInstance(context.Context, string) error { return nil }
+func (s *stubVMD) BareResumeInstance(context.Context, string) (string, uint32, uint32, error) {
+	return "10.0.0.1", 1, 1024, nil
+}
 func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)

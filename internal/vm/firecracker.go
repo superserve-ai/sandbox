@@ -280,8 +280,24 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 	return nil
 }
 
+// PauseVM freezes a running VM's vCPUs (PATCH /vm Paused) without taking a
+// snapshot or stopping the process. This is the bare Tier-1 pause: memory stays
+// resident, so a later UnpauseVM resume faults in zero pages (sub-ms wake,
+// latency-validated). Contrast CreateSnapshot, which pauses *and* writes a Full
+// snapshot for Tier-2.
+func PauseVM(socketPath string) error {
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
+		Context: context.Background(),
+		Body:    &models.VM{State: strPtr(models.VMStatePaused)},
+	}); err != nil {
+		return fmt.Errorf("pause VM: %w", err)
+	}
+	return nil
+}
+
 // UnpauseVM resumes a paused VM's vCPUs. Used after CreateSnapshot to make
-// snapshot creation non-destructive.
+// snapshot creation non-destructive, and as the Tier-1 wake for a bare-paused VM.
 func UnpauseVM(socketPath string) error {
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{

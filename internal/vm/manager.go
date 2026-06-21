@@ -58,6 +58,10 @@ const (
 	StatusPaused
 	StatusStopped
 	StatusError
+	// StatusPausedResident is the bare Tier-1 pause: vCPUs frozen but the VM is
+	// still RAM-resident with its process running (no snapshot, not stopped).
+	// Appended last to keep the persisted iota values of the others stable.
+	StatusPausedResident
 )
 
 func (s VMStatus) String() string {
@@ -72,6 +76,8 @@ func (s VMStatus) String() string {
 		return "stopped"
 	case StatusError:
 		return "error"
+	case StatusPausedResident:
+		return "paused_resident"
 	default:
 		return "unknown"
 	}
@@ -575,6 +581,84 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	m.persistState(inst)
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, nil
+}
+
+// ---------------------------------------------------------------------------
+// PauseVMBare / ResumeVMBare (Tier-1 — freeze vCPUs, keep resident)
+// ---------------------------------------------------------------------------
+
+// PauseVMBare freezes the VM's vCPUs (PATCH /vm Paused) without snapshotting or
+// stopping the process. Memory stays resident, the process keeps running, and
+// the netns/lease are untouched — this is the sub-ms between-turns hibernation
+// state. ResumeVMBare wakes it. No-op if the VM is already bare-paused.
+func (m *Manager) PauseVMBare(_ context.Context, vmID string) error {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return err
+	}
+	inst.mu.Lock()
+	st := inst.Status
+	inst.mu.Unlock()
+	// Only a live VM can be bare-paused. Reject snapshot-paused/stopped VMs: their
+	// firecracker process (and API socket) is already gone, so PATCHing /vm would
+	// hit a dead socket and route into the destructive handleVMError path.
+	switch st {
+	case StatusPausedResident:
+		return nil // already bare-paused — idempotent
+	case StatusRunning:
+		// proceed
+	default:
+		return status.Errorf(codes.FailedPrecondition,
+			"bare pause requires a running VM, but %s is %s", vmID, st)
+	}
+
+	if err := PauseVM(inst.SocketPath); err != nil {
+		return m.handleVMError(vmID, fmt.Errorf("bare pause: %w", err))
+	}
+
+	inst.mu.Lock()
+	inst.Status = StatusPausedResident
+	inst.mu.Unlock()
+	m.persistState(inst)
+	m.log.Info().Str("vm_id", vmID).Msg("VM bare-paused (Tier-1, resident)")
+	return nil
+}
+
+// ResumeVMBare resumes a bare-paused VM's vCPUs (PATCH /vm Resumed) in place —
+// no snapshot restore, since the VM never left memory. Returns the unchanged
+// instance (same IP/PID/socket). No-op if the VM is already running.
+func (m *Manager) ResumeVMBare(_ context.Context, vmID string) (*VMInstance, error) {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return nil, err
+	}
+	inst.mu.Lock()
+	st := inst.Status
+	inst.mu.Unlock()
+	// Bare resume only applies to a still-resident bare-paused VM. A snapshot-paused
+	// (StatusPaused) VM has no running process — it must go through the snapshot
+	// restore path, not an in-place unpause — so reject it rather than UnpauseVM a
+	// dead socket (which would destructively evict its snapshot pointers).
+	switch st {
+	case StatusRunning:
+		return inst, nil // already running — idempotent
+	case StatusPausedResident:
+		// proceed
+	default:
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"bare resume requires a resident-paused VM, but %s is %s (use snapshot restore)", vmID, st)
+	}
+
+	if err := UnpauseVM(inst.SocketPath); err != nil {
+		return nil, m.handleVMError(vmID, fmt.Errorf("bare resume: %w", err))
+	}
+
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.mu.Unlock()
+	m.persistState(inst)
+	m.log.Info().Str("vm_id", vmID).Msg("VM bare-resumed (Tier-1 wake)")
+	return inst, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1177,38 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 				}
 			}
 			log.Info().Msg("reattached paused VM")
+			reattached++
+			continue
+		}
+
+		// Bare-paused (Tier-1) VMs keep their process running with vCPUs frozen,
+		// so — unlike snapshot-paused VMs — their unit IS still active and their
+		// memory lives only in that process. If the process is gone the VM is
+		// unrecoverable (bare pause writes no snapshot), so clean it up; otherwise
+		// reattach with the resident-paused status preserved so the wake path can
+		// BareResume it (and exec/file ops stay gated until then).
+		if rec.Status == StatusPausedResident {
+			if !isUnitActive(ctx, systemdUnitName(rec.ID)) {
+				log.Warn().Msg("bare-paused VM process gone — unrecoverable (no snapshot), cleaning up stale record")
+				if rec.PID > 0 {
+					if proc, err := os.FindProcess(rec.PID); err == nil {
+						_ = proc.Signal(syscall.SIGKILL)
+					}
+				}
+				m.state.Delete(rec.ID)
+				stale++
+				continue
+			}
+			inst := toInstance(rec)
+			m.mu.Lock()
+			m.vms[rec.ID] = inst
+			m.mu.Unlock()
+			if inst.Namespace != "" && inst.IP != "" {
+				if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
+					log.Error().Err(err).Msg("reattach: restore bare-paused VM network state failed")
+				}
+			}
+			log.Info().Msg("reattached bare-paused VM (Tier-1, resident — awaiting wake)")
 			reattached++
 			continue
 		}
