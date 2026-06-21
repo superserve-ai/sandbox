@@ -8,6 +8,10 @@ CollectMode=inactive-or-failed
 Type=simple
 Slice=sandboxes.slice
 
+# fc-cleanup (ExecStopPost) runs under `set -u` and reads ${RUN_DIR}; without
+# this it aborts on the unbound variable and never removes the socket.
+Environment=RUN_DIR=/var/lib/sandbox/rundir
+
 ExecStart=/var/lib/sandbox/rundir/%i/start.sh
 ExecStopPost=/usr/local/bin/fc-cleanup %i
 

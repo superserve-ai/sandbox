@@ -3,7 +3,7 @@
 # Called by ExecStopPost in firecracker@.service.
 #
 # Usage: fc-cleanup <sandbox-id>
-# RUN_DIR is inherited from the unit's EnvironmentFile.
+# RUN_DIR is provided by the unit's Environment= (firecracker@.service).
 
 set -eu
 

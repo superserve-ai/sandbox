@@ -7,6 +7,10 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/vmd
 
+# Reload the egress blocklist config (domains + CIDRs) without bouncing the
+# daemon. vmd handles SIGHUP; blocked-port changes still need a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+
 # DO NOT add ExecStartPre commands that kill Firecracker processes or
 # remove network namespaces. VMs are managed by systemd units
 # (firecracker@.service) and must survive VMD restarts.

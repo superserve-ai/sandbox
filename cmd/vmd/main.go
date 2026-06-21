@@ -296,18 +296,19 @@ func main() {
 	// (feeds, pinned domains/CIDRs, blocked ports). Unset = no global
 	// blocklist.
 	var blockList *blocklist.Blocklist
+	blocklistPath := os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG")
 	// vmd is the daemon, so it owns and reconciles the shared egress port
 	// chain even when no ports are configured (so disabling the feature
 	// clears stale drops). template-builder must not pass this.
 	netMgrOpts := []network.ManagerOption{network.WithEgressPortChainOwner()}
-	if path := os.Getenv("VMD_EGRESS_BLOCKLIST_CONFIG"); path != "" {
-		blCfg, err := blocklist.LoadConfig(path)
+	if blocklistPath != "" {
+		blCfg, err := blocklist.LoadConfig(blocklistPath)
 		if err != nil {
-			log.Fatal().Err(err).Str("path", path).Msg("failed to load egress blocklist config")
+			log.Fatal().Err(err).Str("path", blocklistPath).Msg("failed to load egress blocklist config")
 		}
 		blockList = blocklist.New(blCfg, log)
 		netMgrOpts = append(netMgrOpts, network.WithBlockedEgressPorts(blCfg.BlockedEgressPorts))
-		log.Info().Str("path", path).Int("feeds", len(blCfg.DomainFeeds)).Int("blocked_ports", len(blCfg.BlockedEgressPorts)).Msg("egress blocklist configured")
+		log.Info().Str("path", blocklistPath).Int("feeds", len(blCfg.DomainFeeds)).Int("blocked_ports", len(blCfg.BlockedEgressPorts)).Msg("egress blocklist configured")
 	} else {
 		// Feature disabled — drop any host egress-block table a previous run
 		// installed so its CIDR drops stop affecting sandbox egress. The
@@ -553,6 +554,28 @@ func main() {
 			log.Info().Str("signal", sig.String()).Msg("received shutdown signal")
 			lc.signalShutdown()
 		case <-ctx.Done():
+		}
+	}()
+
+	// SIGHUP (ExecReload) reloads the egress blocklist config without a restart
+	// (domains + CIDRs; blocked ports still need a restart). Always trap it —
+	// the default SIGHUP action is to terminate, so an unhandled reload would
+	// kill the daemon even when no blocklist is configured.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		for {
+			select {
+			case <-hupCh:
+				if blockList != nil && blocklistPath != "" {
+					log.Info().Msg("SIGHUP: reloading egress blocklist config")
+					blockList.Reload(blocklistPath)
+				} else {
+					log.Info().Msg("SIGHUP: no egress blocklist configured, nothing to reload")
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 

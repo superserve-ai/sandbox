@@ -117,6 +117,59 @@ func TestBlocklistBlocked(t *testing.T) {
 	}
 }
 
+func TestReloadConfig_PicksUpNewConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blocklist.yaml")
+	write := func(domain string) {
+		if err := os.WriteFile(path, []byte("custom_domains:\n  - "+domain+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("old.example.com")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := New(cfg, zerolog.Nop())
+	if got, _ := b.Blocked("old.example.com", nil); !got {
+		t.Fatal("old domain should be blocked initially")
+	}
+
+	// Operator edits the YAML and SIGHUPs.
+	write("new.example.com")
+	b.reloadConfig(t.Context(), path)
+
+	if got, _ := b.Blocked("new.example.com", nil); !got {
+		t.Error("reload should pick up the new domain")
+	}
+	if got, _ := b.Blocked("old.example.com", nil); got {
+		t.Error("reload replaces the config (not merge), so the removed domain unblocks")
+	}
+}
+
+func TestReloadConfig_BadConfigKeepsCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blocklist.yaml")
+	if err := os.WriteFile(path, []byte("custom_domains:\n  - pool.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := New(cfg, zerolog.Nop())
+
+	// Corrupt the file, then reload — the live blocklist must be preserved.
+	if err := os.WriteFile(path, []byte("custom_domains: [unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b.reloadConfig(t.Context(), path)
+
+	if got, _ := b.Blocked("pool.example.com", nil); !got {
+		t.Error("a failed reload must keep the current blocklist, not drop it")
+	}
+}
+
 func TestRefreshKeepsLastGoodOnTotalFailure(t *testing.T) {
 	dir := t.TempDir()
 	feed := filepath.Join(dir, "feed.txt")
