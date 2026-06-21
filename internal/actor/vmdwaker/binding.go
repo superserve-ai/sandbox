@@ -7,3 +7,6 @@ import "github.com/superserve-ai/sandbox/internal/vmdclient"
 // with no adapter. (boxd event delivery is the Deliverer, supplied by the
 // control plane.)
 var _ SandboxBooter = (vmdclient.Client)(nil)
+
+// And a Pauser, for the tiered Demoter.
+var _ Pauser = (vmdclient.Client)(nil)
