@@ -38,6 +38,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/scheduler"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/state"
 	"github.com/superserve-ai/sandbox/internal/supervisor"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
@@ -213,6 +214,19 @@ func run() error {
 		waker := vmdwaker.New(vmdClient, deliverer, api.AgentTargetResolver(queries, systemTeam))
 		handlers.Agents = actorrt.NewRouter(actorrt.NewRegistry(pgstore.New(queries), nil), waker, cfg.DefaultHostID, 16)
 		log.Info().Msg("durable-Actor runtime enabled (/v1/agents) with sandbox-exec delivery")
+	}
+
+	// Durable /state versioning (checkpoint/branch/rollback). Enabled when
+	// STATE_DIR is set; backend defaults to the local reference provider,
+	// STATE_BACKEND=archil|mesa selects a SaaS adapter.
+	if stateDir := os.Getenv("STATE_DIR"); stateDir != "" {
+		sp, serr := state.NewProvider(state.Config{Backend: state.Backend(os.Getenv("STATE_BACKEND")), BaseDir: stateDir})
+		if serr != nil {
+			log.Warn().Err(serr).Msg("durable /state provider init failed; /state endpoints disabled")
+		} else {
+			handlers.State = sp
+			log.Info().Str("backend", os.Getenv("STATE_BACKEND")).Msg("durable /state versioning enabled")
+		}
 	}
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
