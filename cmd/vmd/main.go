@@ -289,6 +289,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Trap SIGHUP before any startup work. With ExecReload=kill -HUP on a
+	// Type=simple unit, a reload can arrive mid-init; without this the default
+	// SIGHUP action (terminate) would kill the daemon. The buffered signal is
+	// dispatched to the blocklist reload once it's up (below).
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+
 	lc := newLifecycle(log)
 
 	// ---- Egress blocklist (optional) ----
@@ -557,12 +564,8 @@ func main() {
 		}
 	}()
 
-	// SIGHUP (ExecReload) reloads the egress blocklist config without a restart
-	// (domains + CIDRs; blocked ports still need a restart). Always trap it —
-	// the default SIGHUP action is to terminate, so an unhandled reload would
-	// kill the daemon even when no blocklist is configured.
-	hupCh := make(chan os.Signal, 1)
-	signal.Notify(hupCh, syscall.SIGHUP)
+	// SIGHUP (ExecReload, trapped above) reloads the egress blocklist config
+	// without a restart — domains + CIDRs; blocked ports still need a restart.
 	go func() {
 		for {
 			select {
