@@ -84,7 +84,14 @@ func (w *Waker) Wake(ctx context.Context, a actor.Actor, _ *actor.Lease) (actor.
 	w.mu.Unlock()
 
 	return func(ctx context.Context, ev actor.Event) error {
-		return w.deliver.Deliver(ctx, sandboxID, ev)
+		// The Deliverer streams the harness's output for this turn into ev.Out
+		// (if the caller supplied a sink); close it to signal end-of-turn so the
+		// streaming client sees a clean EOF.
+		err := w.deliver.Deliver(ctx, sandboxID, ev)
+		if ev.Out != nil {
+			ev.Out.Close()
+		}
+		return err
 	}, nil
 }
 

@@ -35,6 +35,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		// Sandbox lifecycle.
 		api.POST("/sandboxes", h.CreateSandbox)
 		api.POST("/sandboxes/from-image", h.CreateSandboxFromImage)
+		api.POST("/agents/send", h.SendAgentEvent)
 		api.GET("/sandboxes", h.ListSandboxes)
 		api.GET("/sandboxes/:sandbox_id", h.GetSandboxByID)
 		api.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)

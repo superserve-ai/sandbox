@@ -308,6 +308,52 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /agents/send:
+    post:
+      operationId: sendAgentEvent
+      tags: [Agents]
+      summary: Send a turn to a durable agent and stream its reply
+      description: |
+        The durable-Actor client plane. Routes a turn to an agent addressed by
+        name: the agent is created on first reference (wake-on-reference), woken
+        if cold (sub-second tiered restore), and the event is serialized through
+        its single-writer inbox. The reply streams back as the agent's harness
+        produces it, and **survives the agent hibernating mid-turn** (the stream
+        does not break across a pause/resume).
+
+        Webhooks, alarms, and agent→agent messages route through the same
+        runtime (fire-and-forget, no streamed reply).
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent, message]
+              properties:
+                agent:
+                  type: string
+                  description: Durable agent name (unique per team), e.g. `support/ticket-4821`.
+                message:
+                  type: string
+                  description: The turn's input.
+      responses:
+        "200":
+          description: A streamed reply (text/plain, chunked) ending at turn completion
+          content:
+            text/plain:
+              schema: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}:
     parameters:
       - $ref: "#/components/parameters/SandboxId"

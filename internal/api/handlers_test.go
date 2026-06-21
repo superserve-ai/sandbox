@@ -263,6 +263,7 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	})
 	r.POST("/sandboxes", h.CreateSandbox)
 	r.POST("/sandboxes/from-image", h.CreateSandboxFromImage)
+	r.POST("/agents/send", h.SendAgentEvent)
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 	r.POST("/sandboxes/:sandbox_id/activate", h.ActivateSandbox)
 	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)

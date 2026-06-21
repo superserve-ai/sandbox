@@ -13,6 +13,12 @@ type Event struct {
 	ID      string // unique id (for dedup / tracing)
 	Type    string // e.g. "msg", "webhook", "alarm"
 	Payload []byte
+
+	// Out, when non-nil, is the per-turn output sink: the harness's output for
+	// THIS event is streamed into it and it is Closed when the turn completes,
+	// so a request/response caller can stream the reply. Nil for fire-and-forget
+	// events (webhooks, alarms, agent→agent) that produce no streamed reply.
+	Out *Relay
 }
 
 // Handler processes a single Event to completion. The Inbox guarantees it is
