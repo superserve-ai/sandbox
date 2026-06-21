@@ -1,0 +1,15 @@
+# Reference adapter: flue (durable framework → Level 2, self-managed durability).
+#
+# Flue brings its OWN brain-state: the Workflow SDK persists each step to an
+# event log and replays deterministically. The adapter does almost nothing
+# except point that store at /state and let webhooks route straight in. The
+# platform supplies the durable substrate + lifecycle; Flue keeps its own replay.
+# This is the contrast that proves the thesis — same socket, different rung, the
+# only variable is *who brings durability* (here: the harness).
+start     = "flue serve --store /state/flue"  # Workflow SDK event log → durable FS
+transport = "http"
+port      = 8080
+ready     = "GET /healthz"
+idle      = "http:/flue/parked"  # Flue reports when a session parks (await human/turn)
+state     = ["/state/flue"]
+level     = 2                    # self-managed: Flue does its own fiber replay

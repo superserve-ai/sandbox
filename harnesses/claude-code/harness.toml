@@ -1,0 +1,16 @@
+# Reference adapter: claude-code (process harness → Level 1).
+#
+# Claude Code is durability-naive: its "memory" is the working directory plus a
+# resumable session transcript. So the adapter maps those paths onto the durable
+# /state filesystem and lets the platform's FS + snapshot supply durability —
+# the harness keeps no special replay log of its own.
+#
+# The shim (cc-actor-shim) runs ONE turn per inbox event: it resumes the saved
+# session, streams Claude Code's output to the outbox, then signals idle so the
+# platform can hibernate the Actor between turns (Tier-1 paused-in-RAM wake is
+# sub-millisecond — see cmd/latencybench/RESULTS.md). No changes to Claude Code.
+start     = "cc-actor-shim"
+transport = "stdin"          # one turn arrives on stdin; output streams on stdout
+idle      = "signal"         # the shim signals when a turn is done → safe to hibernate
+state     = ["/root/.claude", "/work"]  # session history + working tree → /state
+level     = 1                # platform-supplied durability (FS + snapshot)
