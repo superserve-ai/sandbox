@@ -26,8 +26,49 @@ type PgStore struct {
 // New builds a PgStore from a sqlc Queries handle.
 func New(q *db.Queries) *PgStore { return &PgStore{q: q} }
 
-// compile-time check that PgStore satisfies the contract.
-var _ actor.Store = (*PgStore)(nil)
+// compile-time checks that PgStore satisfies the contracts.
+var (
+	_ actor.Store      = (*PgStore)(nil)
+	_ actor.AlarmStore = (*PgStore)(nil)
+)
+
+// SetAlarm schedules a wake for actorID at fireAt (Epic 5.5).
+func (s *PgStore) SetAlarm(ctx context.Context, actorID string, fireAt time.Time) (actor.Alarm, error) {
+	aid, err := uuid.Parse(actorID)
+	if err != nil {
+		return actor.Alarm{}, err
+	}
+	row, err := s.q.CreateActorAlarm(ctx, db.CreateActorAlarmParams{ActorID: aid, FireAt: fireAt})
+	if err != nil {
+		return actor.Alarm{}, err
+	}
+	return actor.Alarm{ID: row.ID.String(), ActorID: actorID, FireAt: row.FireAt}, nil
+}
+
+// DueAlarms returns alarms whose FireAt <= now (due-indexed), oldest first.
+func (s *PgStore) DueAlarms(ctx context.Context, now time.Time, limit int) ([]actor.Alarm, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.q.DueActorAlarms(ctx, db.DueActorAlarmsParams{FireAt: now, Limit: int32(limit)})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]actor.Alarm, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, actor.Alarm{ID: r.ID.String(), ActorID: r.ActorID.String(), FireAt: r.FireAt})
+	}
+	return out, nil
+}
+
+// DeleteAlarm removes a fired alarm.
+func (s *PgStore) DeleteAlarm(ctx context.Context, id string) error {
+	aid, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	return s.q.DeleteActorAlarm(ctx, aid)
+}
 
 func (s *PgStore) GetOrCreate(ctx context.Context, teamID, name string, defaults actor.Actor, _ time.Time) (actor.Actor, bool, error) {
 	tid, err := uuid.Parse(teamID)
