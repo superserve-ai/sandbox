@@ -136,6 +136,14 @@ type Manifest struct {
 	// Level is the durability rung. Defaults to Level0 when omitted.
 	Level Level
 
+	// OnResume is an optional command the runtime runs after a Tier-2/Tier-3
+	// wake (restore-from-snapshot), where TLS connections to external services
+	// (e.g. the model API) were dropped and the guest wall-clock jumped across
+	// the hibernation gap. It lets a harness re-establish connections and
+	// re-sync time before the next turn. NOT run on Tier-1 wakes: memory stays
+	// resident there, so sockets and clocks survive — only deeper tiers need it.
+	OnResume string
+
 	// idleErr carries an `idle`-string parse failure from Parse into Validate
 	// so every manifest problem aggregates into one error. Set only by Parse.
 	idleErr error
@@ -154,6 +162,7 @@ type rawManifest struct {
 	Idle      string   `toml:"idle"`
 	State     []string `toml:"state"`
 	Level     *int     `toml:"level"`
+	OnResume  string   `toml:"on_resume"`
 }
 
 // Load reads a harness.toml from path, parses it, and validates it. It is a
@@ -187,6 +196,7 @@ func Parse(data []byte) (*Manifest, error) {
 		Ready:     strings.TrimSpace(raw.Ready),
 		State:     raw.State,
 		Level:     Level0,
+		OnResume:  strings.TrimSpace(raw.OnResume),
 	}
 	if raw.Port != nil {
 		m.Port = *raw.Port

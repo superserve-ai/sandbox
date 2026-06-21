@@ -14,3 +14,4 @@ transport = "stdin"          # one turn arrives on stdin; output streams on stdo
 idle      = "signal"         # the shim signals when a turn is done → safe to hibernate
 state     = ["/root/.claude", "/work"]  # session history + working tree → /state
 level     = 1                # platform-supplied durability (FS + snapshot)
+on_resume = "cc-actor-shim --reconnect"  # after a Tier-2/3 wake: re-open the model API TLS + re-sync clock (not needed on Tier-1)

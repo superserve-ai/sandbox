@@ -31,6 +31,10 @@ func TestReferenceHarnessManifests(t *testing.T) {
 		if argv := m.StartArgv(); len(argv) != 1 || argv[0] != "cc-actor-shim" {
 			t.Errorf("start argv = %v, want [cc-actor-shim]", argv)
 		}
+		// on_resume reconnect hook (Tier-2/3 wake): re-open dropped connections.
+		if m.OnResume == "" {
+			t.Error("claude-code should declare an on_resume reconnect hook")
+		}
 	})
 
 	t.Run("flue", func(t *testing.T) {
