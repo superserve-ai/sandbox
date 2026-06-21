@@ -3,7 +3,24 @@ info:
   title: Superserve API
   version: 0.1.0
   description: |
-    Superserve provides sandbox infrastructure to run AI agents in the cloud. Powered by Firecracker MicroVMs.
+    Open agent infrastructure: durable agents and persistent sandboxes that run
+    any harness, powered by Firecracker microVMs.
+
+    Superserve gives you a substrate with two composable ideas:
+
+    - **Sandbox** — *a computer that remembers.* Compute plus a persistent
+      filesystem: run commands, read/write files, expose ports. Pause to
+      checkpoint full VM state — memory, processes, and filesystem — at zero
+      compute cost, and resume by id in under a second, exactly where it left off.
+    - **Actor** *(platform direction)* — *a process that survives.* A named,
+      durable, single-writer entity built on a Sandbox: addressable from
+      anywhere, wakes on events, hibernates between turns. (Today this is a
+      pattern you build on sandboxes; first-class support is in progress.)
+
+    The platform is the durable **body**; your harness is the **brain** — Claude
+    Code, Codex, the Claude Agent SDK, or your own loop. Any process that keeps
+    its state on the sandbox filesystem runs and survives pause/resume; bring a
+    built OCI image and it runs as-is.
 
     ## Sandbox lifecycle
 
