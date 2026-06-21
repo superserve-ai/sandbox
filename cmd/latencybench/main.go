@@ -29,6 +29,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -37,7 +38,7 @@ func main() {
 	cfg := defaultConfig()
 
 	var (
-		providerName = flag.String("provider", "stub", "wake provider: 'stub' (synthetic, no VM) or 'vmd' (real Firecracker/vmd — not wired yet)")
+		providerName = flag.String("provider", "stub", "wake provider: 'stub' (synthetic, no VM), 'firecracker' (real bare pause/resume, Tier 1), or 'vmd' (real Firecracker/vmd — not wired yet)")
 		iterations   = flag.Int("iterations", 1000, "iterations per matrix cell (the plan asks for >=1000)")
 		seed         = flag.Int64("seed", 1, "RNG seed for the stub provider (deterministic output)")
 		tiersFlag    = flag.String("tiers", "1,2,3", "comma-separated tiers to sweep")
@@ -45,6 +46,12 @@ func main() {
 		wsFlag       = flag.String("ws", "128,512,1024", "comma-separated working-set sizes in MiB")
 		cacheFlag    = flag.String("cache", "warm,cold", "comma-separated cache states: warm,cold")
 		concFlag     = flag.String("contention", "1,8,32", "comma-separated paused-VMs-per-core values")
+
+		// Real-firecracker provider config (only used with -provider=firecracker).
+		fcBin    = flag.String("fc-bin", "firecracker", "path to the firecracker binary")
+		fcKernel = flag.String("kernel", "", "path to the guest kernel (vmlinux) — required for -provider=firecracker")
+		fcRootfs = flag.String("rootfs", "", "path to a rootfs.ext4 mounted read-only — required for -provider=firecracker")
+		fcRunDir = flag.String("fc-rundir", "/tmp/latencybench-run", "scratch dir for per-VM api sockets")
 	)
 	flag.Parse()
 
@@ -56,10 +63,16 @@ func main() {
 	cfg.Matrix = matrixCfg
 	cfg.Iterations = *iterations
 
-	provider, err := selectProvider(*providerName, *seed)
+	provider, err := selectProvider(*providerName, *seed, fcProviderConfig{
+		bin: *fcBin, kernel: *fcKernel, rootfs: *fcRootfs, runDir: *fcRunDir,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "latencybench: %v\n", err)
 		os.Exit(2)
+	}
+	// Tear down real providers (kills booted firecracker processes) on exit.
+	if c, ok := provider.(io.Closer); ok {
+		defer c.Close()
 	}
 
 	if _, isStub := provider.(*stubProvider); isStub {
@@ -75,14 +88,21 @@ func main() {
 	renderTable(os.Stdout, results, provider.Label())
 }
 
-func selectProvider(name string, seed int64) (WakeProvider, error) {
+// fcProviderConfig carries the real-firecracker provider's paths from flags.
+type fcProviderConfig struct {
+	bin, kernel, rootfs, runDir string
+}
+
+func selectProvider(name string, seed int64, fc fcProviderConfig) (WakeProvider, error) {
 	switch name {
 	case "stub":
 		return newStubProvider(seed), nil
+	case "firecracker":
+		return newFirecrackerProvider(fc.bin, fc.kernel, fc.rootfs, fc.runDir)
 	case "vmd":
 		return newVMDProvider(), nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q (want 'stub' or 'vmd')", name)
+		return nil, fmt.Errorf("unknown provider %q (want 'stub', 'firecracker', or 'vmd')", name)
 	}
 }
 
