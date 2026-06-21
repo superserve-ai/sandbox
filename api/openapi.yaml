@@ -233,6 +233,81 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/from-image:
+    post:
+      operationId: createSandboxFromImage
+      tags: [Sandboxes]
+      summary: Create a sandbox directly from an OCI image
+      description: |
+        Bring an OCI image and it just runs. Resolves the image to a content
+        digest and is digest-keyed:
+
+        - **Cache hit** (a ready template already exists for this image digest):
+          creates a sandbox from it and runs the image's own `ENTRYPOINT`/`CMD`
+          — a sub-second snapshot restore. `command`/`env` override like
+          `docker run`.
+        - **Cache miss**: kicks a one-time template build for the image and
+          returns `202 building`; retry once ready for the fast path.
+
+        v1 does not yet attach secrets or network rules on the hit path — use
+        `POST /sandboxes` with `from_template` for those.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  description: OCI image reference, e.g. `ghcr.io/org/agent:latest`.
+                name:
+                  type: string
+                  description: Sandbox name (required when the image is cached).
+                command:
+                  type: array
+                  items: { type: string }
+                  description: Overrides the image entrypoint+cmd (like `docker run IMG CMD`).
+                env:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: Environment layered over the image's own env.
+                vcpu: { type: integer }
+                memory_mib: { type: integer }
+                disk_mib: { type: integer }
+      responses:
+        "201":
+          description: Sandbox created from a cached image
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxResponse"
+        "202":
+          description: Image not cached; a template build was started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: building }
+                  template_id: { type: string }
+                  build_id: { type: string }
+                  resolved_digest: { type: string }
+                  message: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/InternalError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
