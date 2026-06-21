@@ -49,13 +49,17 @@ type execRequest struct {
 	Stdin   string `json:"stdin,omitempty"`
 }
 
-// ExecStream POSTs the command to the sandbox and streams stdout into onOut.
+// ExecStream POSTs the command to the sandbox and streams the response into
+// onOut.
 //
-// NOTE (live-protocol detail): boxd's /exec/stream multiplexes stdout/stderr
-// into framed chunks (see cmd/boxd/multiplex.go). This reads the raw stream; the
-// production wiring should demux frames so only stdout reaches the harness
-// outbox. The HTTP plumbing (URL, token header, request body, streaming copy) is
-// what this implements and is unit-tested.
+// NOTE (live-protocol detail to validate against running boxd): boxd's
+// streaming exec surface is a connect-go/protobuf server stream (stdout/stderr
+// framed messages), not a raw byte body. This implements the transport-level
+// contract — URL, X-Access-Token, request body, and chunked streaming copy —
+// which is what's unit-testable here; the production build should decode the
+// connect-go ExecChunk frames (stdout only → the outbox) rather than copy the
+// raw body. Swapping the decode is local to this method; the Deliverer/Relay
+// path above is unaffected.
 func (h *HTTPExecStreamer) ExecStream(ctx context.Context, sandboxID string, argv []string, stdin []byte, onOut func([]byte)) error {
 	token, err := h.tokenFor(sandboxID)
 	if err != nil {
