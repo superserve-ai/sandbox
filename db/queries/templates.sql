@@ -235,6 +235,7 @@ SET status = 'ready',
     size_bytes = $5,
     base_path = $6,
     delta_path = $7,
+    image_config = $8,
     built_at = now(),
     updated_at = now(),
     error_message = NULL
