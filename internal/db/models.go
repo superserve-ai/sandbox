@@ -594,6 +594,7 @@ type Template struct {
 	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
 	BasePath     *string            `json:"base_path"`
 	DeltaPath    *string            `json:"delta_path"`
+	ImageConfig  []byte             `json:"image_config"`
 }
 
 type TemplateBuild struct {

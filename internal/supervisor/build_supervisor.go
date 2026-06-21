@@ -312,9 +312,9 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 
 	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
 	affected, err := s.q.TryDispatchBuild(claimCtx, db.TryDispatchBuildParams{
-		ID:             row.ID,
-		VmdHostID:      &hostID,
-		VmdBuildVmID:   &buildVMID,
+		ID:           row.ID,
+		VmdHostID:    &hostID,
+		VmdBuildVmID: &buildVMID,
 	})
 	claimCancel()
 	if err != nil {
@@ -443,6 +443,13 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		if res.DeltaPath != "" {
 			deltaPathArg = &res.DeltaPath
 		}
+		// Persist the captured image config (JSON) so the from-image / sandbox
+		// create path can run the image's own start command. Empty for legacy
+		// builds → leave the jsonb column NULL.
+		var imageConfigArg []byte
+		if res.ImageConfigJSON != "" {
+			imageConfigArg = []byte(res.ImageConfigJSON)
+		}
 		_, err := s.q.FinalizeBuild(finCtx, db.FinalizeBuildParams{
 			ID:           row.ID,
 			RootfsPath:   &rootfs,
@@ -451,6 +458,7 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			SizeBytes:    &size,
 			BasePath:     basePathArg,
 			DeltaPath:    deltaPathArg,
+			ImageConfig:  imageConfigArg,
 		})
 		cancel()
 		if errors.Is(err, pgx.ErrNoRows) {
