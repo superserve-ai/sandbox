@@ -3,8 +3,10 @@ package vm
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,6 +42,17 @@ type ReconcilerConfig struct {
 	// detection (BoltDB ↔ systemd ↔ DB) and writes audit log entries.
 	// When nil, it only compares BoltDB and systemd.
 	DB *db.Queries
+	// DiskScanEnabled turns on the detect-only disk-orphan pass: it scans
+	// RunDir/SnapshotDir for per-sandbox dirs with no live row and logs what
+	// it would reclaim. It never deletes.
+	DiskScanEnabled bool
+	// DiskGracePeriod keeps a sandbox's dirs out of the orphan set for this
+	// long after destroyed_at, so an in-flight in-band delete isn't raced.
+	DiskGracePeriod time.Duration
+	// DiskScanEvery runs the disk pass once every Nth reconcile tick so a
+	// filesystem walk doesn't ride the fast liveness loop. Values < 1 mean
+	// every tick.
+	DiskScanEvery int
 }
 
 // DefaultReconcilerConfig returns sensible defaults from the design doc.
@@ -48,6 +61,9 @@ func DefaultReconcilerConfig() ReconcilerConfig {
 		Interval:           30 * time.Second,
 		GracePeriod:        60 * time.Second,
 		MaxAutoFailPerHour: 5,
+		DiskScanEnabled:    true,
+		DiskGracePeriod:    24 * time.Hour,
+		DiskScanEvery:      4,
 	}
 }
 
@@ -72,6 +88,10 @@ type Reconciler struct {
 	mu          sync.Mutex
 	driftSeen   map[string]time.Time
 	autoFailLog []time.Time // timestamps of recent auto-fail actions
+
+	// passCount counts completed reconcile passes, used to run the disk
+	// scan on a slower sub-cadence. Only touched from the single Run loop.
+	passCount uint64
 }
 
 // NewReconciler creates a reconciler bound to a Manager.
@@ -135,6 +155,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		log.Debug().Msg("no state store — skipping run")
 		return
 	}
+
+	// Pass timestamp; the disk scan derives its grace cutoff from it (rows
+	// destroyed within, and dirs touched within, DiskGracePeriod are kept).
+	snapshotTime := time.Now()
 
 	// Source B: active systemd units.
 	ids, err := listActiveFirecrackerUnits(ctx)
@@ -366,6 +390,198 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.clearDrift("bolt-orphan:" + id)
 		}
 	}
+
+	// Drift 6 (detect-only): per-sandbox dirs on disk with no live row. Runs
+	// on a slower sub-cadence so the filesystem walk doesn't ride every tick.
+	r.passCount++
+	every := r.cfg.DiskScanEvery
+	if every < 1 {
+		every = 1
+	}
+	if r.cfg.DiskScanEnabled && r.passCount%uint64(every) == 0 {
+		r.detectDiskOrphans(ctx, snapshotTime, dbSandboxes, active)
+	}
+}
+
+// sandboxDirInfo is one sandbox's on-disk footprint: every dir found for its
+// UUID and the newest mtime across them.
+type sandboxDirInfo struct {
+	mtime time.Time
+	paths []string
+}
+
+// detectDiskOrphans implements Drift 6 in detect-only mode: it logs the
+// per-sandbox dirs it would reclaim and deletes nothing. Fail-closed: without
+// a DB keep-set it does nothing.
+func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Time, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool) {
+	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_scan").Logger()
+
+	if r.cfg.DB == nil || r.cfg.HostID == "" || dbSandboxes == nil {
+		log.Debug().Msg("disk scan skipped — no DB keep-set (fail-closed)")
+		return
+	}
+
+	// Source D: per-sandbox dirs. A name that parses as a UUID excludes the
+	// template mount target, the build tree, and build-* VMs by construction.
+	onDisk := scanSandboxDirs(r.mgr.cfg.RunDir, r.mgr.cfg.SnapshotDir)
+	if len(onDisk) == 0 {
+		return
+	}
+
+	cutoff := snapshotTime.Add(-r.cfg.DiskGracePeriod)
+	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	recent, err := r.cfg.DB.ListRecentlyDestroyedSandboxIDsByHost(qctx, db.ListRecentlyDestroyedSandboxIDsByHostParams{
+		HostID:         r.cfg.HostID,
+		DestroyedAfter: pgtype.Timestamptz{Time: cutoff, Valid: true},
+	})
+	cancel()
+	if err != nil {
+		log.Error().Err(err).Msg("disk scan: recently-destroyed query failed — skipping (fail-closed)")
+		return
+	}
+	keep := diskKeepSet(dbSandboxes, recent, active, cutoff)
+
+	// A drained or all-failed host legitimately has an empty keep-set; report it
+	// (detect-only is harmless). The hard abort-guard belongs on reclamation.
+	if len(keep) == 0 {
+		log.Warn().Int("on_disk", len(onDisk)).
+			Msg("disk scan: empty keep-set — reporting all on-disk dirs as orphans (verify before enabling reclamation)")
+	}
+
+	orphans := selectOrphanDirs(onDisk, keep, cutoff)
+	if len(orphans) == 0 {
+		log.Info().Int("on_disk", len(onDisk)).Msg("disk scan: no orphan dirs")
+		return
+	}
+
+	var dirCount int
+	var bytes int64
+	for _, id := range orphans {
+		info := onDisk[id]
+		dirCount += len(info.paths)
+		bytes += dirSize(ctx, info.paths)
+	}
+
+	sample := orphans
+	if len(sample) > 20 {
+		sample = sample[:20]
+	}
+	log.Warn().
+		Int("orphan_sandboxes", len(orphans)).
+		Int("orphan_dirs", dirCount).
+		Int64("orphan_bytes", bytes).
+		Strs("sample", sample).
+		Msg("disk scan (detect-only): orphan per-sandbox dirs would be reclaimed")
+}
+
+// diskKeepSet is every sandbox UUID whose on-disk dirs must NOT be reclaimed —
+// the union of all signals a dir may be in use: non-destroyed DB rows (minus
+// failures settled before cutoff), rows destroyed within grace, and active
+// systemd units (a running VM whose row is momentarily gone). BoltDB-only UUIDs
+// are excluded on purpose: no row AND no unit means a dead VM (Drift 5's job),
+// so its dir is reclaimable. In-flight creates are caught by the caller's mtime
+// grace, not here. Pure.
+func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid.UUID, active map[string]bool, cutoff time.Time) map[string]struct{} {
+	keep := make(map[string]struct{}, len(dbSandboxes)+len(recent)+len(active))
+	for id, row := range dbSandboxes {
+		if row.Sandbox.Status == db.SandboxStatusFailed && row.Sandbox.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		keep[id] = struct{}{}
+	}
+	for _, id := range recent {
+		keep[id.String()] = struct{}{}
+	}
+	for id := range active {
+		keep[id] = struct{}{}
+	}
+	return keep
+}
+
+// selectOrphanDirs returns the sandbox UUIDs whose on-disk dirs have no live or
+// within-grace row AND whose newest mtime is older than cutoff. The mtime age
+// grace keeps an in-flight create — whose rundir exists before its DB INSERT
+// commits, so it has no visible row yet — from being flagged as an orphan.
+// Pure: no DB or filesystem access.
+func selectOrphanDirs(onDisk map[string]sandboxDirInfo, keep map[string]struct{}, cutoff time.Time) []string {
+	var orphans []string
+	for id, info := range onDisk {
+		if _, live := keep[id]; live {
+			continue
+		}
+		if info.mtime.After(cutoff) {
+			continue
+		}
+		orphans = append(orphans, id)
+	}
+	return orphans
+}
+
+// scanSandboxDirs enumerates direct children of each root whose name parses as
+// a UUID — the per-sandbox dirs. Non-UUID entries (template, templates,
+// build-*) and unreadable roots/entries are skipped. A sandbox's dirs across
+// roots are merged, keeping the newest mtime.
+func scanSandboxDirs(roots ...string) map[string]sandboxDirInfo {
+	out := make(map[string]sandboxDirInfo)
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			id, err := uuid.Parse(e.Name())
+			if err != nil {
+				continue
+			}
+			fi, err := e.Info()
+			if err != nil {
+				continue
+			}
+			key := id.String()
+			cur := out[key]
+			cur.paths = append(cur.paths, filepath.Join(root, e.Name()))
+			if fi.ModTime().After(cur.mtime) {
+				cur.mtime = fi.ModTime()
+			}
+			out[key] = cur
+		}
+	}
+	return out
+}
+
+// dirSize sums the size of every regular file under the given paths. Errors are
+// swallowed so one unreadable entry can't abort the measurement, and the walk
+// stops early if ctx is cancelled so the pass stays within its deadline.
+func dirSize(ctx context.Context, paths []string) int64 {
+	var total int64
+	for _, p := range paths {
+		_ = filepath.WalkDir(p, func(_ string, d os.DirEntry, err error) error {
+			if ctx.Err() != nil {
+				return filepath.SkipAll
+			}
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			fi, e := d.Info()
+			if e != nil {
+				return nil
+			}
+			// Count allocated blocks (du-style), not apparent length: overlay
+			// images are sparse (createOverlay truncates to the base size), so
+			// fi.Size() would massively overstate the disk a delete frees.
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+				total += st.Blocks * 512 // st_blocks is in 512-byte units
+			}
+			return nil
+		})
+	}
+	return total
 }
 
 // isAlive returns true when the VM's systemd unit is currently active.
