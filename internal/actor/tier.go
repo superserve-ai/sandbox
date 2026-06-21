@@ -1,6 +1,7 @@
 package actor
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -96,6 +97,28 @@ func (c *TierController) Tier(actorID string) Tier {
 		return st.tier
 	}
 	return TierCold
+}
+
+// Run is the background trigger that actually demotes idle Actors: it calls Tick
+// on a fixed interval until ctx is cancelled. Without it, Touch/Tick are inert —
+// nothing advances an idle Actor down the tiers. Returns ctx.Err() on cancel.
+func (c *TierController) Run(ctx context.Context, interval time.Duration) error {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	return c.runLoop(ctx, t.C)
+}
+
+// runLoop drives Tick off a tick channel until ctx is done. Split from Run so a
+// test can drive ticks deterministically (no wall-clock sleeps).
+func (c *TierController) runLoop(ctx context.Context, ticks <-chan time.Time) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticks:
+			c.Tick()
+		}
+	}
 }
 
 // Tick advances demotions for all tracked Actors whose idleness has crossed the

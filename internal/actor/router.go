@@ -34,6 +34,11 @@ type Router struct {
 	holder     string // this host/instance id — the lease holder
 	inboxDepth int
 
+	// activity, if set, is called with the Actor id on every routed event —
+	// wired to TierController.Touch so a present user keeps the Actor promoted
+	// and resets its idle clock. nil = no tiering (events still route normally).
+	activity func(actorID string)
+
 	mu   sync.Mutex
 	live map[string]*liveActor
 }
@@ -50,6 +55,14 @@ func NewRouter(reg *Registry, waker Waker, holder string, inboxDepth int) *Route
 	return &Router{reg: reg, waker: waker, holder: holder, inboxDepth: inboxDepth, live: map[string]*liveActor{}}
 }
 
+// OnActivity registers a per-event activity callback (typically
+// TierController.Touch) and returns the Router for chaining. Called once per
+// routed event with the Actor id, before the event is enqueued.
+func (r *Router) OnActivity(fn func(actorID string)) *Router {
+	r.activity = fn
+	return r
+}
+
 // Route delivers ev to the named Actor, creating it on first reference and
 // waking its compute if cold. defaults supplies the template/state binding used
 // only when the Actor is created. Returns ErrLeaseHeld if another live instance
@@ -62,6 +75,11 @@ func (r *Router) Route(ctx context.Context, teamID, name string, defaults Actor,
 	la, err := r.ensureLive(ctx, a)
 	if err != nil {
 		return err
+	}
+	// Record activity (promote to Live + reset idle) before enqueuing, so a busy
+	// Actor is never demoted out from under an in-flight turn.
+	if r.activity != nil {
+		r.activity(a.ID)
 	}
 	return la.inbox.Send(ctx, ev)
 }

@@ -1,6 +1,7 @@
 package actor
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,35 @@ func (d *recordDemoter) last() string {
 }
 
 func (d *recordDemoter) count() int { d.mu.Lock(); defer d.mu.Unlock(); return len(d.calls) }
+
+// TestTierControllerRunLoop: the Run driver actually fires demotions on each
+// tick. Driven through a manual tick channel so it's deterministic (no sleeps).
+func TestTierControllerRunLoop(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	dem := &recordDemoter{}
+	c := NewTierController(TierPolicy{ToTier1: time.Second}, dem, clk.now)
+	c.Touch("a")
+	clk.advance(2 * time.Second) // "a" is now idle past ToTier1
+
+	ticks := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.runLoop(ctx, ticks) }()
+
+	// Drive one tick, then a second: the second send blocks until the loop has
+	// finished the first Tick and returned to select, so the demotion is
+	// guaranteed visible without polling.
+	ticks <- time.Unix(0, 0)
+	ticks <- time.Unix(0, 0)
+	if dem.count() != 1 || dem.last() != "a:"+string(TierPaused1) {
+		t.Fatalf("run loop should demote idle actor to tier1: count=%d last=%q", dem.count(), dem.last())
+	}
+
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("runLoop should return ctx.Err() after cancel")
+	}
+}
 
 func TestTierStaircase(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}

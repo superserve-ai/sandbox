@@ -50,6 +50,38 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Fatal("condition not met within timeout")
 }
 
+// TestRouterActivityHook: the activity callback fires once per routed event,
+// carrying the resolved Actor id — this is what wires Route → TierController.Touch
+// so a present user keeps the Actor promoted.
+func TestRouterActivityHook(t *testing.T) {
+	reg := NewRegistry(NewMemStore(), nil)
+	w := newRecordingWaker()
+	var mu sync.Mutex
+	var got []string
+	r := NewRouter(reg, w, "host-A", 8).OnActivity(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+	ctx := context.Background()
+
+	for _, id := range []string{"e0", "e1"} {
+		if err := r.Route(ctx, "t", "agent-1", Actor{Template: "base"}, Event{ID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The hook fires synchronously inside Route, so it has recorded both by now.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("activity hook should fire once per event, got %d: %v", len(got), got)
+	}
+	if got[0] == "" || got[0] != got[1] {
+		t.Fatalf("activity should carry the (same) actor id for both events: %v", got)
+	}
+}
+
 func TestRouterWakeOnReference(t *testing.T) {
 	store := NewMemStore()
 	reg := NewRegistry(store, nil)
