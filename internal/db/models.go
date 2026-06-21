@@ -170,6 +170,28 @@ type Activity struct {
 	SecretName   *string     `json:"secret_name"`
 }
 
+type Actor struct {
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Name           string             `json:"name"`
+	TemplateID     pgtype.UUID        `json:"template_id"`
+	StateID        *string            `json:"state_id"`
+	HomeHost       *string            `json:"home_host"`
+	Tier           string             `json:"tier"`
+	LeaseHolder    *string            `json:"lease_holder"`
+	LeaseToken     int64              `json:"lease_token"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+}
+
+type ActorAlarm struct {
+	ID        uuid.UUID `json:"id"`
+	ActorID   uuid.UUID `json:"actor_id"`
+	FireAt    time.Time `json:"fire_at"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type AnalyticsWeeklyUserMetric struct {
 	WeekStart       pgtype.Date `json:"week_start"`
 	Signups         int64       `json:"signups"`
