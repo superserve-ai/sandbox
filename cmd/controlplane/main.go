@@ -30,6 +30,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/actor/vmdwaker"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
@@ -57,17 +58,6 @@ const vmdRetryServiceConfig = `{
     }
   }]
 }`
-
-// notWiredExec is a placeholder boxddeliver.ExecStreamer used until the sandbox
-// exec path (proxy /exec/stream against boxd, with the sandbox access token) is
-// wired into the control plane. It makes the durable-Actor runtime assembly
-// type-check and constructable; live event delivery returns this error until the
-// real ExecStreamer lands.
-type notWiredExec struct{}
-
-func (notWiredExec) ExecStream(context.Context, string, []string, []byte, func([]byte)) error {
-	return fmt.Errorf("actor runtime: sandbox ExecStreamer not wired (implement over proxy /exec/stream)")
-}
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -206,10 +196,23 @@ func run() error {
 	// and the whole graph type-check.
 	if os.Getenv("ACTOR_RUNTIME_ENABLED") == "1" {
 		systemTeam, _ := uuid.Parse(cfg.SystemTeamID)
-		deliverer := boxddeliver.New(notWiredExec{}, []string{"sh", "-c", "harness-turn"})
+		// Event delivery: exec the harness turn in the Actor's sandbox over the
+		// edge proxy /exec/stream path, authenticated with the per-sandbox HMAC
+		// access token (same derivation the edge verifies).
+		execURL := func(sandboxID string) string {
+			return fmt.Sprintf("https://boxd-%s.%s/exec/stream", sandboxID, cfg.EdgeProxyDomain)
+		}
+		execToken := func(sandboxID string) (string, error) {
+			if cfg.SandboxAccessTokenSeed == nil {
+				return "", fmt.Errorf("SANDBOX_ACCESS_TOKEN_SEED not configured")
+			}
+			return auth.ComputeAccessToken(cfg.SandboxAccessTokenSeed, sandboxID), nil
+		}
+		exec := boxddeliver.NewHTTPExecStreamer(http.DefaultClient, execURL, execToken)
+		deliverer := boxddeliver.New(exec, []string{"sh", "-c", "harness-turn"})
 		waker := vmdwaker.New(vmdClient, deliverer, api.AgentTargetResolver(queries, systemTeam))
 		handlers.Agents = actorrt.NewRouter(actorrt.NewRegistry(pgstore.New(queries), nil), waker, cfg.DefaultHostID, 16)
-		log.Info().Msg("durable-Actor runtime enabled (/v1/agents); exec delivery pending real ExecStreamer")
+		log.Info().Msg("durable-Actor runtime enabled (/v1/agents) with sandbox-exec delivery")
 	}
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
