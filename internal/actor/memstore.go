@@ -1,6 +1,7 @@
 package actor
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -24,7 +25,7 @@ func NewMemStore() *MemStore {
 
 func nameKey(teamID, name string) string { return teamID + "\x00" + name }
 
-func (s *MemStore) GetOrCreate(teamID, name string, defaults Actor, now time.Time) (Actor, bool, error) {
+func (s *MemStore) GetOrCreate(_ context.Context, teamID, name string, defaults Actor, now time.Time) (Actor, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if id, ok := s.byName[nameKey(teamID, name)]; ok {
@@ -46,7 +47,7 @@ func (s *MemStore) GetOrCreate(teamID, name string, defaults Actor, now time.Tim
 	return a, true, nil
 }
 
-func (s *MemStore) Get(id string) (Actor, error) {
+func (s *MemStore) Get(_ context.Context, id string) (Actor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.byID[id]
@@ -56,7 +57,7 @@ func (s *MemStore) Get(id string) (Actor, error) {
 	return *a, nil
 }
 
-func (s *MemStore) TryAcquireLease(id, holder string, now time.Time, ttl time.Duration) (LeaseOutcome, error) {
+func (s *MemStore) TryAcquireLease(_ context.Context, id, holder string, now time.Time, ttl time.Duration) (LeaseOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.byID[id]
@@ -77,7 +78,7 @@ func (s *MemStore) TryAcquireLease(id, holder string, now time.Time, ttl time.Du
 	return LeaseOutcome{Granted: true, Token: a.LeaseToken, Expires: a.LeaseExpires}, nil
 }
 
-func (s *MemStore) RenewLease(id, holder string, token int64, now time.Time, ttl time.Duration) (LeaseOutcome, error) {
+func (s *MemStore) RenewLease(_ context.Context, id, holder string, token int64, now time.Time, ttl time.Duration) (LeaseOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.byID[id]
@@ -93,7 +94,7 @@ func (s *MemStore) RenewLease(id, holder string, token int64, now time.Time, ttl
 	return LeaseOutcome{Granted: true, Token: a.LeaseToken, Expires: a.LeaseExpires}, nil
 }
 
-func (s *MemStore) ReleaseLease(id, holder string, token int64) error {
+func (s *MemStore) ReleaseLease(_ context.Context, id, holder string, token int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.byID[id]
@@ -109,7 +110,7 @@ func (s *MemStore) ReleaseLease(id, holder string, token int64) error {
 	return nil
 }
 
-func (s *MemStore) CheckFence(id string, token int64, now time.Time) error {
+func (s *MemStore) CheckFence(_ context.Context, id string, token int64, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.byID[id]
@@ -122,7 +123,7 @@ func (s *MemStore) CheckFence(id string, token int64, now time.Time) error {
 	return nil
 }
 
-func (s *MemStore) SetTier(id string, tier Tier, host string, now time.Time) error {
+func (s *MemStore) SetTier(_ context.Context, id string, tier Tier, host string, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.byID[id]

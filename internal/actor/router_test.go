@@ -84,7 +84,7 @@ func TestRouterHibernateAndRewake(t *testing.T) {
 	r := NewRouter(reg, w, "host-A", 16)
 	ctx := context.Background()
 
-	a, _, _ := reg.GetActor("t", "agent", Actor{})
+	a, _, _ := reg.GetActor(context.Background(), "t", "agent", Actor{})
 	if err := r.Route(ctx, "t", "agent", Actor{}, Event{ID: "e1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestRouterHibernateAndRewake(t *testing.T) {
 		t.Fatal("actor should not be live after hibernate")
 	}
 	// Lease must be released so another host could take over.
-	got, _ := reg.store.Get(a.ID)
+	got, _ := reg.store.Get(context.Background(), a.ID)
 	if got.LeaseHolder != "" {
 		t.Errorf("hibernate should release the lease, holder=%q", got.LeaseHolder)
 	}
@@ -127,7 +127,7 @@ func TestRouterSingleWriterAcrossHosts(t *testing.T) {
 	rB := NewRouter(regB, wB, "host-B", 4)
 	ctx := context.Background()
 
-	a, _, _ := regA.GetActor("t", "agent", Actor{})
+	a, _, _ := regA.GetActor(context.Background(), "t", "agent", Actor{})
 
 	// host-A wakes and holds the Actor.
 	if err := rA.Route(ctx, "t", "agent", Actor{}, Event{ID: "a1"}); err != nil {

@@ -55,7 +55,7 @@ func NewRouter(reg *Registry, waker Waker, holder string, inboxDepth int) *Route
 // only when the Actor is created. Returns ErrLeaseHeld if another live instance
 // (another host) owns the Actor — the caller should forward to that host.
 func (r *Router) Route(ctx context.Context, teamID, name string, defaults Actor, ev Event) error {
-	a, _, err := r.reg.GetActor(teamID, name, defaults)
+	a, _, err := r.reg.GetActor(ctx, teamID, name, defaults)
 	if err != nil {
 		return err
 	}
@@ -77,20 +77,20 @@ func (r *Router) ensureLive(ctx context.Context, a Actor) (*liveActor, error) {
 	}
 	// Single-writer: take the lease before waking. If another host holds it,
 	// surface ErrLeaseHeld so the caller forwards there.
-	lease, err := r.reg.Acquire(a.ID, r.holder, 0)
+	lease, err := r.reg.Acquire(ctx, a.ID, r.holder, 0)
 	if err != nil {
 		return nil, err
 	}
 	h, err := r.waker.Wake(ctx, a, lease)
 	if err != nil {
-		_ = lease.Release()
+		_ = lease.Release(ctx)
 		return nil, err
 	}
 	inbox := NewInbox(r.inboxDepth)
 	runCtx, cancel := context.WithCancel(context.Background())
 	la := &liveActor{inbox: inbox, lease: lease, cancel: cancel}
 	go inbox.Run(runCtx, h, nil)
-	_ = r.reg.SetTier(a.ID, TierLive, r.holder)
+	_ = r.reg.SetTier(ctx, a.ID, TierLive, r.holder)
 	r.live[a.ID] = la
 	return la, nil
 }
@@ -111,8 +111,9 @@ func (r *Router) Hibernate(actorID string, tier Tier) {
 	}
 	la.inbox.Close()
 	la.cancel()
-	_ = r.reg.SetTier(actorID, tier, r.holder)
-	_ = la.lease.Release()
+	bg := context.Background()
+	_ = r.reg.SetTier(bg, actorID, tier, r.holder)
+	_ = la.lease.Release(bg)
 }
 
 // IsLive reports whether actorID has a live instance on this host.

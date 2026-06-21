@@ -1,6 +1,9 @@
 package actor
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // DefaultLeaseTTL is the lease lifetime. A holder must renew within this window
 // or lose the lease (and its fencing token). Short enough that a dead holder's
@@ -28,8 +31,8 @@ func NewRegistry(store Store, clock func() time.Time) *Registry {
 // This is the "getActor(name) just works" primitive: callers never explicitly
 // create an Actor — referencing it brings it into being. defaults supplies the
 // template/state binding used only when the Actor is created.
-func (r *Registry) GetActor(teamID, name string, defaults Actor) (Actor, bool, error) {
-	return r.store.GetOrCreate(teamID, name, defaults, r.now())
+func (r *Registry) GetActor(ctx context.Context, teamID, name string, defaults Actor) (Actor, bool, error) {
+	return r.store.GetOrCreate(ctx, teamID, name, defaults, r.now())
 }
 
 // Lease is a held single-writer lease. Fence() returns the token to stamp on
@@ -50,11 +53,11 @@ func (l *Lease) ActorID() string { return l.actorID }
 
 // Acquire attempts to take the single-writer lease for holder. On success it
 // returns a Lease; if another live instance holds it, it returns ErrLeaseHeld.
-func (r *Registry) Acquire(actorID, holder string, ttl time.Duration) (*Lease, error) {
+func (r *Registry) Acquire(ctx context.Context, actorID, holder string, ttl time.Duration) (*Lease, error) {
 	if ttl <= 0 {
 		ttl = DefaultLeaseTTL
 	}
-	out, err := r.store.TryAcquireLease(actorID, holder, r.now(), ttl)
+	out, err := r.store.TryAcquireLease(ctx, actorID, holder, r.now(), ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -66,11 +69,11 @@ func (r *Registry) Acquire(actorID, holder string, ttl time.Duration) (*Lease, e
 
 // Renew extends the lease. It returns ErrFenced if the lease was lost (expired
 // and stolen) in the meantime — the caller must then stop writing immediately.
-func (l *Lease) Renew(ttl time.Duration) error {
+func (l *Lease) Renew(ctx context.Context, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = DefaultLeaseTTL
 	}
-	out, err := l.reg.store.RenewLease(l.actorID, l.holder, l.token, l.reg.now(), ttl)
+	out, err := l.reg.store.RenewLease(ctx, l.actorID, l.holder, l.token, l.reg.now(), ttl)
 	if err != nil {
 		return err
 	}
@@ -80,17 +83,17 @@ func (l *Lease) Renew(ttl time.Duration) error {
 
 // Release relinquishes the lease so another instance can wake the Actor on a
 // different host without waiting for TTL expiry. Idempotent.
-func (l *Lease) Release() error {
-	return l.reg.store.ReleaseLease(l.actorID, l.holder, l.token)
+func (l *Lease) Release(ctx context.Context) error {
+	return l.reg.store.ReleaseLease(ctx, l.actorID, l.holder, l.token)
 }
 
 // CheckFence verifies this lease's token is still current — the gate to call
 // before a durable /state write. Returns ErrFenced if the lease was lost.
-func (l *Lease) CheckFence() error {
-	return l.reg.store.CheckFence(l.actorID, l.token, l.reg.now())
+func (l *Lease) CheckFence(ctx context.Context) error {
+	return l.reg.store.CheckFence(ctx, l.actorID, l.token, l.reg.now())
 }
 
 // SetTier records the Actor's hibernation tier + host (host stickiness).
-func (r *Registry) SetTier(actorID string, tier Tier, host string) error {
-	return r.store.SetTier(actorID, tier, host, r.now())
+func (r *Registry) SetTier(ctx context.Context, actorID string, tier Tier, host string) error {
+	return r.store.SetTier(ctx, actorID, tier, host, r.now())
 }

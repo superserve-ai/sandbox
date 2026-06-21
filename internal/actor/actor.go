@@ -17,6 +17,7 @@
 package actor
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -88,30 +89,30 @@ type Store interface {
 	// GetOrCreate resolves (team, name) to an Actor, creating it on first
 	// reference. The created flag distinguishes a fresh Actor from an existing
 	// one. This is the wake-on-reference primitive.
-	GetOrCreate(teamID, name string, defaults Actor, now time.Time) (a Actor, created bool, err error)
+	GetOrCreate(ctx context.Context, teamID, name string, defaults Actor, now time.Time) (a Actor, created bool, err error)
 
 	// Get fetches an Actor by id.
-	Get(id string) (Actor, error)
+	Get(ctx context.Context, id string) (Actor, error)
 
 	// TryAcquireLease atomically grants the lease to holder iff it is free,
 	// expired, or already held by holder. On grant it increments the fencing
 	// token and extends expiry. On a valid foreign hold it returns Granted=false
 	// with the current holder.
-	TryAcquireLease(id, holder string, now time.Time, ttl time.Duration) (LeaseOutcome, error)
+	TryAcquireLease(ctx context.Context, id, holder string, now time.Time, ttl time.Duration) (LeaseOutcome, error)
 
 	// RenewLease extends the lease iff holder still holds it with the given
 	// token (no expiry/steal happened in between). Does NOT change the token.
-	RenewLease(id, holder string, token int64, now time.Time, ttl time.Duration) (LeaseOutcome, error)
+	RenewLease(ctx context.Context, id, holder string, token int64, now time.Time, ttl time.Duration) (LeaseOutcome, error)
 
 	// ReleaseLease relinquishes the lease iff holder holds it with token.
 	// Idempotent: releasing an already-released/stolen lease is not an error.
-	ReleaseLease(id, holder string, token int64) error
+	ReleaseLease(ctx context.Context, id, holder string, token int64) error
 
 	// CheckFence verifies token is the current lease token (and unexpired) —
 	// the gate a write path calls before mutating /state. Returns ErrFenced
 	// otherwise.
-	CheckFence(id string, token int64, now time.Time) error
+	CheckFence(ctx context.Context, id string, token int64, now time.Time) error
 
 	// SetTier records the Actor's hibernation tier and current host.
-	SetTier(id string, tier Tier, host string, now time.Time) error
+	SetTier(ctx context.Context, id string, tier Tier, host string, now time.Time) error
 }

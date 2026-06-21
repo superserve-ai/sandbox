@@ -1,6 +1,7 @@
 package actor
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -28,11 +29,11 @@ func newReg() (*Registry, *fakeClock) {
 
 func TestGetActorWakeOnReference(t *testing.T) {
 	reg, _ := newReg()
-	a1, created1, err := reg.GetActor("team-1", "support/ticket-4821", Actor{Template: "base"})
+	a1, created1, err := reg.GetActor(context.Background(), "team-1", "support/ticket-4821", Actor{Template: "base"})
 	if err != nil || !created1 {
 		t.Fatalf("first GetActor: created=%v err=%v", created1, err)
 	}
-	a2, created2, err := reg.GetActor("team-1", "support/ticket-4821", Actor{})
+	a2, created2, err := reg.GetActor(context.Background(), "team-1", "support/ticket-4821", Actor{})
 	if err != nil || created2 {
 		t.Fatalf("second GetActor should resolve existing: created=%v err=%v", created2, err)
 	}
@@ -43,7 +44,7 @@ func TestGetActorWakeOnReference(t *testing.T) {
 		t.Errorf("new actor should start cold, got %s", a1.Tier)
 	}
 	// Same name, different team → different actor (per-team isolation).
-	b, createdB, _ := reg.GetActor("team-2", "support/ticket-4821", Actor{})
+	b, createdB, _ := reg.GetActor(context.Background(), "team-2", "support/ticket-4821", Actor{})
 	if !createdB || b.ID == a1.ID {
 		t.Errorf("name collision across teams must not alias: %s vs %s (created=%v)", b.ID, a1.ID, createdB)
 	}
@@ -51,9 +52,9 @@ func TestGetActorWakeOnReference(t *testing.T) {
 
 func TestLeaseSingleWriter(t *testing.T) {
 	reg, _ := newReg()
-	a, _, _ := reg.GetActor("t", "a", Actor{})
+	a, _, _ := reg.GetActor(context.Background(), "t", "a", Actor{})
 
-	l1, err := reg.Acquire(a.ID, "host-A", time.Second)
+	l1, err := reg.Acquire(context.Background(), a.ID, "host-A", time.Second)
 	if err != nil {
 		t.Fatalf("first acquire should win: %v", err)
 	}
@@ -62,37 +63,37 @@ func TestLeaseSingleWriter(t *testing.T) {
 	}
 
 	// A second, different holder must be refused while the lease is valid.
-	if _, err := reg.Acquire(a.ID, "host-B", time.Second); !errors.Is(err, ErrLeaseHeld) {
+	if _, err := reg.Acquire(context.Background(), a.ID, "host-B", time.Second); !errors.Is(err, ErrLeaseHeld) {
 		t.Fatalf("second holder should get ErrLeaseHeld, got %v", err)
 	}
 
 	// The holder can still fence writes.
-	if err := l1.CheckFence(); err != nil {
+	if err := l1.CheckFence(context.Background()); err != nil {
 		t.Errorf("holder fence check should pass: %v", err)
 	}
 }
 
 func TestLeaseExpiryAndFencing(t *testing.T) {
 	reg, clk := newReg()
-	a, _, _ := reg.GetActor("t", "a", Actor{})
+	a, _, _ := reg.GetActor(context.Background(), "t", "a", Actor{})
 
-	l1, _ := reg.Acquire(a.ID, "host-A", 10*time.Second)
+	l1, _ := reg.Acquire(context.Background(), a.ID, "host-A", 10*time.Second)
 	tok1 := l1.Token()
 
 	// Let the lease lapse.
 	clk.advance(11 * time.Second)
 
 	// host-A's fence is now invalid (lease expired).
-	if err := l1.CheckFence(); !errors.Is(err, ErrFenced) {
+	if err := l1.CheckFence(context.Background()); !errors.Is(err, ErrFenced) {
 		t.Fatalf("expired lease should fence the old holder, got %v", err)
 	}
 	// host-A's renew must also fail — it cannot resurrect a lapsed lease.
-	if err := l1.Renew(10 * time.Second); !errors.Is(err, ErrFenced) {
+	if err := l1.Renew(context.Background(), 10*time.Second); !errors.Is(err, ErrFenced) {
 		t.Fatalf("renew of lapsed lease should be fenced, got %v", err)
 	}
 
 	// host-B now takes over and gets a NEW, higher token (the fence).
-	l2, err := reg.Acquire(a.ID, "host-B", 10*time.Second)
+	l2, err := reg.Acquire(context.Background(), a.ID, "host-B", 10*time.Second)
 	if err != nil {
 		t.Fatalf("host-B should acquire after expiry: %v", err)
 	}
@@ -100,57 +101,57 @@ func TestLeaseExpiryAndFencing(t *testing.T) {
 		t.Fatalf("new holder's fence token must increase: got %d, old %d", l2.Token(), tok1)
 	}
 	// Critical safety: the OLD holder, even if it wakes up confused, is fenced.
-	if err := l1.CheckFence(); !errors.Is(err, ErrFenced) {
+	if err := l1.CheckFence(context.Background()); !errors.Is(err, ErrFenced) {
 		t.Fatalf("old holder must stay fenced after takeover, got %v", err)
 	}
 	// The new holder writes safely.
-	if err := l2.CheckFence(); err != nil {
+	if err := l2.CheckFence(context.Background()); err != nil {
 		t.Errorf("new holder fence should pass: %v", err)
 	}
 }
 
 func TestLeaseRenewKeepsToken(t *testing.T) {
 	reg, clk := newReg()
-	a, _, _ := reg.GetActor("t", "a", Actor{})
-	l, _ := reg.Acquire(a.ID, "host-A", 10*time.Second)
+	a, _, _ := reg.GetActor(context.Background(), "t", "a", Actor{})
+	l, _ := reg.Acquire(context.Background(), a.ID, "host-A", 10*time.Second)
 	tok := l.Token()
 	clk.advance(5 * time.Second)
-	if err := l.Renew(10 * time.Second); err != nil {
+	if err := l.Renew(context.Background(), 10*time.Second); err != nil {
 		t.Fatalf("renew should succeed: %v", err)
 	}
 	if l.Token() != tok {
 		t.Errorf("renew must NOT change the fence token: %d -> %d", tok, l.Token())
 	}
 	clk.advance(8 * time.Second) // would have expired at +10 without the renew
-	if err := l.CheckFence(); err != nil {
+	if err := l.CheckFence(context.Background()); err != nil {
 		t.Errorf("renewed lease should still be valid: %v", err)
 	}
 }
 
 func TestLeaseReleaseHandoff(t *testing.T) {
 	reg, _ := newReg()
-	a, _, _ := reg.GetActor("t", "a", Actor{})
-	l1, _ := reg.Acquire(a.ID, "host-A", time.Hour)
+	a, _, _ := reg.GetActor(context.Background(), "t", "a", Actor{})
+	l1, _ := reg.Acquire(context.Background(), a.ID, "host-A", time.Hour)
 	// Clean handoff: release lets another host take over immediately (no TTL wait).
-	if err := l1.Release(); err != nil {
+	if err := l1.Release(context.Background()); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if err := l1.CheckFence(); !errors.Is(err, ErrFenced) {
+	if err := l1.CheckFence(context.Background()); !errors.Is(err, ErrFenced) {
 		t.Errorf("released holder should be fenced, got %v", err)
 	}
-	if _, err := reg.Acquire(a.ID, "host-B", time.Hour); err != nil {
+	if _, err := reg.Acquire(context.Background(), a.ID, "host-B", time.Hour); err != nil {
 		t.Fatalf("host-B should acquire after release: %v", err)
 	}
 }
 
 func TestLeaseReleaseByNonHolderIsNoop(t *testing.T) {
 	reg, _ := newReg()
-	a, _, _ := reg.GetActor("t", "a", Actor{})
-	l1, _ := reg.Acquire(a.ID, "host-A", time.Hour)
+	a, _, _ := reg.GetActor(context.Background(), "t", "a", Actor{})
+	l1, _ := reg.Acquire(context.Background(), a.ID, "host-A", time.Hour)
 	// Forge a release from a different holder/token — must not free host-A's lease.
 	stale := &Lease{reg: reg, actorID: a.ID, holder: "host-B", token: 999}
-	_ = stale.Release()
-	if err := l1.CheckFence(); err != nil {
+	_ = stale.Release(context.Background())
+	if err := l1.CheckFence(context.Background()); err != nil {
 		t.Errorf("non-holder release must not drop the real lease: %v", err)
 	}
 }
@@ -159,7 +160,7 @@ func TestLeaseReleaseByNonHolderIsNoop(t *testing.T) {
 // many instances race to acquire; exactly one wins.
 func TestLeaseConcurrentAcquire(t *testing.T) {
 	reg, _ := newReg()
-	a, _, _ := reg.GetActor("t", "a", Actor{})
+	a, _, _ := reg.GetActor(context.Background(), "t", "a", Actor{})
 
 	const n = 64
 	var winners int64
@@ -170,7 +171,7 @@ func TestLeaseConcurrentAcquire(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			<-start
-			if _, err := reg.Acquire(a.ID, "host-"+itoa(int64(id)), time.Hour); err == nil {
+			if _, err := reg.Acquire(context.Background(), a.ID, "host-"+itoa(int64(id)), time.Hour); err == nil {
 				atomic.AddInt64(&winners, 1)
 			}
 		}(i)
@@ -184,11 +185,11 @@ func TestLeaseConcurrentAcquire(t *testing.T) {
 
 func TestSetTier(t *testing.T) {
 	reg, _ := newReg()
-	a, _, _ := reg.GetActor("t", "a", Actor{})
-	if err := reg.SetTier(a.ID, TierPaused1, "host-A"); err != nil {
+	a, _, _ := reg.GetActor(context.Background(), "t", "a", Actor{})
+	if err := reg.SetTier(context.Background(), a.ID, TierPaused1, "host-A"); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := reg.store.Get(a.ID)
+	got, _ := reg.store.Get(context.Background(), a.ID)
 	if got.Tier != TierPaused1 || got.HomeHost != "host-A" {
 		t.Errorf("tier/host = %s/%s", got.Tier, got.HomeHost)
 	}
