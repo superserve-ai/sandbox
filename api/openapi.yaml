@@ -354,6 +354,96 @@ paths:
         "501":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/{sandbox_id}/checkpoints:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    post:
+      operationId: createCheckpoint
+      tags: [State]
+      summary: Checkpoint a sandbox's durable state
+      description: |
+        Records a named, immutable snapshot of the sandbox's versioned `/state`
+        (git-commit-like). Re-using a name replaces that snapshot. Enabled only
+        when durable-state versioning is configured.
+      security: [{ apiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201": { description: Checkpoint created }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/InternalError" }
+    get:
+      operationId: listCheckpoints
+      tags: [State]
+      summary: List a sandbox's checkpoints
+      security: [{ apiKey: [] }]
+      responses:
+        "200": { description: Checkpoints (oldest first) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/InternalError" }
+
+  /sandboxes/{sandbox_id}/branches:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    post:
+      operationId: createBranch
+      tags: [State]
+      summary: Fork a sandbox's state into a writable branch
+      description: |
+        Creates an independent, copy-on-write branch from a checkpoint — the
+        Actor `fork` primitive. Writes on the branch don't affect the source.
+      security: [{ apiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, from_checkpoint]
+              properties:
+                name: { type: string }
+                from_checkpoint: { type: string }
+      responses:
+        "201": { description: Branch created }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/InternalError" }
+
+  /sandboxes/{sandbox_id}/rollback:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    post:
+      operationId: rollbackState
+      tags: [State]
+      summary: Roll a sandbox's state back to a checkpoint
+      security: [{ apiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [checkpoint]
+              properties:
+                checkpoint: { type: string }
+      responses:
+        "200": { description: State rolled back }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/InternalError" }
+
   /sandboxes/{sandbox_id}:
     parameters:
       - $ref: "#/components/parameters/SandboxId"

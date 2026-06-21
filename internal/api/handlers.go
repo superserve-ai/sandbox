@@ -27,6 +27,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/state"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -73,6 +74,7 @@ type Handlers struct {
 	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
 	Agents    *actorrt.Router   // when set, enables the durable-Actor client plane (/agents); nil disables it
+	State     state.Provider    // when set, enables versioned /state (checkpoint/branch/rollback); nil disables it
 }
 
 // capture emits a usage event attributed to the API key's owner and team.

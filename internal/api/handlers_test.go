@@ -267,6 +267,10 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	r.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 	r.POST("/sandboxes/:sandbox_id/activate", h.ActivateSandbox)
 	r.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
+	r.POST("/sandboxes/:sandbox_id/checkpoints", h.CreateCheckpoint)
+	r.GET("/sandboxes/:sandbox_id/checkpoints", h.ListCheckpoints)
+	r.POST("/sandboxes/:sandbox_id/branches", h.CreateBranch)
+	r.POST("/sandboxes/:sandbox_id/rollback", h.RollbackState)
 	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 	return r
 }
