@@ -1,11 +1,102 @@
 package api
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/start"
 )
+
+func fromImageReq(body string) *http.Request {
+	return httptest.NewRequest(http.MethodPost, "/sandboxes/from-image", strings.NewReader(body))
+}
+
+// stubDigest overrides the package-level image-digest resolver for a test.
+func stubDigest(t *testing.T, digest string) {
+	t.Helper()
+	orig := resolveImageDigest
+	resolveImageDigest = func(context.Context, string) (string, error) { return digest, nil }
+	t.Cleanup(func() { resolveImageDigest = orig })
+}
+
+func TestCreateSandboxFromImage_MissingImage(t *testing.T) {
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(&mockDBTX{})}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, fromImageReq(`{"name":"x"}`))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing image should 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateSandboxFromImage_CacheHit(t *testing.T) {
+	stubDigest(t, "sha256:abc123")
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+	vmd := &stubVMD{}
+
+	tpl := defaultReadyTemplate()
+	digest := "sha256:abc123"
+	tpl.ResolvedDigest = &digest
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "resolved_digest"):
+				return templateRow(tpl) // cache HIT
+			case strings.Contains(sql, "INSERT INTO sandbox"):
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "agent",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 1024, CreatedAt: time.Now(),
+				})
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, fromImageReq(`{"image":"ghcr.io/org/agent:latest","name":"agent"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("cache hit should create (201), got %d: %s", w.Code, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if body["status"] != "active" {
+		t.Errorf("sandbox should be active, got %v", body["status"])
+	}
+}
+
+func TestCreateSandboxFromImage_HitMissingName(t *testing.T) {
+	stubDigest(t, "sha256:abc")
+	tpl := defaultReadyTemplate()
+	d := "sha256:abc"
+	tpl.ResolvedDigest = &d
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		if strings.Contains(sql, "resolved_digest") {
+			return templateRow(tpl)
+		}
+		return activityRow()
+	}}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, fromImageReq(`{"image":"ghcr.io/org/agent:latest"}`))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("hit without name should 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
 
 func TestResolveImageStartSpec(t *testing.T) {
 	// A realistic python image config as it would be stored in image_config jsonb.
