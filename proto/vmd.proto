@@ -159,6 +159,11 @@ message GetBuildStatusResponse {
   // Overlay-mode artifacts (empty for legacy single-rootfs builds).
   string base_path = 11;
   string delta_path = 12;
+  // Base image runtime config (ENTRYPOINT/CMD/env/workdir/user) captured at
+  // build time, JSON-encoded (builder.ImageDefaults shape). Empty for legacy
+  // builds. Carried as JSON so the control plane persists it to a jsonb column
+  // verbatim without a nested proto message.
+  string image_config_json = 13;
 
   // Populated on failed / cancelled.
   string error_message = 7;

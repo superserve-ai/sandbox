@@ -514,6 +514,11 @@ type GetBuildStatusResponse struct {
 	// Overlay-mode artifacts (empty for legacy single-rootfs builds).
 	BasePath  string `protobuf:"bytes,11,opt,name=base_path,json=basePath,proto3" json:"base_path,omitempty"`
 	DeltaPath string `protobuf:"bytes,12,opt,name=delta_path,json=deltaPath,proto3" json:"delta_path,omitempty"`
+	// Base image runtime config (ENTRYPOINT/CMD/env/workdir/user) captured at
+	// build time, JSON-encoded (builder.ImageDefaults shape). Empty for legacy
+	// builds. Carried as JSON so the control plane persists it to a jsonb column
+	// verbatim without a nested proto message.
+	ImageConfigJson string `protobuf:"bytes,13,opt,name=image_config_json,json=imageConfigJson,proto3" json:"image_config_json,omitempty"`
 	// Populated on failed / cancelled.
 	ErrorMessage  string `protobuf:"bytes,7,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	StartedAtUnix int64  `protobuf:"varint,8,opt,name=started_at_unix,json=startedAtUnix,proto3" json:"started_at_unix,omitempty"`
@@ -608,6 +613,13 @@ func (x *GetBuildStatusResponse) GetBasePath() string {
 func (x *GetBuildStatusResponse) GetDeltaPath() string {
 	if x != nil {
 		return x.DeltaPath
+	}
+	return ""
+}
+
+func (x *GetBuildStatusResponse) GetImageConfigJson() string {
+	if x != nil {
+		return x.ImageConfigJson
 	}
 	return ""
 }
@@ -2976,7 +2988,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x15BuildTemplateResponse\x12\x1e\n" +
 	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"7\n" +
 	"\x15GetBuildStatusRequest\x12\x1e\n" +
-	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xac\x03\n" +
+	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xd8\x03\n" +
 	"\x16GetBuildStatusResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -2988,7 +3000,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"size_bytes\x18\x06 \x01(\x03R\tsizeBytes\x12\x1b\n" +
 	"\tbase_path\x18\v \x01(\tR\bbasePath\x12\x1d\n" +
 	"\n" +
-	"delta_path\x18\f \x01(\tR\tdeltaPath\x12#\n" +
+	"delta_path\x18\f \x01(\tR\tdeltaPath\x12*\n" +
+	"\x11image_config_json\x18\r \x01(\tR\x0fimageConfigJson\x12#\n" +
 	"\rerror_message\x18\a \x01(\tR\ferrorMessage\x12&\n" +
 	"\x0fstarted_at_unix\x18\b \x01(\x03R\rstartedAtUnix\x12\"\n" +
 	"\rended_at_unix\x18\t \x01(\x03R\vendedAtUnix\x12\x1b\n" +

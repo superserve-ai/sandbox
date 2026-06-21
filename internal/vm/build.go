@@ -43,7 +43,11 @@ type BuildTemplateResult struct {
 	BasePath       string // overlay-mode templates only
 	DeltaPath      string // overlay-mode templates only
 	ResolvedDigest string // sha256:... of the resolved base image
-	SizeBytes      int64  // on-disk rootfs size
+	// ImageDefaults is the base image's runtime config (ENTRYPOINT/CMD/env/
+	// workdir/user) captured at build time. Persisted on the template so
+	// sandboxes can run the image's own start command (bring-your-image).
+	ImageDefaults builder.ImageDefaults
+	SizeBytes     int64 // on-disk rootfs size
 }
 
 // BuildTemplate starts a template build asynchronously and returns the
@@ -247,13 +251,14 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		return nil, err
 	}
 	var meta struct {
-		SnapshotPath   string `json:"snapshot_path"`
-		MemPath        string `json:"mem_path"`
-		RootfsPath     string `json:"rootfs_path"`
-		BasePath       string `json:"base_path"`
-		DeltaPath      string `json:"delta_path"`
-		ResolvedDigest string `json:"resolved_digest"`
-		SizeBytes      int64  `json:"size_bytes"`
+		SnapshotPath   string                `json:"snapshot_path"`
+		MemPath        string                `json:"mem_path"`
+		RootfsPath     string                `json:"rootfs_path"`
+		BasePath       string                `json:"base_path"`
+		DeltaPath      string                `json:"delta_path"`
+		ResolvedDigest string                `json:"resolved_digest"`
+		ImageConfig    builder.ImageDefaults `json:"image_config"`
+		SizeBytes      int64                 `json:"size_bytes"`
 	}
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, err
@@ -265,7 +270,7 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		BasePath:       meta.BasePath,
 		DeltaPath:      meta.DeltaPath,
 		ResolvedDigest: meta.ResolvedDigest,
+		ImageDefaults:  meta.ImageConfig,
 		SizeBytes:      meta.SizeBytes,
 	}, nil
 }
-

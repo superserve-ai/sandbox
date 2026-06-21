@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/superserve-ai/sandbox/internal/start"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 )
@@ -79,6 +81,11 @@ func main() {
 
 	ctx := &sandboxContext{}
 
+	// Supervisor for the image's start command. boxd remains the control
+	// agent (PID-1 child via tini); the user's start command runs as a
+	// supervised CHILD of boxd, not as PID 1. One supervisor per process.
+	sup := newSupervisor(os.Environ())
+
 	// Connect RPC services.
 	procService := &processService{
 		processes: &sync.Map{},
@@ -87,12 +94,24 @@ func main() {
 	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
 	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
 
-	// Raw HTTP endpoints (file content transfer + health + init + exec).
+	// Raw HTTP endpoints (file content transfer + health + init + exec + start).
 	mux.HandleFunc("/files", handleFiles)
 	mux.HandleFunc("/init", handleInit(ctx))
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/exec", procService.handleExec)
 	mux.HandleFunc("/exec/stream", procService.handleExecStream)
+	mux.HandleFunc("/start", handleStart(sup))
+
+	// Cold-boot path: if a start spec was baked into the rootfs and no child
+	// is already live, launch it. On snapshot restore the child is already in
+	// the restored memory, so IsSupervising() is true and we skip — the
+	// in-memory guard prevents a double-start.
+	bootStartSpec(sup, start.StartSpecPath)
+
+	// Propagate SIGTERM to the supervised child so boxd shuts the agent down
+	// gracefully before exiting. boxd's HTTP server is left to the process
+	// teardown; the child gets an explicit graceful stop first.
+	go handleSignals(sup)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", httpPort)
 	log.Printf("boxd listening on %s (Connect RPC + HTTP)", addr)
@@ -106,6 +125,43 @@ func main() {
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
+	}
+}
+
+// bootStartSpec reads a baked start spec at path and starts supervising it when
+// present and no child is already live. Errors are logged, not fatal: a missing
+// or malformed bake must not prevent boxd from serving its control API.
+func bootStartSpec(sup *supervisor, path string) {
+	if sup.IsSupervising() {
+		return
+	}
+	spec, err := readStartSpec(path)
+	if err != nil {
+		log.Printf("boot: read start spec %s: %v", path, err)
+		return
+	}
+	if spec == nil || !spec.IsRunnable() {
+		log.Printf("boot: no runnable start spec at %s; idling", path)
+		return
+	}
+	if err := sup.Start(spec); err != nil {
+		log.Printf("boot: start supervised command: %v", err)
+		return
+	}
+	log.Printf("boot: supervising baked start command from %s", path)
+}
+
+// handleSignals stops the supervised child gracefully on SIGTERM/SIGINT, then
+// re-raises the signal so boxd itself exits with the conventional status.
+func handleSignals(sup *supervisor) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigCh
+	log.Printf("received %s: stopping supervised child", sig)
+	sup.Stop()
+	signal.Stop(sigCh)
+	if p, err := os.FindProcess(os.Getpid()); err == nil {
+		_ = p.Signal(sig)
 	}
 }
 
@@ -126,8 +182,14 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 //	  "env_vars":        {"KEY":"VALUE", ...}, // optional
 //	  "default_user":    "appuser",             // optional
 //	  "default_workdir": "/srv/app",            // optional
-//	  "hostname":        "sandbox-abc12345"     // optional
+//	  "hostname":        "sandbox-abc12345",    // optional
+//	  "start":           { ...start.Spec... }   // optional (build-time bake)
 //	}
+//
+// The optional "start" block is a start.Spec. When present, boxd bakes it to
+// start.StartSpecPath so the build-time bake and the runtime POST /start share
+// one read path: boxd reads the same file on cold boot. Callers that omit
+// "start" behave exactly as before (full backward compatibility).
 func handleInit(ctx *sandboxContext) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -141,6 +203,7 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 			DefaultUser    string            `json:"default_user"`
 			DefaultWorkdir string            `json:"default_workdir"`
 			Hostname       string            `json:"hostname"`
+			Start          *start.Spec       `json:"start"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
@@ -159,8 +222,67 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 			}
 		}
 
+		// Bake the start spec into the rootfs so it survives snapshot/restore
+		// and boxd can pick it up on cold boot. This is the build-time path;
+		// the runtime launch path is POST /start. Failing to bake is a 500 —
+		// silently dropping it would lose the agent's entrypoint.
+		if body.Start != nil {
+			if err := writeStartSpec(start.StartSpecPath, body.Start); err != nil {
+				log.Printf("init: bake start spec failed: %v", err)
+				http.Error(w, `{"error":"failed to bake start spec"}`, http.StatusInternalServerError)
+				return
+			}
+			log.Printf("init: baked start spec to %s (argv=%v)", start.StartSpecPath, body.Start.Argv)
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok"}`)
+	}
+}
+
+// handleStart launches & supervises the image's start command at runtime.
+//
+// POST /start  — body is a start.Spec:
+//
+//	{
+//	  "argv":        ["python","agent.py"],   // required to do anything
+//	  "env":         {"KEY":"VALUE", ...},     // optional, layered on base env
+//	  "user":        "1000:1000",              // optional, uid[:gid] or name
+//	  "working_dir": "/srv/app",               // optional, default "/"
+//	  "restart":     "on-failure",             // optional: no|on-failure|always
+//	  "ready":       "..."                     // optional readiness probe
+//	}
+//
+// Idempotency: if a start command is already being supervised, returns 409 —
+// the simplest correct rule (refuse rather than silently replacing a live
+// child). A spec with empty argv is accepted as a no-op (boxd idles).
+func handleStart(sup *supervisor) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var spec start.Spec
+		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+
+		if err := sup.Start(&spec); err != nil {
+			if errors.Is(err, errAlreadySupervising) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				fmt.Fprintf(w, `{"error":"already supervising a start command"}`)
+				return
+			}
+			http.Error(w, `{"error":"failed to start"}`, http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok","supervising":%t}`, spec.IsRunnable())
 	}
 }
 

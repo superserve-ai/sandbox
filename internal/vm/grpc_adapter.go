@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -400,6 +401,14 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 		resp.DeltaPath = snap.Result.DeltaPath
 		resp.ResolvedDigest = snap.Result.ResolvedDigest
 		resp.SizeBytes = snap.Result.SizeBytes
+		// Carry the captured image config as JSON so the control plane can
+		// persist it verbatim. Best-effort: a marshal failure just omits it
+		// (the build is still usable, sandboxes fall back to no auto-start).
+		if !snap.Result.ImageDefaults.IsZero() {
+			if b, err := json.Marshal(snap.Result.ImageDefaults); err == nil {
+				resp.ImageConfigJson = string(b)
+			}
+		}
 	}
 	return resp, nil
 }

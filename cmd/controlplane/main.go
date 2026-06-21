@@ -517,18 +517,19 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		return vmdclient.BuildStatusResult{}, fmt.Errorf("gRPC GetBuildStatus: %w", err)
 	}
 	return vmdclient.BuildStatusResult{
-		NotFound:       resp.GetNotFound(),
-		Status:         resp.GetStatus(),
-		SnapshotPath:   resp.GetSnapshotPath(),
-		MemFilePath:    resp.GetMemFilePath(),
-		RootfsPath:     resp.GetRootfsPath(),
-		BasePath:       resp.GetBasePath(),
-		DeltaPath:      resp.GetDeltaPath(),
-		ResolvedDigest: resp.GetResolvedDigest(),
-		SizeBytes:      resp.GetSizeBytes(),
-		ErrorMessage:   resp.GetErrorMessage(),
-		StartedAtUnix:  resp.GetStartedAtUnix(),
-		EndedAtUnix:    resp.GetEndedAtUnix(),
+		NotFound:        resp.GetNotFound(),
+		Status:          resp.GetStatus(),
+		SnapshotPath:    resp.GetSnapshotPath(),
+		MemFilePath:     resp.GetMemFilePath(),
+		RootfsPath:      resp.GetRootfsPath(),
+		BasePath:        resp.GetBasePath(),
+		DeltaPath:       resp.GetDeltaPath(),
+		ResolvedDigest:  resp.GetResolvedDigest(),
+		ImageConfigJSON: resp.GetImageConfigJson(),
+		SizeBytes:       resp.GetSizeBytes(),
+		ErrorMessage:    resp.GetErrorMessage(),
+		StartedAtUnix:   resp.GetStartedAtUnix(),
+		EndedAtUnix:     resp.GetEndedAtUnix(),
 	}, nil
 }
 
