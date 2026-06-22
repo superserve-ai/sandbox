@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -308,6 +309,12 @@ func resolveImageStartSpec(imageConfigJSON []byte, command []string, env map[str
 // ("sha256:...") with a registry HEAD. Package var so tests can stub it without
 // network. Mirrors how the builder resolves the digest during a real pull, so
 // the value matches what FinalizeBuild persists as template.resolved_digest.
+//
+// Auth: uses the same authn.DefaultKeychain the builder uses
+// (internal/builder/auth.go), so a private image the platform host is
+// credentialed for (docker config / credential helper) resolves here instead of
+// 401-ing on an anonymous HEAD. Per-team/per-request registry credentials are
+// not yet supported — see the PR description.
 var resolveImageDigest = func(ctx context.Context, imageRef string) (string, error) {
-	return crane.Digest(imageRef, crane.WithContext(ctx))
+	return crane.Digest(imageRef, crane.WithContext(ctx), crane.WithAuthFromKeychain(authn.DefaultKeychain))
 }
