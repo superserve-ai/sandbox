@@ -49,6 +49,27 @@ func (h *Handlers) GetBillingPricing(c *gin.Context) {
 		respondError(c, ErrUnauthorized)
 		return
 	}
+	actorID := actorIDFromContext(c)
+	if actorID == nil {
+		respondError(c, ErrUnauthorized)
+		return
+	}
+
+	authzSvc := h.authzService()
+	if authzSvc == nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	allowed, err := authzSvc.CanTeam(c.Request.Context(), *actorID, teamID, "billing:read")
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Str("user_id", actorID.String()).Msg("RBAC billing read check failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if !allowed {
+		respondError(c, ErrForbidden)
+		return
+	}
 
 	rates, err := h.DB.ListActivePricingRatesForTeamCurrent(c.Request.Context(), teamID)
 	if err != nil {

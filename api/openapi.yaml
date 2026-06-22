@@ -115,6 +115,8 @@ paths:
                 $ref: "#/components/schemas/BillingPricingResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "503":
@@ -125,6 +127,132 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/members:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: listTeamMembers
+      tags: [RBAC]
+      summary: List team members
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Team members
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: addTeamMember
+      tags: [RBAC]
+      summary: Add or invite a team member
+      security:
+        - apiKey: []
+      responses:
+        "201":
+          description: Member added
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /teams/{team_id}/members/{user_id}:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      operationId: deactivateTeamMember
+      tags: [RBAC]
+      summary: Deactivate a team member
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Member deactivated
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /teams/{team_id}/roles:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: listTeamRoleAssignments
+      tags: [RBAC]
+      summary: List team role assignments
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Team role assignments
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: assignTeamRole
+      tags: [RBAC]
+      summary: Assign a team role
+      security:
+        - apiKey: []
+      responses:
+        "201":
+          description: Role assigned
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /teams/{team_id}/roles/{assignment_id}:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: assignment_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      operationId: revokeTeamRole
+      tags: [RBAC]
+      summary: Revoke a team role
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Role revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /sandboxes:
     get:

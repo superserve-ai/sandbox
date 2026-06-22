@@ -201,7 +201,8 @@ func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.
 	return nil
 }
 
-// seedTeamAndKey inserts a team + API key and returns (teamID, rawKey).
+// seedTeamAndKey inserts a team/API key pair without a creator profile.
+// Several legacy integration tests rely on the key having no created_by.
 func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
 	t.Helper()
 	ctx := context.Background()
@@ -226,6 +227,64 @@ func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
 	}
 
 	return team.ID, rawKey
+}
+
+// seedTeamAndKeyWithRole inserts a team, active membership, team role, and API
+// key created by that user. Returns (teamID, rawKey, profileID).
+func seedTeamAndKeyWithRole(t *testing.T, roleName string) (uuid.UUID, string, uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+
+	team, err := testQueries.CreateTeam(ctx, "team-"+uuid.New().String()[:8])
+	if err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: create team: %v", err)
+	}
+
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, $2, 'google', $3)`,
+		profileID,
+		fmt.Sprintf("%s-%s@example.com", roleName, profileID.String()[:8]),
+		"google-"+profileID.String()[:8],
+	); err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: insert profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`,
+		team.ID,
+		profileID,
+	); err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: insert membership: %v", err)
+	}
+	roleID, err := roleIDByName(ctx, roleName)
+	if err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: lookup role %s: %v", roleName, err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id) VALUES ($1, $2, 'team', $3)`,
+		profileID,
+		roleID,
+		team.ID,
+	); err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: insert assignment: %v", err)
+	}
+
+	rawKey := "sk-test-" + uuid.New().String()
+	hash := sha256.Sum256([]byte(rawKey))
+	keyHash := hex.EncodeToString(hash[:])
+
+	_, err = testQueries.CreateAPIKeyV2(ctx, db.CreateAPIKeyV2Params{
+		TeamID:    team.ID,
+		KeyHash:   keyHash,
+		Name:      "test-key",
+		Scopes:    []string{},
+		CreatedBy: pgtype.UUID{Bytes: profileID, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: create api key: %v", err)
+	}
+
+	return team.ID, rawKey, profileID
 }
 
 // seedTeamKeyAndProfile is like seedTeamAndKey but also seeds a profile row
@@ -263,6 +322,14 @@ func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
 	}
 
 	return team.ID, rawKey, profileID
+}
+
+func roleIDByName(ctx context.Context, roleName string) (uuid.UUID, error) {
+	var id uuid.UUID
+	if err := testPool.QueryRow(ctx, `SELECT id FROM roles WHERE name = $1`, roleName).Scan(&id); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
 }
 
 // newRouter builds a router scoped to the current test. Using t.Context()
@@ -364,10 +431,10 @@ func TestIntegration_Auth_RevokedKey(t *testing.T) {
 }
 
 func TestIntegration_GetBillingPricing(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
 	r := newRouter(t)
 
-	w := do(r, "GET", "/billing/pricing?team_id="+uuid.New().String(), apiKey, "")
+	w := do(r, "GET", "/billing/pricing?team_id="+teamID.String(), apiKey, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -402,7 +469,7 @@ func TestIntegration_GetPublicBillingPricing(t *testing.T) {
 
 func TestIntegration_GetBillingPricingUsesNewestEffectiveRate(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
 	planKey := "test-plan-" + uuid.New().String()
 	now := time.Now().UTC()
 
@@ -447,7 +514,7 @@ func TestIntegration_GetBillingPricingUsesNewestEffectiveRate(t *testing.T) {
 
 func TestIntegration_GetBillingPricingMissingRequiredRateReturns503(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
 	planKey := "missing-rate-plan-" + uuid.New().String()
 	now := time.Now().UTC()
 
@@ -497,7 +564,7 @@ func TestIntegration_GetPublicBillingPricingInactivePaygReturns503(t *testing.T)
 
 func TestIntegration_GetBillingPricingInactiveTeamPlanFallsBackToPayg(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
 	planKey := "inactive-plan-" + uuid.New().String()
 	now := time.Now().UTC()
 

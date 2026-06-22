@@ -92,6 +92,7 @@ func TestPredefinedErrors(t *testing.T) {
 		{"ErrInvalidState", ErrInvalidState, "conflict", 409},
 		{"ErrBadRequest", ErrBadRequest, "bad_request", 400},
 		{"ErrUnauthorized", ErrUnauthorized, "unauthorized", 401},
+		{"ErrForbidden", ErrForbidden, "forbidden", 403},
 		{"ErrInternal", ErrInternal, "internal_error", 500},
 		{"ErrConflict", ErrConflict, "conflict", 409},
 	}
