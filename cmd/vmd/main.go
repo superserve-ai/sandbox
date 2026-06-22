@@ -348,19 +348,20 @@ func main() {
 	uffdRecordMaxSeconds, _ := strconv.Atoi(envOrDefault("VMD_UFFD_RECORD_MAX_SECONDS", "10"))
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin:        cfg.FirecrackerBin,
-		JailerBin:             cfg.JailerBin,
-		KernelPath:            cfg.KernelPath,
-		BaseRootfsPath:        cfg.BaseRootfsPath,
-		SnapshotDir:           cfg.SnapshotDir,
-		RunDir:                cfg.RunDir,
-		TemplateBuilderBin:    cfg.TemplateBuilderBin,
-		BoxdBinaryPath:        cfg.BoxdBinaryPath,
-		HostInterface:         cfg.HostInterface,
-		MaxConcurrentRestores: maxRestores,
-		UffdEnabled:           uffdEnabled,
-		UffdPrefetchEnabled:   uffdPrefetchEnabled,
-		UffdRecordMaxSeconds:  uffdRecordMaxSeconds,
+		FirecrackerBin:           cfg.FirecrackerBin,
+		JailerBin:                cfg.JailerBin,
+		KernelPath:               cfg.KernelPath,
+		BaseRootfsPath:           cfg.BaseRootfsPath,
+		SnapshotDir:              cfg.SnapshotDir,
+		RunDir:                   cfg.RunDir,
+		TemplateBuilderBin:       cfg.TemplateBuilderBin,
+		BoxdBinaryPath:           cfg.BoxdBinaryPath,
+		HostInterface:            cfg.HostInterface,
+		StateTemplatePlaceholder: os.Getenv("STATE_TEMPLATE_PLACEHOLDER") == "1",
+		MaxConcurrentRestores:    maxRestores,
+		UffdEnabled:              uffdEnabled,
+		UffdPrefetchEnabled:      uffdPrefetchEnabled,
+		UffdRecordMaxSeconds:     uffdRecordMaxSeconds,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

@@ -143,6 +143,12 @@ type ManagerConfig struct {
 	TemplateBuilderBin string // Path to template-builder binary.
 	BoxdBinaryPath     string // Path to boxd binary (passed to template-builder).
 	HostInterface      string // Host network interface (e.g. "ens4").
+	// StateTemplatePlaceholder, when true, attaches a /state placeholder drive to
+	// every template-build VM so the resulting template snapshots can carry a
+	// per-Actor /state (re-pointed on restore). Off by default — no change to
+	// existing builds until durable /state is rolled out.
+	StateTemplatePlaceholder bool
+
 	// MaxConcurrentRestores caps parallel RestoreVMSnapshot operations to
 	// prevent a spike of concurrent sandbox creates from saturating host
 	// file I/O, netns setup, and Firecracker boots. 0 → default 100.
@@ -362,6 +368,33 @@ func waitForPIDExit(pid int, timeout time.Duration) {
 	}
 }
 
+// ensureStatePlaceholder returns the path to the shared, empty ext4 image used
+// as the /state placeholder drive in template-build VMs, creating it once. Its
+// contents never matter — each Actor's restore re-points the /state drive to its
+// own per-identity image — so a single small image is reused across all builds.
+func (m *Manager) ensureStatePlaceholder() (string, error) {
+	path := filepath.Join(m.cfg.SnapshotDir, "state-placeholder.ext4")
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	// mke2fs -F makes a filesystem directly in a regular file (no loop, no root).
+	tmp := path + ".tmp"
+	_ = os.Remove(tmp)
+	out, err := exec.CommandContext(context.Background(), "mke2fs", "-F", "-q", "-t", "ext4", tmp, "64M").CombinedOutput()
+	if err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("mke2fs state placeholder: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return path, nil
+}
+
 // coldBootFromRootfs is the parameterized form: boot a VM from a specific
 // rootfs at the requested vcpu/memory. Used by BuildTemplate to boot the
 // build VM from a freshly-produced rootfs at the template's target shape.
@@ -447,6 +480,20 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 		VMID:       vmID,
 		VMIP:       network.VMInternalIP,
 		GatewayIP:  network.VMGatewayIP,
+	}
+
+	// Attach a /state PLACEHOLDER drive so the template snapshot's device set
+	// includes a /state drive that each Actor's restore re-points to its own
+	// per-identity image (Firecracker LoadSnapshot can't add a drive not in the
+	// snapshot). boxd does not boot-mount it (STATE_MOUNT_AT_BOOT unset), so the
+	// snapshot captures /state unmounted — safe to re-point on restore. Gated on
+	// StateTemplatePlaceholder so it is a no-op for existing builds until enabled.
+	if m.cfg.StateTemplatePlaceholder {
+		if ph, perr := m.ensureStatePlaceholder(); perr != nil {
+			log.Warn().Err(perr).Msg("state placeholder unavailable; template will not carry durable /state")
+		} else {
+			fcCfg.StateDiskPath = ph
+		}
 	}
 
 	// 4. Start Firecracker inside the network namespace, configure, and boot.
