@@ -533,8 +533,9 @@ paths:
         Runs a command to completion and returns its full output in a single
         response. For live output use `POST /exec/stream` (Server-Sent Events)
         or `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
-        the body, not as an HTTP error. A paused sandbox is resumed
-        automatically before the command runs.
+        the body, not as an HTTP error. The sandbox must be `running`; a paused
+        sandbox returns `503`. Activate it first with
+        `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this automatically).
       security:
         - accessToken: []
       requestBody:
@@ -581,10 +582,12 @@ paths:
         (`{"stdout":"..."}` or `{"stderr":"..."}`), the terminal event
         (`{"exit_code":N,"finished":true}`), or an error
         (`{"error":"...","finished":true}`). The stream closes when the command
-        exits. A paused sandbox is resumed automatically before it runs.
+        exits. The sandbox must be `running`; a paused sandbox returns `503`.
+        Activate it first with `POST /sandboxes/{sandbox_id}/activate` (the SDKs
+        do this automatically).
 
-        `timeout_s` is an idle timeout: it resets on every chunk, so a command
-        that keeps producing output runs as long as it needs.
+        `timeout_s` is a hard runtime limit: the command is killed after that
+        many seconds regardless of output, exiting with code 124.
       security:
         - accessToken: []
       requestBody:
