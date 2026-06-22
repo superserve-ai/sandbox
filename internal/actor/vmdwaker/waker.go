@@ -48,6 +48,13 @@ type Target struct {
 	TeamID       string
 	OwnerID      string
 	Env          map[string]string
+	// StateDiskPath, when non-empty, is the host path to the Actor's durable
+	// /state block image (provisioned by the state.Provider, keyed by the Actor's
+	// durable identity). vmd attaches it as the sandbox's /state drive on the
+	// Actor's first (cold) boot; subsequent snapshot restores inherit it (the
+	// snapshot's device set already includes it). Empty for Actors without
+	// durable state or when the provider is directory-model (Mesa/FUSE).
+	StateDiskPath string
 }
 
 // Resolver maps an Actor to its boot Target.

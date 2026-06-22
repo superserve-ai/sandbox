@@ -191,6 +191,31 @@ func run() error {
 	handlers.Hosts = hostreg.New(queries, dialVMD)
 	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 
+	// Durable /state provider (checkpoint/branch/rollback + per-Actor state
+	// volumes). Built BEFORE the Actor runtime so the runtime's target resolver
+	// can auto-provision each Actor's /state. Enabled by a local STATE_DIR
+	// (backend "local" directory ref / "local-block" ext4-image ref) or a SaaS
+	// backend (STATE_BACKEND=archil|mesa, which need no local dir).
+	var stateProvider state.Provider
+	if stateBackend, stateDir := os.Getenv("STATE_BACKEND"), os.Getenv("STATE_DIR"); stateDir != "" ||
+		stateBackend == string(state.BackendArchil) || stateBackend == string(state.BackendMesa) {
+		stateImageMiB, _ := strconv.Atoi(os.Getenv("STATE_IMAGE_MIB"))
+		sp, serr := state.NewProvider(state.Config{
+			Backend:       state.Backend(stateBackend),
+			BaseDir:       stateDir,
+			StateImageMiB: stateImageMiB,
+			Archil:        state.ArchilConfig{APIKey: os.Getenv("ARCHIL_API_KEY"), Region: os.Getenv("ARCHIL_REGION"), DiskID: os.Getenv("ARCHIL_DISK_ID")},
+			Mesa:          state.MesaConfig{APIKey: os.Getenv("MESA_API_KEY"), Org: os.Getenv("MESA_ORG")},
+		})
+		if serr != nil {
+			log.Warn().Err(serr).Msg("durable /state provider init failed; /state endpoints disabled")
+		} else {
+			stateProvider = sp
+			handlers.State = sp
+			log.Info().Str("backend", stateBackend).Msg("durable /state versioning enabled")
+		}
+	}
+
 	// Durable-Actor runtime (client plane, POST /v1/agents/send). Flag-gated and
 	// default-off so it has zero effect on existing behavior. Assembles the
 	// proven runtime: PgStore-backed Registry + single-writer Lease + serial
@@ -215,7 +240,9 @@ func run() error {
 		}
 		exec := boxddeliver.NewHTTPExecStreamer(http.DefaultClient, execURL, execToken)
 		deliverer := boxddeliver.New(exec, []string{"sh", "-c", "harness-turn"})
-		waker := vmdwaker.New(vmdClient, deliverer, api.AgentTargetResolver(queries, systemTeam))
+		// The resolver auto-provisions each Actor's durable /state via the provider
+		// (block backends carry the disk path in the Target for vmd to attach).
+		waker := vmdwaker.New(vmdClient, deliverer, api.AgentTargetResolverWithState(queries, systemTeam, stateProvider))
 		router := actorrt.NewRouter(actorrt.NewRegistry(pgstore.New(queries), nil), waker, cfg.DefaultHostID, 16)
 
 		// Tiered hibernation: a TierController demotes idle Actors down the
@@ -239,36 +266,6 @@ func run() error {
 
 		handlers.Agents = router
 		log.Info().Msg("durable-Actor runtime enabled (/v1/agents) with sandbox-exec delivery + tiered hibernation")
-	}
-
-	// Durable /state versioning (checkpoint/branch/rollback). Enabled when a
-	// local STATE_DIR is set (backend "local" the directory reference, or
-	// "local-block" the ext4-image block reference) or a SaaS backend is selected
-	// (STATE_BACKEND=archil|mesa, which need no local dir).
-	stateBackend := os.Getenv("STATE_BACKEND")
-	stateDir := os.Getenv("STATE_DIR")
-	if stateDir != "" || stateBackend == string(state.BackendArchil) || stateBackend == string(state.BackendMesa) {
-		stateImageMiB, _ := strconv.Atoi(os.Getenv("STATE_IMAGE_MIB"))
-		sp, serr := state.NewProvider(state.Config{
-			Backend:       state.Backend(stateBackend),
-			BaseDir:       stateDir,
-			StateImageMiB: stateImageMiB,
-			Archil: state.ArchilConfig{
-				APIKey: os.Getenv("ARCHIL_API_KEY"),
-				Region: os.Getenv("ARCHIL_REGION"),
-				DiskID: os.Getenv("ARCHIL_DISK_ID"),
-			},
-			Mesa: state.MesaConfig{
-				APIKey: os.Getenv("MESA_API_KEY"),
-				Org:    os.Getenv("MESA_ORG"),
-			},
-		})
-		if serr != nil {
-			log.Warn().Err(serr).Msg("durable /state provider init failed; /state endpoints disabled")
-		} else {
-			handlers.State = sp
-			log.Info().Str("backend", stateBackend).Msg("durable /state versioning enabled")
-		}
 	}
 
 	router := api.SetupRouter(ctx, handlers, dbPool)

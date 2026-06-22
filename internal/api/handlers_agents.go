@@ -12,6 +12,7 @@ import (
 	actorrt "github.com/superserve-ai/sandbox/internal/actor"
 	"github.com/superserve-ai/sandbox/internal/actor/vmdwaker"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/state"
 )
 
 // AgentTargetResolver is the production vmdwaker.Resolver: it maps an Actor to
@@ -23,6 +24,20 @@ import (
 //	router := actor.NewRouter(actor.NewRegistry(pgstore.New(q), nil), waker, hostID, 16)
 //	handlers.Agents = router
 func AgentTargetResolver(q *db.Queries, systemTeam uuid.UUID) vmdwaker.Resolver {
+	return agentTargetResolver(q, systemTeam, nil)
+}
+
+// AgentTargetResolverWithState is AgentTargetResolver that also auto-provisions
+// the Actor's durable /state: on each resolve it ensures the per-Actor state
+// volume exists via the state.Provider (keyed by the Actor's durable identity)
+// and, for block-device backends, carries its host path in Target.StateDiskPath
+// for vmd to attach as the sandbox's /state drive. Directory/FUSE backends
+// (Mesa) provision the repo but leave StateDiskPath empty (the guest mounts it).
+func AgentTargetResolverWithState(q *db.Queries, systemTeam uuid.UUID, provider state.Provider) vmdwaker.Resolver {
+	return agentTargetResolver(q, systemTeam, provider)
+}
+
+func agentTargetResolver(q *db.Queries, systemTeam uuid.UUID, provider state.Provider) vmdwaker.Resolver {
 	return func(a actorrt.Actor) (vmdwaker.Target, error) {
 		tid, err := uuid.Parse(a.Template)
 		if err != nil {
@@ -45,6 +60,17 @@ func AgentTargetResolver(q *db.Queries, systemTeam uuid.UUID) vmdwaker.Resolver 
 		}
 		if tpl.DeltaPath != nil {
 			t.DeltaDir = filepath.Dir(*tpl.DeltaPath)
+		}
+		// Auto-provision the Actor's durable /state, addressed by its stable
+		// identity (a.ID) so state follows the Actor across sandboxes/hosts.
+		if provider != nil {
+			m, err := provider.Mount(context.Background(), a.ID, "/state")
+			if err != nil {
+				return vmdwaker.Target{}, fmt.Errorf("provision /state for actor %q: %w", a.Name, err)
+			}
+			if m.IsBlockDevice {
+				t.StateDiskPath = m.Path
+			}
 		}
 		return t, nil
 	}
