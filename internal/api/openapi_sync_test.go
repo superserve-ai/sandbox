@@ -15,6 +15,8 @@ import (
 // control-plane router, so they have no route here.
 var dataPlaneSpecPaths = map[string]bool{
 	"/files":        true,
+	"/exec":         true,
+	"/exec/stream":  true,
 	"/exec/connect": true,
 }
 

@@ -515,6 +515,105 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /exec:
+    servers:
+      - url: https://sandbox.superserve.ai
+        description: Shared host — send the sandbox ID in `X-Superserve-Sandbox-Id`.
+      - url: https://boxd-{sandbox_id}.sandbox.superserve.ai
+        description: Per-sandbox host.
+        variables:
+          sandbox_id:
+            default: ""
+            description: The sandbox ID.
+    post:
+      operationId: execRun
+      tags: [Exec]
+      summary: Run a command and wait for it to finish
+      description: |
+        Runs a command to completion and returns its full output in a single
+        response. For live output use `POST /exec/stream` (Server-Sent Events)
+        or `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
+        the body, not as an HTTP error. The sandbox must be `running`; a paused
+        sandbox returns `503`. Activate it first with
+        `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this automatically).
+      security:
+        - accessToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+      responses:
+        "200":
+          description: The command finished; full output and exit code.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /exec/stream:
+    servers:
+      - url: https://sandbox.superserve.ai
+        description: Shared host — send the sandbox ID in `X-Superserve-Sandbox-Id`.
+      - url: https://boxd-{sandbox_id}.sandbox.superserve.ai
+        description: Per-sandbox host.
+        variables:
+          sandbox_id:
+            default: ""
+            description: The sandbox ID.
+    post:
+      operationId: execStream
+      tags: [Exec]
+      summary: Run a command and stream output over SSE
+      description: |
+        Runs a command and streams its output as Server-Sent Events while it
+        runs. Each `data:` line is a JSON object: an output chunk
+        (`{"stdout":"..."}` or `{"stderr":"..."}`), the terminal event
+        (`{"exit_code":N,"finished":true}`), or an error
+        (`{"error":"...","finished":true}`). The stream closes when the command
+        exits. The sandbox must be `running`; a paused sandbox returns `503`.
+        Activate it first with `POST /sandboxes/{sandbox_id}/activate` (the SDKs
+        do this automatically).
+
+        `timeout_s` is a hard runtime limit: the command is killed after that
+        many seconds regardless of output, exiting with code 124.
+      security:
+        - accessToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+      responses:
+        "200":
+          description: A Server-Sent Events stream of output and lifecycle events.
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/ExecStreamEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /exec/connect:
     servers:
       - url: https://sandbox.superserve.ai
@@ -1514,6 +1613,54 @@ components:
           default: 30
           description: Timeout in seconds.
 
+    ExecResult:
+      type: object
+      description: Full output of a command run to completion via `POST /exec`.
+      required: [stdout, stderr, exit_code]
+      properties:
+        stdout:
+          type: string
+          description: Complete standard output.
+        stderr:
+          type: string
+          description: Complete standard error.
+        exit_code:
+          type: integer
+          description: Process exit code. A non-zero value is returned, not raised.
+
+    ExecStreamEvent:
+      type: object
+      description: >
+        One Server-Sent Event from `POST /exec/stream`, delivered as a `data:`
+        line carrying this JSON object. Output events carry `stdout` or `stderr`
+        (each with a `timestamp`); the terminal event carries `finished: true`
+        with `exit_code`, or `error` and `code` if the command could not be run.
+        The stream may also include SSE comment keepalive lines (`: keepalive`),
+        which carry no data.
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: RFC 3339 time the event was emitted (output and terminal events).
+        stdout:
+          type: string
+          description: A chunk of standard output.
+        stderr:
+          type: string
+          description: A chunk of standard error.
+        finished:
+          type: boolean
+          description: Present and `true` on the terminal event.
+        exit_code:
+          type: integer
+          description: Process exit code, on the terminal event.
+        error:
+          type: string
+          description: Error message if the command could not be run.
+        code:
+          type: string
+          description: Error code accompanying `error` (e.g. `bad_request`, `exec_failed`).
+
     NetworkConfig:
       type: object
       description: >
@@ -2289,6 +2436,16 @@ components:
       description: >
         The sandbox has run out of disk space. Response body uses error code
         `sandbox_storage_full`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: >
+        The sandbox is not currently running (for example, paused) or is
+        temporarily unavailable. For a paused sandbox, activate it with
+        `POST /sandboxes/{sandbox_id}/activate` and retry; the SDKs do this
+        automatically.
       content:
         application/json:
           schema:
