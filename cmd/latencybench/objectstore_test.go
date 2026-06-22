@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +140,56 @@ func TestGCSStoreHTTPRoundTrip(t *testing.T) {
 	err := s.get(ctx, missURL, filepath.Join(t.TempDir(), "x"))
 	if err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("get of missing object should error with 404, got: %v", err)
+	}
+}
+
+// TestGCSStoreParallelFetch proves the ranged parallel-fetch path reassembles a
+// large object correctly: HEAD reports the size, the chunks come back as 206
+// Partial Content in arbitrary order, and the file is byte-identical.
+func TestGCSStoreParallelFetch(t *testing.T) {
+	// 40 MiB of position-dependent bytes (> fetchChunkBytes → multi-chunk).
+	blob := make([]byte, 40<<20)
+	for i := range blob {
+		blob[i] = byte(i*7 + 3)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauth", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(blob)))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if rng := r.Header.Get("Range"); rng != "" {
+			var start, end int
+			if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); err != nil {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(blob[start : end+1])
+			return
+		}
+		_, _ = w.Write(blob)
+	}))
+	defer srv.Close()
+
+	s := newGCSStore("b", "p")
+	s.token = "test-token"
+	s.tokenExp = time.Now().Add(time.Hour)
+
+	dst := filepath.Join(t.TempDir(), "big")
+	if err := s.get(context.Background(), srv.URL+"/b/p/k/mem", dst); err != nil {
+		t.Fatalf("parallel get: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Fatalf("reassembled blob differs: got %d bytes, want %d", len(got), len(blob))
 	}
 }
 

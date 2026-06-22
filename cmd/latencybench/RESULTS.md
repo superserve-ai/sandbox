@@ -72,9 +72,29 @@ nearest-rank percentiles on 20 samples the p99 column is literally the single
 worst draw, so treat the tails as indicative — the **FAIL is driven by p50**,
 which is stable and ~2.5×/8× over the 1s gate.)
 
+### Parallel ranged fetch — the gate PASSES (the fix the eager number motivated)
+
+The eager numbers above are **single-stream**. Splitting the mem-file fetch into
+16 concurrent ranged GETs (over HTTP/1.1 — HTTP/2 multiplexes them onto one
+connection and erases the win) lifts T_fetch off the ~230 MiB/s ceiling to
+**~1.9 GiB/s** on the GCP↔same-region-GCS path. Re-measured on the same host:
+
+| mem | T_fetch p50 | T_load p50 | T_wake p50 / p99 | gate (<1s / <2s) |
+|---|---|---|---|---|
+| 512M  | **401ms** | 2.4ms | **403ms / 753ms** | **PASS** |
+| 2048M | 1.09s | 2.4ms | 1.09s / 1.31s | FAIL (p50 by ~9%) |
+
+So the **cold cross-host Tier-3 wake clears the <1s gate for typical agent mem
+(≤ ~1.8 GiB)** — a ~6× improvement over eager single-stream (512M: 2.46s→0.40s;
+2 GiB: 8.7s→1.09s). The 2 GiB+ tail sits just over p50<1s at this host's
+parallel-fetch bandwidth ceiling (~1.9 GiB/s); the remaining lever — **lazy
+page-in** (fetch only the ~128 MiB working set on demand, not the whole mem file)
+— closes it for any size and is the SS-109/1.4 UFFD A/B.
+
 **Verdict and what it means for the design.** A *naive* Tier-3 — eager
 whole-mem-file fetch over a single HTTP stream — meets the <1s gate only for tiny
-VMs. The binding p50 crossover, scaled from the measured 512 MiB / 2.461s point
+VMs. **Parallel ranged fetch fixes it for the common case** (above). The full
+levers, in order of remaining headroom: The binding p50 crossover, scaled from the measured 512 MiB / 2.461s point
 (the slower ~208 MiB/s stream the small VM actually got), is **~208 MiB of *mem
 file*** — note this is the full configured-mem snapshot moved, **not** the working
 / resident set (the eager `File` backend fetches every page regardless of working

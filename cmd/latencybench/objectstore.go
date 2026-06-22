@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,8 +82,16 @@ func newGCSStore(bucket, prefix string) *gcsStore {
 		bucket: bucket,
 		prefix: strings.Trim(prefix, "/"),
 		// No client-level timeout: a cold 512MiB mem-file fetch is the whole point;
-		// cancellation rides on the context instead.
-		client: &http.Client{},
+		// cancellation rides on the context instead. Force HTTP/1.1 (empty
+		// TLSNextProto) so the parallel ranged GETs open SEPARATE TCP connections:
+		// HTTP/2 multiplexes them onto one connection, which serializes the bytes
+		// and erases the parallel-fetch throughput win (~8× on GCS).
+		client: &http.Client{Transport: &http.Transport{
+			TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: fetchParallel * 2,
+			IdleConnTimeout:     30 * time.Second,
+		}},
 	}
 }
 
@@ -159,8 +168,33 @@ func (s *gcsStore) put(ctx context.Context, url, localPath string) error {
 	return nil
 }
 
-// get streams the object URL to a local file. This is the T_fetch long pole.
+// Parallel-fetch tuning: a single GCS stream tops out around ~230 MiB/s, so a
+// large mem file is split into chunks fetched concurrently with ranged GETs.
+// This is the Tier-3 latency lever — it lifts T_fetch off the single-stream
+// ceiling so the cold cross-host wake can clear the <1s gate.
+const (
+	fetchChunkBytes = 16 << 20 // 16 MiB per ranged GET
+	fetchParallel   = 16       // concurrent streams (lifts T_fetch well past the
+	// ~230 MiB/s single-stream cap; measured ~2+ GiB/s on the GCP↔same-region GCS
+	// path, enough to clear the Tier-3 <1s gate up to multi-GiB mem files)
+)
+
+// get streams the object URL to a local file. This is the T_fetch long pole, so
+// large objects are fetched with parallel ranged GETs.
 func (s *gcsStore) get(ctx context.Context, url, localPath string) error {
+	size, ok := s.objectSize(ctx, url)
+	if ok && size > fetchChunkBytes {
+		if err := s.getParallel(ctx, url, localPath, size); err == nil {
+			return nil
+		}
+		// Fall through to a single stream if the parallel path errored (e.g. the
+		// server didn't honor Range) — correctness over speed.
+	}
+	return s.getWhole(ctx, url, localPath)
+}
+
+// getWhole streams the entire object in one GET.
+func (s *gcsStore) getWhole(ctx context.Context, url, localPath string) error {
 	resp, err := s.doAuthed(ctx, func(tok string) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -186,6 +220,109 @@ func (s *gcsStore) get(ctx context.Context, url, localPath string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// objectSize returns the object's Content-Length via a HEAD request.
+func (s *gcsStore) objectSize(ctx context.Context, url string) (int64, bool) {
+	resp, err := s.doAuthed(ctx, func(tok string) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return req, nil
+	})
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK || resp.ContentLength <= 0 {
+		return 0, false
+	}
+	return resp.ContentLength, true
+}
+
+// getParallel fetches the object with fetchParallel concurrent ranged GETs,
+// each writing its chunk to the right offset of the preallocated local file.
+func (s *gcsStore) getParallel(ctx context.Context, url, localPath string, size int64) error {
+	out, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	if err := out.Truncate(size); err != nil {
+		out.Close()
+		return err
+	}
+
+	type chunk struct{ start, end int64 } // end inclusive
+	chunks := make(chan chunk)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	fail := func(e error) { errOnce.Do(func() { firstErr = e; cancel() }) }
+
+	for i := 0; i < fetchParallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range chunks {
+				if err := s.getRange(ctx, url, out, c.start, c.end); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}()
+	}
+	for start := int64(0); start < size; start += fetchChunkBytes {
+		end := start + fetchChunkBytes - 1
+		if end >= size {
+			end = size - 1
+		}
+		select {
+		case chunks <- chunk{start, end}:
+		case <-ctx.Done():
+		}
+	}
+	close(chunks)
+	wg.Wait()
+	if firstErr != nil {
+		out.Close()
+		return firstErr
+	}
+	return out.Close()
+}
+
+// getRange fetches bytes [start,end] and writes them at start in out.
+func (s *gcsStore) getRange(ctx context.Context, url string, out *os.File, start, end int64) error {
+	rangeHdr := fmt.Sprintf("bytes=%d-%d", start, end)
+	resp, err := s.doAuthed(ctx, func(tok string) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Range", rangeHdr)
+		return req, nil
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ranged GET %s [%s]: status %d", url, rangeHdr, resp.StatusCode)
+	}
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if _, err := out.WriteAt(buf, start); err != nil {
+		return err
+	}
+	return nil
 }
 
 // doAuthed performs an authenticated request, force-refreshing the token and
