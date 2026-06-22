@@ -66,6 +66,40 @@ So per-identity `/state` needs a deliberate boot-path addition. The options:
    per-drive backing overrides to `LoadSnapshot`, mirroring `NetworkOverrides`.
    Cleanest long-term, but a firecracker-fork change + rebuild.
 
-**Recommendation: option 1.** It is fully validated end-to-end today and needs
-only controlplane wiring (resolve the Actor's identity → `provider.Mount(id)` →
-cold-boot with `StateDiskPath`), exercisable against the live integrated stack.
+## RESOLVED — drive-repoint on restore WORKS on hardware (option 2 wins)
+
+The boot-ordering concern in option 2 was the only thing making it "unvalidated."
+A direct experiment on `superserve-vmd-staging` settled it:
+
+- Booted a "template" VM with a `/state` **placeholder** drive (vdb) and boxd
+  configured to **not** mount it (so the snapshot captures the drive *unmounted*).
+- Snapshotted it; restored in a fresh Firecracker with `LoadSnapshot(resume_vm=false)`,
+  then `PATCH /drives/state {path_on_host: <per-actor image>}`, then `PATCH /vm Resumed`.
+- The guest kernel logged `vdb: detected capacity change` (the backing swapped),
+  and a post-restore in-guest `mount /dev/vdb /state && cat /state/marker`
+  returned **`REPOINTED-OK`** — the per-actor image's marker, exit 0.
+
+**So `PatchGuestDriveByID` after `LoadSnapshot(paused)` re-points a drive's backing
+file before resume.** That makes option 2 the production design — and the best one:
+per-Actor `/state` rides the **fast template-restore path**, no second (cold) boot.
+
+### Production design (de-risked, validated mechanism)
+
+1. **Templates** are built with a `/state` placeholder drive, and boxd is built to
+   **defer** the `/state` mount (don't mount at boot — so the snapshot captures it
+   unmounted; mount it post-restore, on first wake/turn).
+2. **vmd `RestoreSnapshot`** gains an optional `state_disk_path`: load the snapshot
+   `resume_vm=false`, `PatchGuestDriveByID("state", state_disk_path)`, then resume.
+   (The exact API sequence is the one proven above.)
+3. **Controlplane** resolves the Actor → `provider.Mount(identity)` → the per-Actor
+   block image, threaded through `Target.StateDiskPath` (already built) →
+   `vmdclient.RestoreInstance(state_disk_path)` → the proto field.
+
+Every mechanism this rides on is now hardware-validated: the block provider
+(mke2fs image), the drive attach (`FirecrackerConfig.StateDiskPath`), boxd
+mounting `/state`, `/state` surviving snapshot/restore, AND drive-repoint-on-restore.
+The remaining work is the additive wiring in 1–3 plus its e2e against the live
+controlplane+vmd stack — no architectural unknowns left.
+
+(Option 1, per-Actor cold boot, also works and is fully validated, but costs a
+slower first boot; option 2 is preferred now that repoint is proven.)
