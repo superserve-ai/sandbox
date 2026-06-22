@@ -534,7 +534,7 @@ paths:
         response. For live output use `POST /exec/stream` (Server-Sent Events)
         or `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
         the body, not as an HTTP error. The sandbox must be `running`; a paused
-        sandbox returns `503`. Activate it first with
+        sandbox is rejected. Activate it first with
         `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this automatically).
       security:
         - accessToken: []
@@ -557,8 +557,6 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -582,7 +580,7 @@ paths:
         (`{"stdout":"..."}` or `{"stderr":"..."}`), the terminal event
         (`{"exit_code":N,"finished":true}`), or an error
         (`{"error":"...","finished":true}`). The stream closes when the command
-        exits. The sandbox must be `running`; a paused sandbox returns `503`.
+        exits. The sandbox must be `running`; a paused sandbox is rejected.
         Activate it first with `POST /sandboxes/{sandbox_id}/activate` (the SDKs
         do this automatically).
 
@@ -609,8 +607,6 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
 
