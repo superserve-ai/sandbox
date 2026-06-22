@@ -534,7 +534,7 @@ paths:
         response. For live output use `POST /exec/stream` (Server-Sent Events)
         or `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
         the body, not as an HTTP error. The sandbox must be `running`; a paused
-        sandbox is rejected. Activate it first with
+        sandbox returns `503`. Activate it first with
         `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this automatically).
       security:
         - accessToken: []
@@ -559,6 +559,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /exec/stream:
     servers:
@@ -580,7 +582,7 @@ paths:
         (`{"stdout":"..."}` or `{"stderr":"..."}`), the terminal event
         (`{"exit_code":N,"finished":true}`), or an error
         (`{"error":"...","finished":true}`). The stream closes when the command
-        exits. The sandbox must be `running`; a paused sandbox is rejected.
+        exits. The sandbox must be `running`; a paused sandbox returns `503`.
         Activate it first with `POST /sandboxes/{sandbox_id}/activate` (the SDKs
         do this automatically).
 
@@ -609,6 +611,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /exec/connect:
     servers:
@@ -2432,6 +2436,16 @@ components:
       description: >
         The sandbox has run out of disk space. Response body uses error code
         `sandbox_storage_full`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: >
+        The sandbox is not currently running (for example, paused) or is
+        temporarily unavailable. For a paused sandbox, activate it with
+        `POST /sandboxes/{sandbox_id}/activate` and retry; the SDKs do this
+        automatically.
       content:
         application/json:
           schema:
