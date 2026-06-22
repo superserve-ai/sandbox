@@ -77,9 +77,14 @@ func main() {
 		log.Fatalf("chmod defaultHome %s: %v", defaultHome, err)
 	}
 
-	// Mount the durable /state block device, if one is attached. Best-effort: a
-	// sandbox without durable state still serves ephemeral work.
-	mountStateDisk()
+	// Mount the durable /state block device at boot ONLY when explicitly opted in
+	// (STATE_MOUNT_AT_BOOT=1). The production /state-on-restore path keeps /state
+	// UNMOUNTED in the template snapshot so the drive can be re-pointed to the
+	// Actor's per-identity image during the paused restore, then mounted via the
+	// vmd-triggered POST /state/mount. Boot-mount is for cold-boot/standalone use.
+	if os.Getenv("STATE_MOUNT_AT_BOOT") == "1" {
+		mountStateDisk()
+	}
 
 	mux := http.NewServeMux()
 

@@ -44,6 +44,7 @@ mount -t sysfs sys /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
 ip link set eth0 up 2>/dev/null
 ip addr show eth0 2>/dev/null | grep -q $GUESTIP || ip addr add $GUESTIP/30 dev eth0 2>/dev/null
+export STATE_MOUNT_AT_BOOT=1
 exec /usr/bin/boxd
 EOS
 sudo chmod 0755 /tmp/asroot/sbin/init
