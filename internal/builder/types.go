@@ -55,6 +55,42 @@ type UserOp struct {
 	Sudo bool   `json:"sudo,omitempty"`
 }
 
+// ImageDefaults captures the base OCI image's runtime configuration — the
+// information a container runtime (Docker/containerd) uses to decide what to
+// run and how. We read this from the image config during pull and persist it
+// so a sandbox can honor the image's own ENTRYPOINT/CMD/env/user instead of
+// requiring the caller to hand-author a template start command.
+//
+// All fields are optional: a base image may set none of them (e.g. an image
+// built purely to be a foundation for RUN steps).
+type ImageDefaults struct {
+	// Entrypoint is the image's ENTRYPOINT in exec form. Combined with Cmd to
+	// form the default argv (see the precedence rules in package start).
+	Entrypoint []string `json:"entrypoint,omitempty"`
+
+	// Cmd is the image's CMD in exec form — default arguments appended to
+	// Entrypoint, or the full command when Entrypoint is empty.
+	Cmd []string `json:"cmd,omitempty"`
+
+	// Env is the image's environment, parsed from the "KEY=VALUE" form the OCI
+	// config uses into a map for easy merging with build- and sandbox-level env.
+	Env map[string]string `json:"env,omitempty"`
+
+	// WorkingDir is the image's WORKDIR; the directory the start command runs in.
+	WorkingDir string `json:"working_dir,omitempty"`
+
+	// User is the image's USER ("uid", "uid:gid", or a name). The start command
+	// runs as this user unless overridden.
+	User string `json:"user,omitempty"`
+}
+
+// IsZero reports whether no image defaults were captured (an image that
+// specifies no entrypoint, cmd, env, workdir, or user).
+func (d ImageDefaults) IsZero() bool {
+	return len(d.Entrypoint) == 0 && len(d.Cmd) == 0 && len(d.Env) == 0 &&
+		d.WorkingDir == "" && d.User == ""
+}
+
 // BuildRootfsResult is the output of producing a rootfs.ext4 from a BuildSpec.
 type BuildRootfsResult struct {
 	// RootfsPath is the absolute path to the produced ext4 image.
@@ -64,6 +100,11 @@ type BuildRootfsResult struct {
 	// to at build time, e.g. "sha256:abc123...". Stored on template_build for
 	// reproducibility and future cache keys.
 	ResolvedDigest string
+
+	// ImageDefaults is the base image's runtime configuration captured during
+	// pull. Persisted on the template so sandboxes can run the image's own
+	// start command without manual authoring. May be the zero value.
+	ImageDefaults ImageDefaults
 
 	// SizeBytes is the on-disk size of the produced ext4 file.
 	SizeBytes int64

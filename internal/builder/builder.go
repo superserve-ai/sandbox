@@ -76,11 +76,11 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 	defer umaskZero()()
 
 	logger.Info().Str("scratch", scratch).Msg("pulling + flattening OCI image")
-	digest, err := b.pullAndFlatten(ctx, spec.From, scratch)
+	digest, imageDefaults, err := b.pullAndFlatten(ctx, spec.From, scratch)
 	if err != nil {
 		return BuildRootfsResult{}, fmt.Errorf("pull %s: %w", spec.From, err)
 	}
-	logger.Info().Str("digest", digest).Msg("image flattened")
+	logger.Info().Str("digest", digest).Bool("has_image_defaults", !imageDefaults.IsZero()).Msg("image flattened")
 
 	boxdBytes, err := injectGuestAgent(scratch, b.cfg.BoxdBinaryPath, &logger)
 	if err != nil {
@@ -105,6 +105,7 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 	return BuildRootfsResult{
 		RootfsPath:     destPath,
 		ResolvedDigest: digest,
+		ImageDefaults:  imageDefaults,
 		SizeBytes:      info.Size(),
 	}, nil
 }

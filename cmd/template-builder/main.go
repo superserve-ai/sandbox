@@ -841,14 +841,15 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 	// rootfs_path stays in the schema for backwards compat with existing
 	// readers; supervisors that understand overlay use base_path/delta_path.
 	meta := struct {
-		SnapshotPath   string `json:"snapshot_path"`
-		MemPath        string `json:"mem_path"`
-		RootfsPath     string `json:"rootfs_path"`
-		BasePath       string `json:"base_path"`
-		DeltaPath      string `json:"delta_path"`
-		ResolvedDigest string `json:"resolved_digest"`
-		SizeBytes      int64  `json:"size_bytes"`
-		BuiltAt        string `json:"built_at"`
+		SnapshotPath   string                `json:"snapshot_path"`
+		MemPath        string                `json:"mem_path"`
+		RootfsPath     string                `json:"rootfs_path"`
+		BasePath       string                `json:"base_path"`
+		DeltaPath      string                `json:"delta_path"`
+		ResolvedDigest string                `json:"resolved_digest"`
+		ImageConfig    builder.ImageDefaults `json:"image_config"`
+		SizeBytes      int64                 `json:"size_bytes"`
+		BuiltAt        string                `json:"built_at"`
 	}{
 		SnapshotPath:   snapPath,
 		MemPath:        memPath,
@@ -856,6 +857,7 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		BasePath:       basePath,
 		DeltaPath:      deltaPath,
 		ResolvedDigest: br.ResolvedDigest,
+		ImageConfig:    br.ImageDefaults,
 		SizeBytes:      br.SizeBytes,
 		BuiltAt:        time.Now().UTC().Format(time.RFC3339),
 	}

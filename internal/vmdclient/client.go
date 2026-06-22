@@ -153,8 +153,12 @@ type BuildStatusResult struct {
 	BasePath       string // populated on ready, overlay-mode templates only
 	DeltaPath      string // populated on ready, overlay-mode templates only
 	ResolvedDigest string // populated on ready
-	SizeBytes      int64  // populated on ready
-	ErrorMessage   string // populated on failed/cancelled
-	StartedAtUnix  int64
-	EndedAtUnix    int64
+	// ImageConfigJSON is the base image's runtime config (builder.ImageDefaults
+	// shape), JSON-encoded, captured at build time. Empty for legacy builds.
+	// The control plane persists it to the template's image_config jsonb column.
+	ImageConfigJSON string // populated on ready
+	SizeBytes       int64  // populated on ready
+	ErrorMessage    string // populated on failed/cancelled
+	StartedAtUnix   int64
+	EndedAtUnix     int64
 }

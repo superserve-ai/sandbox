@@ -28,10 +28,10 @@ import (
 // We honor them during layer-by-layer extraction — a `.wh.foo` file in a
 // later layer removes `foo` from the accumulated tree. This matches what a
 // runtime like Docker/containerd does when materializing an image.
-func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir string) (string, error) {
+func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir string) (string, ImageDefaults, error) {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
-		return "", fmt.Errorf("parse image reference %q: %w", imageRef, err)
+		return "", ImageDefaults{}, fmt.Errorf("parse image reference %q: %w", imageRef, err)
 	}
 
 	// remote.WithContext lets context cancellation propagate into the HTTP
@@ -42,16 +42,24 @@ func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir
 		remote.WithAuthFromKeychain(keychain),
 	)
 	if err != nil {
-		return "", fmt.Errorf("fetch image %q: %w", imageRef, err)
+		return "", ImageDefaults{}, fmt.Errorf("fetch image %q: %w", imageRef, err)
 	}
 
-	if err := validatePlatform(img, b.cfg.PlatformOS, b.cfg.PlatformArch); err != nil {
-		return "", err
+	// Read the image config once: it drives both platform validation and the
+	// runtime defaults (ENTRYPOINT/CMD/env/user/workdir) we capture so the
+	// image's own start command can run later.
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return "", ImageDefaults{}, fmt.Errorf("read image config: %w", err)
 	}
+	if err := validatePlatformConfig(cfg, b.cfg.PlatformOS, b.cfg.PlatformArch); err != nil {
+		return "", ImageDefaults{}, err
+	}
+	defaults := imageDefaultsFromConfig(cfg)
 
 	digest, err := img.Digest()
 	if err != nil {
-		return "", fmt.Errorf("read digest: %w", err)
+		return "", ImageDefaults{}, fmt.Errorf("read digest: %w", err)
 	}
 
 	// Flatten: export the squashed image as a single tar stream (crane does
@@ -69,22 +77,66 @@ func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir
 		// Drain the export goroutine so it doesn't deadlock on pipe write.
 		_ = pr.CloseWithError(err)
 		<-exportErr
-		return "", fmt.Errorf("extract image: %w", err)
+		return "", ImageDefaults{}, fmt.Errorf("extract image: %w", err)
 	}
 	if err := <-exportErr; err != nil {
-		return "", fmt.Errorf("export image: %w", err)
+		return "", ImageDefaults{}, fmt.Errorf("export image: %w", err)
 	}
 
-	return digest.String(), nil
+	return digest.String(), defaults, nil
 }
 
-// validatePlatform rejects images that don't match the required OS/arch and
-// rejects known-incompatible bases (alpine, distroless) early with a clear
+// imageDefaultsFromConfig extracts the runtime defaults (ENTRYPOINT/CMD/env/
+// workdir/user) from an already-fetched image config. Returns the zero value
+// when the image specifies none of them.
+func imageDefaultsFromConfig(cfg *v1.ConfigFile) ImageDefaults {
+	if cfg == nil {
+		return ImageDefaults{}
+	}
+	return ImageDefaults{
+		Entrypoint: cfg.Config.Entrypoint,
+		Cmd:        cfg.Config.Cmd,
+		Env:        parseEnv(cfg.Config.Env),
+		WorkingDir: cfg.Config.WorkingDir,
+		User:       cfg.Config.User,
+	}
+}
+
+// parseEnv converts OCI "KEY=VALUE" environment entries into a map. Entries
+// without an '=' are treated as a bare key with an empty value (matching how
+// `docker run` carries through an unset-but-declared variable). A later entry
+// for the same key wins, mirroring process-env semantics. Returns nil for an
+// empty input so callers can distinguish "no env" cleanly.
+func parseEnv(env []string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(env))
+	for _, kv := range env {
+		key, val, found := strings.Cut(kv, "=")
+		if key == "" {
+			continue // skip malformed "=value" / "" entries
+		}
+		if !found {
+			out[key] = ""
+			continue
+		}
+		out[key] = val
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// validatePlatformConfig rejects images that don't match the required OS/arch
+// and rejects known-incompatible bases (alpine, distroless) early with a clear
 // message. Catches configuration mistakes before the slow mkfs.ext4 step.
-func validatePlatform(img v1.Image, wantOS, wantArch string) error {
-	cfg, err := img.ConfigFile()
-	if err != nil {
-		return fmt.Errorf("read image config: %w", err)
+// Operates on an already-fetched config so callers avoid a second network
+// round-trip to read it.
+func validatePlatformConfig(cfg *v1.ConfigFile, wantOS, wantArch string) error {
+	if cfg == nil {
+		return fmt.Errorf("read image config: nil config")
 	}
 	if cfg.OS != wantOS {
 		return fmt.Errorf("image os is %q, want %q", cfg.OS, wantOS)
