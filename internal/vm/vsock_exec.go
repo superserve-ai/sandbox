@@ -53,7 +53,6 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 
 var boxdInitClient = &http.Client{Timeout: 5 * time.Second}
 
-
 // postBoxdInit sends sandbox-level configuration (env vars, hostname) to
 // boxd's /init endpoint.
 func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, hostname string) error {
@@ -87,6 +86,30 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, h
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("POST /init: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// postBoxdStateMount triggers boxd to mount the durable /state block device.
+// Called on the /state-on-restore path AFTER the placeholder /state drive has
+// been re-pointed to the Actor's per-identity image during the paused restore:
+// the template snapshot captured /state unmounted, so boxd mounts it now. boxd
+// is idempotent (already-mounted is success); a sandbox without /state never
+// hits this path.
+func postBoxdStateMount(ctx context.Context, vmIP string) error {
+	url := fmt.Sprintf("http://%s:%d/state/mount", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return fmt.Errorf("create state-mount request: %w", err)
+	}
+	resp, err := boxdInitClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /state/mount: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /state/mount: status %d", resp.StatusCode)
 	}
 	return nil
 }

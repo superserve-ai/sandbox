@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -96,4 +97,33 @@ func isMountpoint(path string) (bool, error) {
 		return false, err
 	}
 	return st.Dev != parent.Dev, nil
+}
+
+// handleStateMount mounts the durable /state block device on demand. vmd calls
+// this on the durable-/state restore path: the template snapshot captured /state
+// UNMOUNTED (so the drive could be re-pointed to the Actor's per-identity image
+// during the paused restore), and the mount happens now, after the repoint. It
+// is idempotent — already-mounted and no-device are both reported as success-ish.
+// POST /state/mount[?device=/dev/vdb]
+func handleStateMount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	device := r.URL.Query().Get("device")
+	if device == "" {
+		device = defaultStateDevice
+	}
+	switch err := mountStateDiskAt(device, stateMountpoint, osStat, isMountpoint, syscall.Mount); err {
+	case nil:
+		log.Printf("state: mounted %s at %s (vmd-triggered)", device, stateMountpoint)
+		w.WriteHeader(http.StatusOK)
+	case errStateAlreadyMounted:
+		w.WriteHeader(http.StatusOK)
+	case errNoStateDevice:
+		http.Error(w, "no state device at "+device, http.StatusNotFound)
+	default:
+		log.Printf("state: vmd-triggered mount of %s failed: %v", device, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }

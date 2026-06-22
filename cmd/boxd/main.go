@@ -105,6 +105,7 @@ func main() {
 	mux.HandleFunc("/exec", procService.handleExec)
 	mux.HandleFunc("/exec/stream", procService.handleExecStream)
 	mux.HandleFunc("/start", handleStart(sup))
+	mux.HandleFunc("/state/mount", handleStateMount)
 
 	// Cold-boot path: if a start spec was baked into the rootfs and no child
 	// is already live, launch it. On snapshot restore the child is already in

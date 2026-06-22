@@ -150,6 +150,16 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, err
 	}
 
+	// Durable /state: the restore re-pointed the template's placeholder /state
+	// drive onto this Actor's per-identity image (paused-load → patch → resume);
+	// the template captured /state UNMOUNTED, so trigger boxd to mount it now.
+	// Hardware-validated flow (see internal/state/STATE-MOUNT-FINDINGS.md).
+	if req.GetStateDiskPath() != "" {
+		if err := postBoxdStateMount(ctx, inst.IP); err != nil {
+			return nil, status.Errorf(codes.Internal, "mount /state after restore: %v", err)
+		}
+	}
+
 	// Env vars are pushed in a separate InjectSandboxEnv call so the control
 	// plane can mint a JWT against the now-known source IP before injection.
 	return &vmdpb.RestoreSnapshotResponse{
