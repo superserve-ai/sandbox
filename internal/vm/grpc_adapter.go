@@ -133,6 +133,7 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	}
 	vmCfg.BasePath = req.GetBasePath()
 	vmCfg.DeltaDir = req.GetDeltaDir()
+	vmCfg.StatePath = req.GetStateDiskPath()
 
 	var netCfg *network.Config
 	if nc := req.GetNetworkConfig(); nc != nil {

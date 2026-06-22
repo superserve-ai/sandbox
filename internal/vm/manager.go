@@ -121,7 +121,16 @@ type VMConfig struct {
 	// DeltaDir hydrates a fresh per-VM overlay from <dir>/rootfs.delta on
 	// restore. Empty for in-place resume of an already-populated overlay.
 	DeltaDir string
+	// StatePath, when non-empty, is the Actor's per-identity durable /state block
+	// image. On restore it is re-pointed onto the template's placeholder /state
+	// drive (paused-load → patch-drive → resume); on cold boot it is attached as
+	// the sandbox's /state drive. Empty for sandboxes without durable /state.
+	StatePath string
 }
+
+// stateDriveID is the Firecracker drive id the template bakes as the /state
+// placeholder and that restore re-points to the per-Actor image.
+const stateDriveID = "state"
 
 // ManagerConfig holds paths and settings for the VM manager.
 type ManagerConfig struct {
@@ -1055,6 +1064,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	default:
 		// UFFD disabled but fresh restore — File backend with network overrides.
 		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
+	}
+	// Durable /state: re-point the template's placeholder /state drive onto this
+	// Actor's per-identity image during the paused restore. Overrides the restore
+	// variant above (the repoint path is a File-backend load + drive-patch +
+	// resume; combining it with UFFD lazy page-in is a follow-up). Hardware-
+	// validated sequence; see internal/state/STATE-MOUNT-FINDINGS.md.
+	if resourceLimits.StatePath != "" {
+		restoreErr = RestoreSnapshotWithStateRepoint(
+			socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir, stateDriveID, resourceLimits.StatePath)
 	}
 	log.Info().
 		Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).

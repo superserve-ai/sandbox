@@ -385,6 +385,66 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 	return nil
 }
 
+// RestoreSnapshotWithStateRepoint restores a snapshot that carries a /state
+// PLACEHOLDER drive and re-points that drive to this Actor's per-identity /state
+// image before the guest runs — the production durable-/state-on-restore path.
+//
+// The sequence is hardware-validated (see internal/state/STATE-MOUNT-FINDINGS.md):
+// load the snapshot PAUSED (resume_vm=false), PatchGuestDriveByID swaps the
+// /state drive's backing file, then resume. The template snapshot must capture
+// /state UNMOUNTED (boxd defers the mount to post-restore) so the swap is safe.
+// stateDriveID is the drive id the template baked (e.g. "state"); ifaceID/
+// tapDevice override the network like RestoreSnapshotWithOverrides.
+func RestoreSnapshotWithStateRepoint(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir, stateDriveID, stateDiskPath string) error {
+	if stateDriveID == "" || stateDiskPath == "" {
+		return fmt.Errorf("repoint restore requires stateDriveID and stateDiskPath")
+	}
+	fc := newFCClient(socketPath)
+	ctx := context.Background()
+
+	var netOverrides []*models.NetworkOverride
+	if ifaceID != "" {
+		netOverrides = []*models.NetworkOverride{{IfaceID: &ifaceID, HostDevName: &tapDevice}}
+	} else {
+		netOverrides = []*models.NetworkOverride{} // FC rejects null
+	}
+
+	// 1. Load PAUSED so drives can be re-pointed before the guest resumes.
+	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
+		Context: ctx,
+		Body: &models.SnapshotLoadParams{
+			SnapshotPath:     &snapshotPath,
+			MemBackend:       &models.MemoryBackend{BackendType: strPtr(models.MemoryBackendBackendTypeFile), BackendPath: &memPath},
+			ResumeVM:         false,
+			NetworkOverrides: netOverrides,
+			BlockDeltaDir:    blockDeltaDir,
+		},
+	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot: %w: %v", ErrTornSnapshot, err)
+		}
+		return fmt.Errorf("load snapshot: %w", err)
+	}
+
+	// 2. Re-point the /state drive to this Actor's per-identity image.
+	if _, err := fc.Operations.PatchGuestDriveByID(&operations.PatchGuestDriveByIDParams{
+		Context: ctx,
+		DriveID: stateDriveID,
+		Body:    &models.PartialDrive{DriveID: &stateDriveID, PathOnHost: stateDiskPath},
+	}); err != nil {
+		return fmt.Errorf("repoint /state drive %q to %q: %w", stateDriveID, stateDiskPath, err)
+	}
+
+	// 3. Resume.
+	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
+		Context: ctx,
+		Body:    &models.VM{State: strPtr(models.VMStateResumed)},
+	}); err != nil {
+		return fmt.Errorf("resume after /state repoint: %w", err)
+	}
+	return nil
+}
+
 // RestoreSnapshotUffdInternalWithOverrides loads a snapshot using Firecracker's
 // in-process UFFD handler. Pages are demand-loaded from `memPath` by a handler
 // thread inside the Firecracker process whose lifetime equals the VM's, so vmd

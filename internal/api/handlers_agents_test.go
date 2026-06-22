@@ -19,7 +19,7 @@ import (
 // fakeBooter satisfies vmdwaker.SandboxBooter without a real vmd.
 type fakeBooter struct{}
 
-func (fakeBooter) RestoreSnapshot(context.Context, string, string, string, string, string, string, string, map[string]string) (string, uint32, uint32, error) {
+func (fakeBooter) RestoreSnapshot(context.Context, string, string, string, string, string, string, string, map[string]string, string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
 func (fakeBooter) BareResumeInstance(context.Context, string) (string, uint32, uint32, error) {

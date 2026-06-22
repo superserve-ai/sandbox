@@ -29,7 +29,10 @@ type Client interface {
 	// deltaDir are populated for overlay-mode templates, empty for legacy.
 	// For sandboxes with secrets the caller passes envVars=nil here and uses
 	// InjectSandboxEnv below once the source IP is known and a JWT is minted.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// stateDiskPath, when non-empty, is the Actor's per-identity durable /state
+	// image, re-pointed onto the template's placeholder /state drive during the
+	// paused restore. Empty for sandboxes without durable /state.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string, stateDiskPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error

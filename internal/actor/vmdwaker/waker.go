@@ -22,7 +22,7 @@ import (
 // vmdclient.Client satisfies this shape (RestoreSnapshot / BareResumeInstance /
 // DestroyInstance).
 type SandboxBooter interface {
-	RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, env map[string]string) (string, uint32, uint32, error)
+	RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, env map[string]string, stateDiskPath string) (string, uint32, uint32, error)
 	// BareResumeInstance is the Tier-1 wake: unpause a still-resident, bare-paused
 	// VM in place (sub-ms, no snapshot restore).
 	BareResumeInstance(ctx context.Context, id string) (string, uint32, uint32, error)
@@ -97,7 +97,7 @@ func (w *Waker) Wake(ctx context.Context, a actor.Actor, _ *actor.Lease) (actor.
 			return nil, fmt.Errorf("resolve actor %q: %w", a.Name, err)
 		}
 		if _, _, _, err := w.boot.RestoreSnapshot(ctx, sandboxID,
-			tgt.SnapshotPath, tgt.MemPath, tgt.BasePath, tgt.DeltaDir, tgt.TeamID, tgt.OwnerID, tgt.Env); err != nil {
+			tgt.SnapshotPath, tgt.MemPath, tgt.BasePath, tgt.DeltaDir, tgt.TeamID, tgt.OwnerID, tgt.Env, tgt.StateDiskPath); err != nil {
 			return nil, fmt.Errorf("restore sandbox for actor %q: %w", a.Name, err)
 		}
 	}

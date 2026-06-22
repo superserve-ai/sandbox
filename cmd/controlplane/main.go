@@ -462,16 +462,17 @@ func (c *grpcVMDClient) BareResumeInstance(ctx context.Context, vmID string) (st
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string, stateDiskPath string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		BasePath:     basePath,
-		DeltaDir:     deltaDir,
-		TeamId:       teamID,
-		OwnerId:      ownerID,
-		EnvVars:      envVars,
+		VmId:          vmID,
+		SnapshotPath:  snapshotPath,
+		MemFilePath:   memPath,
+		BasePath:      basePath,
+		DeltaDir:      deltaDir,
+		TeamId:        teamID,
+		OwnerId:       ownerID,
+		EnvVars:       envVars,
+		StateDiskPath: stateDiskPath,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)

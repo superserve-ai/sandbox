@@ -34,22 +34,39 @@ func main() {
 	boxdURL := flag.String("boxd-url", "", "boxd /exec/stream URL of the running sandbox VM (required)")
 	turns := flag.Int("turns", 3, "number of agent turns to drive")
 	agentName := flag.String("agent", "agent-1", "durable Actor name")
+	turnCmd := flag.String("turn-cmd", "", "override the in-guest harness turn (sh -c); default echoes $ACTOR_EVENT")
+	finalMustContain := flag.String("final-must-contain", "", "if set, the LAST turn's reply must contain this (e.g. event-1, to prove /state persisted across turns)")
 	flag.Parse()
 	if *boxdURL == "" {
 		fail("-boxd-url is required")
 	}
 
+	turnArgv := harnessTurnArgv
+	if *turnCmd != "" {
+		turnArgv = []string{"sh", "-c", *turnCmd}
+	}
+
 	fmt.Printf("Driving %d agent turns through Registry+Lease+Router → vmdwaker → boxddeliver → real boxd:\n", *turns)
-	results, err := driveTurns(*boxdURL, *agentName, *turns, harnessTurnArgv)
+	results, err := driveTurns(*boxdURL, *agentName, *turns, turnArgv)
 	if err != nil {
 		fail(err.Error())
 	}
 	for _, r := range results {
-		want := "REPLY[" + r.payload + "]"
-		if !strings.Contains(r.reply, want) {
-			fail(fmt.Sprintf("turn %q: harness reply %q does not contain %q", r.payload, r.reply, want))
+		// Each turn's reply must carry its own event (proves the event reached the
+		// harness via $ACTOR_EVENT and the reply streamed back).
+		if !strings.Contains(r.reply, r.payload) {
+			fail(fmt.Sprintf("turn %q: harness reply %q does not contain the event", r.payload, r.reply))
 		}
 		fmt.Printf("  sent %q → harness streamed %q  (%s) ✓\n", r.payload, r.reply, r.elapsed.Round(time.Millisecond))
+	}
+	// Durability check: the last turn's reply still contains an earlier turn's
+	// data → the in-guest /state survived across turns.
+	if *finalMustContain != "" {
+		last := results[len(results)-1].reply
+		if !strings.Contains(last, *finalMustContain) {
+			fail(fmt.Sprintf("durability: final reply %q does not contain %q — /state did not persist across turns", last, *finalMustContain))
+		}
+		fmt.Printf("  durability ✓ — final turn still sees %q from an earlier turn (/state persisted)\n", *finalMustContain)
 	}
 	fmt.Printf("\nPASS — %d turns delivered to the in-guest harness and streamed back through the Actor loop.\n", *turns)
 }
@@ -118,7 +135,7 @@ func drain(ctx context.Context, relay *actor.Relay) string {
 // harness; here we only exercise the runtime + delivery path.
 type prebootedBooter struct{}
 
-func (prebootedBooter) RestoreSnapshot(_ context.Context, id, _, _, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (prebootedBooter) RestoreSnapshot(_ context.Context, id, _, _, _, _, _, _ string, _ map[string]string, _ string) (string, uint32, uint32, error) {
 	return id, 1, 256, nil
 }
 func (prebootedBooter) BareResumeInstance(_ context.Context, id string) (string, uint32, uint32, error) {

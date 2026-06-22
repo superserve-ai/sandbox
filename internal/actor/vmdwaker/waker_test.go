@@ -18,7 +18,7 @@ type mockBooter struct {
 	restoreErr    error
 }
 
-func (m *mockBooter) RestoreSnapshot(_ context.Context, id, _, _, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (m *mockBooter) RestoreSnapshot(_ context.Context, id, _, _, _, _, _, _ string, _ map[string]string, _ string) (string, uint32, uint32, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.restoreErr != nil {

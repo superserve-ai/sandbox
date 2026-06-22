@@ -337,6 +337,10 @@ message RestoreSnapshotRequest {
   // attribute exec/file activity without a database. Both may be empty.
   string team_id = 10;
   string owner_id = 11;
+  // Durable /state: the Actor's per-identity block image. When set, the
+  // template's placeholder /state drive is re-pointed onto it during the paused
+  // restore (load → patch-drive → resume). Empty for sandboxes without /state.
+  string state_disk_path = 12;
 }
 
 message RestoreSnapshotResponse {

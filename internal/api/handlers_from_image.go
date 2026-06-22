@@ -151,7 +151,7 @@ func (h *Handlers) fromImageCacheHit(c *gin.Context, teamID uuid.UUID, tpl db.Te
 		deltaDir = filepath.Dir(*tpl.DeltaPath)
 	}
 	ip, vcpu, mem, vmdErr := vmd.RestoreSnapshot(c.Request.Context(), sandboxID.String(),
-		*tpl.SnapshotPath, *tpl.MemPath, base, deltaDir, teamID.String(), ownerIDFromContext(c), req.Env)
+		*tpl.SnapshotPath, *tpl.MemPath, base, deltaDir, teamID.String(), ownerIDFromContext(c), req.Env, "")
 	if vmdErr != nil {
 		_ = h.DB.UpdateSandboxStatus(insertCtx, db.UpdateSandboxStatusParams{ID: sandbox.ID, Status: db.SandboxStatusFailed, TeamID: teamID})
 		if isVMDFileMissing(vmdErr) {
