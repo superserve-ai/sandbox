@@ -173,6 +173,9 @@ func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _ string,
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
 	return nil
 }
+func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry, error) {
+	return nil, nil
+}
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }

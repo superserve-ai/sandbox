@@ -53,6 +53,11 @@ generate: generate-sqlc generate-proto
 generate-sqlc:
 	sqlc generate
 
+# Pin protoc to the version the committed *.pb.go files were generated with — see
+# the `// protoc vX.Y.Z` header in proto/boxdpb/*.pb.go. Regenerating with a
+# different protoc rewrites that header and the generated struct formatting for no
+# functional change, producing spurious diffs. Keep protoc (and protoc-gen-go /
+# protoc-gen-go-grpc) consistent here and in CI to avoid that drift.
 generate-proto:
 	protoc --go_out=. --go_opt=module=github.com/superserve-ai/sandbox \
 		--go-grpc_out=. --go-grpc_opt=module=github.com/superserve-ai/sandbox \

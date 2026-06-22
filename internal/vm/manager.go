@@ -1196,6 +1196,55 @@ func (m *Manager) DeleteFile(ctx context.Context, vmID, filePath string) error {
 	return rpcErr
 }
 
+// DirEntry is one entry returned by ListDir. ModifiedUnix is 0 when the
+// sandbox's boxd predates that field; the console renders it as "—".
+type DirEntry struct {
+	Name         string
+	IsDir        bool
+	Size         int64
+	ModifiedUnix int64
+}
+
+// ListDir returns a one-level listing of dirPath inside a running VM via boxd's
+// FilesystemService.ListDir — the metadata-over-Connect-RPC counterpart to the
+// data plane's byte-transfer /files endpoint. It works on every sandbox: boxd
+// has answered ListDir since long before the data-plane ?format=json handler,
+// so existing sandboxes list without a template reseed.
+//
+// boxd's filesystem errors are translated to gRPC status codes here so the API
+// never confuses a missing directory (NotFound) with a gone VM — boxd replying
+// at all means the VM is alive. A gone VM is caught by getRunningVMIP above or
+// surfaces as a connection error, not NotFound.
+func (m *Manager) ListDir(ctx context.Context, vmID, dirPath string) ([]DirEntry, error) {
+	vmIP, err := m.getRunningVMIP(vmID)
+	if err != nil {
+		return nil, err
+	}
+	client := boxdFilesystemClient(vmIP)
+	resp, rpcErr := client.ListDir(ctx, connect.NewRequest(&pb.ListDirRequest{Path: dirPath}))
+	if rpcErr != nil {
+		switch connect.CodeOf(rpcErr) {
+		case connect.CodeNotFound:
+			return nil, status.Error(codes.NotFound, "directory not found")
+		case connect.CodeInvalidArgument:
+			return nil, status.Error(codes.InvalidArgument, "path is not a listable directory")
+		default:
+			return nil, rpcErr
+		}
+	}
+	entries := resp.Msg.GetEntries()
+	out := make([]DirEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, DirEntry{
+			Name:         e.GetName(),
+			IsDir:        e.GetIsDir(),
+			Size:         e.GetSize(),
+			ModifiedUnix: e.GetModifiedUnix(),
+		})
+	}
+	return out, nil
+}
+
 func (m *Manager) getRunningVMIP(vmID string) (string, error) {
 	inst, err := m.getInstance(vmID)
 	if err != nil {

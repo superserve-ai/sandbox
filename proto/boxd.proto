@@ -146,6 +146,9 @@ message FileEntry {
   string name = 1;
   bool is_dir = 2;
   int64 size = 3;
+  // Unix seconds. Absent (0) on older boxd; the control plane and console
+  // tolerate 0 and hide the date.
+  int64 modified_unix = 4;
 }
 
 message MakeDirRequest {

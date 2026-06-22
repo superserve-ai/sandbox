@@ -80,6 +80,19 @@ func isVMDUnimplemented(err error) bool {
 	return status.Code(err) == codes.Unimplemented
 }
 
+// isDirNotFound reports a boxd "directory not found", surfaced by
+// Manager.ListDir as gRPC NotFound. It shares the NotFound code with
+// isVMDNotFound's "VM gone" case, but the listing handler treats it as a
+// benign 404 and must NOT mark the sandbox failed: boxd answering at all means
+// the VM is alive. (Manager.ListDir resolves the running VM IP before calling
+// boxd, so a gone VM surfaces as a connection error, not NotFound.)
+func isDirNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.NotFound
+}
+
 // vmdErrorMessage returns the gRPC message from a vmd error, stripping
 // gRPC/transport framing so the string is safe to surface to API callers.
 func vmdErrorMessage(err error) string {

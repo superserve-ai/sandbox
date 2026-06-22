@@ -38,6 +38,10 @@ type Client interface {
 	// ListBuildArtifacts returns all per-build dirs on this host's snapshot
 	// storage. Used by the controlplane reconciler.
 	ListBuildArtifacts(ctx context.Context) ([]BuildArtifactEntry, error)
+	// ListDir returns a one-level listing of a directory inside a running VM
+	// via boxd's FilesystemService.ListDir. Works on every sandbox regardless
+	// of boxd version.
+	ListDir(ctx context.Context, instanceID, path string) ([]DirEntry, error)
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 
 	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the
@@ -117,6 +121,15 @@ type BuildArtifactEntry struct {
 	TemplateID string
 	BuildID    string
 	MTimeUnix  int64
+}
+
+// DirEntry mirrors vmdpb.ListDirEntry — one entry returned by ListDir.
+// ModifiedUnix is 0 when the sandbox's boxd predates that field.
+type DirEntry struct {
+	Name         string
+	IsDir        bool
+	Size         int64
+	ModifiedUnix int64
 }
 
 // BuildLogEvent is one decoded event from StreamBuildLogs. Finished=true

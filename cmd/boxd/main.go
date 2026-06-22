@@ -1,11 +1,13 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -37,20 +39,58 @@ const (
 // dangerousPaths are paths that must never be modified via the filesystem API.
 var dangerousPaths = []string{"/proc", "/sys", "/dev", "/sbin/init", "/usr/local/bin/boxd"}
 
+// blockedPath returns an error if p is, or lives under, a blocklisted directory
+// (/proc, /sys, /dev, init, the boxd binary). p must already be cleaned.
+func blockedPath(p string) error {
+	for _, d := range dangerousPaths {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return fmt.Errorf("access denied: %s", d)
+		}
+	}
+	return nil
+}
+
 // safePath validates and cleans a filesystem path. It rejects paths that could
 // damage the VM's ability to function (init, boxd, /proc, /sys, /dev) and
 // prevents path traversal to root.
+//
+// NOTE: this is purely lexical — it does NOT resolve symlinks, so a path whose
+// components symlink into a blocklisted location still passes here. Directory
+// listing/archiving must additionally resolve the real path
+// (resolveWithinBlocklist) before reading it.
 func safePath(raw string) (string, error) {
 	p := filepath.Clean(raw)
 	if p == "/" || p == "." {
 		return "", fmt.Errorf("cannot operate on root directory")
 	}
-	for _, d := range dangerousPaths {
-		if p == d || strings.HasPrefix(p, d+"/") {
-			return "", fmt.Errorf("access denied: %s", d)
-		}
+	if err := blockedPath(p); err != nil {
+		return "", err
 	}
 	return p, nil
+}
+
+// resolveWithinBlocklist resolves every symlink in cleanPath (already
+// safePath-cleaned) and re-applies the blocklist to the real path. safePath is
+// lexical, so a symlinked component — a leaf (`export -> /proc`) or an
+// intermediate (`a -> /`, then `a/proc`) — passes its string check, after which
+// os.ReadDir / os.Stat / os.OpenRoot would follow it and enumerate the target.
+// Reading the returned (fully resolved, blocklist-verified) path closes that
+// bypass. EvalSymlinks requires the path to exist; a missing path returns an
+// os.IsNotExist error the caller maps to NotFound.
+//
+// A symlink swapped in between this resolution and the subsequent read is a
+// residual TOCTOU, accepted here because listing exposes only entry names the
+// sandbox occupant can already read via /exec; the byte-streaming zip path adds
+// O_NOFOLLOW per-file opens on top.
+func resolveWithinBlocklist(cleanPath string) (string, error) {
+	real, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		return "", err
+	}
+	if err := blockedPath(real); err != nil {
+		return "", err
+	}
+	return real, nil
 }
 
 func main() {
@@ -164,16 +204,10 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 	}
 }
 
-// setHostname sets the kernel hostname and writes /etc/hostname.
-func setHostname(name string) error {
-	if err := syscall.Sethostname([]byte(name)); err != nil {
-		return fmt.Errorf("sethostname: %w", err)
-	}
-	if err := os.WriteFile("/etc/hostname", []byte(name+"\n"), 0o644); err != nil {
-		return fmt.Errorf("write /etc/hostname: %w", err)
-	}
-	return nil
-}
+// setHostname is defined per-platform — see hostname_linux.go (the real
+// syscall.Sethostname implementation) and hostname_other.go (a stub so the
+// package stays buildable and unit-testable on non-Linux dev machines). boxd
+// only runs inside a Linux microVM in production.
 
 // ---------------------------------------------------------------------------
 // Process service (Connect RPC)
@@ -756,25 +790,37 @@ func (s *filesystemService) ListDir(ctx context.Context, req *connect.Request[pb
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	entries, err := os.ReadDir(path)
+	// Resolve symlinks and re-check the blocklist so a symlinked component
+	// (e.g. export -> /proc) can't be followed past safePath's lexical check.
+	realPath, err := resolveWithinBlocklist(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, connect.NewError(connect.CodeNotFound, err)
+		}
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	entries, truncated, err := collectDirEntries(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
 		}
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
+	if truncated {
+		// The ListDirResponse has no truncation flag yet, so log it: a clamped
+		// control-plane / console listing must not be silent (the same reason the
+		// zip path logs its entry cap). A ListDirResponse.truncated field for a
+		// "showing first N of many" banner is a follow-up.
+		log.Printf("files: ListDir of %q truncated to %d entries", realPath, maxListEntries)
+	}
 
-	var result []*pb.FileEntry
+	result := make([]*pb.FileEntry, 0, len(entries))
 	for _, e := range entries {
-		info, _ := e.Info()
-		size := int64(0)
-		if info != nil {
-			size = info.Size()
-		}
 		result = append(result, &pb.FileEntry{
-			Name:  e.Name(),
-			IsDir: e.IsDir(),
-			Size:  size,
+			Name:         e.Name,
+			IsDir:        e.IsDir,
+			Size:         e.Size,
+			ModifiedUnix: e.ModifiedUnix,
 		})
 	}
 
@@ -860,20 +906,464 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 	if info.IsDir() {
-		http.Error(w, `{"error":"use FilesystemService.ListDir for directories"}`, http.StatusBadRequest)
+		// A directory has no single byte stream, so it is only returned when the
+		// caller explicitly opts in to a representation via ?format=:
+		//   zip  → an archive of its contents      (serveDirAsZip)
+		//   json → a one-level listing of its names (serveDirAsJSON)
+		// Without a format flag we keep the original 400, so the SDK's
+		// files.read()/readText() (which never send one) still throw on a
+		// directory, exactly as before.
+		switch r.URL.Query().Get("format") {
+		case "zip":
+			serveDirAsZip(r.Context(), w, path)
+		case "json":
+			serveDirAsJSON(w, path)
+		default:
+			http.Error(w, `{"error":"use FilesystemService.ListDir for directories"}`, http.StatusBadRequest)
+		}
 		return
 	}
 
-	f, err := os.Open(path)
+	// Single-file download. The path is attacker-controlled and safePath/os.Stat
+	// above are lexical and symlink-following, so a sandbox can symlink it into the
+	// blocklist (export -> /proc/self/environ) or at a special file (FIFO/device).
+	// Resolve the real path and re-check the blocklist (as the zip/json directory
+	// paths do), then open the resolved file no-follow + non-blocking and re-stat
+	// the fd so only a regular file is served — closing the symlink bypass, the
+	// TOCTOU swap, and the FIFO/device block-or-stream-forever holes.
+	realPath, err := resolveWithinBlocklist(path)
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		} else {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	f, fi, err := openRegularNoFollow(realPath)
+	if err != nil {
+		switch {
+		case os.IsNotExist(err):
+			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
+		case errors.Is(err, errNotRegularFile):
+			writeJSONError(w, http.StatusBadRequest, "not a regular file")
+		default:
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 	defer f.Close()
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filepath.Base(path)))
-	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
+	http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
+}
+
+// errNotRegularFile marks a resolved download target that is not a regular file
+// (a directory, FIFO, socket, or device node).
+var errNotRegularFile = errors.New("not a regular file")
+
+// openRegularNoFollow opens an already-resolved, blocklist-checked path for
+// reading without following a final-component symlink (O_NOFOLLOW) and without
+// blocking on a FIFO (O_NONBLOCK), then confirms via fstat that the opened
+// descriptor is a regular file. This closes the time-of-check/time-of-use window
+// between symlink resolution and open (a swap to a symlink fails with ELOOP) and
+// refuses special files a hostile sandbox may have staged.
+func openRegularNoFollow(realPath string) (*os.File, os.FileInfo, error) {
+	f, err := os.OpenFile(realPath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, errNotRegularFile
+	}
+	return f, fi, nil
+}
+
+// serveDirAsJSON writes a one-level JSON listing of dirPath's entries. It is the
+// browser/console-facing surface of the same os.ReadDir that
+// FilesystemService.ListDir exposes internally, reached through the existing
+// /files allow-list via ?format=json — the proxy forwards the query untouched,
+// exactly as it does for ?format=zip, so no proxy change is needed.
+//
+// Unlike serveDirAsZip this never opens or streams file contents; it reports only
+// names, sizes, and modification times. So it deliberately skips the zip path's
+// symlink/TOCTOU hardening: the worst a symlink can do is have the listing follow
+// it like `ls` would, exposing entry names the sandbox occupant can already read
+// via /exec. safePath has already gated the requested path against the blocklist,
+// and the access token scopes the request to this one sandbox.
+func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
+	// Resolve symlinks and re-check the blocklist: handleFiles' safePath is
+	// lexical and its os.Stat already followed dirPath, so a symlinked directory
+	// (export -> /proc, /sys, /dev) would otherwise be listed wholesale.
+	realPath, err := resolveWithinBlocklist(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "file not found")
+		} else {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	entries, truncated, err := collectDirEntries(realPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "file not found")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if truncated {
+		log.Printf("files: json listing of %q truncated to %d entries", dirPath, maxListEntries)
+	}
+
+	body, err := json.Marshal(struct {
+		Entries   []dirEntryMeta `json:"entries"`
+		Truncated bool           `json:"truncated"`
+	}{Entries: entries, Truncated: truncated})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+}
+
+// writeJSONError writes a JSON error body with the correct content type.
+// http.Error would force text/plain even though the body is JSON, so the file
+// listing/download surfaces use this for a consistent {"error":...} shape.
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body, _ := json.Marshal(map[string]string{"error": msg})
+	_, _ = w.Write(body)
+}
+
+// dirEntryMeta is one directory entry's metadata, shared by the JSON listing
+// (serveDirAsJSON) and the gRPC listing (FilesystemService.ListDir) so the two
+// surfaces can't drift in which entries appear or how they degrade.
+type dirEntryMeta struct {
+	Name         string `json:"name"`
+	IsDir        bool   `json:"is_dir"`
+	Size         int64  `json:"size"`
+	ModifiedUnix int64  `json:"modified_unix"`
+}
+
+// maxListEntries bounds how many entries a single directory listing reads. A
+// hostile or merely huge directory (millions of files) would otherwise make boxd
+// — and the shared host vmd that buffers the whole reply with no message cap —
+// read every entry (plus a per-entry lstat) into memory at once, and overflow
+// the control plane's 4 MiB gRPC recv limit. The zip path already caps entries
+// (maxZipEntries); this is the listing-path counterpart, kept smaller because the
+// reply is buffered upstream and the console renders the rows. Var, not const, so
+// tests can lower it.
+var maxListEntries = 10_000
+
+// collectDirEntries lists one level of dirPath, reading at most maxListEntries
+// entries and reporting truncated=true when the directory held more. Reading a
+// bounded count (via f.ReadDir, which stops early — unlike os.ReadDir, which
+// slurps the whole directory first) keeps memory and lstat counts bounded on a
+// pathological directory. Per-entry Info() is an lstat that can fail if the entry
+// was removed mid-listing (the sandbox runs concurrently); such entries degrade
+// to zero size/mtime rather than being dropped, so the name still lists. Entries
+// come back in directory order (the console sorts client-side). The slice is
+// non-nil even when empty, so it marshals as [] rather than null.
+func collectDirEntries(dirPath string) ([]dirEntryMeta, bool, error) {
+	f, err := os.Open(dirPath)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+
+	// Read one past the cap so a directory with exactly maxListEntries entries
+	// isn't falsely flagged as truncated. f.ReadDir(n>0) returns io.EOF (with the
+	// entries read so far) only when it hits the end, which for a non-empty
+	// directory means it returned fewer than we asked for — not an error.
+	entries, err := f.ReadDir(maxListEntries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	truncated := false
+	if len(entries) > maxListEntries {
+		entries = entries[:maxListEntries]
+		truncated = true
+	}
+
+	out := make([]dirEntryMeta, 0, len(entries))
+	for _, e := range entries {
+		m := dirEntryMeta{Name: e.Name(), IsDir: e.IsDir()}
+		if info, err := e.Info(); err == nil {
+			m.Size = info.Size()
+			m.ModifiedUnix = info.ModTime().Unix()
+		}
+		out = append(out, m)
+	}
+	return out, truncated, nil
+}
+
+// maxZipEntries / maxZipBytes bound a directory archive so attacker-staged
+// content (millions of files, or a few multi-GB files) can't stream unbounded
+// and pin a proxy connection. Vars, not consts, so tests can lower them.
+var (
+	maxZipEntries = 100_000
+	maxZipBytes   = int64(2) << 30 // 2 GiB
+)
+
+// errZipLimit halts the zip walk when maxZipBytes is reached.
+var errZipLimit = errors.New("archive size limit exceeded")
+
+// cappedWriter stops the underlying writer once limit bytes have been written,
+// returning errZipLimit so an oversized archive aborts instead of streaming
+// indefinitely.
+type cappedWriter struct {
+	w      io.Writer
+	n      int64
+	limit  int64
+	sealed bool
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	// Once sealed, pass writes through unbounded so zip.Writer.Close can flush a
+	// valid central directory even after the byte cap tripped mid-file. Without
+	// this the deferred Close's own writes also fail with errZipLimit, the
+	// end-of-central-directory record is never written, and the archive is a
+	// corrupt byte stream most unzip clients reject outright.
+	if c.sealed {
+		return c.w.Write(p)
+	}
+	if c.n >= c.limit {
+		return 0, errZipLimit
+	}
+	if c.n+int64(len(p)) > c.limit {
+		avail := c.limit - c.n
+		n, _ := c.w.Write(p[:avail])
+		c.n += int64(n)
+		return n, errZipLimit
+	}
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// seal lets the zip writer's final flush (the central directory and
+// end-of-central-directory record) through after the byte cap has been reached,
+// so a size-capped archive is still a valid zip rather than a corrupt stream.
+func (c *cappedWriter) seal() { c.sealed = true }
+
+// serveDirAsZip streams a ZIP archive of dirPath's contents. Entry names are
+// relative to dirPath and prefixed with its base name, so the archive expands
+// to `<base>/...`.
+//
+// The directory's contents are attacker-controlled and can change mid-walk (the
+// sandbox runs untrusted code), so the walk is hardened against it:
+//
+//   - The whole walk and every file open go through an os.Root anchored at
+//     dirPath. os.Root errors on any path that resolves outside the root, so no
+//     entry — including one reached through a symlink swapped in mid-walk — can
+//     escape the requested directory.
+//   - Only directories and regular files are archived. Symlinks, FIFOs, sockets
+//     and device nodes are skipped, so a named pipe can't block the download and
+//     special files never land in the archive. (os.Root on its own does not
+//     exclude /proc or device files, hence this filter plus the safePath check.)
+//   - Each file is opened through the root with O_NOFOLLOW (a regular file
+//     swapped for a symlink fails with ELOOP instead of being followed) and
+//     O_NONBLOCK (a swap for a FIFO can't block the open); the open fd is then
+//     re-stat'd and skipped unless it is still a regular file, closing the
+//     time-of-check/time-of-use window.
+//   - safePath is re-applied to every descendant so the blocklist (/proc, /sys,
+//     /dev, the boxd binary, ...) is enforced below the top-level argument too.
+//
+// os.OpenRoot validates the directory before the first byte, so a bad request
+// still gets a clean error. Once the archive starts streaming the HTTP status is
+// committed, so per-file errors are logged and skipped rather than aborting the
+// whole download. Entries are written as the walk proceeds — constant memory,
+// no temp file.
+func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
+	// Resolve the parent's real path first so a symlinked component — a leaf, or
+	// an INTERMEDIATE one (a -> /, then a/proc) — can't anchor the archive root
+	// outside the requested tree: os.OpenRoot follows symlinks while opening its
+	// own root and safePath is lexical, so without this the walk escapes past the
+	// blocklist. Then anchor os.Root at the resolved parent, refuse a symlinked
+	// leaf via a no-follow Lstat, and re-check the blocklist on the real dir.
+	realParent, err := filepath.EvalSymlinks(filepath.Dir(dirPath))
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "file not found")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	base := filepath.Base(dirPath)
+	// Re-apply the blocklist to the resolved real directory (realParent/base) so
+	// e.g. a -> / then a/dev (→ /dev) is refused.
+	realDir := filepath.Join(realParent, base)
+	if err := blockedPath(realDir); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	parent, err := os.OpenRoot(realParent)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer parent.Close()
+
+	if li, err := parent.Lstat(base); err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "file not found")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	} else if li.Mode()&fs.ModeSymlink != 0 {
+		writeJSONError(w, http.StatusBadRequest, "refusing to archive a symlinked directory")
+		return
+	}
+
+	// Anchor every subsequent open to the real directory. OpenRoot also
+	// validates it before we commit a 200 + headers and confines the walk.
+	root, err := parent.OpenRoot(base)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer root.Close()
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipDownloadFilename(base)))
+
+	// Bound the archive so attacker-staged content can't stream unbounded and
+	// pin a proxy connection (boxd runs with WriteTimeout: 0): cappedWriter caps
+	// total output bytes; entryCount caps the entry count in the walk below.
+	cw := &cappedWriter{w: w, limit: maxZipBytes}
+	zw := zip.NewWriter(cw)
+	// Deferred LIFO: cw.seal() runs first so the byte cap stops blocking, then
+	// zw.Close() flushes the central directory — yielding a valid (if truncated)
+	// archive instead of a corrupt stream when the cap tripped mid-file.
+	defer zw.Close()
+	defer cw.seal()
+	entryCount := 0
+
+	// Walking root.FS() confines traversal to the tree and never follows
+	// symlinks while descending; rel is a slash path relative to dirPath.
+	zipErr := fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, walkErr error) error {
+		// Stop promptly if the client has gone away — the HTTP server cancels the
+		// request context on disconnect. Without this the walk keeps reading and
+		// compressing the entire tree to a dead socket: boxd runs with
+		// WriteTimeout: 0, and once the connection breaks the byte cap stops
+		// advancing, so only the entry cap would bound the wasted work.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			// Unreadable entry mid-walk: log and skip, keep the archive going.
+			log.Printf("files: zip walk skip %q: %v", rel, walkErr)
+			return nil
+		}
+		if rel == "." {
+			return nil // the directory itself; entries carry the base prefix
+		}
+		// Enforce the blocklist on descendants, not just the top-level path.
+		// Join against the RESOLVED realDir (not the literal dirPath) so the
+		// check reflects where the walk actually reads — an intermediate symlink
+		// can't make a real /proc path look like a benign string.
+		if err := blockedPath(filepath.Join(realDir, rel)); err != nil {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		entryCount++
+		if entryCount > maxZipEntries {
+			log.Printf("files: zip entry cap (%d) reached for %q — archive truncated", maxZipEntries, dirPath)
+			return fs.SkipAll
+		}
+
+		name := filepath.Join(base, rel)
+
+		if d.IsDir() {
+			// Trailing slash marks a directory entry; preserves empty dirs.
+			if _, err := zw.Create(name + "/"); err != nil {
+				log.Printf("files: zip create dir %q: %v", name, err)
+			}
+			return nil
+		}
+		// Only regular files are archived — skip symlinks, FIFOs, sockets and
+		// device nodes before opening anything.
+		if !d.Type().IsRegular() {
+			return nil
+		}
+
+		// Open through the root (can't escape) with no-follow + non-blocking, so
+		// a TOCTOU swap to a symlink or FIFO can't be followed or block us.
+		f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			log.Printf("files: zip skip %q: %v", rel, err)
+			return nil
+		}
+		// Re-check the opened descriptor: only copy if it is still a regular
+		// file (defeats a swap that happened between WalkDir and the open).
+		if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+			f.Close()
+			log.Printf("files: zip skip non-regular %q", rel)
+			return nil
+		}
+		fw, err := zw.Create(name)
+		if err != nil {
+			f.Close()
+			log.Printf("files: zip create %q: %v", name, err)
+			return nil
+		}
+		if _, err := io.Copy(fw, f); err != nil {
+			f.Close()
+			if errors.Is(err, errZipLimit) {
+				log.Printf("files: zip byte cap (%d) reached — archive truncated", maxZipBytes)
+				return fs.SkipAll
+			}
+			// A canceled context means the copy failed because the client went
+			// away (the write to w broke): abort the whole walk rather than read
+			// on to the next file. A copy error with a live context is a per-file
+			// read failure (e.g. the file vanished mid-walk) — skip it and keep
+			// archiving the rest.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			log.Printf("files: zip copy %q: %v", rel, err)
+			return nil
+		}
+		f.Close()
+		return nil
+	})
+	if zipErr != nil {
+		// SkipDir/SkipAll are consumed by WalkDir, so a surfaced error is the
+		// context cancellation returned above — the client disconnected mid-zip.
+		log.Printf("files: zip of %q aborted (client gone): %v", dirPath, zipErr)
+	}
+}
+
+// zipDownloadFilename builds the quoted Content-Disposition filename for a
+// directory archive. The base name comes from the filesystem and can contain a
+// literal double-quote, which would break the quoted-string, or control bytes;
+// strip those. (Go's header writer already rejects CR/LF.)
+func zipDownloadFilename(base string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || r < 0x20 {
+			return -1
+		}
+		return r
+	}, base)
+	if cleaned == "" {
+		cleaned = "download"
+	}
+	return cleaned + ".zip"
 }
 
 // storageFullResponse is the canonical 507 body we return whenever a

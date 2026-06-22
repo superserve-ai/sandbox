@@ -472,6 +472,49 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/{sandbox_id}/files:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    get:
+      operationId: listSandboxFiles
+      tags: [Files]
+      summary: List a directory inside a sandbox
+      description: |
+        Returns a one-level listing of a directory inside the sandbox. The
+        listing is served through the control plane, so it works on every
+        sandbox regardless of when it was created. A paused sandbox is resumed
+        automatically before the listing and stays active afterward.
+        `modified_unix` is 0 for entries on older sandboxes that predate that
+        field.
+      security:
+        - apiKey: []
+      parameters:
+        - name: path
+          in: query
+          required: false
+          description: Absolute directory path to list. Defaults to "/".
+          schema:
+            type: string
+            example: /home/user
+      responses:
+        "200":
+          description: Directory listing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirListing"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /exec/connect:
     servers:
       - url: https://sandbox.superserve.ai
@@ -1416,6 +1459,34 @@ components:
         access_token:
           type: string
           description: Fresh access token; use this instead of the one from create.
+
+    DirListing:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirEntry"
+
+    DirEntry:
+      type: object
+      required: [name, is_dir, size, modified_unix]
+      properties:
+        name:
+          type: string
+          description: Entry name (basename, not a full path).
+        is_dir:
+          type: boolean
+          description: True when the entry is a directory.
+        size:
+          type: integer
+          format: int64
+          description: Size in bytes.
+        modified_unix:
+          type: integer
+          format: int64
+          description: Modification time (Unix seconds). 0 on older sandboxes that predate this field.
 
     ExecRequest:
       type: object
