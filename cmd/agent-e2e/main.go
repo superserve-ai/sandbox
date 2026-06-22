@@ -39,51 +39,64 @@ func main() {
 		fail("-boxd-url is required")
 	}
 
-	// The harness "turn": a real in-guest command that reads the event from
-	// $ACTOR_EVENT (how boxddeliver delivers it) and streams a reply on stdout.
-	turnArgv := []string{"sh", "-c", `printf 'REPLY[%s]' "$ACTOR_EVENT"`}
+	fmt.Printf("Driving %d agent turns through Registry+Lease+Router → vmdwaker → boxddeliver → real boxd:\n", *turns)
+	results, err := driveTurns(*boxdURL, *agentName, *turns, harnessTurnArgv)
+	if err != nil {
+		fail(err.Error())
+	}
+	for _, r := range results {
+		want := "REPLY[" + r.payload + "]"
+		if !strings.Contains(r.reply, want) {
+			fail(fmt.Sprintf("turn %q: harness reply %q does not contain %q", r.payload, r.reply, want))
+		}
+		fmt.Printf("  sent %q → harness streamed %q  (%s) ✓\n", r.payload, r.reply, r.elapsed.Round(time.Millisecond))
+	}
+	fmt.Printf("\nPASS — %d turns delivered to the in-guest harness and streamed back through the Actor loop.\n", *turns)
+}
 
-	// PRODUCTION delivery path: boxddeliver.Deliverer → HTTPExecStreamer → boxd
-	// /exec/stream. One VM serves the Actor, so urlFor is constant; boxd itself
-	// is unauthenticated (the edge proxy authenticates in prod), so no token.
+// harnessTurnArgv is the in-guest "turn": read the event from $ACTOR_EVENT (how
+// boxddeliver delivers it) and stream a reply on stdout.
+var harnessTurnArgv = []string{"sh", "-c", `printf 'REPLY[%s]' "$ACTOR_EVENT"`}
+
+// turnResult is one driven turn's outcome.
+type turnResult struct {
+	payload string
+	reply   string
+	elapsed time.Duration
+}
+
+// driveTurns wires the PRODUCTION agent-loop runtime — actor.Registry (lease) +
+// actor.Router (wake-on-reference, serial inbox + Relay) + the real
+// vmdwaker.Waker + the real boxddeliver.Deliverer over HTTPExecStreamer at
+// boxdURL — and routes `turns` events through it, returning each turn's streamed
+// reply. Only the SandboxBooter is stubbed (the sandbox is pre-booted). Shared by
+// main (real boxd) and the test (httptest fake boxd).
+func driveTurns(boxdURL, agentName string, turns int, turnArgv []string) ([]turnResult, error) {
 	streamer := boxddeliver.NewHTTPExecStreamer(
 		&http.Client{Timeout: 30 * time.Second},
-		func(string) string { return *boxdURL },
+		func(string) string { return boxdURL },
 		func(string) (string, error) { return "", nil },
 	)
 	deliverer := boxddeliver.New(streamer, turnArgv)
-
-	// REAL vmdwaker.Waker; only the SandboxBooter is stubbed (the VM is already
-	// up). Wake returns a Handler that runs the Deliverer per turn and closes the
-	// Relay at turn end — exactly the production path.
 	waker := vmdwaker.New(prebootedBooter{}, deliverer, func(actor.Actor) (vmdwaker.Target, error) {
 		return vmdwaker.Target{}, nil
 	})
-
 	reg := actor.NewRegistry(actor.NewMemStore(), nil)
 	router := actor.NewRouter(reg, waker, "agent-e2e", 16)
 	ctx := context.Background()
 
-	fmt.Printf("Driving %d agent turns through Registry+Lease+Router → vmdwaker → boxddeliver → real boxd:\n", *turns)
-	for i := 1; i <= *turns; i++ {
+	var results []turnResult
+	for i := 1; i <= turns; i++ {
 		payload := fmt.Sprintf("event-%d", i)
 		relay := actor.NewRelay()
 		ev := actor.Event{ID: fmt.Sprintf("ev-%d", i), Type: "msg", Payload: []byte(payload), Out: relay}
-
 		start := time.Now()
-		if err := router.Route(ctx, "team-e2e", *agentName, actor.Actor{}, ev); err != nil {
-			fail(fmt.Sprintf("turn %d: Route: %v", i, err))
+		if err := router.Route(ctx, "team-e2e", agentName, actor.Actor{}, ev); err != nil {
+			return results, fmt.Errorf("turn %d (%q): Route: %w", i, payload, err)
 		}
-		reply := drain(ctx, relay)
-		elapsed := time.Since(start)
-
-		want := "REPLY[" + payload + "]"
-		if !strings.Contains(reply, want) {
-			fail(fmt.Sprintf("turn %d: harness reply %q does not contain %q", i, reply, want))
-		}
-		fmt.Printf("  turn %d: sent %q → harness streamed %q  (%s) ✓\n", i, payload, reply, elapsed.Round(time.Millisecond))
+		results = append(results, turnResult{payload: payload, reply: drain(ctx, relay), elapsed: time.Since(start)})
 	}
-	fmt.Printf("\nPASS — %d turns delivered to the real in-guest harness and streamed back through the Actor loop.\n", *turns)
+	return results, nil
 }
 
 // drain reads the turn's Relay to completion, returning the concatenated reply.
