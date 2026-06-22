@@ -196,6 +196,18 @@ type ApiKey struct {
 	CreatedAt  time.Time          `json:"created_at"`
 }
 
+type AuditLog struct {
+	ID           int64       `json:"id"`
+	ActorUserID  pgtype.UUID `json:"actor_user_id"`
+	TargetUserID pgtype.UUID `json:"target_user_id"`
+	TeamID       pgtype.UUID `json:"team_id"`
+	EventType    string      `json:"event_type"`
+	OldValue     []byte      `json:"old_value"`
+	NewValue     []byte      `json:"new_value"`
+	Metadata     []byte      `json:"metadata"`
+	CreatedAt    time.Time   `json:"created_at"`
+}
+
 type BillingPeriodAnomaly struct {
 	ID          uuid.UUID          `json:"id"`
 	TeamID      uuid.UUID          `json:"team_id"`
@@ -301,6 +313,14 @@ type NetFlow struct {
 	DurationMs *int32     `json:"duration_ms"`
 }
 
+type Permission struct {
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Description *string   `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type PricingPlan struct {
 	Key       string    `json:"key"`
 	Name      string    `json:"name"`
@@ -370,6 +390,21 @@ type RevokedProxyToken struct {
 	ProxyToken string    `json:"proxy_token"`
 	RevokedAt  time.Time `json:"revoked_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+type Role struct {
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	ScopeType   string    `json:"scope_type"`
+	Description *string   `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type RolePermission struct {
+	RoleID       uuid.UUID `json:"role_id"`
+	PermissionID uuid.UUID `json:"permission_id"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type Sandbox struct {
@@ -565,6 +600,15 @@ type TeamMember struct {
 	JoinedAt  time.Time `json:"joined_at"`
 }
 
+type TeamMembership struct {
+	ID        uuid.UUID `json:"id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type TeamPricingPlan struct {
 	TeamID        uuid.UUID          `json:"team_id"`
 	PlanKey       string             `json:"plan_key"`
@@ -609,4 +653,17 @@ type TemplateBuild struct {
 	FinalizedAt   pgtype.Timestamptz  `json:"finalized_at"`
 	CreatedAt     time.Time           `json:"created_at"`
 	UpdatedAt     time.Time           `json:"updated_at"`
+}
+
+type UserRoleAssignment struct {
+	ID        uuid.UUID          `json:"id"`
+	UserID    uuid.UUID          `json:"user_id"`
+	RoleID    uuid.UUID          `json:"role_id"`
+	ScopeType string             `json:"scope_type"`
+	TeamID    pgtype.UUID        `json:"team_id"`
+	GrantedBy pgtype.UUID        `json:"granted_by"`
+	GrantedAt time.Time          `json:"granted_at"`
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt time.Time          `json:"created_at"`
+	UpdatedAt time.Time          `json:"updated_at"`
 }
