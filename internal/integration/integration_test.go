@@ -2232,8 +2232,8 @@ func TestIntegration_FailStuckTransitionalSandboxes(t *testing.T) {
 	insert := func(status string, updatedAt time.Time) uuid.UUID {
 		id := uuid.New()
 		if _, err := testPool.Exec(ctx,
-			`INSERT INTO sandbox (id, team_id, name, status, updated_at) VALUES ($1,$2,$3,$4,$5)`,
-			id, teamID, "stuck-"+status, status, updatedAt); err != nil {
+			`INSERT INTO sandbox (id, team_id, name, status, host_id, updated_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+			id, teamID, "stuck-"+status, status, "host-1", updatedAt); err != nil {
 			t.Fatalf("insert %s: %v", status, err)
 		}
 		return id
