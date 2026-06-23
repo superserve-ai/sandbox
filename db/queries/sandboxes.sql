@@ -116,17 +116,33 @@ UPDATE sandbox
 SET snapshot_id = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
--- name: DestroySandbox :exec
--- Atomic soft-delete AND close of any open sandbox_active_interval row, so
--- a crash/timeout after the destroy can't leave an open interval that
--- causes weekly_user_metrics to count the actor as active forever. If the
--- WHERE clause matches 0 rows (already-deleted sandbox), the close CTE
--- also matches 0 rows via the empty `destroyed` subquery → no-op.
+-- name: DestroySandbox :one
+-- Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
+-- (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+-- whose owning worker is provably gone — updated_at older than
+-- stale_transitional_before. It never claims a live transition, so it serializes
+-- against a concurrent resume/pause (this CAS and BeginResume target the same row,
+-- only one wins) while still letting a crash-wedged sandbox be deleted. Writes the
+-- revocation row and closes open billing/active intervals in the same statement,
+-- so a crash after the claim can't strand a deleted sandbox with a live JWT or an
+-- open interval. Returns the claimed id; 0 rows means already-deleted or a still-live
+-- transition — the caller distinguishes the two with a re-read.
 WITH destroyed AS (
   UPDATE sandbox
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
-  WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  WHERE sandbox.id = sqlc.arg(id) AND sandbox.team_id = sqlc.arg(team_id)
+    AND sandbox.destroyed_at IS NULL
+    AND (
+      sandbox.status IN ('active', 'paused', 'failed')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+          AND sandbox.updated_at < sqlc.arg(stale_transitional_before))
+    )
   RETURNING id
+),
+revoked AS (
+  INSERT INTO sandbox_revocation (sandbox_id, expires_at)
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed
+  ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
   UPDATE sandbox_active_interval
@@ -141,11 +157,15 @@ closed_billing_compute AS (
   WHERE sandbox_id IN (SELECT id FROM destroyed)
     AND ended_at IS NULL
   RETURNING sandbox_id
+),
+closed_storage AS (
+  UPDATE sandbox_storage_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
+  WHERE sandbox_id IN (SELECT id FROM destroyed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_storage_interval
-SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
-WHERE sandbox_id IN (SELECT id FROM destroyed)
-  AND ended_at IS NULL;
+SELECT id FROM destroyed;
 
 -- name: SandboxExists :one
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);

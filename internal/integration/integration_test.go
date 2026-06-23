@@ -2224,6 +2224,45 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected sandbox to be gone after delete")
 	}
+
+	// The revocation row is written in the same statement as the soft-delete.
+	var revoked int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_revocation WHERE sandbox_id = $1`, sandboxID).Scan(&revoked); err != nil {
+		t.Fatalf("revocation query: %v", err)
+	}
+	if revoked != 1 {
+		t.Errorf("sandbox_revocation rows = %d, want 1", revoked)
+	}
+}
+
+// TestIntegration_DeleteStaleTransitionalSandbox proves DELETE claims a
+// crash-wedged (stale) transitional sandbox but still 409s a live transition.
+func TestIntegration_DeleteStaleTransitionalSandbox(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	insert := func(updatedAt time.Time) uuid.UUID {
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id, updated_at) VALUES ($1,$2,$3,'resuming','host-1',$4)`,
+			id, teamID, "wedged", updatedAt); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		return id
+	}
+
+	// Stale (> grace) resuming row: the worker is provably gone, so it's deletable.
+	stale := insert(time.Now().Add(-30 * time.Minute))
+	if dw := do(r, "DELETE", "/sandboxes/"+stale.String(), apiKey, ""); dw.Code != http.StatusNoContent {
+		t.Fatalf("delete stale transitional: got %d, want 204: %s", dw.Code, dw.Body.String())
+	}
+
+	// Fresh resuming row: a live transition must not be deletable (409).
+	fresh := insert(time.Now())
+	if fw := do(r, "DELETE", "/sandboxes/"+fresh.String(), apiKey, ""); fw.Code != http.StatusConflict {
+		t.Fatalf("delete fresh transitional: got %d, want 409: %s", fw.Code, fw.Body.String())
+	}
 }
 
 func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {

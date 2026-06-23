@@ -124,6 +124,12 @@ const vmdTimeout = 30 * time.Second
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
+// staleTransitionGrace is how long a sandbox must sit in a transitional state
+// (starting/resuming/pausing) before DELETE may claim it: past this, its worker
+// is provably gone (every VMD call caps at vmdTimeout and a live worker reverts),
+// so deleting it cannot race a live resume/pause.
+const staleTransitionGrace = 15 * time.Minute
+
 // logSandboxActivity writes a sandbox-scoped activity record in a background
 // goroutine. The request context is stripped of cancellation via
 // context.WithoutCancel so the goroutine is not killed when the HTTP response
@@ -812,52 +818,58 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	// Destroy the VM (skip if sandbox never booted).
-	if sandbox.Status != db.SandboxStatusFailed {
-		vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-		if vmdLookupErr != nil {
-			log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete failed")
-			respondError(c, ErrInternal)
+	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
+	// from a quiescent state (active/paused/failed) or a transitional state whose
+	// worker is provably gone (stale), so it serializes against a live resume/pause
+	// — this CAS and resume's BeginResume cannot both win the same row — while still
+	// letting a crash-wedged sandbox be deleted. The same statement writes the
+	// revocation row, so a crash before teardown can't leave a live VM with a valid JWT.
+	if _, err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
+		ID:                      sandboxID,
+		TeamID:                  teamID,
+		RevocationExpiresAt:     time.Now().Add(SecretsJWTLifetime),
+		StaleTransitionalBefore: time.Now().Add(-staleTransitionGrace),
+	}); err != nil {
+		if err == pgx.ErrNoRows {
+			// Not claimable from its current state. Re-read to tell a
+			// just-completed delete (idempotent) from a transitional state
+			// (resuming/pausing/starting) the caller should retry.
+			cur, gerr := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+			switch {
+			case gerr == pgx.ErrNoRows:
+				c.Status(http.StatusNoContent)
+			case gerr != nil:
+				log.Error().Err(gerr).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox re-read failed")
+				respondError(c, ErrInternal)
+			default:
+				log.Warn().Str("sandbox_id", sandboxID.String()).Str("status", string(cur.Status)).Msg("delete deferred: sandbox is mid-transition")
+				respondError(c, ErrInvalidState)
+			}
 			return
 		}
-		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-		defer vmdCancel()
-		if err := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); err != nil {
-			// Delete is idempotent — if the VM is already gone, proceed
-			// with DB cleanup instead of failing the request.
-			if isVMDNotFound(err) {
-				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance: VM already gone, proceeding with DB cleanup")
-			} else {
-				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance failed")
-				respondError(c, ErrInternal)
-				return
-			}
-		}
-	}
-
-	// Soft-delete in DB.
-	if err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB DestroySandbox failed")
 		respondError(c, ErrInternal)
 		return
 	}
 
-	// Record the revocation so daemons can refuse the JWT, and fan out the
-	// notification to the host. Detach from the request context so a client
-	// disconnect mid-DELETE doesn't strand a destroyed sandbox without its
-	// revocation row. Bootstrap-on-restart still recovers if fanout fails.
-	revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
-	defer revokeCancel()
-	if err := h.DB.InsertSandboxRevocation(revokeCtx, db.InsertSandboxRevocationParams{
-		SandboxID: sandboxID,
-		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
-	}); err != nil {
-		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertSandboxRevocation failed")
+	// The revocation row is committed with the claim above; fan it out to the
+	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
+	// from the persisted row on restart.
+	go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+
+	// Tear down the VM best-effort and unconditionally: a sandbox claimed from a
+	// stale transition or a 'failed' state may still hold a VM, run dir, and netns
+	// that only DestroyInstance reclaims (an absent VM is an idempotent no-op). A
+	// failure here is reconciled by the vm reconciler, so a vmd hiccup must not fail
+	// an already-committed delete.
+	if vmd, lookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID); lookupErr != nil {
+		log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
 	} else {
-		go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+		if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
+			log.Warn().Err(derr).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
+		}
+		vmdCancel()
 	}
 
 	// Best-effort cleanup of pause snapshots. Failures are logged but

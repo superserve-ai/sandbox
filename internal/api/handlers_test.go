@@ -225,6 +225,15 @@ func notFoundRow() *mockRow {
 	return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
 }
 
+// idRow returns a mockRow that scans a single uuid — for queries like
+// DestroySandbox that RETURN the claimed id.
+func idRow(id uuid.UUID) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = id
+		return nil
+	}}
+}
+
 func errorRow(err error) *mockRow {
 	return &mockRow{scanFn: func(...any) error { return err }}
 }
@@ -315,10 +324,14 @@ func TestDeleteSandbox_Success(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "FROM sandbox") {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID) // DestroySandbox claim
+			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
+			default:
+				return activityRow()
 			}
-			return activityRow()
 		},
 		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
@@ -334,6 +347,99 @@ func TestDeleteSandbox_Success(t *testing.T) {
 	}
 	if !destroyCalled {
 		t.Error("VMD.DestroyInstance was not called")
+	}
+}
+
+// TestDeleteSandbox_RevocationAtomicWithClaim verifies the revocation is written
+// in the same statement that commits the soft-delete, leaving no crash window in
+// which a deleted sandbox lacks a revocation row.
+func TestDeleteSandbox_RevocationAtomicWithClaim(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive, HostID: "host-1"}
+
+	var claimHasRevocation, claimHasExpiry, separateRevokeExec bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				if strings.Contains(sql, "sandbox_revocation") {
+					claimHasRevocation = true
+				}
+				for _, a := range args {
+					if ts, ok := a.(time.Time); ok && !ts.IsZero() {
+						claimHasExpiry = true
+					}
+				}
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "INSERT INTO sandbox_revocation") {
+				separateRevokeExec = true
+			}
+			return pgconn.NewCommandTag("OK"), nil
+		},
+	}
+
+	h := &Handlers{VMD: &stubVMD{destroyFn: func(context.Context, string, bool) error { return nil }}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if !claimHasRevocation {
+		t.Error("DestroySandbox claim does not write the revocation row")
+	}
+	if !claimHasExpiry {
+		t.Error("DestroySandbox not called with a revocation expiry")
+	}
+	if separateRevokeExec {
+		t.Error("revocation must be atomic with the claim, not a separate insert")
+	}
+}
+
+// TestDeleteSandbox_Failed_StillAttemptsTeardown guards against leaking a
+// reaper-recovered 'failed' sandbox's VM/run dir/netns: 'failed' no longer
+// implies "never booted", so teardown must still run.
+func TestDeleteSandbox_Failed_StillAttemptsTeardown(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusFailed}
+
+	var destroyCalled bool
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { destroyCalled = true; return nil }}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("OK"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if !destroyCalled {
+		t.Error("teardown must be attempted for a failed sandbox (may still hold resources)")
 	}
 }
 
@@ -410,7 +516,9 @@ func TestDeleteSandbox_DBGetError(t *testing.T) {
 	}
 }
 
-func TestDeleteSandbox_VMDDestroyError(t *testing.T) {
+// Teardown is best-effort AFTER the DB claim commits the delete, so a vmd
+// failure no longer fails the request — the reconciler reclaims the VM.
+func TestDeleteSandbox_TeardownError_StillCommits(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
@@ -419,16 +527,25 @@ func TestDeleteSandbox_VMDDestroyError(t *testing.T) {
 		return fmt.Errorf("vmd unreachable")
 	}}
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
 
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d (teardown is best-effort after the claim); body: %s", w.Code, http.StatusNoContent, w.Body.String())
 	}
 }
 
@@ -439,10 +556,13 @@ func TestDeleteSandbox_DBDestroyError(t *testing.T) {
 
 	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { return nil }}
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag(""), fmt.Errorf("db write failed")
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM destroyed") {
+				return errorRow(fmt.Errorf("db write failed")) // DestroySandbox claim errors
+			}
+			return sandboxRow(sb)
 		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
@@ -461,17 +581,19 @@ func TestDeleteSandbox_ActivityLogFailure_StillReturns204(t *testing.T) {
 
 	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { return nil }}
 
-	queryRowCall := 0
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			queryRowCall++
-			if queryRowCall == 1 {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID) // DestroySandbox claim
+			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb) // GetSandbox
+			default:
+				return errorRow(fmt.Errorf("activity table locked")) // CreateActivity
 			}
-			return errorRow(fmt.Errorf("activity table locked")) // CreateActivity
 		},
 		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil // DestroySandbox
+			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
 
@@ -482,6 +604,70 @@ func TestDeleteSandbox_ActivityLogFailure_StillReturns204(t *testing.T) {
 	// Activity logging failure is non-fatal — should still return 204.
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+}
+
+// A sandbox mid-transition (resuming/pausing/starting) can't be claimed: the
+// guarded soft-delete matches 0 rows, so delete defers with 409 rather than
+// tearing down a VM a concurrent resume is bringing up.
+func TestDeleteSandbox_Resuming_Returns409(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusResuming}
+
+	var destroyCalled bool
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { destroyCalled = true; return nil }}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM destroyed") {
+				return notFoundRow() // claim rejected: not a quiescent state
+			}
+			return sandboxRow(sb) // GetSandbox (top + re-read) → resuming
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409 (delete must defer while resuming); body: %s", w.Code, w.Body.String())
+	}
+	if destroyCalled {
+		t.Error("must NOT tear down a sandbox it couldn't claim")
+	}
+}
+
+// If the row is soft-deleted concurrently between the existence read and the
+// claim, the delete is idempotent (the goal is already met) → 204.
+func TestDeleteSandbox_ConcurrentlyDeleted_Idempotent(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { return nil }}
+	getCalls := 0
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM destroyed") {
+				return notFoundRow() // claim lost: already deleted concurrently
+			}
+			getCalls++
+			if getCalls == 1 {
+				return sandboxRow(sb) // first read: alive
+			}
+			return notFoundRow() // re-read: gone
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want 204 (already-deleted is idempotent); body: %s", w.Code, w.Body.String())
 	}
 }
 
