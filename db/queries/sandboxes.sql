@@ -85,10 +85,7 @@ WITH activated AS (
       memory_mib = $3,
       ip_address = $4,
       updated_at = now()
-  -- Guarded on the source status so a reaper that failed a stuck transition
-  -- (FailStuckTransitionalSandboxes) is not silently resurrected to active.
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
-    AND sandbox.status IN ('starting', 'resuming')
   RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
 ),
 opened_compute AS (
@@ -120,20 +117,26 @@ SET snapshot_id = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
 -- name: DestroySandbox :one
--- Atomic, guarded soft-delete that claims the sandbox for deletion ONLY from a
--- quiescent state (active/paused/failed) — never mid-transition. This is the
--- serialization point against a concurrent resume/pause: this CAS and resume's
--- BeginResume both target the same row, so only one wins. Writes the revocation
--- row and closes open billing/active intervals in the same statement, so a crash
--- after the claim can't strand a deleted sandbox with a live JWT or an open
--- interval that a retry would never fix. Returns the claimed id; 0 rows means
--- already-deleted or transitional — the caller distinguishes the two with a re-read.
+-- Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
+-- (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+-- whose owning worker is provably gone — updated_at older than
+-- stale_transitional_before. It never claims a live transition, so it serializes
+-- against a concurrent resume/pause (this CAS and BeginResume target the same row,
+-- only one wins) while still letting a crash-wedged sandbox be deleted. Writes the
+-- revocation row and closes open billing/active intervals in the same statement,
+-- so a crash after the claim can't strand a deleted sandbox with a live JWT or an
+-- open interval. Returns the claimed id; 0 rows means already-deleted or a still-live
+-- transition — the caller distinguishes the two with a re-read.
 WITH destroyed AS (
   UPDATE sandbox
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
   WHERE sandbox.id = sqlc.arg(id) AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
-    AND sandbox.status IN ('active', 'paused', 'failed')
+    AND (
+      sandbox.status IN ('active', 'paused', 'failed')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+          AND sandbox.updated_at < sqlc.arg(stale_transitional_before))
+    )
   RETURNING id
 ),
 revoked AS (
@@ -221,42 +224,6 @@ SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL;
 
--- name: FailStuckTransitionalSandboxes :many
--- Marks 'failed' sandboxes a crashed worker left mid-transition: a row still in
--- starting/resuming/pausing past stuck_before is un-resumable and un-deletable
--- (both claims require a settled state). The status + age guard spares
--- transitions still in progress; SKIP LOCKED divides the batch across replicas.
-WITH stuck AS (
-  SELECT s.id FROM sandbox s
-  WHERE s.destroyed_at IS NULL
-    AND s.status IN ('starting', 'resuming', 'pausing')
-    AND s.updated_at < sqlc.arg(stuck_before)
-  ORDER BY s.updated_at ASC
-  LIMIT sqlc.arg(max_rows)
-  FOR UPDATE SKIP LOCKED
-),
-failed AS (
-  UPDATE sandbox
-  SET status = 'failed', updated_at = now()
-  WHERE id IN (SELECT id FROM stuck)
-  RETURNING id, team_id, name
-),
-closed_active AS (
-  UPDATE sandbox_active_interval
-  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-  WHERE sandbox_id IN (SELECT id FROM failed)
-    AND ended_at IS NULL
-  RETURNING sandbox_id
-),
-closed_billing AS (
-  UPDATE sandbox_compute_billing_interval
-  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-  WHERE sandbox_id IN (SELECT id FROM failed)
-    AND ended_at IS NULL
-  RETURNING sandbox_id
-)
-SELECT id, team_id, name FROM failed;
-
 -- name: BeginPause :one
 -- Atomic ownership + state check + transition to 'pausing' AND close of any
 -- open sandbox_active_interval row, all in one statement so the "sandbox
@@ -319,11 +286,8 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 -- One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
 -- the UPSERT.
 WITH target AS (
-  -- Guarded on the source status so a reaper-failed stuck transition is not
-  -- resurrected to paused (resume-revert flips 'resuming', pause flips 'pausing').
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-    AND status IN ('pausing', 'resuming')
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)

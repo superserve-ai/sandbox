@@ -748,7 +748,7 @@ func TestResumeSandbox_Success(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'resuming'"):
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb) // BeginResume RETURNING *
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
@@ -806,7 +806,7 @@ func TestResumeSandbox_ReappliesSecretBindings(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'resuming'"):
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
@@ -960,7 +960,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'resuming'"):
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
@@ -1019,7 +1019,7 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'resuming'"):
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
 				atomic.AddInt32(&finalizeCalled, 1)
@@ -1094,7 +1094,7 @@ func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'resuming'"):
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
 				atomic.AddInt32(&finalizeCalled, 1)
@@ -1192,7 +1192,7 @@ func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'resuming'"):
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
@@ -1304,7 +1304,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'resuming'"):
+			case strings.Contains(sql, "'resuming'"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
@@ -1619,7 +1619,7 @@ func TestPauseSandbox_Success(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "status = 'pausing'"):
+			case strings.Contains(sql, "'pausing'"):
 				// BeginPause: atomic transition active → pausing, returns *
 				return sandboxRow(sb)
 			case strings.Contains(sql, "upserted AS"):
@@ -1667,7 +1667,7 @@ func TestPauseSandbox_NotActive(t *testing.T) {
 	// state), we return 409 Conflict.
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "status = 'pausing'") {
+			if strings.Contains(sql, "'pausing'") {
 				return notFoundRow() // BeginPause: no active row matched
 			}
 			if strings.Contains(sql, "EXISTS") {
@@ -1693,7 +1693,7 @@ func TestPauseSandbox_NotFound(t *testing.T) {
 	// SandboxExists fallback also returns false → 404.
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "status = 'pausing'") {
+			if strings.Contains(sql, "'pausing'") {
 				return notFoundRow()
 			}
 			if strings.Contains(sql, "EXISTS") {

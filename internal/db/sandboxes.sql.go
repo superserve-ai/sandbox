@@ -22,10 +22,7 @@ WITH activated AS (
       memory_mib = $3,
       ip_address = $4,
       updated_at = now()
-  -- Guarded on the source status so a reaper that failed a stuck transition
-  -- (FailStuckTransitionalSandboxes) is not silently resurrected to active.
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
-    AND sandbox.status IN ('starting', 'resuming')
   RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
 ),
 opened_compute AS (
@@ -517,12 +514,16 @@ WITH destroyed AS (
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL
-    AND sandbox.status IN ('active', 'paused', 'failed')
+    AND (
+      sandbox.status IN ('active', 'paused', 'failed')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+          AND sandbox.updated_at < $3)
+    )
   RETURNING id
 ),
 revoked AS (
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, $3 FROM destroyed
+  SELECT id, $4 FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -550,101 +551,38 @@ SELECT id FROM destroyed
 `
 
 type DestroySandboxParams struct {
-	ID                  uuid.UUID `json:"id"`
-	TeamID              uuid.UUID `json:"team_id"`
-	RevocationExpiresAt time.Time `json:"revocation_expires_at"`
+	ID                      uuid.UUID `json:"id"`
+	TeamID                  uuid.UUID `json:"team_id"`
+	StaleTransitionalBefore time.Time `json:"stale_transitional_before"`
+	RevocationExpiresAt     time.Time `json:"revocation_expires_at"`
 }
 
-// Atomic, guarded soft-delete that claims the sandbox for deletion ONLY from a
-// quiescent state (active/paused/failed) — never mid-transition. This is the
-// serialization point against a concurrent resume/pause: this CAS and resume's
-// BeginResume both target the same row, so only one wins. Writes the revocation
-// row and closes open billing/active intervals in the same statement, so a crash
-// after the claim can't strand a deleted sandbox with a live JWT or an open
-// interval that a retry would never fix. Returns the claimed id; 0 rows means
-// already-deleted or transitional — the caller distinguishes the two with a re-read.
+// Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
+// (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+// whose owning worker is provably gone — updated_at older than
+// stale_transitional_before. It never claims a live transition, so it serializes
+// against a concurrent resume/pause (this CAS and BeginResume target the same row,
+// only one wins) while still letting a crash-wedged sandbox be deleted. Writes the
+// revocation row and closes open billing/active intervals in the same statement,
+// so a crash after the claim can't strand a deleted sandbox with a live JWT or an
+// open interval. Returns the claimed id; 0 rows means already-deleted or a still-live
+// transition — the caller distinguishes the two with a re-read.
 func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, destroySandbox, arg.ID, arg.TeamID, arg.RevocationExpiresAt)
+	row := q.db.QueryRow(ctx, destroySandbox,
+		arg.ID,
+		arg.TeamID,
+		arg.StaleTransitionalBefore,
+		arg.RevocationExpiresAt,
+	)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
 }
 
-const failStuckTransitionalSandboxes = `-- name: FailStuckTransitionalSandboxes :many
-WITH stuck AS (
-  SELECT s.id FROM sandbox s
-  WHERE s.destroyed_at IS NULL
-    AND s.status IN ('starting', 'resuming', 'pausing')
-    AND s.updated_at < $1
-  ORDER BY s.updated_at ASC
-  LIMIT $2
-  FOR UPDATE SKIP LOCKED
-),
-failed AS (
-  UPDATE sandbox
-  SET status = 'failed', updated_at = now()
-  WHERE id IN (SELECT id FROM stuck)
-  RETURNING id, team_id, name
-),
-closed_active AS (
-  UPDATE sandbox_active_interval
-  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-  WHERE sandbox_id IN (SELECT id FROM failed)
-    AND ended_at IS NULL
-  RETURNING sandbox_id
-),
-closed_billing AS (
-  UPDATE sandbox_compute_billing_interval
-  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-  WHERE sandbox_id IN (SELECT id FROM failed)
-    AND ended_at IS NULL
-  RETURNING sandbox_id
-)
-SELECT id, team_id, name FROM failed
-`
-
-type FailStuckTransitionalSandboxesParams struct {
-	StuckBefore time.Time `json:"stuck_before"`
-	MaxRows     int32     `json:"max_rows"`
-}
-
-type FailStuckTransitionalSandboxesRow struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
-	Name   string    `json:"name"`
-}
-
-// Marks 'failed' sandboxes a crashed worker left mid-transition: a row still in
-// starting/resuming/pausing past stuck_before is un-resumable and un-deletable
-// (both claims require a settled state). The status + age guard spares
-// transitions still in progress; SKIP LOCKED divides the batch across replicas.
-func (q *Queries) FailStuckTransitionalSandboxes(ctx context.Context, arg FailStuckTransitionalSandboxesParams) ([]FailStuckTransitionalSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, failStuckTransitionalSandboxes, arg.StuckBefore, arg.MaxRows)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []FailStuckTransitionalSandboxesRow{}
-	for rows.Next() {
-		var i FailStuckTransitionalSandboxesRow
-		if err := rows.Scan(&i.ID, &i.TeamID, &i.Name); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const finalizePause = `-- name: FinalizePause :one
 WITH target AS (
-  -- Guarded on the source status so a reaper-failed stuck transition is not
-  -- resurrected to paused (resume-revert flips 'resuming', pause flips 'pausing').
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-    AND status IN ('pausing', 'resuming')
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)

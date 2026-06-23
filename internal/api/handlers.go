@@ -124,6 +124,12 @@ const vmdTimeout = 30 * time.Second
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
+// staleTransitionGrace is how long a sandbox must sit in a transitional state
+// (starting/resuming/pausing) before DELETE may claim it: past this, its worker
+// is provably gone (every VMD call caps at vmdTimeout and a live worker reverts),
+// so deleting it cannot race a live resume/pause.
+const staleTransitionGrace = 15 * time.Minute
+
 // logSandboxActivity writes a sandbox-scoped activity record in a background
 // goroutine. The request context is stripped of cancellation via
 // context.WithoutCancel so the goroutine is not killed when the HTTP response
@@ -813,14 +819,16 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
-	// only from a quiescent state (active/paused/failed), so it serializes
-	// against a concurrent resume/pause — this CAS and resume's BeginResume
-	// cannot both win the same row. The same statement writes the revocation
-	// row, so a crash before teardown can't leave a live VM with a valid JWT.
+	// from a quiescent state (active/paused/failed) or a transitional state whose
+	// worker is provably gone (stale), so it serializes against a live resume/pause
+	// — this CAS and resume's BeginResume cannot both win the same row — while still
+	// letting a crash-wedged sandbox be deleted. The same statement writes the
+	// revocation row, so a crash before teardown can't leave a live VM with a valid JWT.
 	if _, err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
-		ID:                  sandboxID,
-		TeamID:              teamID,
-		RevocationExpiresAt: time.Now().Add(SecretsJWTLifetime),
+		ID:                      sandboxID,
+		TeamID:                  teamID,
+		RevocationExpiresAt:     time.Now().Add(SecretsJWTLifetime),
+		StaleTransitionalBefore: time.Now().Add(-staleTransitionGrace),
 	}); err != nil {
 		if err == pgx.ErrNoRows {
 			// Not claimable from its current state. Re-read to tell a
@@ -849,11 +857,11 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// from the persisted row on restart.
 	go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
 
-	// Tear down the VM best-effort and unconditionally: a reaper-recovered
-	// 'failed' sandbox may still hold a VM, run dir, and netns that only
-	// DestroyInstance reclaims (an absent VM is an idempotent no-op). A failure
-	// here is reconciled by the vm reconciler, so a vmd hiccup must not fail an
-	// already-committed delete.
+	// Tear down the VM best-effort and unconditionally: a sandbox claimed from a
+	// stale transition or a 'failed' state may still hold a VM, run dir, and netns
+	// that only DestroyInstance reclaims (an absent VM is an idempotent no-op). A
+	// failure here is reconciled by the vm reconciler, so a vmd hiccup must not fail
+	// an already-committed delete.
 	if vmd, lookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID); lookupErr != nil {
 		log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
 	} else {

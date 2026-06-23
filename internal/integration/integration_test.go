@@ -2232,119 +2232,33 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 	}
 }
 
-// TestIntegration_FailStuckTransitionalSandboxes proves the guard reclaims only
-// old transitional rows, sparing fresh transitions and settled active/paused.
-func TestIntegration_FailStuckTransitionalSandboxes(t *testing.T) {
+// TestIntegration_DeleteStaleTransitionalSandbox proves DELETE claims a
+// crash-wedged (stale) transitional sandbox but still 409s a live transition.
+func TestIntegration_DeleteStaleTransitionalSandbox(t *testing.T) {
 	ctx := context.Background()
-	teamID, _ := seedTeamAndKey(t)
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
 
-	insert := func(status string, updatedAt time.Time) uuid.UUID {
+	insert := func(updatedAt time.Time) uuid.UUID {
 		id := uuid.New()
 		if _, err := testPool.Exec(ctx,
-			`INSERT INTO sandbox (id, team_id, name, status, host_id, updated_at) VALUES ($1,$2,$3,$4,$5,$6)`,
-			id, teamID, "stuck-"+status, status, "host-1", updatedAt); err != nil {
-			t.Fatalf("insert %s: %v", status, err)
-		}
-		return id
-	}
-	statusOf := func(id uuid.UUID) string {
-		var s string
-		if err := testPool.QueryRow(ctx, `SELECT status FROM sandbox WHERE id = $1`, id).Scan(&s); err != nil {
-			t.Fatalf("status query: %v", err)
-		}
-		return s
-	}
-
-	old := time.Now().Add(-30 * time.Minute)
-	stuck := map[string]uuid.UUID{
-		"starting": insert("starting", old),
-		"resuming": insert("resuming", old),
-		"pausing":  insert("pausing", old),
-	}
-	freshStarting := insert("starting", time.Now()) // owner may still be working
-	oldActive := insert("active", old)              // settled, not a transition
-	oldPaused := insert("paused", old)              // settled, not a transition
-
-	rows, err := testQueries.FailStuckTransitionalSandboxes(ctx, db.FailStuckTransitionalSandboxesParams{
-		StuckBefore: time.Now().Add(-15 * time.Minute),
-		MaxRows:     100,
-	})
-	if err != nil {
-		t.Fatalf("FailStuckTransitionalSandboxes: %v", err)
-	}
-	reclaimed := map[uuid.UUID]bool{}
-	for _, row := range rows {
-		reclaimed[row.ID] = true
-	}
-
-	for state, id := range stuck {
-		if !reclaimed[id] {
-			t.Errorf("stuck %s sandbox not reclaimed", state)
-		}
-		if got := statusOf(id); got != "failed" {
-			t.Errorf("stuck %s status = %q, want failed", state, got)
-		}
-	}
-	for _, tc := range []struct {
-		name, want string
-		id         uuid.UUID
-	}{
-		{"fresh starting", "starting", freshStarting},
-		{"old active", "active", oldActive},
-		{"old paused", "paused", oldPaused},
-	} {
-		if reclaimed[tc.id] {
-			t.Errorf("%s was wrongly reclaimed", tc.name)
-		}
-		if got := statusOf(tc.id); got != tc.want {
-			t.Errorf("%s status = %q, want %q", tc.name, got, tc.want)
-		}
-	}
-}
-
-// TestIntegration_FailedSandboxNotResurrected proves the status guards on
-// ActivateSandbox/FinalizePause: a sandbox the reaper marked 'failed' must not
-// be flipped back to active/paused by a late-completing worker.
-func TestIntegration_FailedSandboxNotResurrected(t *testing.T) {
-	ctx := context.Background()
-	teamID, _ := seedTeamAndKey(t)
-
-	insertFailed := func() uuid.UUID {
-		id := uuid.New()
-		if _, err := testPool.Exec(ctx,
-			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'failed','host-1')`,
-			id, teamID, "failed-sb"); err != nil {
+			`INSERT INTO sandbox (id, team_id, name, status, host_id, updated_at) VALUES ($1,$2,$3,'resuming','host-1',$4)`,
+			id, teamID, "wedged", updatedAt); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 		return id
 	}
-	statusOf := func(id uuid.UUID) string {
-		var s string
-		if err := testPool.QueryRow(ctx, `SELECT status FROM sandbox WHERE id=$1`, id).Scan(&s); err != nil {
-			t.Fatalf("status: %v", err)
-		}
-		return s
+
+	// Stale (> grace) resuming row: the worker is provably gone, so it's deletable.
+	stale := insert(time.Now().Add(-30 * time.Minute))
+	if dw := do(r, "DELETE", "/sandboxes/"+stale.String(), apiKey, ""); dw.Code != http.StatusNoContent {
+		t.Fatalf("delete stale transitional: got %d, want 204: %s", dw.Code, dw.Body.String())
 	}
 
-	a := insertFailed()
-	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{
-		ID: a, VcpuCount: 1, MemoryMib: 1024, TeamID: teamID,
-	}); err != nil {
-		t.Fatalf("ActivateSandbox: %v", err)
-	}
-	if got := statusOf(a); got != "failed" {
-		t.Errorf("ActivateSandbox resurrected failed sandbox to %q", got)
-	}
-
-	f := insertFailed()
-	mem := "/snap/mem"
-	if _, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
-		ID: f, TeamID: teamID, Path: "/snap/vmstate", MemPath: &mem, Trigger: "pause",
-	}); err == nil {
-		t.Error("FinalizePause on a failed sandbox should match no row")
-	}
-	if got := statusOf(f); got != "failed" {
-		t.Errorf("FinalizePause resurrected failed sandbox to %q", got)
+	// Fresh resuming row: a live transition must not be deletable (409).
+	fresh := insert(time.Now())
+	if fw := do(r, "DELETE", "/sandboxes/"+fresh.String(), apiKey, ""); fw.Code != http.StatusConflict {
+		t.Fatalf("delete fresh transitional: got %d, want 409: %s", fw.Code, fw.Body.String())
 	}
 }
 
