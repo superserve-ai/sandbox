@@ -445,9 +445,6 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	// Source D: per-sandbox dirs. A name that parses as a UUID excludes the
 	// template mount target, the build tree, and build-* VMs by construction.
 	onDisk := scanSandboxDirs(r.mgr.cfg.RunDir, r.mgr.cfg.SnapshotDir)
-	if len(onDisk) == 0 {
-		return
-	}
 
 	cutoff := snapshotTime.Add(-r.cfg.DiskGracePeriod)
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
@@ -474,9 +471,14 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	}
 
 	// Sweep only after the keep-set is validated, so a fail-closed pass does
-	// nothing destructive. Runs even when this pass finds no new orphans.
+	// nothing destructive. Registered before the empty-disk return below so a
+	// drained host (dirs already quarantined, only .trash left) still sweeps.
 	if r.cfg.DiskReclaimEnabled {
 		defer r.sweepTrash(snapshotTime)
+	}
+
+	if len(onDisk) == 0 {
+		return
 	}
 
 	orphans := selectOrphanDirs(onDisk, keep, cutoff)
