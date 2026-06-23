@@ -426,6 +426,48 @@ func TestDeleteSnapshotFiles_NonEmptyDir_Kept(t *testing.T) {
 	}
 }
 
+func TestDeleteSandboxSnapshots_RemovesWholeDir(t *testing.T) {
+	root := t.TempDir()
+	vmID := "11111111-1111-1111-1111-111111111111"
+	writeFile(t, filepath.Join(root, vmID, "mem.snap"))
+	writeFile(t, filepath.Join(root, vmID, "vmstate.snap"))
+
+	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	if err := mgr.DeleteSandboxSnapshots(vmID); err != nil {
+		t.Fatalf("DeleteSandboxSnapshots: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, vmID)); !os.IsNotExist(err) {
+		t.Fatalf("snapshot dir still present after delete")
+	}
+	// Idempotent: a second call on a missing dir is not an error.
+	if err := mgr.DeleteSandboxSnapshots(vmID); err != nil {
+		t.Fatalf("DeleteSandboxSnapshots (missing): %v", err)
+	}
+}
+
+func TestDeleteSandboxSnapshots_RejectsReservedAndUnsafe(t *testing.T) {
+	root := t.TempDir()
+	// The shared template snapshot tree must never be removable via this call.
+	tmplFile := filepath.Join(root, TemplatesDirName, "tpl1", "base.snap")
+	writeFile(t, tmplFile)
+
+	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	for _, vmID := range []string{"", ".", "..", "../escape", "a/b", templateDirName, TemplatesDirName} {
+		if status.Code(mgr.DeleteSandboxSnapshots(vmID)) != codes.InvalidArgument {
+			t.Errorf("DeleteSandboxSnapshots(%q): want InvalidArgument", vmID)
+		}
+	}
+	if _, err := os.Stat(tmplFile); err != nil {
+		t.Fatalf("template snapshot tree removed by a rejected vmID: %v", err)
+	}
+
+	// Unconfigured snapshot dir must be rejected, not joined into a relative path.
+	empty := &Manager{}
+	if status.Code(empty.DeleteSandboxSnapshots("11111111-1111-1111-1111-111111111111")) != codes.InvalidArgument {
+		t.Error("DeleteSandboxSnapshots with empty SnapshotDir: want InvalidArgument")
+	}
+}
+
 func TestDeleteSnapshotFiles_NestedSnapDir_ParentCleaned(t *testing.T) {
 	root := t.TempDir()
 	vmID := "vm-abc"

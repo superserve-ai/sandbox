@@ -183,6 +183,7 @@ func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { r
 func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error           { return nil }
 func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error  { return nil }
 func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error    { return nil }
+func (s *stubVMD) DeleteSandboxSnapshots(_ context.Context, _ string) error  { return nil }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
 func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {

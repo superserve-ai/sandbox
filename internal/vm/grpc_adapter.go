@@ -179,6 +179,19 @@ func (a *GRPCAdapter) DeleteSnapshot(ctx context.Context, req *vmdpb.DeleteSnaps
 	return &vmdpb.DeleteSnapshotResponse{Deleted: true}, nil
 }
 
+// DeleteSandboxSnapshots removes a sandbox's entire snapshot directory.
+// Idempotent; scoped to <SnapshotDir>/<vm_id>/ at the Manager layer.
+func (a *GRPCAdapter) DeleteSandboxSnapshots(ctx context.Context, req *vmdpb.DeleteSandboxSnapshotsRequest) (*vmdpb.DeleteSandboxSnapshotsResponse, error) {
+	vmID := req.GetVmId()
+	if vmID == "" {
+		return nil, status.Error(codes.InvalidArgument, "vm_id must be set")
+	}
+	if err := a.mgr.DeleteSandboxSnapshots(vmID); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteSandboxSnapshotsResponse{Deleted: true}, nil
+}
+
 // DeleteTemplateArtifacts removes a template's snapshot dir + rootfs dir.
 // Idempotent.
 func (a *GRPCAdapter) DeleteTemplateArtifacts(ctx context.Context, req *vmdpb.DeleteTemplateArtifactsRequest) (*vmdpb.DeleteTemplateArtifactsResponse, error) {
