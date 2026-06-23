@@ -824,6 +824,13 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 // in-memory map. The VM is already gone in reality; this just cleans up
 // VMD's cache.
 func (r *Reconciler) markStale(vmID string) {
+	// Capture the namespace before deleting the record: a VM whose teardown
+	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
+	var namespace string
+	if rec, err := r.mgr.state.Get(vmID); err == nil && rec != nil {
+		namespace = rec.Namespace
+	}
+
 	// Delete from BoltDB first. If this fails, keep the in-memory entry
 	// so the state stays consistent — the reconciler will retry on the
 	// next run. Deleting from the map before BoltDB would cause
@@ -836,6 +843,11 @@ func (r *Reconciler) markStale(vmID string) {
 	r.mgr.mu.Lock()
 	delete(r.mgr.vms, vmID)
 	r.mgr.mu.Unlock()
+
+	// Free the slot too. netMgr is always set in prod; the nil check is defensive.
+	if r.mgr.netMgr != nil {
+		r.mgr.netMgr.CleanupVMOrNamespace(vmID, namespace)
+	}
 
 	r.mu.Lock()
 	delete(r.driftSeen, vmID)
