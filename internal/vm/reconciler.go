@@ -442,12 +442,6 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		return
 	}
 
-	// When reclamation is on, always sweep expired quarantine — even on a pass
-	// that finds no new orphans.
-	if r.cfg.DiskReclaimEnabled {
-		defer r.sweepTrash(snapshotTime)
-	}
-
 	// Source D: per-sandbox dirs. A name that parses as a UUID excludes the
 	// template mount target, the build tree, and build-* VMs by construction.
 	onDisk := scanSandboxDirs(r.mgr.cfg.RunDir, r.mgr.cfg.SnapshotDir)
@@ -466,13 +460,23 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		log.Error().Err(err).Msg("disk scan: recently-destroyed query failed — skipping (fail-closed)")
 		return
 	}
-	keep := diskKeepSet(dbSandboxes, recent, active, cutoff)
+	keep := diskKeepSet(dbSandboxes, recent, active)
 
-	// A drained or all-failed host legitimately has an empty keep-set; report it
-	// (detect-only is harmless). The hard abort-guard belongs on reclamation.
 	if len(keep) == 0 {
+		// An empty keep-set is almost always a query bug, not an empty host;
+		// reclamation aborts (detect-only just reports).
+		if r.cfg.DiskReclaimEnabled {
+			log.Error().Int("on_disk", len(onDisk)).Msg("disk reclaim suppressed: empty keep-set")
+			return
+		}
 		log.Warn().Int("on_disk", len(onDisk)).
 			Msg("disk scan: empty keep-set — reporting all on-disk dirs as orphans (verify before enabling reclamation)")
+	}
+
+	// Sweep only after the keep-set is validated, so a fail-closed pass does
+	// nothing destructive. Runs even when this pass finds no new orphans.
+	if r.cfg.DiskReclaimEnabled {
+		defer r.sweepTrash(snapshotTime)
 	}
 
 	orphans := selectOrphanDirs(onDisk, keep, cutoff)
@@ -502,14 +506,6 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		Msg("disk scan: orphan per-sandbox dirs detected")
 
 	if r.cfg.DiskReclaimEnabled {
-		// An empty keep-set is almost certainly a query bug; detect-only reports
-		// it, but reclamation must never act on it. This is the abort-guard that
-		// §5/§7 of the design moved off the detect path onto here.
-		if len(keep) == 0 {
-			log.Error().Int("orphans", len(orphans)).
-				Msg("disk reclaim suppressed: empty keep-set")
-			return
-		}
 		r.reclaimDiskOrphans(ctx, snapshotTime, orphans, onDisk)
 	}
 }
@@ -568,9 +564,10 @@ func quarantineDir(path, date string) error {
 	return os.Rename(path, filepath.Join(trashDir, name))
 }
 
-// sweepTrash permanently removes quarantined date dirs older than
-// DiskTrashRetention — the irreversible step, after the soak that gives time to
-// spot a bad reclaim.
+// sweepTrash permanently removes quarantine buckets soaked longer than
+// DiskTrashRetention. Age comes from the bucket's actual mtime, not its
+// date-label name, so the full retention is honored rather than rounded down to
+// the label's midnight.
 func (r *Reconciler) sweepTrash(now time.Time) {
 	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "trash_sweep").Logger()
 	cutoff := now.Add(-r.cfg.DiskTrashRetention)
@@ -587,8 +584,8 @@ func (r *Reconciler) sweepTrash(now time.Time) {
 			if !e.IsDir() {
 				continue
 			}
-			d, perr := time.Parse("2006-01-02", e.Name())
-			if perr != nil || !d.Before(cutoff) {
+			info, ierr := e.Info()
+			if ierr != nil || !info.ModTime().Before(cutoff) {
 				continue
 			}
 			p := filepath.Join(trash, e.Name())
@@ -601,19 +598,13 @@ func (r *Reconciler) sweepTrash(now time.Time) {
 	}
 }
 
-// diskKeepSet is every sandbox UUID whose on-disk dirs must NOT be reclaimed —
-// the union of all signals a dir may be in use: non-destroyed DB rows (minus
-// failures settled before cutoff), rows destroyed within grace, and active
-// systemd units (a running VM whose row is momentarily gone). BoltDB-only UUIDs
-// are excluded on purpose: no row AND no unit means a dead VM (Drift 5's job),
-// so its dir is reclaimable. In-flight creates are caught by the caller's mtime
-// grace, not here. Pure.
-func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid.UUID, active map[string]bool, cutoff time.Time) map[string]struct{} {
+// diskKeepSet is every sandbox UUID whose on-disk dirs must NOT be reclaimed:
+// non-destroyed DB rows, rows destroyed within grace, and active systemd units.
+// Failed rows are kept too — a failed sandbox retains billed disk (storage
+// interval open until delete), so it is reclaimed only once destroyed.
+func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid.UUID, active map[string]bool) map[string]struct{} {
 	keep := make(map[string]struct{}, len(dbSandboxes)+len(recent)+len(active))
-	for id, row := range dbSandboxes {
-		if row.Sandbox.Status == db.SandboxStatusFailed && row.Sandbox.UpdatedAt.Before(cutoff) {
-			continue
-		}
+	for id := range dbSandboxes {
 		keep[id] = struct{}{}
 	}
 	for _, id := range recent {

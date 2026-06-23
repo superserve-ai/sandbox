@@ -107,12 +107,12 @@ func TestDirSize(t *testing.T) {
 }
 
 // diskKeepSet is the complete reclaim guard: it must keep a dir live via ANY
-// source — DB row, recently-destroyed grace, or an active unit — and exclude
-// only genuinely-dead ones (settled-failed, and UUIDs in no source at all).
+// source — a non-destroyed DB row (any status, including failed, which retains
+// billed disk until delete), recently-destroyed grace, or an active unit — and
+// reclaim only UUIDs present in no source at all.
 func TestDiskKeepSet(t *testing.T) {
-	cutoff := time.Unix(1_000_000, 0)
-	row := func(s db.SandboxStatus, updated time.Time) db.ListSandboxesByHostRow {
-		return db.ListSandboxesByHostRow{Sandbox: db.Sandbox{Status: s, UpdatedAt: updated}}
+	row := func(s db.SandboxStatus) db.ListSandboxesByHostRow {
+		return db.ListSandboxesByHostRow{Sandbox: db.Sandbox{Status: s}}
 	}
 	const (
 		recentID = "44444444-4444-4444-4444-444444444444" // recently destroyed → kept
@@ -120,25 +120,22 @@ func TestDiskKeepSet(t *testing.T) {
 		orphanID = "66666666-6666-6666-6666-666666666666" // in no source → reclaimable
 	)
 	dbSandboxes := map[string]db.ListSandboxesByHostRow{
-		uuidA: row(db.SandboxStatusActive, cutoff.Add(-time.Hour)), // live → kept
-		uuidB: row(db.SandboxStatusPaused, cutoff.Add(-time.Hour)), // live → kept
-		uuidC: row(db.SandboxStatusFailed, cutoff.Add(-time.Hour)), // settled-failed → excluded
-		"new": row(db.SandboxStatusFailed, cutoff.Add(time.Hour)),  // within grace → kept
+		uuidA: row(db.SandboxStatusActive), // live → kept
+		uuidB: row(db.SandboxStatusPaused), // live → kept
+		uuidC: row(db.SandboxStatusFailed), // failed retains billed disk → kept until delete
 	}
 	recent := []uuid.UUID{uuid.MustParse(recentID)}
 	active := map[string]bool{activeID: true}
 
-	keep := diskKeepSet(dbSandboxes, recent, active, cutoff)
+	keep := diskKeepSet(dbSandboxes, recent, active)
 
-	for _, id := range []string{uuidA, uuidB, "new", recentID, activeID} {
+	for _, id := range []string{uuidA, uuidB, uuidC, recentID, activeID} {
 		if _, ok := keep[id]; !ok {
 			t.Errorf("%s should be in keep-set", id)
 		}
 	}
-	for _, id := range []string{uuidC, orphanID} {
-		if _, ok := keep[id]; ok {
-			t.Errorf("%s should NOT be in keep-set (reclaimable)", id)
-		}
+	if _, ok := keep[orphanID]; ok {
+		t.Errorf("%s should NOT be in keep-set (no source → reclaimable)", orphanID)
 	}
 }
 
@@ -180,15 +177,21 @@ func TestQuarantineDir_RejectsNonUUID(t *testing.T) {
 func TestSweepTrash_RemovesExpiredKeepsRecent(t *testing.T) {
 	runDir := t.TempDir()
 	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC) // retention 72h → cutoff 06-17 12:00
-	mk := func(date string) string {
-		p := filepath.Join(runDir, ".trash", date)
+	mk := func(label string, mtime time.Time) string {
+		p := filepath.Join(runDir, ".trash", label)
 		if err := os.MkdirAll(filepath.Join(p, uuidA), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Age is taken from the bucket's mtime, not its label.
+		if err := os.Chtimes(p, mtime, mtime); err != nil {
 			t.Fatal(err)
 		}
 		return p
 	}
-	oldDir := mk("2026-06-15")    // 5 days old → swept
-	recentDir := mk("2026-06-19") // 1 day old → kept
+	expired := mk("2026-06-15", now.Add(-96*time.Hour)) // soaked 96h → swept
+	// Soaked only 48h: a date-label sweep could remove this early, but by actual
+	// mtime it has not reached the 72h window, so the full retention is honored.
+	young := mk("2026-06-18", now.Add(-48*time.Hour))
 
 	r := &Reconciler{
 		mgr: &Manager{cfg: ManagerConfig{RunDir: runDir}, log: zerolog.Nop()},
@@ -196,11 +199,11 @@ func TestSweepTrash_RemovesExpiredKeepsRecent(t *testing.T) {
 	}
 	r.sweepTrash(now)
 
-	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
-		t.Error("expired quarantine should be removed")
+	if _, err := os.Stat(expired); !os.IsNotExist(err) {
+		t.Error("quarantine soaked 96h should be removed")
 	}
-	if _, err := os.Stat(recentDir); err != nil {
-		t.Error("recent quarantine should be kept")
+	if _, err := os.Stat(young); err != nil {
+		t.Error("quarantine soaked only 48h should be kept (full 72h retention honored)")
 	}
 }
 
