@@ -403,6 +403,16 @@ func (c *grpcVMDClient) DeleteSnapshot(ctx context.Context, vmID, snapshotPath, 
 	return nil
 }
 
+// DeleteSandboxSnapshots removes a sandbox's entire on-disk snapshot directory.
+// Idempotent; path traversal and reserved names are blocked VMD-side.
+func (c *grpcVMDClient) DeleteSandboxSnapshots(ctx context.Context, vmID string) error {
+	_, err := c.client.DeleteSandboxSnapshots(ctx, &vmdpb.DeleteSandboxSnapshotsRequest{VmId: vmID})
+	if err != nil {
+		return fmt.Errorf("gRPC DeleteSandboxSnapshots: %w", err)
+	}
+	return nil
+}
+
 func (c *grpcVMDClient) ListBuildArtifacts(ctx context.Context) ([]vmdclient.BuildArtifactEntry, error) {
 	resp, err := c.client.ListBuildArtifacts(ctx, &vmdpb.ListBuildArtifactsRequest{})
 	if err != nil {

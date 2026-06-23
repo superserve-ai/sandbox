@@ -772,6 +772,27 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 	return nil
 }
 
+// DeleteSandboxSnapshots removes a sandbox's entire snapshot directory
+// (<SnapshotDir>/<vmID>/). Path-based and idempotent — a missing directory is
+// not an error — so it reclaims pause artifacts even when no snapshot row
+// exists or the per-file delete was missed. The leaf/reserved guard prevents a
+// stray vmID from escaping the snapshot root or removing the shared template
+// tree. Only call this for a sandbox being deleted; it does not inspect
+// instance state, so the caller must ensure the snapshot can't be resumed.
+func (m *Manager) DeleteSandboxSnapshots(vmID string) error {
+	if m.cfg.SnapshotDir == "" {
+		return status.Error(codes.InvalidArgument, "snapshot dir not configured")
+	}
+	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
+		return status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
+	}
+	dir := filepath.Join(m.cfg.SnapshotDir, vmID)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("remove %s: %w", dir, err)
+	}
+	return nil
+}
+
 // assertUnderVMSnapshotDir returns nil iff `p` is an absolute path that, after
 // cleaning, lies strictly under <SnapshotDir>/<vmID>/. This is the guard that
 // keeps DeleteSnapshotFiles from being used to unlink another sandbox's files

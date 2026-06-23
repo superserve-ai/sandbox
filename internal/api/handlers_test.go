@@ -31,6 +31,7 @@ type stubVMD struct {
 	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
+	deleteSnapsFn    func(ctx context.Context, id string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
@@ -65,6 +66,12 @@ func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath
 func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath string) error {
 	if s.deleteSnapshotFn != nil {
 		return s.deleteSnapshotFn(ctx, id, snapshotPath, memPath)
+	}
+	return nil
+}
+func (s *stubVMD) DeleteSandboxSnapshots(ctx context.Context, id string) error {
+	if s.deleteSnapsFn != nil {
+		return s.deleteSnapsFn(ctx, id)
 	}
 	return nil
 }
@@ -404,17 +411,18 @@ func TestDeleteSandbox_RevocationAtomicWithClaim(t *testing.T) {
 	}
 }
 
-// TestDeleteSandbox_Failed_StillAttemptsTeardown guards against leaking a
-// reaper-recovered 'failed' sandbox's VM/run dir/netns: 'failed' no longer
-// implies "never booted", so teardown must still run.
-func TestDeleteSandbox_Failed_StillAttemptsTeardown(t *testing.T) {
+// A failed sandbox can still hold a VM, rundir, and snapshot dir, so deleting it
+// must attempt VM teardown and the path-based snapshot sweep.
+func TestDeleteSandbox_Failed_StillCleansUp(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusFailed}
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusFailed}
 
-	var destroyCalled bool
-	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { destroyCalled = true; return nil }}
-
+	var destroyCalled, snapDirCleaned bool
+	vmd := &stubVMD{
+		destroyFn:     func(context.Context, string, bool) error { destroyCalled = true; return nil },
+		deleteSnapsFn: func(context.Context, string) error { snapDirCleaned = true; return nil },
+	}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
@@ -440,6 +448,103 @@ func TestDeleteSandbox_Failed_StillAttemptsTeardown(t *testing.T) {
 	}
 	if !destroyCalled {
 		t.Error("teardown must be attempted for a failed sandbox (may still hold resources)")
+	}
+	if !snapDirCleaned {
+		t.Error("DeleteSandboxSnapshots must run on delete to reclaim the snapshot dir")
+	}
+}
+
+// A failed sandbox must stay deletable even when VM teardown fails (best-effort);
+// the vm reconciler backstops the miss.
+func TestDeleteSandbox_FailedSandbox_DestroyError_StillDeletes(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusFailed}
+
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
+		return fmt.Errorf("vmd unreachable")
+	}}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("OK"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d (teardown is best-effort); body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+}
+
+// If the host vmd predates DeleteSandboxSnapshots (codes.Unimplemented), snapshot
+// cleanup must fall back to the per-file DeleteSnapshot path during the upgrade window.
+func TestDeleteSandbox_SnapshotCleanup_FallsBackOnUnimplemented(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	var perFileCalled bool
+	vmd := &stubVMD{
+		destroyFn:        func(context.Context, string, bool) error { return nil },
+		deleteSnapsFn:    func(context.Context, string) error { return status.Error(codes.Unimplemented, "old vmd") },
+		deleteSnapshotFn: func(context.Context, string, string, string) error { perFileCalled = true; return nil },
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "FROM snapshot") {
+				return &scanRows{rows: []func(...any) error{func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = snapID
+					*dest[1].(*uuid.UUID) = sandboxID
+					*dest[2].(*uuid.UUID) = teamID
+					*dest[3].(*string) = "/snapshots/x/vmstate.snap"
+					*dest[4].(*int64) = 0
+					*dest[5].(*string) = "pause"
+					*dest[6].(*time.Time) = time.Unix(0, 0)
+					mp := "/snapshots/x/mem.snap"
+					*dest[7].(**string) = &mp
+					return nil
+				}}}, nil
+			}
+			return &scanRows{}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("OK"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	if !perFileCalled {
+		t.Error("on Unimplemented, cleanup must fall back to per-file DeleteSnapshot")
 	}
 }
 

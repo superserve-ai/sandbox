@@ -34,6 +34,13 @@ service VMDaemon {
   // re-paused and only the latest snapshot is reachable.
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
 
+  // DeleteSandboxSnapshots removes a sandbox's entire on-disk snapshot
+  // directory (<snapshot_dir>/<vm_id>/). Path-based and idempotent, so it
+  // reclaims pause artifacts even when no snapshot row exists or the per-file
+  // delete was missed. Only for a sandbox being deleted — never for one that
+  // may resume.
+  rpc DeleteSandboxSnapshots(DeleteSandboxSnapshotsRequest) returns (DeleteSandboxSnapshotsResponse);
+
   // DeleteTemplateArtifacts removes a template's on-disk snapshot dir and
   // rootfs. Idempotent.
   rpc DeleteTemplateArtifacts(DeleteTemplateArtifactsRequest) returns (DeleteTemplateArtifactsResponse);
@@ -371,6 +378,18 @@ message DeleteSnapshotRequest {
 message DeleteSnapshotResponse {
   // True when both files are no longer on disk after this call — either
   // because this call removed them, or because they were already gone.
+  bool deleted = 1;
+}
+
+message DeleteSandboxSnapshotsRequest {
+  // Required. The sandbox whose snapshot directory (<snapshot_dir>/<vm_id>/)
+  // is removed. The daemon rejects non-leaf or reserved names so a call
+  // cannot escape the snapshot root or delete the shared template tree.
+  string vm_id = 1;
+}
+
+message DeleteSandboxSnapshotsResponse {
+  // True when the directory is gone after this call (removed now or already absent).
   bool deleted = 1;
 }
 

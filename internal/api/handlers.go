@@ -935,31 +935,43 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, sandbox db.Sandbo
 // cleanupSandboxSnapshots deletes the on-disk snapshot files via vmd and
 // the snapshot DB rows for a destroyed sandbox. Best-effort.
 func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, hostID string) {
+	// List snapshot rows first: they feed the per-file fallback below and are
+	// cleared at the end.
 	snaps, err := h.DB.ListSnapshotsBySandbox(reqCtx, sandboxID)
 	if err != nil {
 		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("list snapshots for cleanup")
-		return
 	}
-	if len(snaps) == 0 {
-		return
-	}
-	vmd, err := h.vmdForHost(reqCtx, hostID)
-	if err != nil {
-		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("resolve vmd for snapshot cleanup; files may need manual cleanup")
-	}
-	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
-	defer cancel()
-	for _, s := range snaps {
-		if vmd != nil {
-			memPath := ""
-			if s.MemPath != nil {
-				memPath = *s.MemPath
+
+	// Remove the whole <SnapshotDir>/<id>/ tree path-based, independent of
+	// snapshot DB rows — reclaims pause artifacts even when a row is missing.
+	// On an old vmd that predates this RPC (control-plane-deploys-first window),
+	// fall back to the per-file delete so cleanup still runs. Best-effort;
+	// anything missed is left for out-of-band GC.
+	if vmd, verr := h.vmdForHost(reqCtx, hostID); verr != nil {
+		log.Warn().Err(verr).Str("sandbox_id", sandboxID.String()).Msg("resolve vmd for snapshot cleanup; files may need GC")
+	} else {
+		ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+		switch delErr := vmd.DeleteSandboxSnapshots(ctx, sandboxID.String()); {
+		case delErr == nil || isVMDNotFound(delErr):
+		case isVMDUnimplemented(delErr):
+			for _, s := range snaps {
+				memPath := ""
+				if s.MemPath != nil {
+					memPath = *s.MemPath
+				}
+				if e := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); e != nil && !isVMDNotFound(e) {
+					log.Warn().Err(e).Str("sandbox_id", sandboxID.String()).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot (fallback) failed")
+				}
 			}
-			if delErr := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); delErr != nil && !isVMDNotFound(delErr) {
-				log.Warn().Err(delErr).Str("sandbox_id", sandboxID.String()).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot failed")
-			}
+		default:
+			log.Warn().Err(delErr).Str("sandbox_id", sandboxID.String()).Msg("vmd DeleteSandboxSnapshots failed; files may need GC")
 		}
-		if delErr := h.DB.DeleteSnapshot(ctx, s.ID); delErr != nil {
+		cancel()
+	}
+
+	// Clear the snapshot DB rows (their files are gone above).
+	for _, s := range snaps {
+		if delErr := h.DB.DeleteSnapshot(reqCtx, s.ID); delErr != nil {
 			log.Warn().Err(delErr).Str("snapshot_id", s.ID.String()).Msg("DB DeleteSnapshot failed")
 		}
 	}
