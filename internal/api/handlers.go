@@ -843,10 +843,25 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	// The delete is committed. Tear down the VM best-effort — a failure here is
-	// reconciled by the vm reconciler (active unit + deleted row → stop), so a
-	// vmd hiccup must not fail an already-committed delete. Skip when the
-	// sandbox never booted (failed).
+	// Revoke before teardown: teardown can hang up to vmdTimeout, and a crash
+	// mid-teardown leaves the sandbox soft-deleted with its VM still up — and
+	// bootstrap only re-fans revocations that were written. WithoutCancel
+	// survives a client disconnect.
+	revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer revokeCancel()
+	if err := h.DB.InsertSandboxRevocation(revokeCtx, db.InsertSandboxRevocationParams{
+		SandboxID: sandboxID,
+		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
+	}); err != nil {
+		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertSandboxRevocation failed")
+	} else {
+		go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+	}
+
+	// Tear down the VM best-effort — a failure here is reconciled by the vm
+	// reconciler (active unit + deleted row → stop), so a vmd hiccup must not
+	// fail an already-committed delete. Skip when the sandbox never booted
+	// (failed).
 	if sandbox.Status != db.SandboxStatusFailed {
 		if vmd, lookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID); lookupErr != nil {
 			log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
@@ -857,21 +872,6 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 			}
 			vmdCancel()
 		}
-	}
-
-	// Record the revocation so daemons can refuse the JWT, and fan out the
-	// notification to the host. Detach from the request context so a client
-	// disconnect mid-DELETE doesn't strand a destroyed sandbox without its
-	// revocation row. Bootstrap-on-restart still recovers if fanout fails.
-	revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
-	defer revokeCancel()
-	if err := h.DB.InsertSandboxRevocation(revokeCtx, db.InsertSandboxRevocationParams{
-		SandboxID: sandboxID,
-		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
-	}); err != nil {
-		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertSandboxRevocation failed")
-	} else {
-		go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
 	}
 
 	// Best-effort cleanup of pause snapshots. Failures are logged but

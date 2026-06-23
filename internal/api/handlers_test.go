@@ -342,6 +342,50 @@ func TestDeleteSandbox_Success(t *testing.T) {
 	}
 }
 
+// TestDeleteSandbox_RevokesBeforeTeardown pins the ordering that closes the
+// secrets-leak window: revocation must be written before best-effort teardown.
+func TestDeleteSandbox_RevokesBeforeTeardown(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive, HostID: "host-1"}
+
+	var order []string
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
+		order = append(order, "teardown")
+		return nil
+	}}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID) // DestroySandbox claim
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "sandbox_revocation") {
+				order = append(order, "revoke")
+			}
+			return pgconn.NewCommandTag("INSERT 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if len(order) != 2 || order[0] != "revoke" || order[1] != "teardown" {
+		t.Errorf("call order = %v, want [revoke teardown]", order)
+	}
+}
+
 func TestDeleteSandbox_InvalidUUID(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },

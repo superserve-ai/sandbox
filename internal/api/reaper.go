@@ -21,14 +21,23 @@ type ReaperConfig struct {
 	BatchSize int32
 	// Parallelism caps concurrent pauses within a single batch. 0 → 10.
 	Parallelism int
+	// StuckTransitionGrace bounds how long a sandbox may sit in a transitional
+	// state before the reaper marks it 'failed' (its worker presumed crashed).
+	// 0 → defaultStuckTransitionGrace.
+	StuckTransitionGrace time.Duration
 }
+
+// defaultStuckTransitionGrace exceeds any real transition (each vmd call caps at
+// vmdTimeout and a live worker reverts on failure), so it only fires post-crash.
+const defaultStuckTransitionGrace = 15 * time.Minute
 
 // DefaultReaperConfig returns sensible defaults for the timeout reaper.
 func DefaultReaperConfig() ReaperConfig {
 	return ReaperConfig{
-		Interval:    30 * time.Second,
-		BatchSize:   50,
-		Parallelism: 10,
+		Interval:             30 * time.Second,
+		BatchSize:            50,
+		Parallelism:          10,
+		StuckTransitionGrace: defaultStuckTransitionGrace,
 	}
 }
 
@@ -61,6 +70,11 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 		parallelism = int(cfg.BatchSize)
 	}
 
+	stuckGrace := cfg.StuckTransitionGrace
+	if stuckGrace <= 0 {
+		stuckGrace = defaultStuckTransitionGrace
+	}
+
 	log.Info().
 		Dur("interval", cfg.Interval).
 		Int32("batch_size", cfg.BatchSize).
@@ -72,6 +86,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 
 	runTick := func() {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
+		sentrylog.RunSafe("stuck-transition-recovery", func() { h.recoverStuckTransitions(ctx, stuckGrace, cfg.BatchSize) })
 		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
 		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
 	}
@@ -127,6 +142,29 @@ func (h *Handlers) cleanupExpiredRevocations(ctx context.Context) {
 	}
 	if tn > 0 {
 		log.Info().Int64("reaped", tn).Msg("reaper: deleted expired revoked proxy tokens")
+	}
+}
+
+// recoverStuckTransitions marks 'failed' any sandbox a crashed worker left in a
+// transitional state past the grace window, restoring deletability. The query's
+// status + age guard cannot touch a transition still in progress.
+func (h *Handlers) recoverStuckTransitions(ctx context.Context, grace time.Duration, batchSize int32) {
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	recovered, err := h.DB.FailStuckTransitionalSandboxes(queryCtx, db.FailStuckTransitionalSandboxesParams{
+		StuckBefore: time.Now().Add(-grace),
+		MaxRows:     batchSize,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("reaper: recover stuck transitions failed")
+		return
+	}
+	for _, sb := range recovered {
+		log.Warn().
+			Str("sandbox_id", sb.ID.String()).
+			Str("team_id", sb.TeamID.String()).
+			Str("sandbox_name", sb.Name).
+			Msg("reaper: sandbox stuck mid-transition past grace, marked 'failed' (owning worker likely crashed)")
 	}
 }
 

@@ -2223,6 +2223,76 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 	}
 }
 
+// TestIntegration_FailStuckTransitionalSandboxes proves the guard reclaims only
+// old transitional rows, sparing fresh transitions and settled active/paused.
+func TestIntegration_FailStuckTransitionalSandboxes(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	insert := func(status string, updatedAt time.Time) uuid.UUID {
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, updated_at) VALUES ($1,$2,$3,$4,$5)`,
+			id, teamID, "stuck-"+status, status, updatedAt); err != nil {
+			t.Fatalf("insert %s: %v", status, err)
+		}
+		return id
+	}
+	statusOf := func(id uuid.UUID) string {
+		var s string
+		if err := testPool.QueryRow(ctx, `SELECT status FROM sandbox WHERE id = $1`, id).Scan(&s); err != nil {
+			t.Fatalf("status query: %v", err)
+		}
+		return s
+	}
+
+	old := time.Now().Add(-30 * time.Minute)
+	stuck := map[string]uuid.UUID{
+		"starting": insert("starting", old),
+		"resuming": insert("resuming", old),
+		"pausing":  insert("pausing", old),
+	}
+	freshStarting := insert("starting", time.Now()) // owner may still be working
+	oldActive := insert("active", old)              // settled, not a transition
+	oldPaused := insert("paused", old)              // settled, not a transition
+
+	rows, err := testQueries.FailStuckTransitionalSandboxes(ctx, db.FailStuckTransitionalSandboxesParams{
+		StuckBefore: time.Now().Add(-15 * time.Minute),
+		MaxRows:     100,
+	})
+	if err != nil {
+		t.Fatalf("FailStuckTransitionalSandboxes: %v", err)
+	}
+	reclaimed := map[uuid.UUID]bool{}
+	for _, row := range rows {
+		reclaimed[row.ID] = true
+	}
+
+	for state, id := range stuck {
+		if !reclaimed[id] {
+			t.Errorf("stuck %s sandbox not reclaimed", state)
+		}
+		if got := statusOf(id); got != "failed" {
+			t.Errorf("stuck %s status = %q, want failed", state, got)
+		}
+	}
+	for _, tc := range []struct {
+		name, want string
+		id         uuid.UUID
+	}{
+		{"fresh starting", "starting", freshStarting},
+		{"old active", "active", oldActive},
+		{"old paused", "paused", oldPaused},
+	} {
+		if reclaimed[tc.id] {
+			t.Errorf("%s was wrongly reclaimed", tc.name)
+		}
+		if got := statusOf(tc.id); got != tc.want {
+			t.Errorf("%s status = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	w := do(newRouter(t), "DELETE", "/sandboxes/"+uuid.New().String(), apiKey, "")

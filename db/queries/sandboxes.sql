@@ -213,6 +213,42 @@ SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL;
 
+-- name: FailStuckTransitionalSandboxes :many
+-- Marks 'failed' sandboxes a crashed worker left mid-transition: a row still in
+-- starting/resuming/pausing past stuck_before is un-resumable and un-deletable
+-- (both claims require a settled state). The status + age guard spares
+-- transitions still in progress; SKIP LOCKED divides the batch across replicas.
+WITH stuck AS (
+  SELECT s.id FROM sandbox s
+  WHERE s.destroyed_at IS NULL
+    AND s.status IN ('starting', 'resuming', 'pausing')
+    AND s.updated_at < sqlc.arg(stuck_before)
+  ORDER BY s.updated_at ASC
+  LIMIT sqlc.arg(max_rows)
+  FOR UPDATE SKIP LOCKED
+),
+failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE id IN (SELECT id FROM stuck)
+  RETURNING id, team_id, name
+),
+closed_active AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT id, team_id, name FROM failed;
+
 -- name: BeginPause :one
 -- Atomic ownership + state check + transition to 'pausing' AND close of any
 -- open sandbox_active_interval row, all in one statement so the "sandbox

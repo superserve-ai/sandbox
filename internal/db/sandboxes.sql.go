@@ -561,6 +561,74 @@ func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) 
 	return id, err
 }
 
+const failStuckTransitionalSandboxes = `-- name: FailStuckTransitionalSandboxes :many
+WITH stuck AS (
+  SELECT s.id FROM sandbox s
+  WHERE s.destroyed_at IS NULL
+    AND s.status IN ('starting', 'resuming', 'pausing')
+    AND s.updated_at < $1
+  ORDER BY s.updated_at ASC
+  LIMIT $2
+  FOR UPDATE SKIP LOCKED
+),
+failed AS (
+  UPDATE sandbox
+  SET status = 'failed', updated_at = now()
+  WHERE id IN (SELECT id FROM stuck)
+  RETURNING id, team_id, name
+),
+closed_active AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT id, team_id, name FROM failed
+`
+
+type FailStuckTransitionalSandboxesParams struct {
+	StuckBefore time.Time `json:"stuck_before"`
+	MaxRows     int32     `json:"max_rows"`
+}
+
+type FailStuckTransitionalSandboxesRow struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+	Name   string    `json:"name"`
+}
+
+// Marks 'failed' sandboxes a crashed worker left mid-transition: a row still in
+// starting/resuming/pausing past stuck_before is un-resumable and un-deletable
+// (both claims require a settled state). The status + age guard spares
+// transitions still in progress; SKIP LOCKED divides the batch across replicas.
+func (q *Queries) FailStuckTransitionalSandboxes(ctx context.Context, arg FailStuckTransitionalSandboxesParams) ([]FailStuckTransitionalSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, failStuckTransitionalSandboxes, arg.StuckBefore, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []FailStuckTransitionalSandboxesRow{}
+	for rows.Next() {
+		var i FailStuckTransitionalSandboxesRow
+		if err := rows.Scan(&i.ID, &i.TeamID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const finalizePause = `-- name: FinalizePause :one
 WITH target AS (
   SELECT id, team_id FROM sandbox
