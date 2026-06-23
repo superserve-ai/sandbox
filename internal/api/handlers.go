@@ -849,20 +849,19 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// from the persisted row on restart.
 	go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
 
-	// Tear down the VM best-effort — a failure here is reconciled by the vm
-	// reconciler (active unit + deleted row → stop), so a vmd hiccup must not
-	// fail an already-committed delete. Skip when the sandbox never booted
-	// (failed).
-	if sandbox.Status != db.SandboxStatusFailed {
-		if vmd, lookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID); lookupErr != nil {
-			log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
-		} else {
-			vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-			if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
-				log.Warn().Err(derr).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
-			}
-			vmdCancel()
+	// Tear down the VM best-effort and unconditionally: a reaper-recovered
+	// 'failed' sandbox may still hold a VM, run dir, and netns that only
+	// DestroyInstance reclaims (an absent VM is an idempotent no-op). A failure
+	// here is reconciled by the vm reconciler, so a vmd hiccup must not fail an
+	// already-committed delete.
+	if vmd, lookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID); lookupErr != nil {
+		log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
+	} else {
+		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+		if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
+			log.Warn().Err(derr).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
 		}
+		vmdCancel()
 	}
 
 	// Best-effort cleanup of pause snapshots. Failures are logged but

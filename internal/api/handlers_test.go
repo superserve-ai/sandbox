@@ -396,6 +396,45 @@ func TestDeleteSandbox_RevocationAtomicWithClaim(t *testing.T) {
 	}
 }
 
+// TestDeleteSandbox_Failed_StillAttemptsTeardown guards against leaking a
+// reaper-recovered 'failed' sandbox's VM/run dir/netns: 'failed' no longer
+// implies "never booted", so teardown must still run.
+func TestDeleteSandbox_Failed_StillAttemptsTeardown(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusFailed}
+
+	var destroyCalled bool
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { destroyCalled = true; return nil }}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("OK"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if !destroyCalled {
+		t.Error("teardown must be attempted for a failed sandbox (may still hold resources)")
+	}
+}
+
 func TestDeleteSandbox_InvalidUUID(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return notFoundRow() },
