@@ -259,6 +259,10 @@ func run() error {
 		}
 	}
 
+	// Stop background reconcilers before draining HTTP so they don't keep
+	// issuing DB queries (which time out and log as errors) while shutting down.
+	cancel()
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
 

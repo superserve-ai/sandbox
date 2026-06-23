@@ -4,11 +4,20 @@ package sentrylog
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/getsentry/sentry-go"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+// benignCancellation matches shutdown/disconnect blips (cancelled context,
+// closed pool). Timeouts and connection failures are excluded on purpose —
+// those are real signals that must still reach Sentry.
+func benignCancellation(errStr string) bool {
+	return strings.Contains(errStr, "context canceled") ||
+		strings.Contains(errStr, "closed pool")
+}
 
 // Writer forwards error-level zerolog events to Sentry; a no-op until Sentry is
 // initialized. Use it in a zerolog.MultiLevelWriter beside the primary output.
@@ -34,6 +43,9 @@ func (w *Writer) WriteLevel(level zerolog.Level, p []byte) (int, error) {
 		msg, _ = fields["msg"].(string)
 	}
 	errStr, _ := fields["error"].(string)
+	if benignCancellation(errStr) {
+		return len(p), nil
+	}
 	caller, _ := fields["caller"].(string)
 
 	extras := make(map[string]interface{}, len(fields))

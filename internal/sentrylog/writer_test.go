@@ -1,6 +1,7 @@
 package sentrylog
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +52,36 @@ func TestWriter_ForwardsErrorsNotWarnings(t *testing.T) {
 	if logCtx, ok := e.Contexts["log"]; ok {
 		if _, dup := logCtx["caller"]; dup {
 			t.Error("caller duplicated in log context; it should be a tag only")
+		}
+	}
+}
+
+func TestWriter_DropsBenignCancellations(t *testing.T) {
+	mock := &sentry.MockTransport{}
+	if err := sentry.Init(sentry.ClientOptions{
+		Dsn:       "https://test@example.com/1",
+		Transport: mock,
+	}); err != nil {
+		t.Fatalf("sentry init: %v", err)
+	}
+
+	w := &Writer{}
+	// Benign shutdown / client-disconnect errors: must NOT reach Sentry.
+	w.WriteLevel(zerolog.ErrorLevel, []byte(`{"level":"error","message":"reaper: ClaimExpiredSandboxes failed","error":"closed pool"}`))
+	w.WriteLevel(zerolog.ErrorLevel, []byte(`{"level":"error","message":"exec: upstream error","error":"context canceled"}`))
+	// Real signals: must still reach Sentry — these are how an outage is detected.
+	w.WriteLevel(zerolog.ErrorLevel, []byte(`{"level":"error","message":"list active builds failed","error":"context deadline exceeded"}`))
+	w.WriteLevel(zerolog.ErrorLevel, []byte(`{"level":"error","message":"UpdateHostHeartbeat failed","error":"failed to connect to host"}`))
+
+	sentry.Flush(2 * time.Second)
+
+	events := mock.Events()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 forwarded events (deadline + connect), got %d", len(events))
+	}
+	for _, e := range events {
+		if strings.Contains(e.Message, "closed pool") || strings.Contains(e.Message, "context canceled") {
+			t.Errorf("benign cancellation forwarded to Sentry: %q", e.Message)
 		}
 	}
 }
