@@ -85,7 +85,10 @@ WITH activated AS (
       memory_mib = $3,
       ip_address = $4,
       updated_at = now()
+  -- Guarded on the source status so a reaper that failed a stuck transition
+  -- (FailStuckTransitionalSandboxes) is not silently resurrected to active.
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
+    AND sandbox.status IN ('starting', 'resuming')
   RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
 ),
 opened_compute AS (
@@ -316,8 +319,11 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 -- One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
 -- the UPSERT.
 WITH target AS (
+  -- Guarded on the source status so a reaper-failed stuck transition is not
+  -- resurrected to paused (resume-revert flips 'resuming', pause flips 'pausing').
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+    AND status IN ('pausing', 'resuming')
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)

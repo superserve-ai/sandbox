@@ -2302,6 +2302,52 @@ func TestIntegration_FailStuckTransitionalSandboxes(t *testing.T) {
 	}
 }
 
+// TestIntegration_FailedSandboxNotResurrected proves the status guards on
+// ActivateSandbox/FinalizePause: a sandbox the reaper marked 'failed' must not
+// be flipped back to active/paused by a late-completing worker.
+func TestIntegration_FailedSandboxNotResurrected(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	insertFailed := func() uuid.UUID {
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'failed','host-1')`,
+			id, teamID, "failed-sb"); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		return id
+	}
+	statusOf := func(id uuid.UUID) string {
+		var s string
+		if err := testPool.QueryRow(ctx, `SELECT status FROM sandbox WHERE id=$1`, id).Scan(&s); err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		return s
+	}
+
+	a := insertFailed()
+	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{
+		ID: a, VcpuCount: 1, MemoryMib: 1024, TeamID: teamID,
+	}); err != nil {
+		t.Fatalf("ActivateSandbox: %v", err)
+	}
+	if got := statusOf(a); got != "failed" {
+		t.Errorf("ActivateSandbox resurrected failed sandbox to %q", got)
+	}
+
+	f := insertFailed()
+	mem := "/snap/mem"
+	if _, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
+		ID: f, TeamID: teamID, Path: "/snap/vmstate", MemPath: &mem, Trigger: "pause",
+	}); err == nil {
+		t.Error("FinalizePause on a failed sandbox should match no row")
+	}
+	if got := statusOf(f); got != "failed" {
+		t.Errorf("FinalizePause resurrected failed sandbox to %q", got)
+	}
+}
+
 func TestIntegration_DeleteSandbox_NotFound(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	w := do(newRouter(t), "DELETE", "/sandboxes/"+uuid.New().String(), apiKey, "")
