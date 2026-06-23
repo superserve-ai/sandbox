@@ -56,23 +56,6 @@ func (q *Queries) InsertRevokedProxyToken(ctx context.Context, arg InsertRevoked
 	return err
 }
 
-const insertSandboxRevocation = `-- name: InsertSandboxRevocation :exec
-INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-VALUES ($1, $2)
-ON CONFLICT (sandbox_id) DO NOTHING
-`
-
-type InsertSandboxRevocationParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
-// Idempotent: destroying a sandbox twice is a no-op on the second call.
-func (q *Queries) InsertSandboxRevocation(ctx context.Context, arg InsertSandboxRevocationParams) error {
-	_, err := q.db.Exec(ctx, insertSandboxRevocation, arg.SandboxID, arg.ExpiresAt)
-	return err
-}
-
 const listActiveRevokedProxyTokens = `-- name: ListActiveRevokedProxyTokens :many
 SELECT sandbox_id, proxy_token FROM revoked_proxy_token
 WHERE expires_at > NOW()

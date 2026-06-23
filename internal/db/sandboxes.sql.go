@@ -512,9 +512,15 @@ const destroySandbox = `-- name: DestroySandbox :one
 WITH destroyed AS (
   UPDATE sandbox
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
-  WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  WHERE sandbox.id = $1 AND sandbox.team_id = $2
+    AND sandbox.destroyed_at IS NULL
     AND sandbox.status IN ('active', 'paused', 'failed')
   RETURNING id
+),
+revoked AS (
+  INSERT INTO sandbox_revocation (sandbox_id, expires_at)
+  SELECT id, $3 FROM destroyed
+  ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
   UPDATE sandbox_active_interval
@@ -541,21 +547,21 @@ SELECT id FROM destroyed
 `
 
 type DestroySandboxParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
+	ID                  uuid.UUID `json:"id"`
+	TeamID              uuid.UUID `json:"team_id"`
+	RevocationExpiresAt time.Time `json:"revocation_expires_at"`
 }
 
 // Atomic, guarded soft-delete that claims the sandbox for deletion ONLY from a
 // quiescent state (active/paused/failed) — never mid-transition. This is the
 // serialization point against a concurrent resume/pause: this CAS and resume's
-// BeginResume both target the same row, so only one wins. Also closes any open
-// billing/active intervals so a crash after the destroy can't leave an interval
-// open (which would have weekly_user_metrics count the actor active forever).
-// Returns the claimed id; 0 rows means the sandbox was already deleted or is in
-// a transitional state (resuming/pausing/starting) — the caller distinguishes
-// the two with a re-read.
+// BeginResume both target the same row, so only one wins. Writes the revocation
+// row and closes open billing/active intervals in the same statement, so a crash
+// after the claim can't strand a deleted sandbox with a live JWT or an open
+// interval that a retry would never fix. Returns the claimed id; 0 rows means
+// already-deleted or transitional — the caller distinguishes the two with a re-read.
 func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, destroySandbox, arg.ID, arg.TeamID)
+	row := q.db.QueryRow(ctx, destroySandbox, arg.ID, arg.TeamID, arg.RevocationExpiresAt)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err

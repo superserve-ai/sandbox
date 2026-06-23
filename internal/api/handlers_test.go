@@ -342,24 +342,28 @@ func TestDeleteSandbox_Success(t *testing.T) {
 	}
 }
 
-// TestDeleteSandbox_RevokesBeforeTeardown pins the ordering that closes the
-// secrets-leak window: revocation must be written before best-effort teardown.
-func TestDeleteSandbox_RevokesBeforeTeardown(t *testing.T) {
+// TestDeleteSandbox_RevocationAtomicWithClaim verifies the revocation is written
+// in the same statement that commits the soft-delete, leaving no crash window in
+// which a deleted sandbox lacks a revocation row.
+func TestDeleteSandbox_RevocationAtomicWithClaim(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive, HostID: "host-1"}
 
-	var order []string
-	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
-		order = append(order, "teardown")
-		return nil
-	}}
-
+	var claimHasRevocation, claimHasExpiry, separateRevokeExec bool
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "FROM destroyed"):
-				return idRow(sandboxID) // DestroySandbox claim
+				if strings.Contains(sql, "sandbox_revocation") {
+					claimHasRevocation = true
+				}
+				for _, a := range args {
+					if ts, ok := a.(time.Time); ok && !ts.IsZero() {
+						claimHasExpiry = true
+					}
+				}
+				return idRow(sandboxID)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			default:
@@ -367,22 +371,28 @@ func TestDeleteSandbox_RevokesBeforeTeardown(t *testing.T) {
 			}
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-			if strings.Contains(sql, "sandbox_revocation") {
-				order = append(order, "revoke")
+			if strings.Contains(sql, "INSERT INTO sandbox_revocation") {
+				separateRevokeExec = true
 			}
-			return pgconn.NewCommandTag("INSERT 1"), nil
+			return pgconn.NewCommandTag("OK"), nil
 		},
 	}
 
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	h := &Handlers{VMD: &stubVMD{destroyFn: func(context.Context, string, bool) error { return nil }}, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
 	}
-	if len(order) != 2 || order[0] != "revoke" || order[1] != "teardown" {
-		t.Errorf("call order = %v, want [revoke teardown]", order)
+	if !claimHasRevocation {
+		t.Error("DestroySandbox claim does not write the revocation row")
+	}
+	if !claimHasExpiry {
+		t.Error("DestroySandbox not called with a revocation expiry")
+	}
+	if separateRevokeExec {
+		t.Error("revocation must be atomic with the claim, not a separate insert")
 	}
 }
 

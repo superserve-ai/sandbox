@@ -815,11 +815,12 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
 	// only from a quiescent state (active/paused/failed), so it serializes
 	// against a concurrent resume/pause — this CAS and resume's BeginResume
-	// cannot both win the same row — and the teardown below therefore cannot
-	// race a resume that is bringing the VM up.
+	// cannot both win the same row. The same statement writes the revocation
+	// row, so a crash before teardown can't leave a live VM with a valid JWT.
 	if _, err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
+		ID:                  sandboxID,
+		TeamID:              teamID,
+		RevocationExpiresAt: time.Now().Add(SecretsJWTLifetime),
 	}); err != nil {
 		if err == pgx.ErrNoRows {
 			// Not claimable from its current state. Re-read to tell a
@@ -843,20 +844,10 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	// Revoke before teardown: teardown can hang up to vmdTimeout, and a crash
-	// mid-teardown leaves the sandbox soft-deleted with its VM still up — and
-	// bootstrap only re-fans revocations that were written. WithoutCancel
-	// survives a client disconnect.
-	revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
-	defer revokeCancel()
-	if err := h.DB.InsertSandboxRevocation(revokeCtx, db.InsertSandboxRevocationParams{
-		SandboxID: sandboxID,
-		ExpiresAt: time.Now().Add(SecretsJWTLifetime),
-	}); err != nil {
-		log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB InsertSandboxRevocation failed")
-	} else {
-		go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
-	}
+	// The revocation row is committed with the claim above; fan it out to the
+	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
+	// from the persisted row on restart.
+	go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
 
 	// Tear down the VM best-effort — a failure here is reconciled by the vm
 	// reconciler (active unit + deleted row → stop), so a vmd hiccup must not

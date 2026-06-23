@@ -2221,6 +2221,15 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected sandbox to be gone after delete")
 	}
+
+	// The revocation row is written in the same statement as the soft-delete.
+	var revoked int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_revocation WHERE sandbox_id = $1`, sandboxID).Scan(&revoked); err != nil {
+		t.Fatalf("revocation query: %v", err)
+	}
+	if revoked != 1 {
+		t.Errorf("sandbox_revocation rows = %d, want 1", revoked)
+	}
 }
 
 // TestIntegration_FailStuckTransitionalSandboxes proves the guard reclaims only
