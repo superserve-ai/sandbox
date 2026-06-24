@@ -342,11 +342,11 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 func quotaEmailHTML(a QuotaAlert) string {
 	team := html.EscapeString(a.TeamName)
 	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">You're approaching your sandbox limit</h1>
-<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Team <strong style="color:#e5e5e5;">%s</strong> is using <strong style="color:#e5e5e5;">%d of %d</strong> sandboxes (%d%%).</p>
-<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Reach out and we'll raise your limit before you run out of room — or grab time to talk through your use case.</p>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Team <strong style="color:#e5e5e5;">%s</strong> is using <strong style="color:#e5e5e5;">%d of %d</strong> sandboxes — about <strong style="color:#e5e5e5;">%d%%</strong> of your limit.</p>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Once you hit %d, new sandboxes won't start until you free up room. Pause or delete any you're done with, or book a quick call and we'll raise your limit.</p>
 <a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">Book a Meeting</a>
 <a href="%s" style="background-color:transparent;color:#e5e5e5;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:13px 24px;margin:12px 0 0 0;border:1px dashed #404040;">View Usage</a>`,
-		team, a.Used, a.Limit, a.Pct, emailMeetingURL, emailUsageURL)
+		team, a.Used, a.Limit, a.Pct, a.Limit, emailMeetingURL, emailUsageURL)
 	return emailShell("You're approaching your sandbox limit", body)
 }
 
