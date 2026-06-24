@@ -223,7 +223,7 @@ func TestReclaimDiskOrphans_QuarantinesUpToBudget(t *testing.T) {
 		mgr: &Manager{cfg: ManagerConfig{RunDir: runDir}, log: zerolog.Nop()},
 		cfg: ReconcilerConfig{DiskDeleteBudget: 2},
 	}
-	r.reclaimDiskOrphans(context.Background(), time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC), ids, onDisk)
+	r.reclaimDiskOrphans(context.Background(), time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC), ids, onDisk, map[string]db.ListSandboxesByHostRow{})
 
 	// Budget 2: the first two (slice order) move, the third stays.
 	if _, err := os.Stat(filepath.Join(runDir, uuidA)); !os.IsNotExist(err) {
@@ -235,6 +235,70 @@ func TestReclaimDiskOrphans_QuarantinesUpToBudget(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(runDir, ".trash", "2026-06-20"))
 	if len(entries) != 2 {
 		t.Errorf(".trash has %d entries, want 2 (budget)", len(entries))
+	}
+}
+
+// The reclaim-time tripwire must refuse to move a dir whose UUID still has a
+// live (non-destroyed) DB row, even if it reached the orphan list.
+func TestReclaimDiskOrphans_SkipsLiveSandbox(t *testing.T) {
+	runDir := t.TempDir()
+	ids := []string{uuidA, uuidB}
+	onDisk := map[string]sandboxDirInfo{}
+	for _, id := range ids {
+		p := filepath.Join(runDir, id)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		onDisk[id] = sandboxDirInfo{paths: []string{p}}
+	}
+	dbSandboxes := map[string]db.ListSandboxesByHostRow{
+		uuidA: {Sandbox: db.Sandbox{Status: db.SandboxStatusPaused}}, // live → must not move
+	}
+
+	r := &Reconciler{
+		mgr: &Manager{cfg: ManagerConfig{RunDir: runDir}, log: zerolog.Nop()},
+		cfg: ReconcilerConfig{DiskDeleteBudget: 10},
+	}
+	r.reclaimDiskOrphans(context.Background(), time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC), ids, onDisk, dbSandboxes)
+
+	if _, err := os.Stat(filepath.Join(runDir, uuidA)); err != nil {
+		t.Error("live sandbox dir (uuidA) must NOT be quarantined")
+	}
+	if _, err := os.Stat(filepath.Join(runDir, uuidB)); !os.IsNotExist(err) {
+		t.Error("orphan uuidB should have been quarantined")
+	}
+}
+
+// A cancelled pass (e.g. runTimeout) must stop before any destructive move,
+// even with budget to spare.
+func TestReclaimDiskOrphans_StopsOnCancel(t *testing.T) {
+	runDir := t.TempDir()
+	ids := []string{uuidA, uuidB}
+	onDisk := map[string]sandboxDirInfo{}
+	for _, id := range ids {
+		p := filepath.Join(runDir, id)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		onDisk[id] = sandboxDirInfo{paths: []string{p}}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	r := &Reconciler{
+		mgr: &Manager{cfg: ManagerConfig{RunDir: runDir}, log: zerolog.Nop()},
+		cfg: ReconcilerConfig{DiskDeleteBudget: 10},
+	}
+	r.reclaimDiskOrphans(ctx, time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC), ids, onDisk, map[string]db.ListSandboxesByHostRow{})
+
+	for _, id := range ids {
+		if _, err := os.Stat(filepath.Join(runDir, id)); err != nil {
+			t.Errorf("%s must not be moved when ctx is cancelled", id)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(runDir, trashDirName)); !os.IsNotExist(err) {
+		t.Error("no .trash should be created when ctx is cancelled")
 	}
 }
 

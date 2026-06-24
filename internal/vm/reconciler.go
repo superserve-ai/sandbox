@@ -499,29 +499,52 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	if len(sample) > 20 {
 		sample = sample[:20]
 	}
+	// Surface the live sandboxes being protected so each pass is auditable.
+	var keptActive, keptPaused int
+	for _, row := range dbSandboxes {
+		switch row.Sandbox.Status {
+		case db.SandboxStatusActive:
+			keptActive++
+		case db.SandboxStatusPaused:
+			keptPaused++
+		}
+	}
 	log.Warn().
 		Int("orphan_sandboxes", len(orphans)).
 		Int("orphan_dirs", dirCount).
 		Int64("orphan_bytes", bytes).
+		Int("kept_total", len(keep)).
+		Int("kept_active", keptActive).
+		Int("kept_paused", keptPaused).
 		Strs("sample", sample).
 		Bool("reclaim", r.cfg.DiskReclaimEnabled).
 		Msg("disk scan: orphan per-sandbox dirs detected")
 
 	if r.cfg.DiskReclaimEnabled {
-		r.reclaimDiskOrphans(ctx, snapshotTime, orphans, onDisk)
+		r.reclaimDiskOrphans(ctx, snapshotTime, orphans, onDisk, dbSandboxes)
 	}
 }
 
 // reclaimDiskOrphans quarantine-moves orphan dirs to <root>/.trash/<date>/<uuid>
 // (reversible), bounded by DiskDeleteBudget. Space is freed later by sweepTrash
 // once the retention soak elapses. The caller guarantees a non-empty keep-set.
-func (r *Reconciler) reclaimDiskOrphans(ctx context.Context, snapshotTime time.Time, orphans []string, onDisk map[string]sandboxDirInfo) {
+func (r *Reconciler) reclaimDiskOrphans(ctx context.Context, snapshotTime time.Time, orphans []string, onDisk map[string]sandboxDirInfo, dbSandboxes map[string]db.ListSandboxesByHostRow) {
 	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_reclaim").Logger()
 	date := snapshotTime.UTC().Format("2006-01-02")
 
 	var moved, dirCount int
 	var bytes int64
 	for _, id := range orphans {
+		// Stop on a cancelled pass (e.g. runTimeout) rather than keep mutating.
+		if ctx.Err() != nil {
+			return
+		}
+		// Tripwire: dbSandboxes is non-destroyed rows only, so a hit means a live
+		// sandbox slipped past the keep-set — alarm and skip, never move it.
+		if _, live := dbSandboxes[id]; live {
+			log.Error().Str("vm_id", id).Msg("disk reclaim: refusing to quarantine a live sandbox dir (keep-set regression)")
+			continue
+		}
 		if moved >= r.cfg.DiskDeleteBudget {
 			log.Warn().Int("budget", r.cfg.DiskDeleteBudget).Int("deferred", len(orphans)-moved).
 				Msg("disk reclaim: budget reached, deferring rest to next pass")
