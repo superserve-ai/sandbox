@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/authz"
@@ -160,7 +161,7 @@ func (h *Handlers) listTeamAssignmentsForManagement(c *gin.Context, teamID uuid.
 	assignments := make([]roleAssignmentResponse, 0)
 	for rows.Next() {
 		var row roleAssignmentResponse
-		var grantedBy uuid.NullUUID
+		var grantedBy pgtype.UUID
 		if err := rows.Scan(
 			&row.AssignmentID,
 			&row.UserID,
@@ -176,10 +177,7 @@ func (h *Handlers) listTeamAssignmentsForManagement(c *gin.Context, teamID uuid.
 		); err != nil {
 			return nil, err
 		}
-		if grantedBy.Valid {
-			s := grantedBy.UUID.String()
-			row.GrantedBy = &s
-		}
+		row.GrantedBy = uuidPGTypeString(grantedBy)
 		assignments = append(assignments, row)
 	}
 	return assignments, rows.Err()
