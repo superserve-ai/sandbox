@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,11 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+// trashDirName is the per-root quarantine directory. Orphan dirs are moved to
+// <root>/<trashDirName>/<date>/<uuid> before being removed after the retention
+// soak. It is not a UUID, so the orphan scan never enumerates it.
+const trashDirName = ".trash"
 
 // buildVMIDPrefix marks VMs owned by the template build pipeline. Their
 // lifecycle is managed by buildTemplateWorker, not the reconciler — they
@@ -53,6 +59,17 @@ type ReconcilerConfig struct {
 	// filesystem walk doesn't ride the fast liveness loop. Values < 1 mean
 	// every tick.
 	DiskScanEvery int
+	// DiskReclaimEnabled turns the disk pass from detect-only into reclamation:
+	// orphan dirs are quarantine-moved to <root>/.trash/<date>/ (reversible)
+	// and trash older than DiskTrashRetention is removed. Default false — the
+	// detect-only numbers must be validated on prod before this is flipped on.
+	DiskReclaimEnabled bool
+	// DiskDeleteBudget bounds how many orphan sandboxes one pass quarantines so
+	// a keep-set bug can't move everything at once. Deferred work runs next pass.
+	DiskDeleteBudget int
+	// DiskTrashRetention is how long a quarantined dir soaks under .trash before
+	// it is permanently removed — the window to spot and reverse a bad reclaim.
+	DiskTrashRetention time.Duration
 }
 
 // DefaultReconcilerConfig returns sensible defaults from the design doc.
@@ -64,6 +81,9 @@ func DefaultReconcilerConfig() ReconcilerConfig {
 		DiskScanEnabled:    true,
 		DiskGracePeriod:    24 * time.Hour,
 		DiskScanEvery:      4,
+		DiskReclaimEnabled: false,
+		DiskDeleteBudget:   50,
+		DiskTrashRetention: 72 * time.Hour,
 	}
 }
 
@@ -92,14 +112,18 @@ type Reconciler struct {
 	// passCount counts completed reconcile passes, used to run the disk
 	// scan on a slower sub-cadence. Only touched from the single Run loop.
 	passCount uint64
+	// prevKeptLive is the prior disk pass's protected live-sandbox count, used
+	// to detect a keep-set collapse. -1 until the first pass. Run loop only.
+	prevKeptLive int
 }
 
 // NewReconciler creates a reconciler bound to a Manager.
 func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 	return &Reconciler{
-		mgr:       mgr,
-		cfg:       cfg,
-		driftSeen: make(map[string]time.Time),
+		mgr:          mgr,
+		cfg:          cfg,
+		driftSeen:    make(map[string]time.Time),
+		prevKeptLive: -1,
 	}
 }
 
@@ -378,10 +402,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
 				Msg("BoltDB entry with no DB row — cleaning up")
-			// Stop the unit if it's still live so we don't leak a VM.
+			// Stop the unit if it's still live. If the stop fails the VM may
+			// still be running, so leave the entry for next pass — markStale
+			// frees the network slot, which must never happen for a live VM.
 			if rec.Status == StatusRunning {
 				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
-					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB")
+					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
+					continue
 				}
 				removeUnitDropIn(id)
 			}
@@ -410,9 +437,10 @@ type sandboxDirInfo struct {
 	paths []string
 }
 
-// detectDiskOrphans implements Drift 6 in detect-only mode: it logs the
-// per-sandbox dirs it would reclaim and deletes nothing. Fail-closed: without
-// a DB keep-set it does nothing.
+// detectDiskOrphans implements Drift 6: it logs the per-sandbox dirs with no
+// live row and, when DiskReclaimEnabled, quarantine-moves them (bounded by
+// DiskDeleteBudget) and sweeps expired quarantine. Fail-closed: without a DB
+// keep-set it does nothing.
 func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Time, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool) {
 	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_scan").Logger()
 
@@ -424,9 +452,6 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	// Source D: per-sandbox dirs. A name that parses as a UUID excludes the
 	// template mount target, the build tree, and build-* VMs by construction.
 	onDisk := scanSandboxDirs(r.mgr.cfg.RunDir, r.mgr.cfg.SnapshotDir)
-	if len(onDisk) == 0 {
-		return
-	}
 
 	cutoff := snapshotTime.Add(-r.cfg.DiskGracePeriod)
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
@@ -439,13 +464,54 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		log.Error().Err(err).Msg("disk scan: recently-destroyed query failed — skipping (fail-closed)")
 		return
 	}
-	keep := diskKeepSet(dbSandboxes, recent, active, cutoff)
+	keep := diskKeepSet(dbSandboxes, recent, active)
 
-	// A drained or all-failed host legitimately has an empty keep-set; report it
-	// (detect-only is harmless). The hard abort-guard belongs on reclamation.
+	// Protected live sandboxes — used by the collapse guard and the audit log.
+	var keptActive, keptPaused int
+	for _, row := range dbSandboxes {
+		switch row.Sandbox.Status {
+		case db.SandboxStatusActive:
+			keptActive++
+		case db.SandboxStatusPaused:
+			keptPaused++
+		}
+	}
+	keptLive := keptActive + keptPaused
+
 	if len(keep) == 0 {
+		// An empty keep-set is almost always a query bug, not an empty host;
+		// reclamation aborts (detect-only just reports).
+		if r.cfg.DiskReclaimEnabled {
+			log.Error().Int("on_disk", len(onDisk)).Msg("disk reclaim suppressed: empty keep-set")
+			return
+		}
 		log.Warn().Int("on_disk", len(onDisk)).
 			Msg("disk scan: empty keep-set — reporting all on-disk dirs as orphans (verify before enabling reclamation)")
+	}
+
+	if r.cfg.DiskReclaimEnabled {
+		if r.cfg.DiskTrashRetention <= 0 || r.cfg.DiskDeleteBudget <= 0 {
+			log.Error().Dur("retention", r.cfg.DiskTrashRetention).Int("budget", r.cfg.DiskDeleteBudget).
+				Msg("disk reclaim suppressed: retention and budget must be > 0")
+			return
+		}
+		// keep-set and tripwire both read dbSandboxes, so a query returning too
+		// few live rows evades both; a sharp drop vs the prior pass is the
+		// independent signal. Keep the baseline so a sustained drop stays suppressed.
+		if keepSetCollapsed(r.prevKeptLive, keptLive) {
+			log.Error().Int("kept_live", keptLive).Int("prev_kept_live", r.prevKeptLive).
+				Msg("disk reclaim suppressed: live keep-set collapsed since last pass")
+			return
+		}
+		r.prevKeptLive = keptLive
+		// Sweep only after the keep-set is validated, so a fail-closed pass does
+		// nothing destructive. Registered before the empty-disk return below so a
+		// drained host (dirs already quarantined, only .trash left) still sweeps.
+		defer r.sweepTrash(snapshotTime)
+	}
+
+	if len(onDisk) == 0 {
+		return
 	}
 
 	orphans := selectOrphanDirs(onDisk, keep, cutoff)
@@ -470,23 +536,123 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 		Int("orphan_sandboxes", len(orphans)).
 		Int("orphan_dirs", dirCount).
 		Int64("orphan_bytes", bytes).
+		Int("kept_total", len(keep)).
+		Int("kept_active", keptActive).
+		Int("kept_paused", keptPaused).
 		Strs("sample", sample).
-		Msg("disk scan (detect-only): orphan per-sandbox dirs would be reclaimed")
+		Bool("reclaim", r.cfg.DiskReclaimEnabled).
+		Msg("disk scan: orphan per-sandbox dirs detected")
+
+	if r.cfg.DiskReclaimEnabled {
+		r.reclaimDiskOrphans(ctx, snapshotTime, orphans, onDisk, dbSandboxes)
+	}
 }
 
-// diskKeepSet is every sandbox UUID whose on-disk dirs must NOT be reclaimed —
-// the union of all signals a dir may be in use: non-destroyed DB rows (minus
-// failures settled before cutoff), rows destroyed within grace, and active
-// systemd units (a running VM whose row is momentarily gone). BoltDB-only UUIDs
-// are excluded on purpose: no row AND no unit means a dead VM (Drift 5's job),
-// so its dir is reclaimable. In-flight creates are caught by the caller's mtime
-// grace, not here. Pure.
-func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid.UUID, active map[string]bool, cutoff time.Time) map[string]struct{} {
-	keep := make(map[string]struct{}, len(dbSandboxes)+len(recent)+len(active))
-	for id, row := range dbSandboxes {
-		if row.Sandbox.Status == db.SandboxStatusFailed && row.Sandbox.UpdatedAt.Before(cutoff) {
+// reclaimDiskOrphans quarantine-moves orphan dirs to <root>/.trash/<date>/<uuid>
+// (reversible), bounded by DiskDeleteBudget. Space is freed later by sweepTrash
+// once the retention soak elapses. The caller guarantees a non-empty keep-set.
+func (r *Reconciler) reclaimDiskOrphans(ctx context.Context, snapshotTime time.Time, orphans []string, onDisk map[string]sandboxDirInfo, dbSandboxes map[string]db.ListSandboxesByHostRow) {
+	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "disk_reclaim").Logger()
+	date := snapshotTime.UTC().Format("2006-01-02")
+
+	var moved, dirCount int
+	var bytes int64
+	for _, id := range orphans {
+		// Tripwire: dbSandboxes is non-destroyed rows only, so a hit means a live
+		// sandbox slipped past the keep-set — alarm and skip, never move it.
+		if _, live := dbSandboxes[id]; live {
+			log.Error().Str("vm_id", id).Msg("disk reclaim: refusing to quarantine a live sandbox dir (keep-set regression)")
 			continue
 		}
+		if moved >= r.cfg.DiskDeleteBudget {
+			log.Warn().Int("budget", r.cfg.DiskDeleteBudget).Int("deferred", len(orphans)-moved).
+				Msg("disk reclaim: budget reached, deferring rest to next pass")
+			break
+		}
+		info := onDisk[id]
+		sz := dirSize(ctx, info.paths)
+		// Re-check right before the move: dirSize can run long, and a cancelled
+		// pass (runTimeout/shutdown) must stop before mutating disk.
+		if ctx.Err() != nil {
+			return
+		}
+		any := false
+		for _, p := range info.paths {
+			if err := quarantineDir(p, date); err != nil {
+				log.Error().Err(err).Str("path", p).Msg("disk reclaim: quarantine failed")
+				continue
+			}
+			dirCount++
+			any = true
+		}
+		if any {
+			moved++
+			bytes += sz
+		}
+	}
+	if moved > 0 {
+		log.Warn().Int("quarantined_sandboxes", moved).Int("quarantined_dirs", dirCount).Int64("bytes", bytes).
+			Msg("disk reclaim: orphan dirs quarantined to .trash")
+	}
+}
+
+// quarantineDir moves a per-sandbox dir (<root>/<uuid>) to
+// <root>/.trash/<date>/<uuid>. The dir name must parse as a UUID (so a stray
+// path can't be moved) and the move stays within the same root (same
+// filesystem → atomic rename).
+func quarantineDir(path, date string) error {
+	root := filepath.Dir(path)
+	name := filepath.Base(path)
+	if _, err := uuid.Parse(name); err != nil {
+		return fmt.Errorf("refusing to quarantine non-uuid dir %q", name)
+	}
+	trashDir := filepath.Join(root, trashDirName, date)
+	if err := os.MkdirAll(trashDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir trash: %w", err)
+	}
+	return os.Rename(path, filepath.Join(trashDir, name))
+}
+
+// sweepTrash permanently removes quarantine buckets soaked past
+// DiskTrashRetention. Age is the bucket's mtime, not its date label, so a bucket
+// always soaks at least the full retention (never the rounded-down midnight).
+func (r *Reconciler) sweepTrash(now time.Time) {
+	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "trash_sweep").Logger()
+	cutoff := now.Add(-r.cfg.DiskTrashRetention)
+	for _, root := range []string{r.mgr.cfg.RunDir, r.mgr.cfg.SnapshotDir} {
+		if root == "" {
+			continue
+		}
+		trash := filepath.Join(root, trashDirName)
+		entries, err := os.ReadDir(trash)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			info, ierr := e.Info()
+			if ierr != nil || !info.ModTime().Before(cutoff) {
+				continue
+			}
+			p := filepath.Join(trash, e.Name())
+			if err := os.RemoveAll(p); err != nil {
+				log.Warn().Err(err).Str("path", p).Msg("trash sweep: remove failed")
+			} else {
+				log.Info().Str("path", p).Msg("trash sweep: removed expired quarantine")
+			}
+		}
+	}
+}
+
+// diskKeepSet is every sandbox UUID whose on-disk dirs must NOT be reclaimed:
+// non-destroyed DB rows, rows destroyed within grace, and active systemd units.
+// Failed rows are kept too — a failed sandbox retains billed disk (storage
+// interval open until delete), so it is reclaimed only once destroyed.
+func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid.UUID, active map[string]bool) map[string]struct{} {
+	keep := make(map[string]struct{}, len(dbSandboxes)+len(recent)+len(active))
+	for id := range dbSandboxes {
 		keep[id] = struct{}{}
 	}
 	for _, id := range recent {
@@ -496,6 +662,13 @@ func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid
 		keep[id] = struct{}{}
 	}
 	return keep
+}
+
+// keepSetCollapsed reports whether the protected live-sandbox count dropped by
+// more than half between disk passes — a sign the keep-set query regressed. A
+// prev of < 1 (no prior pass, or an already-drained host) never trips.
+func keepSetCollapsed(prev, cur int) bool {
+	return prev > 0 && cur*2 < prev
 }
 
 // selectOrphanDirs returns the sandbox UUIDs whose on-disk dirs have no live or
@@ -697,6 +870,13 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 // in-memory map. The VM is already gone in reality; this just cleans up
 // VMD's cache.
 func (r *Reconciler) markStale(vmID string) {
+	// Capture the namespace before deleting the record: a VM whose teardown
+	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
+	var namespace string
+	if rec, err := r.mgr.state.Get(vmID); err == nil && rec != nil {
+		namespace = rec.Namespace
+	}
+
 	// Delete from BoltDB first. If this fails, keep the in-memory entry
 	// so the state stays consistent — the reconciler will retry on the
 	// next run. Deleting from the map before BoltDB would cause
@@ -709,6 +889,11 @@ func (r *Reconciler) markStale(vmID string) {
 	r.mgr.mu.Lock()
 	delete(r.mgr.vms, vmID)
 	r.mgr.mu.Unlock()
+
+	// Free the slot too. netMgr is always set in prod; the nil check is defensive.
+	if r.mgr.netMgr != nil {
+		r.mgr.netMgr.CleanupVMOrNamespace(vmID, namespace)
+	}
 
 	r.mu.Lock()
 	delete(r.driftSeen, vmID)
