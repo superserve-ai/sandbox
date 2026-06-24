@@ -76,6 +76,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/billing/pricing", h.GetBillingPricing)
 
 		// RBAC Phase 2b customer-facing team management.
+		api.GET("/teams/:team_id/management", h.GetTeamManagement)
 		api.GET("/teams/:team_id/members", h.ListTeamMembers)
 		api.POST("/teams/:team_id/members", h.AddTeamMember)
 		api.DELETE("/teams/:team_id/members/:user_id", h.DeactivateTeamMember)
