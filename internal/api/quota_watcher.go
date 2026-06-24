@@ -35,7 +35,6 @@ const (
 	// Shared brand assets, mirroring the console's EmailLayout.
 	emailLogoURL     = "https://superserve.ai/assets/logo-light.png"
 	emailMeetingURL  = "https://www.superserve.ai/meet/?utm_source=email&utm_medium=quota"
-	emailUsageURL    = "https://console.superserve.ai/plan-usage"
 	emailSupportAddr = "support@superserve.ai"
 )
 
@@ -300,7 +299,7 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	payload := map[string]any{
 		"from":    n.from,
 		"to":      []string{to},
-		"subject": fmt.Sprintf("You've used %d%% of your sandbox limit", a.Pct),
+		"subject": "Verify your team on Superserve",
 		"html":    quotaEmailHTML(a),
 	}
 	body, _ := json.Marshal(payload)
@@ -338,16 +337,19 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	}
 }
 
-// quotaEmailHTML renders the sandbox-limit email body inside the shared shell.
+// quotaEmailHTML renders the team-verification email body inside the shared shell.
 func quotaEmailHTML(a QuotaAlert) string {
-	team := html.EscapeString(a.TeamName)
-	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">You're approaching your sandbox limit</h1>
-<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Team <strong style="color:#e5e5e5;">%s</strong> is using <strong style="color:#e5e5e5;">%d of %d</strong> sandboxes — about <strong style="color:#e5e5e5;">%d%%</strong> of your limit.</p>
-<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Once you hit %d, new sandboxes won't start until you free up room. Pause or delete any you're done with, or book a quick call and we'll raise your limit.</p>
-<a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">Book a Meeting</a>
-<a href="%s" style="background-color:transparent;color:#e5e5e5;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:13px 24px;margin:12px 0 0 0;border:1px dashed #404040;">View Usage</a>`,
-		team, a.Used, a.Limit, a.Pct, a.Limit, emailMeetingURL, emailUsageURL)
-	return emailShell("You're approaching your sandbox limit", body)
+	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">Verify your team on Superserve</h1>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We're glad to see increasing usage on your Superserve account. For security reasons, we limit the number of active sandboxes on new accounts to <strong style="color:#e5e5e5;">%d</strong>. To request a higher limit, book a meeting using the link below, or reply to this email with:</p>
+<ul style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;padding-left:20px;">
+<li>a link to your website or domain</li>
+<li>a company email address</li>
+<li>a brief description of your use case</li>
+</ul>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We review every request and aim to respond within 48 hours. Our goal is to provide infinite compute to power your agents, and this verification helps us allocate capacity safely and responsibly across all our customers.</p>
+<a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">Book a Meeting</a>`,
+		a.Limit, emailMeetingURL)
+	return emailShell("Verify your team on Superserve", body)
 }
 
 // emailShell wraps body HTML in the shared Superserve email chrome — logo header,
