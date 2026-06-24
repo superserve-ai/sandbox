@@ -745,6 +745,14 @@ func ownerIDFromContext(c *gin.Context) string {
 // transparently resuming the VM if it was paused. Idempotent on active
 // sandboxes. Transitional states (pausing, resuming, failed) → 409.
 func (h *Handlers) ActivateSandbox(c *gin.Context) {
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+
 	sandbox := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
@@ -760,6 +768,9 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
 
@@ -808,6 +819,9 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
 
@@ -1142,6 +1156,9 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSandboxRead(c, teamID) {
+		return
+	}
 
 	// Parse metadata filters from the query string. Any query param that
 	// starts with `metadata.` is treated as a filter clause:
@@ -1226,6 +1243,9 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSandboxRead(c, teamID) {
+		return
+	}
 
 	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
 		ID:     sandboxID,
@@ -1241,7 +1261,17 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	resp := h.sandboxToResponseWithToken(sandbox)
+	resp := h.sandboxToResponse(sandbox)
+	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
+	if permErr != nil {
+		log.Error().
+			Err(permErr).
+			Str("team_id", teamID.String()).
+			Str("sandbox_id", sandboxID.String()).
+			Msg("RBAC sandbox token permission check failed")
+	} else if canWrite {
+		resp = h.sandboxToResponseWithToken(sandbox)
+	}
 	resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
 	c.JSON(http.StatusOK, resp)
 }
@@ -1346,6 +1376,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
 
@@ -1806,6 +1839,9 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
 
 	// Atomic ownership + state check + transition to 'pausing'. Collapses
 	// GetSandbox + UpdateStatus into a single DB roundtrip on the happy
@@ -1972,6 +2008,14 @@ func hasDotDotSegment(p string) bool {
 // for sandboxes whose boxd predates the data-plane ?format=json handler. Paused
 // sandboxes are resumed transparently, the same as exec.
 func (h *Handlers) ListSandboxFiles(c *gin.Context) {
+	teamID, err := teamIDFromContext(c)
+	if err != nil {
+		return
+	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+
 	sandbox := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
@@ -2055,6 +2099,9 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
 

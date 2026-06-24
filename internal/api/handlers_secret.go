@@ -633,6 +633,9 @@ func (h *Handlers) CreateSecret(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSettingsWrite(c, teamID) {
+		return
+	}
 
 	var req createSecretRequest
 	if err := bindJSONStrict(c, &req); err != nil {
@@ -702,6 +705,9 @@ func (h *Handlers) ListSecrets(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSettingsRead(c, teamID) {
+		return
+	}
 	rows, err := h.DB.ListSecretsForTeam(c.Request.Context(), teamID)
 	if err != nil {
 		log.Error().Err(err).Msg("DB ListSecretsForTeam failed")
@@ -718,6 +724,9 @@ func (h *Handlers) ListSecrets(c *gin.Context) {
 func (h *Handlers) GetSecret(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsRead(c, teamID) {
 		return
 	}
 	name := c.Param("name")
@@ -746,6 +755,9 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsWrite(c, teamID) {
 		return
 	}
 	name := c.Param("name")
@@ -808,6 +820,9 @@ func (h *Handlers) PatchSecret(c *gin.Context) {
 func (h *Handlers) DeleteSecret(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsWrite(c, teamID) {
 		return
 	}
 	name := c.Param("name")
@@ -1394,6 +1409,9 @@ func (h *Handlers) GetSecretAudit(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSettingsRead(c, teamID) {
+		return
+	}
 	name := c.Param("name")
 	if err := validateSecretName(name); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
@@ -1467,6 +1485,9 @@ type sandboxBoundResponse struct {
 func (h *Handlers) GetSecretSandboxes(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsRead(c, teamID) {
 		return
 	}
 	name := c.Param("name")

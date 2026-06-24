@@ -65,6 +65,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
 
 	var req attachSecretRequest
 	if err := bindJSONStrict(c, &req); err != nil {
@@ -228,6 +231,9 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
 	envKey := c.Param("env_key")
