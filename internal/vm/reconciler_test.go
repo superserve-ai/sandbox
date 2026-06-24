@@ -139,6 +139,27 @@ func TestDiskKeepSet(t *testing.T) {
 	}
 }
 
+func TestKeepSetCollapsed(t *testing.T) {
+	cases := []struct {
+		name      string
+		prev, cur int
+		want      bool
+	}{
+		{"first pass", -1, 50, false},
+		{"prev drained", 0, 0, false},
+		{"stable", 40, 40, false},
+		{"exactly half", 40, 20, false},
+		{"more than half gone", 40, 19, true},
+		{"vanished", 40, 0, true},
+		{"growth", 10, 50, false},
+	}
+	for _, c := range cases {
+		if got := keepSetCollapsed(c.prev, c.cur); got != c.want {
+			t.Errorf("%s: keepSetCollapsed(%d,%d)=%v want %v", c.name, c.prev, c.cur, got, c.want)
+		}
+	}
+}
+
 func TestQuarantineDir(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, uuidA)

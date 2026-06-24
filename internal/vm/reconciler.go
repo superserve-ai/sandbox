@@ -112,14 +112,18 @@ type Reconciler struct {
 	// passCount counts completed reconcile passes, used to run the disk
 	// scan on a slower sub-cadence. Only touched from the single Run loop.
 	passCount uint64
+	// prevKeptLive is the prior disk pass's protected live-sandbox count, used
+	// to detect a keep-set collapse. -1 until the first pass. Run loop only.
+	prevKeptLive int
 }
 
 // NewReconciler creates a reconciler bound to a Manager.
 func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 	return &Reconciler{
-		mgr:       mgr,
-		cfg:       cfg,
-		driftSeen: make(map[string]time.Time),
+		mgr:          mgr,
+		cfg:          cfg,
+		driftSeen:    make(map[string]time.Time),
+		prevKeptLive: -1,
 	}
 }
 
@@ -398,10 +402,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
 				Msg("BoltDB entry with no DB row — cleaning up")
-			// Stop the unit if it's still live so we don't leak a VM.
+			// Stop the unit if it's still live. If the stop fails the VM may
+			// still be running, so leave the entry for next pass — markStale
+			// frees the network slot, which must never happen for a live VM.
 			if rec.Status == StatusRunning {
 				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
-					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB")
+					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
+					continue
 				}
 				removeUnitDropIn(id)
 			}
@@ -459,6 +466,18 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	}
 	keep := diskKeepSet(dbSandboxes, recent, active)
 
+	// Protected live sandboxes — used by the collapse guard and the audit log.
+	var keptActive, keptPaused int
+	for _, row := range dbSandboxes {
+		switch row.Sandbox.Status {
+		case db.SandboxStatusActive:
+			keptActive++
+		case db.SandboxStatusPaused:
+			keptPaused++
+		}
+	}
+	keptLive := keptActive + keptPaused
+
 	if len(keep) == 0 {
 		// An empty keep-set is almost always a query bug, not an empty host;
 		// reclamation aborts (detect-only just reports).
@@ -470,10 +489,24 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 			Msg("disk scan: empty keep-set — reporting all on-disk dirs as orphans (verify before enabling reclamation)")
 	}
 
-	// Sweep only after the keep-set is validated, so a fail-closed pass does
-	// nothing destructive. Registered before the empty-disk return below so a
-	// drained host (dirs already quarantined, only .trash left) still sweeps.
 	if r.cfg.DiskReclaimEnabled {
+		if r.cfg.DiskTrashRetention <= 0 || r.cfg.DiskDeleteBudget <= 0 {
+			log.Error().Dur("retention", r.cfg.DiskTrashRetention).Int("budget", r.cfg.DiskDeleteBudget).
+				Msg("disk reclaim suppressed: retention and budget must be > 0")
+			return
+		}
+		// keep-set and tripwire both read dbSandboxes, so a query returning too
+		// few live rows evades both; a sharp drop vs the prior pass is the
+		// independent signal. Keep the baseline so a sustained drop stays suppressed.
+		if keepSetCollapsed(r.prevKeptLive, keptLive) {
+			log.Error().Int("kept_live", keptLive).Int("prev_kept_live", r.prevKeptLive).
+				Msg("disk reclaim suppressed: live keep-set collapsed since last pass")
+			return
+		}
+		r.prevKeptLive = keptLive
+		// Sweep only after the keep-set is validated, so a fail-closed pass does
+		// nothing destructive. Registered before the empty-disk return below so a
+		// drained host (dirs already quarantined, only .trash left) still sweeps.
 		defer r.sweepTrash(snapshotTime)
 	}
 
@@ -498,16 +531,6 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	sample := orphans
 	if len(sample) > 20 {
 		sample = sample[:20]
-	}
-	// Surface the live sandboxes being protected so each pass is auditable.
-	var keptActive, keptPaused int
-	for _, row := range dbSandboxes {
-		switch row.Sandbox.Status {
-		case db.SandboxStatusActive:
-			keptActive++
-		case db.SandboxStatusPaused:
-			keptPaused++
-		}
 	}
 	log.Warn().
 		Int("orphan_sandboxes", len(orphans)).
@@ -535,10 +558,6 @@ func (r *Reconciler) reclaimDiskOrphans(ctx context.Context, snapshotTime time.T
 	var moved, dirCount int
 	var bytes int64
 	for _, id := range orphans {
-		// Stop on a cancelled pass (e.g. runTimeout) rather than keep mutating.
-		if ctx.Err() != nil {
-			return
-		}
 		// Tripwire: dbSandboxes is non-destroyed rows only, so a hit means a live
 		// sandbox slipped past the keep-set — alarm and skip, never move it.
 		if _, live := dbSandboxes[id]; live {
@@ -552,6 +571,11 @@ func (r *Reconciler) reclaimDiskOrphans(ctx context.Context, snapshotTime time.T
 		}
 		info := onDisk[id]
 		sz := dirSize(ctx, info.paths)
+		// Re-check right before the move: dirSize can run long, and a cancelled
+		// pass (runTimeout/shutdown) must stop before mutating disk.
+		if ctx.Err() != nil {
+			return
+		}
 		any := false
 		for _, p := range info.paths {
 			if err := quarantineDir(p, date); err != nil {
@@ -589,10 +613,9 @@ func quarantineDir(path, date string) error {
 	return os.Rename(path, filepath.Join(trashDir, name))
 }
 
-// sweepTrash permanently removes quarantine buckets soaked longer than
-// DiskTrashRetention. Age comes from the bucket's actual mtime, not its
-// date-label name, so the full retention is honored rather than rounded down to
-// the label's midnight.
+// sweepTrash permanently removes quarantine buckets soaked past
+// DiskTrashRetention. Age is the bucket's mtime, not its date label, so a bucket
+// always soaks at least the full retention (never the rounded-down midnight).
 func (r *Reconciler) sweepTrash(now time.Time) {
 	log := r.mgr.log.With().Str("component", "reconciler").Str("pass", "trash_sweep").Logger()
 	cutoff := now.Add(-r.cfg.DiskTrashRetention)
@@ -639,6 +662,13 @@ func diskKeepSet(dbSandboxes map[string]db.ListSandboxesByHostRow, recent []uuid
 		keep[id] = struct{}{}
 	}
 	return keep
+}
+
+// keepSetCollapsed reports whether the protected live-sandbox count dropped by
+// more than half between disk passes — a sign the keep-set query regressed. A
+// prev of < 1 (no prior pass, or an already-drained host) never trips.
+func keepSetCollapsed(prev, cur int) bool {
+	return prev > 0 && cur*2 < prev
 }
 
 // selectOrphanDirs returns the sandbox UUIDs whose on-disk dirs have no live or
