@@ -31,6 +31,12 @@ const (
 	quotaWatchTimeout  = 30 * time.Second
 
 	resendEmailEndpoint = "https://api.resend.com/emails"
+
+	// Shared brand assets, mirroring the console's EmailLayout.
+	emailLogoURL     = "https://superserve.ai/assets/logo-light.png"
+	emailMeetingURL  = "https://www.superserve.ai/meet/?utm_source=email&utm_medium=quota"
+	emailUsageURL    = "https://console.superserve.ai/plan-usage"
+	emailSupportAddr = "support@superserve.ai"
 )
 
 // QuotaAlert is a team crossing the usage threshold for one resource.
@@ -332,23 +338,42 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	}
 }
 
-// quotaEmailHTML renders the customer-facing sandbox-limit email body.
+// quotaEmailHTML renders the sandbox-limit email body inside the shared shell.
 func quotaEmailHTML(a QuotaAlert) string {
 	team := html.EscapeString(a.TeamName)
+	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">You're approaching your sandbox limit</h1>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Team <strong style="color:#e5e5e5;">%s</strong> is using <strong style="color:#e5e5e5;">%d of %d</strong> sandboxes (%d%%).</p>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Reach out and we'll raise your limit before you run out of room — or grab time to talk through your use case.</p>
+<a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">Book a Meeting</a>
+<a href="%s" style="background-color:transparent;color:#e5e5e5;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:13px 24px;margin:12px 0 0 0;border:1px dashed #404040;">View Usage</a>`,
+		team, a.Used, a.Limit, a.Pct, emailMeetingURL, emailUsageURL)
+	return emailShell("You're approaching your sandbox limit", body)
+}
+
+// emailShell wraps body HTML in the shared Superserve email chrome — logo header,
+// dashed card, footer — mirroring the console's EmailLayout so control-plane mail
+// matches the auth/welcome emails. Styles are inlined for email-client support.
+func emailShell(preview, body string) string {
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html>
-  <body style="margin:0;padding:24px;background:#0b0b0f;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#e7e7ea;">
-    <table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="max-width:480px;margin:0 auto;background:#15151b;border-radius:12px;">
-      <tr><td style="padding:28px 28px 8px;">
-        <h1 style="margin:0;font-size:18px;font-weight:600;">You're approaching your sandbox limit</h1>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Geist+Mono:wght@500&display=swap">
+  </head>
+  <body style="background-color:#0a0a0a;font-family:'Instrument Sans',Helvetica,Arial,sans-serif;margin:0;padding:0;color:#e5e5e5;">
+    <div style="display:none;overflow:hidden;line-height:1px;max-height:0;max-width:0;opacity:0;">%s</div>
+    <table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="max-width:520px;margin:0 auto;padding:40px 20px;">
+      <tr><td style="text-align:center;padding:0 0 32px 0;">
+        <img src="%s" width="173" height="32" alt="Superserve">
       </td></tr>
-      <tr><td style="padding:8px 28px 0;font-size:14px;line-height:22px;color:#b6b6bf;">
-        <p style="margin:0 0 16px;">Team <strong style="color:#e7e7ea;">%s</strong> is using <strong style="color:#e7e7ea;">%d of %d</strong> sandboxes (%d%%).</p>
-        <p style="margin:0 0 20px;">You've hit %d%% of your sandbox limit. Please contact our team to raise it before you run out of room to create new sandboxes.</p>
-        <p style="margin:0 0 28px;"><a href="mailto:support@superserve.ai" style="display:inline-block;padding:10px 18px;background:#5b5bd6;color:#fff;text-decoration:none;border-radius:8px;font-size:14px;font-weight:500;">Contact the team</a></p>
-        <p style="margin:0;font-size:12px;color:#6f6f7a;">Or reply to this email and we'll help you out.</p>
+      <tr><td style="background-color:#171717;border:1px dashed #262626;padding:40px 32px;">%s</td></tr>
+      <tr><td style="padding:32px 0 0 0;text-align:center;">
+        <p style="color:#737373;font-family:'Geist Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.08em;line-height:20px;margin:0 0 8px 0;">SUPERSERVE</p>
+        <p style="color:#525252;font-size:11px;line-height:18px;margin:0;">455 Market St Ste 1940 PMB 924076, San Francisco, California 94105-2448 US.</p>
+        <p style="color:#525252;font-size:11px;line-height:18px;margin:0;">Questions? Contact <a href="mailto:%s" style="color:#e5e5e5;text-decoration:underline;text-underline-offset:2px;">%s</a></p>
       </td></tr>
     </table>
   </body>
-</html>`, team, a.Used, a.Limit, a.Pct, a.Pct)
+</html>`, html.EscapeString(preview), emailLogoURL, body, emailSupportAddr, emailSupportAddr)
 }
