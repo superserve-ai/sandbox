@@ -316,14 +316,21 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	}
 
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	// Non-429 4xx is permanent (unverified domain, bad recipient) — retrying
-	// every tick only spins, so drop it. 5xx/429 are transient: return an error.
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+	// 401/403 are recoverable config errors (bad API key, unverified sender
+	// domain) an operator will fix; 429 and 5xx are transient. Retry all of these
+	// so the email lands once the cause clears. Other 4xx (bad recipient,
+	// malformed request) won't self-heal, so drop rather than spin every tick.
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized,
+		resp.StatusCode == http.StatusForbidden,
+		resp.StatusCode == http.StatusTooManyRequests,
+		resp.StatusCode >= 500:
+		return fmt.Errorf("resend returned %d: %s", resp.StatusCode, string(snippet))
+	default:
 		log.Warn().Int("status", resp.StatusCode).Str("team", a.TeamID.String()).Str("body", string(snippet)).
 			Msg("quota email: permanent rejection; not retrying")
 		return nil
 	}
-	return fmt.Errorf("resend returned %d: %s", resp.StatusCode, string(snippet))
 }
 
 // quotaEmailHTML renders the customer-facing sandbox-limit email body.

@@ -56,14 +56,13 @@ const getTeamNotifyEmail = `-- name: GetTeamNotifyEmail :one
 SELECT p.email
 FROM team_member tm
 JOIN profile p ON p.id = tm.profile_id
-WHERE tm.team_id = $1
-ORDER BY (tm.role = 'owner') DESC, tm.joined_at ASC
+WHERE tm.team_id = $1 AND tm.role = 'owner'
+ORDER BY tm.joined_at ASC
 LIMIT 1
 `
 
-// Single recipient for a team's quota email: the owner if there is one, else the
-// earliest-joined member as a fallback so a team without an explicit owner still
-// gets notified.
+// The team owner's email for the quota notification. No row (caller skips) when
+// the team has no owner, so the email never goes to a non-owner member.
 func (q *Queries) GetTeamNotifyEmail(ctx context.Context, teamID uuid.UUID) (string, error) {
 	row := q.db.QueryRow(ctx, getTeamNotifyEmail, teamID)
 	var email string
