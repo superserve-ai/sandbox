@@ -1,14 +1,34 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func ptrInt32(v int32) *int32 { return &v }
+
+// stubRecipient is a teamEmailLookup for exercising EmailQuotaNotifier offline.
+type stubRecipient struct {
+	email string
+	err   error
+	calls int
+}
+
+func (s *stubRecipient) GetTeamNotifyEmail(context.Context, uuid.UUID) (string, error) {
+	s.calls++
+	return s.email, s.err
+}
 
 func TestComputeQuotaAlerts(t *testing.T) {
 	atThreshold := uuid.New()  // sandboxes 80/100 = 80% -> alert
@@ -49,5 +69,149 @@ func TestComputeQuotaAlerts(t *testing.T) {
 		if _, ok := got[neg]; ok {
 			t.Errorf("%v should not have alerted", neg)
 		}
+	}
+}
+
+func TestShouldRearm(t *testing.T) {
+	team := uuid.New()
+	cutoff := time.Now().Add(-quotaAlertCooldown)
+	elevated := map[quotaKey]QuotaAlert{{team, "sandboxes"}: {}}
+
+	// Still elevated: keep suppressed regardless of age.
+	stillUp := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "sandboxes", Channel: "email", CreatedAt: time.Now().Add(-30 * 24 * time.Hour)}
+	if shouldRearm(stillUp, elevated, cutoff) {
+		t.Error("should not re-arm while still in the elevated band")
+	}
+
+	// Dropped under the band but inside the cooldown window: keep suppressed.
+	freshDrop := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "templates", Channel: "slack", CreatedAt: time.Now().Add(-1 * time.Hour)}
+	if shouldRearm(freshDrop, elevated, cutoff) {
+		t.Error("should not re-arm inside the cooldown window")
+	}
+
+	// Dropped under the band and aged past the cooldown: re-arm.
+	aged := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "templates", Channel: "email", CreatedAt: time.Now().Add(-quotaAlertCooldown - time.Hour)}
+	if !shouldRearm(aged, elevated, cutoff) {
+		t.Error("should re-arm once below the band and past the cooldown")
+	}
+}
+
+func TestEmailQuotaNotifierHandlesAndChannel(t *testing.T) {
+	n := NewEmailQuotaNotifier("k", "from@superserve.ai", nil)
+	if n.Channel() != "email" {
+		t.Errorf("channel = %q, want email", n.Channel())
+	}
+	if !n.Handles("sandboxes") {
+		t.Error("email notifier should handle sandboxes")
+	}
+	if n.Handles("templates") {
+		t.Error("email notifier should not handle templates (Slack-only)")
+	}
+}
+
+func TestEmailQuotaNotifierSends(t *testing.T) {
+	var gotAuth, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	rcpt := &stubRecipient{email: "owner@acme.test"}
+	n := &EmailQuotaNotifier{apiKey: "rk_test", from: "alerts@superserve.ai", recipients: rcpt, endpoint: srv.URL, client: srv.Client()}
+
+	alert := QuotaAlert{TeamID: uuid.New(), TeamName: "Acme", Resource: "sandboxes", Used: 16, Limit: 20, Pct: 80}
+	if err := n.Notify(context.Background(), alert); err != nil {
+		t.Fatalf("Notify returned error: %v", err)
+	}
+	if gotAuth != "Bearer rk_test" {
+		t.Errorf("auth header = %q, want Bearer rk_test", gotAuth)
+	}
+
+	var payload struct {
+		To      []string `json:"to"`
+		Subject string   `json:"subject"`
+		HTML    string   `json:"html"`
+	}
+	if err := json.Unmarshal([]byte(gotBody), &payload); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if len(payload.To) != 1 || payload.To[0] != "owner@acme.test" {
+		t.Errorf("to = %v, want [owner@acme.test]", payload.To)
+	}
+	if !strings.Contains(payload.Subject, "80%") {
+		t.Errorf("subject = %q, want it to mention 80%%", payload.Subject)
+	}
+	if !strings.Contains(payload.HTML, "16 of 20") {
+		t.Errorf("html missing usage detail: %q", payload.HTML)
+	}
+}
+
+func TestEmailQuotaNotifierServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer srv.Close()
+
+	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 90})
+	if err == nil {
+		t.Fatal("expected error on 5xx so the watcher retries")
+	}
+}
+
+func TestEmailQuotaNotifierPermanentRejection(t *testing.T) {
+	// A 422 (e.g. unverified sender domain) is permanent: Notify must not return
+	// an error, so the claim is kept and the tick doesn't retry forever.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"domain not verified"}`))
+	}))
+	defer srv.Close()
+
+	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82}); err != nil {
+		t.Fatalf("permanent 4xx should be a quiet drop, got %v", err)
+	}
+}
+
+func TestEmailQuotaNotifierRateLimited(t *testing.T) {
+	// 429 is transient: Notify must return an error so the watcher retries.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82}); err == nil {
+		t.Fatal("429 should return an error so the watcher retries")
+	}
+}
+
+func TestEmailQuotaNotifierNoRecipient(t *testing.T) {
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	defer srv.Close()
+
+	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{err: pgx.ErrNoRows}, endpoint: srv.URL, client: srv.Client()}
+	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 85}); err != nil {
+		t.Fatalf("missing recipient should be a quiet skip, got %v", err)
+	}
+	if called {
+		t.Error("should not call Resend when there is no recipient")
+	}
+}
+
+func TestEmailQuotaNotifierDisabled(t *testing.T) {
+	rcpt := &stubRecipient{email: "o@x.test"}
+	n := &EmailQuotaNotifier{apiKey: "", from: "f@superserve.ai", recipients: rcpt, endpoint: "http://unused", client: http.DefaultClient}
+	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes"}); err != nil {
+		t.Fatalf("disabled notifier should no-op, got %v", err)
+	}
+	if rcpt.calls != 0 {
+		t.Error("disabled notifier must not look up a recipient")
 	}
 }

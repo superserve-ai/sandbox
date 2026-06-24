@@ -220,12 +220,20 @@ func run() error {
 		billing.StartHourlyRollupService(ctx, dbPool, queries, billing.DefaultHourlyRollupConfig())
 	}
 
-	// Quota watcher: alerts (Slack) when a team crosses 80% of a resource limit.
-	// Only runs when a webhook is configured.
+	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
+	// to a Slack webhook and an email notifier; each channel is independently
+	// gated on its config and skipped when unset.
+	var quotaNotifiers []api.QuotaNotifier
 	if webhook := os.Getenv("SLACK_QUOTA_ALERT_WEBHOOK"); webhook != "" {
-		go api.StartQuotaWatcher(ctx, queries, api.NewSlackQuotaNotifier(webhook))
+		quotaNotifiers = append(quotaNotifiers, api.NewSlackQuotaNotifier(webhook))
+	}
+	if apiKey, from := os.Getenv("RESEND_API_KEY"), os.Getenv("QUOTA_EMAIL_FROM"); apiKey != "" && from != "" {
+		quotaNotifiers = append(quotaNotifiers, api.NewEmailQuotaNotifier(apiKey, from, queries))
+	}
+	if len(quotaNotifiers) > 0 {
+		go api.StartQuotaWatcher(ctx, queries, quotaNotifiers)
 	} else {
-		log.Info().Msg("quota watcher disabled (SLACK_QUOTA_ALERT_WEBHOOK not set)")
+		log.Info().Msg("quota watcher disabled (no SLACK_QUOTA_ALERT_WEBHOOK or RESEND_API_KEY/QUOTA_EMAIL_FROM)")
 	}
 
 	// Start HTTP server.
