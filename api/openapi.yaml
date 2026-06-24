@@ -127,6 +127,32 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
+  /teams/{team_id}/management:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getTeamManagement
+      tags: [RBAC]
+      summary: Get team management state
+      description: |
+        Returns the caller-visible team members, role assignments, and
+        capability flags used by customer-facing member management UI. The
+        authenticated API key determines the actor; customer clients must not
+        send or rely on `X-Actor-User-Id`.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Team management state
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /teams/{team_id}/members:
     parameters:
