@@ -75,24 +75,17 @@ func TestComputeQuotaAlerts(t *testing.T) {
 func TestShouldRearm(t *testing.T) {
 	team := uuid.New()
 	cutoff := time.Now().Add(-quotaAlertCooldown)
-	elevated := map[quotaKey]QuotaAlert{{team, "sandboxes"}: {}}
 
-	// Still elevated: keep suppressed regardless of age.
-	stillUp := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "sandboxes", Channel: "email", CreatedAt: time.Now().Add(-30 * 24 * time.Hour)}
-	if shouldRearm(stillUp, elevated, cutoff) {
-		t.Error("should not re-arm while still in the elevated band")
-	}
-
-	// Dropped under the band but inside the cooldown window: keep suppressed.
-	freshDrop := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "templates", Channel: "slack", CreatedAt: time.Now().Add(-1 * time.Hour)}
-	if shouldRearm(freshDrop, elevated, cutoff) {
+	// Inside the cooldown window: keep suppressed.
+	fresh := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "sandboxes", Channel: "email", CreatedAt: time.Now().Add(-1 * time.Hour)}
+	if shouldRearm(fresh, cutoff) {
 		t.Error("should not re-arm inside the cooldown window")
 	}
 
-	// Dropped under the band and aged past the cooldown: re-arm.
-	aged := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "templates", Channel: "email", CreatedAt: time.Now().Add(-quotaAlertCooldown - time.Hour)}
-	if !shouldRearm(aged, elevated, cutoff) {
-		t.Error("should re-arm once below the band and past the cooldown")
+	// Aged past the cooldown: re-arm regardless of current usage.
+	aged := db.ListQuotaAlertStateRow{TeamID: team, QuotaType: "sandboxes", Channel: "email", CreatedAt: time.Now().Add(-quotaAlertCooldown - time.Hour)}
+	if !shouldRearm(aged, cutoff) {
+		t.Error("should re-arm once the row ages past the cooldown")
 	}
 }
 

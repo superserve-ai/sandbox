@@ -20,13 +20,12 @@ import (
 )
 
 const (
-	// A team is alerted once on reaching quotaAlertPct, and not again until it has
-	// both fallen under quotaResetPct (hysteresis, so hovering doesn't re-alert)
-	// and aged past quotaAlertCooldown — at most one alert per cooldown window,
-	// even across recover/re-cross cycles.
+	// A team at or over quotaAlertPct of a limit is alerted at most once per
+	// quotaAlertCooldown — a fixed suppression window that ignores how the team
+	// bounces across the threshold in between. Simple, predictable guarantee; the
+	// always-on console banner carries the real-time state.
 	quotaAlertPct      = 80
-	quotaResetPct      = 70
-	quotaAlertCooldown = 7 * 24 * time.Hour
+	quotaAlertCooldown = 30 * 24 * time.Hour
 
 	quotaWatchInterval = 15 * time.Minute
 	quotaWatchTimeout  = 30 * time.Second
@@ -114,7 +113,7 @@ func StartQuotaWatcher(ctx context.Context, queries *db.Queries, notifiers []Quo
 	for i, n := range notifiers {
 		channels[i] = n.Channel()
 	}
-	log.Info().Int("alert_pct", quotaAlertPct).Int("reset_pct", quotaResetPct).
+	log.Info().Int("alert_pct", quotaAlertPct).Dur("cooldown", quotaAlertCooldown).
 		Dur("interval", quotaWatchInterval).Strs("channels", channels).Msg("quota watcher started")
 	ticker := time.NewTicker(quotaWatchInterval)
 	defer ticker.Stop()
@@ -144,11 +143,12 @@ func quotaWatchOnce(ctx context.Context, queries *db.Queries, notifiers []QuotaN
 		log.Error().Err(err).Msg("quota watcher: ListTeamQuotaUsage failed")
 		return
 	}
-	over := computeQuotaAlerts(rows)              // >= alert threshold
-	elevated := teamsOverPct(rows, quotaResetPct) // >= reset threshold (hysteresis band)
+	over := computeQuotaAlerts(rows) // >= alert threshold
 
 	// Per over-threshold (team, resource), claim and notify each channel
 	// independently so a flaky channel retries without re-sending the others.
+	// A claim that returns 0 is suppressed by the cooldown window.
+	var alerted, suppressed int
 	for k, alert := range over {
 		for _, n := range notifiers {
 			if !n.Handles(k.typ) {
@@ -161,8 +161,10 @@ func quotaWatchOnce(ctx context.Context, queries *db.Queries, notifiers []QuotaN
 				continue
 			}
 			if claimed == 0 {
-				continue // already alerted this episode, or still within cooldown
+				suppressed++
+				continue // within the cooldown window
 			}
+			alerted++
 			if err := n.Notify(ctx, alert); err != nil {
 				log.Error().Err(err).Str("team", k.team.String()).Str("resource", k.typ).Str("channel", ch).
 					Msg("quota watcher: notify failed; releasing claim")
@@ -174,10 +176,13 @@ func quotaWatchOnce(ctx context.Context, queries *db.Queries, notifiers []QuotaN
 			}
 		}
 	}
+	if alerted > 0 || suppressed > 0 {
+		log.Info().Int("over_threshold", len(over)).Int("alerted", alerted).Int("suppressed", suppressed).
+			Msg("quota watcher: alert pass")
+	}
 
-	// Re-arm a key only once it has both fallen below the reset threshold
-	// (hysteresis) and aged past the cooldown. Satisfying just one keeps the
-	// row, so we neither flap on the boundary nor re-alert too soon.
+	// Re-arm a key once its row ages past the cooldown, regardless of where the
+	// team currently sits — a fixed one-per-window suppression.
 	states, err := queries.ListQuotaAlertState(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("quota watcher: ListQuotaAlertState failed")
@@ -185,7 +190,7 @@ func quotaWatchOnce(ctx context.Context, queries *db.Queries, notifiers []QuotaN
 	}
 	cooldownCutoff := time.Now().Add(-quotaAlertCooldown)
 	for _, s := range states {
-		if !shouldRearm(s, elevated, cooldownCutoff) {
+		if !shouldRearm(s, cooldownCutoff) {
 			continue
 		}
 		if err := queries.ClearQuotaAlert(ctx, db.ClearQuotaAlertParams{TeamID: s.TeamID, QuotaType: s.QuotaType, Channel: s.Channel}); err != nil {
@@ -194,15 +199,9 @@ func quotaWatchOnce(ctx context.Context, queries *db.Queries, notifiers []QuotaN
 	}
 }
 
-// shouldRearm reports whether a stored alert state should be cleared so the key
-// can alert again. It clears only when the key has both fallen out of the
-// elevated (reset-threshold) band and aged past the cooldown; satisfying just
-// one keeps the row, which is what prevents boundary flapping and too-soon
-// re-alerts.
-func shouldRearm(s db.ListQuotaAlertStateRow, elevated map[quotaKey]QuotaAlert, cooldownCutoff time.Time) bool {
-	if _, stillElevated := elevated[quotaKey{s.TeamID, s.QuotaType}]; stillElevated {
-		return false
-	}
+// shouldRearm reports whether a stored alert state has aged past the cooldown and
+// can be cleared so the key may alert again.
+func shouldRearm(s db.ListQuotaAlertStateRow, cooldownCutoff time.Time) bool {
 	return !s.CreatedAt.After(cooldownCutoff)
 }
 
