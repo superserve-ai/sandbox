@@ -3150,3 +3150,4 @@ func TestIntegration_CreateTemplate_DuplicateLiveNameReturns409(t *testing.T) {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
