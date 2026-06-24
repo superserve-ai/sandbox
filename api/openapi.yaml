@@ -955,20 +955,36 @@ paths:
         schema:
           type: string
         description: >
-          Absolute path of the file inside the sandbox (e.g.
-          `/home/user/out.txt`).
+          Absolute path inside the sandbox (e.g. `/home/user/out.txt`).
 
     get:
       operationId: readFile
       tags: [Files]
       summary: Read a file from a sandbox
+      description: >
+        Returns the file at `path` as raw bytes. To download a directory, set
+        `format=zip` to receive its contents as a zip archive.
       security:
         - accessToken: []
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: >
+            Set to `zip` to download the directory at `path` as a zip archive.
+            Omit when downloading a single file.
+          schema:
+            type: string
+            enum: [zip]
       responses:
         "200":
-          description: File contents.
+          description: File contents, or a zip archive when `format=zip`.
           content:
             application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            application/zip:
               schema:
                 type: string
                 format: binary
