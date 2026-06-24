@@ -320,16 +320,21 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	}
 
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	// 401/403 are recoverable config errors (bad API key, unverified sender
-	// domain) an operator will fix; 429 and 5xx are transient. Retry all of these
-	// so the email lands once the cause clears. Other 4xx (bad recipient,
-	// malformed request) won't self-heal, so drop rather than spin every tick.
+	var rerr struct {
+		Name string `json:"name"`
+	}
+	_ = json.Unmarshal(snippet, &rerr)
+	// Retry transient errors (429/5xx) and recoverable config errors an operator
+	// will fix: bad API key / unverified domain (401/403) and a malformed
+	// QUOTA_EMAIL_FROM, which Resend reports as invalid_from_address (a 422).
+	// Other 4xx (e.g. a bad recipient) won't self-heal, so drop rather than spin.
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized,
 		resp.StatusCode == http.StatusForbidden,
 		resp.StatusCode == http.StatusTooManyRequests,
-		resp.StatusCode >= 500:
-		return fmt.Errorf("resend returned %d: %s", resp.StatusCode, string(snippet))
+		resp.StatusCode >= 500,
+		rerr.Name == "invalid_from_address":
+		return fmt.Errorf("resend returned %d (%s): %s", resp.StatusCode, rerr.Name, string(snippet))
 	default:
 		log.Warn().Int("status", resp.StatusCode).Str("team", a.TeamID.String()).Str("body", string(snippet)).
 			Msg("quota email: permanent rejection; not retrying")

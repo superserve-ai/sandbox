@@ -157,17 +157,32 @@ func TestEmailQuotaNotifierServerError(t *testing.T) {
 }
 
 func TestEmailQuotaNotifierPermanentRejection(t *testing.T) {
-	// A 422 (e.g. unverified sender domain) is permanent: Notify must not return
-	// an error, so the claim is kept and the tick doesn't retry forever.
+	// A 422 for a bad recipient is permanent: Notify must not return an error, so
+	// the claim is kept and the tick doesn't retry forever.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
-		_, _ = w.Write([]byte(`{"message":"domain not verified"}`))
+		_, _ = w.Write([]byte(`{"name":"validation_error","message":"Invalid recipient"}`))
 	}))
 	defer srv.Close()
 
 	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
 	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82}); err != nil {
 		t.Fatalf("permanent 4xx should be a quiet drop, got %v", err)
+	}
+}
+
+func TestEmailQuotaNotifierInvalidFromRetries(t *testing.T) {
+	// A malformed QUOTA_EMAIL_FROM is reported as invalid_from_address (422) but is
+	// recoverable config — Notify must return an error so it retries once fixed.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"name":"invalid_from_address","message":"Invalid from"}`))
+	}))
+	defer srv.Close()
+
+	n := &EmailQuotaNotifier{apiKey: "rk", from: "bad", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82}); err == nil {
+		t.Fatal("invalid_from_address is recoverable config; should return an error to retry")
 	}
 }
 
