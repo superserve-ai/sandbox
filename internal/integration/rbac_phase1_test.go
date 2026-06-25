@@ -468,8 +468,8 @@ func TestRbacBackfill(t *testing.T) {
 
 	assertActiveMembership(t, ctx, multiTeamA, multiTeamUser)
 	assertActiveMembership(t, ctx, multiTeamB, multiTeamUser)
-	assertRoleAssignment(t, ctx, multiTeamA, multiTeamUser, "viewer")
-	assertRoleAssignment(t, ctx, multiTeamB, multiTeamUser, "viewer")
+	assertRoleAssignment(t, ctx, multiTeamA, multiTeamUser, "team_owner")
+	assertRoleAssignment(t, ctx, multiTeamB, multiTeamUser, "team_owner")
 }
 
 func TestAuditLogAcceptsEvents(t *testing.T) {
