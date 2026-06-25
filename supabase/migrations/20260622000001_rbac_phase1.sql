@@ -22,9 +22,6 @@ CREATE INDEX IF NOT EXISTS idx_team_memberships_user
 CREATE UNIQUE INDEX IF NOT EXISTS idx_team_memberships_active_team_user_unique
     ON team_memberships(team_id, user_id)
     WHERE status = 'active';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_team_memberships_active_user_unique
-    ON team_memberships(user_id)
-    WHERE status = 'active';
 
 CREATE TABLE IF NOT EXISTS roles (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -320,29 +317,8 @@ JOIN permissions p
   )
 ON CONFLICT DO NOTHING;
 
-DO $$
-DECLARE
-    duplicate_user_count integer;
-BEGIN
-    SELECT COUNT(*)
-    INTO duplicate_user_count
-    FROM (
-        SELECT tm.profile_id
-        FROM team_member tm
-        GROUP BY tm.profile_id
-        HAVING COUNT(DISTINCT tm.team_id) > 1
-    ) multi_team_users;
-
-    IF duplicate_user_count > 0 THEN
-        RAISE EXCEPTION
-            'rbac backfill refused: % legacy users belong to multiple teams',
-            duplicate_user_count;
-    END IF;
-END $$;
-
--- Backfill memberships from the legacy team_member table. The current product
--- shape is one user per team, and this migration enforces that invariant with a
--- partial unique index plus the preflight above.
+-- Backfill memberships from the legacy team_member table. Users may belong to
+-- multiple teams, so every legacy row is preserved as an active membership.
 INSERT INTO team_memberships (team_id, user_id, status, created_at, updated_at)
 SELECT
     tm.team_id,

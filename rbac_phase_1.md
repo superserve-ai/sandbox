@@ -3,6 +3,7 @@
 ## Schema Added
 
 - `team_memberships` to track active/inactive/invited membership state per user and team.
+- Users may belong to multiple teams.
 - `roles` with a `scope_type` of `platform` or `team`.
 - `permissions` as a global permission catalog.
 - `role_permissions` as the join table between roles and permissions.
@@ -37,7 +38,7 @@
 ## Backfill Behavior
 
 - Legacy `team_member` rows are copied into `team_memberships` as active memberships.
-- The migration refuses to guess when a legacy user belongs to multiple teams; this must be cleaned up before applying the migration.
+- Legacy users may appear in multiple teams, and the migration preserves every membership row.
 - Existing single-user teams are granted `team_owner`.
 - If a legacy row explicitly looks like an owner/admin, that legacy hint is used after the single-member owner case.
 - If a team has multiple members and there is no stronger hint, the fallback role is `viewer`.
@@ -47,7 +48,7 @@
 ## Assumptions
 
 - Existing user-to-team relationships that should be active are represented in `team_member`.
-- The product enforces one active team membership per user; the new schema enforces this with a partial unique index.
+- The schema allows a user to hold active memberships in multiple teams.
 - The new RBAC tables are internal and will be accessed by the service role in later phases.
 - RLS is intentionally fail-closed in this migration. Customer-facing policies are deferred until the application has explicit RBAC-aware access paths.
 
@@ -55,7 +56,13 @@
 
 - If a team has multiple members and no legacy owner/admin hint, ownership is ambiguous.
 - In that case the migration uses `viewer` rather than guessing an owner.
-- If a user belongs to multiple legacy teams, the migration raises instead of choosing one.
+
+## Team Model
+
+- New signup may create a personal/default team.
+- Joining another team should not delete or inactivate the personal team.
+- Resources remain scoped to the team where they were created.
+- Future UI/session work needs explicit team selection and current-team handling.
 
 ## Manual Platform Admin Bootstrap
 

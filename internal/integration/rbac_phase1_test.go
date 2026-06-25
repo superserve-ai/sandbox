@@ -206,14 +206,24 @@ func TestRbacAssignmentConstraints(t *testing.T) {
 		}
 	})
 
-	t.Run("user can have only one active membership", func(t *testing.T) {
+	t.Run("user can have active memberships in multiple teams", func(t *testing.T) {
 		otherTeamID := mustCreateTeam(t, ctx, "rbac-second-team-"+uuid.NewString()[:8])
 		_, err := testPool.Exec(ctx, `
 			INSERT INTO team_memberships (team_id, user_id, status)
 			VALUES ($1, $2, 'active')
 		`, otherTeamID, userID)
+		if err != nil {
+			t.Fatalf("insert second active membership: %v", err)
+		}
+	})
+
+	t.Run("duplicate active membership in same team is blocked", func(t *testing.T) {
+		_, err := testPool.Exec(ctx, `
+			INSERT INTO team_memberships (team_id, user_id, status)
+			VALUES ($1, $2, 'active')
+		`, teamID, userID)
 		if err == nil {
-			t.Fatal("expected second active membership for same user to fail")
+			t.Fatal("expected duplicate active membership for same team and user to fail")
 		}
 	})
 
@@ -437,6 +447,12 @@ func TestRbacBackfill(t *testing.T) {
 	seedLegacyMembership(t, ctx, ambiguousTeam, ambiguousA, "member")
 	seedLegacyMembership(t, ctx, ambiguousTeam, ambiguousB, "member")
 
+	multiTeamUser := seedRBACProfile(t)
+	multiTeamA := mustCreateTeam(t, ctx, "rbac-multi-user-a-"+uuid.NewString()[:8])
+	multiTeamB := mustCreateTeam(t, ctx, "rbac-multi-user-b-"+uuid.NewString()[:8])
+	seedLegacyMembership(t, ctx, multiTeamA, multiTeamUser, "member")
+	seedLegacyMembership(t, ctx, multiTeamB, multiTeamUser, "member")
+
 	runRBACBackfill(t, ctx)
 
 	assertActiveMembership(t, ctx, oneUserTeam, oneUser)
@@ -449,6 +465,11 @@ func TestRbacBackfill(t *testing.T) {
 	assertActiveMembership(t, ctx, ambiguousTeam, ambiguousB)
 	assertRoleAssignment(t, ctx, ambiguousTeam, ambiguousA, "viewer")
 	assertRoleAssignment(t, ctx, ambiguousTeam, ambiguousB, "viewer")
+
+	assertActiveMembership(t, ctx, multiTeamA, multiTeamUser)
+	assertActiveMembership(t, ctx, multiTeamB, multiTeamUser)
+	assertRoleAssignment(t, ctx, multiTeamA, multiTeamUser, "viewer")
+	assertRoleAssignment(t, ctx, multiTeamB, multiTeamUser, "viewer")
 }
 
 func TestAuditLogAcceptsEvents(t *testing.T) {
