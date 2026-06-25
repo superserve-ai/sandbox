@@ -199,7 +199,7 @@ func TestRbacPhase2bTeamMemberManagement(t *testing.T) {
 		}
 	})
 
-	t.Run("user_admin cannot reactivate former team owner", func(t *testing.T) {
+	t.Run("user_admin can reactivate former team owner after role revoke", func(t *testing.T) {
 		teamID2, userAdminKey, _ := seedTeamAndKeyWithRole(t, "user_admin")
 		target := seedRBACProfile(t)
 		seedMembership(t, ctx, teamID2, target)
@@ -213,11 +213,11 @@ func TestRbacPhase2bTeamMemberManagement(t *testing.T) {
 		}
 
 		w := do(r, "POST", "/teams/"+teamID2.String()+"/members", userAdminKey, fmt.Sprintf(`{"user_id":%q,"status":"active"}`, target))
-		if w.Code != http.StatusForbidden {
-			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		if w.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 		}
-		if got := membershipStatus(t, ctx, teamID2, target); got != "inactive" {
-			t.Fatalf("membership status = %q, want inactive", got)
+		if got := membershipStatus(t, ctx, teamID2, target); got != "active" {
+			t.Fatalf("membership status = %q, want active", got)
 		}
 	})
 

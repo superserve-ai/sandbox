@@ -739,11 +739,11 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 			if err != nil {
 				return err
 			}
-			hasPrivilegedHistory, err := hasPrivilegedRoleGrantHistory(ctx, q, teamID, targetUserID)
+			hasPrivilegedActiveGrant, err := hasActivePrivilegedRoleGrants(ctx, q, teamID, targetUserID)
 			if err != nil {
 				return err
 			}
-			if hasActiveRole || hasPrivilegedHistory {
+			if hasActiveRole || hasPrivilegedActiveGrant {
 				permission := "roles:write"
 				if platform {
 					permission = "platform:team_roles:write"
