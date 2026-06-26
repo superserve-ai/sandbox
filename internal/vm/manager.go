@@ -754,7 +754,10 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 		tapDevice = netInfo.TAPDevice
 	}
 
-	// Throwaway Firecracker in the sandbox's existing env; stopped on the way out.
+	// Throwaway Firecracker in the sandbox's existing unit/rundir, stopped on the
+	// way out. Safe because the VM is paused (no live FC to disrupt), but it must
+	// not run concurrently with a resume of the same sandbox — fine for the
+	// debug/staging use this endpoint is gated to.
 	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}

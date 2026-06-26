@@ -297,6 +297,12 @@ func UnpauseVM(socketPath string) error {
 // re-snapshot it (SnapshotPausedVM) and verify the memory round-trips. The TAP
 // override mirrors RestoreSnapshot* so device restore succeeds.
 func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string) error {
+	// Empty, not nil — Firecracker rejects null. Only override the TAP when one
+	// is actually provided; a blank HostDevName is invalid.
+	overrides := []*models.NetworkOverride{}
+	if tapDevice != "" {
+		overrides = []*models.NetworkOverride{{IfaceID: &ifaceID, HostDevName: &tapDevice}}
+	}
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
@@ -306,11 +312,9 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 				BackendType: strPtr(models.MemoryBackendBackendTypeFile),
 				BackendPath: &memPath,
 			},
-			ResumeVM: false,
-			NetworkOverrides: []*models.NetworkOverride{
-				{IfaceID: &ifaceID, HostDevName: &tapDevice},
-			},
-			BlockDeltaDir: blockDeltaDir,
+			ResumeVM:         false,
+			NetworkOverrides: overrides,
+			BlockDeltaDir:    blockDeltaDir,
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {
