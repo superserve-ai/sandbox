@@ -829,6 +829,10 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 			if !ok {
 				return ErrConflict
 			}
+			revokedAssignments, err := loadActiveRoleAssignments(ctx, q, teamID, targetUserID)
+			if err != nil {
+				return err
+			}
 			if err := h.requireRolesWriteForActivePrivilegedGrants(ctx, q, svc, actorID, teamID, targetUserID, platform); err != nil {
 				return err
 			}
