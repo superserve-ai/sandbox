@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -473,9 +474,16 @@ func (h *Handlers) requirePlatformAdminGoogleSession(ctx context.Context, q db.D
 	if q == nil {
 		return fmt.Errorf("rbac store is not configured")
 	}
-	var claims authz.SessionClaims
-	if err := q.QueryRow(ctx, `SELECT provider, email FROM profile WHERE id = $1`, actorID).Scan(&claims.Provider, &claims.Email); err != nil {
+	var provider, email sql.NullString
+	if err := q.QueryRow(ctx, `SELECT provider, email FROM profile WHERE id = $1`, actorID).Scan(&provider, &email); err != nil {
 		return err
+	}
+	if !provider.Valid || !email.Valid {
+		return authz.ErrSessionNotEligible
+	}
+	claims := authz.SessionClaims{
+		Provider: provider.String,
+		Email:    email.String,
 	}
 	return authz.RequirePlatformAdminGoogleSession(ctx, claims)
 }
