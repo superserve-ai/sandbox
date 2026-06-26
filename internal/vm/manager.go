@@ -665,6 +665,8 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	if err := m.restoreForResume(socketPath, snapshotPath, memPath, netInfo); err != nil {
+		// Firecracker is already running; stop the unit before returning or it leaks.
+		m.stopUnitDuringRestoreError(vmID)
 		if errors.Is(err, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
@@ -693,15 +695,10 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath string, net
 		return RestoreSnapshot(socketPath, snapshotPath, memPath, "")
 	}
 
-	accessLogPath := ""
-	if m.cfg.UffdPrefetchEnabled {
-		candidate := filepath.Join(filepath.Dir(memPath), accessLogFilename)
-		if _, err := os.Stat(candidate); err == nil {
-			accessLogPath = candidate
-		}
-	}
+	// No prefetch access log: only template builds record one (next to the template
+	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
 	return RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, accessLogPath, "", "eth0", netInfo.TAPDevice, "",
+		socketPath, snapshotPath, memPath, "", "", "eth0", netInfo.TAPDevice, "",
 	)
 }
 

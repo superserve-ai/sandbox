@@ -89,15 +89,17 @@ func comparePages(a, b io.Reader, pageSize int) (compareResult, error) {
 		if endA && endB {
 			return res, nil // both ended cleanly on a page boundary
 		}
-		if endA != endB || nA != nB {
-			return res, fmt.Errorf("mem files differ in length (page %d: %d vs %d bytes)", page, nA, nB)
-		}
-		// A short final page (io.ErrUnexpectedEOF) is fine as long as both match.
-		if errA != nil && !errors.Is(errA, io.ErrUnexpectedEOF) {
+		// Surface a real read error (e.g. EIO) before inferring a length mismatch.
+		// EOF/ErrUnexpectedEOF aren't real errors: EOF is handled above and as a
+		// length mismatch below; a short final page (ErrUnexpectedEOF) is fine.
+		if errA != nil && !endA && !errors.Is(errA, io.ErrUnexpectedEOF) {
 			return res, fmt.Errorf("read a: %w", errA)
 		}
-		if errB != nil && !errors.Is(errB, io.ErrUnexpectedEOF) {
+		if errB != nil && !endB && !errors.Is(errB, io.ErrUnexpectedEOF) {
 			return res, fmt.Errorf("read b: %w", errB)
+		}
+		if endA != endB || nA != nB {
+			return res, fmt.Errorf("mem files differ in length (page %d: %d vs %d bytes)", page, nA, nB)
 		}
 
 		res.totalPages++
