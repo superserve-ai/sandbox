@@ -60,6 +60,7 @@ type Handler struct {
 	sandboxConns *connLimiter
 	ipConns      *connLimiter
 	log          zerolog.Logger
+	previewPorts PreviewPortAuthorizer
 
 	// seedKey is the HMAC seed shared with the control plane. Both
 	// sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
@@ -122,7 +123,17 @@ func NewHandler(domain string, resolver Resolver, log zerolog.Logger) *Handler {
 		sandboxConns: newConnLimiter(maxConnsPerSandbox),
 		ipConns:      newConnLimiter(maxConnsPerIP),
 		log:          log,
+		previewPorts: allowAllPreviewPortAuthorizer{},
 	}
+	return h
+}
+
+// WithPreviewPortAuthorizer sets the allow/deny hook for non-boxd preview ports.
+func (h *Handler) WithPreviewPortAuthorizer(authorizer PreviewPortAuthorizer) *Handler {
+	if authorizer == nil {
+		authorizer = allowAllPreviewPortAuthorizer{}
+	}
+	h.previewPorts = authorizer
 	return h
 }
 
@@ -202,6 +213,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if info.Status != "running" {
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, fmt.Sprintf("sandbox is %s", info.Status), http.StatusServiceUnavailable)
+		return
+	}
+
+	previewAuthorizer := h.previewPorts
+	if previewAuthorizer == nil {
+		previewAuthorizer = allowAllPreviewPortAuthorizer{}
+	}
+	allowed, err := previewAuthorizer.Allowed(r.Context(), instanceID, port, info)
+	if err != nil {
+		h.log.Error().Err(err).Str("instance", instanceID).Int("port", port).Msg("preview port authorization failed")
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "sandbox unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !allowed {
+		h.log.Warn().Str("instance", instanceID).Int("port", port).Msg("preview port denied")
+		http.NotFound(w, r)
 		return
 	}
 
