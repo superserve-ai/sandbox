@@ -41,7 +41,7 @@
 - Legacy users may appear in multiple teams, and the migration preserves every membership row.
 - Existing single-user teams are granted `team_owner`.
 - If a legacy row explicitly looks like an owner/admin, that legacy hint is used after the single-member owner case.
-- If a team has multiple members and there is no stronger hint, the fallback role is `viewer`.
+- If a team has multiple members and no explicit owner hint, the earliest legacy member by `joined_at` and profile ID is granted `team_owner`; remaining members fall back to `viewer` unless their legacy role maps to `team_admin`.
 - Platform admin is never auto-granted.
 - The orphan check is scoped to profiles represented in legacy `team_member`; profiles without a legacy membership are left for a later explicit user-state cleanup.
 
@@ -55,7 +55,7 @@
 ## Ambiguity
 
 - If a team has multiple members and no legacy owner/admin hint, ownership is ambiguous.
-- In that case the migration uses `viewer` rather than guessing an owner.
+- In that case the migration chooses a deterministic fallback owner using earliest `joined_at`, then profile ID.
 
 ## Team Model
 

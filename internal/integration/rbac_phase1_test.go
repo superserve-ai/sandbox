@@ -463,8 +463,7 @@ func TestRbacBackfill(t *testing.T) {
 
 	assertActiveMembership(t, ctx, ambiguousTeam, ambiguousA)
 	assertActiveMembership(t, ctx, ambiguousTeam, ambiguousB)
-	assertRoleAssignment(t, ctx, ambiguousTeam, ambiguousA, "viewer")
-	assertRoleAssignment(t, ctx, ambiguousTeam, ambiguousB, "viewer")
+	assertActiveOwnerCount(t, ctx, ambiguousTeam, 1)
 
 	assertActiveMembership(t, ctx, multiTeamA, multiTeamUser)
 	assertActiveMembership(t, ctx, multiTeamB, multiTeamUser)
@@ -653,26 +652,19 @@ func runRBACBackfill(t *testing.T, ctx context.Context) {
 			  AND m.status = 'active'
 		);
 
-		WITH team_sizes AS (
-			SELECT team_id, COUNT(*)::int AS member_count
-			FROM team_memberships
-			WHERE status = 'active'
-			GROUP BY team_id
-		),
-		legacy_memberships AS (
+		WITH legacy_memberships AS (
 			SELECT
-				m.team_id,
-				m.user_id,
-				m.created_at,
+				tm.team_id,
+				tm.profile_id AS user_id,
+				COALESCE(tm.joined_at, now()) AS created_at,
 				LOWER(COALESCE(tm.role, '')) AS legacy_role,
-				ts.member_count
-			FROM team_memberships m
-			JOIN team_sizes ts
-			  ON ts.team_id = m.team_id
-			LEFT JOIN team_member tm
-			  ON tm.team_id = m.team_id
-			 AND tm.profile_id = m.user_id
-			WHERE m.status = 'active'
+				BOOL_OR(LOWER(COALESCE(tm.role, '')) IN ('owner', 'team_owner'))
+					OVER (PARTITION BY tm.team_id) AS has_explicit_owner,
+				ROW_NUMBER() OVER (
+					PARTITION BY tm.team_id
+					ORDER BY COALESCE(tm.joined_at, 'infinity'::timestamptz), tm.profile_id
+				) AS owner_rank
+			FROM team_member tm
 		)
 		INSERT INTO user_role_assignments (
 			user_id, role_id, scope_type, team_id,
@@ -692,8 +684,8 @@ func runRBACBackfill(t *testing.T, ctx context.Context) {
 		JOIN roles r
 		  ON r.scope_type = 'team'
 		 AND r.name = CASE
-			WHEN lm.member_count = 1 THEN 'team_owner'
 			WHEN lm.legacy_role IN ('owner', 'team_owner') THEN 'team_owner'
+			WHEN NOT lm.has_explicit_owner AND lm.owner_rank = 1 THEN 'team_owner'
 			WHEN lm.legacy_role IN ('admin', 'team_admin') THEN 'team_admin'
 			ELSE 'viewer'
 		 END
@@ -726,6 +718,25 @@ func assertActiveMembership(t *testing.T, ctx context.Context, teamID, userID uu
 	}
 	if status != "active" {
 		t.Fatalf("membership status = %q, want active", status)
+	}
+}
+
+func assertActiveOwnerCount(t *testing.T, ctx context.Context, teamID uuid.UUID, want int) {
+	t.Helper()
+	var got int
+	if err := testPool.QueryRow(ctx, `
+		SELECT COUNT(*)::int
+		FROM user_role_assignments a
+		JOIN roles r ON r.id = a.role_id
+		WHERE a.team_id = $1
+		  AND a.scope_type = 'team'
+		  AND a.revoked_at IS NULL
+		  AND r.name = 'team_owner'
+	`, teamID).Scan(&got); err != nil {
+		t.Fatalf("count active owners: %v", err)
+	}
+	if got != want {
+		t.Fatalf("active owner count = %d, want %d", got, want)
 	}
 }
 

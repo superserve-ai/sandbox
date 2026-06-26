@@ -35,8 +35,13 @@ CREATE TABLE IF NOT EXISTS roles (
     CONSTRAINT roles_scope_type_check CHECK (scope_type IN ('platform', 'team'))
 );
 
-ALTER TABLE roles
-    ADD CONSTRAINT roles_id_scope_unique UNIQUE (id, scope_type);
+DO $$
+BEGIN
+    ALTER TABLE roles
+        ADD CONSTRAINT roles_id_scope_unique UNIQUE (id, scope_type);
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS permissions (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -77,10 +82,15 @@ CREATE TABLE IF NOT EXISTS user_role_assignments (
         )
 );
 
-ALTER TABLE user_role_assignments
-    ADD CONSTRAINT user_role_assignments_role_scope_fk
-    FOREIGN KEY (role_id, scope_type)
-    REFERENCES roles(id, scope_type);
+DO $$
+BEGIN
+    ALTER TABLE user_role_assignments
+        ADD CONSTRAINT user_role_assignments_role_scope_fk
+        FOREIGN KEY (role_id, scope_type)
+        REFERENCES roles(id, scope_type);
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_user_role_assignments_user_scope_team
     ON user_role_assignments(user_id, scope_type, team_id);
@@ -124,6 +134,8 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS trg_user_role_assignments_active_membership ON user_role_assignments;
+
 CREATE TRIGGER trg_user_role_assignments_active_membership
     BEFORE INSERT OR UPDATE OF user_id, scope_type, team_id, revoked_at
     ON user_role_assignments
@@ -144,6 +156,8 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS trg_team_memberships_prevent_identity_update ON team_memberships;
+
 CREATE TRIGGER trg_team_memberships_prevent_identity_update
     BEFORE UPDATE OF team_id, user_id
     ON team_memberships
@@ -155,7 +169,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF OLD.status = 'active' AND NEW.status <> 'active' THEN
+    IF OLD.status = 'active' AND NEW.status = 'inactive' THEN
         UPDATE user_role_assignments
         SET revoked_at = COALESCE(revoked_at, now()),
             updated_at = now()
@@ -167,6 +181,8 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+DROP TRIGGER IF EXISTS trg_team_memberships_revoke_assignments ON team_memberships;
 
 CREATE TRIGGER trg_team_memberships_revoke_assignments
     AFTER UPDATE OF status
@@ -190,6 +206,8 @@ BEGIN
     RETURN OLD;
 END;
 $$;
+
+DROP TRIGGER IF EXISTS trg_team_memberships_revoke_assignments_on_delete ON team_memberships;
 
 CREATE TRIGGER trg_team_memberships_revoke_assignments_on_delete
     AFTER DELETE
@@ -229,6 +247,8 @@ BEGIN
     RETURN OLD;
 END;
 $$;
+
+DROP TRIGGER IF EXISTS trg_audit_logs_prevent_mutation ON audit_logs;
 
 CREATE TRIGGER trg_audit_logs_prevent_mutation
     BEFORE UPDATE OR DELETE
@@ -351,26 +371,19 @@ WHERE NOT EXISTS (
       AND m.status = 'active'
 );
 
-WITH team_sizes AS (
-    SELECT team_id, COUNT(*)::int AS member_count
-    FROM team_memberships
-    WHERE status = 'active'
-    GROUP BY team_id
-),
-legacy_memberships AS (
+WITH legacy_memberships AS (
     SELECT
-        m.team_id,
-        m.user_id,
-        m.created_at,
+        tm.team_id,
+        tm.profile_id AS user_id,
+        COALESCE(tm.joined_at, now()) AS created_at,
         LOWER(COALESCE(tm.role, '')) AS legacy_role,
-        ts.member_count
-    FROM team_memberships m
-    JOIN team_sizes ts
-      ON ts.team_id = m.team_id
-    LEFT JOIN team_member tm
-      ON tm.team_id = m.team_id
-     AND tm.profile_id = m.user_id
-    WHERE m.status = 'active'
+        BOOL_OR(LOWER(COALESCE(tm.role, '')) IN ('owner', 'team_owner'))
+            OVER (PARTITION BY tm.team_id) AS has_explicit_owner,
+        ROW_NUMBER() OVER (
+            PARTITION BY tm.team_id
+            ORDER BY COALESCE(tm.joined_at, 'infinity'::timestamptz), tm.profile_id
+        ) AS owner_rank
+    FROM team_member tm
 )
 INSERT INTO user_role_assignments (
     user_id, role_id, scope_type, team_id,
@@ -390,8 +403,8 @@ FROM legacy_memberships lm
     JOIN roles r
       ON r.scope_type = 'team'
      AND r.name = CASE
-        WHEN lm.member_count = 1 THEN 'team_owner'
         WHEN lm.legacy_role IN ('owner', 'team_owner') THEN 'team_owner'
+        WHEN NOT lm.has_explicit_owner AND lm.owner_rank = 1 THEN 'team_owner'
         WHEN lm.legacy_role IN ('admin', 'team_admin') THEN 'team_admin'
         ELSE 'viewer'
      END
