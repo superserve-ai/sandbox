@@ -702,6 +702,70 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath string, net
 	)
 }
 
+// VerifySnapshot loads vmID's snapshot without resuming, re-snapshots the frozen
+// image to a temp file, and returns its path (compare with the original via
+// snapcheck). Non-destructive: stops the throwaway FC, leaving the sandbox paused.
+func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, error) {
+	log := m.log.With().Str("vm_id", vmID).Logger()
+
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return "", err
+	}
+	snapshotPath, memPath := inst.SnapshotPath, inst.MemFilePath
+	if snapshotPath == "" || memPath == "" {
+		return "", status.Errorf(codes.InvalidArgument, "vm %s has no snapshot on record", vmID)
+	}
+	if _, err := os.Stat(memPath); err != nil {
+		return "", status.Errorf(codes.FailedPrecondition, "mem file missing on host: %s", memPath)
+	}
+
+	rundirKey := vmID
+	if inst.RunDirID != "" {
+		rundirKey = inst.RunDirID
+	}
+	rootfsPath := inst.DiskPath
+	if rootfsPath == "" {
+		fname := "rootfs.ext4"
+		if inst.Config.BasePath != "" {
+			fname = "overlay.ext4"
+		}
+		rootfsPath = filepath.Join(m.cfg.RunDir, rundirKey, fname)
+	}
+	socketPath := filepath.Join(m.cfg.RunDir, rundirKey, "firecracker.sock")
+
+	var tapDevice string
+	if inst.Namespace != "" {
+		netInfo, nsErr := m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress)
+		if nsErr != nil {
+			return "", fmt.Errorf("ensure network slot for verify: %w", nsErr)
+		}
+		tapDevice = netInfo.TAPDevice
+	}
+
+	// Throwaway Firecracker in the sandbox's existing env; stopped on the way out.
+	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
+		return "", fmt.Errorf("start firecracker for verify: %w", err)
+	}
+	defer func() { _ = stopUnit(context.Background(), systemdUnitName(vmID)) }()
+
+	if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
+		return "", err
+	}
+
+	verifyDir := filepath.Join(filepath.Dir(memPath), "verify")
+	if err := os.MkdirAll(verifyDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir verify dir: %w", err)
+	}
+	memBPath := filepath.Join(verifyDir, "mem.snap")
+	if err := SnapshotPausedVM(socketPath, filepath.Join(verifyDir, "vmstate.snap"), memBPath); err != nil {
+		return "", err
+	}
+
+	log.Info().Str("mem_b", memBPath).Msg("verify snapshot: re-snapshotted frozen image")
+	return memBPath, nil
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot management
 // ---------------------------------------------------------------------------
