@@ -322,6 +322,33 @@ func TestRbacAssignmentConstraints(t *testing.T) {
 		}
 	})
 
+	t.Run("membership invited transition revokes team assignments", func(t *testing.T) {
+		otherTeamID := mustCreateTeam(t, ctx, "rbac-invite-transition-"+uuid.NewString()[:8])
+		otherUser := seedRBACProfile(t)
+		seedMembership(t, ctx, otherTeamID, otherUser)
+		seedTeamRoleAssignment(t, ctx, otherUser, teamOwnerRoleID, otherTeamID)
+
+		if _, err := testPool.Exec(ctx, `
+			UPDATE team_memberships
+			SET status = 'invited'
+			WHERE team_id = $1 AND user_id = $2
+		`, otherTeamID, otherUser); err != nil {
+			t.Fatalf("move membership to invited: %v", err)
+		}
+
+		var revokedAt pgtype.Timestamptz
+		if err := testPool.QueryRow(ctx, `
+			SELECT revoked_at
+			FROM user_role_assignments
+			WHERE team_id = $1 AND user_id = $2 AND role_id = $3
+		`, otherTeamID, otherUser, teamOwnerRoleID).Scan(&revokedAt); err != nil {
+			t.Fatalf("read revoked assignment: %v", err)
+		}
+		if !revokedAt.Valid {
+			t.Fatal("expected role assignment to be revoked after membership moved to invited")
+		}
+	})
+
 	t.Run("membership delete revokes team assignments", func(t *testing.T) {
 		otherTeamID := mustCreateTeam(t, ctx, "rbac-delete-membership-"+uuid.NewString()[:8])
 		otherUser := seedRBACProfile(t)

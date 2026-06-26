@@ -169,7 +169,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF OLD.status = 'active' AND NEW.status = 'inactive' THEN
+    IF OLD.status = 'active' AND NEW.status <> 'active' THEN
         UPDATE user_role_assignments
         SET revoked_at = COALESCE(revoked_at, now()),
             updated_at = now()
