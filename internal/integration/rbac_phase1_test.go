@@ -489,6 +489,7 @@ func TestAuditLogAcceptsEvents(t *testing.T) {
 	}
 
 	var got struct {
+		ID        int64
 		ActorID   pgtype.UUID
 		TargetID  pgtype.UUID
 		TeamID    pgtype.UUID
@@ -498,12 +499,12 @@ func TestAuditLogAcceptsEvents(t *testing.T) {
 		Metadata  []byte
 	}
 	if err := testPool.QueryRow(ctx, `
-		SELECT actor_user_id, target_user_id, team_id, event_type, old_value, new_value, metadata
+		SELECT id, actor_user_id, target_user_id, team_id, event_type, old_value, new_value, metadata
 		FROM audit_logs
 		WHERE event_type = 'role_assigned'
 		ORDER BY created_at DESC
 		LIMIT 1
-	`).Scan(&got.ActorID, &got.TargetID, &got.TeamID, &got.EventType, &got.OldValue, &got.NewValue, &got.Metadata); err != nil {
+	`).Scan(&got.ID, &got.ActorID, &got.TargetID, &got.TeamID, &got.EventType, &got.OldValue, &got.NewValue, &got.Metadata); err != nil {
 		t.Fatalf("read audit log: %v", err)
 	}
 	if !got.ActorID.Valid || got.ActorID.Bytes != actorID {
@@ -517,6 +518,21 @@ func TestAuditLogAcceptsEvents(t *testing.T) {
 	}
 	if got.EventType != "role_assigned" {
 		t.Fatalf("event_type = %q, want role_assigned", got.EventType)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE audit_logs
+		SET event_type = 'tampered'
+		WHERE id = $1
+	`, got.ID); err == nil {
+		t.Fatal("expected audit log update to fail")
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		DELETE FROM audit_logs
+		WHERE id = $1
+	`, got.ID); err == nil {
+		t.Fatal("expected audit log delete to fail")
 	}
 }
 

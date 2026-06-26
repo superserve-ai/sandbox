@@ -8,7 +8,7 @@
 - `permissions` as a global permission catalog.
 - `role_permissions` as the join table between roles and permissions.
 - `user_role_assignments` for scoped role grants with explicit platform/team scope.
-- `audit_logs` as an append-only event log foundation.
+- `audit_logs` as an append-only event log foundation with database-level UPDATE/DELETE protection.
 
 ## Seed Data Added
 

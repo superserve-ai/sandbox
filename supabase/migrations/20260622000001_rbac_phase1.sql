@@ -220,6 +220,22 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_target_created_at
 CREATE INDEX IF NOT EXISTS idx_audit_logs_event_created_at
     ON audit_logs(event_type, created_at DESC);
 
+CREATE OR REPLACE FUNCTION prevent_audit_log_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_logs is append-only; update/delete is not allowed';
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_audit_logs_prevent_mutation
+    BEFORE UPDATE OR DELETE
+    ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_audit_log_mutation();
+
 -- Fail closed until Phase 2 adds service-owned access paths and explicit
 -- policies. The API uses the service role for these internal RBAC tables.
 ALTER TABLE public.team_memberships ENABLE ROW LEVEL SECURITY;
