@@ -301,6 +301,50 @@ func loadAssignment(ctx context.Context, q db.DBTX, teamID, assignmentID uuid.UU
 	return rec, nil
 }
 
+func loadActiveRoleAssignments(ctx context.Context, q db.DBTX, teamID, userID uuid.UUID) ([]roleAssignmentRecord, error) {
+	rows, err := q.Query(ctx, `
+		SELECT ura.id, ura.user_id, ura.role_id, r.name, ura.team_id, ura.granted_by, ura.granted_at,
+		       ura.revoked_at, ura.created_at, ura.updated_at
+		FROM user_role_assignments ura
+		JOIN roles r
+		  ON r.id = ura.role_id
+		WHERE ura.team_id = $1
+		  AND ura.user_id = $2
+		  AND ura.scope_type = 'team'
+		  AND ura.revoked_at IS NULL
+		ORDER BY ura.granted_at DESC, ura.created_at DESC
+		FOR UPDATE
+	`, teamID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	assignments := make([]roleAssignmentRecord, 0)
+	for rows.Next() {
+		var rec roleAssignmentRecord
+		if err := rows.Scan(
+			&rec.ID,
+			&rec.UserID,
+			&rec.RoleID,
+			&rec.RoleName,
+			&rec.TeamID,
+			&rec.GrantedBy,
+			&rec.GrantedAt,
+			&rec.RevokedAt,
+			&rec.CreatedAt,
+			&rec.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return assignments, nil
+}
+
 func activeAssignmentExists(ctx context.Context, q db.DBTX, teamID, userID, roleID uuid.UUID) (bool, error) {
 	var exists bool
 	err := q.QueryRow(ctx, `
@@ -425,6 +469,17 @@ func (h *Handlers) writeRBACAudit(ctx context.Context, q db.DBTX, actorID, targe
 	})
 }
 
+func (h *Handlers) requirePlatformAdminGoogleSession(ctx context.Context, q db.DBTX, actorID uuid.UUID) error {
+	if q == nil {
+		return fmt.Errorf("rbac store is not configured")
+	}
+	var claims authz.SessionClaims
+	if err := q.QueryRow(ctx, `SELECT provider, email FROM profile WHERE id = $1`, actorID).Scan(&claims.Provider, &claims.Email); err != nil {
+		return err
+	}
+	return authz.RequirePlatformAdminGoogleSession(ctx, claims)
+}
+
 func (h *Handlers) requireTeamPermission(c *gin.Context, actorID, teamID uuid.UUID, permission string, platform bool) error {
 	svc := h.rbacService()
 	if svc == nil {
@@ -479,7 +534,22 @@ func (h *Handlers) listMembers(c *gin.Context, platform bool) {
 	if err != nil {
 		return
 	}
-	if err := h.requireTeamPermission(c, actorID, teamID, "users:read", platform); err != nil {
+	if platform {
+		if err := h.requirePlatformAdminGoogleSession(c.Request.Context(), h.Pool, actorID); err != nil {
+			if errors.Is(err, authz.ErrSessionNotEligible) || errors.Is(err, pgx.ErrNoRows) {
+				respondError(c, ErrForbidden)
+				return
+			}
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC list members session validation failed")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+	permission := "users:read"
+	if platform {
+		permission = "platform:teams:read"
+	}
+	if err := h.requireTeamPermission(c, actorID, teamID, permission, platform); err != nil {
 		if errors.Is(err, authz.ErrPermissionDenied) || errors.Is(err, authz.ErrScopeMismatch) {
 			respondError(c, ErrForbidden)
 			return
@@ -559,6 +629,17 @@ func (h *Handlers) listAssignments(c *gin.Context, platform bool) {
 	actorID, err := requestActorID(c, platform)
 	if err != nil {
 		return
+	}
+	if platform {
+		if err := h.requirePlatformAdminGoogleSession(c.Request.Context(), h.Pool, actorID); err != nil {
+			if errors.Is(err, authz.ErrSessionNotEligible) || errors.Is(err, pgx.ErrNoRows) {
+				respondError(c, ErrForbidden)
+				return
+			}
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC list assignments session validation failed")
+			respondError(c, ErrInternal)
+			return
+		}
 	}
 	permission := "roles:read"
 	if platform {
@@ -656,6 +737,17 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 	if err != nil {
 		return
 	}
+	if platform {
+		if err := h.requirePlatformAdminGoogleSession(c.Request.Context(), h.Pool, actorID); err != nil {
+			if errors.Is(err, authz.ErrSessionNotEligible) || errors.Is(err, pgx.ErrNoRows) {
+				respondError(c, ErrForbidden)
+				return
+			}
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC add member session validation failed")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
 	permission := "users:write"
 	if platform {
 		permission = "platform:team_users:write"
@@ -705,6 +797,10 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 			return priorErr
 		}
 		if priorErr == nil && prior.Status == "active" && status != "active" {
+			revokedAssignments, err := loadActiveRoleAssignments(ctx, q, teamID, targetUserID)
+			if err != nil {
+				return err
+			}
 			ok, err := svc.CanRevokeLastTeamOwner(ctx, teamID, targetUserID)
 			if err != nil {
 				return err
@@ -713,6 +809,9 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 				return ErrConflict
 			}
 			if err := h.requireRolesWriteForActivePrivilegedGrants(ctx, q, svc, actorID, teamID, targetUserID, platform); err != nil {
+				return err
+			}
+			if err := h.auditRevokedRoleAssignments(ctx, q, &actorID, &targetUserID, &teamID, platform, revokedAssignments, time.Now().UTC()); err != nil {
 				return err
 			}
 		}
@@ -794,6 +893,17 @@ func (h *Handlers) deactivateMember(c *gin.Context, platform bool) {
 	if err != nil {
 		return
 	}
+	if platform {
+		if err := h.requirePlatformAdminGoogleSession(c.Request.Context(), h.Pool, actorID); err != nil {
+			if errors.Is(err, authz.ErrSessionNotEligible) || errors.Is(err, pgx.ErrNoRows) {
+				respondError(c, ErrForbidden)
+				return
+			}
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC deactivate member session validation failed")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
 	permission := "users:write"
 	if platform {
 		permission = "platform:team_users:write"
@@ -835,6 +945,10 @@ func (h *Handlers) deactivateMember(c *gin.Context, platform bool) {
 		if !ok {
 			return ErrConflict
 		}
+		revokedAssignments, err := loadActiveRoleAssignments(ctx, q, teamID, targetUserID)
+		if err != nil {
+			return err
+		}
 		if err := h.requireRolesWriteForActivePrivilegedGrants(ctx, q, svc, actorID, teamID, targetUserID, platform); err != nil {
 			return err
 		}
@@ -850,6 +964,9 @@ func (h *Handlers) deactivateMember(c *gin.Context, platform bool) {
 		eventType := "team_member_deactivated"
 		if platform {
 			eventType = "platform_team_member_deactivated"
+		}
+		if err := h.auditRevokedRoleAssignments(ctx, q, &actorID, &targetUserID, &teamID, platform, revokedAssignments, now); err != nil {
+			return err
 		}
 		return h.writeRBACAudit(ctx, q, &actorID, &targetUserID, &teamID, eventType, map[string]any{
 			"status": rec.Status,
@@ -897,6 +1014,17 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 	actorID, err := requestActorID(c, platform)
 	if err != nil {
 		return
+	}
+	if platform {
+		if err := h.requirePlatformAdminGoogleSession(c.Request.Context(), h.Pool, actorID); err != nil {
+			if errors.Is(err, authz.ErrSessionNotEligible) || errors.Is(err, pgx.ErrNoRows) {
+				respondError(c, ErrForbidden)
+				return
+			}
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC assign role session validation failed")
+			respondError(c, ErrInternal)
+			return
+		}
 	}
 	permission := "roles:write"
 	if platform {
@@ -1065,6 +1193,17 @@ func (h *Handlers) revokeRole(c *gin.Context, platform bool) {
 	if err != nil {
 		return
 	}
+	if platform {
+		if err := h.requirePlatformAdminGoogleSession(c.Request.Context(), h.Pool, actorID); err != nil {
+			if errors.Is(err, authz.ErrSessionNotEligible) || errors.Is(err, pgx.ErrNoRows) {
+				respondError(c, ErrForbidden)
+				return
+			}
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC revoke role session validation failed")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
 	permission := "roles:write"
 	if platform {
 		permission = "platform:team_roles:write"
@@ -1151,6 +1290,15 @@ func (h *Handlers) recoverTeam(c *gin.Context) {
 	}
 	actorID, err := requestActorID(c, true)
 	if err != nil {
+		return
+	}
+	if err := h.requirePlatformAdminGoogleSession(c.Request.Context(), h.Pool, actorID); err != nil {
+		if errors.Is(err, authz.ErrSessionNotEligible) || errors.Is(err, pgx.ErrNoRows) {
+			respondError(c, ErrForbidden)
+			return
+		}
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC recovery session validation failed")
+		respondError(c, ErrInternal)
 		return
 	}
 	svc := h.rbacService()
@@ -1295,3 +1443,28 @@ func (h *Handlers) AssignPlatformTeamRole(c *gin.Context)          { h.assignRol
 func (h *Handlers) RevokeTeamRole(c *gin.Context)                  { h.revokeRole(c, false) }
 func (h *Handlers) RevokePlatformTeamRole(c *gin.Context)          { h.revokeRole(c, true) }
 func (h *Handlers) RecoverTeam(c *gin.Context)                     { h.recoverTeam(c) }
+
+func (h *Handlers) auditRevokedRoleAssignments(ctx context.Context, q db.DBTX, actorID, targetID, teamID *uuid.UUID, platform bool, assignments []roleAssignmentRecord, revokedAt time.Time) error {
+	if len(assignments) == 0 {
+		return nil
+	}
+	eventType := "team_role_revoked"
+	if platform {
+		eventType = "platform_team_role_revoked"
+	}
+	for _, assignment := range assignments {
+		if err := h.writeRBACAudit(ctx, q, actorID, targetID, teamID, eventType, map[string]any{
+			"assignment_id": assignment.ID.String(),
+			"role_name":     assignment.RoleName,
+		}, map[string]any{
+			"assignment_id": assignment.ID.String(),
+			"role_name":     assignment.RoleName,
+			"revoked_at":    revokedAt,
+		}, map[string]any{
+			"cascade": true,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}

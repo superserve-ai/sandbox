@@ -155,13 +155,34 @@ paths:
       summary: Add or invite a team member
       security:
         - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                user_id:
+                  type: string
+                  format: uuid
+                status:
+                  type: string
+                  enum: [active, invited]
+              required: [user_id]
       responses:
         "201":
           description: Member added
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /teams/{team_id}/members/{user_id}:
     parameters:
@@ -190,6 +211,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /teams/{team_id}/roles:
     parameters:
@@ -218,13 +243,33 @@ paths:
       summary: Assign a team role
       security:
         - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                user_id:
+                  type: string
+                  format: uuid
+                role_name:
+                  type: string
+              required: [user_id, role_name]
       responses:
         "201":
           description: Role assigned
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /teams/{team_id}/roles/{assignment_id}:
     parameters:
@@ -253,6 +298,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /sandboxes:
     get:
@@ -2545,6 +2594,12 @@ components:
             $ref: "#/components/schemas/Error"
     Unauthorized:
       description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Caller is authenticated but not allowed to perform the action
       content:
         application/json:
           schema:

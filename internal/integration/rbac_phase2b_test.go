@@ -44,12 +44,17 @@ func doInternal(r *gin.Engine, method, path, actorID, body string) *httptest.Res
 
 func seedPlatformAdminProfile(t *testing.T) uuid.UUID {
 	t.Helper()
+	return seedPlatformAdminProfileWithIdentity(t, fmt.Sprintf("admin-%s@superserve.ai", uuid.NewString()[:8]), "google")
+}
+
+func seedPlatformAdminProfileWithIdentity(t *testing.T, email, provider string) uuid.UUID {
+	t.Helper()
 	ctx := context.Background()
 	userID := uuid.New()
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO profile (id, email, provider, provider_id)
-		VALUES ($1, $2, 'google', $3)
-	`, userID, fmt.Sprintf("admin-%s@superserve.ai", userID.String()[:8]), "google-"+userID.String()[:8]); err != nil {
+		VALUES ($1, $2, $3, $4)
+	`, userID, email, provider, provider+"-"+userID.String()[:8]); err != nil {
 		t.Fatalf("insert platform admin profile: %v", err)
 	}
 	roleID := mustRoleID(t, ctx, "platform_admin")
@@ -166,6 +171,22 @@ func TestRbacPhase2bTeamMemberManagement(t *testing.T) {
 	if auditEventCount(t, ctx, teamID, "team_member_deactivated") == 0 {
 		t.Fatal("expected team_member_deactivated audit row")
 	}
+
+	t.Run("deactivating a member audits revoked roles", func(t *testing.T) {
+		teamID2, key2, _ := seedTeamAndKeyWithRole(t, "team_owner")
+		target := seedRBACProfile(t)
+		seedMembership(t, ctx, teamID2, target)
+		seedTeamRoleAssignment(t, ctx, target, mustRoleID(t, ctx, "team_admin"), teamID2)
+		before := auditEventCount(t, ctx, teamID2, "team_role_revoked")
+
+		w := do(r, "DELETE", "/teams/"+teamID2.String()+"/members/"+target.String(), key2, "")
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("deactivate member: %d %s", w.Code, w.Body.String())
+		}
+		if got := auditEventCount(t, ctx, teamID2, "team_role_revoked"); got <= before {
+			t.Fatalf("team_role_revoked audit rows = %d, want > %d", got, before)
+		}
+	})
 
 	t.Run("customer route ignores actor header for legacy key", func(t *testing.T) {
 		legacyTeam, legacyKey := seedTeamAndKey(t)
@@ -357,9 +378,17 @@ func TestRbacPhase2bPlatformRecovery(t *testing.T) {
 	ctx := context.Background()
 	r := newInternalRouter(t)
 	platformActor := seedPlatformAdminProfile(t)
+	invalidPlatformActor := seedPlatformAdminProfileWithIdentity(t, "admin@example.com", "google")
 	nonPlatformActor := seedRBACProfile(t)
 	superserveCandidate := seedSuperserveEmailProfile(t)
 	teamID := mustCreateTeam(t, ctx, "rbac-recovery-"+uuid.NewString()[:8])
+
+	t.Run("internal platform routes require a superserve google session", func(t *testing.T) {
+		w := doInternal(r, "GET", "/internal/teams/"+teamID.String()+"/members", invalidPlatformActor.String(), "")
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		}
+	})
 
 	w := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/recover", platformActor.String(), fmt.Sprintf(`{"user_id":%q}`, superserveCandidate))
 	if w.Code != http.StatusOK {
