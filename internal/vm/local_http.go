@@ -124,6 +124,10 @@ type verifySnapshotResponse struct {
 // handleVerifySnapshot handles POST /verify-snapshot/{vmID}: re-snapshot the
 // frozen image and return its path for comparison. Internal/debug only.
 func (s *LocalHTTPServer) handleVerifySnapshot(w http.ResponseWriter, r *http.Request) {
+	if !s.mgr.cfg.VerifySnapshotEnabled {
+		http.Error(w, "verify-snapshot disabled", http.StatusNotFound)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return

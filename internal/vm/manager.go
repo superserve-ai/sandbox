@@ -153,6 +153,11 @@ type ManagerConfig struct {
 	// instead of File, reusing the existing tap. Requires UffdEnabled;
 	// default false, with File as the fallback.
 	ResumeUffdEnabled bool
+
+	// VerifySnapshotEnabled exposes the debug POST /verify-snapshot/{id} endpoint
+	// (re-snapshot a paused VM for bit-identical checks). Default false; intended
+	// for staging gate runs, not production.
+	VerifySnapshotEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +716,12 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return "", err
+	}
+	// Only operate on a paused VM. Starting a throwaway Firecracker for a running
+	// sandbox (and stopping it on the way out) would disrupt the live VM.
+	if inst.Status != StatusPaused {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"vm %s is not paused (status %s); verify only runs on paused snapshots", vmID, inst.Status)
 	}
 	snapshotPath, memPath := inst.SnapshotPath, inst.MemFilePath
 	if snapshotPath == "" || memPath == "" {
