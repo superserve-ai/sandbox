@@ -254,6 +254,21 @@ func TestRbacPhase2bTeamMemberManagement(t *testing.T) {
 			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 		}
 	})
+
+	t.Run("deactivating active owner without roles write is forbidden", func(t *testing.T) {
+		teamID2, userAdminKey, _ := seedTeamAndKeyWithRole(t, "user_admin")
+		target := seedRBACProfile(t)
+		spareOwner := seedRBACProfile(t)
+		seedMembership(t, ctx, teamID2, target)
+		seedMembership(t, ctx, teamID2, spareOwner)
+		seedTeamRoleAssignment(t, ctx, target, mustRoleID(t, ctx, "team_owner"), teamID2)
+		seedTeamRoleAssignment(t, ctx, spareOwner, mustRoleID(t, ctx, "team_owner"), teamID2)
+
+		w := do(r, "DELETE", "/teams/"+teamID2.String()+"/members/"+target.String(), userAdminKey, "")
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		}
+	})
 }
 
 func TestRbacPhase2bTeamRoleManagement(t *testing.T) {

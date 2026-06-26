@@ -338,27 +338,6 @@ func hasActiveRoleGrants(ctx context.Context, q db.DBTX, teamID, userID uuid.UUI
 	return exists, nil
 }
 
-func hasPrivilegedRoleGrantHistory(ctx context.Context, q db.DBTX, teamID, userID uuid.UUID) (bool, error) {
-	var exists bool
-	err := q.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1
-			FROM user_role_assignments ura
-			JOIN roles r
-			  ON r.id = ura.role_id
-			 AND r.scope_type = 'team'
-			WHERE ura.team_id = $1
-			  AND ura.user_id = $2
-			  AND ura.scope_type = 'team'
-			  AND r.name IN ('team_owner', 'team_admin')
-		)
-	`, teamID, userID).Scan(&exists)
-	if err != nil {
-		return false, err
-	}
-	return exists, nil
-}
-
 func hasActivePrivilegedRoleGrants(ctx context.Context, q db.DBTX, teamID, userID uuid.UUID) (bool, error) {
 	var exists bool
 	err := q.QueryRow(ctx, `
@@ -381,7 +360,7 @@ func hasActivePrivilegedRoleGrants(ctx context.Context, q db.DBTX, teamID, userI
 	return exists, nil
 }
 
-func (h *Handlers) requireRolesWriteForActivePrivilegedGrants(ctx context.Context, q db.DBTX, c *gin.Context, actorID, teamID, targetUserID uuid.UUID, platform bool) error {
+func (h *Handlers) requireRolesWriteForActivePrivilegedGrants(ctx context.Context, q db.DBTX, svc *authz.Service, actorID, teamID, targetUserID uuid.UUID, platform bool) error {
 	hasPrivilegedActiveGrant, err := hasActivePrivilegedRoleGrants(ctx, q, teamID, targetUserID)
 	if err != nil {
 		return err
@@ -393,7 +372,10 @@ func (h *Handlers) requireRolesWriteForActivePrivilegedGrants(ctx context.Contex
 	if platform {
 		permission = "platform:team_roles:write"
 	}
-	return h.requireTeamPermission(c, actorID, teamID, permission, platform)
+	if platform {
+		return svc.RequirePlatformPermission(ctx, actorID, permission)
+	}
+	return svc.RequireTeamPermission(ctx, actorID, teamID, permission)
 }
 
 func activeOwnerCount(ctx context.Context, q db.DBTX, teamID uuid.UUID) (int64, error) {
@@ -730,7 +712,7 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 			if !ok {
 				return ErrConflict
 			}
-			if err := h.requireRolesWriteForActivePrivilegedGrants(ctx, q, c, actorID, teamID, targetUserID, platform); err != nil {
+			if err := h.requireRolesWriteForActivePrivilegedGrants(ctx, q, svc, actorID, teamID, targetUserID, platform); err != nil {
 				return err
 			}
 		}
@@ -853,7 +835,7 @@ func (h *Handlers) deactivateMember(c *gin.Context, platform bool) {
 		if !ok {
 			return ErrConflict
 		}
-		if err := h.requireRolesWriteForActivePrivilegedGrants(ctx, q, c, actorID, teamID, targetUserID, platform); err != nil {
+		if err := h.requireRolesWriteForActivePrivilegedGrants(ctx, q, svc, actorID, teamID, targetUserID, platform); err != nil {
 			return err
 		}
 		now := time.Now().UTC()
@@ -883,6 +865,10 @@ func (h *Handlers) deactivateMember(c *gin.Context, platform bool) {
 		}
 		if errors.Is(err, ErrConflict) {
 			respondError(c, ErrConflict)
+			return
+		}
+		if errors.Is(err, authz.ErrPermissionDenied) || errors.Is(err, authz.ErrScopeMismatch) {
+			respondError(c, ErrForbidden)
 			return
 		}
 		if errors.Is(err, errMembershipNotActive) {
