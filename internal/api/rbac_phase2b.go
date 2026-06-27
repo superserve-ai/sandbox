@@ -499,6 +499,16 @@ func (h *Handlers) requireTeamPermission(c *gin.Context, actorID, teamID uuid.UU
 	return svc.RequireTeamPermission(c.Request.Context(), actorID, teamID, permission)
 }
 
+func requireTeamPermissionOnTx(ctx context.Context, svc *authz.Service, actorID, teamID uuid.UUID, permission string, platform bool) error {
+	if svc == nil {
+		return fmt.Errorf("rbac service is not configured")
+	}
+	if platform {
+		return svc.RequirePlatformPermission(ctx, actorID, permission)
+	}
+	return svc.RequireTeamPermission(ctx, actorID, teamID, permission)
+}
+
 func teamMemberResponseFromRow(row teamMemberResponse) gin.H {
 	return gin.H{
 		"user_id":    row.UserID,
@@ -794,6 +804,9 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
 		}
+		if err := requireTeamPermissionOnTx(ctx, svc, actorID, teamID, permission, platform); err != nil {
+			return err
+		}
 		if err := ensureTeamExists(ctx, q, teamID); err != nil {
 			return err
 		}
@@ -837,7 +850,7 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 				if platform {
 					permission = "platform:team_roles:write"
 				}
-				if err := h.requireTeamPermission(c, actorID, teamID, permission, platform); err != nil {
+				if err := requireTeamPermissionOnTx(ctx, svc, actorID, teamID, permission, platform); err != nil {
 					return err
 				}
 			}
@@ -934,6 +947,9 @@ func (h *Handlers) deactivateMember(c *gin.Context, platform bool) {
 	ctx := c.Request.Context()
 	err = h.withRBACMutation(ctx, func(q db.DBTX, svc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
+			return err
+		}
+		if err := requireTeamPermissionOnTx(ctx, svc, actorID, teamID, permission, platform); err != nil {
 			return err
 		}
 		if err := ensureTeamExists(ctx, q, teamID); err != nil {
@@ -1068,6 +1084,9 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 	var assignment roleAssignmentRecord
 	err = h.withRBACMutation(ctx, func(q db.DBTX, svc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
+			return err
+		}
+		if err := requireTeamPermissionOnTx(ctx, svc, actorID, teamID, permission, platform); err != nil {
 			return err
 		}
 		if err := ensureTeamExists(ctx, q, teamID); err != nil {
@@ -1236,6 +1255,9 @@ func (h *Handlers) revokeRole(c *gin.Context, platform bool) {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
 		}
+		if err := requireTeamPermissionOnTx(ctx, svc, actorID, teamID, permission, platform); err != nil {
+			return err
+		}
 		rec, err := loadAssignment(ctx, q, teamID, assignmentID)
 		if err != nil {
 			return err
@@ -1344,6 +1366,11 @@ func (h *Handlers) recoverTeam(c *gin.Context) {
 	err = h.withRBACMutation(ctx, func(q db.DBTX, txSvc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
+		}
+		for _, permission := range []string{"platform:team_users:write", "platform:team_roles:write", "platform:teams:read"} {
+			if err := requireTeamPermissionOnTx(ctx, txSvc, actorID, teamID, permission, true); err != nil {
+				return err
+			}
 		}
 		if err := ensureTeamExists(ctx, q, teamID); err != nil {
 			return err
