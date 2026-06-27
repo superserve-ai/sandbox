@@ -293,6 +293,55 @@ func UnpauseVM(socketPath string) error {
 	return nil
 }
 
+// LoadSnapshotNoResume loads a snapshot but leaves the vCPUs paused — used to
+// re-snapshot it (SnapshotPausedVM) and verify the memory round-trips. The TAP
+// override mirrors RestoreSnapshot* so device restore succeeds.
+func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string) error {
+	// Empty, not nil — Firecracker rejects null. Only override the TAP when one
+	// is actually provided; a blank HostDevName is invalid.
+	overrides := []*models.NetworkOverride{}
+	if tapDevice != "" {
+		overrides = []*models.NetworkOverride{{IfaceID: &ifaceID, HostDevName: &tapDevice}}
+	}
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
+		Context: context.Background(),
+		Body: &models.SnapshotLoadParams{
+			SnapshotPath: &snapshotPath,
+			MemBackend: &models.MemoryBackend{
+				BackendType: strPtr(models.MemoryBackendBackendTypeFile),
+				BackendPath: &memPath,
+			},
+			ResumeVM:         false,
+			NetworkOverrides: overrides,
+			BlockDeltaDir:    blockDeltaDir,
+		},
+	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot (no-resume): %w: %v", ErrTornSnapshot, err)
+		}
+		return fmt.Errorf("load snapshot (no-resume): %w", err)
+	}
+	return nil
+}
+
+// SnapshotPausedVM creates a Full snapshot of an already-paused VM (e.g. one
+// loaded via LoadSnapshotNoResume), issuing no pause first as CreateSnapshot does.
+func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
+		Context: context.Background(),
+		Body: &models.SnapshotCreateParams{
+			SnapshotPath: &snapshotPath,
+			MemFilePath:  &memPath,
+			SnapshotType: models.SnapshotCreateParamsSnapshotTypeFull,
+		},
+	}); err != nil {
+		return fmt.Errorf("create snapshot (paused): %w", err)
+	}
+	return nil
+}
+
 // RestoreSnapshot loads a snapshot and resumes the VM. Non-empty blockDeltaDir
 // hydrates a fresh per-VM overlay from <dir>/<drive_id>.delta — pass empty
 // for in-place resume (existing overlay already carries state).

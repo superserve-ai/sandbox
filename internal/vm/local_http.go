@@ -31,6 +31,7 @@ func NewLocalHTTPServer(mgr *Manager, log zerolog.Logger) *LocalHTTPServer {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/instances/", s.handleInstance)
+	mux.HandleFunc("/verify-snapshot/", s.handleVerifySnapshot)
 	s.server = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -112,6 +113,43 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		OwnerID:   info.OwnerID,
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
+	}
+}
+
+// verifySnapshotResponse is the JSON shape returned by POST /verify-snapshot/{id}.
+type verifySnapshotResponse struct {
+	MemPath string `json:"mem_path"` // re-snapshotted image to compare against the original
+}
+
+// handleVerifySnapshot handles POST /verify-snapshot/{vmID}: re-snapshot the
+// frozen image and return its path for comparison. Internal/debug only.
+func (s *LocalHTTPServer) handleVerifySnapshot(w http.ResponseWriter, r *http.Request) {
+	if !s.mgr.cfg.VerifySnapshotEnabled {
+		http.Error(w, "verify-snapshot disabled", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	vmID := strings.TrimPrefix(r.URL.Path, "/verify-snapshot/")
+	if vmID == "" || strings.Contains(vmID, "/") {
+		http.Error(w, "missing vm ID", http.StatusBadRequest)
+		return
+	}
+
+	// Re-snapshotting a multi-GB image outlasts the default write timeout.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2 * time.Minute))
+
+	memPath, err := s.mgr.VerifySnapshot(r.Context(), vmID)
+	if err != nil {
+		s.log.Error().Err(err).Str("vm_id", vmID).Msg("verify snapshot failed")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(verifySnapshotResponse{MemPath: memPath}); err != nil {
+		s.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to encode verify response")
 	}
 }
 
