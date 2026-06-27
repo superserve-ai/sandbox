@@ -32,6 +32,7 @@ func NewLocalHTTPServer(mgr *Manager, log zerolog.Logger) *LocalHTTPServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/instances/", s.handleInstance)
 	mux.HandleFunc("/verify-snapshot/", s.handleVerifySnapshot)
+	mux.HandleFunc("/diff-equiv-check/", s.handleDiffEquivCheck)
 	s.server = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -150,6 +151,45 @@ func (s *LocalHTTPServer) handleVerifySnapshot(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(verifySnapshotResponse{MemPath: memPath}); err != nil {
 		s.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to encode verify response")
+	}
+}
+
+// diffEquivResponse is the JSON shape returned by POST /diff-equiv-check/{id}.
+type diffEquivResponse struct {
+	DiffPath string `json:"diff_path"` // base + dirty diff, merged
+	FullPath string `json:"full_path"` // full dump of the same frozen point
+}
+
+// handleDiffEquivCheck handles POST /diff-equiv-check/{vmID}: dump a Diff-merged
+// and a Full image of the same frozen point and return both for snapcheck (zero
+// differing pages ⇒ the Diff dirty-set is complete). Internal/debug only.
+func (s *LocalHTTPServer) handleDiffEquivCheck(w http.ResponseWriter, r *http.Request) {
+	if !s.mgr.cfg.DiffEquivEnabled {
+		http.Error(w, "diff-equiv-check disabled", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	vmID := strings.TrimPrefix(r.URL.Path, "/diff-equiv-check/")
+	if vmID == "" || strings.Contains(vmID, "/") {
+		http.Error(w, "missing vm ID", http.StatusBadRequest)
+		return
+	}
+
+	// Copying + dumping a multi-GB image outlasts the default write timeout.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(3 * time.Minute))
+
+	diffPath, fullPath, err := s.mgr.DiffEquivCheck(r.Context(), vmID)
+	if err != nil {
+		s.log.Error().Err(err).Str("vm_id", vmID).Msg("diff-equiv check failed")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(diffEquivResponse{DiffPath: diffPath, FullPath: fullPath}); err != nil {
+		s.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to encode diff-equiv response")
 	}
 }
 

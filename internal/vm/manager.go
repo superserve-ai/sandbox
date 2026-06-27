@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -158,6 +159,11 @@ type ManagerConfig struct {
 	// (re-snapshot a paused VM for bit-identical checks). Default false; intended
 	// for staging gate runs, not production.
 	VerifySnapshotEnabled bool
+
+	// DiffEquivEnabled arms dirty-page tracking on UFFD resume and exposes the
+	// debug POST /diff-equiv-check/{id} endpoint. Requires ResumeUffdEnabled.
+	// Default false; staging-only.
+	DiffEquivEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -702,8 +708,10 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath string, net
 
 	// No prefetch access log: only template builds record one (next to the template
 	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
+	// trackDirty arms dirty-page tracking so the diff-equiv check can take a Diff
+	// at the next pause; off by default (no overhead on the normal resume path).
 	return RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, "", "", "eth0", netInfo.TAPDevice, "",
+		socketPath, snapshotPath, memPath, "", "", "eth0", netInfo.TAPDevice, "", m.cfg.DiffEquivEnabled,
 	)
 }
 
@@ -778,6 +786,90 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 
 	log.Info().Str("mem_b", memBPath).Msg("verify snapshot: re-snapshotted frozen image")
 	return memBPath, nil
+}
+
+// DiffEquivCheck freezes a running, dirty-tracked UFFD-resumed VM once and dumps,
+// at that single frozen point, a Diff merged into a copy of the base and a fresh
+// Full, returning both paths. snapcheck of the two reports zero differing pages
+// iff the Diff dirty-set is complete. Non-destructive (the live VM is unpaused on
+// the way out); single-shot per resume, as the trailing Full resets the bitmap.
+func (m *Manager) DiffEquivCheck(ctx context.Context, vmID string) (diffPath, fullPath string, err error) {
+	log := m.log.With().Str("vm_id", vmID).Logger()
+
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return "", "", err
+	}
+	// Dirty tracking is only armed on resume when the flag is on; without it the
+	// Diff would be empty/meaningless, so refuse rather than report a false pass.
+	if !m.cfg.DiffEquivEnabled {
+		return "", "", status.Errorf(codes.FailedPrecondition, "diff-equiv check disabled")
+	}
+	if inst.Status != StatusRunning {
+		return "", "", status.Errorf(codes.FailedPrecondition,
+			"vm %s is not running (status %s); diff-equiv runs on a live resumed VM", vmID, inst.Status)
+	}
+	base := inst.MemFilePath
+	if base == "" || inst.SocketPath == "" {
+		return "", "", status.Errorf(codes.FailedPrecondition, "vm %s has no live snapshot/socket on record", vmID)
+	}
+
+	equivDir := filepath.Join(filepath.Dir(base), "equiv")
+	if err := os.MkdirAll(equivDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("mkdir equiv dir: %w", err)
+	}
+	diffPath = filepath.Join(equivDir, "mem_diff.snap")
+	fullPath = filepath.Join(equivDir, "mem_full.snap")
+
+	// The Diff merges into a copy of the exact base the VM resumed from, so
+	// base + dirty must reconstruct the live image. Copy before pausing — it's
+	// the largest step and the vCPUs need not be frozen for it.
+	if err := copyFile(base, diffPath); err != nil {
+		return "", "", fmt.Errorf("copy base for diff merge: %w", err)
+	}
+
+	if err := PauseVCPUs(inst.SocketPath); err != nil {
+		return "", "", err
+	}
+	// Best-effort unpause so the live VM keeps running even if a dump fails.
+	defer func() {
+		if uerr := UnpauseVM(inst.SocketPath); uerr != nil {
+			log.Error().Err(uerr).Msg("diff-equiv: failed to unpause live VM")
+			if err == nil {
+				err = uerr
+			}
+		}
+	}()
+
+	// Diff first (consumes the dirty bitmap), then Full (dumps everything; resets
+	// the bitmap). Order matters: a leading Full would clear the dirty set.
+	if err := SnapshotPausedVMDiff(inst.SocketPath, filepath.Join(equivDir, "vmstate_diff.snap"), diffPath); err != nil {
+		return "", "", err
+	}
+	if err := SnapshotPausedVM(inst.SocketPath, filepath.Join(equivDir, "vmstate_full.snap"), fullPath); err != nil {
+		return "", "", err
+	}
+
+	log.Info().Str("diff", diffPath).Str("full", fullPath).Msg("diff-equiv: dumped diff-merged + full")
+	return diffPath, fullPath, nil
+}
+
+// copyFile copies src to dst, overwriting dst.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,7 +1181,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			}
 		}
 		restoreErr = RestoreSnapshotUffdInternalWithOverrides(
-			socketPath, snapshotPath, memPath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir,
+			socketPath, snapshotPath, memPath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, false,
 		)
 	case inPlace:
 		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)

@@ -342,6 +342,36 @@ func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {
 	return nil
 }
 
+// SnapshotPausedVMDiff creates a Diff snapshot of an already-paused VM, merging
+// the dirty pages in place into memPath (which must already hold the base image
+// of the same size). Requires the VM to have been loaded with dirty tracking on.
+func SnapshotPausedVMDiff(socketPath, snapshotPath, memPath string) error {
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
+		Context: context.Background(),
+		Body: &models.SnapshotCreateParams{
+			SnapshotPath: &snapshotPath,
+			MemFilePath:  &memPath,
+			SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
+		},
+	}); err != nil {
+		return fmt.Errorf("create snapshot (diff, paused): %w", err)
+	}
+	return nil
+}
+
+// PauseVCPUs pauses a running VM's vCPUs without taking a snapshot. Inverse of UnpauseVM.
+func PauseVCPUs(socketPath string) error {
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
+		Context: context.Background(),
+		Body:    &models.VM{State: strPtr(models.VMStatePaused)},
+	}); err != nil {
+		return fmt.Errorf("pause vCPUs: %w", err)
+	}
+	return nil
+}
+
 // RestoreSnapshot loads a snapshot and resumes the VM. Non-empty blockDeltaDir
 // hydrates a fresh per-VM overlay from <dir>/<drive_id>.delta — pass empty
 // for in-place resume (existing overlay already carries state).
@@ -406,6 +436,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
+	trackDirty bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -421,7 +452,8 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				AccessLogPath: accessLogPath,
 				RecordTo:      recordToPath,
 			},
-			ResumeVM: true,
+			TrackDirtyPages: trackDirty,
+			ResumeVM:        true,
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},
