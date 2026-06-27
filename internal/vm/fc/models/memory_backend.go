@@ -26,6 +26,9 @@ type MemoryBackend struct {
 	// Enum: ["File","Uffd","UffdInternal"]
 	BackendType *string `json:"backend_type"`
 
+	// Optional base (template) memory file for a layered UffdInternal restore. When set, a page is served from backend_path if present there, else from this base. Only meaningful when backend_type is UffdInternal; ignored otherwise.
+	BasePath string `json:"base_path,omitempty"`
+
 	// Optional path to a recorded page-access trace replayed as prefetch on restore. Only meaningful when backend_type is UffdInternal; ignored otherwise.
 	AccessLogPath string `json:"access_log_path,omitempty"`
 

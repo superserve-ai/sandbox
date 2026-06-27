@@ -432,7 +432,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // page offset (template-build mode). When recordToPath is set, prefetch is
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
-	socketPath, snapshotPath, memPath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
+	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
 	trackDirty bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
@@ -444,8 +444,11 @@ func RestoreSnapshotUffdInternalWithOverrides(
 		Body: &models.SnapshotLoadParams{
 			SnapshotPath: &snapshotPath,
 			MemBackend: &models.MemoryBackend{
-				BackendType:   strPtr(models.MemoryBackendBackendTypeUffdInternal),
-				BackendPath:   &memPath,
+				BackendType: strPtr(models.MemoryBackendBackendTypeUffdInternal),
+				BackendPath: &memPath,
+				// Layered restore: pages absent from memPath (the overlay/diff) are
+				// served from this base (template). Empty ⇒ single-file restore.
+				BasePath:      basePath,
 				AccessLogPath: accessLogPath,
 				RecordTo:      recordToPath,
 			},
