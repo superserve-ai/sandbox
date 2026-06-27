@@ -148,6 +148,11 @@ type ManagerConfig struct {
 	// UffdRecordMaxSeconds caps how long RecordAccessPattern waits for the
 	// guest's fault rate to settle before giving up. 0 → 10s default.
 	UffdRecordMaxSeconds int
+
+	// ResumeUffdEnabled routes resume-from-pause through the UFFD backend
+	// instead of File, reusing the existing tap. Requires UffdEnabled;
+	// default false, with File as the fallback.
+	ResumeUffdEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -644,9 +649,12 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
+	var netInfo *network.VMNetInfo
 	if inst.Namespace != "" {
-		if _, err := m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
-			return nil, fmt.Errorf("ensure network slot for resume: %w", err)
+		var nsErr error
+		netInfo, nsErr = m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress)
+		if nsErr != nil {
+			return nil, fmt.Errorf("ensure network slot for resume: %w", nsErr)
 		}
 	}
 
@@ -656,7 +664,9 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	if err := RestoreSnapshot(socketPath, snapshotPath, memPath, ""); err != nil {
+	if err := m.restoreForResume(socketPath, snapshotPath, memPath, netInfo); err != nil {
+		// Firecracker is already running; stop the unit before returning or it leaks.
+		m.stopUnitDuringRestoreError(vmID)
 		if errors.Is(err, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
@@ -674,6 +684,22 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
 	return inst, nil
+}
+
+// restoreForResume picks the resume memory backend: UFFD (reusing the existing
+// tap for the interface override) when enabled and a tap is present, else File,
+// which is also the fallback when ResumeUffdEnabled is off.
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath string, netInfo *network.VMNetInfo) error {
+	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
+	if !useUffd {
+		return RestoreSnapshot(socketPath, snapshotPath, memPath, "")
+	}
+
+	// No prefetch access log: only template builds record one (next to the template
+	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
+	return RestoreSnapshotUffdInternalWithOverrides(
+		socketPath, snapshotPath, memPath, "", "", "eth0", netInfo.TAPDevice, "",
+	)
 }
 
 // ---------------------------------------------------------------------------
