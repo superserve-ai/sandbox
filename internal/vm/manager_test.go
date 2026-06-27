@@ -616,3 +616,27 @@ func TestWaitForSocketPolling_AppearsAfterStart(t *testing.T) {
 		t.Errorf("waitForSocketPolling: %v", err)
 	}
 }
+
+func TestShouldWriteDiff(t *testing.T) {
+	const base = "/snap/vm/mem.snap"
+	cases := []struct {
+		name                      string
+		incremental, dirtyTracked bool
+		memPath, resumeBase       string
+		baseExists                bool
+		want                      bool
+	}{
+		{"all conditions met", true, true, base, base, true, true},
+		{"feature off", false, true, base, base, true, false},
+		{"tracking not armed (e.g. cold create or non-incremental resume)", true, false, base, base, true, false},
+		{"different path than resume base (custom snapshot dir)", true, true, "/snap/vm/other.snap", base, true, false},
+		{"base file missing (first pause)", true, true, base, base, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldWriteDiff(c.incremental, c.dirtyTracked, c.memPath, c.resumeBase, c.baseExists); got != c.want {
+				t.Fatalf("shouldWriteDiff = %v, want %v", got, c.want)
+			}
+		})
+	}
+}

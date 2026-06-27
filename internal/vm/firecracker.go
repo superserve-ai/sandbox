@@ -280,6 +280,33 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 	return nil
 }
 
+// CreateDiffSnapshot pauses the VM and writes a Diff snapshot — the pages dirtied
+// since load, merged in place into memPath (which must already hold the base image
+// of the same size). Requires the VM to have been loaded with dirty tracking on.
+func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
+	fc := newFCClient(socketPath)
+	ctx := context.Background()
+
+	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
+		Context: ctx,
+		Body:    &models.VM{State: strPtr(models.VMStatePaused)},
+	}); err != nil {
+		return fmt.Errorf("pause VM: %w", err)
+	}
+
+	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
+		Context: ctx,
+		Body: &models.SnapshotCreateParams{
+			SnapshotPath: &snapshotPath,
+			MemFilePath:  &memPath,
+			SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
+		},
+	}); err != nil {
+		return fmt.Errorf("create diff snapshot: %w", err)
+	}
+	return nil
+}
+
 // UnpauseVM resumes a paused VM's vCPUs. Used after CreateSnapshot to make
 // snapshot creation non-destructive.
 func UnpauseVM(socketPath string) error {
@@ -406,6 +433,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
+	trackDirty bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -421,7 +449,10 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				AccessLogPath: accessLogPath,
 				RecordTo:      recordToPath,
 			},
-			ResumeVM: true,
+			// Arms dirty-page tracking so the next pause can write an incremental
+			// (Diff) snapshot instead of a Full one.
+			TrackDirtyPages: trackDirty,
+			ResumeVM:        true,
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},

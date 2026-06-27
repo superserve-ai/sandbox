@@ -98,6 +98,12 @@ type VMInstance struct {
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
 
+	// DirtyTracked is true when the current Firecracker run was loaded with
+	// dirty-page tracking armed (set on incremental UFFD resume). Gates whether
+	// the next pause may write a Diff snapshot. Not persisted: it describes the
+	// live FC process, which a fresh resume re-establishes.
+	DirtyTracked bool
+
 	mu sync.RWMutex
 }
 
@@ -158,6 +164,12 @@ type ManagerConfig struct {
 	// (re-snapshot a paused VM for bit-identical checks). Default false; intended
 	// for staging gate runs, not production.
 	VerifySnapshotEnabled bool
+
+	// IncrementalSnapshotEnabled makes a UFFD resume arm dirty-page tracking so the
+	// next pause writes an incremental (Diff) snapshot — only the dirtied pages,
+	// merged into the existing mem.snap — instead of a Full one. Requires
+	// ResumeUffdEnabled. Default false.
+	IncrementalSnapshotEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -566,9 +578,22 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
-	log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
-	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
-		return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+	// Diff merges into the same mem.snap the live UFFD handler faults from, but only
+	// at dirtied offsets — which are resident and never re-faulted, so disjoint from
+	// the clean offsets the handler reads. Safe while the VM is still up pre-stop.
+	useDiff := shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, inst.DirtyTracked,
+		memPath, inst.MemFilePath, fileExists(memPath))
+
+	if useDiff {
+		log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
+		if err := CreateDiffSnapshot(inst.SocketPath, snapshotPath, memPath); err != nil {
+			return "", "", m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
+		}
+	} else {
+		log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
+		if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+			return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+		}
 	}
 
 	// Stop the Firecracker process — snapshot is already on disk.
@@ -580,11 +605,26 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = memPath
+	inst.DirtyTracked = false // FC process is stopping; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
 
 	m.persistState(inst)
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, nil
+}
+
+// shouldWriteDiff reports whether a pause may write a Diff instead of a Full.
+// Diff is correct only when tracking was armed this run AND memPath is the exact
+// base this VM resumed from AND that base exists; any miss falls back to Full.
+// Diff onto a non-base or untracked run would silently corrupt the snapshot.
+func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeBasePath string, baseExists bool) bool {
+	return incremental && dirtyTracked && memPath == resumeBasePath && baseExists
+}
+
+// fileExists reports whether path exists and is a regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // ---------------------------------------------------------------------------
@@ -669,7 +709,8 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	if err := m.restoreForResume(socketPath, snapshotPath, memPath, netInfo); err != nil {
+	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, netInfo)
+	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
 		if errors.Is(err, ErrTornSnapshot) {
@@ -684,6 +725,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.PID = pid
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
+	inst.DirtyTracked = dirtyTracked
 	inst.mu.Unlock()
 
 	m.persistState(inst)
@@ -694,16 +736,20 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 // restoreForResume picks the resume memory backend: UFFD (reusing the existing
 // tap for the interface override) when enabled and a tap is present, else File,
 // which is also the fallback when ResumeUffdEnabled is off.
-func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath string, netInfo *network.VMNetInfo) error {
+// restoreForResume restores the VM and reports whether dirty-page tracking was
+// armed (true only on the incremental UFFD path) so the caller can decide if the
+// next pause may write a Diff.
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
-		return RestoreSnapshot(socketPath, snapshotPath, memPath, "")
+		return false, RestoreSnapshot(socketPath, snapshotPath, memPath, "")
 	}
 
 	// No prefetch access log: only template builds record one (next to the template
 	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
-	return RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, "", "", "eth0", netInfo.TAPDevice, "",
+	trackDirty := m.cfg.IncrementalSnapshotEnabled
+	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
+		socketPath, snapshotPath, memPath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
 	)
 }
 
@@ -1088,8 +1134,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				accessLogPath = candidate
 			}
 		}
+		// Cold create/restore from a template: no incremental tracking — the first
+		// pause writes a Full base. Tracking is armed only on a later resume.
 		restoreErr = RestoreSnapshotUffdInternalWithOverrides(
-			socketPath, snapshotPath, memPath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir,
+			socketPath, snapshotPath, memPath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, false,
 		)
 	case inPlace:
 		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
