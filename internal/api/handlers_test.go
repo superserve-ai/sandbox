@@ -792,6 +792,39 @@ func snapshotRow(s db.Snapshot) *mockRow {
 	}}
 }
 
+// beginResumeWithSnapshotRow mocks the claim+snapshot-join row: the 22 sandbox
+// columns (BeginResume RETURNING * order) followed by snap_path, snap_mem_path.
+func beginResumeWithSnapshotRow(s db.Sandbox, snap db.Snapshot) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = s.ID
+		*dest[1].(*uuid.UUID) = s.TeamID
+		*dest[2].(*string) = s.Name
+		*dest[3].(*db.SandboxStatus) = s.Status
+		*dest[4].(*int32) = s.VcpuCount
+		*dest[5].(*int32) = s.MemoryMib
+		*dest[6].(*string) = s.HostID
+		*dest[7].(**netip.Addr) = s.IpAddress
+		*dest[8].(**int32) = s.Pid
+		*dest[9].(*pgtype.UUID) = s.SnapshotID
+		*dest[10].(*time.Time) = s.CreatedAt
+		*dest[11].(*time.Time) = s.UpdatedAt
+		*dest[12].(*pgtype.Timestamptz) = s.DestroyedAt
+		*dest[13].(*[]byte) = s.NetworkConfig
+		*dest[14].(**int32) = s.TimeoutSeconds
+		*dest[15].(*[]byte) = s.Metadata
+		*dest[16].(*pgtype.UUID) = s.TemplateID
+		*dest[17].(**string) = s.SnapshotPath
+		*dest[18].(**string) = s.MemPath
+		*dest[19].(**string) = s.BasePath
+		*dest[20].(**string) = s.DeltaPath
+		*dest[21].(*int32) = s.DiskMib
+		snapPath := snap.Path
+		*dest[22].(**string) = &snapPath
+		*dest[23].(**string) = snap.MemPath
+		return nil
+	}}
+}
+
 // finalizePauseRow mocks the single-column RETURNING of FinalizePause.
 func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
@@ -862,7 +895,7 @@ func TestResumeSandbox_Success(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb) // BeginResume RETURNING *
+				return beginResumeWithSnapshotRow(sb, snap)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -920,7 +953,7 @@ func TestResumeSandbox_ReappliesSecretBindings(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return beginResumeWithSnapshotRow(sb, snap)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -1074,7 +1107,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return beginResumeWithSnapshotRow(sb, snap)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			default:
@@ -1133,7 +1166,7 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return beginResumeWithSnapshotRow(sb, snap)
 			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
@@ -1208,7 +1241,7 @@ func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return beginResumeWithSnapshotRow(sb, snap)
 			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
@@ -1306,7 +1339,7 @@ func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return beginResumeWithSnapshotRow(sb, snap)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -1418,7 +1451,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return beginResumeWithSnapshotRow(sb, snap)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):

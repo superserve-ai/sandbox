@@ -282,6 +282,31 @@ SET status = 'resuming', updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
 RETURNING *;
 
+-- name: BeginResumeWithSnapshot :one
+-- Same atomic paused→resuming claim as BeginResume, but also returns the
+-- snapshot's path/mem_path so resume needs one DB round trip instead of a
+-- follow-up GetSnapshot. The LEFT JOIN returns NULL snap_path when the
+-- snapshot is missing (rather than dropping the row, as an inner join would),
+-- so the caller still gets the claimed sandbox and can revert — matching the
+-- separate-query path, where a missing snapshot errors after the claim.
+WITH claimed AS (
+    UPDATE sandbox
+    SET status = 'resuming', updated_at = now()
+    WHERE sandbox.id = $1 AND sandbox.team_id = $2
+      AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+    RETURNING *
+)
+SELECT
+    claimed.id, claimed.team_id, claimed.name, claimed.status, claimed.vcpu_count,
+    claimed.memory_mib, claimed.host_id, claimed.ip_address, claimed.pid,
+    claimed.snapshot_id, claimed.created_at, claimed.updated_at, claimed.destroyed_at,
+    claimed.network_config, claimed.timeout_seconds, claimed.metadata, claimed.template_id,
+    claimed.snapshot_path, claimed.mem_path, claimed.base_path, claimed.delta_path,
+    claimed.disk_mib,
+    s.path AS snap_path, s.mem_path AS snap_mem_path
+FROM claimed
+LEFT JOIN snapshot s ON s.id = claimed.snapshot_id AND s.team_id = claimed.team_id;
+
 -- name: RevertResumeToPaused :exec
 -- Compensate a failed resume attempt by flipping status back to 'paused'.
 -- Guarded on status = 'resuming' so we never clobber a concurrent transition

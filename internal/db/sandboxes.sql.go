@@ -224,6 +224,96 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 	return i, err
 }
 
+const beginResumeWithSnapshot = `-- name: BeginResumeWithSnapshot :one
+WITH claimed AS (
+    UPDATE sandbox
+    SET status = 'resuming', updated_at = now()
+    WHERE sandbox.id = $1 AND sandbox.team_id = $2
+      AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+    RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib
+)
+SELECT
+    claimed.id, claimed.team_id, claimed.name, claimed.status, claimed.vcpu_count,
+    claimed.memory_mib, claimed.host_id, claimed.ip_address, claimed.pid,
+    claimed.snapshot_id, claimed.created_at, claimed.updated_at, claimed.destroyed_at,
+    claimed.network_config, claimed.timeout_seconds, claimed.metadata, claimed.template_id,
+    claimed.snapshot_path, claimed.mem_path, claimed.base_path, claimed.delta_path,
+    claimed.disk_mib,
+    s.path AS snap_path, s.mem_path AS snap_mem_path
+FROM claimed
+LEFT JOIN snapshot s ON s.id = claimed.snapshot_id AND s.team_id = claimed.team_id
+`
+
+type BeginResumeWithSnapshotParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+type BeginResumeWithSnapshotRow struct {
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Name           string             `json:"name"`
+	Status         SandboxStatus      `json:"status"`
+	VcpuCount      int32              `json:"vcpu_count"`
+	MemoryMib      int32              `json:"memory_mib"`
+	HostID         string             `json:"host_id"`
+	IpAddress      *netip.Addr        `json:"ip_address"`
+	Pid            *int32             `json:"pid"`
+	SnapshotID     pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	DestroyedAt    pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig  []byte             `json:"network_config"`
+	TimeoutSeconds *int32             `json:"timeout_seconds"`
+	Metadata       []byte             `json:"metadata"`
+	TemplateID     pgtype.UUID        `json:"template_id"`
+	SnapshotPath   *string            `json:"snapshot_path"`
+	MemPath        *string            `json:"mem_path"`
+	BasePath       *string            `json:"base_path"`
+	DeltaPath      *string            `json:"delta_path"`
+	DiskMib        int32              `json:"disk_mib"`
+	SnapPath       *string            `json:"snap_path"`
+	SnapMemPath    *string            `json:"snap_mem_path"`
+}
+
+// Same atomic paused→resuming claim as BeginResume, but also returns the
+// snapshot's path/mem_path so resume needs one DB round trip instead of a
+// follow-up GetSnapshot. The LEFT JOIN returns NULL snap_path when the
+// snapshot is missing (rather than dropping the row, as an inner join would),
+// so the caller still gets the claimed sandbox and can revert — matching the
+// separate-query path, where a missing snapshot errors after the claim.
+func (q *Queries) BeginResumeWithSnapshot(ctx context.Context, arg BeginResumeWithSnapshotParams) (BeginResumeWithSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, beginResumeWithSnapshot, arg.ID, arg.TeamID)
+	var i BeginResumeWithSnapshotRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.DiskMib,
+		&i.SnapPath,
+		&i.SnapMemPath,
+	)
+	return i, err
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH open_sessions AS (
   -- Current session start per sandbox: the open interval, computed once.

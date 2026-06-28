@@ -376,16 +376,16 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// under it, so across API instances a mutation can't read a stale 'paused' and
 	// land a binding this resume won't pick up. Once the claim flips status to
 	// 'resuming', those handlers see it under the lock and reject with 409.
-	claimResume := func(q *db.Queries) (db.Sandbox, error) {
+	claimResume := func(q *db.Queries) (db.BeginResumeWithSnapshotRow, error) {
 		if h.Pool != nil {
 			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), sandboxID.String()); lerr != nil {
-				return db.Sandbox{}, lerr
+				return db.BeginResumeWithSnapshotRow{}, lerr
 			}
 		}
-		return q.BeginResume(c.Request.Context(), db.BeginResumeParams{ID: sandboxID, TeamID: teamID})
+		return q.BeginResumeWithSnapshot(c.Request.Context(), db.BeginResumeWithSnapshotParams{ID: sandboxID, TeamID: teamID})
 	}
 	var (
-		claimed db.Sandbox
+		claimed db.BeginResumeWithSnapshotRow
 		err     error
 	)
 	if h.Pool == nil {
@@ -410,7 +410,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondError(c, ErrInternal)
 		return false
 	}
-	*sandbox = claimed
+	*sandbox = sandboxFromResumeRow(claimed)
 
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	revertToPaused := func() {
@@ -424,17 +424,16 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
-		ID:     sandbox.SnapshotID.Bytes,
-		TeamID: teamID,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
+	// The claim's LEFT JOIN already returned the snapshot paths. A NULL snap_path
+	// means the snapshot row is missing despite a set snapshot_id (corrupt state) —
+	// revert and surface as before, when GetSnapshot would have errored post-claim.
+	if claimed.SnapPath == nil {
+		log.Error().Str("sandbox_id", sandboxID.String()).Msg("resume: snapshot row missing for snapshot_id")
 		revertToPaused()
 		respondError(c, ErrInternal)
 		return false
 	}
-
+	snapshot := db.Snapshot{Path: *claimed.SnapPath, MemPath: claimed.SnapMemPath}
 	snapshotPath := snapshot.Path
 	memPath := resolveMemPath(snapshot)
 
@@ -597,6 +596,20 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
 	return true
+}
+
+// sandboxFromResumeRow projects the sandbox columns out of a
+// BeginResumeWithSnapshot row, which also carries the joined snapshot paths.
+func sandboxFromResumeRow(r db.BeginResumeWithSnapshotRow) db.Sandbox {
+	return db.Sandbox{
+		ID: r.ID, TeamID: r.TeamID, Name: r.Name, Status: r.Status,
+		VcpuCount: r.VcpuCount, MemoryMib: r.MemoryMib, HostID: r.HostID,
+		IpAddress: r.IpAddress, Pid: r.Pid, SnapshotID: r.SnapshotID,
+		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, DestroyedAt: r.DestroyedAt,
+		NetworkConfig: r.NetworkConfig, TimeoutSeconds: r.TimeoutSeconds, Metadata: r.Metadata,
+		TemplateID: r.TemplateID, SnapshotPath: r.SnapshotPath, MemPath: r.MemPath,
+		BasePath: r.BasePath, DeltaPath: r.DeltaPath, DiskMib: r.DiskMib,
+	}
 }
 
 // resolveMemPath returns the memory snapshot path from a Snapshot record.
