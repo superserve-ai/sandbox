@@ -1034,12 +1034,21 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		}
 	}
 
-	// Side-car (overlay-mode only). Missing is expected for legacy;
-	// any other error is logged — leftover side-cars caused fork bugs.
+	// Side-cars. Missing is expected for legacy; any other error is logged —
+	// leftover side-cars caused fork bugs. The .overlay record sits next to the
+	// vmstate snapshot; the layered .base record sits next to the mem overlay
+	// (mem.diff.base). A stray .base would make a later restore treat a
+	// non-layered mem file as a layered overlay, so it must go with the mem file.
 	if snapshotPath != "" {
 		sidecar := snapshotPath + ".overlay"
 		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
 			m.log.Warn().Err(err).Str("path", sidecar).Msg("remove overlay side-car")
+		}
+	}
+	if memPath != "" {
+		sidecar := layeredBaseSidecarPath(memPath)
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Str("path", sidecar).Msg("remove layered base side-car")
 		}
 	}
 

@@ -244,6 +244,30 @@ func TestDeleteSnapshotFiles_UnderVMDir_OK(t *testing.T) {
 	}
 }
 
+func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
+	root := t.TempDir()
+	vmID := "vm-abc"
+	snap := filepath.Join(root, vmID, "vmstate.snap")
+	mem := filepath.Join(root, vmID, "mem.diff")
+	overlay := snap + ".overlay"
+	base := layeredBaseSidecarPath(mem) // mem.diff.base
+	for _, p := range []string{snap, mem, overlay, base} {
+		writeFile(t, p)
+	}
+
+	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	if err := mgr.DeleteSnapshotFiles(vmID, snap, mem); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// A leftover sidecar would make a later restore mis-handle a non-layered
+	// mem file as a layered overlay — the fork-bug class both removals prevent.
+	for _, p := range []string{overlay, base} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("sidecar still exists: %s (%v)", p, err)
+		}
+	}
+}
+
 func TestDeleteSnapshotFiles_PathEqualSnapshotRoot_Rejected(t *testing.T) {
 	root := t.TempDir()
 	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}

@@ -280,9 +280,15 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 	return nil
 }
 
-// CreateDiffSnapshot pauses the VM and writes a Diff snapshot — the pages dirtied
-// since load, merged in place into memPath (which must already hold the base image
-// of the same size). Requires the VM to have been loaded with dirty tracking on.
+// CreateDiffSnapshot pauses the VM and writes a Diff snapshot: only the pages
+// dirtied since load, written at their offsets into memPath. Requires the VM to
+// have been loaded with dirty tracking on. Whether memPath ends up a complete
+// image or a sparse overlay is the caller's choice, set by what memPath holds
+// going in:
+//   - in-place merge: memPath already holds the base image (same size), so the
+//     dirty pages overwrite it and it stays a complete, standalone image.
+//   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
+//     changed pages — restored over a separate base, never loaded standalone.
 func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
