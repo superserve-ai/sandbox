@@ -330,6 +330,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 	if err != nil {
 		return nil
 	}
+	tGet := time.Now()
 	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
 		ID:     sandboxID,
 		TeamID: teamID,
@@ -343,6 +344,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 		}
 		return nil
 	}
+	log.Info().Str("sandbox_id", sandboxID.String()).Int64("getsandbox_us", time.Since(tGet).Microseconds()).Msg("PROBE activate GetSandbox")
 	switch sandbox.Status {
 	case db.SandboxStatusActive:
 		return &sandbox
@@ -364,6 +366,8 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 // after VMD resume succeeds, destroys the VM + reverts to paused.
 func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) bool {
 	sandboxID := sandbox.ID
+	tStart := time.Now()
+	tClaim, tSnap, tVmd, tNet, tSecret := tStart, tStart, tStart, tStart, tStart
 
 	if !sandbox.SnapshotID.Valid {
 		log.Error().Str("sandbox_id", sandboxID.String()).Msg("paused sandbox has no snapshot_id")
@@ -411,6 +415,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 	*sandbox = claimed
+	tClaim = time.Now()
 
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	revertToPaused := func() {
@@ -435,6 +440,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	tSnap = time.Now()
 	snapshotPath := snapshot.Path
 	memPath := resolveMemPath(snapshot)
 
@@ -489,6 +495,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return false
 		}
 	}
+
+	tVmd = time.Now()
 
 	// Older vmd builds may return 0 for vcpu/mem on both the Resume and
 	// Restore paths (ResourceLimits field was added later). Fall back to
@@ -556,6 +564,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	tNet = time.Now()
+
 	// Re-apply the current binding set before committing to 'active', so a secret
 	// attached or detached while paused takes effect — the snapshot froze the old
 	// JWT. Skipped when there are no bindings, keeping the secret-less resume a
@@ -575,6 +585,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
+	tSecret = time.Now()
+
 	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
 		ID:        sandboxID,
 		VcpuCount: int32(actualVcpu),
@@ -592,6 +604,18 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandbox.VcpuCount = int32(actualVcpu)
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
+
+	tActivate := time.Now()
+	log.Info().
+		Str("sandbox_id", sandboxID.String()).
+		Int64("claim_us", tClaim.Sub(tStart).Microseconds()).
+		Int64("getsnap_us", tSnap.Sub(tClaim).Microseconds()).
+		Int64("vmd_resume_us", tVmd.Sub(tSnap).Microseconds()).
+		Int64("net_us", tNet.Sub(tVmd).Microseconds()).
+		Int64("secrets_us", tSecret.Sub(tNet).Microseconds()).
+		Int64("activate_us", tActivate.Sub(tSecret).Microseconds()).
+		Int64("total_us", tActivate.Sub(tStart).Microseconds()).
+		Msg("PROBE resume step timings")
 
 	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
