@@ -825,15 +825,21 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	return inst, nil
 }
 
-// restoreForResume picks the resume memory backend: UFFD (reusing the existing
-// tap for the interface override) when enabled and a tap is present, else File,
-// which is also the fallback when ResumeUffdEnabled is off.
-// restoreForResume restores the VM and reports whether dirty-page tracking was
-// armed (true only on the incremental UFFD path) so the caller can decide if the
-// next pause may write a Diff.
+// restoreForResume picks the resume memory backend: UFFD (reusing the existing tap
+// for the interface override, optionally layered over basePath) when enabled and a
+// tap is present, else File. A layered overlay (basePath set) requires UFFD. Reports
+// whether dirty-page tracking was armed so the caller can decide if the next pause
+// may write a Diff.
 func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
+		// A layered overlay can only be served by the UFFD layered backend. If this
+		// host can't take that path (resume-UFFD/UFFD off, or no tap), refuse rather
+		// than load the sparse overlay via the File backend, which would read the
+		// base's pages as zero holes.
+		if basePath != "" {
+			return false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
+		}
 		return false, RestoreSnapshot(socketPath, snapshotPath, memPath, "")
 	}
 
