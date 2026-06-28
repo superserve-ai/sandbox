@@ -597,6 +597,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		if err := CreateDiffSnapshot(inst.SocketPath, snapshotPath, memPath); err != nil {
 			return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 		}
+		// Record the base on disk so a restore that only has the artifact (no
+		// BoltDB instance) can still resume this overlay layered.
+		if err := os.WriteFile(layeredBaseSidecarPath(memPath), []byte(baseMemPath), 0o644); err != nil {
+			log.Warn().Err(err).Msg("pause: failed to write layered base sidecar")
+		}
 	default:
 		memPath = filepath.Join(snapshotDir, "mem.snap")
 		// In-place diff (no template base): merge dirtied pages into the VM's own
@@ -639,6 +644,30 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 // Diff onto a non-base or untracked run would silently corrupt the snapshot.
 func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeBasePath string, baseExists bool) bool {
 	return incremental && dirtyTracked && memPath == resumeBasePath && baseExists
+}
+
+// layeredBaseSidecarPath is where the layered base (template) path is recorded
+// next to an overlay mem file, so a restore that has only the on-disk artifact
+// (no in-memory/BoltDB instance — e.g. a stateless RestoreVMSnapshot after host
+// loss) can still reconstruct the base instead of loading the sparse overlay
+// standalone (which would read the base's pages as zero holes).
+func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
+
+// readLayeredBase returns the recorded base for an overlay mem file and whether
+// the sidecar is present and non-empty.
+func readLayeredBase(memPath string) (string, bool) {
+	b, err := os.ReadFile(layeredBaseSidecarPath(memPath))
+	if err != nil {
+		return "", false
+	}
+	base := strings.TrimSpace(string(b))
+	return base, base != ""
+}
+
+// isOverlayMemFile reports whether memPath names a layered diff overlay (which
+// must be restored over a base, never standalone).
+func isOverlayMemFile(memPath string) bool {
+	return filepath.Base(memPath) == "mem.diff"
 }
 
 // fileExists reports whether path exists and is a regular file.
@@ -729,9 +758,21 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	// Layered resume: a non-empty BaseMemPath means memPath is a diff overlay to be
-	// served over this template base. Empty ⇒ memPath is a standalone image.
-	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, inst.BaseMemPath, netInfo)
+	// Layered resume: a non-empty base means memPath is a diff overlay to be served
+	// over that template base. Prefer the in-memory record; fall back to the on-disk
+	// sidecar so a layered overlay still resumes correctly if the instance record
+	// was lost. An overlay with no recoverable base must not be loaded standalone.
+	basePath := inst.BaseMemPath
+	if basePath == "" {
+		if b, ok := readLayeredBase(memPath); ok {
+			basePath = b
+		} else if isOverlayMemFile(memPath) {
+			m.stopUnitDuringRestoreError(vmID)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
+		}
+	}
+	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
 	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
@@ -753,6 +794,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// what Firecracker's dirty bitmap is relative to.
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = memPath
+	inst.BaseMemPath = basePath // re-cache (may have come from the on-disk sidecar)
 	inst.mu.Unlock()
 
 	m.persistState(inst)
@@ -1170,26 +1212,48 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				accessLogPath = candidate
 			}
 		}
-		// Layered incremental: creating from a template with incremental on arms
-		// tracking and records the template mem file as the base, so the first pause
-		// writes a small diff overlay vs the template. The load stays single-file;
-		// the base only matters on the next resume.
-		// Require resume-UFFD too: a layered pause writes mem.diff, which only
-		// resumes correctly via the UFFD layered backend. Without resume-UFFD the
-		// resume would fall back to the File backend and load the sparse diff as a
-		// full image, so don't arm layered tracking in that configuration.
+		// Decide the layered base for this UFFD restore:
+		//  - overlay (mem.diff) with a base sidecar → stateless resume of a layered
+		//    sandbox: reconstruct the base from disk and load layered.
+		//  - overlay with no recoverable base → refuse (loading the sparse diff
+		//    standalone would read the base's pages as zero holes).
+		//  - template create with incremental + resume-UFFD on → arm tracking and
+		//    record the template as the base; the load stays single-file (the base
+		//    only matters on the next resume).
+		// Require resume-UFFD for any layered path: only the UFFD layered backend can
+		// serve overlay-over-base.
 		_, tmplErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath)
-		layeredCreate := m.cfg.IncrementalSnapshotEnabled && m.cfg.ResumeUffdEnabled &&
-			m.cfg.UffdEnabled && recordToPath == "" && tmplErr == nil
-		if layeredCreate {
+		isTemplate := tmplErr == nil
+		sidecarBase, hasSidecar := readLayeredBase(memPath)
+		canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
+		basePath := ""
+		armLayered := false
+		switch {
+		case hasSidecar:
+			if !canLayered {
+				restoreErr = fmt.Errorf("layered overlay %q requires resume-UFFD to restore", memPath)
+			} else {
+				basePath = sidecarBase
+				armLayered = m.cfg.IncrementalSnapshotEnabled
+				inst.mu.Lock()
+				inst.BaseMemPath = sidecarBase
+				inst.DirtyTracked = armLayered
+				inst.mu.Unlock()
+			}
+		case isOverlayMemFile(memPath):
+			restoreErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
+		case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
+			armLayered = true
 			inst.mu.Lock()
 			inst.BaseMemPath = memPath // template mem file = the layered base
-			inst.DirtyTracked = true   // armed below, so the first pause writes a diff
+			inst.DirtyTracked = true
 			inst.mu.Unlock()
 		}
-		restoreErr = RestoreSnapshotUffdInternalWithOverrides(
-			socketPath, snapshotPath, memPath, "", accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, layeredCreate,
-		)
+		if restoreErr == nil {
+			restoreErr = RestoreSnapshotUffdInternalWithOverrides(
+				socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+			)
+		}
 	case inPlace:
 		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
 	default:
