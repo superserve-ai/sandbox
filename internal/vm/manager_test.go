@@ -244,6 +244,64 @@ func TestDeleteSnapshotFiles_UnderVMDir_OK(t *testing.T) {
 	}
 }
 
+func TestReadLayeredBase_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	mem := filepath.Join(dir, "mem.diff")
+	base := "/var/lib/sandbox/snapshots/templates/abc/build-1/mem.snap"
+
+	// Missing sidecar → not present.
+	if got, ok := readLayeredBase(mem); ok || got != "" {
+		t.Errorf("missing sidecar: got (%q,%v), want (\"\",false)", got, ok)
+	}
+
+	// Write via the canonical path, read back the exact base.
+	if err := os.WriteFile(layeredBaseSidecarPath(mem), []byte(base), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	if got, ok := readLayeredBase(mem); !ok || got != base {
+		t.Errorf("round-trip: got (%q,%v), want (%q,true)", got, ok, base)
+	}
+
+	// Empty sidecar → not present (a 0-byte record must not be trusted as a base).
+	if err := os.WriteFile(layeredBaseSidecarPath(mem), []byte("  \n"), 0o644); err != nil {
+		t.Fatalf("write empty sidecar: %v", err)
+	}
+	if got, ok := readLayeredBase(mem); ok || got != "" {
+		t.Errorf("empty sidecar: got (%q,%v), want (\"\",false)", got, ok)
+	}
+}
+
+func TestFreshenFirstPassOverlay(t *testing.T) {
+	dir := t.TempDir()
+
+	// Missing overlay → nil (the normal first-pause case).
+	if err := freshenFirstPassOverlay(filepath.Join(dir, "absent.diff")); err != nil {
+		t.Errorf("missing overlay: got %v, want nil", err)
+	}
+
+	// Existing overlay → removed, nil.
+	f := filepath.Join(dir, "mem.diff")
+	if err := os.WriteFile(f, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := freshenFirstPassOverlay(f); err != nil {
+		t.Errorf("existing overlay: got %v, want nil", err)
+	}
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Errorf("overlay not removed: %v", err)
+	}
+
+	// Un-removable overlay (non-empty dir stands in for any remove failure) → error,
+	// which drives the caller's fall-back-to-Full path.
+	stuck := filepath.Join(dir, "stuck.diff")
+	if err := os.MkdirAll(filepath.Join(stuck, "child"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := freshenFirstPassOverlay(stuck); err == nil {
+		t.Error("un-removable overlay: got nil, want error (so caller falls back to Full)")
+	}
+}
+
 func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	root := t.TempDir()
 	vmID := "vm-abc"
