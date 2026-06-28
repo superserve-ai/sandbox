@@ -455,7 +455,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
-	trackDirty bool,
+	trackDirty, abortOnHandlerDeath bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -470,9 +470,10 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				BackendPath: &memPath,
 				// Layered restore: pages absent from memPath (the overlay/diff) are
 				// served from this base (template). Empty ⇒ single-file restore.
-				BasePath:      basePath,
-				AccessLogPath: accessLogPath,
-				RecordTo:      recordToPath,
+				BasePath:            basePath,
+				AccessLogPath:       accessLogPath,
+				RecordTo:            recordToPath,
+				AbortOnHandlerDeath: abortOnHandlerDeath,
 			},
 			// Arms dirty-page tracking so the next pause can write an incremental
 			// (Diff) snapshot instead of a Full one.

@@ -176,6 +176,12 @@ type ManagerConfig struct {
 	// merged into the existing mem.snap — instead of a Full one. Requires
 	// ResumeUffdEnabled. Default false.
 	IncrementalSnapshotEnabled bool
+
+	// HandlerDeathAbortEnabled tells the in-process UFFD handler to abort Firecracker
+	// on an unexpected handler death (instead of letting the guest freeze on its next
+	// page fault). The dead VM then surfaces via the unit-inactive → reconciler path
+	// rather than hanging silently. Independent of the snapshot flags. Default false.
+	HandlerDeathAbortEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +909,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
 	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
 		socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+		m.cfg.HandlerDeathAbortEnabled,
 	)
 }
 
@@ -1356,6 +1363,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if restoreErr == nil {
 			restoreErr = RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+				m.cfg.HandlerDeathAbortEnabled,
 			)
 		}
 	case inPlace:

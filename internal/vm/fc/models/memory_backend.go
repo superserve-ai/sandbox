@@ -34,6 +34,9 @@ type MemoryBackend struct {
 
 	// Optional path the in-process UFFD handler writes each served page offset to (template-build mode). Only meaningful when backend_type is UffdInternal; ignored otherwise. When present, prefetch is suppressed.
 	RecordTo string `json:"record_to,omitempty"`
+
+	// When true, an unexpected UffdInternal handler death aborts Firecracker instead of leaving the guest to freeze on its next page fault. Only meaningful when backend_type is UffdInternal; ignored otherwise. Omitted (false) by default so the wire format is unchanged when off.
+	AbortOnHandlerDeath bool `json:"abort_on_handler_death,omitempty"`
 }
 
 // Validate validates this memory backend
