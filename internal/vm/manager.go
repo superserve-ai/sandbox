@@ -758,12 +758,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	// A base is needed only when memPath is itself a diff overlay; a standalone
-	// image (including an explicit override path) gets no base. Keying on memPath —
-	// not on the cached BaseMemPath — means a full-image resume clears any stale
-	// base below, so the next pause won't wrongly diff against the old template.
-	// For an overlay, prefer the in-memory base, fall back to the on-disk sidecar,
-	// and refuse rather than load a sparse overlay standalone.
+	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
+	// (not the cached BaseMemPath) means a standalone/override resume clears any
+	// stale base, so the next pause won't wrongly diff against the old template. For
+	// an overlay: in-memory base, then on-disk sidecar, else refuse.
 	basePath := ""
 	if isOverlayMemFile(memPath) {
 		basePath = inst.BaseMemPath
@@ -1223,16 +1221,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				accessLogPath = candidate
 			}
 		}
-		// Decide the layered base for this UFFD restore:
-		//  - overlay (mem.diff) with a base sidecar → stateless resume of a layered
-		//    sandbox: reconstruct the base from disk and load layered.
-		//  - overlay with no recoverable base → refuse (loading the sparse diff
-		//    standalone would read the base's pages as zero holes).
-		//  - template create with incremental + resume-UFFD on → arm tracking and
-		//    record the template as the base; the load stays single-file (the base
-		//    only matters on the next resume).
-		// Require resume-UFFD for any layered path: only the UFFD layered backend can
-		// serve overlay-over-base.
+		// Decide the layered base for this UFFD restore. An overlay (mem.diff) needs
+		// its base reconstructed from the sidecar (else refuse — loading it
+		// standalone reads the base as zero holes); a template create instead arms
+		// tracking and records the template as the base. Layered needs resume-UFFD.
 		_, tmplErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath)
 		isTemplate := tmplErr == nil
 		sidecarBase, hasSidecar := readLayeredBase(memPath)
