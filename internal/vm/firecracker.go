@@ -31,6 +31,22 @@ func isTornSnapshotErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
 }
 
+// ErrLayeredInvalidSnapshot is the firecracker fork's sentinel for a structurally
+// invalid layered restore (overlay/base size mismatch, huge-page overlay, block
+// size > page size, missing base). It is permanent — retrying or falling back to a
+// standalone load of the overlay won't help (the latter would read base pages as
+// zero holes), so the caller must use a Full/previous snapshot instead.
+var ErrLayeredInvalidSnapshot = errors.New("layered restore overlay/base pairing is invalid")
+
+// layeredInvalidMarker is the exact substring the forked Firecracker embeds in its
+// error for an invalid layered restore (the GuestMemoryFromUffdError::LayeredInvalid
+// display text). Named so a fork message change is updated here, not missed at runtime.
+const layeredInvalidMarker = "overlay/base pairing is invalid"
+
+func isLayeredInvalidErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), layeredInvalidMarker)
+}
+
 // ---------------------------------------------------------------------------
 // Firecracker config (our internal type, not a Firecracker API type)
 // ---------------------------------------------------------------------------
@@ -470,6 +486,9 @@ func RestoreSnapshotUffdInternalWithOverrides(
 	}); err != nil {
 		if isTornSnapshotErr(err) {
 			return fmt.Errorf("load snapshot (uffd-internal): %w: %v", ErrTornSnapshot, err)
+		}
+		if isLayeredInvalidErr(err) {
+			return fmt.Errorf("load snapshot (uffd-internal): %w: %v", ErrLayeredInvalidSnapshot, err)
 		}
 		return fmt.Errorf("load snapshot (uffd-internal): %w", err)
 	}

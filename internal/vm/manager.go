@@ -850,6 +850,14 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
 				snapshotPath, err)
 		}
+		if errors.Is(err, ErrLayeredInvalidSnapshot) {
+			// Permanent: the overlay/base pairing is structurally invalid, so retrying
+			// the layered restore can't succeed. FailedPrecondition tells the caller not
+			// to retry (vs the generic Internal below, which it may).
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
+				snapshotPath, err)
+		}
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
@@ -1372,6 +1380,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if errors.Is(restoreErr, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
+				snapshotPath, restoreErr)
+		}
+		if errors.Is(restoreErr, ErrLayeredInvalidSnapshot) {
+			// Permanent: the overlay/base pairing is structurally invalid, so retrying
+			// the layered restore can't succeed. FailedPrecondition tells the caller not
+			// to retry (vs the generic Internal below, which it may).
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
 				snapshotPath, restoreErr)
 		}
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)

@@ -2,6 +2,7 @@ package vm
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -139,4 +140,25 @@ func waitForUnixSocket(t *testing.T, socketPath string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("server at %s never became ready", socketPath)
+}
+
+// TestIsLayeredInvalidErr guards the cross-repo string coupling: the matcher must
+// recognize the forked Firecracker's LayeredInvalid display text (and not generic
+// errors). If the fork changes that message, this test fails instead of the
+// classification silently degrading to a retryable Internal error at runtime.
+func TestIsLayeredInvalidErr(t *testing.T) {
+	// Representative of the full Display chain Firecracker surfaces on the API error.
+	fcErr := fmt.Errorf("load snapshot (uffd-internal): [PUT /snapshot/load][400] " +
+		"Error creating guest memory from uffd: Layered restore " +
+		"overlay/base pairing is invalid (permanent — do not retry): " +
+		"base \"/t/mem.base\" is 1048576 bytes, smaller than guest RAM 2097152")
+	if !isLayeredInvalidErr(fcErr) {
+		t.Errorf("isLayeredInvalidErr = false, want true for %q", fcErr)
+	}
+	if isLayeredInvalidErr(fmt.Errorf("load snapshot: connection refused")) {
+		t.Error("isLayeredInvalidErr = true for an unrelated error, want false")
+	}
+	if isLayeredInvalidErr(nil) {
+		t.Error("isLayeredInvalidErr(nil) = true, want false")
+	}
 }
