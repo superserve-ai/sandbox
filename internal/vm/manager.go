@@ -802,13 +802,18 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
 	// (not the cached BaseMemPath) means a standalone/override resume clears any
-	// stale base, so the next pause won't wrongly diff against the old template. For
-	// an overlay: in-memory base, then on-disk sidecar, else refuse.
+	// stale base, so the next pause won't wrongly diff against the old template.
+	//
+	// The .base sidecar is authoritative for THIS overlay, so prefer it — the cached
+	// BaseMemPath only matches the cached overlay (inst.MemFilePath) and would supply
+	// the wrong base for an explicit override of a different mem.diff. Fall back to
+	// the cached base only when the sidecar is missing and this is the cached overlay.
 	basePath := ""
 	if isOverlayMemFile(memPath) {
-		basePath = inst.BaseMemPath
-		if basePath == "" {
-			basePath, _ = readLayeredBase(memPath)
+		if b, ok := readLayeredBase(memPath); ok {
+			basePath = b
+		} else if memPath == inst.MemFilePath {
+			basePath = inst.BaseMemPath
 		}
 		if basePath == "" {
 			m.stopUnitDuringRestoreError(vmID)
