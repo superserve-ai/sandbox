@@ -587,11 +587,19 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// (mem.diff) holding only the pages changed vs its template base. The base is a
 	// distinct file from the overlay, so the merge never touches the template the
 	// handler still faults from; resume loads overlay+base lazily.
-	layered := m.cfg.IncrementalSnapshotEnabled && inst.DirtyTracked && inst.BaseMemPath != ""
+	//
+	// Only layer when this overlay is the one the VM accumulates into: the first
+	// pause after a template create (resumed from the base directly), or a later
+	// pause writing the exact overlay the VM resumed from. Otherwise (custom dir,
+	// explicit-override resume) the diff would capture only this run's changes and
+	// drop the prior overlay's pages, so fall back to a Full (complete) image.
+	overlayPath := filepath.Join(snapshotDir, "mem.diff")
+	layered := m.cfg.IncrementalSnapshotEnabled && inst.DirtyTracked && inst.BaseMemPath != "" &&
+		(inst.MemFilePath == inst.BaseMemPath || overlayPath == inst.MemFilePath)
 	baseMemPath := ""
 	switch {
 	case layered:
-		memPath = filepath.Join(snapshotDir, "mem.diff")
+		memPath = overlayPath
 		baseMemPath = inst.BaseMemPath
 		log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
 		if err := CreateDiffSnapshot(inst.SocketPath, snapshotPath, memPath); err != nil {
