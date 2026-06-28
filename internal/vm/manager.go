@@ -1003,17 +1003,19 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
 
-	if err := UnpauseVM(inst.SocketPath); err != nil {
-		return snapshotPath, memPath, fmt.Errorf("resume after snapshot: %w", err)
-	}
-
 	// This Full snapshot reset Firecracker's dirty bitmap, so the diff baseline
-	// relative to the resume base is gone. Force the next pause back to Full — a
-	// Diff now would miss pages dirtied between resume and this ad-hoc snapshot.
+	// relative to the resume base is gone. Clear the flag now — before the unpause,
+	// which can fail and return early — so a later pause can't take the Diff path
+	// against the stale baseline and miss pages dirtied between resume and this
+	// ad-hoc snapshot. Forces the next pause back to Full.
 	inst.mu.Lock()
 	inst.DirtyTracked = false
 	inst.mu.Unlock()
 	m.persistState(inst)
+
+	if err := UnpauseVM(inst.SocketPath); err != nil {
+		return snapshotPath, memPath, fmt.Errorf("resume after snapshot: %w", err)
+	}
 
 	return snapshotPath, memPath, nil
 }
