@@ -758,15 +758,19 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	// Layered resume: a non-empty base means memPath is a diff overlay to be served
-	// over that template base. Prefer the in-memory record; fall back to the on-disk
-	// sidecar so a layered overlay still resumes correctly if the instance record
-	// was lost. An overlay with no recoverable base must not be loaded standalone.
-	basePath := inst.BaseMemPath
-	if basePath == "" {
-		if b, ok := readLayeredBase(memPath); ok {
-			basePath = b
-		} else if isOverlayMemFile(memPath) {
+	// A base is needed only when memPath is itself a diff overlay; a standalone
+	// image (including an explicit override path) gets no base. Keying on memPath —
+	// not on the cached BaseMemPath — means a full-image resume clears any stale
+	// base below, so the next pause won't wrongly diff against the old template.
+	// For an overlay, prefer the in-memory base, fall back to the on-disk sidecar,
+	// and refuse rather than load a sparse overlay standalone.
+	basePath := ""
+	if isOverlayMemFile(memPath) {
+		basePath = inst.BaseMemPath
+		if basePath == "" {
+			basePath, _ = readLayeredBase(memPath)
+		}
+		if basePath == "" {
 			m.stopUnitDuringRestoreError(vmID)
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
@@ -842,6 +846,13 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	snapshotPath, memPath := inst.SnapshotPath, inst.MemFilePath
 	if snapshotPath == "" || memPath == "" {
 		return "", status.Errorf(codes.InvalidArgument, "vm %s has no snapshot on record", vmID)
+	}
+	// This gate loads via the File backend (no base), so it can only verify a
+	// standalone image. A layered diff overlay would load with its base's pages as
+	// zero holes and produce a meaningless comparison — refuse instead.
+	if isOverlayMemFile(memPath) || inst.BaseMemPath != "" {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"vm %s is a layered (diff-overlay) snapshot; the verify gate only supports standalone images", vmID)
 	}
 	if _, err := os.Stat(memPath); err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "mem file missing on host: %s", memPath)
