@@ -748,6 +748,11 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
 	inst.DirtyTracked = dirtyTracked
+	// Record the file actually resumed from (callers may pass an explicit path
+	// that differs from the cached one) so the next pause's diff baseline matches
+	// what Firecracker's dirty bitmap is relative to.
+	inst.SnapshotPath = snapshotPath
+	inst.MemFilePath = memPath
 	inst.mu.Unlock()
 
 	m.persistState(inst)
@@ -877,6 +882,14 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	if err := UnpauseVM(inst.SocketPath); err != nil {
 		return snapshotPath, memPath, fmt.Errorf("resume after snapshot: %w", err)
 	}
+
+	// This Full snapshot reset Firecracker's dirty bitmap, so the diff baseline
+	// relative to the resume base is gone. Force the next pause back to Full — a
+	// Diff now would miss pages dirtied between resume and this ad-hoc snapshot.
+	inst.mu.Lock()
+	inst.DirtyTracked = false
+	inst.mu.Unlock()
+	m.persistState(inst)
 
 	return snapshotPath, memPath, nil
 }
@@ -1161,8 +1174,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// tracking and records the template mem file as the base, so the first pause
 		// writes a small diff overlay vs the template. The load stays single-file;
 		// the base only matters on the next resume.
+		// Require resume-UFFD too: a layered pause writes mem.diff, which only
+		// resumes correctly via the UFFD layered backend. Without resume-UFFD the
+		// resume would fall back to the File backend and load the sparse diff as a
+		// full image, so don't arm layered tracking in that configuration.
 		_, tmplErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath)
-		layeredCreate := m.cfg.IncrementalSnapshotEnabled && recordToPath == "" && tmplErr == nil
+		layeredCreate := m.cfg.IncrementalSnapshotEnabled && m.cfg.ResumeUffdEnabled &&
+			m.cfg.UffdEnabled && recordToPath == "" && tmplErr == nil
 		if layeredCreate {
 			inst.mu.Lock()
 			inst.BaseMemPath = memPath // template mem file = the layered base
