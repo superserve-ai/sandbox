@@ -615,20 +615,40 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	case layered:
 		memPath = overlayPath
 		baseMemPath = instBaseMem
+		// A first layered pass (VM loaded straight from the template base, not from
+		// this overlay) must start from a fresh overlay: its dirty set is the whole
+		// overlay, so any leftover mem.diff from a failed/un-finalized earlier pause
+		// would survive as stale page extents — CreateDiffSnapshot writes only
+		// dirtied pages in place and never truncates — and override the base on the
+		// next layered restore, corrupting guest memory. Remove it; if it can't be
+		// removed, fall back to Full. An accumulating pass (resumed from this same
+		// overlay) must instead keep it, so this only runs for the first pass.
+		usable := true
+		if instMemFile == instBaseMem {
+			if rerr := os.Remove(overlayPath); rerr != nil && !os.IsNotExist(rerr) {
+				log.Warn().Err(rerr).Str("path", overlayPath).Msg("pause: stale overlay removal failed; falling back to Full")
+				usable = false
+			}
+		}
 		// Write the base sidecar BEFORE the diff so an overlay never exists on disk
 		// without its base record (a stateless cross-host restore relies on it). If
 		// the sidecar can't be written, fall back to a Full rather than produce an
 		// unrecoverable overlay.
-		if serr := os.WriteFile(layeredBaseSidecarPath(memPath), []byte(baseMemPath), 0o644); serr != nil {
-			log.Warn().Err(serr).Msg("pause: layered base sidecar write failed; falling back to Full")
-			memPath, baseMemPath = fullPath, ""
-			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
-				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+		if usable {
+			if serr := os.WriteFile(layeredBaseSidecarPath(memPath), []byte(baseMemPath), 0o644); serr != nil {
+				log.Warn().Err(serr).Msg("pause: layered base sidecar write failed; falling back to Full")
+				usable = false
 			}
-		} else {
+		}
+		if usable {
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
+			}
+		} else {
+			memPath, baseMemPath = fullPath, ""
+			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
 		}
 	default:
