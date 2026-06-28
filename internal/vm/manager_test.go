@@ -640,3 +640,29 @@ func TestShouldWriteDiff(t *testing.T) {
 		})
 	}
 }
+
+func TestIsTemplateMemPath(t *testing.T) {
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: "/var/lib/sandbox/snapshots"}}
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"flat template", "/var/lib/sandbox/snapshots/templates/abc/mem.snap", true},
+		{"build-nested template", "/var/lib/sandbox/snapshots/templates/abc/build-abc/mem.snap", true},
+		{"paused sandbox (not template)", "/var/lib/sandbox/snapshots/vm123/mem.snap", false},
+		{"layered overlay of a sandbox", "/var/lib/sandbox/snapshots/vm123/mem.diff", false},
+		{"empty", "", false},
+		{"templates substring elsewhere", "/var/lib/sandbox/snapshots/vm-templates-x/mem.snap", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := m.isTemplateMemPath(c.path); got != c.want {
+				t.Fatalf("isTemplateMemPath(%q) = %v, want %v", c.path, got, c.want)
+			}
+		})
+	}
+	if isOverlayMemFile("/x/mem.diff") != true || isOverlayMemFile("/x/mem.snap") != false {
+		t.Fatal("isOverlayMemFile basename detection wrong")
+	}
+}

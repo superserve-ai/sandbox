@@ -670,6 +670,19 @@ func isOverlayMemFile(memPath string) bool {
 	return filepath.Base(memPath) == "mem.diff"
 }
 
+// isTemplateMemPath reports whether memPath is an immutable template memory
+// artifact (under <SnapshotDir>/templates/...), making it a valid layered base.
+// Covers both system and user-built templates and any nesting (e.g. the
+// build-<id> subdir the build pipeline writes), unlike the strict-shape
+// templateRootfsForSnapshot used for legacy disk resolution.
+func (m *Manager) isTemplateMemPath(memPath string) bool {
+	if m.cfg.SnapshotDir == "" || memPath == "" {
+		return false
+	}
+	root := filepath.Clean(filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)) + string(filepath.Separator)
+	return strings.HasPrefix(filepath.Clean(memPath), root)
+}
+
 // fileExists reports whether path exists and is a regular file.
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
@@ -1225,8 +1238,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// its base reconstructed from the sidecar (else refuse — loading it
 		// standalone reads the base as zero holes); a template create instead arms
 		// tracking and records the template as the base. Layered needs resume-UFFD.
-		_, tmplErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath)
-		isTemplate := tmplErr == nil
+		isTemplate := m.isTemplateMemPath(memPath)
 		sidecarBase, hasSidecar := readLayeredBase(memPath)
 		canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
 		basePath := ""
