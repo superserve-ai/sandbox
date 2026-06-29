@@ -115,6 +115,8 @@ paths:
                 $ref: "#/components/schemas/BillingPricingResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "503":
@@ -125,6 +127,197 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/members:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: listTeamMembers
+      tags: [RBAC]
+      summary: List team members
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Team members
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamMembersResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: addTeamMember
+      tags: [RBAC]
+      summary: Add or invite a team member
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                user_id:
+                  type: string
+                  format: uuid
+                status:
+                  type: string
+                  enum: [active, invited]
+              required: [user_id]
+      responses:
+        "201":
+          description: Member added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamMembershipMutationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /teams/{team_id}/members/{user_id}:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      operationId: deactivateTeamMember
+      tags: [RBAC]
+      summary: Deactivate a team member
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Member deactivated
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /teams/{team_id}/roles:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: listTeamRoleAssignments
+      tags: [RBAC]
+      summary: List team role assignments
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Team role assignments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamRoleAssignmentsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: assignTeamRole
+      tags: [RBAC]
+      summary: Assign a team role
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                user_id:
+                  type: string
+                  format: uuid
+                role_name:
+                  type: string
+              required: [user_id, role_name]
+      responses:
+        "201":
+          description: Role assigned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamRoleAssignment"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /teams/{team_id}/roles/{assignment_id}:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: assignment_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      operationId: revokeTeamRole
+      tags: [RBAC]
+      summary: Revoke a team role
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Role revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /sandboxes:
     get:
@@ -2389,6 +2582,109 @@ components:
           type: string
           format: date-time
 
+    TeamMember:
+      type: object
+      required: [user_id, email, status, created_at, updated_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [active, invited, inactive]
+        roles:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    TeamMembersResponse:
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/TeamMember"
+
+    TeamMembershipMutationResponse:
+      type: object
+      required: [team_id, user_id, status, action, platform]
+      properties:
+        team_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [active, invited]
+        action:
+          type: string
+          enum: [added]
+        platform:
+          type: boolean
+
+    TeamRoleAssignment:
+      type: object
+      required: [assignment_id, user_id, email, role_name, scope_type, team_id, granted_at, created_at, updated_at]
+      properties:
+        assignment_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role_name:
+          type: string
+        scope_type:
+          type: string
+          enum: [team]
+        team_id:
+          type: string
+          format: uuid
+        granted_by:
+          type: string
+          format: uuid
+          nullable: true
+        granted_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    TeamRoleAssignmentsResponse:
+      type: object
+      required: [assignments]
+      properties:
+        assignments:
+          type: array
+          items:
+            $ref: "#/components/schemas/TeamRoleAssignment"
+
     Error:
       type: object
       description: |
@@ -2417,6 +2713,12 @@ components:
             $ref: "#/components/schemas/Error"
     Unauthorized:
       description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Caller is authenticated but not allowed to perform the action
       content:
         application/json:
           schema:

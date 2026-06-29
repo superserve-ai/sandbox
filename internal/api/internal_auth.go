@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // InternalAuth returns middleware that authenticates internal API requests
@@ -37,6 +38,21 @@ func InternalAuth() gin.HandlerFunc {
 			return
 		}
 
+		c.Next()
+	}
+}
+
+// InternalActorFromHeader records an actor UUID from the X-Actor-User-Id
+// header when internal handlers need to attribute an action. The header is
+// optional so read-only internal endpoints can continue to work without it.
+func InternalActorFromHeader() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw := strings.TrimSpace(c.GetHeader("X-Actor-User-Id"))
+		if raw != "" {
+			if id, err := uuid.Parse(raw); err == nil {
+				c.Set("actor_id", id)
+			}
+		}
 		c.Next()
 	}
 }

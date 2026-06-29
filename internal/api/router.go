@@ -74,6 +74,14 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)
 
 		api.GET("/billing/pricing", h.GetBillingPricing)
+
+		// RBAC Phase 2b customer-facing team management.
+		api.GET("/teams/:team_id/members", h.ListTeamMembers)
+		api.POST("/teams/:team_id/members", h.AddTeamMember)
+		api.DELETE("/teams/:team_id/members/:user_id", h.DeactivateTeamMember)
+		api.GET("/teams/:team_id/roles", h.ListTeamRoleAssignments)
+		api.POST("/teams/:team_id/roles", h.AssignTeamRole)
+		api.DELETE("/teams/:team_id/roles/:assignment_id", h.RevokeTeamRole)
 	}
 
 	r.GET("/health", h.Health)
@@ -86,13 +94,22 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// middleware; if INTERNAL_API_TOKEN is unset, the middleware rejects
 	// all requests (fail-closed).
 	internal := r.Group("/internal")
-	internal.Use(InternalAuth())
+	internal.Use(InternalAuth(), InternalActorFromHeader())
 	{
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
 		internal.POST("/secrets/decrypt", h.DecryptSecret)
 		internal.GET("/jwks", h.JWKS)
 		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)
 		internal.GET("/sandboxes/:sandbox_id/egress_rules", h.GetSandboxEgressRules)
+
+		// RBAC Phase 2b platform recovery and internal team administration.
+		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)
+		internal.POST("/teams/:team_id/members", h.AddPlatformTeamMember)
+		internal.DELETE("/teams/:team_id/members/:user_id", h.DeactivatePlatformTeamMember)
+		internal.GET("/teams/:team_id/roles", h.ListPlatformTeamRoleAssignments)
+		internal.POST("/teams/:team_id/roles", h.AssignPlatformTeamRole)
+		internal.DELETE("/teams/:team_id/roles/:assignment_id", h.RevokePlatformTeamRole)
+		internal.POST("/teams/:team_id/recover", h.RecoverTeam)
 	}
 
 	return r

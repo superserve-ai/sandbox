@@ -22,6 +22,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/secrets"
@@ -96,6 +97,13 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 		DB:     queries,
 		Config: cfg,
 	}
+}
+
+func (h *Handlers) authzService() *authz.Service {
+	if h == nil || h.Pool == nil {
+		return nil
+	}
+	return authz.New(h.Pool)
 }
 
 // vmdForHost returns the VMDClient for the given host. When a registry is
