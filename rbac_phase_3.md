@@ -29,6 +29,16 @@
 - `users:read` / `users:write`:
   - reserved for Phase 2 user and role management APIs, not sandbox lifecycle control
 
+## Access Matrix Decision
+
+Phase 3 intentionally uses `settings:*` as the customer-facing resource-management permission family for sandboxes, templates, secrets, secret audit, and sandbox network logs. This keeps the rollout small and matches the predefined Phase 1 roles, but it has important visible behavior:
+
+- `billing_admin` and `user_admin` do not receive `settings:read`, so they cannot list or inspect sandbox, template, or secret surfaces unless they are also granted a settings-capable role.
+- `viewer` receives `settings:read`, so viewers can read sandbox/template metadata, secret metadata, secret audit usage, sandbox secret bindings, and sandbox network logs.
+- Viewers cannot receive sandbox access tokens from sandbox detail responses and cannot call write paths that create, mutate, resume, pause, or delete resources.
+
+If the product needs narrower visibility later, split `settings:*` into resource-specific permissions such as `sandboxes:*`, `templates:*`, and `secrets:*` in a follow-up phase instead of changing this rollout in place.
+
 ## Notes
 
 - Keys without a creator are denied on protected endpoints because the RBAC layer cannot verify the actor.
