@@ -231,6 +231,11 @@ func (h *Handlers) GetTeamManagement(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	if !caps.CanViewRoleAssignments {
+		for i := range members {
+			members[i].Roles = nil
+		}
+	}
 
 	assignments := make([]roleAssignmentResponse, 0)
 	if caps.CanViewRoleAssignments {
