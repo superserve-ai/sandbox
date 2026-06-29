@@ -1082,6 +1082,7 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 
 	ctx := c.Request.Context()
 	var assignment roleAssignmentRecord
+	var assignmentEmail string
 	err = h.withRBACMutation(ctx, func(q db.DBTX, svc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
@@ -1124,11 +1125,13 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 			return err
 		}
 		if err := q.QueryRow(ctx, `
-			SELECT ura.id, ura.user_id, ura.role_id, r.name, ura.team_id, ura.granted_by, ura.granted_at,
+			SELECT ura.id, ura.user_id, p.email, ura.role_id, r.name, ura.team_id, ura.granted_by, ura.granted_at,
 			       ura.revoked_at, ura.created_at, ura.updated_at
 			FROM user_role_assignments ura
 			JOIN roles r
 			  ON r.id = ura.role_id
+			JOIN profile p
+			  ON p.id = ura.user_id
 			WHERE ura.user_id = $1
 			  AND ura.role_id = $2
 			  AND ura.team_id = $3
@@ -1139,6 +1142,7 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 		`, targetUserID, roleID, teamID).Scan(
 			&assignment.ID,
 			&assignment.UserID,
+			&assignmentEmail,
 			&assignment.RoleID,
 			&assignment.RoleName,
 			&assignment.TeamID,
@@ -1166,6 +1170,10 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 			respondError(c, ErrConflict)
 			return
 		}
+		if errors.Is(err, authz.ErrPermissionDenied) || errors.Is(err, authz.ErrScopeMismatch) {
+			respondError(c, ErrForbidden)
+			return
+		}
 		if errors.Is(err, errMembershipNotActive) {
 			respondErrorMsg(c, "conflict", errMembershipNotActive.Error(), http.StatusConflict)
 			return
@@ -1178,6 +1186,7 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 	c.JSON(http.StatusCreated, gin.H{
 		"assignment_id": assignment.ID.String(),
 		"user_id":       assignment.UserID.String(),
+		"email":         assignmentEmail,
 		"role_name":     assignment.RoleName,
 		"scope_type":    "team",
 		"team_id":       assignment.TeamID.String(),
@@ -1303,6 +1312,10 @@ func (h *Handlers) revokeRole(c *gin.Context, platform bool) {
 		}
 		if errors.Is(err, ErrConflict) {
 			respondError(c, ErrConflict)
+			return
+		}
+		if errors.Is(err, authz.ErrPermissionDenied) || errors.Is(err, authz.ErrScopeMismatch) {
+			respondError(c, ErrForbidden)
 			return
 		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Str("assignment_id", assignmentID.String()).Msg("RBAC revoke role failed")
@@ -1453,6 +1466,10 @@ func (h *Handlers) recoverTeam(c *gin.Context) {
 		}
 		if errors.Is(err, ErrConflict) {
 			respondError(c, ErrConflict)
+			return
+		}
+		if errors.Is(err, authz.ErrPermissionDenied) || errors.Is(err, authz.ErrScopeMismatch) {
+			respondError(c, ErrForbidden)
 			return
 		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Str("user_id", targetUserID.String()).Msg("RBAC recover team failed")

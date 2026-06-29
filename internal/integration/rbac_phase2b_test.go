@@ -309,6 +309,13 @@ func TestRbacPhase2bTeamRoleManagement(t *testing.T) {
 	if assignW.Code != http.StatusCreated {
 		t.Fatalf("assign role: %d %s", assignW.Code, assignW.Body.String())
 	}
+	var assignBody map[string]any
+	if err := json.Unmarshal(assignW.Body.Bytes(), &assignBody); err != nil {
+		t.Fatalf("parse assign response: %v", err)
+	}
+	if email, ok := assignBody["email"].(string); !ok || email == "" {
+		t.Fatalf("assign response email = %#v, want non-empty string", assignBody["email"])
+	}
 	assignmentID := teamRoleAssignmentID(t, ctx, teamID, targetID, "team_admin")
 
 	listW := do(r, "GET", "/teams/"+teamID.String()+"/roles", apiKey, "")
