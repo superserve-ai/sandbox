@@ -38,4 +38,5 @@ The response includes:
 
 ## OpenAPI
 
-The new customer route should be added to `api/openapi.yaml` with the Phase 4 response shape before merge. This environment could not clone the repository or safely regenerate the full large OpenAPI file locally; the implementation and tests are committed on the Phase 4 branch for review.
+- `GET /teams/:team_id/management` is documented in `api/openapi.yaml`.
+- The documented response shape is `TeamManagementResponse`. this endpoint should stay customer-facing only. Do not add `/internal/teams/{team_id}/management`.
