@@ -613,6 +613,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && instBaseMem != "" &&
 		(instMemFile == instBaseMem || overlayPath == instMemFile)
 	baseMemPath := ""
+	// pause-flush instrumentation: time the snapshot write (the inline pause cost the
+	// caller blocks on) and, after, record the bytes actually written. Used to size the
+	// §2.5 sync-vs-async threshold and to tell whether large diffs are slow in practice.
+	tSnap := time.Now()
+	snapType := "full"
 	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
@@ -647,6 +652,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 		}
 		if usable {
+			snapType = "layered-diff"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
 				// A failed diff may have left a partial overlay. Drop the .base sidecar
@@ -659,6 +665,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 			}
 		} else {
+			snapType = "full-fallback"
 			memPath, baseMemPath = fullPath, ""
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
@@ -670,6 +677,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// mem.snap when tracking was armed this run and mem.snap is the resume base —
 		// dirtied offsets are resident/never re-faulted, disjoint from clean reads.
 		if shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, dirtyTracked, memPath, instMemFile, fileExists(memPath)) {
+			snapType = "in-place-diff"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
@@ -681,6 +689,20 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 		}
 	}
+
+	// pause-flush metric: how long the snapshot write blocked (flush_ms) and the bytes
+	// it actually allocated on disk (alloc_bytes ≈ the diff for a sparse mem.diff; the
+	// full image for an in-place/Full mem.snap). apparent_bytes is the logical size.
+	// This is the §2.5 signal — a large alloc_bytes with a high flush_ms is the case the
+	// async path would address.
+	flushMs := time.Since(tSnap).Milliseconds()
+	log.Info().
+		Str("snap_type", snapType).
+		Str("mem_file", filepath.Base(memPath)).
+		Int64("flush_ms", flushMs).
+		Int64("alloc_bytes", allocatedBytes(memPath)).
+		Int64("apparent_bytes", apparentBytes(memPath)).
+		Msg("pause flush metric")
 
 	// Stop the Firecracker process — snapshot is already on disk.
 	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
@@ -763,6 +785,29 @@ func (m *Manager) isTemplateMemPath(memPath string) bool {
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
+}
+
+// allocatedBytes returns the on-disk space the file actually occupies (st_blocks ×
+// 512), i.e. `du` semantics. For a sparse mem.diff this is the dirty bytes written;
+// for a full mem.snap it is the whole image. 0 on error. Used by the pause-flush metric.
+func allocatedBytes(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Blocks * 512
+	}
+	return 0
+}
+
+// apparentBytes returns the file's logical size (the `ls -l` size), 0 on error.
+func apparentBytes(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // ---------------------------------------------------------------------------
