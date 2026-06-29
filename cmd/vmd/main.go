@@ -358,6 +358,7 @@ func main() {
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
+	layerAppendEnabled := envOrDefault("VMD_LAYER_APPEND", "false") == "true"
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:             cfg.FirecrackerBin,
@@ -377,6 +378,7 @@ func main() {
 		VerifySnapshotEnabled:      verifySnapshotEnabled,
 		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
 		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
+		LayerAppendEnabled:         layerAppendEnabled,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

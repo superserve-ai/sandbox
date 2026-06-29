@@ -182,6 +182,15 @@ type ManagerConfig struct {
 	// page fault). The dead VM then surfaces via the unit-inactive → reconciler path
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
+
+	// LayerAppendEnabled makes a layered pause append a new immutable diff layer
+	// (recorded in a per-sandbox manifest) instead of merging the diff in place into
+	// a single mem.diff. Restore then loads base → diff₁ → … → diffₙ via the layered
+	// chain. This is the on-disk foundation the async/durable pause path needs (an
+	// in-place merge has no surviving copy if a write is interrupted). Requires
+	// IncrementalSnapshotEnabled + ResumeUffdEnabled and an FC binary that accepts
+	// lower_overlay_paths. Default false.
+	LayerAppendEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -613,11 +622,53 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && instBaseMem != "" &&
 		(instMemFile == instBaseMem || overlayPath == instMemFile)
 	baseMemPath := ""
+	// Append-only layered: when enabled, a layered pause appends a NEW immutable diff
+	// layer and republishes the manifest, instead of merging in place. The committed
+	// manifest is the durability anchor — an interrupted layer write leaves the prior
+	// chain intact and resumable. This is the on-disk foundation the async/durable
+	// pause path needs. When disabled, the in-place paths below run unchanged.
+	appendBase, appendManifest, appendOK := m.planLayerAppend(snapshotDir, dirtyTracked, instBaseMem, instMemFile)
 	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
 	// diff is the durability-boundary work, intentionally out of scope here.
 	switch {
+	case appendOK:
+		// Append the next layer to a fresh, dedicated file; the manifest records the
+		// ordered chain. CreateDiffSnapshot writes only this run's dirtied pages (a
+		// sparse layer), so the file is self-contained as one chain link.
+		newIndex := len(appendManifest.Overlays)
+		layerName := overlayLayerName(newIndex)
+		layerPath := filepath.Join(snapshotDir, layerName)
+		memPath = layerPath
+		baseMemPath = appendBase
+		// A leftover file at this index (a failed prior attempt) would survive as
+		// stale page extents over the chain — CreateDiffSnapshot writes only dirtied
+		// pages and never truncates. Start fresh; if it can't be removed, fall back to
+		// Full rather than diff onto stale data.
+		if rerr := os.Remove(layerPath); rerr != nil && !os.IsNotExist(rerr) {
+			log.Warn().Err(rerr).Str("path", layerPath).Msg("pause: stale layer removal failed; falling back to Full")
+			memPath, baseMemPath = fullPath, ""
+			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+			}
+			break
+		}
+		log.Info().Str("snapshot_path", snapshotPath).Int("layer", newIndex).Msg("pausing VM — appending layered diff snapshot")
+		if err := CreateDiffSnapshot(socketPath, snapshotPath, layerPath); err != nil {
+			// Leave the partial layer orphaned and do NOT republish the manifest — the
+			// previously committed chain stays intact and resumable. Drop the orphan so
+			// the next attempt at this index starts clean.
+			_ = os.Remove(layerPath)
+			return "", "", m.handleVMError(vmID, fmt.Errorf("append layered diff snapshot: %w", err))
+		}
+		// Commit point: republish the manifest with the new layer appended (atomic
+		// temp-write + rename). Until this lands, restore loads the prior chain.
+		appendManifest.Overlays = append(appendManifest.Overlays, layerName)
+		if err := writeManifestAtomic(snapshotDir, appendManifest); err != nil {
+			_ = os.Remove(layerPath)
+			return "", "", m.handleVMError(vmID, fmt.Errorf("publish snapshot manifest: %w", err))
+		}
 	case layered:
 		memPath = overlayPath
 		baseMemPath = instBaseMem
@@ -717,6 +768,39 @@ func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeMemPath stri
 // standalone (which would read the base's pages as zero holes).
 func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
 
+// planLayerAppend decides whether this pause may append a new immutable diff layer
+// to the sandbox's chain, returning the base and the manifest to extend. ok is
+// false (caller falls back to the in-place/Full paths) unless append is enabled,
+// dirty tracking is armed, and the VM resumed from a recognized chain position:
+// either straight from the template base (the first layer) or from the manifest's
+// newest overlay (an accumulating layer). Any other resume source (explicit
+// override, standalone mem file) would make this diff capture only part of the
+// state, so it falls back.
+func (m *Manager) planLayerAppend(snapshotDir string, dirtyTracked bool, instBaseMem, instMemFile string) (base string, manifest *snapshotManifest, ok bool) {
+	if !(m.cfg.LayerAppendEnabled && m.cfg.IncrementalSnapshotEnabled && dirtyTracked) {
+		return "", nil, false
+	}
+	man, err := readManifest(snapshotDir)
+	if err != nil {
+		// An unreadable manifest must not be silently overwritten — falling back to a
+		// Full snapshot is safe and preserves whatever chain is on disk.
+		return "", nil, false
+	}
+	if man != nil && len(man.Overlays) > 0 {
+		// Accumulating: the VM must have resumed from the chain's newest overlay.
+		newest := filepath.Join(snapshotDir, man.Overlays[len(man.Overlays)-1])
+		if instMemFile != newest {
+			return "", nil, false
+		}
+		return man.Base, man, true
+	}
+	// First layer: the VM loaded straight from the read-only template base.
+	if instBaseMem == "" || instMemFile != instBaseMem {
+		return "", nil, false
+	}
+	return instBaseMem, &snapshotManifest{Base: instBaseMem}, true
+}
+
 // freshenFirstPassOverlay removes any leftover overlay so a first layered pass starts
 // from a clean file (its dirty set is the whole overlay, so a stale one would leave
 // non-dirtied stale pages that override the base on restore). A missing overlay is the
@@ -788,6 +872,24 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
 	}
 
+	// Layered chain (append-only path): if a manifest is present, it is authoritative
+	// for the base + ordered overlay chain. Resolve it here (before starting FC) so a
+	// corrupt/empty manifest fails fast, and so the file checks below validate the
+	// chain's newest overlay. basePath drives the layered restore; an absent manifest
+	// leaves it "" and falls through to the legacy single-overlay resolution below.
+	basePath := ""
+	var lowerOverlays []string
+	snapshotDir := filepath.Dir(memPath)
+	if man, merr := readManifest(snapshotDir); merr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "unreadable snapshot manifest in %s: %v", snapshotDir, merr)
+	} else if man != nil {
+		base, lower, newest, ok := man.chainPaths(snapshotDir)
+		if !ok {
+			return nil, status.Errorf(codes.FailedPrecondition, "snapshot manifest in %s has no overlays", snapshotDir)
+		}
+		basePath, lowerOverlays, memPath = base, lower, newest
+	}
+
 	// Verify the snapshot files actually exist on disk. DB can claim
 	// "ready" but the files be missing — common scenarios:
 	//   - vmd host replaced; new host has no cached snapshots
@@ -847,16 +949,17 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
-	// (not the cached BaseMemPath) means a standalone/override resume clears any
-	// stale base, so the next pause won't wrongly diff against the old template.
+	// Legacy single-overlay resolution — only when the manifest above didn't already
+	// supply a base. A base is needed only when memPath is itself a diff overlay.
+	// Keying on memPath (not the cached BaseMemPath) means a standalone/override
+	// resume clears any stale base, so the next pause won't wrongly diff against the
+	// old template.
 	//
 	// The .base sidecar is authoritative for THIS overlay, so prefer it — the cached
 	// BaseMemPath only matches the cached overlay (inst.MemFilePath) and would supply
 	// the wrong base for an explicit override of a different mem.diff. Fall back to
 	// the cached base only when the sidecar is missing and this is the cached overlay.
-	basePath := ""
-	if isOverlayMemFile(memPath) {
+	if basePath == "" && isOverlayMemFile(memPath) {
 		if b, ok := readLayeredBase(memPath); ok {
 			basePath = b
 		} else if memPath == inst.MemFilePath {
@@ -868,7 +971,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
 		}
 	}
-	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, lowerOverlays, netInfo)
 	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
@@ -907,18 +1010,19 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 }
 
 // restoreForResume picks the resume memory backend: UFFD (reusing the existing tap
-// for the interface override, optionally layered over basePath) when enabled and a
-// tap is present, else File. A layered overlay (basePath set) requires UFFD. Reports
-// whether dirty-page tracking was armed so the caller can decide if the next pause
-// may write a Diff.
-func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error) {
+// for the interface override, optionally layered over basePath + lowerOverlays)
+// when enabled and a tap is present, else File. A layered restore (basePath set,
+// memPath the newest overlay, lowerOverlays the intermediate diffs oldest→newest)
+// requires UFFD. Reports whether dirty-page tracking was armed so the caller can
+// decide if the next pause may write a Diff.
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, lowerOverlays []string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
 		// A layered overlay can only be served by the UFFD layered backend. If this
 		// host can't take that path (resume-UFFD/UFFD off, or no tap), refuse rather
 		// than load the sparse overlay via the File backend, which would read the
 		// base's pages as zero holes.
-		if basePath != "" {
+		if basePath != "" || len(lowerOverlays) > 0 {
 			return false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
 		}
 		return false, RestoreSnapshot(socketPath, snapshotPath, memPath, "")
@@ -926,10 +1030,11 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 
 	// No prefetch access log: only template builds record one (next to the template
 	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
-	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
+	// basePath non-empty ⇒ layered restore: memPath is the newest overlay, served over
+	// lowerOverlays (oldest→newest) then basePath.
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
 	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, basePath, nil, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+		socketPath, snapshotPath, memPath, basePath, lowerOverlays, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
 		m.cfg.HandlerDeathAbortEnabled,
 	)
 }
@@ -1107,6 +1212,24 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		sidecar := layeredBaseSidecarPath(memPath)
 		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
 			m.log.Warn().Err(err).Str("path", sidecar).Msg("remove layered base side-car")
+		}
+		// Append-only chain: the manifest names overlay layers that aren't passed in
+		// memPath (only the newest is). Remove every layer it lists, plus the manifest
+		// and any uncommitted .next, so no orphaned diff bodies leak. The base is a
+		// shared template image and is never removed here.
+		memDir := filepath.Dir(memPath)
+		if man, err := readManifest(memDir); err == nil && man != nil {
+			for _, name := range man.Overlays {
+				p := filepath.Join(memDir, name)
+				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+					m.log.Warn().Err(err).Str("path", p).Msg("remove chain overlay layer")
+				}
+			}
+		}
+		for _, p := range []string{manifestPath(memDir), manifestPath(memDir) + ".next"} {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				m.log.Warn().Err(err).Str("path", p).Msg("remove snapshot manifest")
+			}
 		}
 	}
 
