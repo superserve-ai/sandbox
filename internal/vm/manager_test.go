@@ -244,6 +244,88 @@ func TestDeleteSnapshotFiles_UnderVMDir_OK(t *testing.T) {
 	}
 }
 
+func TestReadLayeredBase_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	mem := filepath.Join(dir, "mem.diff")
+	base := "/var/lib/sandbox/snapshots/templates/abc/build-1/mem.snap"
+
+	// Missing sidecar → not present.
+	if got, ok := readLayeredBase(mem); ok || got != "" {
+		t.Errorf("missing sidecar: got (%q,%v), want (\"\",false)", got, ok)
+	}
+
+	// Write via the canonical path, read back the exact base.
+	if err := os.WriteFile(layeredBaseSidecarPath(mem), []byte(base), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	if got, ok := readLayeredBase(mem); !ok || got != base {
+		t.Errorf("round-trip: got (%q,%v), want (%q,true)", got, ok, base)
+	}
+
+	// Empty sidecar → not present (a 0-byte record must not be trusted as a base).
+	if err := os.WriteFile(layeredBaseSidecarPath(mem), []byte("  \n"), 0o644); err != nil {
+		t.Fatalf("write empty sidecar: %v", err)
+	}
+	if got, ok := readLayeredBase(mem); ok || got != "" {
+		t.Errorf("empty sidecar: got (%q,%v), want (\"\",false)", got, ok)
+	}
+}
+
+func TestFreshenFirstPassOverlay(t *testing.T) {
+	dir := t.TempDir()
+
+	// Missing overlay → nil (the normal first-pause case).
+	if err := freshenFirstPassOverlay(filepath.Join(dir, "absent.diff")); err != nil {
+		t.Errorf("missing overlay: got %v, want nil", err)
+	}
+
+	// Existing overlay → removed, nil.
+	f := filepath.Join(dir, "mem.diff")
+	if err := os.WriteFile(f, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := freshenFirstPassOverlay(f); err != nil {
+		t.Errorf("existing overlay: got %v, want nil", err)
+	}
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Errorf("overlay not removed: %v", err)
+	}
+
+	// Un-removable overlay (non-empty dir stands in for any remove failure) → error,
+	// which drives the caller's fall-back-to-Full path.
+	stuck := filepath.Join(dir, "stuck.diff")
+	if err := os.MkdirAll(filepath.Join(stuck, "child"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := freshenFirstPassOverlay(stuck); err == nil {
+		t.Error("un-removable overlay: got nil, want error (so caller falls back to Full)")
+	}
+}
+
+func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
+	root := t.TempDir()
+	vmID := "vm-abc"
+	snap := filepath.Join(root, vmID, "vmstate.snap")
+	mem := filepath.Join(root, vmID, "mem.diff")
+	overlay := snap + ".overlay"
+	base := layeredBaseSidecarPath(mem) // mem.diff.base
+	for _, p := range []string{snap, mem, overlay, base} {
+		writeFile(t, p)
+	}
+
+	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	if err := mgr.DeleteSnapshotFiles(vmID, snap, mem); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// A leftover sidecar would make a later restore mis-handle a non-layered
+	// mem file as a layered overlay — the fork-bug class both removals prevent.
+	for _, p := range []string{overlay, base} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("sidecar still exists: %s (%v)", p, err)
+		}
+	}
+}
+
 func TestDeleteSnapshotFiles_PathEqualSnapshotRoot_Rejected(t *testing.T) {
 	root := t.TempDir()
 	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
@@ -614,5 +696,55 @@ func TestWaitForSocketPolling_AppearsAfterStart(t *testing.T) {
 	}()
 	if err := waitForSocketPolling(path, time.Second); err != nil {
 		t.Errorf("waitForSocketPolling: %v", err)
+	}
+}
+
+func TestShouldWriteDiff(t *testing.T) {
+	const base = "/snap/vm/mem.snap"
+	cases := []struct {
+		name                      string
+		incremental, dirtyTracked bool
+		memPath, resumeBase       string
+		baseExists                bool
+		want                      bool
+	}{
+		{"all conditions met", true, true, base, base, true, true},
+		{"feature off", false, true, base, base, true, false},
+		{"tracking not armed (e.g. cold create or non-incremental resume)", true, false, base, base, true, false},
+		{"different path than resume base (custom snapshot dir)", true, true, "/snap/vm/other.snap", base, true, false},
+		{"base file missing (first pause)", true, true, base, base, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldWriteDiff(c.incremental, c.dirtyTracked, c.memPath, c.resumeBase, c.baseExists); got != c.want {
+				t.Fatalf("shouldWriteDiff = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsTemplateMemPath(t *testing.T) {
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: "/var/lib/sandbox/snapshots"}}
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"flat template", "/var/lib/sandbox/snapshots/templates/abc/mem.snap", true},
+		{"build-nested template", "/var/lib/sandbox/snapshots/templates/abc/build-abc/mem.snap", true},
+		{"paused sandbox (not template)", "/var/lib/sandbox/snapshots/vm123/mem.snap", false},
+		{"layered overlay of a sandbox", "/var/lib/sandbox/snapshots/vm123/mem.diff", false},
+		{"empty", "", false},
+		{"templates substring elsewhere", "/var/lib/sandbox/snapshots/vm-templates-x/mem.snap", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := m.isTemplateMemPath(c.path); got != c.want {
+				t.Fatalf("isTemplateMemPath(%q) = %v, want %v", c.path, got, c.want)
+			}
+		})
+	}
+	if isOverlayMemFile("/x/mem.diff") != true || isOverlayMemFile("/x/mem.snap") != false {
+		t.Fatal("isOverlayMemFile basename detection wrong")
 	}
 }

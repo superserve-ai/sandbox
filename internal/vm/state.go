@@ -20,23 +20,28 @@ var bucketName = []byte("vms")
 // It contains everything VMD needs to reconstruct its in-memory map on
 // startup and reattach to a live Firecracker process.
 type VMRecord struct {
-	ID           string            `json:"id"`
-	PID          int               `json:"pid"`
-	SocketPath   string            `json:"socket_path"`
-	VsockPath    string            `json:"vsock_path,omitempty"`
-	IP           string            `json:"ip"`
-	TAPDevice    string            `json:"tap_device"`
-	MACAddress   string            `json:"mac_address"`
-	Status       VMStatus          `json:"status"`
-	RunDirID     string            `json:"rundir_id"`
-	Namespace    string            `json:"namespace"`
-	DiskPath     string            `json:"disk_path"`
-	SnapshotPath string            `json:"snapshot_path,omitempty"`
-	MemFilePath  string            `json:"mem_file_path,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
-	VCPU         uint32            `json:"vcpu"`
-	MemoryMiB    uint32            `json:"memory_mib"`
+	ID           string   `json:"id"`
+	PID          int      `json:"pid"`
+	SocketPath   string   `json:"socket_path"`
+	VsockPath    string   `json:"vsock_path,omitempty"`
+	IP           string   `json:"ip"`
+	TAPDevice    string   `json:"tap_device"`
+	MACAddress   string   `json:"mac_address"`
+	Status       VMStatus `json:"status"`
+	RunDirID     string   `json:"rundir_id"`
+	Namespace    string   `json:"namespace"`
+	DiskPath     string   `json:"disk_path"`
+	SnapshotPath string   `json:"snapshot_path,omitempty"`
+	MemFilePath  string   `json:"mem_file_path,omitempty"`
+	// Persisted so a layered (diff-overlay) sandbox resumes correctly after a vmd
+	// restart: non-empty means MemFilePath is an overlay to be served over this
+	// base. Without it, resume would load the overlay standalone and read the
+	// base's pages as zero holes.
+	BaseMemPath string            `json:"base_mem_path,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	VCPU        uint32            `json:"vcpu"`
+	MemoryMiB   uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -160,6 +165,7 @@ func toRecord(inst *VMInstance) VMRecord {
 		DiskPath:     inst.DiskPath,
 		SnapshotPath: inst.SnapshotPath,
 		MemFilePath:  inst.MemFilePath,
+		BaseMemPath:  inst.BaseMemPath,
 		CreatedAt:    inst.CreatedAt,
 		Metadata:     inst.Metadata,
 		VCPU:         inst.Config.VCPU,
@@ -186,6 +192,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		DiskPath:     rec.DiskPath,
 		SnapshotPath: rec.SnapshotPath,
 		MemFilePath:  rec.MemFilePath,
+		BaseMemPath:  rec.BaseMemPath,
 		CreatedAt:    rec.CreatedAt,
 		Metadata:     rec.Metadata,
 		TeamID:       rec.TeamID,

@@ -98,6 +98,18 @@ type VMInstance struct {
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
 
+	// BaseMemPath is the immutable base (template) memory file for a layered
+	// snapshot. Set at create-from-template; non-empty ⇒ this VM's pauses write a
+	// Diff overlay (mem.diff) against this base, and resume loads layered
+	// (overlay + base). Cleared when a pause falls back to a standalone Full.
+	BaseMemPath string
+
+	// DirtyTracked is true when the current Firecracker run was loaded with
+	// dirty-page tracking armed (set on incremental UFFD resume). Gates whether
+	// the next pause may write a Diff snapshot. Not persisted: it describes the
+	// live FC process, which a fresh resume re-establishes.
+	DirtyTracked bool
+
 	mu sync.RWMutex
 }
 
@@ -158,6 +170,18 @@ type ManagerConfig struct {
 	// (re-snapshot a paused VM for bit-identical checks). Default false; intended
 	// for staging gate runs, not production.
 	VerifySnapshotEnabled bool
+
+	// IncrementalSnapshotEnabled makes a UFFD resume arm dirty-page tracking so the
+	// next pause writes an incremental (Diff) snapshot — only the dirtied pages,
+	// merged into the existing mem.snap — instead of a Full one. Requires
+	// ResumeUffdEnabled. Default false.
+	IncrementalSnapshotEnabled bool
+
+	// HandlerDeathAbortEnabled tells the in-process UFFD handler to abort Firecracker
+	// on an unexpected handler death (instead of letting the guest freeze on its next
+	// page fault). The dead VM then surfaces via the unit-inactive → reconciler path
+	// rather than hanging silently. Independent of the snapshot flags. Default false.
+	HandlerDeathAbortEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -564,11 +588,98 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	}
 
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
-	memPath = filepath.Join(snapshotDir, "mem.snap")
 
-	log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
-	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
-		return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+	// Read the fields that select Full vs in-place-diff vs layered together under the
+	// lock, so the decision can't see a torn mix written by a concurrent resume.
+	inst.mu.RLock()
+	socketPath := inst.SocketPath
+	dirtyTracked := inst.DirtyTracked
+	instBaseMem := inst.BaseMemPath
+	instMemFile := inst.MemFilePath
+	inst.mu.RUnlock()
+
+	// Layered incremental: a template-created, dirty-tracked VM writes a diff overlay
+	// (mem.diff) holding only the pages changed vs its template base. The base is a
+	// distinct file from the overlay, so the merge never touches the template the
+	// handler still faults from; resume loads overlay+base lazily.
+	//
+	// Only layer when this overlay is the one the VM accumulates into: the first
+	// pause after a template create (resumed from the base directly), or a later
+	// pause writing the exact overlay the VM resumed from. Otherwise (custom dir,
+	// explicit-override resume) the diff would capture only this run's changes and
+	// drop the prior overlay's pages, so fall back to a Full (complete) image.
+	overlayPath := filepath.Join(snapshotDir, "mem.diff")
+	fullPath := filepath.Join(snapshotDir, "mem.snap")
+	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && instBaseMem != "" &&
+		(instMemFile == instBaseMem || overlayPath == instMemFile)
+	baseMemPath := ""
+	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
+	// of the file it overwrites (for layered, only the session delta — the template
+	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
+	// diff is the durability-boundary work, intentionally out of scope here.
+	switch {
+	case layered:
+		memPath = overlayPath
+		baseMemPath = instBaseMem
+		// A first layered pass (VM loaded straight from the template base, not from
+		// this overlay) must start from a fresh overlay: its dirty set is the whole
+		// overlay, so any leftover mem.diff from a failed/un-finalized earlier pause
+		// would survive as stale page extents — CreateDiffSnapshot writes only
+		// dirtied pages in place and never truncates — and override the base on the
+		// next layered restore, corrupting guest memory. Remove it; if it can't be
+		// removed, fall back to Full. An accumulating pass (resumed from this same
+		// overlay) must instead keep it, so this only runs for the first pass.
+		usable := true
+		if instMemFile == instBaseMem {
+			if rerr := freshenFirstPassOverlay(overlayPath); rerr != nil {
+				log.Warn().Err(rerr).Str("path", overlayPath).Msg("pause: stale overlay removal failed; falling back to Full")
+				usable = false
+			}
+		}
+		// Write the base sidecar BEFORE the diff so an overlay never exists on disk
+		// without its base record (a stateless cross-host restore relies on it). If
+		// the sidecar can't be written, fall back to a Full rather than produce an
+		// unrecoverable overlay.
+		if usable {
+			if serr := os.WriteFile(layeredBaseSidecarPath(memPath), []byte(baseMemPath), 0o644); serr != nil {
+				log.Warn().Err(serr).Msg("pause: layered base sidecar write failed; falling back to Full")
+				usable = false
+			}
+		}
+		if usable {
+			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
+			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
+				// A failed diff may have left a partial overlay. Drop the .base sidecar
+				// so a later restore can't treat that partial data as a valid layered
+				// overlay — without the sidecar it's refused (overlay-without-base),
+				// failing loud instead of loading corrupt memory. The overlay file
+				// itself is left in place: handleVMError keeps a still-running VM, which
+				// may still have it mmap'd. (True crash-atomicity is out of scope.)
+				_ = os.Remove(layeredBaseSidecarPath(memPath))
+				return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
+			}
+		} else {
+			memPath, baseMemPath = fullPath, ""
+			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+			}
+		}
+	default:
+		memPath = fullPath
+		// In-place diff (no template base): merge dirtied pages into the VM's own
+		// mem.snap when tracking was armed this run and mem.snap is the resume base —
+		// dirtied offsets are resident/never re-faulted, disjoint from clean reads.
+		if shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, dirtyTracked, memPath, instMemFile, fileExists(memPath)) {
+			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
+			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
+				return "", "", m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
+			}
+		} else {
+			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
+			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+			}
+		}
 	}
 
 	// Stop the Firecracker process — snapshot is already on disk.
@@ -580,11 +691,78 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = memPath
+	inst.BaseMemPath = baseMemPath // template base for a layered overlay; "" when standalone
+	inst.DirtyTracked = false      // FC process is stopping; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
 
 	m.persistState(inst)
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, nil
+}
+
+// shouldWriteDiff reports whether a pause may write a Diff instead of a Full.
+// Diff is correct only when tracking was armed this run AND memPath is the exact
+// mem file this VM resumed from AND that file exists; any miss falls back to Full.
+// Diff onto a non-resume-file or untracked run would silently corrupt the snapshot.
+// memFileExists is the on-disk presence of memPath itself (the VM's own mem.snap),
+// not a template/layered base — the in-place diff merges into that resume file.
+func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeMemPath string, memFileExists bool) bool {
+	return incremental && dirtyTracked && memPath == resumeMemPath && memFileExists
+}
+
+// layeredBaseSidecarPath is where the layered base (template) path is recorded
+// next to an overlay mem file, so a restore that has only the on-disk artifact
+// (no in-memory/BoltDB instance — e.g. a stateless RestoreVMSnapshot after host
+// loss) can still reconstruct the base instead of loading the sparse overlay
+// standalone (which would read the base's pages as zero holes).
+func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
+
+// freshenFirstPassOverlay removes any leftover overlay so a first layered pass starts
+// from a clean file (its dirty set is the whole overlay, so a stale one would leave
+// non-dirtied stale pages that override the base on restore). A missing overlay is the
+// normal case (nil); a real overlay that can't be removed returns an error so the
+// caller falls back to a Full snapshot rather than diff onto stale data.
+func freshenFirstPassOverlay(overlayPath string) error {
+	if err := os.Remove(overlayPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// readLayeredBase returns the recorded base for an overlay mem file and whether
+// the sidecar is present and non-empty.
+func readLayeredBase(memPath string) (string, bool) {
+	b, err := os.ReadFile(layeredBaseSidecarPath(memPath))
+	if err != nil {
+		return "", false
+	}
+	base := strings.TrimSpace(string(b))
+	return base, base != ""
+}
+
+// isOverlayMemFile reports whether memPath names a layered diff overlay (which
+// must be restored over a base, never standalone).
+func isOverlayMemFile(memPath string) bool {
+	return filepath.Base(memPath) == "mem.diff"
+}
+
+// isTemplateMemPath reports whether memPath is an immutable template memory
+// artifact (under <SnapshotDir>/templates/...), making it a valid layered base.
+// Covers both system and user-built templates and any nesting (e.g. the
+// build-<id> subdir the build pipeline writes), unlike the strict-shape
+// templateRootfsForSnapshot used for legacy disk resolution.
+func (m *Manager) isTemplateMemPath(memPath string) bool {
+	if m.cfg.SnapshotDir == "" || memPath == "" {
+		return false
+	}
+	root := filepath.Clean(filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)) + string(filepath.Separator)
+	return strings.HasPrefix(filepath.Clean(memPath), root)
+}
+
+// fileExists reports whether path exists and is a regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // ---------------------------------------------------------------------------
@@ -669,12 +847,42 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	if err := m.restoreForResume(socketPath, snapshotPath, memPath, netInfo); err != nil {
+	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
+	// (not the cached BaseMemPath) means a standalone/override resume clears any
+	// stale base, so the next pause won't wrongly diff against the old template.
+	//
+	// The .base sidecar is authoritative for THIS overlay, so prefer it — the cached
+	// BaseMemPath only matches the cached overlay (inst.MemFilePath) and would supply
+	// the wrong base for an explicit override of a different mem.diff. Fall back to
+	// the cached base only when the sidecar is missing and this is the cached overlay.
+	basePath := ""
+	if isOverlayMemFile(memPath) {
+		if b, ok := readLayeredBase(memPath); ok {
+			basePath = b
+		} else if memPath == inst.MemFilePath {
+			basePath = inst.BaseMemPath
+		}
+		if basePath == "" {
+			m.stopUnitDuringRestoreError(vmID)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
+		}
+	}
+	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
 		if errors.Is(err, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
+				snapshotPath, err)
+		}
+		if errors.Is(err, ErrLayeredInvalidSnapshot) {
+			// Permanent: the overlay/base pairing is structurally invalid, so retrying
+			// the layered restore can't succeed. FailedPrecondition tells the caller not
+			// to retry (vs the generic Internal below, which it may).
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
 				snapshotPath, err)
 		}
 		return nil, fmt.Errorf("restore snapshot: %w", err)
@@ -684,6 +892,13 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.PID = pid
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
+	inst.DirtyTracked = dirtyTracked
+	// Record the file actually resumed from (callers may pass an explicit path
+	// that differs from the cached one) so the next pause's diff baseline matches
+	// what Firecracker's dirty bitmap is relative to.
+	inst.SnapshotPath = snapshotPath
+	inst.MemFilePath = memPath
+	inst.BaseMemPath = basePath // re-cache (may have come from the on-disk sidecar)
 	inst.mu.Unlock()
 
 	m.persistState(inst)
@@ -691,19 +906,31 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	return inst, nil
 }
 
-// restoreForResume picks the resume memory backend: UFFD (reusing the existing
-// tap for the interface override) when enabled and a tap is present, else File,
-// which is also the fallback when ResumeUffdEnabled is off.
-func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath string, netInfo *network.VMNetInfo) error {
+// restoreForResume picks the resume memory backend: UFFD (reusing the existing tap
+// for the interface override, optionally layered over basePath) when enabled and a
+// tap is present, else File. A layered overlay (basePath set) requires UFFD. Reports
+// whether dirty-page tracking was armed so the caller can decide if the next pause
+// may write a Diff.
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
-		return RestoreSnapshot(socketPath, snapshotPath, memPath, "")
+		// A layered overlay can only be served by the UFFD layered backend. If this
+		// host can't take that path (resume-UFFD/UFFD off, or no tap), refuse rather
+		// than load the sparse overlay via the File backend, which would read the
+		// base's pages as zero holes.
+		if basePath != "" {
+			return false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
+		}
+		return false, RestoreSnapshot(socketPath, snapshotPath, memPath, "")
 	}
 
 	// No prefetch access log: only template builds record one (next to the template
 	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
-	return RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, "", "", "eth0", netInfo.TAPDevice, "",
+	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
+	trackDirty := m.cfg.IncrementalSnapshotEnabled
+	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
+		socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+		m.cfg.HandlerDeathAbortEnabled,
 	)
 }
 
@@ -726,6 +953,13 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	snapshotPath, memPath := inst.SnapshotPath, inst.MemFilePath
 	if snapshotPath == "" || memPath == "" {
 		return "", status.Errorf(codes.InvalidArgument, "vm %s has no snapshot on record", vmID)
+	}
+	// This gate loads via the File backend (no base), so it can only verify a
+	// standalone image. A layered diff overlay would load with its base's pages as
+	// zero holes and produce a meaningless comparison — refuse instead.
+	if isOverlayMemFile(memPath) || inst.BaseMemPath != "" {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"vm %s is a layered (diff-overlay) snapshot; the verify gate only supports standalone images", vmID)
 	}
 	if _, err := os.Stat(memPath); err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "mem file missing on host: %s", memPath)
@@ -805,6 +1039,16 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
 
+	// This Full snapshot reset Firecracker's dirty bitmap, so the diff baseline
+	// relative to the resume base is gone. Clear the flag now — before the unpause,
+	// which can fail and return early — so a later pause can't take the Diff path
+	// against the stale baseline and miss pages dirtied between resume and this
+	// ad-hoc snapshot. Forces the next pause back to Full.
+	inst.mu.Lock()
+	inst.DirtyTracked = false
+	inst.mu.Unlock()
+	m.persistState(inst)
+
 	if err := UnpauseVM(inst.SocketPath); err != nil {
 		return snapshotPath, memPath, fmt.Errorf("resume after snapshot: %w", err)
 	}
@@ -848,12 +1092,21 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		}
 	}
 
-	// Side-car (overlay-mode only). Missing is expected for legacy;
-	// any other error is logged — leftover side-cars caused fork bugs.
+	// Side-cars. Missing is expected for legacy; any other error is logged —
+	// leftover side-cars caused fork bugs. The .overlay record sits next to the
+	// vmstate snapshot; the layered .base record sits next to the mem overlay
+	// (mem.diff.base). A stray .base would make a later restore treat a
+	// non-layered mem file as a layered overlay, so it must go with the mem file.
 	if snapshotPath != "" {
 		sidecar := snapshotPath + ".overlay"
 		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
 			m.log.Warn().Err(err).Str("path", sidecar).Msg("remove overlay side-car")
+		}
+	}
+	if memPath != "" {
+		sidecar := layeredBaseSidecarPath(memPath)
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Str("path", sidecar).Msg("remove layered base side-car")
 		}
 	}
 
@@ -1073,7 +1326,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Msg("restoring snapshot")
 
 	var restoreErr error
+	// A diff overlay (mem.diff, or any file with a base sidecar) must be served by
+	// the UFFD layered backend. Catch it before backend selection so that with UFFD
+	// disabled / inPlace / resume-UFFD off it fails loud instead of falling to the
+	// File backend, which would load the sparse overlay as a full image (the base's
+	// pages read as zero holes).
+	sidecarBase, hasSidecar := readLayeredBase(memPath)
+	overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
 	switch {
+	case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
+		restoreErr = fmt.Errorf(
+			"layered overlay %q requires UFFD layered restore (uffd + resume-uffd); refusing File-backend restore",
+			memPath)
 	case useUffd:
 		// Skip prefetch trace when recording so the captured order reflects
 		// guest-driven access, not pages pulled in by the prefetcher.
@@ -1088,9 +1352,39 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				accessLogPath = candidate
 			}
 		}
-		restoreErr = RestoreSnapshotUffdInternalWithOverrides(
-			socketPath, snapshotPath, memPath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir,
-		)
+		// Decide the layered base for this UFFD restore. An overlay (mem.diff) needs
+		// its base reconstructed from the sidecar (else refuse — loading it
+		// standalone reads the base as zero holes); a template create instead arms
+		// tracking and records the template as the base. Layered needs resume-UFFD.
+		isTemplate := m.isTemplateMemPath(memPath)
+		canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
+		basePath := ""
+		armLayered := false
+		switch {
+		case hasSidecar:
+			// The outer overlayNeedsLayered guard already required resume-UFFD to reach
+			// here, so canLayered holds — serve the overlay over its recorded base.
+			basePath = sidecarBase
+			armLayered = m.cfg.IncrementalSnapshotEnabled
+			inst.mu.Lock()
+			inst.BaseMemPath = sidecarBase
+			inst.DirtyTracked = armLayered
+			inst.mu.Unlock()
+		case isOverlayMemFile(memPath):
+			restoreErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
+		case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
+			armLayered = true
+			inst.mu.Lock()
+			inst.BaseMemPath = memPath // template mem file = the layered base
+			inst.DirtyTracked = true
+			inst.mu.Unlock()
+		}
+		if restoreErr == nil {
+			restoreErr = RestoreSnapshotUffdInternalWithOverrides(
+				socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+				m.cfg.HandlerDeathAbortEnabled,
+			)
+		}
 	case inPlace:
 		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
 	default:
@@ -1110,9 +1404,24 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
+		// armLayered may have set DirtyTracked=true on inst before the restore call;
+		// clear it on failure so a lingering instance can't later take a Diff against a
+		// baseline that never loaded. (The VM is StatusError + unit stopped, so this is
+		// belt-and-suspenders, but it keeps the flag honest.)
+		inst.mu.Lock()
+		inst.DirtyTracked = false
+		inst.mu.Unlock()
 		if errors.Is(restoreErr, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
+				snapshotPath, restoreErr)
+		}
+		if errors.Is(restoreErr, ErrLayeredInvalidSnapshot) {
+			// Permanent: the overlay/base pairing is structurally invalid, so retrying
+			// the layered restore can't succeed. FailedPrecondition tells the caller not
+			// to retry (vs the generic Internal below, which it may).
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
 				snapshotPath, restoreErr)
 		}
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)

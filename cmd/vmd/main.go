@@ -356,23 +356,27 @@ func main() {
 	uffdRecordMaxSeconds, _ := strconv.Atoi(envOrDefault("VMD_UFFD_RECORD_MAX_SECONDS", "10"))
 	resumeUffdEnabled := envOrDefault("VMD_RESUME_UFFD", "false") == "true"
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
+	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
+	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin:        cfg.FirecrackerBin,
-		JailerBin:             cfg.JailerBin,
-		KernelPath:            cfg.KernelPath,
-		BaseRootfsPath:        cfg.BaseRootfsPath,
-		SnapshotDir:           cfg.SnapshotDir,
-		RunDir:                cfg.RunDir,
-		TemplateBuilderBin:    cfg.TemplateBuilderBin,
-		BoxdBinaryPath:        cfg.BoxdBinaryPath,
-		HostInterface:         cfg.HostInterface,
-		MaxConcurrentRestores: maxRestores,
-		UffdEnabled:           uffdEnabled,
-		UffdPrefetchEnabled:   uffdPrefetchEnabled,
-		UffdRecordMaxSeconds:  uffdRecordMaxSeconds,
-		ResumeUffdEnabled:     resumeUffdEnabled,
-		VerifySnapshotEnabled: verifySnapshotEnabled,
+		FirecrackerBin:             cfg.FirecrackerBin,
+		JailerBin:                  cfg.JailerBin,
+		KernelPath:                 cfg.KernelPath,
+		BaseRootfsPath:             cfg.BaseRootfsPath,
+		SnapshotDir:                cfg.SnapshotDir,
+		RunDir:                     cfg.RunDir,
+		TemplateBuilderBin:         cfg.TemplateBuilderBin,
+		BoxdBinaryPath:             cfg.BoxdBinaryPath,
+		HostInterface:              cfg.HostInterface,
+		MaxConcurrentRestores:      maxRestores,
+		UffdEnabled:                uffdEnabled,
+		UffdPrefetchEnabled:        uffdPrefetchEnabled,
+		UffdRecordMaxSeconds:       uffdRecordMaxSeconds,
+		ResumeUffdEnabled:          resumeUffdEnabled,
+		VerifySnapshotEnabled:      verifySnapshotEnabled,
+		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
+		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

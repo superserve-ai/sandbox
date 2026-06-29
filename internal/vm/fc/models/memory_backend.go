@@ -26,11 +26,17 @@ type MemoryBackend struct {
 	// Enum: ["File","Uffd","UffdInternal"]
 	BackendType *string `json:"backend_type"`
 
+	// Optional base (template) memory file for a layered UffdInternal restore. When set, a page is served from backend_path if present there, else from this base. Only meaningful when backend_type is UffdInternal; ignored otherwise.
+	BasePath string `json:"base_path,omitempty"`
+
 	// Optional path to a recorded page-access trace replayed as prefetch on restore. Only meaningful when backend_type is UffdInternal; ignored otherwise.
 	AccessLogPath string `json:"access_log_path,omitempty"`
 
 	// Optional path the in-process UFFD handler writes each served page offset to (template-build mode). Only meaningful when backend_type is UffdInternal; ignored otherwise. When present, prefetch is suppressed.
 	RecordTo string `json:"record_to,omitempty"`
+
+	// When true, an unexpected UffdInternal handler death aborts Firecracker instead of leaving the guest to freeze on its next page fault. Only meaningful when backend_type is UffdInternal; ignored otherwise. Omitted (false) by default so the wire format is unchanged when off.
+	AbortOnHandlerDeath bool `json:"abort_on_handler_death,omitempty"`
 }
 
 // Validate validates this memory backend

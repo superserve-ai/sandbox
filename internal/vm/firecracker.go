@@ -31,6 +31,22 @@ func isTornSnapshotErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
 }
 
+// ErrLayeredInvalidSnapshot is the firecracker fork's sentinel for a structurally
+// invalid layered restore (overlay/base size mismatch, huge-page overlay, block
+// size > page size, missing base). It is permanent — retrying or falling back to a
+// standalone load of the overlay won't help (the latter would read base pages as
+// zero holes), so the caller must use a Full/previous snapshot instead.
+var ErrLayeredInvalidSnapshot = errors.New("layered restore overlay/base pairing is invalid")
+
+// layeredInvalidMarker is the exact substring the forked Firecracker embeds in its
+// error for an invalid layered restore (the GuestMemoryFromUffdError::LayeredInvalid
+// display text). Named so a fork message change is updated here, not missed at runtime.
+const layeredInvalidMarker = "overlay/base pairing is invalid"
+
+func isLayeredInvalidErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), layeredInvalidMarker)
+}
+
 // ---------------------------------------------------------------------------
 // Firecracker config (our internal type, not a Firecracker API type)
 // ---------------------------------------------------------------------------
@@ -280,6 +296,39 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 	return nil
 }
 
+// CreateDiffSnapshot pauses the VM and writes a Diff snapshot: only the pages
+// dirtied since load, written at their offsets into memPath. Requires the VM to
+// have been loaded with dirty tracking on. Whether memPath ends up a complete
+// image or a sparse overlay is the caller's choice, set by what memPath holds
+// going in:
+//   - in-place merge: memPath already holds the base image (same size), so the
+//     dirty pages overwrite it and it stays a complete, standalone image.
+//   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
+//     changed pages — restored over a separate base, never loaded standalone.
+func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
+	fc := newFCClient(socketPath)
+	ctx := context.Background()
+
+	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
+		Context: ctx,
+		Body:    &models.VM{State: strPtr(models.VMStatePaused)},
+	}); err != nil {
+		return fmt.Errorf("pause VM: %w", err)
+	}
+
+	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
+		Context: ctx,
+		Body: &models.SnapshotCreateParams{
+			SnapshotPath: &snapshotPath,
+			MemFilePath:  &memPath,
+			SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
+		},
+	}); err != nil {
+		return fmt.Errorf("create diff snapshot: %w", err)
+	}
+	return nil
+}
+
 // UnpauseVM resumes a paused VM's vCPUs. Used after CreateSnapshot to make
 // snapshot creation non-destructive.
 func UnpauseVM(socketPath string) error {
@@ -405,7 +454,8 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // page offset (template-build mode). When recordToPath is set, prefetch is
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
-	socketPath, snapshotPath, memPath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
+	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
+	trackDirty, abortOnHandlerDeath bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -416,12 +466,19 @@ func RestoreSnapshotUffdInternalWithOverrides(
 		Body: &models.SnapshotLoadParams{
 			SnapshotPath: &snapshotPath,
 			MemBackend: &models.MemoryBackend{
-				BackendType:   strPtr(models.MemoryBackendBackendTypeUffdInternal),
-				BackendPath:   &memPath,
-				AccessLogPath: accessLogPath,
-				RecordTo:      recordToPath,
+				BackendType: strPtr(models.MemoryBackendBackendTypeUffdInternal),
+				BackendPath: &memPath,
+				// Layered restore: pages absent from memPath (the overlay/diff) are
+				// served from this base (template). Empty ⇒ single-file restore.
+				BasePath:            basePath,
+				AccessLogPath:       accessLogPath,
+				RecordTo:            recordToPath,
+				AbortOnHandlerDeath: abortOnHandlerDeath,
 			},
-			ResumeVM: true,
+			// Arms dirty-page tracking so the next pause can write an incremental
+			// (Diff) snapshot instead of a Full one.
+			TrackDirtyPages: trackDirty,
+			ResumeVM:        true,
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},
@@ -430,6 +487,9 @@ func RestoreSnapshotUffdInternalWithOverrides(
 	}); err != nil {
 		if isTornSnapshotErr(err) {
 			return fmt.Errorf("load snapshot (uffd-internal): %w: %v", ErrTornSnapshot, err)
+		}
+		if isLayeredInvalidErr(err) {
+			return fmt.Errorf("load snapshot (uffd-internal): %w: %v", ErrLayeredInvalidSnapshot, err)
 		}
 		return fmt.Errorf("load snapshot (uffd-internal): %w", err)
 	}
