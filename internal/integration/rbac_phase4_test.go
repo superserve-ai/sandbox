@@ -72,6 +72,13 @@ func TestRbacPhase4TeamManagementReadModel(t *testing.T) {
 	if len(viewerBody.Members) == 0 {
 		t.Fatal("viewer management summary missing members")
 	}
+	for _, member := range viewerBody.Members {
+		if roles, ok := member["roles"]; ok {
+			if roleList, ok := roles.([]any); !ok || len(roleList) != 0 {
+				t.Fatalf("viewer member roles = %#v, want omitted or empty without roles:read", roles)
+			}
+		}
+	}
 	if viewerBody.Capabilities.CanInviteMembers || viewerBody.Capabilities.CanDeactivateMembers || viewerBody.Capabilities.CanAssignRoles || viewerBody.Capabilities.CanRevokeRoles || viewerBody.Capabilities.CanViewRoleAssignments {
 		t.Fatalf("viewer capabilities = %+v, want read-only users view without mutation or role-assignment controls", viewerBody.Capabilities)
 	}
