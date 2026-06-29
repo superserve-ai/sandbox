@@ -197,6 +197,10 @@ func (h *Handlers) GetTeamManagement(c *gin.Context) {
 	}
 	usersRead, err := h.customerPermissionAllowed(c, actorID, teamID, "users:read")
 	if err != nil {
+		if errors.Is(err, authz.ErrPermissionDenied) || errors.Is(err, authz.ErrScopeMismatch) {
+			respondError(c, ErrForbidden)
+			return
+		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("RBAC management users:read check failed")
 		respondError(c, ErrInternal)
 		return
