@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -305,7 +306,13 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 //     dirty pages overwrite it and it stays a complete, standalone image.
 //   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
 //     changed pages — restored over a separate base, never loaded standalone.
-func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
+//
+// When async is true the VM's memory diff is written on a Firecracker background
+// thread and the create call returns at the snapshot point; the caller must then
+// call CompleteSnapshot to confirm the write is durable, and must keep the VM
+// paused (do not unpause) until it does. async is only honored for the layered
+// (sparse-overlay) case, where the writer target is a fresh file it owns alone.
+func CreateDiffSnapshot(socketPath, snapshotPath, memPath string, async bool) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
@@ -319,12 +326,50 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
 		Context: ctx,
 		Body: &models.SnapshotCreateParams{
-			SnapshotPath: &snapshotPath,
-			MemFilePath:  &memPath,
-			SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
+			SnapshotPath:  &snapshotPath,
+			MemFilePath:   &memPath,
+			SnapshotType:  models.SnapshotCreateParamsSnapshotTypeDiff,
+			AsyncSnapshot: async,
 		},
 	}); err != nil {
 		return fmt.Errorf("create diff snapshot: %w", err)
+	}
+	return nil
+}
+
+// CompleteSnapshot waits (PUT /snapshot/complete) for an async snapshot's background
+// write + fsync to finish, so the diff is durable on return; a no-op on the FC side
+// when no async snapshot is active. Issued as a raw request over the UDS (the
+// generated client has no such operation); FC requires a body on PUT /snapshot/*, so
+// a "{}" is sent and ignored.
+func CompleteSnapshot(socketPath string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				addr, err := net.ResolveUnixAddr("unix", socketPath)
+				if err != nil {
+					return nil, err
+				}
+				return net.DialUnix("unix", nil, addr)
+			},
+		},
+		// Longer than Firecracker's internal completion wait so the HTTP call doesn't
+		// time out before the background write does.
+		Timeout: 60 * time.Second,
+	}
+	req, err := http.NewRequest(http.MethodPut, "http://localhost/snapshot/complete", strings.NewReader("{}"))
+	if err != nil {
+		return fmt.Errorf("complete snapshot: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("complete snapshot: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("complete snapshot: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }

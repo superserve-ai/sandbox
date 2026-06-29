@@ -110,6 +110,17 @@ type VMInstance struct {
 	// live FC process, which a fresh resume re-establishes.
 	DirtyTracked bool
 
+	// Async-pause flush tracking. While flushing is true, an async pause's
+	// background memory write is still in progress: the new diff layer is being
+	// written and is NOT yet in the manifest, so the durable state is still the
+	// previous chain. flushDone is closed when the flush finishes (outcome in
+	// flushErr). Resume/re-pause/delete wait on it (waitForFlush) so they never act
+	// on a not-yet-durable layer. Not persisted — a vmd restart resolves any
+	// in-flight flush from on-disk state (the manifest), not this handle.
+	flushing  bool
+	flushDone chan struct{}
+	flushErr  error
+
 	mu sync.RWMutex
 }
 
@@ -191,6 +202,14 @@ type ManagerConfig struct {
 	// IncrementalSnapshotEnabled + ResumeUffdEnabled and an FC binary that accepts
 	// lower_overlay_paths. Default false.
 	LayerAppendEnabled bool
+
+	// AsyncPauseEnabled lets a layered append pause return at the snapshot point and
+	// write the diff layer on a Firecracker background thread, marking the snapshot
+	// durable (republishing the manifest, then stopping FC) once the write completes.
+	// The first pause of a chain stays synchronous (no prior durable layer to fall
+	// back to). Requires LayerAppendEnabled and an FC binary with /snapshot/complete.
+	// Default false.
+	AsyncPauseEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +608,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
+	// A prior async pause may still be flushing; wait so this pause sees the durable
+	// chain (committed manifest) and doesn't race the background writer or FC stop.
+	_ = m.waitForFlush(inst)
+
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
 	}
@@ -654,15 +677,37 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 			break
 		}
-		log.Info().Str("snapshot_path", snapshotPath).Int("layer", newIndex).Msg("pausing VM — appending layered diff snapshot")
-		if err := CreateDiffSnapshot(socketPath, snapshotPath, layerPath); err != nil {
+		// Async only when enabled AND a prior durable layer exists to fall back to if
+		// the background write is interrupted (first-pause-always-sync: newIndex 0 is
+		// the first layer, which has only the read-only template base under it).
+		async := m.cfg.AsyncPauseEnabled && newIndex > 0
+		log.Info().Str("snapshot_path", snapshotPath).Int("layer", newIndex).Bool("async", async).
+			Msg("pausing VM — appending layered diff snapshot")
+		if err := CreateDiffSnapshot(socketPath, snapshotPath, layerPath, async); err != nil {
 			// Leave the partial layer orphaned and do NOT republish the manifest — the
 			// previously committed chain stays intact and resumable. Drop the orphan so
 			// the next attempt at this index starts clean.
 			_ = os.Remove(layerPath)
 			return "", "", m.handleVMError(vmID, fmt.Errorf("append layered diff snapshot: %w", err))
 		}
-		// Commit point: republish the manifest with the new layer appended (atomic
+		if async {
+			// Returned at the snapshot point: FC is alive + paused, writing the layer in
+			// the background. Record the paused (resumable) state, then finish + commit
+			// off the hot path (see completeAsyncPause).
+			inst.mu.Lock()
+			inst.Status = StatusPaused
+			inst.SnapshotPath = snapshotPath
+			inst.MemFilePath = layerPath
+			inst.BaseMemPath = baseMemPath
+			inst.DirtyTracked = false
+			inst.mu.Unlock()
+			m.beginFlush(inst)
+			m.persistState(inst)
+			go m.completeAsyncPause(inst, snapshotDir, layerPath, layerName, socketPath, appendManifest)
+			log.Info().Int("layer", newIndex).Msg("VM pausing (async memory flush in background)")
+			return snapshotPath, layerPath, nil
+		}
+		// Sync commit point: republish the manifest with the new layer appended (atomic
 		// temp-write + rename). Until this lands, restore loads the prior chain.
 		appendManifest.Overlays = append(appendManifest.Overlays, layerName)
 		if err := writeManifestAtomic(snapshotDir, appendManifest); err != nil {
@@ -699,7 +744,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 		if usable {
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
-			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
+			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, false); err != nil {
 				// A failed diff may have left a partial overlay. Drop the .base sidecar
 				// so a later restore can't treat that partial data as a valid layered
 				// overlay — without the sidecar it's refused (overlay-without-base),
@@ -722,7 +767,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// dirtied offsets are resident/never re-faulted, disjoint from clean reads.
 		if shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, dirtyTracked, memPath, instMemFile, fileExists(memPath)) {
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
-			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
+			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, false); err != nil {
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
 			}
 		} else {
@@ -749,6 +794,46 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	m.persistState(inst)
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, nil
+}
+
+// completeAsyncPause runs after an async pause returned at the snapshot point: it
+// waits for Firecracker's background write + fsync (CompleteSnapshot), then on
+// success commits the new layer (republish the manifest — the durability commit
+// point) and stops FC; on failure it drops the orphaned layer and leaves the
+// previous durable chain in place. Either way the sandbox stays resumable: the
+// manifest names the prior chain until (and unless) the new layer commits. Always
+// ends the flush so waiters (resume/re-pause/delete) unblock.
+func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, layerName, socketPath string, manifest *snapshotManifest) {
+	vmID := inst.ID
+	log := m.log.With().Str("vm_id", vmID).Logger()
+
+	if err := CompleteSnapshot(socketPath); err != nil {
+		log.Error().Err(err).Msg("async pause flush failed; keeping previous durable snapshot")
+		_ = os.Remove(layerPath)
+		m.stopAsyncPauseFC(vmID)
+		m.endFlush(inst, err)
+		return
+	}
+	// Durable: commit the manifest, then stop FC.
+	manifest.Overlays = append(manifest.Overlays, layerName)
+	if err := writeManifestAtomic(snapshotDir, manifest); err != nil {
+		log.Error().Err(err).Msg("async pause manifest commit failed; keeping previous durable snapshot")
+		_ = os.Remove(layerPath)
+		m.stopAsyncPauseFC(vmID)
+		m.endFlush(inst, err)
+		return
+	}
+	m.stopAsyncPauseFC(vmID)
+	log.Info().Msg("VM paused (async memory flush durable)")
+	m.endFlush(inst, nil)
+}
+
+// stopAsyncPauseFC stops the still-alive paused Firecracker after an async flush
+// settles. Best-effort: a stop failure is logged, not fatal (the snapshot is on disk).
+func (m *Manager) stopAsyncPauseFC(vmID string) {
+	if err := stopUnit(context.Background(), systemdUnitName(vmID)); err != nil {
+		m.log.Warn().Str("vm_id", vmID).Err(err).Msg("stop FC after async pause flush")
+	}
 }
 
 // shouldWriteDiff reports whether a pause may write a Diff instead of a Full.
@@ -799,6 +884,45 @@ func (m *Manager) planLayerAppend(snapshotDir string, dirtyTracked bool, instBas
 		return "", nil, false
 	}
 	return instBaseMem, &snapshotManifest{Base: instBaseMem}, true
+}
+
+// beginFlush marks inst as having an in-progress async-pause flush, arming the
+// channel that endFlush closes when the flush finishes.
+func (m *Manager) beginFlush(inst *VMInstance) {
+	inst.mu.Lock()
+	inst.flushing = true
+	inst.flushErr = nil
+	inst.flushDone = make(chan struct{})
+	inst.mu.Unlock()
+}
+
+// endFlush records the flush outcome and wakes any waiters.
+func (m *Manager) endFlush(inst *VMInstance, err error) {
+	inst.mu.Lock()
+	inst.flushErr = err
+	inst.flushing = false
+	ch := inst.flushDone
+	inst.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// waitForFlush blocks until any in-progress async-pause flush for inst finishes,
+// returning that flush's outcome (nil when none was in progress). Callers that act
+// on the durable snapshot — resume, re-pause, delete — must call this first so they
+// never read a not-yet-durable layer or race the background writer.
+func (m *Manager) waitForFlush(inst *VMInstance) error {
+	inst.mu.RLock()
+	flushing, ch := inst.flushing, inst.flushDone
+	inst.mu.RUnlock()
+	if !flushing || ch == nil {
+		return nil
+	}
+	<-ch
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.flushErr
 }
 
 // freshenFirstPassOverlay removes any leftover overlay so a first layered pass starts
@@ -861,6 +985,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	if err != nil {
 		return nil, err
 	}
+
+	// If an async pause is still flushing, wait for it to commit (and stop the old
+	// FC) before resuming — the chain we load must be the committed one.
+	_ = m.waitForFlush(inst)
 
 	if snapshotPath == "" {
 		snapshotPath = inst.SnapshotPath
@@ -1178,6 +1306,10 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 	}
 	if snapshotPath == "" && memPath == "" {
 		return status.Error(codes.InvalidArgument, "at least one of snapshot_path/mem_file_path is required")
+	}
+	// Don't delete chain files out from under an in-progress async flush; wait it out.
+	if inst, ierr := m.getInstance(vmID); ierr == nil {
+		_ = m.waitForFlush(inst)
 	}
 	for _, p := range []string{snapshotPath, memPath} {
 		if p == "" {

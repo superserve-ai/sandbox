@@ -1618,6 +1618,14 @@ definitions:
           Directory for block device delta files. When set, overlay block
           devices write delta files (containing only dirty blocks) into this
           directory, named {drive_id}.delta.
+      async_snapshot:
+        type: boolean
+        default: false
+        description:
+          If true (and snapshot_type is Diff), write the memory diff on a
+          background thread and return at the snapshot point; the caller must
+          PUT /snapshot/complete to confirm durability. The vCPUs must stay
+          paused until then. Ignored for Full snapshots.
 
   NetworkOverride:
     type: object
