@@ -189,7 +189,7 @@ func TestRbacPhase2bTeamMemberManagement(t *testing.T) {
 	})
 
 	t.Run("customer route ignores actor header for legacy key", func(t *testing.T) {
-		legacyTeam, legacyKey := seedTeamAndKey(t)
+		legacyTeam, legacyKey := seedTeamAndKeyNoCreator(t)
 		privilegedUser := seedRBACProfile(t)
 		seedMembership(t, ctx, legacyTeam, privilegedUser)
 		seedTeamRoleAssignment(t, ctx, privilegedUser, mustRoleID(t, ctx, "team_owner"), legacyTeam)
