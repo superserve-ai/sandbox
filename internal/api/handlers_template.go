@@ -384,6 +384,9 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSettingsWrite(c, teamID) {
+		return
+	}
 
 	// Field validation (manual; bindJSONStrict doesn't honor `binding` tags).
 	req.Name = strings.TrimSpace(req.Name)
@@ -571,6 +574,9 @@ func (h *Handlers) GetTemplate(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSettingsRead(c, teamID) {
+		return
+	}
 
 	tpl, err := h.DB.GetTemplate(c.Request.Context(), db.GetTemplateParams{
 		ID:       tplID,
@@ -593,6 +599,9 @@ func (h *Handlers) GetTemplate(c *gin.Context) {
 func (h *Handlers) ListTemplates(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsRead(c, teamID) {
 		return
 	}
 
@@ -646,6 +655,9 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsWrite(c, teamID) {
 		return
 	}
 
@@ -704,6 +716,9 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsWrite(c, teamID) {
 		return
 	}
 
@@ -796,6 +811,9 @@ func (h *Handlers) GetTemplateBuild(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSettingsRead(c, teamID) {
+		return
+	}
 
 	build, err := h.DB.GetTemplateBuild(c.Request.Context(), db.GetTemplateBuildParams{
 		ID:         buildID,
@@ -822,6 +840,9 @@ func (h *Handlers) ListTemplateBuilds(c *gin.Context) {
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsRead(c, teamID) {
 		return
 	}
 
@@ -854,6 +875,9 @@ func (h *Handlers) CancelTemplateBuild(c *gin.Context) {
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsWrite(c, teamID) {
 		return
 	}
 
@@ -1021,6 +1045,9 @@ func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if !h.requireTeamSettingsRead(c, teamID) {
 		return
 	}
 

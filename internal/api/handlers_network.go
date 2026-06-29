@@ -65,6 +65,9 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	if !h.requireTeamSettingsRead(c, teamID) {
+		return
+	}
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return

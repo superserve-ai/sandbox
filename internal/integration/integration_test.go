@@ -63,6 +63,11 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	if err := resetTestSchema(ctx, testPool); err != nil {
+		fmt.Fprintf(os.Stderr, "reset test schema: %v\n", err)
+		os.Exit(1)
+	}
+
 	if err := applyMigrations(ctx, testPool); err != nil {
 		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
 		os.Exit(1)
@@ -76,6 +81,11 @@ func TestMain(m *testing.M) {
 	}
 
 	os.Exit(m.Run())
+}
+
+func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
+	return err
 }
 
 // seedSystemTemplate creates the system team + a ready `superserve/base`
@@ -201,36 +211,15 @@ func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.
 	return nil
 }
 
-// seedTeamAndKey inserts a team/API key pair without a creator profile.
-// Several legacy integration tests rely on the key having no created_by.
+// seedTeamAndKey inserts a team owner plus API key pair.
+// Most integration tests exercise high-risk endpoints and need write access.
 func seedTeamAndKey(t *testing.T) (uuid.UUID, string) {
-	t.Helper()
-	ctx := context.Background()
-
-	team, err := testQueries.CreateTeam(ctx, "team-"+uuid.New().String()[:8])
-	if err != nil {
-		t.Fatalf("seedTeamAndKey: create team: %v", err)
-	}
-
-	rawKey := "sk-test-" + uuid.New().String()
-	hash := sha256.Sum256([]byte(rawKey))
-	keyHash := hex.EncodeToString(hash[:])
-
-	_, err = testQueries.CreateAPIKeyV2(ctx, db.CreateAPIKeyV2Params{
-		TeamID:  team.ID,
-		KeyHash: keyHash,
-		Name:    "test-key",
-		Scopes:  []string{},
-	})
-	if err != nil {
-		t.Fatalf("seedTeamAndKey: create api key: %v", err)
-	}
-
-	return team.ID, rawKey
+	teamID, rawKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	return teamID, rawKey
 }
 
-// seedTeamAndKeyWithRole inserts a team, active membership, team role, and API
-// key created by that user. Returns (teamID, rawKey, profileID).
+// seedTeamAndKeyWithRole inserts a team, owner profile, active membership, and
+// API key for the requested team role. Returns (teamID, rawKey, profileID).
 func seedTeamAndKeyWithRole(t *testing.T, roleName string) (uuid.UUID, string, uuid.UUID) {
 	t.Helper()
 	ctx := context.Background()
@@ -287,6 +276,85 @@ func seedTeamAndKeyWithRole(t *testing.T, roleName string) (uuid.UUID, string, u
 	return team.ID, rawKey, profileID
 }
 
+func seedKeyForExistingTeamWithRole(t *testing.T, teamID uuid.UUID, roleName string) string {
+	t.Helper()
+	ctx := context.Background()
+
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, $2, 'google', $3)`,
+		profileID,
+		fmt.Sprintf("%s-%s@example.com", roleName, profileID.String()[:8]),
+		"google-"+profileID.String()[:8],
+	); err != nil {
+		t.Fatalf("seedKeyForExistingTeamWithRole: insert profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`,
+		teamID,
+		profileID,
+	); err != nil {
+		t.Fatalf("seedKeyForExistingTeamWithRole: insert membership: %v", err)
+	}
+	roleID, err := roleIDByName(ctx, roleName)
+	if err != nil {
+		t.Fatalf("seedKeyForExistingTeamWithRole: lookup role %s: %v", roleName, err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id) VALUES ($1, $2, 'team', $3)`,
+		profileID,
+		roleID,
+		teamID,
+	); err != nil {
+		t.Fatalf("seedKeyForExistingTeamWithRole: insert assignment: %v", err)
+	}
+
+	rawKey := "sk-test-" + uuid.New().String()
+	hash := sha256.Sum256([]byte(rawKey))
+	keyHash := hex.EncodeToString(hash[:])
+
+	_, err = testQueries.CreateAPIKeyV2(ctx, db.CreateAPIKeyV2Params{
+		TeamID:    teamID,
+		KeyHash:   keyHash,
+		Name:      "test-key",
+		Scopes:    []string{},
+		CreatedBy: pgtype.UUID{Bytes: profileID, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("seedKeyForExistingTeamWithRole: create api key: %v", err)
+	}
+
+	return rawKey
+}
+
+// seedTeamAndKeyNoCreator inserts a team/API key pair without a creator profile.
+// Use this only for tests that explicitly verify null actor attribution.
+func seedTeamAndKeyNoCreator(t *testing.T) (uuid.UUID, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	team, err := testQueries.CreateTeam(ctx, "team-"+uuid.New().String()[:8])
+	if err != nil {
+		t.Fatalf("seedTeamAndKeyNoCreator: create team: %v", err)
+	}
+
+	rawKey := "sk-test-" + uuid.New().String()
+	hash := sha256.Sum256([]byte(rawKey))
+	keyHash := hex.EncodeToString(hash[:])
+
+	_, err = testQueries.CreateAPIKeyV2(ctx, db.CreateAPIKeyV2Params{
+		TeamID:  team.ID,
+		KeyHash: keyHash,
+		Name:    "test-key",
+		Scopes:  []string{},
+	})
+	if err != nil {
+		t.Fatalf("seedTeamAndKeyNoCreator: create api key: %v", err)
+	}
+
+	return team.ID, rawKey
+}
+
 // seedTeamKeyAndProfile is like seedTeamAndKey but also seeds a profile row
 // and sets api_key.created_by to it. Returns (teamID, rawKey, profileID).
 func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
@@ -304,6 +372,25 @@ func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
 		profileID, fmt.Sprintf("test-%s@example.com", profileID.String()[:8]),
 	); err != nil {
 		t.Fatalf("seedTeamKeyAndProfile: insert profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`,
+		team.ID,
+		profileID,
+	); err != nil {
+		t.Fatalf("seedTeamKeyAndProfile: insert membership: %v", err)
+	}
+	roleID, err := roleIDByName(ctx, "team_owner")
+	if err != nil {
+		t.Fatalf("seedTeamKeyAndProfile: lookup role team_owner: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id) VALUES ($1, $2, 'team', $3)`,
+		profileID,
+		roleID,
+		team.ID,
+	); err != nil {
+		t.Fatalf("seedTeamKeyAndProfile: insert assignment: %v", err)
 	}
 
 	rawKey := "sk-test-" + uuid.New().String()
@@ -2484,38 +2571,13 @@ func TestIntegration_ActivityLog_ActorAttributedToKeyCreator(t *testing.T) {
 	}
 }
 
-func TestIntegration_ActivityLog_ActorNullWhenKeyHasNoCreator(t *testing.T) {
-	ctx := context.Background()
-	_, apiKey := seedTeamAndKey(t)
+func TestIntegration_ProtectedEndpointRejectsKeyWithoutCreator(t *testing.T) {
+	_, apiKey := seedTeamAndKeyNoCreator(t)
 	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"null-actor-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	sandboxID, _ := uuid.Parse(sid)
-
-	time.Sleep(100 * time.Millisecond)
-	activities, err := testQueries.ListActivityBySandbox(ctx, db.ListActivityBySandboxParams{
-		SandboxID: pgtype.UUID{Bytes: sandboxID, Valid: true},
-		Limit:     20,
-	})
-	if err != nil {
-		t.Fatalf("list activities: %v", err)
-	}
-
-	var found bool
-	for _, a := range activities {
-		if a.Category == "sandbox" && a.Action == "started" {
-			found = true
-			if a.ActorID.Valid {
-				t.Errorf("actor_id = %s, want NULL", uuid.UUID(a.ActorID.Bytes))
-			}
-		}
-	}
-	if !found {
-		t.Error("no 'sandbox/started' activity record after create")
+	if cw.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden for key without creator, got %d: %s", cw.Code, cw.Body.String())
 	}
 }
 
