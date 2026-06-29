@@ -929,7 +929,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
 	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+		socketPath, snapshotPath, memPath, basePath, nil, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
 		m.cfg.HandlerDeathAbortEnabled,
 	)
 }
@@ -1381,7 +1381,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		if restoreErr == nil {
 			restoreErr = RestoreSnapshotUffdInternalWithOverrides(
-				socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+				socketPath, snapshotPath, memPath, basePath, nil, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
 				m.cfg.HandlerDeathAbortEnabled,
 			)
 		}
