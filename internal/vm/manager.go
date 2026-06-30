@@ -771,10 +771,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		layerPath := filepath.Join(snapshotDir, layerName)
 		memPath = layerPath
 		baseMemPath = appendBase
-		// Per-layer vmstate: FC writes this pause's CPU/device state to its own file (not the
-		// shared vmstate.snap), and the manifest commit records it — so {chain + vmstate}
-		// commit atomically in one manifest rename. A failed/uncommitted pause never replaces
-		// the prior committed vmstate; its orphan file is GC'd.
+		// Per-layer vmstate (see snapshotManifest.Vmstate): FC writes this pause's CPU/device
+		// state to its own file, which the manifest commit records — so it never overwrites the
+		// prior committed vmstate.
 		vmstateName := vmstateLayerName(newIndex)
 		vmstatePath := filepath.Join(snapshotDir, vmstateName)
 		// A leftover file at this index (a failed prior attempt) would survive as
@@ -894,9 +893,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			log.Info().Int("layer", newIndex).Msg("VM pausing (async memory flush in background)")
 			return vmstatePath, layerPath, nil
 		}
-		// Sync commit point: the manifest records the new layer AND its vmstate, so the single
-		// atomic rename commits {chain + vmstate} together. Until it lands, restore loads the
-		// prior chain + prior vmstate (both intact).
+		// Sync commit point: the manifest rename commits the new layer + its vmstate together;
+		// until it lands, restore loads the prior (intact) snapshot.
 		appendManifest.Overlays = append(appendManifest.Overlays, layerName)
 		appendManifest.Vmstate = vmstateName
 		if err := writeManifestAtomic(snapshotDir, appendManifest); err != nil {
@@ -1024,8 +1022,8 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	vmstatePath := filepath.Join(snapshotDir, vmstateName)
 
-	// On failure: the manifest never commits, so the prior chain + its vmstate stay the durable
-	// state — nothing to revert. Just drop the uncommitted layer + per-layer vmstate orphans.
+	// On failure the manifest never commits, so the prior snapshot stays durable — nothing to
+	// revert; just drop the uncommitted layer + vmstate orphans.
 	failClean := func(err error, msg string) {
 		log.Error().Err(err).Msg(msg)
 		_ = os.Remove(layerPath)
@@ -1085,9 +1083,9 @@ func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	vmstatePath := filepath.Join(snapshotDir, vmstateName)
 
-	// On failure: the manifest never commits, so the prior chain + its vmstate stay durable —
-	// nothing to revert. Drop the uncommitted layer + per-layer vmstate orphans. A fast-resume
-	// that adopted them holds its own fds, so the unlink doesn't disturb it.
+	// On failure, drop the uncommitted layer + vmstate orphans (the manifest never committed,
+	// so the prior snapshot stays durable). A fast-resume that adopted them holds its own fds,
+	// so the unlink doesn't disturb it.
 	failClean := func(err error, msg string) {
 		log.Error().Err(err).Msg(msg)
 		_ = os.Remove(layerPath)

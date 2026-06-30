@@ -95,10 +95,8 @@ func writeManifestAtomic(dir string, m *snapshotManifest) error {
 // snapshots — used when a manifest doesn't record its own Vmstate.
 const legacyVmstateName = "vmstate.snap"
 
-// vmstateLayerName is the file name for the vmstate committed alongside chain index i. An
-// accumulating pause writes its CPU/device state here (not the shared vmstate.snap) and the
-// manifest commit records it, so {chain + vmstate} commit atomically and a failed/uncommitted
-// pause never replaces the prior committed vmstate.
+// vmstateLayerName is the file name for the vmstate committed alongside chain index i
+// (recorded in the manifest's Vmstate — see that field).
 func vmstateLayerName(i int) string { return fmt.Sprintf("vmstate.%d.snap", i) }
 
 // manifestVmstatePath resolves the committed vmstate file: the manifest's recorded Vmstate
