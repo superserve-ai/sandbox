@@ -779,6 +779,18 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 			break
 		}
+		// Preserve the prior committed vmstate before this pause overwrites vmstate.snap, so
+		// a failed async/bridge flush can revert to a vmstate matching the prior memory chain
+		// (accumulating pauses only — the first layer has no prior committed state). Restored
+		// on any failure below, discarded once the new layer commits.
+		priorVmstateSaved := false
+		if newIndex > 0 {
+			saved, serr := savePriorVmstate(snapshotPath)
+			if serr != nil {
+				log.Warn().Err(serr).Msg("pause: save prior vmstate failed; a failed flush won't be revertible")
+			}
+			priorVmstateSaved = saved
+		}
 		// Async only when enabled AND a prior durable layer exists to fall back to if
 		// the background write is interrupted (first-pause-always-sync: newIndex 0 is
 		// the first layer, which has only the read-only template base under it).
@@ -817,6 +829,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 					memFile.Close()
 					<-m.pauseSem
 					_ = os.Remove(layerPath)
+					m.revertPriorVmstate(inst, snapshotPath, false) // VM kept running; restore the committed vmstate
 					return "", "", m.handleVMError(vmID, fmt.Errorf("bridge diff snapshot: %w", err))
 				}
 				// Stop the old FC now: vmd holds the memfd, so guest RAM stays resident and
@@ -841,7 +854,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				inst.bridgePendingLayer = layerPath
 				inst.mu.Unlock()
 				m.persistState(inst)
-				go m.completeBridgePause(inst, snapshotDir, layerPath, layerName, memFile, dirtyOffsetsPath, appendManifest)
+				go m.completeBridgePause(inst, snapshotDir, layerPath, layerName, memFile, dirtyOffsetsPath, appendManifest, priorVmstateSaved)
 				log.Info().Int("layer", newIndex).Msg("VM pausing (memfd bridge flush in background)")
 				return snapshotPath, layerPath, nil
 			}
@@ -856,6 +869,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			// previously committed chain stays intact and resumable. Drop the orphan so
 			// the next attempt at this index starts clean.
 			_ = os.Remove(layerPath)
+			m.revertPriorVmstate(inst, snapshotPath, false) // VM kept running; restore the committed vmstate
 			return "", "", m.handleVMError(vmID, fmt.Errorf("append layered diff snapshot: %w", err))
 		}
 		if async {
@@ -874,7 +888,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			inst.DirtyTracked = false
 			inst.mu.Unlock()
 			m.persistState(inst)
-			go m.completeAsyncPause(inst, snapshotDir, layerPath, layerName, socketPath, appendManifest)
+			go m.completeAsyncPause(inst, snapshotDir, layerPath, layerName, socketPath, appendManifest, priorVmstateSaved)
 			log.Info().Int("layer", newIndex).Msg("VM pausing (async memory flush in background)")
 			return snapshotPath, layerPath, nil
 		}
@@ -883,7 +897,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		appendManifest.Overlays = append(appendManifest.Overlays, layerName)
 		if err := writeManifestAtomic(snapshotDir, appendManifest); err != nil {
 			_ = os.Remove(layerPath)
+			m.revertPriorVmstate(inst, snapshotPath, false) // VM kept running; restore the committed vmstate
 			return "", "", m.handleVMError(vmID, fmt.Errorf("publish snapshot manifest: %w", err))
+		}
+		// Committed: the new vmstate.snap pairs with the new chain, so drop the prior copy.
+		if priorVmstateSaved {
+			discardPriorVmstate(snapshotPath)
 		}
 	case layered:
 		memPath = overlayPath
@@ -977,26 +996,39 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 // previous durable chain in place. Either way the sandbox stays resumable: the
 // manifest names the prior chain until (and unless) the new layer commits. Always
 // ends the flush so waiters (resume/re-pause/delete) unblock.
-func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, layerName, socketPath string, manifest *snapshotManifest) {
+func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, layerName, socketPath string, manifest *snapshotManifest, priorVmstateSaved bool) {
 	defer func() { <-m.pauseSem }() // release the background-flush slot claimed in PauseVM
 	vmID := inst.ID
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	vmstatePath := filepath.Join(snapshotDir, "vmstate.snap")
 
-	if err := CompleteSnapshot(socketPath); err != nil {
-		log.Error().Err(err).Msg("async pause flush failed; keeping previous durable snapshot")
+	// On failure, revert vmstate to the prior committed copy so it pairs with the prior
+	// (still-committed) memory chain — resume then loads a consistent stale-by-one snapshot.
+	// A resume can't have happened mid-flush on this path (it waits for the flush), so the
+	// sandbox is still paused; revert unconditionally. endFlush AFTER the revert so a waiting
+	// resume observes the reverted state.
+	failRevert := func(err error, msg string) {
+		log.Error().Err(err).Msg(msg)
 		_ = os.Remove(layerPath)
+		if priorVmstateSaved {
+			m.revertPriorVmstate(inst, vmstatePath, false)
+		}
 		m.stopAsyncPauseFC(vmID)
 		m.endFlush(inst, err)
+	}
+
+	if err := CompleteSnapshot(socketPath); err != nil {
+		failRevert(err, "async pause flush failed; reverting to previous durable snapshot")
 		return
 	}
 	// Durable: commit the manifest, then stop FC.
 	manifest.Overlays = append(manifest.Overlays, layerName)
 	if err := writeManifestAtomic(snapshotDir, manifest); err != nil {
-		log.Error().Err(err).Msg("async pause manifest commit failed; keeping previous durable snapshot")
-		_ = os.Remove(layerPath)
-		m.stopAsyncPauseFC(vmID)
-		m.endFlush(inst, err)
+		failRevert(err, "async pause manifest commit failed; reverting to previous durable snapshot")
 		return
+	}
+	if priorVmstateSaved {
+		discardPriorVmstate(vmstatePath) // new vmstate pairs with the new chain now
 	}
 	m.stopAsyncPauseFC(vmID)
 	log.Info().Msg("VM paused (async memory flush durable)")
@@ -1013,7 +1045,7 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 // sandbox stays resumable from the committed manifest (stale by one pause, never corrupt).
 // vmd's memfd fd is closed when the dump finishes; a resume that adopted the memfd during
 // the flush holds its own fd (and the new Firecracker's mmap keeps the pages resident).
-func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, layerName string, memFile *os.File, dirtyOffsetsPath string, manifest *snapshotManifest) {
+func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, layerName string, memFile *os.File, dirtyOffsetsPath string, manifest *snapshotManifest, priorVmstateSaved bool) {
 	// Defers run LIFO: clear the handoff fields under mu FIRST, then close memFile, then
 	// release the sem. Clearing before the close (and under mu) means a concurrent resume
 	// either sees the path set and reopens its own fd while memFile is still open, or sees
@@ -1030,27 +1062,38 @@ func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, 
 	defer os.Remove(dirtyOffsetsPath)
 	vmID := inst.ID
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	vmstatePath := filepath.Join(snapshotDir, "vmstate.snap")
+
+	// On failure, revert vmstate to the prior committed copy ONLY if the sandbox is still
+	// paused: a fast-resumed (Running) VM already loaded the new vmstate into its Firecracker,
+	// so reverting the file is pointless and could race that restore (it self-heals on the
+	// next pause). endFlush AFTER the revert so a waiting resume observes the reverted state.
+	failRevert := func(err error, msg string) {
+		log.Error().Err(err).Msg(msg)
+		_ = os.Remove(layerPath)
+		if priorVmstateSaved {
+			m.revertPriorVmstate(inst, vmstatePath, true)
+		}
+		m.endFlush(inst, err)
+	}
 
 	offsets, err := readDirtyOffsets(dirtyOffsetsPath)
 	if err != nil {
-		log.Error().Err(err).Msg("bridge pause: read dirty offsets failed; keeping previous durable snapshot")
-		_ = os.Remove(layerPath)
-		m.endFlush(inst, err)
+		failRevert(err, "bridge pause: read dirty offsets failed; reverting to previous durable snapshot")
 		return
 	}
 	if err := dumpMemfdPages(memFile, offsets, layerPath, os.Getpagesize()); err != nil {
-		log.Error().Err(err).Msg("bridge pause: memfd dump failed; keeping previous durable snapshot")
-		_ = os.Remove(layerPath)
-		m.endFlush(inst, err)
+		failRevert(err, "bridge pause: memfd dump failed; reverting to previous durable snapshot")
 		return
 	}
 	// Durable: commit the manifest with the new layer appended (atomic temp + rename).
 	manifest.Overlays = append(manifest.Overlays, layerName)
 	if err := writeManifestAtomic(snapshotDir, manifest); err != nil {
-		log.Error().Err(err).Msg("bridge pause: manifest commit failed; keeping previous durable snapshot")
-		_ = os.Remove(layerPath)
-		m.endFlush(inst, err)
+		failRevert(err, "bridge pause: manifest commit failed; reverting to previous durable snapshot")
 		return
+	}
+	if priorVmstateSaved {
+		discardPriorVmstate(vmstatePath) // new vmstate pairs with the new chain now
 	}
 	log.Info().Int("pages", len(offsets)).Msg("VM paused (memfd bridge flush durable)")
 	m.endFlush(inst, nil)
@@ -1140,6 +1183,27 @@ func (m *Manager) countHeldBridgeMemfds() int {
 		inst.mu.RUnlock()
 	}
 	return n
+}
+
+// revertPriorVmstate reverts vmstate to the prior committed copy after a failed flush, so a
+// later resume loads a vmstate consistent with the prior (still-committed) memory chain.
+// onlyIfPaused is set on the bridge path: a fast-resumed (Running) VM has already loaded the
+// new vmstate into its Firecracker, so reverting the file would both be pointless and could
+// race that restore — leave it (the VM's next pause re-commits a consistent state, and a
+// crash before then is the same stale-by-one the prior chain already represents).
+func (m *Manager) revertPriorVmstate(inst *VMInstance, vmstatePath string, onlyIfPaused bool) {
+	if onlyIfPaused {
+		inst.mu.RLock()
+		running := inst.Status != StatusPaused
+		inst.mu.RUnlock()
+		if running {
+			discardPriorVmstate(vmstatePath)
+			return
+		}
+	}
+	if err := restorePriorVmstate(vmstatePath); err != nil {
+		m.log.Warn().Str("vm_id", inst.ID).Err(err).Msg("revert prior vmstate after failed flush")
+	}
 }
 
 // beginFlush marks inst as having an in-progress async-pause flush, arming the
@@ -1370,13 +1434,11 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}()
 	if !useMemfd {
 		// No memfd handoff — wait for any in-flight flush to commit the durable chain. If it
-		// FAILED, the memory chain reverted to the prior one while vmstate.snap holds the
-		// failed pause's state, so a resume would pair mismatched vmstate + memory. Refuse and
-		// mark failed rather than boot a torn VM.
+		// FAILED, completeAsyncPause/completeBridgePause already reverted vmstate to the prior
+		// committed copy, so the prior chain + vmstate are consistent: resume from it (the
+		// failed pause's changes are lost — stale by one pause), surfacing the failure loudly.
 		if ferr := m.waitForFlush(inst); ferr != nil {
-			m.setStatus(vmID, StatusError)
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"cannot resume %s: last async snapshot flush failed (%v); snapshot is not durable", vmID, ferr)
+			log.Warn().Err(ferr).Msg("last async flush failed; resuming from the prior durable snapshot (last pause's changes lost)")
 		}
 	}
 	m.waitForFlatten(inst)

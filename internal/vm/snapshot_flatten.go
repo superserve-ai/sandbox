@@ -218,7 +218,7 @@ func (m *Manager) gcOrphanLayers(snapshotDir string) (int64, error) {
 			continue
 		}
 		name := e.Name()
-		if !layerFileRe.MatchString(name) && !strings.HasSuffix(name, ".next") && name != bridgeDirtyOffsetsName {
+		if !layerFileRe.MatchString(name) && !strings.HasSuffix(name, ".next") && name != bridgeDirtyOffsetsName && name != vmstatePrevName {
 			continue
 		}
 		if referenced[name] {
