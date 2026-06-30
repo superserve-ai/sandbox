@@ -197,6 +197,12 @@ var layerFileRe = regexp.MustCompile(`^mem\.(?:\d+|flat\.\d+)\.diff$`)
 // records is kept; the rest are interrupted-pause orphans.
 var vmstateFileRe = regexp.MustCompile(`^vmstate\.\d+\.snap$`)
 
+// vmstateOverlayFileRe matches a per-layer vmstate's block-overlay sidecar
+// (vmstate.<n>.snap.overlay — Firecracker reads "<vmstate>.overlay" on restore). The sidecar
+// paired with the manifest's committed vmstate is kept; the rest are orphans (older layers, or
+// an interrupted/failed pause).
+var vmstateOverlayFileRe = regexp.MustCompile(`^vmstate\.\d+\.snap\.overlay$`)
+
 // gcOrphanLayers reclaims layer/temp files the manifest doesn't reference that have
 // been untouched for the grace period — interrupted-flatten leftovers and stale
 // *.next temps. (Crashed-pause partials self-heal: the next append overwrites the
@@ -212,7 +218,8 @@ func (m *Manager) gcOrphanLayers(snapshotDir string) (int64, error) {
 		referenced[o] = true
 	}
 	if man.Vmstate != "" {
-		referenced[man.Vmstate] = true // the committed vmstate pairs with this chain — keep it
+		referenced[man.Vmstate] = true            // the committed vmstate pairs with this chain — keep it
+		referenced[man.Vmstate+".overlay"] = true // and its block-overlay sidecar (Firecracker reads <vmstate>.overlay)
 	}
 	entries, err := os.ReadDir(snapshotDir)
 	if err != nil {
@@ -225,7 +232,9 @@ func (m *Manager) gcOrphanLayers(snapshotDir string) (int64, error) {
 			continue
 		}
 		name := e.Name()
-		if !layerFileRe.MatchString(name) && !vmstateFileRe.MatchString(name) && !strings.HasSuffix(name, ".next") && name != bridgeDirtyOffsetsName {
+		if !layerFileRe.MatchString(name) && !vmstateFileRe.MatchString(name) &&
+			!vmstateOverlayFileRe.MatchString(name) && !strings.HasSuffix(name, ".next") &&
+			name != bridgeDirtyOffsetsName {
 			continue
 		}
 		if referenced[name] {

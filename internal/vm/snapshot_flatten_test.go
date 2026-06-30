@@ -154,9 +154,15 @@ func TestGCOrphanLayers(t *testing.T) {
 	mk("mem.1.diff", true)         // aged orphan → reclaim
 	mk("manifest.json.next", true) // aged temp → reclaim
 	mk("mem.2.diff", false)        // recent orphan → keep (grace)
-	mk("vmstate.snap", true)       // not a layer/temp → keep
+	mk("vmstate.snap", true)       // legacy vmstate (no index) → not a layer/temp → keep
+	// Per-layer vmstate + its block-overlay sidecar: the committed one (man.Vmstate) and its
+	// sidecar are kept; an older/interrupted layer's vmstate + sidecar are aged orphans → reclaim.
+	mk("vmstate.5.snap", true)         // committed (man.Vmstate) → keep
+	mk("vmstate.5.snap.overlay", true) // committed sidecar → keep (FC reads <vmstate>.overlay)
+	mk("vmstate.1.snap", true)         // aged orphan vmstate → reclaim
+	mk("vmstate.1.snap.overlay", true) // aged orphan sidecar → reclaim
 
-	man := &snapshotManifest{Base: "/templates/x/mem.snap", Overlays: []string{"mem.0.diff"}}
+	man := &snapshotManifest{Base: "/templates/x/mem.snap", Overlays: []string{"mem.0.diff"}, Vmstate: "vmstate.5.snap"}
 	if err := writeManifestAtomic(dir, man); err != nil {
 		t.Fatal(err)
 	}
@@ -170,12 +176,12 @@ func TestGCOrphanLayers(t *testing.T) {
 		_, err := os.Stat(filepath.Join(dir, name))
 		return err == nil
 	}
-	for _, keep := range []string{"mem.0.diff", "mem.2.diff", "vmstate.snap", "manifest.json"} {
+	for _, keep := range []string{"mem.0.diff", "mem.2.diff", "vmstate.snap", "manifest.json", "vmstate.5.snap", "vmstate.5.snap.overlay"} {
 		if !exists(keep) {
 			t.Fatalf("%s was reclaimed but should be kept", keep)
 		}
 	}
-	for _, gone := range []string{"mem.1.diff", "manifest.json.next"} {
+	for _, gone := range []string{"mem.1.diff", "manifest.json.next", "vmstate.1.snap", "vmstate.1.snap.overlay"} {
 		if exists(gone) {
 			t.Fatalf("%s should have been reclaimed", gone)
 		}
