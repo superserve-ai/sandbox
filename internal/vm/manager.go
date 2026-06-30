@@ -788,7 +788,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// Memfd bridge: when guest RAM is memfd-backed, capture it, take a vmstate +
 		// dirty-offsets snapshot (no mem dump), stop the old FC to free the unit, and copy
 		// the dirty pages from the held memfd in the background. This frees the unit for an
-		// immediate resume (A5) instead of keeping the old FC alive for the whole flush.
+		// immediate resume instead of keeping the old FC alive for the whole flush.
 		// Any capture/snapshot failure falls back to the in-FC async path (sem still held).
 		if async && m.cfg.SharedMemEnabled {
 			// The cached PID is 0 right after a resume (the unit's MainPID is published
@@ -826,7 +826,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				inst.DirtyTracked = false
 				inst.PID = 0 // FC stopped
 				// Expose the held memfd so a resume during this flush serves faults from
-				// RAM instead of waiting for the dump (A5). Valid only while completeBridgePause
+				// RAM instead of waiting for the dump. Valid only while completeBridgePause
 				// holds memFile open; it clears these (under mu) before closing it.
 				inst.bridgeMemFdPath = guestMemFdPath(memFile)
 				inst.bridgePendingLayer = layerPath
@@ -1002,7 +1002,8 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 // fresh sparse diff layer, and on success commits the manifest (the durability point).
 // On any failure it drops the orphaned layer and keeps the previous durable chain — the
 // sandbox stays resumable from the committed manifest (stale by one pause, never corrupt).
-// The held memfd is released when the dump finishes (A5 extends the hold for fast resume).
+// vmd's memfd fd is closed when the dump finishes; a resume that adopted the memfd during
+// the flush holds its own fd (and the new Firecracker's mmap keeps the pages resident).
 func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, layerName string, memFile *os.File, dirtyOffsetsPath string, manifest *snapshotManifest) {
 	// Defers run LIFO: clear the handoff fields under mu FIRST, then close memFile, then
 	// release the sem. Clearing before the close (and under mu) means a concurrent resume
@@ -1323,7 +1324,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, err
 	}
 
-	// Memfd-bridge fast resume (A5): if a bridge pause is still flushing and its memfd is
+	// Memfd-bridge fast resume: if a bridge pause is still flushing and its memfd is
 	// available, serve faults from that RAM (as the newest overlay) instead of waiting for
 	// the disk flush — resume returns in ~constant time regardless of the dirty-set size.
 	// Reopen vmd's own fd to the memfd under the lock so it can't be closed mid-decision;
