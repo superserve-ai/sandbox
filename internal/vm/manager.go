@@ -1454,10 +1454,11 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	var memfdFd *os.File
 	var memfdResumePath, bridgePendingLayer string
 	// Only take the memfd fast path while under the held-memfd cap, so the feature can't
-	// pin unbounded extra RAM fleet-wide. Check the count BEFORE taking inst.mu
-	// (countHeldBridgeMemfds locks instances); this inst isn't counted yet, and a soft
-	// over-allow under concurrent resumes is acceptable.
-	if m.countHeldBridgeMemfds() < m.maxBridgeMemfds() {
+	// pin unbounded extra RAM fleet-wide. Gate on the flag first so a flags-off resume pays
+	// nothing (countHeldBridgeMemfds scans all VMs). Check the count BEFORE taking inst.mu
+	// (it locks instances); this inst isn't counted yet, and a soft over-allow under concurrent
+	// resumes is acceptable.
+	if m.cfg.SharedMemEnabled && m.countHeldBridgeMemfds() < m.maxBridgeMemfds() {
 		inst.mu.Lock()
 		if inst.flushing && inst.bridgeMemFdPath != "" {
 			if f, oerr := os.Open(inst.bridgeMemFdPath); oerr == nil {
