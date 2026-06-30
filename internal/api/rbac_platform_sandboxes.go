@@ -135,7 +135,7 @@ func (h *Handlers) ListPlatformTeamSandboxes(c *gin.Context) {
 	rows, err := h.Pool.Query(c.Request.Context(), `
 		SELECT id, team_id, name, status, vcpu_count, memory_mib,
 		       snapshot_id, timeout_seconds,
-		       COALESCE(network, '{}'::jsonb),
+		       COALESCE(network_config, '{}'::jsonb),
 		       COALESCE(metadata, '{}'::jsonb),
 		       created_at
 		FROM sandbox
@@ -189,7 +189,7 @@ func (h *Handlers) GetPlatformTeamSandbox(c *gin.Context) {
 		return h.Pool.QueryRow(c.Request.Context(), `
 			SELECT id, team_id, name, status, vcpu_count, memory_mib,
 			       snapshot_id, timeout_seconds,
-			       COALESCE(network, '{}'::jsonb),
+			       COALESCE(network_config, '{}'::jsonb),
 			       COALESCE(metadata, '{}'::jsonb),
 			       created_at
 			FROM sandbox
