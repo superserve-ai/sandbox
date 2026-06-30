@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,6 +49,64 @@ func captureGuestMemFd(fcPID int) (*os.File, error) {
 		return f, nil
 	}
 	return nil, fmt.Errorf("capture guest_mem fd: no guest_mem memfd in pid %d (shared_mem not enabled?)", fcPID)
+}
+
+// readDirtyOffsets parses the dirty-page-offsets sidecar Firecracker writes for a
+// memfd-bridge pause: a sequence of little-endian u64 byte offsets (ascending). These
+// are the exact pages a normal diff dump would have written.
+func readDirtyOffsets(path string) ([]uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read dirty offsets: %w", err)
+	}
+	if len(data)%8 != 0 {
+		return nil, fmt.Errorf("dirty offsets sidecar %q has truncated length %d", path, len(data))
+	}
+	offsets := make([]uint64, len(data)/8)
+	for i := range offsets {
+		offsets[i] = binary.LittleEndian.Uint64(data[i*8:])
+	}
+	return offsets, nil
+}
+
+// dumpMemfdPages copies the pages at `offsets` from the held guest-memory memfd into a
+// fresh sparse diff layer at dstPath, producing the same overlay a Firecracker diff dump
+// would have (only dirtied pages written; the rest left as holes that fall through to the
+// base on restore). The layer is sized to the full memfd (guest RAM) so the offsets are
+// valid and unwritten regions read as zero holes. Fsyncs before returning (the durability
+// point is the caller's manifest commit, which follows).
+func dumpMemfdPages(src *os.File, offsets []uint64, dstPath string, pageSize int) error {
+	info, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat memfd: %w", err)
+	}
+	total := info.Size()
+
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("open diff layer: %w", err)
+	}
+	defer dst.Close()
+	if err := dst.Truncate(total); err != nil {
+		return fmt.Errorf("size diff layer: %w", err)
+	}
+
+	buf := make([]byte, pageSize)
+	for _, off := range offsets {
+		if int64(off)+int64(pageSize) > total {
+			return fmt.Errorf("dirty offset %d + page exceeds guest RAM %d", off, total)
+		}
+		if _, err := src.ReadAt(buf, int64(off)); err != nil {
+			return fmt.Errorf("read page at %d from memfd: %w", off, err)
+		}
+		if _, err := dst.WriteAt(buf, int64(off)); err != nil {
+			return fmt.Errorf("write page at %d to diff layer: %w", off, err)
+		}
+	}
+	if err := dst.Sync(); err != nil {
+		return fmt.Errorf("fsync diff layer: %w", err)
+	}
+	return nil
 }
 
 // guestMemFdPath returns the path a freshly spawned Firecracker can use to

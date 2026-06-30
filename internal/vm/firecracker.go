@@ -337,6 +337,37 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath string, async bool) er
 	return nil
 }
 
+// CreateDiffSnapshotBridge takes the memfd-bridge variant of a diff pause: Firecracker
+// pauses the vCPUs, writes the microVM state to snapshotPath and the dirty page offsets to
+// dirtyOffsetsPath, and returns WITHOUT dumping guest memory. The caller holds the guest
+// memory memfd and copies exactly those pages from it (then stops Firecracker), so the VM
+// unit frees immediately for a fast resume. memPath is required by the API but unused here
+// (no memory dump happens). Requires shared_mem-backed guest memory.
+func CreateDiffSnapshotBridge(socketPath, snapshotPath, memPath, dirtyOffsetsPath string) error {
+	fc := newFCClient(socketPath)
+	ctx := context.Background()
+
+	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
+		Context: ctx,
+		Body:    &models.VM{State: strPtr(models.VMStatePaused)},
+	}); err != nil {
+		return fmt.Errorf("pause VM: %w", err)
+	}
+
+	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
+		Context: ctx,
+		Body: &models.SnapshotCreateParams{
+			SnapshotPath:     &snapshotPath,
+			MemFilePath:      &memPath,
+			SnapshotType:     models.SnapshotCreateParamsSnapshotTypeDiff,
+			DirtyOffsetsPath: dirtyOffsetsPath,
+		},
+	}); err != nil {
+		return fmt.Errorf("create bridge snapshot: %w", err)
+	}
+	return nil
+}
+
 // CompleteSnapshot waits (PUT /snapshot/complete) for an async snapshot's background
 // write + fsync to finish, so the diff is durable on return; a no-op on the FC side
 // when no async snapshot is active. Issued as a raw request over the UDS (the

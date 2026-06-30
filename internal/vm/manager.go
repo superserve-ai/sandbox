@@ -690,6 +690,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	dirtyTracked := inst.DirtyTracked
 	instBaseMem := inst.BaseMemPath
 	instMemFile := inst.MemFilePath
+	instPID := inst.PID
 	inst.mu.RUnlock()
 
 	// Layered incremental: a template-created, dirty-tracked VM writes a diff overlay
@@ -744,13 +745,55 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// the first layer, which has only the read-only template base under it).
 		async := m.cfg.AsyncPauseEnabled && newIndex > 0
 		// Claim a background-flush slot; if the cap is full, fall back to a synchronous
-		// pause rather than pile RAM-holding flushes on. Released in completeAsyncPause.
+		// pause rather than pile RAM-holding flushes on. Released in completeAsyncPause /
+		// completeBridgePause.
 		if async {
 			select {
 			case m.pauseSem <- struct{}{}:
 			default:
 				async = false
 				log.Info().Msg("async pause cap full; falling back to synchronous pause")
+			}
+		}
+		// Memfd bridge: when guest RAM is memfd-backed, capture it, take a vmstate +
+		// dirty-offsets snapshot (no mem dump), stop the old FC to free the unit, and copy
+		// the dirty pages from the held memfd in the background. This frees the unit for an
+		// immediate resume (A5) instead of keeping the old FC alive for the whole flush.
+		// Any capture/snapshot failure falls back to the in-FC async path (sem still held).
+		if async && m.cfg.SharedMemEnabled {
+			memFile, ferr := captureGuestMemFd(instPID)
+			if ferr != nil {
+				log.Warn().Err(ferr).Msg("memfd capture failed; falling back to in-FC async flush")
+			} else {
+				dirtyOffsetsPath := filepath.Join(snapshotDir, "mem.dirty.offsets")
+				log.Info().Str("snapshot_path", snapshotPath).Int("layer", newIndex).
+					Msg("pausing VM — memfd bridge (vmd flushes dirty pages)")
+				if err := CreateDiffSnapshotBridge(socketPath, snapshotPath, layerPath, dirtyOffsetsPath); err != nil {
+					memFile.Close()
+					<-m.pauseSem
+					_ = os.Remove(layerPath)
+					return "", "", m.handleVMError(vmID, fmt.Errorf("bridge diff snapshot: %w", err))
+				}
+				// Stop the old FC now: vmd holds the memfd, so guest RAM stays resident and
+				// the unit is free for a fast resume while vmd flushes.
+				if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
+					log.Warn().Err(err).Msg("stop FC after bridge snapshot")
+				}
+				// Mark flushing BEFORE status=paused (same ordering as the in-FC async path)
+				// so the reconciler never mistakes the flush window for a stranded FC.
+				m.beginFlush(inst)
+				inst.mu.Lock()
+				inst.Status = StatusPaused
+				inst.SnapshotPath = snapshotPath
+				inst.MemFilePath = layerPath
+				inst.BaseMemPath = baseMemPath
+				inst.DirtyTracked = false
+				inst.PID = 0 // FC stopped
+				inst.mu.Unlock()
+				m.persistState(inst)
+				go m.completeBridgePause(inst, snapshotDir, layerPath, layerName, memFile, dirtyOffsetsPath, appendManifest)
+				log.Info().Int("layer", newIndex).Msg("VM pausing (memfd bridge flush in background)")
+				return snapshotPath, layerPath, nil
 			}
 		}
 		log.Info().Str("snapshot_path", snapshotPath).Int("layer", newIndex).Bool("async", async).
@@ -907,6 +950,47 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 	}
 	m.stopAsyncPauseFC(vmID)
 	log.Info().Msg("VM paused (async memory flush durable)")
+	m.endFlush(inst, nil)
+	// Bound chain depth off the hot path now that this layer is durable.
+	m.maybeFlatten(inst, snapshotDir)
+}
+
+// completeBridgePause runs after a memfd-bridge pause returned at the snapshot point.
+// The old Firecracker is already stopped; vmd holds the guest-memory memfd. It reads the
+// dirty-page offsets Firecracker wrote, copies exactly those pages from the memfd into a
+// fresh sparse diff layer, and on success commits the manifest (the durability point).
+// On any failure it drops the orphaned layer and keeps the previous durable chain — the
+// sandbox stays resumable from the committed manifest (stale by one pause, never corrupt).
+// The held memfd is released when the dump finishes (A5 extends the hold for fast resume).
+func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, layerName string, memFile *os.File, dirtyOffsetsPath string, manifest *snapshotManifest) {
+	defer func() { <-m.pauseSem }()  // release the background-flush slot claimed in PauseVM
+	defer memFile.Close()            // release the held memfd
+	defer os.Remove(dirtyOffsetsPath) // sidecar consumed
+	vmID := inst.ID
+	log := m.log.With().Str("vm_id", vmID).Logger()
+
+	offsets, err := readDirtyOffsets(dirtyOffsetsPath)
+	if err != nil {
+		log.Error().Err(err).Msg("bridge pause: read dirty offsets failed; keeping previous durable snapshot")
+		_ = os.Remove(layerPath)
+		m.endFlush(inst, err)
+		return
+	}
+	if err := dumpMemfdPages(memFile, offsets, layerPath, os.Getpagesize()); err != nil {
+		log.Error().Err(err).Msg("bridge pause: memfd dump failed; keeping previous durable snapshot")
+		_ = os.Remove(layerPath)
+		m.endFlush(inst, err)
+		return
+	}
+	// Durable: commit the manifest with the new layer appended (atomic temp + rename).
+	manifest.Overlays = append(manifest.Overlays, layerName)
+	if err := writeManifestAtomic(snapshotDir, manifest); err != nil {
+		log.Error().Err(err).Msg("bridge pause: manifest commit failed; keeping previous durable snapshot")
+		_ = os.Remove(layerPath)
+		m.endFlush(inst, err)
+		return
+	}
+	log.Info().Int("pages", len(offsets)).Msg("VM paused (memfd bridge flush durable)")
 	m.endFlush(inst, nil)
 	// Bound chain depth off the hot path now that this layer is durable.
 	m.maybeFlatten(inst, snapshotDir)

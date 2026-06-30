@@ -26,6 +26,9 @@ type SnapshotCreateParams struct {
 	// If true (and snapshot_type is Diff), write the memory diff on a background thread and return at the snapshot point; the caller must PUT /snapshot/complete to confirm durability. The vCPUs must stay paused until then. Ignored for Full snapshots.
 	AsyncSnapshot bool `json:"async_snapshot,omitempty"`
 
+	// Memfd bridge (requires snapshot_type Diff): write the microVM state plus a dirty-page-offsets sidecar at this path and skip the memory dump. The orchestrator copies those pages from the held guest-memory memfd. The vCPUs must stay paused.
+	DirtyOffsetsPath string `json:"dirty_offsets_path,omitempty"`
+
 	// Path to the file that will contain the guest memory.
 	// Required: true
 	MemFilePath *string `json:"mem_file_path"`

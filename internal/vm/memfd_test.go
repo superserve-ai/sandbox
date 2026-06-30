@@ -1,7 +1,10 @@
 package vm
 
 import (
+	"bytes"
+	"encoding/binary"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -58,6 +61,81 @@ func TestCaptureGuestMemFd(t *testing.T) {
 	}
 	if string(buf) != want {
 		t.Fatalf("held fd content = %q, want %q", buf, want)
+	}
+}
+
+// TestDumpMemfdPages drives the bridge dump end to end: a memfd with two dirty pages,
+// a dirty-offsets sidecar naming them, then readDirtyOffsets + dumpMemfdPages must
+// reproduce exactly those pages in a sparse diff layer (the rest left as zero holes).
+func TestDumpMemfdPages(t *testing.T) {
+	ps := os.Getpagesize()
+	const npages = 5
+
+	fd, err := unix.MemfdCreate("guest_mem", 0)
+	if err != nil {
+		t.Fatalf("memfd_create: %v", err)
+	}
+	src := os.NewFile(uintptr(fd), "guest_mem")
+	defer src.Close()
+	if err := src.Truncate(int64(npages * ps)); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	// Dirty pages 1 (0xAA) and 3 (0xBB); pages 0,2,4 stay holes.
+	if _, err := src.WriteAt(bytes.Repeat([]byte{0xAA}, ps), int64(1*ps)); err != nil {
+		t.Fatalf("write page 1: %v", err)
+	}
+	if _, err := src.WriteAt(bytes.Repeat([]byte{0xBB}, ps), int64(3*ps)); err != nil {
+		t.Fatalf("write page 3: %v", err)
+	}
+
+	dir := t.TempDir()
+	sidecar := filepath.Join(dir, "mem.dirty.offsets")
+	var enc []byte
+	for _, off := range []uint64{uint64(1 * ps), uint64(3 * ps)} {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], off)
+		enc = append(enc, b[:]...)
+	}
+	if err := os.WriteFile(sidecar, enc, 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	offsets, err := readDirtyOffsets(sidecar)
+	if err != nil {
+		t.Fatalf("readDirtyOffsets: %v", err)
+	}
+	if want := []uint64{uint64(1 * ps), uint64(3 * ps)}; len(offsets) != 2 || offsets[0] != want[0] || offsets[1] != want[1] {
+		t.Fatalf("offsets = %v, want %v", offsets, want)
+	}
+
+	out := filepath.Join(dir, "mem.0.diff")
+	if err := dumpMemfdPages(src, offsets, out, ps); err != nil {
+		t.Fatalf("dumpMemfdPages: %v", err)
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	if len(data) != npages*ps {
+		t.Fatalf("out size = %d, want %d", len(data), npages*ps)
+	}
+	for pg, want := range map[int]byte{0: 0x00, 1: 0xAA, 2: 0x00, 3: 0xBB, 4: 0x00} {
+		got := data[pg*ps : pg*ps+ps]
+		if !bytes.Equal(got, bytes.Repeat([]byte{want}, ps)) {
+			t.Fatalf("page %d: first byte 0x%02x, want all 0x%02x", pg, got[0], want)
+		}
+	}
+}
+
+func TestReadDirtyOffsetsTruncated(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "off")
+	if err := os.WriteFile(p, []byte{1, 2, 3}, 0o644); err != nil { // not a multiple of 8
+		t.Fatal(err)
+	}
+	if _, err := readDirtyOffsets(p); err == nil {
+		t.Fatal("expected error for truncated offsets file")
 	}
 }
 
