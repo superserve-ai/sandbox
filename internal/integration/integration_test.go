@@ -476,6 +476,14 @@ func assertFloatNear(t *testing.T, got, want float64) {
 	}
 }
 
+func assertFloatBetween(t *testing.T, got, min, max float64) {
+	t.Helper()
+	const epsilon = 0.000000000001
+	if got < min-epsilon || got > max+epsilon {
+		t.Fatalf("got %v, want between %v and %v", got, min, max)
+	}
+}
+
 func TestIntegration_Auth_HealthNoKeyRequired(t *testing.T) {
 	w := do(newRouter(t), "GET", "/health", "", "")
 	if w.Code != http.StatusOK {
@@ -535,6 +543,192 @@ func TestIntegration_GetBillingPricing(t *testing.T) {
 
 	body := decodeBillingPricingResponse(t, w)
 	assertPaygPricingResponse(t, body)
+}
+
+func TestIntegration_GetBillingSummary(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-summary-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	periodStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	periodEnd := periodStart.AddDate(0, 1, 0)
+	end := now.Add(-30 * time.Minute)
+	start := end.Add(-1 * time.Hour)
+	if start.Before(periodStart) {
+		start = periodStart
+		end = start.Add(time.Hour)
+		if end.After(now) {
+			end = now
+		}
+	}
+	if !end.After(start) {
+		t.Fatalf("test clock is too close to the billing period start: start=%s end=%s", start, end)
+	}
+	seconds := end.Sub(start).Seconds()
+	openStart := now.Add(-15 * time.Minute)
+	if openStart.Before(periodStart) {
+		openStart = periodStart
+	}
+	if !now.After(openStart) {
+		t.Fatalf("test clock is too close to the billing period start for open interval: now=%s openStart=%s", now, openStart)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 2, 2048, $3, $4, 'paused')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed compute billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 10240, $3, $4, 'deleted')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed storage billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at
+		)
+		VALUES ($1, $2, 1, 512, $3)
+	`, sandboxID, teamID, openStart); err != nil {
+		t.Fatalf("seed open compute billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at
+		)
+		VALUES ($1, $2, 5120, $3)
+	`, sandboxID, teamID, openStart); err != nil {
+		t.Fatalf("seed open storage billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 0.100000, 0.100000, 'integration test credit')
+	`, teamID); err != nil {
+		t.Fatalf("seed billing credit: %v", err)
+	}
+
+	requestStarted := time.Now().UTC()
+	w := do(r, "GET", "/billing/summary", viewerKey, "")
+	requestFinished := time.Now().UTC()
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "private, max-age=60" {
+		t.Fatalf("Cache-Control = %q, want private, max-age=60", got)
+	}
+	if got := w.Header().Get("Vary"); got != "X-API-Key" {
+		t.Fatalf("Vary = %q, want X-API-Key", got)
+	}
+
+	body := mustJSON(t, w)
+	breakdown, ok := body["cost_breakdown_usd"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
+	}
+	closedCompute := 2 * seconds * 0.000014
+	closedMemory := 2 * seconds * 0.0000045
+	closedStorage := 10 * seconds * 0.00000003
+	minOpenSeconds := requestStarted.Sub(openStart).Seconds()
+	maxOpenSeconds := requestFinished.Sub(openStart).Seconds()
+	if minOpenSeconds < 0 {
+		minOpenSeconds = 0
+	}
+	if maxOpenSeconds < minOpenSeconds {
+		maxOpenSeconds = minOpenSeconds
+	}
+	compute := breakdown["compute"].(float64)
+	memory := breakdown["memory"].(float64)
+	storage := breakdown["storage"].(float64)
+	assertFloatBetween(t, compute, closedCompute+minOpenSeconds*0.000014, closedCompute+maxOpenSeconds*0.000014)
+	assertFloatBetween(t, memory, closedMemory+0.5*minOpenSeconds*0.0000045, closedMemory+0.5*maxOpenSeconds*0.0000045)
+	assertFloatBetween(t, storage, closedStorage+5*minOpenSeconds*0.00000003, closedStorage+5*maxOpenSeconds*0.00000003)
+
+	currentCharges := body["current_charges_usd"].(float64)
+	creditsApplied := math.Min(currentCharges, 0.1)
+	assertFloatNear(t, currentCharges, compute+memory+storage)
+	assertFloatNear(t, body["current_charges_usd"].(float64), currentCharges)
+	assertFloatNear(t, body["credits_applied_usd"].(float64), creditsApplied)
+	assertFloatNear(t, body["credits_remaining_usd"].(float64), 0.1-creditsApplied)
+	assertFloatNear(t, body["expected_invoice_amount_usd"].(float64), currentCharges-creditsApplied)
+
+	period, ok := body["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", body["billing_period"])
+	}
+	if got := period["start"].(string); got != periodStart.Format(time.RFC3339) {
+		t.Fatalf("period start = %q, want %q", got, periodStart.Format(time.RFC3339))
+	}
+	if got := period["end"].(string); got != periodEnd.Format(time.RFC3339) {
+		t.Fatalf("period end = %q, want %q", got, periodEnd.Format(time.RFC3339))
+	}
+	tier, ok := body["pricing_tier"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("pricing_tier not an object: %v", body["pricing_tier"])
+	}
+	if tier["plan_key"] != "payg" || tier["plan_name"] != "Pay-as-you-go" || tier["currency"] != "USD" {
+		t.Fatalf("pricing tier = %v, want payg/Pay-as-you-go/USD", tier)
+	}
+	if _, ok := body["calculated_at"].(string); !ok {
+		t.Fatalf("calculated_at missing or not a string: %v", body["calculated_at"])
+	}
+}
+
+func TestIntegration_GetBillingSummaryDeniesUserAdmin(t *testing.T) {
+	_, apiKey, _ := seedTeamAndKeyWithRole(t, "user_admin")
+	r := newRouter(t)
+
+	w := do(r, "GET", "/billing/summary", apiKey, "")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetBillingSummaryNoActivePricingRatesReturns503(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
+	planKey := "empty-rate-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Empty rate integration pricing', 'USD', true)
+	`, planKey); err != nil {
+		t.Fatalf("insert pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("assign pricing plan: %v", err)
+	}
+
+	w := do(newRouter(t), "GET", "/billing/summary", apiKey, "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for empty pricing rates, got %d: %s", w.Code, w.Body.String())
+	}
 }
 
 func TestIntegration_GetPublicBillingPricing(t *testing.T) {
@@ -3191,4 +3385,3 @@ func TestIntegration_CreateTemplate_DuplicateLiveNameReturns409(t *testing.T) {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
 	}
 }
-
