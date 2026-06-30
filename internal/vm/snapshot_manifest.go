@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/rs/zerolog/log"
 )
 
 // snapshotManifest records a layered memory snapshot as a read-only base image
@@ -73,7 +75,15 @@ func writeManifestAtomic(dir string, m *snapshotManifest) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return fsyncDir(dir)
+	// The rename is the commit point — the manifest is now visible and names the new layer.
+	// A dir-fsync failure here only means the rename may not survive a power loss (which then
+	// falls back to the prior chain, still intact); it must NOT be returned, or callers would
+	// take it as a failed commit and delete the just-committed layer, leaving the live manifest
+	// pointing at a missing file. Surface it as a warning instead.
+	if err := fsyncDir(dir); err != nil {
+		log.Warn().Err(err).Str("dir", dir).Msg("manifest committed but dir fsync failed (not crash-durable)")
+	}
+	return nil
 }
 
 // vmstatePrevName is the basename savePriorVmstate writes (the prior committed vmstate held

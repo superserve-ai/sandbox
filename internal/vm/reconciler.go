@@ -350,7 +350,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// Guards: the grace period lets a normal resume-in-progress clear first, and
 	// isFlushing skips a live in-process flush.
 	for id := range active {
-		if r.mgr.isFlushing(id) {
+		if r.mgr.isFlushing(id) || r.mgr.isRestoring(id) {
+			// A live flush or an in-progress resume/verify legitimately runs the unit while
+			// the record still reads paused — not a stranded FC.
 			r.clearDrift("stranded:" + id)
 			continue
 		}
