@@ -193,6 +193,10 @@ const orphanGraceSeconds = 600
 // layerFileRe matches an overlay layer file name (mem.<n>.diff or mem.flat.<n>.diff).
 var layerFileRe = regexp.MustCompile(`^mem\.(?:\d+|flat\.\d+)\.diff$`)
 
+// vmstateFileRe matches a per-layer vmstate file (vmstate.<n>.snap). The one the manifest
+// records is kept; the rest are interrupted-pause orphans.
+var vmstateFileRe = regexp.MustCompile(`^vmstate\.\d+\.snap$`)
+
 // gcOrphanLayers reclaims layer/temp files the manifest doesn't reference that have
 // been untouched for the grace period — interrupted-flatten leftovers and stale
 // *.next temps. (Crashed-pause partials self-heal: the next append overwrites the
@@ -203,9 +207,12 @@ func (m *Manager) gcOrphanLayers(snapshotDir string) (int64, error) {
 	if err != nil || man == nil {
 		return 0, err
 	}
-	referenced := make(map[string]bool, len(man.Overlays))
+	referenced := make(map[string]bool, len(man.Overlays)+1)
 	for _, o := range man.Overlays {
 		referenced[o] = true
+	}
+	if man.Vmstate != "" {
+		referenced[man.Vmstate] = true // the committed vmstate pairs with this chain — keep it
 	}
 	entries, err := os.ReadDir(snapshotDir)
 	if err != nil {
@@ -218,7 +225,7 @@ func (m *Manager) gcOrphanLayers(snapshotDir string) (int64, error) {
 			continue
 		}
 		name := e.Name()
-		if !layerFileRe.MatchString(name) && !strings.HasSuffix(name, ".next") && name != bridgeDirtyOffsetsName && name != vmstatePrevName {
+		if !layerFileRe.MatchString(name) && !vmstateFileRe.MatchString(name) && !strings.HasSuffix(name, ".next") && name != bridgeDirtyOffsetsName {
 			continue
 		}
 		if referenced[name] {

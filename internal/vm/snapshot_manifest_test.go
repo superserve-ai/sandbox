@@ -66,54 +66,40 @@ func TestRemoveManifest(t *testing.T) {
 	}
 }
 
-func TestPriorVmstatePreservation(t *testing.T) {
+func TestManifestVmstate(t *testing.T) {
 	dir := t.TempDir()
-	vmstate := filepath.Join(dir, "vmstate.snap")
-	if err := os.WriteFile(vmstate, []byte("committed-N"), 0o644); err != nil {
-		t.Fatal(err)
+
+	// A manifest that records its vmstate resolves to that per-layer file; the commit is
+	// atomic (the single manifest rename carries chain + vmstate), and round-trips.
+	want := &snapshotManifest{
+		Base:     "/templates/foo/mem.snap",
+		Overlays: []string{"mem.0.diff", "mem.1.diff"},
+		Vmstate:  vmstateLayerName(1),
+	}
+	if want.Vmstate != "vmstate.1.snap" {
+		t.Fatalf("vmstateLayerName(1) = %q, want vmstate.1.snap", want.Vmstate)
+	}
+	if err := writeManifestAtomic(dir, want); err != nil {
+		t.Fatalf("writeManifestAtomic: %v", err)
+	}
+	got, err := readManifest(dir)
+	if err != nil || got == nil {
+		t.Fatalf("readManifest = (%v, %v)", got, err)
+	}
+	if got.Vmstate != want.Vmstate {
+		t.Fatalf("round-trip Vmstate = %q, want %q", got.Vmstate, want.Vmstate)
+	}
+	if p := manifestVmstatePath(dir, got); p != filepath.Join(dir, "vmstate.1.snap") {
+		t.Fatalf("manifestVmstatePath = %q, want dir/vmstate.1.snap", p)
 	}
 
-	// Save copies the committed vmstate aside without disturbing the live file.
-	saved, err := savePriorVmstate(vmstate)
-	if err != nil || !saved {
-		t.Fatalf("savePriorVmstate = (%v, %v), want (true, nil)", saved, err)
+	// A manifest without a recorded vmstate (or no manifest) falls back to the legacy file.
+	legacy := &snapshotManifest{Base: "b", Overlays: []string{"mem.0.diff"}}
+	if p := manifestVmstatePath(dir, legacy); p != filepath.Join(dir, "vmstate.snap") {
+		t.Fatalf("legacy manifestVmstatePath = %q, want dir/vmstate.snap", p)
 	}
-	if b, _ := os.ReadFile(vmstate); string(b) != "committed-N" {
-		t.Fatalf("save disturbed the live vmstate: %q", b)
-	}
-
-	// The pause overwrites vmstate with the new (about-to-fail) state.
-	if err := os.WriteFile(vmstate, []byte("failed-N+1"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Restore (flush failed) reverts to the prior committed copy and clears it.
-	if err := restorePriorVmstate(vmstate); err != nil {
-		t.Fatalf("restorePriorVmstate: %v", err)
-	}
-	if b, _ := os.ReadFile(vmstate); string(b) != "committed-N" {
-		t.Fatalf("after restore vmstate = %q, want committed-N", b)
-	}
-	if _, err := os.Stat(vmstatePrevPath(vmstate)); !os.IsNotExist(err) {
-		t.Fatalf(".prev survived restore: %v", err)
-	}
-
-	// Discard (flush succeeded) just drops the copy; restore is then a no-op.
-	if _, err := savePriorVmstate(vmstate); err != nil {
-		t.Fatal(err)
-	}
-	discardPriorVmstate(vmstate)
-	if _, err := os.Stat(vmstatePrevPath(vmstate)); !os.IsNotExist(err) {
-		t.Fatalf(".prev survived discard: %v", err)
-	}
-	if err := restorePriorVmstate(vmstate); err != nil {
-		t.Fatalf("restorePriorVmstate(absent) = %v, want nil", err)
-	}
-
-	// No prior vmstate (first layer) ⇒ save reports nothing copied, no error.
-	empty := filepath.Join(dir, "missing.snap")
-	if saved, err := savePriorVmstate(empty); err != nil || saved {
-		t.Fatalf("savePriorVmstate(absent) = (%v, %v), want (false, nil)", saved, err)
+	if p := manifestVmstatePath(dir, nil); p != filepath.Join(dir, "vmstate.snap") {
+		t.Fatalf("nil manifestVmstatePath = %q, want dir/vmstate.snap", p)
 	}
 }
 

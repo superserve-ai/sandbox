@@ -3,7 +3,6 @@ package vm
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -29,6 +28,12 @@ type snapshotManifest struct {
 	// ordered oldest → newest. The newest is the active layer (the loader's
 	// snapshot path); the earlier ones are lower overlays.
 	Overlays []string `json:"overlays"`
+	// Vmstate is the file name (within the snapshot dir) of the CPU/device state that
+	// pairs with this chain. Recording it here makes the manifest the single atomic
+	// commit for {memory chain + vmstate}: the one manifest rename commits both, so a
+	// crash or failed flush can never leave a new vmstate paired with an old chain.
+	// Empty ⇒ legacy snapshot whose vmstate is the dir's "vmstate.snap".
+	Vmstate string `json:"vmstate,omitempty"`
 }
 
 const manifestFileName = "manifest.json"
@@ -86,59 +91,24 @@ func writeManifestAtomic(dir string, m *snapshotManifest) error {
 	return nil
 }
 
-// vmstatePrevName is the basename savePriorVmstate writes (the prior committed vmstate held
-// for revert during an async/bridge flush). The orphan GC reclaims a stale one left by a crash.
-const vmstatePrevName = "vmstate.snap.prev"
+// legacyVmstateName is the fixed vmstate file for non-layered / pre-manifest-vmstate
+// snapshots — used when a manifest doesn't record its own Vmstate.
+const legacyVmstateName = "vmstate.snap"
 
-// vmstatePrevPath is where savePriorVmstate stashes the prior committed vmstate.
-func vmstatePrevPath(vmstatePath string) string { return vmstatePath + ".prev" }
+// vmstateLayerName is the file name for the vmstate committed alongside chain index i. An
+// accumulating pause writes its CPU/device state here (not the shared vmstate.snap) and the
+// manifest commit records it, so {chain + vmstate} commit atomically and a failed/uncommitted
+// pause never replaces the prior committed vmstate.
+func vmstateLayerName(i int) string { return fmt.Sprintf("vmstate.%d.snap", i) }
 
-// savePriorVmstate copies the current committed vmstate aside before an accumulating async/
-// bridge pause overwrites it, so a failed background flush can revert to a vmstate that
-// matches the prior (still-committed) memory chain — otherwise resume would pair the failed
-// pause's new vmstate with old memory (torn). Copy, not move, so the live file stays valid
-// if the pause errors before writing a new one. Returns false when there's no prior vmstate.
-func savePriorVmstate(vmstatePath string) (bool, error) {
-	src, err := os.Open(vmstatePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
+// manifestVmstatePath resolves the committed vmstate file: the manifest's recorded Vmstate
+// when present, else the legacy dir/vmstate.snap.
+func manifestVmstatePath(dir string, m *snapshotManifest) string {
+	if m != nil && m.Vmstate != "" {
+		return filepath.Join(dir, m.Vmstate)
 	}
-	defer src.Close()
-	dst, err := os.Create(vmstatePrevPath(vmstatePath))
-	if err != nil {
-		return false, err
-	}
-	defer dst.Close()
-	if _, err := io.Copy(dst, src); err != nil {
-		return false, err
-	}
-	if err := dst.Sync(); err != nil {
-		return false, err
-	}
-	return true, nil
+	return filepath.Join(dir, legacyVmstateName)
 }
-
-// restorePriorVmstate reverts vmstate to the savePriorVmstate copy (on a failed flush) so
-// the on-disk vmstate matches the prior committed memory chain. No-op if absent.
-func restorePriorVmstate(vmstatePath string) error {
-	prev := vmstatePrevPath(vmstatePath)
-	if _, err := os.Stat(prev); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if err := os.Rename(prev, vmstatePath); err != nil {
-		return err
-	}
-	return fsyncDir(filepath.Dir(vmstatePath))
-}
-
-// discardPriorVmstate drops the saved copy once the flush commits (or is no longer needed).
-func discardPriorVmstate(vmstatePath string) { _ = os.Remove(vmstatePrevPath(vmstatePath)) }
 
 // removeManifest deletes the manifest so a standalone (non-layered) snapshot in the same
 // dir becomes authoritative for a resume. Used when a pause falls back to a Full image:
