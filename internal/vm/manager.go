@@ -225,9 +225,15 @@ type ManagerConfig struct {
 	// LayerAppendEnabled. Default false.
 	LayerFlattenEnabled bool
 
-	// FlattenChainDepth is the overlay count at/above which a chain is flattened.
-	// Default 16 when <= 0.
+	// FlattenChainDepth is the overlay count at/above which a chain is flattened
+	// (bounds restore fd/walk cost). Default 16 when <= 0.
 	FlattenChainDepth int
+
+	// FlattenChainBytes, when > 0, also flattens once the chain's overlays occupy at
+	// least this many allocated bytes (bounds storage — a sandbox that dirties a lot
+	// per pause hits a storage problem at a shallow depth). 0 disables the byte
+	// trigger (depth-only).
+	FlattenChainBytes int64
 
 	// MaxConcurrentFlattens bounds simultaneous background flattens (each is
 	// I/O-heavy). Default 2 when <= 0.
@@ -976,18 +982,25 @@ func (m *Manager) waitForFlatten(inst *VMInstance) {
 }
 
 // maybeFlatten kicks off a background flatten when enabled and the chain has grown
-// to the configured depth. Non-blocking; bounded by flattenSem (skips this round if
-// the cap is full — the next pause will retry). Call after a durable pause commit.
+// past the depth threshold (restore fd/walk cost) or the byte threshold (storage).
+// Non-blocking; bounded by flattenSem (skips this round if the cap is full — the
+// next pause will retry). Call after a durable pause commit.
 func (m *Manager) maybeFlatten(inst *VMInstance, snapshotDir string) {
 	if !m.cfg.LayerFlattenEnabled {
 		return
 	}
-	depth := m.cfg.FlattenChainDepth
-	if depth <= 0 {
-		depth = 16
-	}
 	man, err := readManifest(snapshotDir)
-	if err != nil || man == nil || len(man.Overlays) < depth {
+	if err != nil || man == nil || len(man.Overlays) == 0 {
+		return
+	}
+	// Only stat the layers when a byte threshold is set (avoids the cost otherwise).
+	var allocated int64
+	if m.cfg.FlattenChainBytes > 0 {
+		for _, name := range man.Overlays {
+			allocated += allocatedBytes(filepath.Join(snapshotDir, name))
+		}
+	}
+	if !shouldFlatten(len(man.Overlays), allocated, m.cfg.FlattenChainDepth, m.cfg.FlattenChainBytes) {
 		return
 	}
 	select {

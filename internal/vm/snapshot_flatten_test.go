@@ -182,6 +182,31 @@ func TestGCOrphanLayers(t *testing.T) {
 	}
 }
 
+func TestShouldFlatten(t *testing.T) {
+	cases := []struct {
+		name      string
+		count     int
+		allocated int64
+		depth     int
+		bytes     int64
+		want      bool
+	}{
+		{"single overlay never flattens", 1, 1 << 40, 0, 1, false},
+		{"below both thresholds", 3, 100, 16, 1 << 30, false},
+		{"depth reached", 16, 0, 16, 0, true},
+		{"depth default when unset", 16, 0, 0, 0, true},
+		{"bytes reached below depth", 4, 2 << 30, 16, 1 << 30, true},
+		{"bytes disabled (0) below depth", 4, 1 << 40, 16, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldFlatten(c.count, c.allocated, c.depth, c.bytes); got != c.want {
+				t.Fatalf("shouldFlatten(%d,%d,%d,%d) = %v, want %v", c.count, c.allocated, c.depth, c.bytes, got, c.want)
+			}
+		})
+	}
+}
+
 func TestNextFlatName(t *testing.T) {
 	if n := nextFlatName([]string{"mem.0.diff", "mem.1.diff"}); n != "mem.flat.0.diff" {
 		t.Fatalf("got %q, want mem.flat.0.diff", n)

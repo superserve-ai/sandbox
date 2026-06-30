@@ -7,10 +7,41 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// shouldFlatten reports whether a chain should be flattened: when it has at least
+// depthThreshold overlays (bounds restore fd/walk cost), OR — when bytesThreshold > 0
+// — its overlays occupy at least bytesThreshold allocated bytes (bounds storage).
+// depthThreshold <= 0 defaults to 16. A single overlay is never flattened.
+func shouldFlatten(overlayCount int, allocatedBytes int64, depthThreshold int, bytesThreshold int64) bool {
+	if overlayCount < 2 {
+		return false
+	}
+	if depthThreshold <= 0 {
+		depthThreshold = 16
+	}
+	if overlayCount >= depthThreshold {
+		return true
+	}
+	return bytesThreshold > 0 && allocatedBytes >= bytesThreshold
+}
+
+// allocatedBytes returns the on-disk bytes actually allocated to a (sparse) file
+// (st_blocks × 512), not its apparent size; 0 if it can't be stat'd.
+func allocatedBytes(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Blocks * 512
+	}
+	return info.Size()
+}
 
 // flattenPageSize is the granularity at which overlay pages are composed. Guest
 // RAM and the overlay files are page-aligned (guest RAM is MiB-sized), and the
@@ -19,10 +50,9 @@ import (
 const flattenPageSize = 4096
 
 // flattenChain merges a sandbox's overlay chain into a single sparse overlay
-// (newest owner of each page wins), keeping the shared read-only template base,
-// then republishes the manifest as base → merged. This bounds chain depth and
-// reclaims pages duplicated across layers, without copying the base (so base
-// sharing is preserved) and without spinning a VM or faulting guest RAM.
+// (newest owner of each page wins), keeping the shared template base, and
+// republishes the manifest as base → merged — bounding chain depth and reclaiming
+// pages duplicated across layers.
 //
 // Crash-safe: the merged overlay is written to a fresh name (never an input) and
 // the manifest swap is the commit point — a crash before it leaves the old chain
@@ -163,12 +193,11 @@ const orphanGraceSeconds = 600
 // layerFileRe matches an overlay layer file name (mem.<n>.diff or mem.flat.<n>.diff).
 var layerFileRe = regexp.MustCompile(`^mem\.(?:\d+|flat\.\d+)\.diff$`)
 
-// gcOrphanLayers reclaims layer and temp files in a chain sandbox's snapshot dir
-// that the current manifest does not reference and that have been untouched for the
-// grace period — interrupted-flatten leftovers and stale *.next temps. (Crashed-pause
-// partials self-heal: the next append removes the file at that index before reusing
-// it.) No-op for a non-chain dir (no manifest), so legacy/standalone snapshots are
-// never touched. Best-effort; returns apparent bytes reclaimed.
+// gcOrphanLayers reclaims layer/temp files the manifest doesn't reference that have
+// been untouched for the grace period — interrupted-flatten leftovers and stale
+// *.next temps. (Crashed-pause partials self-heal: the next append overwrites the
+// file at that index.) No-op for a non-chain dir, so legacy/standalone snapshots are
+// untouched. Best-effort; returns apparent bytes reclaimed.
 func (m *Manager) gcOrphanLayers(snapshotDir string) (int64, error) {
 	man, err := readManifest(snapshotDir)
 	if err != nil || man == nil {
