@@ -2,24 +2,11 @@ package api
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
-
-const consoleImpersonationKeyName = "__console_impersonation__"
-const consoleImpersonationReadPermission = "platform:teams:read"
-
-func isConsoleImpersonationRequest(c *gin.Context) bool {
-	value, ok := c.Get("api_key_name")
-	if !ok {
-		return false
-	}
-	name, ok := value.(string)
-	return ok && name == consoleImpersonationKeyName
-}
 
 // customerTeamPermissionAllowed checks an active team-scoped permission without
 // writing a response. Use this for optional capability fields on otherwise
@@ -45,13 +32,6 @@ func (h *Handlers) customerTeamPermissionAllowed(c *gin.Context, teamID uuid.UUI
 	authzSvc := h.authzService()
 	if authzSvc == nil {
 		return false, fmt.Errorf("missing authz service")
-	}
-
-	if isConsoleImpersonationRequest(c) {
-		if !strings.HasSuffix(permission, ":read") {
-			return false, nil
-		}
-		return authzSvc.CanPlatform(c.Request.Context(), *actorID, consoleImpersonationReadPermission)
 	}
 
 	return authzSvc.CanTeam(c.Request.Context(), *actorID, teamID, permission)
