@@ -779,10 +779,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 			break
 		}
-		// Preserve the prior committed vmstate before this pause overwrites vmstate.snap, so
-		// a failed async/bridge flush can revert to a vmstate matching the prior memory chain
-		// (accumulating pauses only — the first layer has no prior committed state). Restored
-		// on any failure below, discarded once the new layer commits.
+		// Stash the prior committed vmstate (see savePriorVmstate) before this pause overwrites
+		// it, so a failed flush can revert. Accumulating pauses only — the first layer has no
+		// prior committed state.
 		priorVmstateSaved := false
 		if newIndex > 0 {
 			saved, serr := savePriorVmstate(snapshotPath)
@@ -1002,10 +1001,8 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	vmstatePath := filepath.Join(snapshotDir, "vmstate.snap")
 
-	// On failure, revert vmstate to the prior committed copy so it pairs with the prior
-	// (still-committed) memory chain — resume then loads a consistent stale-by-one snapshot.
-	// A resume can't have happened mid-flush on this path (it waits for the flush), so the
-	// sandbox is still paused; revert unconditionally. endFlush AFTER the revert so a waiting
+	// Revert unconditionally on failure: a resume can't have happened mid-flush here (it waits
+	// for the flush), so the sandbox is still paused. endFlush AFTER the revert so a waiting
 	// resume observes the reverted state.
 	failRevert := func(err error, msg string) {
 		log.Error().Err(err).Msg(msg)
@@ -1064,10 +1061,8 @@ func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	vmstatePath := filepath.Join(snapshotDir, "vmstate.snap")
 
-	// On failure, revert vmstate to the prior committed copy ONLY if the sandbox is still
-	// paused: a fast-resumed (Running) VM already loaded the new vmstate into its Firecracker,
-	// so reverting the file is pointless and could race that restore (it self-heals on the
-	// next pause). endFlush AFTER the revert so a waiting resume observes the reverted state.
+	// Revert on failure, but only-if-paused (revertPriorVmstate's guard): a fast-resumed VM
+	// owns the new vmstate and self-heals on its next pause. endFlush AFTER the revert.
 	failRevert := func(err error, msg string) {
 		log.Error().Err(err).Msg(msg)
 		_ = os.Remove(layerPath)
