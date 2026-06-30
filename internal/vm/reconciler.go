@@ -343,6 +343,35 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Drift 3b: a paused sandbox whose FC unit is still active and isn't flushing — a
+	// stranded Firecracker from an interrupted async flush (see isFlushing). Safe to
+	// stop: a paused sandbox should have no FC and its durable chain is on disk; only
+	// the stray FC is stopped (no markStale — it stays a valid paused sandbox).
+	// Guards: the grace period lets a normal resume-in-progress clear first, and
+	// isFlushing skips a live in-process flush.
+	for id := range active {
+		if r.mgr.isFlushing(id) {
+			r.clearDrift("stranded:" + id)
+			continue
+		}
+		rec, getErr := r.mgr.state.Get(id)
+		if getErr != nil || rec == nil || rec.Status != StatusPaused {
+			r.clearDrift("stranded:" + id)
+			continue
+		}
+		if !r.gracePeriodElapsed("stranded:"+id, now) {
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("drift", "paused_unit_active").
+			Msg("stranded Firecracker for paused sandbox (interrupted async flush) — stopping")
+		if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop stranded FC")
+			continue
+		}
+		r.writeAudit(ctx, id, "stranded_stop", "interrupted async flush", "paused_unit_active")
+		r.clearDrift("stranded:" + id)
+	}
+
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {

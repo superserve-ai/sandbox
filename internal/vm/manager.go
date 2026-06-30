@@ -761,6 +761,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			// Returned at the snapshot point: FC is alive + paused, writing the layer in
 			// the background. Record the paused (resumable) state, then finish + commit
 			// off the hot path (see completeAsyncPause).
+			//
+			// Mark flushing BEFORE status=paused so the reconciler never observes a live
+			// flush as (paused + unit active + not flushing) and mistakes it for stranded.
+			m.beginFlush(inst)
 			inst.mu.Lock()
 			inst.Status = StatusPaused
 			inst.SnapshotPath = snapshotPath
@@ -768,7 +772,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			inst.BaseMemPath = baseMemPath
 			inst.DirtyTracked = false
 			inst.mu.Unlock()
-			m.beginFlush(inst)
 			m.persistState(inst)
 			go m.completeAsyncPause(inst, snapshotDir, layerPath, layerName, socketPath, appendManifest)
 			log.Info().Int("layer", newIndex).Msg("VM pausing (async memory flush in background)")
@@ -998,6 +1001,20 @@ func (m *Manager) waitForFlush(inst *VMInstance) error {
 	return inst.flushErr
 }
 
+// isFlushing reports whether an async-pause background flush is in progress for
+// vmID in THIS process. The reconciler uses it to tell a live flush (FC legitimately
+// still up, writing the diff) from a stranded FC (a flush whose goroutine died, e.g.
+// across a vmd restart — where flushing is false because the process is fresh).
+func (m *Manager) isFlushing(vmID string) bool {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return false
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.flushing
+}
+
 // waitForFlatten blocks until any in-progress background flatten for inst finishes.
 // Callers that read the manifest or load the chain (resume, re-pause, delete) must
 // call this so they never see a half-swapped manifest or a layer being deleted.
@@ -1219,6 +1236,15 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		netInfo, nsErr = m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress)
 		if nsErr != nil {
 			return nil, fmt.Errorf("ensure network slot for resume: %w", nsErr)
+		}
+	}
+
+	// A stranded FC (interrupted async flush) may still hold this unit — waitForFlush
+	// above drained any live flush, so an active unit here means it's stranded. Stop
+	// it so we start a clean FC on the durable chain, not the stale one.
+	if isUnitActive(ctx, systemdUnitName(vmID)) {
+		if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
+			log.Warn().Err(err).Msg("resume: stop stranded FC unit before restart")
 		}
 	}
 
