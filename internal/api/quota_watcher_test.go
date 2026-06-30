@@ -191,15 +191,17 @@ func TestEmailQuotaNotifierConfigErrorRetries(t *testing.T) {
 	// must return an error so the claim releases and the next tick retries once
 	// the config is fixed.
 	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(code)
-		}))
-		n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
-		err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82})
-		srv.Close()
-		if err == nil {
-			t.Errorf("status %d should return an error so the watcher retries", code)
-		}
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+			n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+			err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82})
+			if err == nil {
+				t.Errorf("status %d should return an error so the watcher retries", code)
+			}
+		})
 	}
 }
 
