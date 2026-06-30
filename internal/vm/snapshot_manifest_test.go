@@ -66,6 +66,57 @@ func TestRemoveManifest(t *testing.T) {
 	}
 }
 
+func TestPriorVmstatePreservation(t *testing.T) {
+	dir := t.TempDir()
+	vmstate := filepath.Join(dir, "vmstate.snap")
+	if err := os.WriteFile(vmstate, []byte("committed-N"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save copies the committed vmstate aside without disturbing the live file.
+	saved, err := savePriorVmstate(vmstate)
+	if err != nil || !saved {
+		t.Fatalf("savePriorVmstate = (%v, %v), want (true, nil)", saved, err)
+	}
+	if b, _ := os.ReadFile(vmstate); string(b) != "committed-N" {
+		t.Fatalf("save disturbed the live vmstate: %q", b)
+	}
+
+	// The pause overwrites vmstate with the new (about-to-fail) state.
+	if err := os.WriteFile(vmstate, []byte("failed-N+1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore (flush failed) reverts to the prior committed copy and clears it.
+	if err := restorePriorVmstate(vmstate); err != nil {
+		t.Fatalf("restorePriorVmstate: %v", err)
+	}
+	if b, _ := os.ReadFile(vmstate); string(b) != "committed-N" {
+		t.Fatalf("after restore vmstate = %q, want committed-N", b)
+	}
+	if _, err := os.Stat(vmstatePrevPath(vmstate)); !os.IsNotExist(err) {
+		t.Fatalf(".prev survived restore: %v", err)
+	}
+
+	// Discard (flush succeeded) just drops the copy; restore is then a no-op.
+	if _, err := savePriorVmstate(vmstate); err != nil {
+		t.Fatal(err)
+	}
+	discardPriorVmstate(vmstate)
+	if _, err := os.Stat(vmstatePrevPath(vmstate)); !os.IsNotExist(err) {
+		t.Fatalf(".prev survived discard: %v", err)
+	}
+	if err := restorePriorVmstate(vmstate); err != nil {
+		t.Fatalf("restorePriorVmstate(absent) = %v, want nil", err)
+	}
+
+	// No prior vmstate (first layer) ⇒ save reports nothing copied, no error.
+	empty := filepath.Join(dir, "missing.snap")
+	if saved, err := savePriorVmstate(empty); err != nil || saved {
+		t.Fatalf("savePriorVmstate(absent) = (%v, %v), want (false, nil)", saved, err)
+	}
+}
+
 func TestChainPaths(t *testing.T) {
 	dir := "/snap/vm1"
 
