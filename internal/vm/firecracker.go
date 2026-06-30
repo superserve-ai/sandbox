@@ -537,7 +537,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, basePath string, lowerOverlayPaths []string,
 	accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
-	trackDirty, abortOnHandlerDeath bool,
+	trackDirty, abortOnHandlerDeath, sharedMem bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -563,6 +563,7 @@ func RestoreSnapshotUffdInternalWithOverrides(
 			// (Diff) snapshot instead of a Full one.
 			TrackDirtyPages: trackDirty,
 			ResumeVM:        true,
+			SharedMem:       sharedMem,
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},

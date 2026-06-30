@@ -244,6 +244,14 @@ type ManagerConfig struct {
 	// MaxConcurrentFlattens bounds simultaneous background flattens (each is
 	// I/O-heavy). Default 2 when <= 0.
 	MaxConcurrentFlattens int
+
+	// SharedMemEnabled backs restored guest memory with a memfd (MAP_SHARED) instead
+	// of an anonymous mapping, so a paused FC's frozen RAM can be handed to a new FC
+	// for an immediate resume that doesn't wait for the background flush. Requires
+	// ResumeUffdEnabled and an FC binary that accepts shared_mem on /snapshot/load.
+	// Inert on its own (the memfd is just allocated); the resume bridge consumes it.
+	// Default false.
+	SharedMemEnabled bool
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,7 +1348,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
 	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
 		socketPath, snapshotPath, memPath, basePath, lowerOverlays, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
-		m.cfg.HandlerDeathAbortEnabled,
+		m.cfg.HandlerDeathAbortEnabled, m.cfg.SharedMemEnabled,
 	)
 }
 
@@ -1843,7 +1851,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if restoreErr == nil {
 			restoreErr = RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, snapshotPath, memPath, basePath, nil, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-				m.cfg.HandlerDeathAbortEnabled,
+				m.cfg.HandlerDeathAbortEnabled, m.cfg.SharedMemEnabled,
 			)
 		}
 	case inPlace:
