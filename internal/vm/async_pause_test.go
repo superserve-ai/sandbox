@@ -2,6 +2,9 @@ package vm
 
 import (
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,5 +72,75 @@ func TestCountHeldBridgeMemfds(t *testing.T) {
 	m.vms["c"] = &VMInstance{ID: "c", holdingBridgeMemfd: true}
 	if n := m.countHeldBridgeMemfds(); n != 2 {
 		t.Fatalf("count = %d, want 2", n)
+	}
+}
+
+// TestTryClaimBridgeMemfd covers the atomic reserve: a slot goes only to an eligible
+// (mid-flush, in-flight files set) instance, the cap is enforced, and the count-and-claim is
+// atomic so a burst of concurrent claims can never exceed the cap.
+func TestTryClaimBridgeMemfd(t *testing.T) {
+	mkInst := func(id string) *VMInstance {
+		return &VMInstance{
+			ID:                   id,
+			flushing:             true,
+			bridgeMemFdPath:      "/proc/1/fd/7",
+			bridgePendingVmstate: "/snap/" + id + "/vmstate.0.snap",
+			bridgePendingLayer:   "/snap/" + id + "/mem.0.diff",
+		}
+	}
+
+	// Ineligible instances are never granted, even with the cap wide open.
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, cfg: ManagerConfig{MaxBridgeMemfds: 4}}
+	notFlushing := &VMInstance{ID: "x", bridgeMemFdPath: "/proc/1/fd/7", bridgePendingVmstate: "/v"}
+	m.vms["x"] = notFlushing
+	if _, _, _, ok := m.tryClaimBridgeMemfd(notFlushing); ok {
+		t.Fatal("granted a slot to a non-flushing instance")
+	}
+	noPaths := &VMInstance{ID: "y", flushing: true}
+	m.vms["y"] = noPaths
+	if _, _, _, ok := m.tryClaimBridgeMemfd(noPaths); ok {
+		t.Fatal("granted a slot with no in-flight files")
+	}
+
+	// A grant returns the in-flight files and marks the hold; the cap is then enforced.
+	m = &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, cfg: ManagerConfig{MaxBridgeMemfds: 2}}
+	a, b, c := mkInst("a"), mkInst("b"), mkInst("c")
+	m.vms["a"], m.vms["b"], m.vms["c"] = a, b, c
+	if mp, vp, lp, ok := m.tryClaimBridgeMemfd(a); !ok || mp != a.bridgeMemFdPath || vp != a.bridgePendingVmstate || lp != a.bridgePendingLayer {
+		t.Fatalf("claim a = (%q,%q,%q,%v), want its files + true", mp, vp, lp, ok)
+	}
+	if !a.holdingBridgeMemfd {
+		t.Fatal("claim a did not mark the hold")
+	}
+	if _, _, _, ok := m.tryClaimBridgeMemfd(b); !ok {
+		t.Fatal("claim b under cap denied")
+	}
+	if _, _, _, ok := m.tryClaimBridgeMemfd(c); ok {
+		t.Fatal("claim c granted past the cap of 2")
+	}
+
+	// Atomic under a burst: cap 3 over many eligible instances → exactly 3 grants.
+	m = &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, cfg: ManagerConfig{MaxBridgeMemfds: 3}}
+	const n = 24
+	insts := make([]*VMInstance, n)
+	for i := range insts {
+		id := fmt.Sprintf("vm%d", i)
+		insts[i] = mkInst(id)
+		m.vms[id] = insts[i]
+	}
+	var granted int64
+	var wg sync.WaitGroup
+	for _, in := range insts {
+		wg.Add(1)
+		go func(in *VMInstance) {
+			defer wg.Done()
+			if _, _, _, ok := m.tryClaimBridgeMemfd(in); ok {
+				atomic.AddInt64(&granted, 1)
+			}
+		}(in)
+	}
+	wg.Wait()
+	if granted != 3 {
+		t.Fatalf("concurrent grants = %d, want exactly 3 (the cap)", granted)
 	}
 }

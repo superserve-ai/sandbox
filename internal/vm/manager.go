@@ -971,15 +971,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// Drop a stale chain manifest (+ its orphaned overlays) left by a standalone pause, so
 	// resume loads this snapshot, not the old chain. See the `appended` comment above.
 	if !appended {
-		if man, merr := readManifest(snapshotDir); merr == nil && man != nil {
-			// Remove the manifest FIRST so it's no longer authoritative, THEN reclaim its
-			// layers. The reverse order would let a crash (or a removeManifest failure) leave a
-			// live manifest pointing at just-deleted files, so resume would fail the chain load
-			// instead of using the standalone snapshot. Only reclaim layers once the manifest
-			// is gone.
+		man, merr := readManifest(snapshotDir)
+		// A leftover manifest — stale chain, or corrupt/unreadable — must not shadow the standalone
+		// snapshot just written: ResumeVM treats a present-or-unreadable manifest as authoritative
+		// and would refuse, leaving the VM unrestorable. Drop it. Remove the manifest FIRST so it's
+		// no longer authoritative, THEN reclaim its layers — the reverse order would let a crash (or
+		// a removeManifest failure) leave a live manifest pointing at just-deleted files. A corrupt
+		// manifest yields no overlay list, so its layers (if any) fall to GC.
+		if merr != nil || man != nil {
 			if rmErr := removeManifest(snapshotDir); rmErr != nil {
 				log.Warn().Err(rmErr).Msg("pause: remove stale manifest after standalone snapshot")
-			} else {
+			} else if man != nil {
 				for _, name := range man.Overlays {
 					_ = os.Remove(filepath.Join(snapshotDir, name))
 				}
@@ -1208,6 +1210,35 @@ func (m *Manager) countHeldBridgeMemfds() int {
 		inst.mu.RUnlock()
 	}
 	return n
+}
+
+// tryClaimBridgeMemfd reserves a held-memfd slot for inst if it's mid-bridge-flush and the fleet
+// is under the cap, returning the in-flight files to reopen. Counting the held slots and setting
+// this inst's hold happen under m.mu, so the check-and-claim is atomic — a burst of concurrent
+// resumes can't all observe an under-cap count and then each take the fast path. A caller that
+// reserves a slot but doesn't finish holding it (reopen fails, restore fails, or it falls back off
+// the memfd path) must release it with clearBridgeHold.
+func (m *Manager) tryClaimBridgeMemfd(inst *VMInstance) (memFdPath, vmstatePath, pendingLayer string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	held := 0
+	for _, i := range m.vms {
+		i.mu.RLock()
+		if i.holdingBridgeMemfd {
+			held++
+		}
+		i.mu.RUnlock()
+	}
+	if held >= m.maxBridgeMemfds() {
+		return "", "", "", false
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if !inst.flushing || inst.bridgeMemFdPath == "" || inst.bridgePendingVmstate == "" {
+		return "", "", "", false
+	}
+	inst.holdingBridgeMemfd = true // reserve atomically with the count above
+	return inst.bridgeMemFdPath, inst.bridgePendingVmstate, inst.bridgePendingLayer, true
 }
 
 // beginFlush marks inst as having an in-progress async-pause flush, arming the
@@ -1440,21 +1471,24 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// the new FC mmaps it during restore and keeps it alive, so we drop our fd afterwards.
 	var memfdFd, vmstateFd *os.File
 	var memfdResumePath, memfdVmstatePath, bridgePendingLayer string
-	// Only take the memfd fast path while under the held-memfd cap, so the feature can't
-	// pin unbounded extra RAM fleet-wide. Gate on the flag first so a flags-off resume pays
-	// nothing (countHeldBridgeMemfds scans all VMs). Reopen vmd's own fds to the memfd AND the
-	// in-flight per-layer vmstate under the lock, so a concurrent commit/delete can't pull them
-	// out from under us; the new FC mmaps/reads them during restore and they're dropped after.
-	if m.cfg.SharedMemEnabled && m.countHeldBridgeMemfds() < m.maxBridgeMemfds() {
-		inst.mu.Lock()
-		if inst.flushing && inst.bridgeMemFdPath != "" && inst.bridgePendingVmstate != "" {
-			memf, merr := os.Open(inst.bridgeMemFdPath)
-			vmf, verr := os.Open(inst.bridgePendingVmstate)
+	// Take the memfd fast path only while a bridge flush is in progress AND the fleet is under
+	// the held-memfd cap, so the feature can't pin unbounded extra RAM. tryClaimBridgeMemfd
+	// reserves the slot atomically with the count (so a burst of concurrent resumes can't all
+	// pass the cap) and returns the files to reopen. We then reopen vmd's own fds to those paths,
+	// so a concurrent commit/delete can't pull them out from under us; the new FC mmaps/reads
+	// them during restore and they're dropped after. Gate on the flag first so a flags-off resume
+	// pays nothing.
+	claimedMemfd := false
+	if m.cfg.SharedMemEnabled {
+		if memFdPath, vmstatePath, pendingLayer, ok := m.tryClaimBridgeMemfd(inst); ok {
+			claimedMemfd = true
+			memf, merr := os.Open(memFdPath)
+			vmf, verr := os.Open(vmstatePath)
 			if merr == nil && verr == nil {
 				memfdFd, vmstateFd = memf, vmf
 				memfdResumePath = guestMemFdPath(memf)
 				memfdVmstatePath = guestMemFdPath(vmf)
-				bridgePendingLayer = inst.bridgePendingLayer
+				bridgePendingLayer = pendingLayer
 			} else {
 				if memf != nil {
 					_ = memf.Close()
@@ -1462,17 +1496,24 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 				if vmf != nil {
 					_ = vmf.Close()
 				}
+				m.clearBridgeHold(inst) // reopen failed — release the reserved slot
+				claimedMemfd = false
 			}
 		}
-		inst.mu.Unlock()
 	}
 	useMemfd := memfdFd != nil
+	resumeOK := false
 	defer func() {
 		if memfdFd != nil {
 			_ = memfdFd.Close()
 		}
 		if vmstateFd != nil {
 			_ = vmstateFd.Close()
+		}
+		// The slot was reserved at claim time; keep the hold only if the resume completed using
+		// the memfd. On early failure, or a fall-back off the memfd path, release the reservation.
+		if claimedMemfd && !(resumeOK && useMemfd) {
+			m.clearBridgeHold(inst)
 		}
 	}()
 	if !useMemfd {
@@ -1665,10 +1706,12 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = resumedMemFile
 	inst.BaseMemPath = basePath // re-cache (may have come from the on-disk sidecar)
-	// A memfd resume pins this sandbox's prior RAM (via the new FC's mmap) until its next
-	// pause; mark the hold so it counts against MaxBridgeMemfds. Cleared at the next pause.
-	inst.holdingBridgeMemfd = useMemfd
 	inst.mu.Unlock()
+
+	// A memfd resume pins this sandbox's prior RAM (via the new FC's mmap) until its next pause;
+	// the slot reserved at claim time stays held (it counts against MaxBridgeMemfds and is cleared
+	// at the next pause). resumeOK keeps the deferred release from dropping it.
+	resumeOK = true
 
 	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
