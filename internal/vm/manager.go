@@ -138,6 +138,12 @@ type VMInstance struct {
 	bridgeMemFdPath    string
 	bridgePendingLayer string
 
+	// holdingBridgeMemfd is true between a memfd fast-resume and the resumed VM's next
+	// pause/stop — the window where this sandbox pins ~2× its RAM (the new FC's mmap of
+	// the prior memfd). Counted against MaxBridgeMemfds. Not persisted; a vmd restart
+	// drops the memfd, so the count resets to zero on its own.
+	holdingBridgeMemfd bool
+
 	mu sync.RWMutex
 }
 
@@ -262,6 +268,14 @@ type ManagerConfig struct {
 	// Inert on its own (the memfd is just allocated); the resume bridge consumes it.
 	// Default false.
 	SharedMemEnabled bool
+
+	// MaxBridgeMemfds bounds how many sandboxes may concurrently hold a bridge memfd
+	// for fast resume. A memfd-resume keeps the paused VM's frozen RAM resident (via the
+	// new FC's mmap) until that VM next pauses — roughly 2× that sandbox's RAM — so this
+	// caps the extra memory the feature can pin fleet-wide. When the cap is reached, a
+	// resume that could use the memfd falls back to the (correct, slower) wait-for-flush
+	// path. Default 4 when <= 0.
+	MaxBridgeMemfds int
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +698,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	_ = m.waitForFlush(inst)
 	m.waitForFlatten(inst)
 
+	// If this VM was fast-resumed from a bridge memfd, pausing now stops that FC and
+	// frees the pinned RAM — drop the hold so it stops counting against MaxBridgeMemfds.
+	inst.mu.Lock()
+	inst.holdingBridgeMemfd = false
+	inst.mu.Unlock()
+
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
 	}
@@ -775,7 +795,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			if ferr != nil {
 				log.Warn().Err(ferr).Msg("memfd capture failed; falling back to in-FC async flush")
 			} else {
-				dirtyOffsetsPath := filepath.Join(snapshotDir, "mem.dirty.offsets")
+				dirtyOffsetsPath := filepath.Join(snapshotDir, bridgeDirtyOffsetsName)
 				log.Info().Str("snapshot_path", snapshotPath).Int("layer", newIndex).
 					Msg("pausing VM — memfd bridge (vmd flushes dirty pages)")
 				if err := CreateDiffSnapshotBridge(socketPath, snapshotPath, layerPath, dirtyOffsetsPath); err != nil {
@@ -1080,6 +1100,32 @@ func (m *Manager) planLayerAppend(snapshotDir string, dirtyTracked bool, instBas
 	return instBaseMem, &snapshotManifest{Base: instBaseMem}, true
 }
 
+// maxBridgeMemfds returns the configured cap on concurrently-held bridge memfds.
+func (m *Manager) maxBridgeMemfds() int {
+	if m.cfg.MaxBridgeMemfds > 0 {
+		return m.cfg.MaxBridgeMemfds
+	}
+	return 4
+}
+
+// countHeldBridgeMemfds returns how many sandboxes are currently holding a bridge memfd
+// for fast resume. Derived from per-inst flags (not a semaphore) so a crashed/reaped
+// holder can never leak a slot — an over-count is conservative (it only makes the cap
+// stricter) and self-corrects when the dead inst is removed.
+func (m *Manager) countHeldBridgeMemfds() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	n := 0
+	for _, inst := range m.vms {
+		inst.mu.RLock()
+		if inst.holdingBridgeMemfd {
+			n++
+		}
+		inst.mu.RUnlock()
+	}
+	return n
+}
+
 // beginFlush marks inst as having an in-progress async-pause flush, arming the
 // channel that endFlush closes when the flush finishes.
 func (m *Manager) beginFlush(inst *VMInstance) {
@@ -1278,15 +1324,21 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// the new FC mmaps it during restore and keeps it alive, so we drop our fd afterwards.
 	var memfdFd *os.File
 	var memfdResumePath, bridgePendingLayer string
-	inst.mu.Lock()
-	if inst.flushing && inst.bridgeMemFdPath != "" {
-		if f, oerr := os.Open(inst.bridgeMemFdPath); oerr == nil {
-			memfdFd = f
-			memfdResumePath = guestMemFdPath(f)
-			bridgePendingLayer = inst.bridgePendingLayer
+	// Only take the memfd fast path while under the held-memfd cap, so the feature can't
+	// pin unbounded extra RAM fleet-wide. Check the count BEFORE taking inst.mu
+	// (countHeldBridgeMemfds locks instances); this inst isn't counted yet, and a soft
+	// over-allow under concurrent resumes is acceptable.
+	if m.countHeldBridgeMemfds() < m.maxBridgeMemfds() {
+		inst.mu.Lock()
+		if inst.flushing && inst.bridgeMemFdPath != "" {
+			if f, oerr := os.Open(inst.bridgeMemFdPath); oerr == nil {
+				memfdFd = f
+				memfdResumePath = guestMemFdPath(f)
+				bridgePendingLayer = inst.bridgePendingLayer
+			}
 		}
+		inst.mu.Unlock()
 	}
-	inst.mu.Unlock()
 	useMemfd := memfdFd != nil
 	defer func() {
 		if memfdFd != nil {
@@ -1474,6 +1526,9 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = resumedMemFile
 	inst.BaseMemPath = basePath // re-cache (may have come from the on-disk sidecar)
+	// A memfd resume pins this sandbox's prior RAM (via the new FC's mmap) until its next
+	// pause; mark the hold so it counts against MaxBridgeMemfds. Cleared at the next pause.
+	inst.holdingBridgeMemfd = useMemfd
 	inst.mu.Unlock()
 
 	m.persistState(inst)

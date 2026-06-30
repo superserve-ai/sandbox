@@ -365,6 +365,7 @@ func main() {
 	flattenChainBytes, _ := strconv.ParseInt(envOrDefault("VMD_FLATTEN_CHAIN_BYTES", "0"), 10, 64)    // 0 ⇒ depth-only
 	maxConcurrentAsyncPauses, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_ASYNC_PAUSES", "0")) // 0 ⇒ default (3)
 	sharedMemEnabled := envOrDefault("VMD_SHARED_MEM", "false") == "true"
+	maxBridgeMemfds, _ := strconv.Atoi(envOrDefault("VMD_MAX_BRIDGE_MEMFDS", "0")) // 0 ⇒ default (4)
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:             cfg.FirecrackerBin,
@@ -391,6 +392,7 @@ func main() {
 		FlattenChainBytes:          flattenChainBytes,
 		MaxConcurrentAsyncPauses:   maxConcurrentAsyncPauses,
 		SharedMemEnabled:           sharedMemEnabled,
+		MaxBridgeMemfds:            maxBridgeMemfds,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

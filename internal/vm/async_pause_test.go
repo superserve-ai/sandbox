@@ -47,3 +47,27 @@ func TestWaitForFlush(t *testing.T) {
 		t.Fatalf("waitForFlush(after) = %v, want nil", err)
 	}
 }
+
+// TestCountHeldBridgeMemfds covers the bridge-memfd cap accounting: the default cap,
+// an override, and counting only instances currently holding a memfd.
+func TestCountHeldBridgeMemfds(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+
+	if got := m.maxBridgeMemfds(); got != 4 {
+		t.Fatalf("default cap = %d, want 4", got)
+	}
+	m.cfg.MaxBridgeMemfds = 2
+	if got := m.maxBridgeMemfds(); got != 2 {
+		t.Fatalf("configured cap = %d, want 2", got)
+	}
+
+	if n := m.countHeldBridgeMemfds(); n != 0 {
+		t.Fatalf("count(empty) = %d, want 0", n)
+	}
+	m.vms["a"] = &VMInstance{ID: "a", holdingBridgeMemfd: true}
+	m.vms["b"] = &VMInstance{ID: "b"}
+	m.vms["c"] = &VMInstance{ID: "c", holdingBridgeMemfd: true}
+	if n := m.countHeldBridgeMemfds(); n != 2 {
+		t.Fatalf("count = %d, want 2", n)
+	}
+}

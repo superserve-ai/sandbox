@@ -7,6 +7,11 @@ import (
 	"path/filepath"
 )
 
+// bridgeDirtyOffsetsName is the per-sandbox sidecar a memfd-bridge pause writes (the
+// dirty page offsets vmd copies from the memfd). Removed when the flush completes; the
+// orphan GC reclaims a stale one left by a crash mid-bridge.
+const bridgeDirtyOffsetsName = "mem.dirty.offsets"
+
 // guestMemLink is the /proc/<pid>/fd readlink target of Firecracker's
 // MAP_SHARED guest-memory memfd (created as memfd_create("guest_mem", ...) when
 // shared_mem is set). The kernel reports a memfd as "/memfd:<name> (deleted)".
