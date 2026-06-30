@@ -218,6 +218,12 @@ type ManagerConfig struct {
 	// Default false.
 	AsyncPauseEnabled bool
 
+	// MaxConcurrentAsyncPauses bounds simultaneous async-pause background flushes
+	// (each holds the flushing FC's RAM until durable). When the cap is full, a pause
+	// that would go async falls back to the synchronous path instead — it always
+	// completes, just inline. Default 3 when <= 0.
+	MaxConcurrentAsyncPauses int
+
 	// LayerFlattenEnabled turns on background chain flattening: once a sandbox's
 	// overlay chain reaches FlattenChainDepth, its overlays are merged into one
 	// sparse overlay (newest-wins, shared base preserved) off the hot path, bounding
@@ -263,6 +269,10 @@ type Manager struct {
 	// I/O-heavy). Buffered; capacity = effective MaxConcurrentFlattens.
 	flattenSem chan struct{}
 
+	// pauseSem bounds concurrent async-pause background flushes. Buffered; capacity =
+	// effective MaxConcurrentAsyncPauses.
+	pauseSem chan struct{}
+
 	// builds tracks in-flight and completed template builds. Keyed by
 	// build VM id (which is also "build-" + templateID). Entries survive
 	// until process exit so late pollers can read terminal outcomes.
@@ -285,6 +295,10 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 	if maxFlattens <= 0 {
 		maxFlattens = 2
 	}
+	maxAsyncPauses := cfg.MaxConcurrentAsyncPauses
+	if maxAsyncPauses <= 0 {
+		maxAsyncPauses = 3
+	}
 	// Magic mount target — every per-VM start script mounts tmpfs over it.
 	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
 	// at startup so an aggressive ops cleanup can't break sandbox/build paths.
@@ -300,6 +314,7 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		vms:        make(map[string]*VMInstance),
 		restoreSem: make(chan struct{}, maxRestores),
 		flattenSem: make(chan struct{}, maxFlattens),
+		pauseSem:   make(chan struct{}, maxAsyncPauses),
 	}, nil
 }
 
@@ -720,9 +735,22 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// the background write is interrupted (first-pause-always-sync: newIndex 0 is
 		// the first layer, which has only the read-only template base under it).
 		async := m.cfg.AsyncPauseEnabled && newIndex > 0
+		// Claim a background-flush slot; if the cap is full, fall back to a synchronous
+		// pause rather than pile RAM-holding flushes on. Released in completeAsyncPause.
+		if async {
+			select {
+			case m.pauseSem <- struct{}{}:
+			default:
+				async = false
+				log.Info().Msg("async pause cap full; falling back to synchronous pause")
+			}
+		}
 		log.Info().Str("snapshot_path", snapshotPath).Int("layer", newIndex).Bool("async", async).
 			Msg("pausing VM — appending layered diff snapshot")
 		if err := CreateDiffSnapshot(socketPath, snapshotPath, layerPath, async); err != nil {
+			if async {
+				<-m.pauseSem // completeAsyncPause won't run; release the slot here
+			}
 			// Leave the partial layer orphaned and do NOT republish the manifest — the
 			// previously committed chain stays intact and resumable. Drop the orphan so
 			// the next attempt at this index starts clean.
@@ -846,6 +874,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 // manifest names the prior chain until (and unless) the new layer commits. Always
 // ends the flush so waiters (resume/re-pause/delete) unblock.
 func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, layerName, socketPath string, manifest *snapshotManifest) {
+	defer func() { <-m.pauseSem }() // release the background-flush slot claimed in PauseVM
 	vmID := inst.ID
 	log := m.log.With().Str("vm_id", vmID).Logger()
 

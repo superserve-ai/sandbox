@@ -361,8 +361,9 @@ func main() {
 	layerAppendEnabled := envOrDefault("VMD_LAYER_APPEND", "false") == "true"
 	asyncPauseEnabled := envOrDefault("VMD_ASYNC_PAUSE", "false") == "true"
 	layerFlattenEnabled := envOrDefault("VMD_LAYER_FLATTEN", "false") == "true"
-	flattenChainDepth, _ := strconv.Atoi(envOrDefault("VMD_FLATTEN_CHAIN_DEPTH", "0"))             // 0 ⇒ default (16)
-	flattenChainBytes, _ := strconv.ParseInt(envOrDefault("VMD_FLATTEN_CHAIN_BYTES", "0"), 10, 64) // 0 ⇒ depth-only
+	flattenChainDepth, _ := strconv.Atoi(envOrDefault("VMD_FLATTEN_CHAIN_DEPTH", "0"))                // 0 ⇒ default (16)
+	flattenChainBytes, _ := strconv.ParseInt(envOrDefault("VMD_FLATTEN_CHAIN_BYTES", "0"), 10, 64)    // 0 ⇒ depth-only
+	maxConcurrentAsyncPauses, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_ASYNC_PAUSES", "0")) // 0 ⇒ default (3)
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:             cfg.FirecrackerBin,
@@ -387,6 +388,7 @@ func main() {
 		LayerFlattenEnabled:        layerFlattenEnabled,
 		FlattenChainDepth:          flattenChainDepth,
 		FlattenChainBytes:          flattenChainBytes,
+		MaxConcurrentAsyncPauses:   maxConcurrentAsyncPauses,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
