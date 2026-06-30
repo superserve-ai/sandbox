@@ -194,9 +194,9 @@ func TestEmailQuotaNotifierConfigErrorRetries(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(code)
 		}))
+		defer srv.Close()
 		n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
 		err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82})
-		srv.Close()
 		if err == nil {
 			t.Errorf("status %d should return an error so the watcher retries", code)
 		}
