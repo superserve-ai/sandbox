@@ -128,6 +128,16 @@ type VMInstance struct {
 	flattening  bool
 	flattenDone chan struct{}
 
+	// Memfd-bridge fast-resume handoff (set during a bridge pause's flush window).
+	// bridgeMemFdPath is the /proc path through which a resume can reopen the held
+	// guest-memory memfd to serve faults from RAM instead of waiting for the disk
+	// flush; bridgePendingLayer is the disk layer the flush is committing (which the
+	// resumed VM treats as its newest chain link for the next pause). Both are cleared
+	// (under mu) when the flush ends. Not persisted — a vmd restart drops the memfd and
+	// resume falls back to the committed disk chain.
+	bridgeMemFdPath    string
+	bridgePendingLayer string
+
 	mu sync.RWMutex
 }
 
@@ -789,6 +799,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				inst.BaseMemPath = baseMemPath
 				inst.DirtyTracked = false
 				inst.PID = 0 // FC stopped
+				// Expose the held memfd so a resume during this flush serves faults from
+				// RAM instead of waiting for the dump (A5). Valid only while completeBridgePause
+				// holds memFile open; it clears these (under mu) before closing it.
+				inst.bridgeMemFdPath = guestMemFdPath(memFile)
+				inst.bridgePendingLayer = layerPath
 				inst.mu.Unlock()
 				m.persistState(inst)
 				go m.completeBridgePause(inst, snapshotDir, layerPath, layerName, memFile, dirtyOffsetsPath, appendManifest)
@@ -963,9 +978,20 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 // sandbox stays resumable from the committed manifest (stale by one pause, never corrupt).
 // The held memfd is released when the dump finishes (A5 extends the hold for fast resume).
 func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, layerName string, memFile *os.File, dirtyOffsetsPath string, manifest *snapshotManifest) {
-	defer func() { <-m.pauseSem }()  // release the background-flush slot claimed in PauseVM
-	defer memFile.Close()            // release the held memfd
-	defer os.Remove(dirtyOffsetsPath) // sidecar consumed
+	// Defers run LIFO: clear the handoff fields under mu FIRST, then close memFile, then
+	// release the sem. Clearing before the close (and under mu) means a concurrent resume
+	// either sees the path set and reopens its own fd while memFile is still open, or sees
+	// it cleared and falls back to the disk chain — never a closed-fd path. A resume that
+	// already reopened keeps the memfd alive via its own fd / the new FC's mmap.
+	defer func() { <-m.pauseSem }()
+	defer memFile.Close()
+	defer func() {
+		inst.mu.Lock()
+		inst.bridgeMemFdPath = ""
+		inst.bridgePendingLayer = ""
+		inst.mu.Unlock()
+	}()
+	defer os.Remove(dirtyOffsetsPath)
 	vmID := inst.ID
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
@@ -1245,9 +1271,33 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, err
 	}
 
-	// If an async pause is still flushing, or a flatten is rewriting the chain, wait
-	// for it to commit before resuming — the chain we load must be the committed one.
-	_ = m.waitForFlush(inst)
+	// Memfd-bridge fast resume (A5): if a bridge pause is still flushing and its memfd is
+	// available, serve faults from that RAM (as the newest overlay) instead of waiting for
+	// the disk flush — resume returns in ~constant time regardless of the dirty-set size.
+	// Reopen vmd's own fd to the memfd under the lock so it can't be closed mid-decision;
+	// the new FC mmaps it during restore and keeps it alive, so we drop our fd afterwards.
+	var memfdFd *os.File
+	var memfdResumePath, bridgePendingLayer string
+	inst.mu.Lock()
+	if inst.flushing && inst.bridgeMemFdPath != "" {
+		if f, oerr := os.Open(inst.bridgeMemFdPath); oerr == nil {
+			memfdFd = f
+			memfdResumePath = guestMemFdPath(f)
+			bridgePendingLayer = inst.bridgePendingLayer
+		}
+	}
+	inst.mu.Unlock()
+	useMemfd := memfdFd != nil
+	defer func() {
+		if memfdFd != nil {
+			_ = memfdFd.Close()
+		}
+	}()
+	if !useMemfd {
+		// No memfd handoff — wait for any in-flight flush/flatten to commit the durable
+		// chain before resuming, so the chain we load is the committed one.
+		_ = m.waitForFlush(inst)
+	}
 	m.waitForFlatten(inst)
 
 	if snapshotPath == "" {
@@ -1275,7 +1325,24 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		if !ok {
 			return nil, status.Errorf(codes.FailedPrecondition, "snapshot manifest in %s has no overlays", snapshotDir)
 		}
-		basePath, lowerOverlays, memPath = base, lower, newest
+		if useMemfd {
+			// Lay the held memfd (the frozen RAM at the pause point) over the committed disk
+			// chain as the newest overlay: it owns every faulted page (shadowing the chain),
+			// and never-faulted pages fall through to the chain. The in-flight layer the
+			// flush is writing is NOT yet committed, so the chain here is the prior one.
+			basePath = base
+			lowerOverlays = append(lower, newest)
+			memPath = memfdResumePath
+		} else {
+			basePath, lowerOverlays, memPath = base, lower, newest
+		}
+	} else if useMemfd {
+		// A bridge pause always leaves a manifest; if it vanished, abandon the memfd path
+		// and fall back to a normal (post-flush) resume.
+		useMemfd = false
+		_ = memfdFd.Close()
+		memfdFd = nil
+		_ = m.waitForFlush(inst)
 	}
 
 	// Verify the snapshot files actually exist on disk. DB can claim
@@ -1388,6 +1455,14 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
+	// For a memfd resume, memPath is the transient /proc memfd path — not a chain link.
+	// Cache the disk layer the flush committed instead, so the next pause is recognized as
+	// an accumulating append onto the committed chain (and so a restart resolves to disk).
+	resumedMemFile := memPath
+	if useMemfd {
+		resumedMemFile = bridgePendingLayer
+	}
+
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
@@ -1397,7 +1472,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// that differs from the cached one) so the next pause's diff baseline matches
 	// what Firecracker's dirty bitmap is relative to.
 	inst.SnapshotPath = snapshotPath
-	inst.MemFilePath = memPath
+	inst.MemFilePath = resumedMemFile
 	inst.BaseMemPath = basePath // re-cache (may have come from the on-disk sidecar)
 	inst.mu.Unlock()
 
