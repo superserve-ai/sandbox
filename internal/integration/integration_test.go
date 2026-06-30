@@ -1006,6 +1006,47 @@ func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	}
 }
 
+func TestIntegration_ResumeSandbox_QuotaBlocked(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	// Cap the team at a single active sandbox.
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_sandboxes = 1 WHERE id = $1`, teamID); err != nil {
+		t.Fatalf("set max_sandboxes: %v", err)
+	}
+
+	// Create A, then pause it — under active-only counting this frees the slot.
+	cwA := do(r, "POST", "/sandboxes", apiKey, `{"name":"box-a"}`)
+	if cwA.Code != http.StatusCreated {
+		t.Fatalf("create A: %d %s", cwA.Code, cwA.Body.String())
+	}
+	sidA := mustJSON(t, cwA)["id"].(string)
+	if pw := do(r, "POST", "/sandboxes/"+sidA+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause A: %d %s", pw.Code, pw.Body.String())
+	}
+
+	cwB := do(r, "POST", "/sandboxes", apiKey, `{"name":"box-b"}`)
+	if cwB.Code != http.StatusCreated {
+		t.Fatalf("create B (slot should be free after pausing A): %d %s", cwB.Code, cwB.Body.String())
+	}
+
+	// Resuming A would exceed the cap → 429, A stays paused.
+	rw := do(r, "POST", "/sandboxes/"+sidA+"/resume", apiKey, "")
+	if rw.Code != http.StatusTooManyRequests {
+		t.Fatalf("resume A: expected 429, got %d: %s", rw.Code, rw.Body.String())
+	}
+
+	sandboxIDA, _ := uuid.Parse(sidA)
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxIDA, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get A: %v", err)
+	}
+	if sb.Status != db.SandboxStatusPaused {
+		t.Errorf("A status = %q, want paused (resume must be rejected)", sb.Status)
+	}
+}
+
 func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)

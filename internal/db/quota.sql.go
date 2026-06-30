@@ -7,25 +7,29 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 const claimQuotaAlert = `-- name: ClaimQuotaAlert :execrows
-INSERT INTO quota_alert_state (team_id, quota_type)
-VALUES ($1, $2)
-ON CONFLICT (team_id, quota_type) DO NOTHING
+INSERT INTO quota_alert_state (team_id, quota_type, channel)
+VALUES ($1, $2, $3)
+ON CONFLICT (team_id, quota_type, channel) DO NOTHING
 `
 
 type ClaimQuotaAlertParams struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	QuotaType string    `json:"quota_type"`
+	Channel   string    `json:"channel"`
 }
 
-// Atomically record that (team, quota_type) has been alerted. Affects 1 row when
-// this caller wins the claim, 0 when another replica already alerted.
+// Atomically record that (team, quota_type, channel) has been alerted. Affects 1
+// row when this caller wins the claim, 0 when the channel was already alerted
+// this episode (or is still within the cooldown window). The row's created_at is
+// the last-alerted time the cooldown sweep reads.
 func (q *Queries) ClaimQuotaAlert(ctx context.Context, arg ClaimQuotaAlertParams) (int64, error) {
-	result, err := q.db.Exec(ctx, claimQuotaAlert, arg.TeamID, arg.QuotaType)
+	result, err := q.db.Exec(ctx, claimQuotaAlert, arg.TeamID, arg.QuotaType, arg.Channel)
 	if err != nil {
 		return 0, err
 	}
@@ -33,26 +37,48 @@ func (q *Queries) ClaimQuotaAlert(ctx context.Context, arg ClaimQuotaAlertParams
 }
 
 const clearQuotaAlert = `-- name: ClearQuotaAlert :exec
-DELETE FROM quota_alert_state WHERE team_id = $1 AND quota_type = $2
+DELETE FROM quota_alert_state
+WHERE team_id = $1 AND quota_type = $2 AND channel = $3
 `
 
 type ClearQuotaAlertParams struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	QuotaType string    `json:"quota_type"`
+	Channel   string    `json:"channel"`
 }
 
 func (q *Queries) ClearQuotaAlert(ctx context.Context, arg ClearQuotaAlertParams) error {
-	_, err := q.db.Exec(ctx, clearQuotaAlert, arg.TeamID, arg.QuotaType)
+	_, err := q.db.Exec(ctx, clearQuotaAlert, arg.TeamID, arg.QuotaType, arg.Channel)
 	return err
 }
 
+const getTeamNotifyEmail = `-- name: GetTeamNotifyEmail :one
+SELECT p.email
+FROM team_member tm
+JOIN profile p ON p.id = tm.profile_id
+WHERE tm.team_id = $1 AND tm.role = 'owner'
+ORDER BY tm.joined_at ASC
+LIMIT 1
+`
+
+// The team owner's email for the quota notification. No row (caller skips) when
+// the team has no owner, so the email never goes to a non-owner member.
+func (q *Queries) GetTeamNotifyEmail(ctx context.Context, teamID uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getTeamNotifyEmail, teamID)
+	var email string
+	err := row.Scan(&email)
+	return email, err
+}
+
 const listQuotaAlertState = `-- name: ListQuotaAlertState :many
-SELECT team_id, quota_type FROM quota_alert_state
+SELECT team_id, quota_type, channel, created_at FROM quota_alert_state
 `
 
 type ListQuotaAlertStateRow struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	QuotaType string    `json:"quota_type"`
+	Channel   string    `json:"channel"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (q *Queries) ListQuotaAlertState(ctx context.Context) ([]ListQuotaAlertStateRow, error) {
@@ -64,7 +90,12 @@ func (q *Queries) ListQuotaAlertState(ctx context.Context) ([]ListQuotaAlertStat
 	items := []ListQuotaAlertStateRow{}
 	for rows.Next() {
 		var i ListQuotaAlertStateRow
-		if err := rows.Scan(&i.TeamID, &i.QuotaType); err != nil {
+		if err := rows.Scan(
+			&i.TeamID,
+			&i.QuotaType,
+			&i.Channel,
+			&i.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

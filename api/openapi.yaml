@@ -429,9 +429,9 @@ paths:
           description: |
             Rate-limited or quota reached. The `error.code` distinguishes:
             - `rate_limited` — request rate exceeded; retry after a short backoff.
-            - `too_many_sandboxes` — team has reached its sandbox count limit
-              (paused sandboxes count toward this cap; only DELETE frees a slot);
-              delete existing sandboxes or contact support to raise the cap.
+            - `too_many_sandboxes` — team has reached its active sandbox count
+              limit (paused sandboxes do not count; pause or delete a sandbox to
+              free a slot, or contact support to raise the cap).
           content:
             application/json:
               schema:
@@ -576,6 +576,12 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          description: "`too_many_sandboxes` — resuming would exceed the team's active sandbox limit; free a slot or contact support to raise it."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -606,6 +612,12 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          description: "`too_many_sandboxes` — auto-resuming a paused sandbox would exceed the active sandbox limit; free a slot or contact support to raise it."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -734,7 +746,11 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
-          $ref: "#/components/responses/TooManyRequests"
+          description: "`rate_limited` (retry after backoff) or `too_many_sandboxes` — auto-resuming the paused sandbox would exceed the active sandbox limit; free a slot or contact support to raise it."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
 

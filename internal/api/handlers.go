@@ -414,6 +414,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			respondError(c, ErrInvalidState)
 			return false
 		}
+		if isSandboxQuotaErr(err) {
+			// Resuming re-enters the active set; the team is already at its limit.
+			h.respondQuotaExceeded(c, teamID)
+			return false
+		}
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginResume failed")
 		respondError(c, ErrInternal)
 		return false

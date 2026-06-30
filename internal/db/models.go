@@ -373,6 +373,7 @@ type QuotaAlertState struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	QuotaType string    `json:"quota_type"`
 	CreatedAt time.Time `json:"created_at"`
+	Channel   string    `json:"channel"`
 }
 
 type ReconcilerLog struct {
