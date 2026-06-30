@@ -768,6 +768,15 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
+			// The Full image is now the durable state; drop the manifest (and its now-orphaned
+			// overlays) so resume loads this snapshot instead of the stale chain the manifest
+			// would otherwise still name as authoritative.
+			for _, name := range appendManifest.Overlays {
+				_ = os.Remove(filepath.Join(snapshotDir, name))
+			}
+			if merr := removeManifest(snapshotDir); merr != nil {
+				log.Warn().Err(merr).Msg("pause: remove manifest on Full fallback")
+			}
 			break
 		}
 		// Async only when enabled AND a prior durable layer exists to fall back to if
@@ -1222,6 +1231,13 @@ func (m *Manager) maybeFlatten(inst *VMInstance, snapshotDir string) {
 	}
 	select {
 	case m.flattenSem <- struct{}{}:
+		// Arm the flatten guard synchronously, BEFORE the goroutine starts, so a resume/
+		// delete/re-pause arriving in the scheduling window waits on flattenDone instead of
+		// reading the chain while the goroutine swaps the manifest and deletes old layers.
+		inst.mu.Lock()
+		inst.flattening = true
+		inst.flattenDone = make(chan struct{})
+		inst.mu.Unlock()
 		go func() {
 			defer func() { <-m.flattenSem }()
 			m.flattenInBackground(inst, snapshotDir)
@@ -1234,13 +1250,13 @@ func (m *Manager) maybeFlatten(inst *VMInstance, snapshotDir string) {
 // flattenInBackground serializes against any in-flight async flush, then flattens
 // the chain under the per-instance flatten guard (so resume/re-pause/delete wait).
 func (m *Manager) flattenInBackground(inst *VMInstance, snapshotDir string) {
+	// The guard (flattening=true, flattenDone) was armed by maybeFlatten before this
+	// goroutine started, so a concurrent resume/delete already waits on it.
 	_ = m.waitForFlush(inst)
 
-	inst.mu.Lock()
-	inst.flattening = true
-	inst.flattenDone = make(chan struct{})
+	inst.mu.RLock()
 	ch := inst.flattenDone
-	inst.mu.Unlock()
+	inst.mu.RUnlock()
 
 	err := m.flattenChain(snapshotDir)
 	if err == nil {
@@ -1353,9 +1369,15 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		}
 	}()
 	if !useMemfd {
-		// No memfd handoff — wait for any in-flight flush/flatten to commit the durable
-		// chain before resuming, so the chain we load is the committed one.
-		_ = m.waitForFlush(inst)
+		// No memfd handoff — wait for any in-flight flush to commit the durable chain. If it
+		// FAILED, the memory chain reverted to the prior one while vmstate.snap holds the
+		// failed pause's state, so a resume would pair mismatched vmstate + memory. Refuse and
+		// mark failed rather than boot a torn VM.
+		if ferr := m.waitForFlush(inst); ferr != nil {
+			m.setStatus(vmID, StatusError)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot resume %s: last async snapshot flush failed (%v); snapshot is not durable", vmID, ferr)
+		}
 	}
 	m.waitForFlatten(inst)
 
@@ -2049,8 +2071,27 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		isTemplate := m.isTemplateMemPath(memPath)
 		canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
 		basePath := ""
+		var lowerOverlays []string
 		armLayered := false
+		// The manifest is authoritative for the full base → overlay chain (as in ResumeVM):
+		// a stateless restore of a multi-layer chain must load the whole chain, not just the
+		// newest overlay over the base, or the intermediate layers' pages are lost.
+		man, manErr := readManifest(filepath.Dir(memPath))
 		switch {
+		case manErr != nil:
+			restoreErr = fmt.Errorf("unreadable snapshot manifest in %s: %w", filepath.Dir(memPath), manErr)
+		case man != nil:
+			base, lower, newest, ok := man.chainPaths(filepath.Dir(memPath))
+			if !ok {
+				restoreErr = fmt.Errorf("snapshot manifest in %s has no overlays", filepath.Dir(memPath))
+				break
+			}
+			basePath, lowerOverlays, memPath = base, lower, newest
+			armLayered = m.cfg.IncrementalSnapshotEnabled
+			inst.mu.Lock()
+			inst.BaseMemPath = base
+			inst.DirtyTracked = armLayered
+			inst.mu.Unlock()
 		case hasSidecar:
 			// The outer overlayNeedsLayered guard already required resume-UFFD to reach
 			// here, so canLayered holds — serve the overlay over its recorded base.
@@ -2071,7 +2112,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		if restoreErr == nil {
 			restoreErr = RestoreSnapshotUffdInternalWithOverrides(
-				socketPath, snapshotPath, memPath, basePath, nil, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+				socketPath, snapshotPath, memPath, basePath, lowerOverlays, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
 				m.cfg.HandlerDeathAbortEnabled, m.cfg.SharedMemEnabled,
 			)
 		}
