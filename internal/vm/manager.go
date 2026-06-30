@@ -744,6 +744,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// chain intact and resumable. This is the on-disk foundation the async/durable
 	// pause path needs. When disabled, the in-place paths below run unchanged.
 	appendBase, appendManifest, appendOK := m.planLayerAppend(snapshotDir, dirtyTracked, instBaseMem, instMemFile)
+	// appended is set once a pause commits a layer onto the chain (manifest republished). If a
+	// pause instead writes a STANDALONE snapshot (in-place mem.diff / Full mem.snap) while a
+	// chain manifest exists — e.g. flags turned off, dirty-tracking cleared, or planLayerAppend
+	// rejected the baseline — that manifest is now stale and would shadow the new snapshot on
+	// resume (ResumeVM treats a present manifest as authoritative). The post-switch tail
+	// reconciles it.
+	appended := false
 	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
@@ -768,15 +775,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
-			// The Full image is now the durable state; drop the manifest (and its now-orphaned
-			// overlays) so resume loads this snapshot instead of the stale chain the manifest
-			// would otherwise still name as authoritative.
-			for _, name := range appendManifest.Overlays {
-				_ = os.Remove(filepath.Join(snapshotDir, name))
-			}
-			if merr := removeManifest(snapshotDir); merr != nil {
-				log.Warn().Err(merr).Msg("pause: remove manifest on Full fallback")
-			}
+			// appended stays false → the post-switch tail drops the now-stale manifest so
+			// resume loads this Full image, not the chain it would otherwise still name.
 			break
 		}
 		// Stash the prior committed vmstate (see savePriorVmstate) before this pause overwrites
@@ -903,6 +903,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		if priorVmstateSaved {
 			discardPriorVmstate(snapshotPath)
 		}
+		appended = true
 	case layered:
 		memPath = overlayPath
 		baseMemPath = instBaseMem
@@ -963,6 +964,21 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+			}
+		}
+	}
+
+	// Standalone snapshot (in-place / Full): if a chain manifest lingers from a prior
+	// append-mode run, drop it (and its now-orphaned overlays) so resume loads this snapshot
+	// instead of the stale chain. No-op when this pause appended (manifest is fresh) or when
+	// there's no manifest. (The Full-fallback above already handled its own removal.)
+	if !appended {
+		if man, merr := readManifest(snapshotDir); merr == nil && man != nil {
+			for _, name := range man.Overlays {
+				_ = os.Remove(filepath.Join(snapshotDir, name))
+			}
+			if rmErr := removeManifest(snapshotDir); rmErr != nil {
+				log.Warn().Err(rmErr).Msg("pause: remove stale manifest after standalone snapshot")
 			}
 		}
 	}
@@ -1029,9 +1045,11 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 	}
 	m.stopAsyncPauseFC(vmID)
 	log.Info().Msg("VM paused (async memory flush durable)")
-	m.endFlush(inst, nil)
-	// Bound chain depth off the hot path now that this layer is durable.
+	// Arm/launch flatten BEFORE endFlush: maybeFlatten sets the flatten guard synchronously,
+	// so a resume/delete woken by endFlush observes the pending flatten (waitForFlatten) and
+	// won't read the chain while the background flatten swaps the manifest + deletes layers.
 	m.maybeFlatten(inst, snapshotDir)
+	m.endFlush(inst, nil)
 }
 
 // completeBridgePause runs after a memfd-bridge pause returned at the snapshot point.
@@ -1091,9 +1109,10 @@ func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, 
 		discardPriorVmstate(vmstatePath) // new vmstate pairs with the new chain now
 	}
 	log.Info().Int("pages", len(offsets)).Msg("VM paused (memfd bridge flush durable)")
-	m.endFlush(inst, nil)
-	// Bound chain depth off the hot path now that this layer is durable.
+	// Arm/launch flatten BEFORE endFlush (see completeAsyncPause) so a woken resume/delete
+	// observes the pending flatten instead of racing the manifest swap.
 	m.maybeFlatten(inst, snapshotDir)
+	m.endFlush(inst, nil)
 }
 
 // stopAsyncPauseFC stops the still-alive paused Firecracker after an async flush
@@ -2095,14 +2114,19 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Msg("restoring snapshot")
 
 	var restoreErr error
-	// A diff overlay (mem.diff, or any file with a base sidecar) must be served by
-	// the UFFD layered backend. Catch it before backend selection so that with UFFD
-	// disabled / inPlace / resume-UFFD off it fails loud instead of falling to the
-	// File backend, which would load the sparse overlay as a full image (the base's
-	// pages read as zero holes).
+	// A diff overlay (mem.diff / a sidecar file) or a layered manifest chain must be served by
+	// the UFFD layered backend. Resolve those up front, before backend selection, so that with
+	// UFFD disabled / inPlace / resume-UFFD off it fails loud instead of falling to the File
+	// backend (which would load a sparse overlay as a full image — the base's pages read as
+	// zero holes). The manifest is read here too because an append-chain newest layer is
+	// mem.N.diff, which isOverlayMemFile (only "mem.diff") doesn't match.
 	sidecarBase, hasSidecar := readLayeredBase(memPath)
-	overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
+	man, manErr := readManifest(filepath.Dir(memPath))
+	hasManifest := manErr == nil && man != nil
+	overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar || hasManifest
 	switch {
+	case manErr != nil:
+		restoreErr = fmt.Errorf("unreadable snapshot manifest in %s: %w", filepath.Dir(memPath), manErr)
 	case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
 		restoreErr = fmt.Errorf(
 			"layered overlay %q requires UFFD layered restore (uffd + resume-uffd); refusing File-backend restore",
@@ -2121,22 +2145,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				accessLogPath = candidate
 			}
 		}
-		// Decide the layered base for this UFFD restore. An overlay (mem.diff) needs
-		// its base reconstructed from the sidecar (else refuse — loading it
-		// standalone reads the base as zero holes); a template create instead arms
-		// tracking and records the template as the base. Layered needs resume-UFFD.
+		// Decide the layered base for this UFFD restore. The manifest (resolved above) is
+		// authoritative for a multi-layer chain — load the whole chain, not just the newest
+		// overlay. Else an overlay needs its sidecar base; a template create arms tracking.
 		isTemplate := m.isTemplateMemPath(memPath)
 		canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
 		basePath := ""
 		var lowerOverlays []string
 		armLayered := false
-		// The manifest is authoritative for the full base → overlay chain (as in ResumeVM):
-		// a stateless restore of a multi-layer chain must load the whole chain, not just the
-		// newest overlay over the base, or the intermediate layers' pages are lost.
-		man, manErr := readManifest(filepath.Dir(memPath))
 		switch {
-		case manErr != nil:
-			restoreErr = fmt.Errorf("unreadable snapshot manifest in %s: %w", filepath.Dir(memPath), manErr)
 		case man != nil:
 			base, lower, newest, ok := man.chainPaths(filepath.Dir(memPath))
 			if !ok {
@@ -2147,6 +2164,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			armLayered = m.cfg.IncrementalSnapshotEnabled
 			inst.mu.Lock()
 			inst.BaseMemPath = base
+			inst.MemFilePath = newest // resolved chain newest, so the next pause appends onto it
 			inst.DirtyTracked = armLayered
 			inst.mu.Unlock()
 		case hasSidecar:
