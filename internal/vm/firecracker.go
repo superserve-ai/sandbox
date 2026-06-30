@@ -419,6 +419,42 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 	return nil
 }
 
+// LoadSnapshotNoResumeLayered loads a base + ordered overlay chain via the in-process
+// UFFD handler WITHOUT resuming the vCPUs (leaves the VM paused). For offline use —
+// verification and flatten — where the composed image must be read but not run.
+// memPath is the newest overlay; lowerOverlayPaths are the intermediate overlays
+// (oldest→newest); basePath is the template base. No dirty tracking is armed.
+func LoadSnapshotNoResumeLayered(socketPath, snapshotPath, memPath, basePath string, lowerOverlayPaths []string, ifaceID, tapDevice string) error {
+	overrides := []*models.NetworkOverride{}
+	if tapDevice != "" {
+		overrides = []*models.NetworkOverride{{IfaceID: &ifaceID, HostDevName: &tapDevice}}
+	}
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
+		Context: context.Background(),
+		Body: &models.SnapshotLoadParams{
+			SnapshotPath: &snapshotPath,
+			MemBackend: &models.MemoryBackend{
+				BackendType:       strPtr(models.MemoryBackendBackendTypeUffdInternal),
+				BackendPath:       &memPath,
+				BasePath:          basePath,
+				LowerOverlayPaths: lowerOverlayPaths,
+			},
+			ResumeVM:         false,
+			NetworkOverrides: overrides,
+		},
+	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot (no-resume layered): %w: %v", ErrTornSnapshot, err)
+		}
+		if isLayeredInvalidErr(err) {
+			return fmt.Errorf("load snapshot (no-resume layered): %w: %v", ErrLayeredInvalidSnapshot, err)
+		}
+		return fmt.Errorf("load snapshot (no-resume layered): %w", err)
+	}
+	return nil
+}
+
 // SnapshotPausedVM creates a Full snapshot of an already-paused VM (e.g. one
 // loaded via LoadSnapshotNoResume), issuing no pause first as CreateSnapshot does.
 func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {

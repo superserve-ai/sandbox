@@ -1187,12 +1187,32 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	if snapshotPath == "" || memPath == "" {
 		return "", status.Errorf(codes.InvalidArgument, "vm %s has no snapshot on record", vmID)
 	}
-	// This gate loads via the File backend (no base), so it can only verify a
-	// standalone image. A layered diff overlay would load with its base's pages as
-	// zero holes and produce a meaningless comparison — refuse instead.
-	if isOverlayMemFile(memPath) || inst.BaseMemPath != "" {
-		return "", status.Errorf(codes.FailedPrecondition,
-			"vm %s is a layered (diff-overlay) snapshot; the verify gate only supports standalone images", vmID)
+	// Resolve the layered chain (if any). The manifest is authoritative for the
+	// base + ordered overlays (so this also verifies a post-flatten chain whose
+	// inst fields may be stale); fall back to the single-overlay .base sidecar.
+	// A standalone image leaves basePath empty and loads via the File backend.
+	snapshotDir := filepath.Dir(memPath)
+	basePath := ""
+	var lowerOverlays []string
+	if man, merr := readManifest(snapshotDir); merr != nil {
+		return "", status.Errorf(codes.FailedPrecondition, "unreadable snapshot manifest in %s: %v", snapshotDir, merr)
+	} else if man != nil {
+		base, lower, newest, ok := man.chainPaths(snapshotDir)
+		if !ok {
+			return "", status.Errorf(codes.FailedPrecondition, "snapshot manifest in %s has no overlays", snapshotDir)
+		}
+		basePath, lowerOverlays, memPath = base, lower, newest
+	}
+	if basePath == "" && isOverlayMemFile(memPath) {
+		if b, ok := readLayeredBase(memPath); ok {
+			basePath = b
+		} else if memPath == inst.MemFilePath {
+			basePath = inst.BaseMemPath
+		}
+		if basePath == "" {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"vm %s layered overlay %q has no recoverable base", vmID, memPath)
+		}
 	}
 	if _, err := os.Stat(memPath); err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "mem file missing on host: %s", memPath)
@@ -1230,11 +1250,19 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	}
 	defer func() { _ = stopUnit(context.Background(), systemdUnitName(vmID)) }()
 
-	if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
-		return "", err
+	// Layered chain → UFFD no-resume load (composes base + overlays); standalone →
+	// File backend. The re-snapshot below then captures the fully composed image.
+	if basePath != "" {
+		if err := LoadSnapshotNoResumeLayered(socketPath, snapshotPath, memPath, basePath, lowerOverlays, "eth0", tapDevice); err != nil {
+			return "", err
+		}
+	} else {
+		if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
+			return "", err
+		}
 	}
 
-	verifyDir := filepath.Join(filepath.Dir(memPath), "verify")
+	verifyDir := filepath.Join(snapshotDir, "verify")
 	if err := os.MkdirAll(verifyDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir verify dir: %w", err)
 	}
