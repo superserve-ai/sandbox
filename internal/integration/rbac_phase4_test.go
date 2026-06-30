@@ -3,6 +3,8 @@
 package integration
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -94,4 +96,67 @@ func TestRbacPhase4TeamManagementReadModel(t *testing.T) {
 	if otherW.Code != http.StatusForbidden {
 		t.Fatalf("expected cross-team management summary forbidden, got %d: %s", otherW.Code, otherW.Body.String())
 	}
+}
+
+func TestRbacPhase4ConsoleImpersonationReadModel(t *testing.T) {
+	targetTeamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	platformActorID := seedRBACProfile(t)
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id)
+		VALUES ($1, $2, 'platform', NULL)
+	`, platformActorID, mustRoleID(t, t.Context(), "platform_admin")); err != nil {
+		t.Fatalf("insert platform admin assignment: %v", err)
+	}
+
+	impersonationKey := seedConsoleImpersonationKey(t, targetTeamID, platformActorID)
+	r := newRouter(t)
+
+	readW := do(r, "GET", "/teams/"+targetTeamID.String()+"/management", impersonationKey, "")
+	if readW.Code != http.StatusOK {
+		t.Fatalf("expected platform impersonation read to succeed, got %d: %s", readW.Code, readW.Body.String())
+	}
+	var readBody struct {
+		Capabilities struct {
+			CanInviteMembers       bool `json:"can_invite_members"`
+			CanDeactivateMembers   bool `json:"can_deactivate_members"`
+			CanAssignRoles         bool `json:"can_assign_roles"`
+			CanRevokeRoles         bool `json:"can_revoke_roles"`
+			CanViewRoleAssignments bool `json:"can_view_role_assignments"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(readW.Body.Bytes(), &readBody); err != nil {
+		t.Fatalf("decode impersonation management summary: %v", err)
+	}
+	if !readBody.Capabilities.CanViewRoleAssignments {
+		t.Fatal("expected platform impersonation to expose read-only role visibility")
+	}
+	if readBody.Capabilities.CanInviteMembers || readBody.Capabilities.CanDeactivateMembers || readBody.Capabilities.CanAssignRoles || readBody.Capabilities.CanRevokeRoles {
+		t.Fatalf("impersonation mutation capabilities = %+v, want read-only", readBody.Capabilities)
+	}
+
+	writeW := do(r, "POST", "/teams/"+targetTeamID.String()+"/members", impersonationKey, `{"user_id":"`+platformActorID.String()+`","status":"active"}`)
+	if writeW.Code != http.StatusForbidden {
+		t.Fatalf("expected platform impersonation write to be forbidden, got %d: %s", writeW.Code, writeW.Body.String())
+	}
+
+	unprivilegedActorID := seedRBACProfile(t)
+	unprivilegedKey := seedConsoleImpersonationKey(t, targetTeamID, unprivilegedActorID)
+	forbiddenW := do(r, "GET", "/teams/"+targetTeamID.String()+"/management", unprivilegedKey, "")
+	if forbiddenW.Code != http.StatusForbidden {
+		t.Fatalf("expected impersonation without platform permission to be forbidden, got %d: %s", forbiddenW.Code, forbiddenW.Body.String())
+	}
+}
+
+func seedConsoleImpersonationKey(t *testing.T, teamID, actorID uuid.UUID) string {
+	t.Helper()
+	rawKey := "sk-test-impersonation-" + uuid.NewString()
+	hash := sha256.Sum256([]byte(rawKey))
+	keyHash := hex.EncodeToString(hash[:])
+	if _, err := testPool.Exec(t.Context(), `
+		INSERT INTO api_key (team_id, key_hash, name, scopes, created_by)
+		VALUES ($1, $2, '__console_impersonation__', '{}'::text[], $3)
+	`, teamID, keyHash, actorID); err != nil {
+		t.Fatalf("insert console impersonation key: %v", err)
+	}
+	return rawKey
 }
