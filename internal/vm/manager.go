@@ -702,12 +702,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// and doesn't race the background writer, FC stop, or layer deletion.
 	_ = m.waitForFlush(inst)
 	m.waitForFlatten(inst)
-
-	// If this VM was fast-resumed from a bridge memfd, pausing now stops that FC and
-	// frees the pinned RAM — drop the hold so it stops counting against MaxBridgeMemfds.
-	inst.mu.Lock()
-	inst.holdingBridgeMemfd = false
-	inst.mu.Unlock()
+	// A prior memfd fast-resume's hold (holdingBridgeMemfd) is dropped only once this pause has
+	// actually stopped that Firecracker — see clearBridgeHold at each stop point below. Clearing
+	// it here at entry would undercount the cap whenever the pause then fails with the FC (and
+	// its memfd mapping) still alive.
 
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
@@ -840,6 +838,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
 					log.Warn().Err(err).Msg("stop FC after bridge snapshot")
 				}
+				m.clearBridgeHold(inst) // prior fast-resume's FC is stopped; release its memfd hold
 				// Mark flushing BEFORE status=paused (same ordering as the in-FC async path)
 				// so the reconciler never mistakes the flush window for a stranded FC.
 				m.beginFlush(inst)
@@ -976,11 +975,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// resume loads this snapshot, not the old chain. See the `appended` comment above.
 	if !appended {
 		if man, merr := readManifest(snapshotDir); merr == nil && man != nil {
-			for _, name := range man.Overlays {
-				_ = os.Remove(filepath.Join(snapshotDir, name))
-			}
+			// Remove the manifest FIRST so it's no longer authoritative, THEN reclaim its
+			// layers. The reverse order would let a crash (or a removeManifest failure) leave a
+			// live manifest pointing at just-deleted files, so resume would fail the chain load
+			// instead of using the standalone snapshot. Only reclaim layers once the manifest
+			// is gone.
 			if rmErr := removeManifest(snapshotDir); rmErr != nil {
 				log.Warn().Err(rmErr).Msg("pause: remove stale manifest after standalone snapshot")
+			} else {
+				for _, name := range man.Overlays {
+					_ = os.Remove(filepath.Join(snapshotDir, name))
+				}
 			}
 		}
 	}
@@ -989,6 +994,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
 		log.Warn().Err(err).Msg("systemctl stop failed during pause")
 	}
+	m.clearBridgeHold(inst) // the fast-resumed FC (if any) is stopped; release its memfd hold
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
@@ -1029,6 +1035,7 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 			m.revertPriorVmstate(inst, vmstatePath)
 		}
 		m.stopAsyncPauseFC(vmID)
+		m.clearBridgeHold(inst) // FC stopped; release any prior fast-resume memfd hold
 		m.endFlush(inst, err)
 	}
 
@@ -1046,6 +1053,7 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 		discardPriorVmstate(vmstatePath) // new vmstate pairs with the new chain now
 	}
 	m.stopAsyncPauseFC(vmID)
+	m.clearBridgeHold(inst) // FC stopped; release any prior fast-resume memfd hold
 	log.Info().Msg("VM paused (async memory flush durable)")
 	// Arm/launch flatten BEFORE endFlush: maybeFlatten sets the flatten guard synchronously,
 	// so a resume/delete woken by endFlush observes the pending flatten (waitForFlatten) and
@@ -1184,6 +1192,16 @@ func (m *Manager) planLayerAppend(snapshotDir string, dirtyTracked bool, instBas
 		return "", nil, false
 	}
 	return instBaseMem, &snapshotManifest{Base: instBaseMem}, true
+}
+
+// clearBridgeHold drops a prior fast-resume's memfd hold once the Firecracker that mapped it
+// has been stopped (so it stops counting against MaxBridgeMemfds). Called at each pause stop
+// point — not at pause entry — so a failed pause that leaves the FC (and its mapping) alive
+// keeps the hold counted.
+func (m *Manager) clearBridgeHold(inst *VMInstance) {
+	inst.mu.Lock()
+	inst.holdingBridgeMemfd = false
+	inst.mu.Unlock()
 }
 
 // maxBridgeMemfds returns the configured cap on concurrently-held bridge memfds.
