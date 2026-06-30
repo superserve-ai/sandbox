@@ -46,6 +46,26 @@ func TestSnapshotManifestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRemoveManifest(t *testing.T) {
+	dir := t.TempDir()
+
+	// Removing an absent manifest is not an error (a Full-fallback dir may have none).
+	if err := removeManifest(dir); err != nil {
+		t.Fatalf("removeManifest(absent) = %v, want nil", err)
+	}
+
+	if err := writeManifestAtomic(dir, &snapshotManifest{Base: "b", Overlays: []string{"mem.0.diff"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeManifest(dir); err != nil {
+		t.Fatalf("removeManifest = %v", err)
+	}
+	// After removal a resume must not see a manifest (standalone snapshot is authoritative).
+	if m, err := readManifest(dir); err != nil || m != nil {
+		t.Fatalf("readManifest after remove = (%v, %v), want (nil, nil)", m, err)
+	}
+}
+
 func TestChainPaths(t *testing.T) {
 	dir := "/snap/vm1"
 

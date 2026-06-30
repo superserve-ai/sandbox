@@ -75,6 +75,17 @@ func writeManifestAtomic(dir string, m *snapshotManifest) error {
 	return fsyncDir(dir)
 }
 
+// removeManifest deletes the manifest so a standalone (non-layered) snapshot in the same
+// dir becomes authoritative for a resume. Used when a pause falls back to a Full image:
+// the manifest must not keep naming the now-superseded chain. Absent manifest is not an
+// error. fsyncs the dir so the removal is durable before the caller relies on it.
+func removeManifest(dir string) error {
+	if err := os.Remove(manifestPath(dir)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return fsyncDir(dir)
+}
+
 // chainPaths resolves the manifest into absolute layer paths for a restore: the
 // base, the lower overlays (oldest → newest, all but the last), and the newest
 // overlay (the active snapshot path). ok is false when the chain has no overlays.
