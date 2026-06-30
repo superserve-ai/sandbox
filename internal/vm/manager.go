@@ -121,6 +121,13 @@ type VMInstance struct {
 	flushDone chan struct{}
 	flushErr  error
 
+	// Background-flatten guard. While flattening is true, this sandbox's overlay
+	// chain is being merged + the manifest swapped + old layers deleted; resume/
+	// re-pause/delete wait on flattenDone so they don't read a half-swapped manifest
+	// or a layer flatten is removing. Not persisted.
+	flattening  bool
+	flattenDone chan struct{}
+
 	mu sync.RWMutex
 }
 
@@ -210,6 +217,21 @@ type ManagerConfig struct {
 	// back to). Requires LayerAppendEnabled and an FC binary with /snapshot/complete.
 	// Default false.
 	AsyncPauseEnabled bool
+
+	// LayerFlattenEnabled turns on background chain flattening: once a sandbox's
+	// overlay chain reaches FlattenChainDepth, its overlays are merged into one
+	// sparse overlay (newest-wins, shared base preserved) off the hot path, bounding
+	// chain depth and reclaiming pages duplicated across layers. Requires
+	// LayerAppendEnabled. Default false.
+	LayerFlattenEnabled bool
+
+	// FlattenChainDepth is the overlay count at/above which a chain is flattened.
+	// Default 16 when <= 0.
+	FlattenChainDepth int
+
+	// MaxConcurrentFlattens bounds simultaneous background flattens (each is
+	// I/O-heavy). Default 2 when <= 0.
+	MaxConcurrentFlattens int
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +253,10 @@ type Manager struct {
 	// channel; capacity = effective MaxConcurrentRestores.
 	restoreSem chan struct{}
 
+	// flattenSem bounds concurrent background chain-flatten operations (each is
+	// I/O-heavy). Buffered; capacity = effective MaxConcurrentFlattens.
+	flattenSem chan struct{}
+
 	// builds tracks in-flight and completed template builds. Keyed by
 	// build VM id (which is also "build-" + templateID). Entries survive
 	// until process exit so late pollers can read terminal outcomes.
@@ -249,6 +275,10 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 	if maxRestores <= 0 {
 		maxRestores = 100
 	}
+	maxFlattens := cfg.MaxConcurrentFlattens
+	if maxFlattens <= 0 {
+		maxFlattens = 2
+	}
 	// Magic mount target — every per-VM start script mounts tmpfs over it.
 	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
 	// at startup so an aggressive ops cleanup can't break sandbox/build paths.
@@ -263,6 +293,7 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		log:        log.With().Str("component", "vm_manager").Logger(),
 		vms:        make(map[string]*VMInstance),
 		restoreSem: make(chan struct{}, maxRestores),
+		flattenSem: make(chan struct{}, maxFlattens),
 	}, nil
 }
 
@@ -608,9 +639,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
-	// A prior async pause may still be flushing; wait so this pause sees the durable
-	// chain (committed manifest) and doesn't race the background writer or FC stop.
+	// A prior async pause may still be flushing, or a background flatten may be
+	// rewriting the chain; wait so this pause sees the durable, committed manifest
+	// and doesn't race the background writer, FC stop, or layer deletion.
 	_ = m.waitForFlush(inst)
+	m.waitForFlatten(inst)
 
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
@@ -792,6 +825,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.mu.Unlock()
 
 	m.persistState(inst)
+	// Bound chain depth: if this (synchronous) pause grew the chain to the flatten
+	// threshold, merge it off the hot path. No-op for non-layered paths.
+	m.maybeFlatten(inst, snapshotDir)
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, nil
 }
@@ -826,6 +862,8 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 	m.stopAsyncPauseFC(vmID)
 	log.Info().Msg("VM paused (async memory flush durable)")
 	m.endFlush(inst, nil)
+	// Bound chain depth off the hot path now that this layer is durable.
+	m.maybeFlatten(inst, snapshotDir)
 }
 
 // stopAsyncPauseFC stops the still-alive paused Firecracker after an async flush
@@ -925,6 +963,76 @@ func (m *Manager) waitForFlush(inst *VMInstance) error {
 	return inst.flushErr
 }
 
+// waitForFlatten blocks until any in-progress background flatten for inst finishes.
+// Callers that read the manifest or load the chain (resume, re-pause, delete) must
+// call this so they never see a half-swapped manifest or a layer being deleted.
+func (m *Manager) waitForFlatten(inst *VMInstance) {
+	inst.mu.RLock()
+	flattening, ch := inst.flattening, inst.flattenDone
+	inst.mu.RUnlock()
+	if flattening && ch != nil {
+		<-ch
+	}
+}
+
+// maybeFlatten kicks off a background flatten when enabled and the chain has grown
+// to the configured depth. Non-blocking; bounded by flattenSem (skips this round if
+// the cap is full — the next pause will retry). Call after a durable pause commit.
+func (m *Manager) maybeFlatten(inst *VMInstance, snapshotDir string) {
+	if !m.cfg.LayerFlattenEnabled {
+		return
+	}
+	depth := m.cfg.FlattenChainDepth
+	if depth <= 0 {
+		depth = 16
+	}
+	man, err := readManifest(snapshotDir)
+	if err != nil || man == nil || len(man.Overlays) < depth {
+		return
+	}
+	select {
+	case m.flattenSem <- struct{}{}:
+		go func() {
+			defer func() { <-m.flattenSem }()
+			m.flattenInBackground(inst, snapshotDir)
+		}()
+	default:
+		// Cap full — skip; a later pause re-triggers.
+	}
+}
+
+// flattenInBackground serializes against any in-flight async flush, then flattens
+// the chain under the per-instance flatten guard (so resume/re-pause/delete wait).
+func (m *Manager) flattenInBackground(inst *VMInstance, snapshotDir string) {
+	_ = m.waitForFlush(inst)
+
+	inst.mu.Lock()
+	inst.flattening = true
+	inst.flattenDone = make(chan struct{})
+	ch := inst.flattenDone
+	inst.mu.Unlock()
+
+	err := m.flattenChain(snapshotDir)
+	if err == nil {
+		// Reclaim any interrupted-flatten leftovers / stale temps while still under
+		// the guard (resume/re-pause/delete are waiting on flattenDone).
+		if _, gcErr := m.gcOrphanLayers(snapshotDir); gcErr != nil {
+			m.log.Warn().Str("vm_id", inst.ID).Err(gcErr).Msg("gc after flatten")
+		}
+	}
+
+	inst.mu.Lock()
+	inst.flattening = false
+	inst.mu.Unlock()
+	close(ch)
+
+	if err != nil {
+		m.log.Warn().Str("vm_id", inst.ID).Err(err).Msg("background flatten failed; chain left intact")
+		return
+	}
+	m.log.Info().Str("vm_id", inst.ID).Msg("flattened overlay chain")
+}
+
 // freshenFirstPassOverlay removes any leftover overlay so a first layered pass starts
 // from a clean file (its dirty set is the whole overlay, so a stale one would leave
 // non-dirtied stale pages that override the base on restore). A missing overlay is the
@@ -986,9 +1094,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, err
 	}
 
-	// If an async pause is still flushing, wait for it to commit (and stop the old
-	// FC) before resuming — the chain we load must be the committed one.
+	// If an async pause is still flushing, or a flatten is rewriting the chain, wait
+	// for it to commit before resuming — the chain we load must be the committed one.
 	_ = m.waitForFlush(inst)
+	m.waitForFlatten(inst)
 
 	if snapshotPath == "" {
 		snapshotPath = inst.SnapshotPath
@@ -1335,9 +1444,10 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 	if snapshotPath == "" && memPath == "" {
 		return status.Error(codes.InvalidArgument, "at least one of snapshot_path/mem_file_path is required")
 	}
-	// Don't delete chain files out from under an in-progress async flush; wait it out.
+	// Don't delete chain files out from under an in-progress async flush or flatten.
 	if inst, ierr := m.getInstance(vmID); ierr == nil {
 		_ = m.waitForFlush(inst)
+		m.waitForFlatten(inst)
 	}
 	for _, p := range []string{snapshotPath, memPath} {
 		if p == "" {

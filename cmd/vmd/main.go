@@ -360,6 +360,7 @@ func main() {
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
 	layerAppendEnabled := envOrDefault("VMD_LAYER_APPEND", "false") == "true"
 	asyncPauseEnabled := envOrDefault("VMD_ASYNC_PAUSE", "false") == "true"
+	layerFlattenEnabled := envOrDefault("VMD_LAYER_FLATTEN", "false") == "true"
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:             cfg.FirecrackerBin,
@@ -381,6 +382,7 @@ func main() {
 		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
 		LayerAppendEnabled:         layerAppendEnabled,
 		AsyncPauseEnabled:          asyncPauseEnabled,
+		LayerFlattenEnabled:        layerFlattenEnabled,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

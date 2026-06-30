@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
@@ -128,6 +129,56 @@ func TestFlattenChain(t *testing.T) {
 	}
 	if !pageIsHole(t, merged, 3) {
 		t.Fatal("page 3 should be a hole (fall through to base), but it was written")
+	}
+}
+
+func TestGCOrphanLayers(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-time.Hour)
+
+	mk := func(name string, aged bool) {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if aged {
+			if err := os.Chtimes(p, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Referenced layer (kept), an aged orphan layer (reclaimed), an aged temp
+	// (reclaimed), a recent orphan (kept — within grace), and an unrelated file (kept).
+	mk("mem.0.diff", true)         // referenced
+	mk("mem.1.diff", true)         // aged orphan → reclaim
+	mk("manifest.json.next", true) // aged temp → reclaim
+	mk("mem.2.diff", false)        // recent orphan → keep (grace)
+	mk("vmstate.snap", true)       // not a layer/temp → keep
+
+	man := &snapshotManifest{Base: "/templates/x/mem.snap", Overlays: []string{"mem.0.diff"}}
+	if err := writeManifestAtomic(dir, man); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{log: zerolog.Nop()}
+	if _, err := m.gcOrphanLayers(dir); err != nil {
+		t.Fatalf("gcOrphanLayers: %v", err)
+	}
+
+	exists := func(name string) bool {
+		_, err := os.Stat(filepath.Join(dir, name))
+		return err == nil
+	}
+	for _, keep := range []string{"mem.0.diff", "mem.2.diff", "vmstate.snap", "manifest.json"} {
+		if !exists(keep) {
+			t.Fatalf("%s was reclaimed but should be kept", keep)
+		}
+	}
+	for _, gone := range []string{"mem.1.diff", "manifest.json.next"} {
+		if exists(gone) {
+			t.Fatalf("%s should have been reclaimed", gone)
+		}
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -151,6 +153,61 @@ func mergeOverlayPages(ovPath string, out *os.File, written []bool) error {
 		off = holeStart
 	}
 	return nil
+}
+
+// orphanGraceSeconds is how long an unreferenced layer/temp file must be
+// untouched before GC reclaims it, so a file an in-flight pause is mid-writing is
+// never removed.
+const orphanGraceSeconds = 600
+
+// layerFileRe matches an overlay layer file name (mem.<n>.diff or mem.flat.<n>.diff).
+var layerFileRe = regexp.MustCompile(`^mem\.(?:\d+|flat\.\d+)\.diff$`)
+
+// gcOrphanLayers reclaims layer and temp files in a chain sandbox's snapshot dir
+// that the current manifest does not reference and that have been untouched for the
+// grace period — interrupted-flatten leftovers and stale *.next temps. (Crashed-pause
+// partials self-heal: the next append removes the file at that index before reusing
+// it.) No-op for a non-chain dir (no manifest), so legacy/standalone snapshots are
+// never touched. Best-effort; returns apparent bytes reclaimed.
+func (m *Manager) gcOrphanLayers(snapshotDir string) (int64, error) {
+	man, err := readManifest(snapshotDir)
+	if err != nil || man == nil {
+		return 0, err
+	}
+	referenced := make(map[string]bool, len(man.Overlays))
+	for _, o := range man.Overlays {
+		referenced[o] = true
+	}
+	entries, err := os.ReadDir(snapshotDir)
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-orphanGraceSeconds * time.Second)
+	var reclaimed int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !layerFileRe.MatchString(name) && !strings.HasSuffix(name, ".next") {
+			continue
+		}
+		if referenced[name] {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue // recent → may be an in-flight write; leave it
+		}
+		p := filepath.Join(snapshotDir, name)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Str("path", p).Msg("gc: remove orphan layer")
+			continue
+		}
+		reclaimed += info.Size()
+		m.log.Info().Str("file", name).Msg("gc: reclaimed orphan layer")
+	}
+	return reclaimed, nil
 }
 
 var flatNameRe = regexp.MustCompile(`^mem\.flat\.(\d+)\.diff$`)
