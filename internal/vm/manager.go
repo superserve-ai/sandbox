@@ -1060,17 +1060,17 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 // The old Firecracker is already stopped; vmd holds the guest-memory memfd. It reads the
 // dirty-page offsets Firecracker wrote, copies exactly those pages from the memfd into a
 // fresh sparse diff layer, and on success commits the manifest (the durability point).
-// On any failure it drops the orphaned layer and keeps the previous durable chain — the
-// sandbox stays resumable from the committed manifest (stale by one pause, never corrupt).
-// vmd's memfd fd is closed when the dump finishes; a resume that adopted the memfd + the
-// per-layer vmstate during the flush holds its own fds (and the new Firecracker's mmap keeps
-// the pages resident), so deleting the uncommitted files on failure can't pull them out from
-// under it.
+// On any failure it keeps the previous durable chain — the sandbox stays resumable from the
+// committed manifest (stale by one pause, never corrupt). vmd's memfd fd is closed when the dump
+// finishes; a resume that adopted the memfd during the flush holds its own fd (and the new
+// Firecracker's mmap keeps the pages resident). On failure the uncommitted layer + vmstate are
+// left on disk as orphans (not unlinked here): a resume may still be loading the vmstate by path,
+// and the manifest doesn't reference them, so gcOrphanLayers reclaims them after the grace period.
 func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, layerName, vmstateName string, memFile *os.File, dirtyOffsetsPath string, manifest *snapshotManifest) {
 	// Defers run LIFO: clear the handoff fields under mu FIRST, then close memFile, then
 	// release the sem. Clearing before the close (and under mu) means a concurrent resume
-	// either sees the paths set and reopens its own fds while the files exist, or sees them
-	// cleared and falls back to the committed disk chain — never a stale path.
+	// either sees the paths set and adopts the memfd (+ the vmstate disk path) while the files
+	// exist, or sees them cleared and falls back to the committed disk chain — never a stale handoff.
 	defer func() { <-m.pauseSem }()
 	defer memFile.Close()
 	defer func() {
@@ -1083,15 +1083,14 @@ func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, 
 	defer os.Remove(dirtyOffsetsPath)
 	vmID := inst.ID
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	vmstatePath := filepath.Join(snapshotDir, vmstateName)
 
-	// On failure, drop the uncommitted layer + vmstate orphans (the manifest never committed,
-	// so the prior snapshot stays durable). A fast-resume that adopted them holds its own fds,
-	// so the unlink doesn't disturb it.
+	// On failure the manifest never commits, so the prior snapshot stays durable. Leave the
+	// uncommitted layer + vmstate (and its .overlay sidecar) on disk as orphans rather than
+	// unlinking them here: an in-flight fast-resume may still be loading the vmstate by path, and
+	// a path-based delete would race it. The manifest doesn't reference them, so gcOrphanLayers
+	// reclaims them after the grace period.
 	failClean := func(err error, msg string) {
 		log.Error().Err(err).Msg(msg)
-		_ = os.Remove(layerPath)
-		_ = os.Remove(vmstatePath)
 		m.endFlush(inst, err)
 	}
 
@@ -1469,33 +1468,27 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// the disk flush — resume returns in ~constant time regardless of the dirty-set size.
 	// Reopen vmd's own fd to the memfd under the lock so it can't be closed mid-decision;
 	// the new FC mmaps it during restore and keeps it alive, so we drop our fd afterwards.
-	var memfdFd, vmstateFd *os.File
-	var memfdResumePath, memfdVmstatePath, bridgePendingLayer string
+	var memfdFd *os.File
+	var memfdResumePath, bridgeVmstatePath, bridgePendingLayer string
 	// Take the memfd fast path only while a bridge flush is in progress AND the fleet is under
 	// the held-memfd cap, so the feature can't pin unbounded extra RAM. tryClaimBridgeMemfd
 	// reserves the slot atomically with the count (so a burst of concurrent resumes can't all
-	// pass the cap) and returns the files to reopen. We then reopen vmd's own fds to those paths,
-	// so a concurrent commit/delete can't pull them out from under us; the new FC mmaps/reads
-	// them during restore and they're dropped after. Gate on the flag first so a flags-off resume
-	// pays nothing.
+	// pass the cap) and returns the in-flight files. We hold our own fd to the guest-memory
+	// memfd — an anonymous object with no stable path; the fd both keeps its pages resident and
+	// gives the new FC a /proc path to mmap. The vmstate, by contrast, is a real on-disk file the
+	// new FC must open by its real path so Firecracker resolves the paired "<vmstate>.overlay"
+	// block-overlay sidecar; completeBridgePause leaves it on disk for GC rather than unlinking,
+	// so it needs no fd pin. Gate on the flag first so a flags-off resume pays nothing.
 	claimedMemfd := false
 	if m.cfg.SharedMemEnabled {
 		if memFdPath, vmstatePath, pendingLayer, ok := m.tryClaimBridgeMemfd(inst); ok {
 			claimedMemfd = true
-			memf, merr := os.Open(memFdPath)
-			vmf, verr := os.Open(vmstatePath)
-			if merr == nil && verr == nil {
-				memfdFd, vmstateFd = memf, vmf
+			if memf, merr := os.Open(memFdPath); merr == nil {
+				memfdFd = memf
 				memfdResumePath = guestMemFdPath(memf)
-				memfdVmstatePath = guestMemFdPath(vmf)
+				bridgeVmstatePath = vmstatePath
 				bridgePendingLayer = pendingLayer
 			} else {
-				if memf != nil {
-					_ = memf.Close()
-				}
-				if vmf != nil {
-					_ = vmf.Close()
-				}
 				m.clearBridgeHold(inst) // reopen failed — release the reserved slot
 				claimedMemfd = false
 			}
@@ -1506,9 +1499,6 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	defer func() {
 		if memfdFd != nil {
 			_ = memfdFd.Close()
-		}
-		if vmstateFd != nil {
-			_ = vmstateFd.Close()
 		}
 		// The slot was reserved at claim time; keep the hold only if the resume completed using
 		// the memfd. On early failure, or a fall-back off the memfd path, release the reservation.
@@ -1550,12 +1540,14 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		}
 		if useMemfd {
 			// Lay the held memfd (the frozen RAM at the pause point) over the committed disk
-			// chain as the newest overlay, and load the in-flight vmstate that matches it. The
-			// layer the flush is writing is NOT yet committed, so the chain here is the prior one.
+			// chain as the newest overlay, and load the in-flight vmstate that matches it — by its
+			// real on-disk path, so Firecracker finds the paired "<vmstate>.overlay" block-overlay
+			// sidecar. The layer the flush is writing is NOT yet committed, so the chain here is
+			// the prior one.
 			basePath = base
 			lowerOverlays = append(lower, newest)
 			memPath = memfdResumePath
-			snapshotPath = memfdVmstatePath
+			snapshotPath = bridgeVmstatePath
 		} else {
 			basePath, lowerOverlays, memPath = base, lower, newest
 			snapshotPath = manifestVmstatePath(snapshotDir, man) // committed vmstate for this chain
@@ -1566,8 +1558,6 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		useMemfd = false
 		_ = memfdFd.Close()
 		memfdFd = nil
-		_ = vmstateFd.Close()
-		vmstateFd = nil
 		_ = m.waitForFlush(inst)
 	}
 	if snapshotPath == "" {
