@@ -791,7 +791,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// immediate resume (A5) instead of keeping the old FC alive for the whole flush.
 		// Any capture/snapshot failure falls back to the in-FC async path (sem still held).
 		if async && m.cfg.SharedMemEnabled {
-			memFile, ferr := captureGuestMemFd(instPID)
+			// The cached PID is 0 right after a resume (the unit's MainPID is published
+			// asynchronously), so resolve it from systemd here rather than trust inst.PID.
+			fcPID := instPID
+			if fcPID <= 0 {
+				fcPID = m.firecrackerMainPID(ctx, vmID)
+			}
+			memFile, ferr := captureGuestMemFd(fcPID)
 			if ferr != nil {
 				log.Warn().Err(ferr).Msg("memfd capture failed; falling back to in-FC async flush")
 			} else {
@@ -2787,17 +2793,29 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	return 0, nil
 }
 
+// firecrackerMainPID resolves a systemd-managed VM's Firecracker PID via the unit's
+// MainPID. Returns 0 if it can't be determined. Used both to cache the PID after a
+// start/resume and to find the FC process at bridge-pause time (the cached inst.PID is
+// 0 right after a resume, since the start returns before MainPID is published).
+func (m *Manager) firecrackerMainPID(ctx context.Context, vmID string) int {
+	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID))
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid); err != nil {
+		return 0
+	}
+	return pid
+}
+
 func (m *Manager) resolveAndSetPID(vmID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID))
-	out, err := cmd.Output()
-	if err != nil {
-		return
-	}
-	var pid int
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid); err != nil || pid == 0 {
+	pid := m.firecrackerMainPID(ctx, vmID)
+	if pid == 0 {
 		return
 	}
 
