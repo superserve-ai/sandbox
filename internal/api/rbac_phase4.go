@@ -24,16 +24,8 @@ func (c teamManagementCapabilities) hasMutationControls() bool {
 	return c.CanInviteMembers || c.CanDeactivateMembers || c.CanAssignRoles || c.CanRevokeRoles
 }
 
-func (h *Handlers) customerPermissionAllowed(c *gin.Context, actorID, teamID uuid.UUID, permission string) (bool, error) {
-	svc := h.rbacService()
-	if svc == nil {
-		return false, errors.New("rbac service is not configured")
-	}
-	ok, err := svc.CanTeam(c.Request.Context(), actorID, teamID, permission)
-	if err != nil {
-		return false, err
-	}
-	return ok, nil
+func (h *Handlers) customerPermissionAllowed(c *gin.Context, _ uuid.UUID, teamID uuid.UUID, permission string) (bool, error) {
+	return h.customerTeamPermissionAllowed(c, teamID, permission)
 }
 
 func (h *Handlers) customerManagementCapabilities(c *gin.Context, actorID, teamID uuid.UUID) (teamManagementCapabilities, error) {
