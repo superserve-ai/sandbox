@@ -76,6 +76,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/billing/pricing", h.GetBillingPricing)
 
 		// RBAC Phase 2b customer-facing team management.
+		api.GET("/teams/:team_id/management", h.GetTeamManagement)
 		api.GET("/teams/:team_id/members", h.ListTeamMembers)
 		api.POST("/teams/:team_id/members", h.AddTeamMember)
 		api.DELETE("/teams/:team_id/members/:user_id", h.DeactivateTeamMember)
@@ -101,6 +102,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/jwks", h.JWKS)
 		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)
 		internal.GET("/sandboxes/:sandbox_id/egress_rules", h.GetSandboxEgressRules)
+		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
+		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

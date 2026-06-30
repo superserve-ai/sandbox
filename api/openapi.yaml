@@ -127,6 +127,36 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
+  /teams/{team_id}/management:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getTeamManagement
+      tags: [RBAC]
+      summary: Get team management state
+      description: |
+        Returns the caller-visible team members, role assignments, and
+        capability flags used by customer-facing member management UI. The
+        authenticated API key determines the actor; customer clients must not
+        send or rely on `X-Actor-User-Id`.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Team management state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamManagementResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /teams/{team_id}/members:
     parameters:
@@ -2636,6 +2666,59 @@ components:
           enum: [added]
         platform:
           type: boolean
+
+    TeamManagementResponse:
+      type: object
+      required: [team_id, members, assignments, capabilities]
+      properties:
+        team_id:
+          type: string
+          format: uuid
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/TeamMember"
+        assignments:
+          type: array
+          items:
+            $ref: "#/components/schemas/TeamRoleAssignment"
+        capabilities:
+          $ref: "#/components/schemas/TeamManagementCapabilities"
+        mutation_options:
+          $ref: "#/components/schemas/TeamManagementMutationOptions"
+
+    TeamManagementCapabilities:
+      type: object
+      required:
+        - can_view_role_assignments
+        - can_invite_members
+        - can_deactivate_members
+        - can_assign_roles
+        - can_revoke_roles
+      properties:
+        can_view_role_assignments:
+          type: boolean
+        can_invite_members:
+          type: boolean
+        can_deactivate_members:
+          type: boolean
+        can_assign_roles:
+          type: boolean
+        can_revoke_roles:
+          type: boolean
+
+    TeamManagementMutationOptions:
+      type: object
+      properties:
+        member_statuses:
+          type: array
+          items:
+            type: string
+            enum: [active, invited]
+        assignable_roles:
+          type: array
+          items:
+            type: string
 
     TeamRoleAssignment:
       type: object
