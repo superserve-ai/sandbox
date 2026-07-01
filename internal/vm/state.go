@@ -51,6 +51,11 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// Persisted so the bridge-memfd RAM cap holds across a vmd restart: a fast-resumed
+	// FC keeps the prior memfd mapped (~2× RAM) independent of vmd, so a reattached holder
+	// must still count against MaxBridgeMemfds. A stale true only makes the cap stricter
+	// (the safe direction) and clears at the sandbox's next pause.
+	HoldingBridgeMemfd bool `json:"holding_bridge_memfd,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -152,51 +157,53 @@ func toRecord(inst *VMInstance) VMRecord {
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
 	return VMRecord{
-		ID:           inst.ID,
-		PID:          inst.PID,
-		SocketPath:   inst.SocketPath,
-		VsockPath:    inst.VsockPath,
-		IP:           inst.IP,
-		TAPDevice:    inst.TAPDevice,
-		MACAddress:   inst.MACAddress,
-		Status:       inst.Status,
-		RunDirID:     inst.RunDirID,
-		Namespace:    inst.Namespace,
-		DiskPath:     inst.DiskPath,
-		SnapshotPath: inst.SnapshotPath,
-		MemFilePath:  inst.MemFilePath,
-		BaseMemPath:  inst.BaseMemPath,
-		CreatedAt:    inst.CreatedAt,
-		Metadata:     inst.Metadata,
-		VCPU:         inst.Config.VCPU,
-		MemoryMiB:    inst.Config.MemoryMiB,
-		BasePath:     inst.Config.BasePath,
-		TeamID:       inst.TeamID,
-		OwnerID:      inst.OwnerID,
+		ID:                 inst.ID,
+		PID:                inst.PID,
+		SocketPath:         inst.SocketPath,
+		VsockPath:          inst.VsockPath,
+		IP:                 inst.IP,
+		TAPDevice:          inst.TAPDevice,
+		MACAddress:         inst.MACAddress,
+		Status:             inst.Status,
+		RunDirID:           inst.RunDirID,
+		Namespace:          inst.Namespace,
+		DiskPath:           inst.DiskPath,
+		SnapshotPath:       inst.SnapshotPath,
+		MemFilePath:        inst.MemFilePath,
+		BaseMemPath:        inst.BaseMemPath,
+		CreatedAt:          inst.CreatedAt,
+		Metadata:           inst.Metadata,
+		VCPU:               inst.Config.VCPU,
+		MemoryMiB:          inst.Config.MemoryMiB,
+		BasePath:           inst.Config.BasePath,
+		TeamID:             inst.TeamID,
+		OwnerID:            inst.OwnerID,
+		HoldingBridgeMemfd: inst.holdingBridgeMemfd,
 	}
 }
 
 // toInstance converts a VMRecord back to a VMInstance.
 func toInstance(rec VMRecord) *VMInstance {
 	return &VMInstance{
-		ID:           rec.ID,
-		PID:          rec.PID,
-		SocketPath:   rec.SocketPath,
-		VsockPath:    rec.VsockPath,
-		IP:           rec.IP,
-		TAPDevice:    rec.TAPDevice,
-		MACAddress:   rec.MACAddress,
-		Status:       rec.Status,
-		RunDirID:     rec.RunDirID,
-		Namespace:    rec.Namespace,
-		DiskPath:     rec.DiskPath,
-		SnapshotPath: rec.SnapshotPath,
-		MemFilePath:  rec.MemFilePath,
-		BaseMemPath:  rec.BaseMemPath,
-		CreatedAt:    rec.CreatedAt,
-		Metadata:     rec.Metadata,
-		TeamID:       rec.TeamID,
-		OwnerID:      rec.OwnerID,
+		ID:                 rec.ID,
+		PID:                rec.PID,
+		SocketPath:         rec.SocketPath,
+		VsockPath:          rec.VsockPath,
+		IP:                 rec.IP,
+		TAPDevice:          rec.TAPDevice,
+		MACAddress:         rec.MACAddress,
+		Status:             rec.Status,
+		RunDirID:           rec.RunDirID,
+		Namespace:          rec.Namespace,
+		DiskPath:           rec.DiskPath,
+		SnapshotPath:       rec.SnapshotPath,
+		MemFilePath:        rec.MemFilePath,
+		BaseMemPath:        rec.BaseMemPath,
+		CreatedAt:          rec.CreatedAt,
+		Metadata:           rec.Metadata,
+		TeamID:             rec.TeamID,
+		OwnerID:            rec.OwnerID,
+		holdingBridgeMemfd: rec.HoldingBridgeMemfd,
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
 			MemoryMiB: rec.MemoryMiB,

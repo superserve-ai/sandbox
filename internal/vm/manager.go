@@ -144,8 +144,9 @@ type VMInstance struct {
 
 	// holdingBridgeMemfd is true between a memfd fast-resume and the resumed VM's next
 	// pause/stop — the window where this sandbox pins ~2× its RAM (the new FC's mmap of
-	// the prior memfd). Counted against MaxBridgeMemfds. Not persisted; a vmd restart
-	// drops the memfd, so the count resets to zero on its own.
+	// the prior memfd). Counted against MaxBridgeMemfds. Persisted (VMRecord) so a
+	// reattached holder still counts after a vmd restart — its FC keeps the memfd mapped
+	// independently of vmd, so the RAM stays pinned; cleared at the next pause.
 	holdingBridgeMemfd bool
 
 	// restoring is true while a resume/verify is starting a Firecracker and loading a

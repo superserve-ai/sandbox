@@ -75,6 +75,17 @@ func TestCountHeldBridgeMemfds(t *testing.T) {
 	}
 }
 
+func TestHoldingBridgeMemfdPersists(t *testing.T) {
+	// The bridge-memfd hold must survive a vmd restart (toRecord → toInstance): a reattached
+	// fast-resumed FC still keeps the prior memfd mapped, so it must keep counting against the cap.
+	if got := toInstance(toRecord(&VMInstance{ID: "v", holdingBridgeMemfd: true})); !got.holdingBridgeMemfd {
+		t.Fatal("holdingBridgeMemfd did not survive the record round-trip")
+	}
+	if got := toInstance(toRecord(&VMInstance{ID: "w"})); got.holdingBridgeMemfd {
+		t.Fatal("holdingBridgeMemfd wrongly true after round-trip of a non-holder")
+	}
+}
+
 // TestTryClaimBridgeMemfd covers the atomic reserve: a slot goes only to an eligible
 // (mid-flush, in-flight files set) instance, the cap is enforced, and the count-and-claim is
 // atomic so a burst of concurrent claims can never exceed the cap.
