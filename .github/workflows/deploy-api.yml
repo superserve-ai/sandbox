@@ -66,7 +66,10 @@ jobs:
       - name: Build and push
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane"
-          docker build --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
+          # --no-cache prevents BuildKit from importing stale inline cache metadata
+          # from the existing :latest tag in the registry, which caused prod to deploy
+          # an old binary even when the source had changed (SQLSTATE 42P10 incident).
+          docker build --no-cache --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
 
@@ -132,7 +135,7 @@ jobs:
       - name: Build and push
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane"
-          docker build --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
+          docker build --no-cache --platform linux/amd64 -t ${IMAGE}:latest -t ${IMAGE}:${{ github.sha }} .
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
 
