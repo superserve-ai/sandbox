@@ -59,21 +59,36 @@ const flattenPageSize = 4096
 // intact; a crash after it leaves the old layers as orphans for GC. The caller
 // must ensure the sandbox is quiescent (paused, no in-flight async flush). No-op
 // when the chain has fewer than two overlays.
-func (m *Manager) flattenChain(snapshotDir string) error {
+// flattenChain returns the merged overlay's path on success (empty for a no-op chain of < 2
+// overlays), so the caller can refresh the cached newest-layer for the next append.
+func (m *Manager) flattenChain(snapshotDir string) (string, error) {
 	man, err := readManifest(snapshotDir)
 	if err != nil {
-		return fmt.Errorf("flatten: read manifest: %w", err)
+		return "", fmt.Errorf("flatten: read manifest: %w", err)
 	}
 	if man == nil || len(man.Overlays) < 2 {
-		return nil
+		return "", nil
 	}
 
 	// All overlays share the base's logical size; stat the base for it.
 	baseInfo, err := os.Stat(man.Base)
 	if err != nil {
-		return fmt.Errorf("flatten: stat base %s: %w", man.Base, err)
+		return "", fmt.Errorf("flatten: stat base %s: %w", man.Base, err)
 	}
 	total := baseInfo.Size()
+
+	// Every overlay must cover full guest RAM (the base's size). The merge bounds each layer's scan
+	// by its own size, so a short/truncated overlay would silently drop its out-of-range pages to
+	// an older layer — reject it here (as the FC loader does at restore) rather than mis-merge.
+	for _, name := range man.Overlays {
+		info, err := os.Stat(filepath.Join(snapshotDir, name))
+		if err != nil {
+			return "", fmt.Errorf("flatten: stat overlay %s: %w", name, err)
+		}
+		if info.Size() != total {
+			return "", fmt.Errorf("flatten: overlay %s is %d bytes, expected %d (guest RAM)", name, info.Size(), total)
+		}
+	}
 
 	outName := nextFlatName(man.Overlays)
 	outTmp := filepath.Join(snapshotDir, outName+".next")
@@ -81,12 +96,12 @@ func (m *Manager) flattenChain(snapshotDir string) error {
 
 	out, err := os.OpenFile(outTmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return fmt.Errorf("flatten: create %s: %w", outTmp, err)
+		return "", fmt.Errorf("flatten: create %s: %w", outTmp, err)
 	}
 	if err := out.Truncate(total); err != nil { // sparse: full logical size, no allocation
 		out.Close()
 		_ = os.Remove(outTmp)
-		return fmt.Errorf("flatten: size output: %w", err)
+		return "", fmt.Errorf("flatten: size output: %w", err)
 	}
 
 	written := make([]bool, (total+flattenPageSize-1)/flattenPageSize)
@@ -98,24 +113,24 @@ func (m *Manager) flattenChain(snapshotDir string) error {
 		if err := mergeOverlayPages(ov, out, written); err != nil {
 			out.Close()
 			_ = os.Remove(outTmp)
-			return fmt.Errorf("flatten: merge %s: %w", man.Overlays[i], err)
+			return "", fmt.Errorf("flatten: merge %s: %w", man.Overlays[i], err)
 		}
 	}
 	if err := out.Sync(); err != nil {
 		out.Close()
 		_ = os.Remove(outTmp)
-		return fmt.Errorf("flatten: sync output: %w", err)
+		return "", fmt.Errorf("flatten: sync output: %w", err)
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(outTmp)
-		return fmt.Errorf("flatten: close output: %w", err)
+		return "", fmt.Errorf("flatten: close output: %w", err)
 	}
 	if err := os.Rename(outTmp, outPath); err != nil {
 		_ = os.Remove(outTmp)
-		return fmt.Errorf("flatten: publish output: %w", err)
+		return "", fmt.Errorf("flatten: publish output: %w", err)
 	}
 	if err := fsyncDir(snapshotDir); err != nil {
-		return fmt.Errorf("flatten: fsync dir: %w", err)
+		return "", fmt.Errorf("flatten: fsync dir: %w", err)
 	}
 
 	// Commit point: the manifest now names only the merged overlay.
@@ -123,15 +138,22 @@ func (m *Manager) flattenChain(snapshotDir string) error {
 	man.Overlays = []string{outName}
 	if err := writeManifestAtomic(snapshotDir, man); err != nil {
 		_ = os.Remove(outPath)
-		return fmt.Errorf("flatten: commit manifest: %w", err)
+		return "", fmt.Errorf("flatten: commit manifest: %w", err)
 	}
-	// Reclaim the old layers — safe now, the manifest no longer references them.
+	// Flatten is about to UNLINK the prior chain, so the manifest rename must be durable first
+	// (writeManifestAtomic's own dir-fsync is best-effort — fine for an append, which falls back
+	// to the prior chain, but not here). On failure bail without deleting: the prior chain stays
+	// on disk and resumable.
+	if err := fsyncDir(snapshotDir); err != nil {
+		return "", fmt.Errorf("flatten: durable manifest commit: %w", err)
+	}
+	// Reclaim the old layers — safe now, the manifest no longer references them and is durable.
 	for _, name := range old {
 		if err := os.Remove(filepath.Join(snapshotDir, name)); err != nil && !os.IsNotExist(err) {
 			m.log.Warn().Err(err).Str("path", name).Msg("flatten: remove old layer")
 		}
 	}
-	return nil
+	return outPath, nil
 }
 
 // mergeOverlayPages copies every present page of ovPath (data extents found via

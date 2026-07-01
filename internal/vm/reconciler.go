@@ -391,6 +391,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				r.clearDrift("paused:" + id)
 				continue
 			}
+			// The DB-recorded path is gone, but an async/bridge flush failure can delete a
+			// not-yet-committed vmstate while the manifest still names the prior durable chain
+			// (which resume loads instead). Don't fail a sandbox still resumable from its manifest.
+			if r.mgr.resumableFromManifest(filepath.Dir(snapPath)) {
+				r.clearDrift("paused:" + id)
+				continue
+			}
 			if !r.gracePeriodElapsed("paused:"+id, now) {
 				continue
 			}

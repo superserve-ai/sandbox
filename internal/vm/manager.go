@@ -828,7 +828,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 					memFile.Close()
 					<-m.pauseSem
 					_ = os.Remove(layerPath)
-					_ = os.Remove(vmstatePath) // uncommitted per-layer vmstate; nothing references it
+					_ = os.Remove(vmstatePath)      // uncommitted per-layer vmstate; nothing references it
+					_ = os.Remove(dirtyOffsetsPath) // don't leave a stale offsets sidecar behind
 					return "", "", m.handleVMError(vmID, fmt.Errorf("bridge diff snapshot: %w", err))
 				}
 				// Stop the old FC now: vmd holds the memfd, so guest RAM stays resident and
@@ -1022,6 +1023,13 @@ func (m *Manager) completeAsyncPause(inst *VMInstance, snapshotDir, layerPath, l
 	defer func() { <-m.pauseSem }() // release the background-flush slot claimed in PauseVM
 	vmID := inst.ID
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	// Recover so a panic can't crash all of vmd or strand flushing=true forever; endFlush is idempotent.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Msg("panic in async pause completion; keeping previous durable snapshot")
+			m.endFlush(inst, fmt.Errorf("async pause completion panicked: %v", r))
+		}
+	}()
 	vmstatePath := filepath.Join(snapshotDir, vmstateName)
 
 	// On failure the manifest never commits, so the prior snapshot stays durable — nothing to
@@ -1083,6 +1091,16 @@ func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, 
 	defer os.Remove(dirtyOffsetsPath)
 	vmID := inst.ID
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	// Recover so a panic can't crash all of vmd or strand flushing=true forever; endFlush is idempotent.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Msg("panic in bridge pause completion; keeping previous durable snapshot")
+			m.endFlush(inst, fmt.Errorf("bridge pause completion panicked: %v", r))
+		}
+	}()
+	// Ensure the old FC is stopped: the bridge pause's stop is warn-only, so a transient failure
+	// would leave a vCPU-paused FC pinning ~2x RAM. The held memfd keeps the RAM; re-stop is a no-op.
+	m.stopAsyncPauseFC(vmID)
 
 	// On failure the manifest never commits, so the prior snapshot stays durable. Leave the
 	// uncommitted layer + vmstate (and its .overlay sidecar) on disk as orphans rather than
@@ -1253,9 +1271,29 @@ func (m *Manager) beginFlush(inst *VMInstance) {
 // endFlush records the flush outcome and wakes any waiters.
 func (m *Manager) endFlush(inst *VMInstance, err error) {
 	inst.mu.Lock()
+	if !inst.flushing { // already ended — idempotent (a panic safety-net can't double-close)
+		inst.mu.Unlock()
+		return
+	}
 	inst.flushErr = err
 	inst.flushing = false
 	ch := inst.flushDone
+	inst.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// endFlatten clears the flatten guard and wakes waitForFlatten waiters. Idempotent so the
+// deferred safety-net in flattenInBackground can't double-close flattenDone.
+func (m *Manager) endFlatten(inst *VMInstance) {
+	inst.mu.Lock()
+	if !inst.flattening {
+		inst.mu.Unlock()
+		return
+	}
+	inst.flattening = false
+	ch := inst.flattenDone
 	inst.mu.Unlock()
 	if ch != nil {
 		close(ch)
@@ -1307,6 +1345,28 @@ func (m *Manager) isRestoring(vmID string) bool {
 	return inst.restoring
 }
 
+// resumableFromManifest reports whether snapshotDir holds a committed layered chain ResumeVM
+// could restore from (manifest resolves; base, vmstate, all overlays present on disk). Lets the
+// reconciler not fail a paused sandbox whose DB-recorded vmstate a flush failure deleted but
+// whose committed manifest chain is intact.
+func (m *Manager) resumableFromManifest(snapshotDir string) bool {
+	man, err := readManifest(snapshotDir)
+	if err != nil || man == nil {
+		return false
+	}
+	base, lower, newest, ok := man.chainPaths(snapshotDir)
+	if !ok {
+		return false
+	}
+	paths := append([]string{base, newest, manifestVmstatePath(snapshotDir, man)}, lower...)
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // waitForFlatten blocks until any in-progress background flatten for inst finishes.
 // Callers that read the manifest or load the chain (resume, re-pause, delete) must
 // call this so they never see a half-swapped manifest or a layer being deleted.
@@ -1346,10 +1406,24 @@ func (m *Manager) maybeFlatten(inst *VMInstance, snapshotDir string) {
 		// Arm the flatten guard synchronously, BEFORE the goroutine starts, so a resume/
 		// delete/re-pause arriving in the scheduling window waits on flattenDone instead of
 		// reading the chain while the goroutine swaps the manifest and deletes old layers.
+		//
+		// The guard only protects callers that hit waitForFlatten before reading the chain. A memfd
+		// bridge fast-resume skips waitForFlush and is already past it, mid-restore with the
+		// committed chain open as its lower layers — flattening now would delete those files out
+		// from under it. Defer while a restore is in flight or a bridge memfd is held (atomic with
+		// the arm); a later pause retries.
+		armed := false
 		inst.mu.Lock()
-		inst.flattening = true
-		inst.flattenDone = make(chan struct{})
+		if !inst.restoring && !inst.holdingBridgeMemfd && !inst.flattening {
+			inst.flattening = true
+			inst.flattenDone = make(chan struct{})
+			armed = true
+		}
 		inst.mu.Unlock()
+		if !armed {
+			<-m.flattenSem // release the slot we claimed; a later pause re-triggers
+			return
+		}
 		go func() {
 			defer func() { <-m.flattenSem }()
 			m.flattenInBackground(inst, snapshotDir)
@@ -1362,31 +1436,34 @@ func (m *Manager) maybeFlatten(inst *VMInstance, snapshotDir string) {
 // flattenInBackground serializes against any in-flight async flush, then flattens
 // the chain under the per-instance flatten guard (so resume/re-pause/delete wait).
 func (m *Manager) flattenInBackground(inst *VMInstance, snapshotDir string) {
-	// The guard (flattening=true, flattenDone) was armed by maybeFlatten before this
-	// goroutine started, so a concurrent resume/delete already waits on it.
+	// The guard was armed by maybeFlatten before this goroutine started. Always clear it + wake
+	// waiters, even on panic — else a panic crashes vmd and every future waitForFlatten hangs.
+	// endFlatten is idempotent.
+	defer func() {
+		if r := recover(); r != nil {
+			m.log.Error().Str("vm_id", inst.ID).Interface("panic", r).Msg("panic in background flatten; chain left intact")
+		}
+		m.endFlatten(inst)
+	}()
+
 	_ = m.waitForFlush(inst)
 
-	inst.mu.RLock()
-	ch := inst.flattenDone
-	inst.mu.RUnlock()
-
-	err := m.flattenChain(snapshotDir)
-	if err == nil {
-		// Reclaim any interrupted-flatten leftovers / stale temps while still under
-		// the guard (resume/re-pause/delete are waiting on flattenDone).
-		if _, gcErr := m.gcOrphanLayers(snapshotDir); gcErr != nil {
-			m.log.Warn().Str("vm_id", inst.ID).Err(gcErr).Msg("gc after flatten")
-		}
-	}
-
-	inst.mu.Lock()
-	inst.flattening = false
-	inst.mu.Unlock()
-	close(ch)
-
+	newest, err := m.flattenChain(snapshotDir)
 	if err != nil {
 		m.log.Warn().Str("vm_id", inst.ID).Err(err).Msg("background flatten failed; chain left intact")
 		return
+	}
+	// Refresh the cached newest layer so the next pause's planLayerAppend recognizes the flattened
+	// chain. Safe under the flatten guard — no resume runs concurrently to also update it.
+	if newest != "" {
+		inst.mu.Lock()
+		inst.MemFilePath = newest
+		inst.mu.Unlock()
+	}
+	// Reclaim any interrupted-flatten leftovers / stale temps while still under the guard
+	// (resume/re-pause/delete are waiting on flattenDone).
+	if _, gcErr := m.gcOrphanLayers(snapshotDir); gcErr != nil {
+		m.log.Warn().Str("vm_id", inst.ID).Err(gcErr).Msg("gc after flatten")
 	}
 	m.log.Info().Str("vm_id", inst.ID).Msg("flattened overlay chain")
 }
@@ -1414,10 +1491,13 @@ func readLayeredBase(memPath string) (string, bool) {
 	return base, base != ""
 }
 
-// isOverlayMemFile reports whether memPath names a layered diff overlay (which
-// must be restored over a base, never standalone).
+// isOverlayMemFile reports whether memPath names a layered diff overlay (must be restored over a
+// base, never standalone). Matches "mem.diff" and append-chain names ("mem.N.diff",
+// "mem.flat.N.diff") so a manifest-less restore refuses instead of loading a sparse layer as a
+// full image (absent pages read as zero holes).
 func isOverlayMemFile(memPath string) bool {
-	return filepath.Base(memPath) == "mem.diff"
+	base := filepath.Base(memPath)
+	return base == "mem.diff" || layerFileRe.MatchString(base)
 }
 
 // isTemplateMemPath reports whether memPath is an immutable template memory
@@ -1768,6 +1848,11 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 		inst.restoring = false
 		inst.mu.Unlock()
 	}()
+	// Wait out any in-flight async flush + background flatten before reading the chain (as
+	// ResumeVM/DeleteSnapshotFiles do): otherwise verify could load a not-yet-committed
+	// vmstate/memory pair or disrupt the still-flushing Firecracker.
+	_ = m.waitForFlush(inst)
+	m.waitForFlatten(inst)
 	// Resolve the layered chain (if any). The manifest is authoritative for the
 	// base + ordered overlays (so this also verifies a post-flatten chain whose
 	// inst fields may be stale); fall back to the single-overlay .base sidecar.
