@@ -65,3 +65,21 @@ docs/
 
 # misc artifacts
 *:Zone.Identifier
+
+# Terraform local state/cache
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+**/tfplan
+**/plan.txt
+plan.txt
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+.envrc

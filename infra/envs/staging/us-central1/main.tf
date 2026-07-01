@@ -1,0 +1,207 @@
+terraform {
+  required_version = ">= 1.5.0"
+
+  backend "gcs" {
+    bucket = "superserve-terraform-state"
+    prefix = "staging/us-central1"
+  }
+}
+
+locals {
+  project_id      = var.project_id
+  environment     = var.environment
+  region          = var.region
+  zone            = var.zone
+  resource_suffix = coalesce(var.resource_suffix, var.environment)
+
+  common_labels = {
+    environment = local.environment
+    managed_by  = "terraform"
+    region      = local.region
+  }
+}
+
+module "network" {
+  source = "../../../modules/network"
+
+  project_id                  = local.project_id
+  environment                 = local.environment
+  region                      = local.region
+  network_name                = "superserve-network-3cb2c3b"
+  subnet_name                 = "superserve-subnet-05cb005"
+  subnet_cidr                 = "10.0.0.0/24"
+  create_vpc_connector        = true
+  vpc_connector_name          = "ss-vpc-conn-f1b3552"
+  vpc_connector_mode          = "ip_cidr_range"
+  vpc_connector_ip_cidr_range = "10.8.0.0/28"
+  firewall_rules = {
+    vmd_grpc = {
+      name          = "superserve-allow-internal-7506206"
+      direction     = "INGRESS"
+      source_ranges = ["10.0.0.0/24"]
+      target_tags   = []
+      allow = [
+        {
+          protocol = "tcp"
+          ports    = ["0-65535"]
+        },
+        {
+          protocol = "udp"
+          ports    = ["0-65535"]
+        },
+        {
+          protocol = "icmp"
+          ports    = []
+        }
+      ]
+      description = null
+    }
+  }
+  labels = local.common_labels
+}
+
+module "iam" {
+  source = "../../../modules/iam"
+
+  project_id  = local.project_id
+  environment = local.environment
+  service_accounts = {
+    superserve_api = {
+      account_id   = "superserve-api"
+      display_name = "Superserve API (Cloud Run)"
+    }
+    superserve_build = {
+      account_id   = "superserve-build"
+      display_name = "Superserve Build (Cloud Build / CI)"
+    }
+    superserve_github_actions = {
+      account_id   = "superserve-github-actions"
+      display_name = "GitHub Actions CI/CD Service Account"
+    }
+  }
+  labels = local.common_labels
+}
+
+module "artifact_storage" {
+  source = "../../../modules/artifact-storage"
+
+  project_id  = local.project_id
+  environment = local.environment
+  region      = local.region
+  buckets = {
+    superserve_artifacts = {
+      name          = "superserve-artifacts"
+      location      = "US-CENTRAL1"
+      storage_class = "STANDARD"
+    }
+  }
+  labels = local.common_labels
+}
+
+module "api" {
+  source = "../../../modules/api"
+
+  project_id            = local.project_id
+  environment           = local.environment
+  region                = local.region
+  service_name          = "superserve-api"
+  service_account_email = module.iam.service_account_emails["superserve_api"]
+  image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
+  env = {
+    API_PORT          = "8080"
+    EDGE_PROXY_DOMAIN = "staging-sandbox.superserve.ai"
+    SUPABASE_URL      = var.supabase_url
+    VMD_GRPC_ADDRESS  = "10.0.0.2:50051"
+  }
+  secrets = {
+    SANDBOX_ACCESS_TOKEN_SEED = {
+      secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
+    }
+    SECRETS_SIGNING_KEY = {
+      secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
+    }
+    DATABASE_URL = {
+      secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
+    }
+    INTERNAL_API_TOKEN = {
+      secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
+    }
+  }
+  vpc_connector = module.network.vpc_connector_id
+  labels        = local.common_labels
+}
+
+module "sandbox_host" {
+  source = "../../../modules/sandbox-host"
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-staging"
+  machine_type  = "n2-standard-32"
+
+  subnet      = "projects/rayai-dev/regions/us-central1/subnetworks/superserve-subnet-05cb005"
+  internal_ip = "10.0.0.2"
+  tags        = ["superserve-vmd"]
+
+  labels = merge(local.common_labels, {
+    component    = "vmd"
+    sandbox_role = "vmd"
+  })
+
+  service_account_email = module.iam.service_account_emails["superserve_api"]
+  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_size_gb     = 200
+  can_ip_forward        = true
+
+  metadata = {
+    startup-script = <<-EOT
+      #!/bin/bash
+      # Minimal startup script — the Packer image has everything pre-installed.
+      # This just detects the host network interface and starts VMD.
+      set -euo pipefail
+      exec > /var/log/startup-script.log 2>&1
+
+      echo "=== Superserve VMD startup ==="
+
+      # Detect host network interface and update env
+      HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+      sed -i "s/^HOST_INTERFACE=.*/HOST_INTERFACE=$${HOST_IFACE}/" /etc/superserve/vmd.env
+
+      # Ensure KVM is available
+      modprobe kvm
+      modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
+      chmod 0666 /dev/kvm 2>/dev/null || true
+
+      # Ensure IP forwarding
+      sysctl -w net.ipv4.ip_forward=1
+
+      # Clean stale state from previous run
+      pkill -9 firecracker 2>/dev/null || true
+      for ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do ip netns del $ns 2>/dev/null; done
+      rm -rf /var/lib/superserve/snapshots/* /var/lib/superserve/rundir/*
+
+      # Start VMD
+      systemctl start superserve-vmd
+
+      echo "=== Superserve VMD started ==="
+    EOT
+  }
+}
+
+module "observability" {
+  source = "../../../modules/observability"
+
+  project_id  = local.project_id
+  environment = local.environment
+  uptime_checks = {
+    api = {
+      display_name = "superserve-api-staging"
+      host         = "staging-sandbox.superserve.ai"
+      path         = "/"
+      port         = 443
+    }
+  }
+  labels = local.common_labels
+}

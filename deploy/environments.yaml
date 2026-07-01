@@ -1,0 +1,146 @@
+# Deployment targets for GitHub Actions/CD.
+#
+# Terraform owns the infrastructure referenced here. This file owns deployment
+# discovery and rollout intent: which environments/regions should receive a
+# built release artifact.
+#
+# A deployment workflow should build once, publish immutable artifacts, then
+# deploy the same release manifest to each enabled target below.
+
+schema_version: 1
+
+defaults:
+  host_selector:
+    sandbox_role: vmd
+    sandbox_status: ready
+  host_ports:
+    vmd_grpc: 50051
+    proxy_https_backend: 5007
+    proxy_redirect_backend: 5008
+
+environments:
+  new-region:
+    # Keep disabled until Terraform has created the target infra and host
+    # bootstrap/smoke tests have passed.
+    auto_deploy: false
+    terraform_dir: infra/envs/new-region
+    project: rayai-dev
+    regions:
+      - name: us-east1
+        required: false
+        api:
+          platform: cloud_run
+          service: superserve-api-new-region-use1
+          region: us-east1
+          image_repository: us-east1-docker.pkg.dev/rayai-dev/superserve-new-region-use1/controlplane
+        host_deployments:
+          vmd:
+            enabled: false
+            selector:
+              environment: new-region
+              region: us-east1
+              sandbox_role: vmd
+              sandbox_status: ready
+          proxy:
+            enabled: false
+            selector:
+              environment: new-region
+              region: us-east1
+              sandbox_role: vmd
+              sandbox_status: ready
+            domain: new-region-sandbox.superserve.ai
+        artifacts:
+          docker_repository: us-east1-docker.pkg.dev/rayai-dev/superserve-new-region-use1
+          object_bucket: superserve-artifacts-new-region-use1
+
+  staging:
+    auto_deploy: true
+    terraform_dir: infra/envs/staging
+    project: rayai-dev
+    regions:
+      - name: us-central1
+        required: true
+        api:
+          platform: cloud_run
+          service: superserve-api
+          region: us-central1
+          image_repository: us-central1-docker.pkg.dev/rayai-dev/superserve/controlplane
+        host_deployments:
+          vmd:
+            enabled: true
+            selector:
+              environment: staging
+              region: us-central1
+              sandbox_role: vmd
+              sandbox_status: ready
+          proxy:
+            enabled: true
+            selector:
+              environment: staging
+              region: us-central1
+              sandbox_role: vmd
+              sandbox_status: ready
+            domain: staging-sandbox.superserve.ai
+        artifacts:
+          docker_repository: us-central1-docker.pkg.dev/rayai-dev/superserve
+          object_bucket: superserve-artifacts
+
+  production:
+    # Keep production deployment explicitly gated until the rollout workflow has
+    # environment approvals and deployment ledgers.
+    auto_deploy: false
+    terraform_dir: infra/envs/production
+    project: rayai-prod
+    regions:
+      - name: us-central1
+        required: true
+        api:
+          platform: cloud_run
+          service: superserve-api
+          region: us-central1
+          image_repository: us-central1-docker.pkg.dev/rayai-prod/superserve/controlplane
+        host_deployments:
+          vmd:
+            enabled: true
+            selector:
+              environment: production
+              region: us-central1
+              sandbox_role: vmd
+              sandbox_status: ready
+          proxy:
+            enabled: true
+            selector:
+              environment: production
+              region: us-central1
+              sandbox_role: vmd
+              sandbox_status: ready
+            domain: usc-sandbox.superserve.ai
+        artifacts:
+          docker_repository: us-central1-docker.pkg.dev/rayai-prod/superserve
+          object_bucket: superserve-artifacts
+      - name: us-west2
+        required: true
+        api:
+          platform: cloud_run
+          service: superserve-api-usw2
+          region: us-west2
+          image_repository: us-west2-docker.pkg.dev/rayai-prod/superserve-usw2/controlplane
+        host_deployments:
+          vmd:
+            enabled: true
+            selector:
+              environment: production
+              region: us-west2
+              sandbox_role: vmd
+              sandbox_status: ready
+          proxy:
+            enabled: true
+            selector:
+              environment: production
+              region: us-west2
+              sandbox_role: vmd
+              sandbox_status: ready
+            domain: usw-sandbox.superserve.ai
+        artifacts:
+          docker_repository: us-west2-docker.pkg.dev/rayai-prod/superserve-usw2
+          object_bucket: superserve-artifacts
