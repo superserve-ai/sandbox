@@ -188,10 +188,12 @@ func TestPlanLayerAppendAfterFlatten(t *testing.T) {
 }
 
 func TestMaybeFlattenDefersDuringRestore(t *testing.T) {
-	// A memfd bridge fast-resume skips waitForFlush and restores from the committed overlay
-	// chain while a bridge completion may call maybeFlatten. Flattening then would delete those
-	// overlay files out from under the in-flight restore. maybeFlatten must DEFER (not arm) while
-	// a restore is in flight (restoring) or a bridge memfd is held (holdingBridgeMemfd).
+	// A memfd bridge fast-resume skips waitForFlush and restores from the committed overlay chain
+	// while a bridge completion may call maybeFlatten. Flattening then would delete those overlay
+	// files while the restore is still opening them, so maybeFlatten must DEFER while a restore is
+	// IN FLIGHT (restoring). It must NOT defer merely because a bridge memfd is held after the
+	// restore finished (the FC has the overlays mmap'd → deletion is safe), else continuous bridge
+	// pause/resume would starve flatten and grow the chain unbounded.
 	dir := t.TempDir()
 	man := &snapshotManifest{
 		Base:     "/templates/x/mem.snap",
@@ -206,33 +208,35 @@ func TestMaybeFlattenDefersDuringRestore(t *testing.T) {
 		cfg:        ManagerConfig{LayerFlattenEnabled: true, FlattenChainDepth: 2},
 	}
 
+	// armed reports whether maybeFlatten armed a flatten. flattenDone is set synchronously under
+	// the lock when arming and is never nil'd (endFlatten only closes it), so it's a race-free
+	// signal even after the background goroutine — which fails fast on the fake chain — completes.
+	// When it armed, we drain flattenDone so the goroutine releases its flattenSem slot.
 	armed := func(inst *VMInstance) bool {
 		m.maybeFlatten(inst, dir)
 		inst.mu.Lock()
-		defer inst.mu.Unlock()
-		return inst.flattening
+		ch := inst.flattenDone
+		inst.mu.Unlock()
+		if ch == nil {
+			return false
+		}
+		<-ch
+		return true
 	}
 
 	if armed(&VMInstance{ID: "r", restoring: true}) {
 		t.Fatal("maybeFlatten armed flatten while a restore was in flight (would race the restore's lower-overlay reads)")
 	}
-	if armed(&VMInstance{ID: "h", holdingBridgeMemfd: true}) {
-		t.Fatal("maybeFlatten armed flatten while a bridge memfd was held for resume")
+	// A held bridge memfd (restore already finished) must NOT defer flatten — else it starves.
+	if !armed(&VMInstance{ID: "h", holdingBridgeMemfd: true}) {
+		t.Fatal("maybeFlatten deferred flatten for a held-but-not-restoring bridge memfd (starves flatten)")
 	}
-	if len(m.flattenSem) != 0 {
-		t.Fatalf("deferred flatten leaked a flattenSem slot: len=%d, want 0", len(m.flattenSem))
-	}
-	// Sanity: with neither guard set, a flatten-worthy chain DOES arm.
-	clean := &VMInstance{ID: "c"}
-	m.maybeFlatten(clean, dir)
-	clean.mu.Lock()
-	gotArmed := clean.flattening
-	clean.mu.Unlock()
-	if !gotArmed {
+	// Neither guard set ⇒ arms.
+	if !armed(&VMInstance{ID: "c"}) {
 		t.Fatal("maybeFlatten did not arm flatten for a flatten-worthy chain with no restore in flight")
 	}
-	if clean.flattenDone != nil {
-		<-clean.flattenDone // let the background flatten finish (errors on the fake chain, but endFlatten still fires)
+	if len(m.flattenSem) != 0 {
+		t.Fatalf("flattenSem slot leaked: len=%d, want 0", len(m.flattenSem))
 	}
 }
 

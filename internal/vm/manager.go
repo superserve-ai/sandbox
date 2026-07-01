@@ -1411,12 +1411,15 @@ func (m *Manager) maybeFlatten(inst *VMInstance, snapshotDir string) {
 		//
 		// The guard only protects callers that hit waitForFlatten before reading the chain. A memfd
 		// bridge fast-resume skips waitForFlush and is already past it, mid-restore with the
-		// committed chain open as its lower layers — flattening now would delete those files out
-		// from under it. Defer while a restore is in flight or a bridge memfd is held (atomic with
-		// the arm); a later pause retries.
+		// committed chain open as its lower layers — flattening then would delete those files while
+		// the restore is still opening them. Defer only while a restore is IN FLIGHT (restoring),
+		// checked atomically with the arm. NOT while a bridge memfd is merely held: once the restore
+		// finishes the new FC has the overlays mmap'd, so deleting the files is safe (the inodes
+		// live on via the mapping) — and gating on the whole hold would starve flatten forever under
+		// continuous bridge pause/resume, growing the chain unbounded.
 		armed := false
 		inst.mu.Lock()
-		if !inst.restoring && !inst.holdingBridgeMemfd && !inst.flattening {
+		if !inst.restoring && !inst.flattening {
 			inst.flattening = true
 			inst.flattenDone = make(chan struct{})
 			armed = true
