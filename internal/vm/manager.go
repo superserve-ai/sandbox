@@ -817,7 +817,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			if fcPID <= 0 {
 				fcPID = m.firecrackerMainPID(ctx, vmID)
 			}
-			memFile, ferr := captureGuestMemFd(fcPID)
+			memFile, ferr := captureGuestMemFd(fcPID, vmID)
 			if ferr != nil {
 				log.Warn().Err(ferr).Msg("memfd capture failed; falling back to in-FC async flush")
 			} else {

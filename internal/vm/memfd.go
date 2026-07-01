@@ -12,12 +12,17 @@ import (
 // orphan GC reclaims a stale one left by a crash mid-bridge.
 const bridgeDirtyOffsetsName = "mem.dirty.offsets"
 
-// guestMemLink is the /proc/<pid>/fd readlink target of Firecracker's
-// MAP_SHARED guest-memory memfd (created as memfd_create("guest_mem", ...) when
-// shared_mem is set). The kernel reports a memfd as "/memfd:<name> (deleted)".
-const guestMemLink = "/memfd:guest_mem (deleted)"
+// guestMemLink is the /proc/<pid>/fd readlink target of Firecracker's MAP_SHARED guest-memory
+// memfd for vmID. Firecracker names it "guest_mem-<instance id>" (the instance id is the vmID vmd
+// passes as --id) and the kernel reports a memfd as "/memfd:<name> (deleted)". Matching the per-VM
+// name — not a generic "guest_mem" — ties the capture to the intended VM: on a mis-resolved PID the
+// names won't match, so capture fails and the caller falls back to the safe resume path rather than
+// handing back another tenant's memory.
+func guestMemLink(vmID string) string {
+	return fmt.Sprintf("/memfd:guest_mem-%s (deleted)", vmID)
+}
 
-// captureGuestMemFd finds the guest-memory memfd of a running Firecracker
+// captureGuestMemFd finds vmID's guest-memory memfd in a running Firecracker
 // process and reopens it as a fd owned by vmd. Holding the returned file keeps
 // the guest RAM resident after that Firecracker exits — a memfd's pages live as
 // long as any fd references the inode — which is what lets a paused VM's frozen
@@ -27,10 +32,11 @@ const guestMemLink = "/memfd:guest_mem (deleted)"
 // otherwise its guest memory is an anonymous mapping with no memfd and this
 // returns an error. O_RDONLY is sufficient: a new Firecracker copies pages out
 // of this source via UFFDIO_COPY and never writes back to it.
-func captureGuestMemFd(fcPID int) (*os.File, error) {
+func captureGuestMemFd(fcPID int, vmID string) (*os.File, error) {
 	if fcPID <= 0 {
 		return nil, fmt.Errorf("capture guest_mem fd: invalid pid %d", fcPID)
 	}
+	want := guestMemLink(vmID)
 	fdDir := fmt.Sprintf("/proc/%d/fd", fcPID)
 	entries, err := os.ReadDir(fdDir)
 	if err != nil {
@@ -42,7 +48,7 @@ func captureGuestMemFd(fcPID int) (*os.File, error) {
 		if err != nil {
 			continue // fd closed between ReadDir and Readlink
 		}
-		if target != guestMemLink {
+		if target != want {
 			continue
 		}
 		// Reopen through the magic symlink: yields a new fd to the SAME memfd
@@ -53,7 +59,7 @@ func captureGuestMemFd(fcPID int) (*os.File, error) {
 		}
 		return f, nil
 	}
-	return nil, fmt.Errorf("capture guest_mem fd: no guest_mem memfd in pid %d (shared_mem not enabled?)", fcPID)
+	return nil, fmt.Errorf("capture guest_mem fd: no %s memfd in pid %d (shared_mem not enabled? wrong pid?)", want, fcPID)
 }
 
 // readDirtyOffsets parses the dirty-page-offsets sidecar Firecracker writes for a

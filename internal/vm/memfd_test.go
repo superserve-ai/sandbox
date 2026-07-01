@@ -15,9 +15,10 @@ import (
 // guest-memory memfd. It proves the reopened fd refers to the same inode (same
 // pages) and survives the original fd being closed.
 func TestCaptureGuestMemFd(t *testing.T) {
-	// memfd_create("guest_mem") — same name Firecracker uses, so /proc/self/fd
+	const vmID = "sandbox-abc123"
+	// memfd_create("guest_mem-<vmID>") — the per-VM name Firecracker uses, so /proc/self/fd
 	// reports the readlink captureGuestMemFd matches on.
-	mfd, err := unix.MemfdCreate("guest_mem", 0)
+	mfd, err := unix.MemfdCreate("guest_mem-"+vmID, 0)
 	if err != nil {
 		t.Fatalf("memfd_create: %v", err)
 	}
@@ -31,11 +32,17 @@ func TestCaptureGuestMemFd(t *testing.T) {
 		t.Fatalf("write marker: %v", err)
 	}
 
-	held, err := captureGuestMemFd(os.Getpid())
+	held, err := captureGuestMemFd(os.Getpid(), vmID)
 	if err != nil {
 		t.Fatalf("captureGuestMemFd: %v", err)
 	}
 	defer held.Close()
+
+	// Per-VM safety: a capture for a different vmID must NOT match this memfd — so a
+	// mis-resolved PID pointing at another tenant's Firecracker can't hand back its RAM.
+	if _, err := captureGuestMemFd(os.Getpid(), "other-vm"); err == nil {
+		t.Fatal("captureGuestMemFd matched a memfd whose vmID differs; per-VM name safety broken")
+	}
 
 	// Same inode ⇒ same memory object, not a copy.
 	var origStat, heldStat unix.Stat_t
@@ -140,11 +147,11 @@ func TestReadDirtyOffsetsTruncated(t *testing.T) {
 }
 
 func TestCaptureGuestMemFdAbsent(t *testing.T) {
-	// This test process has no guest_mem memfd ⇒ must error, not panic.
-	if _, err := captureGuestMemFd(os.Getpid()); err == nil {
-		t.Fatal("expected error when no guest_mem memfd is present")
+	// This test process has no guest_mem memfd for this vmID ⇒ must error, not panic.
+	if _, err := captureGuestMemFd(os.Getpid(), "sandbox-none"); err == nil {
+		t.Fatal("expected error when no matching guest_mem memfd is present")
 	}
-	if _, err := captureGuestMemFd(0); err == nil {
+	if _, err := captureGuestMemFd(0, "sandbox-none"); err == nil {
 		t.Fatal("expected error for invalid pid 0")
 	}
 }
