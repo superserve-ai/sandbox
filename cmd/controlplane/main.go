@@ -15,6 +15,7 @@ import (
 
 	kms "cloud.google.com/go/kms/apiv1"
 	"github.com/getsentry/sentry-go"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -92,6 +93,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("parse database url: %w", err)
 	}
+	// Supabase's transaction pooler (PgBouncer) does not preserve named
+	// prepared statements across transactions — connections are swapped between
+	// clients, so a statement prepared on backend B1 is gone on B2. CacheDescribe
+	// uses unnamed prepared statements (which don't persist) while still using
+	// the extended protocol for typed/binary parameter encoding.
+	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
 	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
 		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
 			poolCfg.MaxConns = int32(n)
