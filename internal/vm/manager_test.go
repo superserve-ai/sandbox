@@ -306,23 +306,36 @@ func TestFreshenFirstPassOverlay(t *testing.T) {
 func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	root := t.TempDir()
 	vmID := "vm-abc"
-	snap := filepath.Join(root, vmID, "vmstate.snap")
-	mem := filepath.Join(root, vmID, "mem.diff")
+	dir := filepath.Join(root, vmID)
+	snap := filepath.Join(dir, "vmstate.2.snap") // newest (committed) vmstate
+	mem := filepath.Join(dir, "mem.2.diff")      // newest overlay
 	overlay := snap + ".overlay"
-	base := layeredBaseSidecarPath(mem) // mem.diff.base
-	for _, p := range []string{snap, mem, overlay, base} {
+	base := layeredBaseSidecarPath(mem)
+	// A multi-pause append chain leaves older per-layer vmstates + sidecars + the bridge
+	// offsets sidecar; the manifest names only the newest. All must be reclaimed on delete.
+	older := []string{
+		filepath.Join(dir, "vmstate.0.snap"), filepath.Join(dir, "vmstate.0.snap.overlay"),
+		filepath.Join(dir, "vmstate.1.snap"), filepath.Join(dir, "vmstate.1.snap.overlay"),
+		filepath.Join(dir, "mem.0.diff"), filepath.Join(dir, "mem.1.diff"),
+		filepath.Join(dir, bridgeDirtyOffsetsName),
+	}
+	for _, p := range append([]string{snap, mem, overlay, base}, older...) {
 		writeFile(t, p)
 	}
+	man := &snapshotManifest{Base: "/tpl/mem.snap", Overlays: []string{"mem.0.diff", "mem.1.diff", "mem.2.diff"}, Vmstate: "vmstate.2.snap"}
+	if err := writeManifestAtomic(dir, man); err != nil {
+		t.Fatal(err)
+	}
 
-	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: root}}
 	if err := mgr.DeleteSnapshotFiles(vmID, snap, mem); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	// A leftover sidecar would make a later restore mis-handle a non-layered
-	// mem file as a layered overlay — the fork-bug class both removals prevent.
-	for _, p := range []string{overlay, base} {
+	// Nothing snapshot-related must survive: leftover sidecars cause fork bugs, and leftover
+	// per-layer vmstates/overlays leak block-overlay data and keep the dir from being reclaimed.
+	for _, p := range append([]string{overlay, base}, older...) {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("sidecar still exists: %s (%v)", p, err)
+			t.Errorf("still exists after delete: %s (%v)", p, err)
 		}
 	}
 }

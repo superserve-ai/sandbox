@@ -1098,9 +1098,10 @@ func (m *Manager) completeBridgePause(inst *VMInstance, snapshotDir, layerPath, 
 			m.endFlush(inst, fmt.Errorf("bridge pause completion panicked: %v", r))
 		}
 	}()
-	// Ensure the old FC is stopped: the bridge pause's stop is warn-only, so a transient failure
-	// would leave a vCPU-paused FC pinning ~2x RAM. The held memfd keeps the RAM; re-stop is a no-op.
-	m.stopAsyncPauseFC(vmID)
+	// Do NOT re-stop the unit here: a bridge fast-resume can restart firecracker@<id> concurrently,
+	// and a delayed stop would kill the freshly-resumed FC. The old FC was already stopped at the
+	// pause point; a transient failure there is handled by ResumeVM's stranded-unit stop and the
+	// reconciler, not by racing the resume from this goroutine.
 
 	// On failure the manifest never commits, so the prior snapshot stays durable. Leave the
 	// uncommitted layer + vmstate (and its .overlay sidecar) on disk as orphans rather than
@@ -2057,6 +2058,20 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		for _, p := range []string{manifestPath(memDir), manifestPath(memDir) + ".next"} {
 			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 				m.log.Warn().Err(err).Str("path", p).Msg("remove snapshot manifest")
+			}
+		}
+		// Older per-layer vmstates + their block-overlay sidecars + the bridge offsets sidecar
+		// aren't named in memPath/Overlays (only the newest vmstate is snapshotPath); once the
+		// manifest is gone gcOrphanLayers can't see them either. The whole snapshot is being
+		// deleted, so reclaim them here (else they leak block-overlay data for every prior layer).
+		if entries, rerr := os.ReadDir(memDir); rerr == nil {
+			for _, e := range entries {
+				n := e.Name()
+				if vmstateFileRe.MatchString(n) || vmstateOverlayFileRe.MatchString(n) || n == bridgeDirtyOffsetsName {
+					if err := os.Remove(filepath.Join(memDir, n)); err != nil && !os.IsNotExist(err) {
+						m.log.Warn().Err(err).Str("path", n).Msg("remove per-layer vmstate/sidecar")
+					}
+				}
 			}
 		}
 	}
