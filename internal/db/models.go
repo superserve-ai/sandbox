@@ -257,6 +257,23 @@ type BillingRollupTeamBackfillState struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+type BillingUsageExport struct {
+	ID                         uuid.UUID          `json:"id"`
+	TeamID                     uuid.UUID          `json:"team_id"`
+	PeriodStart                time.Time          `json:"period_start"`
+	PeriodEnd                  time.Time          `json:"period_end"`
+	ResourceType               string             `json:"resource_type"`
+	StripeCustomerID           *string            `json:"stripe_customer_id"`
+	StripeMeterEventIdentifier string             `json:"stripe_meter_event_identifier"`
+	StripeEventName            string             `json:"stripe_event_name"`
+	Value                      pgtype.Numeric     `json:"value"`
+	Status                     string             `json:"status"`
+	Error                      *string            `json:"error"`
+	CreatedAt                  time.Time          `json:"created_at"`
+	SentAt                     pgtype.Timestamptz `json:"sent_at"`
+	UpdatedAt                  time.Time          `json:"updated_at"`
+}
+
 type DeviceCode struct {
 	ID         uuid.UUID   `json:"id"`
 	DeviceCode string      `json:"device_code"`
@@ -507,6 +524,16 @@ type Snapshot struct {
 	MemPath   *string   `json:"mem_path"`
 }
 
+type StripeWebhookEvent struct {
+	EventID     string             `json:"event_id"`
+	EventType   string             `json:"event_type"`
+	Payload     []byte             `json:"payload"`
+	ReceivedAt  time.Time          `json:"received_at"`
+	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+	LastError   *string            `json:"last_error"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+}
+
 type Team struct {
 	ID                    uuid.UUID `json:"id"`
 	Name                  string    `json:"name"`
@@ -522,6 +549,18 @@ type Team struct {
 	CredentialStoreKind   string    `json:"credential_store_kind"`
 	CredentialStoreConfig []byte    `json:"credential_store_config"`
 	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
+}
+
+type TeamBillingAccount struct {
+	TeamID                   uuid.UUID          `json:"team_id"`
+	StripeCustomerID         *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID     *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus *string            `json:"stripe_subscription_status"`
+	CurrentPeriodStart       pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd         pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd        bool               `json:"cancel_at_period_end"`
+	CreatedAt                time.Time          `json:"created_at"`
+	UpdatedAt                time.Time          `json:"updated_at"`
 }
 
 type TeamBillingPeriod struct {

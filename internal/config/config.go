@@ -17,6 +17,10 @@ type Config struct {
 	VMDAddress  string // VMD_GRPC_ADDRESS, default "localhost:50051"
 	DatabaseURL string // DATABASE_URL, required
 
+	StripeSecretKey     string // STRIPE_SECRET_KEY
+	StripeWebhookSecret string // STRIPE_WEBHOOK_SECRET
+	StripeAPIBaseURL    string // STRIPE_API_BASE_URL, default "https://api.stripe.com"
+
 	// SandboxAccessTokenSeed is the HMAC seed shared with the edge
 	// proxy. Both sides derive per-sandbox access tokens as
 	// HMAC-SHA256(seed, sandboxID). Loaded from SANDBOX_ACCESS_TOKEN_SEED
@@ -73,6 +77,9 @@ func Load() (*Config, error) {
 		Port:                   envOrDefault("API_PORT", "8080"),
 		VMDAddress:             envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
 		DatabaseURL:            dbURL,
+		StripeSecretKey:        os.Getenv("STRIPE_SECRET_KEY"),
+		StripeWebhookSecret:    os.Getenv("STRIPE_WEBHOOK_SECRET"),
+		StripeAPIBaseURL:       envOrDefault("STRIPE_API_BASE_URL", "https://api.stripe.com"),
 		SandboxAccessTokenSeed: seed,
 		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
