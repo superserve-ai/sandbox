@@ -384,9 +384,10 @@ func CompleteSnapshot(socketPath string) error {
 				return net.DialUnix("unix", nil, addr)
 			},
 		},
-		// Longer than Firecracker's internal completion wait so the HTTP call doesn't
-		// time out before the background write does.
-		Timeout: 60 * time.Second,
+		// Coarse backstop only: Firecracker owns real hang-detection (its writer trips a
+		// stall timeout if the dump stops making progress), so this just needs to exceed the
+		// longest legitimate write — generous so it never caps a large-but-progressing dump.
+		Timeout: 10 * time.Minute,
 	}
 	req, err := http.NewRequest(http.MethodPut, "http://localhost/snapshot/complete", strings.NewReader("{}"))
 	if err != nil {
