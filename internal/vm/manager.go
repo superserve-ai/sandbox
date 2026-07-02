@@ -1904,26 +1904,25 @@ func isReservedRunDirName(name string) bool {
 // caller's gRPC ctx is often already cancelled (deadline exceeded under
 // load). Without this, the firecracker process leaks.
 func (m *Manager) stopUnitDuringRestoreError(vmID string) {
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := stopUnit(cleanupCtx, systemdUnitName(vmID)); err != nil {
+	if err := stopUnit(stopCtx, systemdUnitName(vmID)); err != nil {
 		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("systemctl stop failed during restore error cleanup")
 	}
-	removeUnitDropIn(vmID)
 
-	// Slot is recycled right after this returns; SIGKILL by PID and wait for
-	// exit so the tap0 fd is released first (stopUnit can time out under load).
-	if inst, err := m.getInstance(vmID); err == nil {
-		inst.mu.RLock()
-		pid := inst.PID
-		inst.mu.RUnlock()
-		if pid > 0 {
-			if proc, err := os.FindProcess(pid); err == nil {
-				_ = proc.Signal(syscall.SIGKILL)
-				waitForPIDExit(pid, 500*time.Millisecond)
-			}
+	// Slot is recycled right after this returns; if stopUnit timed out the FC
+	// may still hold tap0. Resolve the unit's live MainPID (inst.PID is set
+	// asynchronously and often still 0 this early), SIGKILL, and wait for exit.
+	killCtx, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if pid := m.unitMainPID(killCtx, vmID); pid > 0 {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGKILL)
+			waitForPIDExit(pid, 500*time.Millisecond)
 		}
 	}
+
+	removeUnitDropIn(vmID)
 }
 
 // RecordAccessPattern restores the snapshot in recording mode, waits a fixed
@@ -2118,17 +2117,26 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	return 0, nil
 }
 
+// unitMainPID returns the systemd MainPID for a VM's unit, or 0 when it can't
+// be resolved or the unit has no running process.
+func (m *Manager) unitMainPID(ctx context.Context, vmID string) int {
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID)).Output()
+	if err != nil {
+		return 0
+	}
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid); err != nil {
+		return 0
+	}
+	return pid
+}
+
 func (m *Manager) resolveAndSetPID(vmID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID))
-	out, err := cmd.Output()
-	if err != nil {
-		return
-	}
-	var pid int
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid); err != nil || pid == 0 {
+	pid := m.unitMainPID(ctx, vmID)
+	if pid == 0 {
 		return
 	}
 
