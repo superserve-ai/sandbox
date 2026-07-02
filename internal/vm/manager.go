@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -903,6 +904,29 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 
 	m.persistState(inst)
 	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
+
+	// Telemetry only: measure how long boxd takes to become reachable after
+	// the vCPUs resume. Detached — status is already running and the probe
+	// mutates nothing, so a slow or dead boxd can't affect the resume. The
+	// field name matches the restore path's wait_boxd_ms so both are
+	// queryable the same way; resume readiness was the blind spot in the
+	// exec-503 incidents.
+	probeStart := time.Now()
+	vmIP := inst.IP
+	go func() {
+		defer sentrylog.Recover("resume-boxd-probe")
+		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := m.waitForBoxd(probeCtx, vmIP, 30*time.Second); err != nil {
+			log.Warn().Err(err).
+				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
+				Msg("boxd not reachable after resume")
+			return
+		}
+		log.Info().
+			Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
+			Msg("boxd reachable after resume")
+	}()
 	return inst, nil
 }
 
