@@ -58,7 +58,9 @@ BUNDLE_FILES = [
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
     "deploy/sandboxes.slice",
+    "deploy/sandbox-localssd.service",
     "scripts/fc-cleanup",
+    "scripts/setup-localssd.sh",
 ]
 
 
@@ -138,6 +140,12 @@ def main() -> int:
             sudo systemctl daemon-reload
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
+
+            # Local-SSD boot setup (no-op on hosts without local SSD).
+            sudo install -m 0755 {extract_dir}/scripts/setup-localssd.sh {install_dir}/setup-localssd.sh
+            sudo install -m 0644 {extract_dir}/deploy/sandbox-localssd.service /etc/systemd/system/sandbox-localssd.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable --quiet sandbox-localssd.service
 
             # Inject boxd + rebuild rootfs only when the new binary differs
             # from what's already installed. `-trimpath -ldflags '-s -w'`
