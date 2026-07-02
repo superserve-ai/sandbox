@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -65,6 +67,127 @@ func TestAPIKeyAuth_EmptyHeader(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Wrong-cell 401 (region-tagged API keys)
+// ---------------------------------------------------------------------------
+
+// newUnreachablePool returns a pool whose every query errors: pgxpool
+// connects lazily, so construction succeeds and the middleware's key lookup
+// fails at Scan — the same branch a key-not-found takes.
+func newUnreachablePool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), "postgres://u:p@127.0.0.1:1/db?connect_timeout=1")
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// doAuthRequest sends a request with the given API key and returns the status
+// code and decoded error object (nil if the body has none).
+func doAuthRequest(t *testing.T, r *gin.Engine, key string) (int, map[string]interface{}) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/test", nil)
+	req.Header.Set("X-API-Key", key)
+	r.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	errObj, _ := resp["error"].(map[string]interface{})
+	return w.Code, errObj
+}
+
+func TestAPIKeyAuth_WrongRegionKey(t *testing.T) {
+	t.Setenv("SANDBOX_ID_REGION", "use")
+	r := newAuthTestRouter(newUnreachablePool(t))
+
+	code, errObj := doAuthRequest(t, r, "ss_live_usw_dGVzdHJhbmRvbQ")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", code)
+	}
+	if errObj["code"] != "wrong_region" {
+		t.Errorf("expected code=wrong_region, got %v", errObj["code"])
+	}
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "region 'usw'") || !strings.Contains(msg, "https://api-usw.superserve.ai") {
+		t.Errorf("message should name the region and its endpoint, got %q", msg)
+	}
+}
+
+func TestAPIKeyAuth_WrongRegionKey_DefaultCellRegion(t *testing.T) {
+	// Unset SANDBOX_ID_REGION means the pre-multi-region primary cell,
+	// region "use" — a usw-tagged key must still get the redirect hint.
+	t.Setenv("SANDBOX_ID_REGION", "")
+	r := newAuthTestRouter(newUnreachablePool(t))
+
+	code, errObj := doAuthRequest(t, r, "ss_live_usw_dGVzdHJhbmRvbQ")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", code)
+	}
+	if errObj["code"] != "wrong_region" {
+		t.Errorf("expected code=wrong_region, got %v", errObj["code"])
+	}
+}
+
+func TestAPIKeyAuth_LookupFailureStaysGeneric(t *testing.T) {
+	t.Setenv("SANDBOX_ID_REGION", "use")
+	r := newAuthTestRouter(newUnreachablePool(t))
+
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{"same-region key not in DB", "ss_live_use_dGVzdHJhbmRvbQ"},
+		{"legacy key", "ss_live_dGVzdHJhbmRvbQ"},
+		// Legacy randoms are base64url and may contain underscores; "abc"
+		// parses as a region but is not in knownRegions, so no hint.
+		{"legacy key with coincidental underscore segments", "ss_live_abc_ZGVm_NDU2"},
+		// "euw" could be a real region one day, but until it lands in
+		// knownRegions the hint is suppressed — the accepted tradeoff for
+		// never pointing legacy-key users at endpoints that do not exist.
+		{"unknown-region prefix", "ss_live_euw_dGVzdHJhbmRvbQ"},
+		{"unparseable key", "not-a-key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, errObj := doAuthRequest(t, r, tc.key)
+			if code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d", code)
+			}
+			if errObj["code"] != "auth_failed" {
+				t.Errorf("expected code=auth_failed, got %v", errObj["code"])
+			}
+			if errObj["message"] != "Invalid or missing X-API-Key header." {
+				t.Errorf("expected the generic 401 message, got %v", errObj["message"])
+			}
+		})
+	}
+}
+
+func TestAPIKeyRegion(t *testing.T) {
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{"ss_live_usw_dGVzdA", "usw"},
+		{"ss_live_use_dGVzdA", "use"},
+		{"ss_live_dGVzdA", ""},                    // legacy: no region segment
+		{"ss_live_ABC_def", ""},                   // uppercase: not a region shape
+		{"ss_live__abc", ""},                      // empty region segment
+		{"ss_live_usw_", ""},                      // empty random
+		{"ss_live_aaaaaaaaaaaaaaaaaa_dGVzdA", ""}, // 18 chars, over the cap
+		{"sk-something", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := apiKeyRegion(tc.key); got != tc.want {
+			t.Errorf("apiKeyRegion(%q) = %q, want %q", tc.key, got, tc.want)
+		}
 	}
 }
 

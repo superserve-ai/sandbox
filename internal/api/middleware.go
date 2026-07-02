@@ -67,7 +67,10 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			keyHash,
 		).Scan(&id, &teamID, &createdBy, &expiresAt)
 		if err != nil {
-			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+			// Lookup failed — usually a bad key, but with per-cell databases
+			// it is also how a valid key presented to the wrong cell fails.
+			// respondAuthFailed names the right region when the key says so.
+			respondAuthFailed(c, apiKey)
 			c.Abort()
 			return
 		}

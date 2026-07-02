@@ -1,0 +1,78 @@
+package api
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+// API keys optionally carry the issuing cell's region between the live prefix
+// and the random component:
+//
+//	ss_live_<region>_<random>   e.g. ss_live_usw_k3TQxV...
+//
+// Each cell's database holds only its own teams' keys, so a key presented to
+// the wrong cell fails the hash lookup exactly like an invalid key. When the
+// key names a different cell's region, the 401 says so — otherwise a valid
+// key pointed at the wrong endpoint reads as "invalid key" with no hint that
+// the fix is the URL, not the key.
+const apiKeyLivePrefix = "ss_live_"
+
+// knownRegions is the allowlist of region tokens with a launched cell, grown
+// by hand per cell launch. It exists to kill false positives: legacy key
+// randoms are base64url and may contain underscores, so a legacy
+// "ss_live_abc_..." key parses as region "abc" by coincidence — without the
+// allowlist we would point that user at a nonexistent api-abc endpoint. The
+// tradeoff is that a key from a cell launched after this deploy gets the
+// generic 401 instead of the redirect hint until the list catches up; cells
+// launch rarely, so that window is accepted.
+var knownRegions = map[string]bool{
+	"use": true,
+	"usw": true,
+}
+
+// cellRegion is this cell's own region token. Empty SANDBOX_ID_REGION means
+// the pre-multi-region primary cell, which is region "use".
+func cellRegion() string {
+	if r := sandboxIDRegionFromEnv(); r != "" {
+		return r
+	}
+	return "use"
+}
+
+// apiKeyRegion extracts the region token from a region-tagged API key. It
+// returns "" for legacy keys (ss_live_<random>, no region segment) and for
+// anything that does not parse — a non-conforming segment is treated as "no
+// region", never an error. Shape rules match sandbox IDs: 1-17 lowercase
+// alphanumeric characters.
+func apiKeyRegion(key string) string {
+	rest, ok := strings.CutPrefix(key, apiKeyLivePrefix)
+	if !ok {
+		return ""
+	}
+	region, random, ok := strings.Cut(rest, "_")
+	if !ok || random == "" {
+		return "" // legacy: random only, no region segment
+	}
+	if len(region) > maxRegionCodeLen || !validRegionCode(region) {
+		return ""
+	}
+	return region
+}
+
+// respondAuthFailed writes the 401 for a failed API-key lookup. When the key
+// is tagged with a known region other than this cell's, the body names the
+// fix; every other failure — invalid, legacy, same-region key not found,
+// unparseable — returns the identical generic 401, so the response reveals
+// nothing about whether a key exists. The region token is client-visible
+// plaintext, so echoing it back leaks nothing either.
+func respondAuthFailed(c *gin.Context, apiKey string) {
+	if region := apiKeyRegion(apiKey); region != "" && knownRegions[region] && region != cellRegion() {
+		respondErrorMsg(c, "wrong_region",
+			"this API key belongs to region '"+region+"'; use that region's endpoint (https://api-"+region+".superserve.ai) or upgrade your SDK, which routes automatically",
+			http.StatusUnauthorized)
+		return
+	}
+	respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+}
