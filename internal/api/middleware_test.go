@@ -134,6 +134,29 @@ func TestAPIKeyAuth_WrongRegionKey_DefaultCellRegion(t *testing.T) {
 	}
 }
 
+func TestAPIKeyAuth_WrongRegionKey_UseKeyOnUswCell(t *testing.T) {
+	// The primary cell predates the region scheme and lives at the bare api
+	// hostname — a use-tagged key misrouted to the usw cell must be pointed
+	// at https://api.superserve.ai, not a derived api-use that doesn't exist.
+	t.Setenv("SANDBOX_ID_REGION", "usw")
+	r := newAuthTestRouter(newUnreachablePool(t))
+
+	code, errObj := doAuthRequest(t, r, "ss_live_use_dGVzdHJhbmRvbQ")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", code)
+	}
+	if errObj["code"] != "wrong_region" {
+		t.Errorf("expected code=wrong_region, got %v", errObj["code"])
+	}
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "region 'use'") || !strings.Contains(msg, "(https://api.superserve.ai)") {
+		t.Errorf("message should point at the bare canonical endpoint, got %q", msg)
+	}
+	if strings.Contains(msg, "api-use") {
+		t.Errorf("message must not reference the nonexistent api-use host, got %q", msg)
+	}
+}
+
 func TestAPIKeyAuth_LookupFailureStaysGeneric(t *testing.T) {
 	t.Setenv("SANDBOX_ID_REGION", "use")
 	r := newAuthTestRouter(newUnreachablePool(t))

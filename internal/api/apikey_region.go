@@ -19,17 +19,20 @@ import (
 // the fix is the URL, not the key.
 const apiKeyLivePrefix = "ss_live_"
 
-// knownRegions is the allowlist of region tokens with a launched cell, grown
-// by hand per cell launch. It exists to kill false positives: legacy key
-// randoms are base64url and may contain underscores, so a legacy
+// knownRegions maps region tokens with a launched cell to that cell's
+// canonical API endpoint, grown by hand per cell launch. Endpoints are
+// stored rather than derived because regional hostnames aren't uniform:
+// the primary cell predates the region scheme and lives at the bare api
+// hostname, not api-use. The allowlist half also kills false positives:
+// legacy key randoms are base64url and may contain underscores, so a legacy
 // "ss_live_abc_..." key parses as region "abc" by coincidence — without the
 // allowlist we would point that user at a nonexistent api-abc endpoint. The
 // tradeoff is that a key from a cell launched after this deploy gets the
-// generic 401 instead of the redirect hint until the list catches up; cells
+// generic 401 instead of the redirect hint until the map catches up; cells
 // launch rarely, so that window is accepted.
-var knownRegions = map[string]bool{
-	"use": true,
-	"usw": true,
+var knownRegions = map[string]string{
+	"use": "https://api.superserve.ai",
+	"usw": "https://api-usw.superserve.ai",
 }
 
 // cellRegion is this cell's own region token. Empty SANDBOX_ID_REGION means
@@ -68,11 +71,13 @@ func apiKeyRegion(key string) string {
 // nothing about whether a key exists. The region token is client-visible
 // plaintext, so echoing it back leaks nothing either.
 func respondAuthFailed(c *gin.Context, apiKey string) {
-	if region := apiKeyRegion(apiKey); region != "" && knownRegions[region] && region != cellRegion() {
-		respondErrorMsg(c, "wrong_region",
-			"this API key belongs to region '"+region+"'; use that region's endpoint (https://api-"+region+".superserve.ai) or upgrade your SDK, which routes automatically",
-			http.StatusUnauthorized)
-		return
+	if region := apiKeyRegion(apiKey); region != "" && region != cellRegion() {
+		if endpoint, known := knownRegions[region]; known {
+			respondErrorMsg(c, "wrong_region",
+				"this API key belongs to region '"+region+"'; use that region's endpoint ("+endpoint+") or upgrade your SDK, which routes automatically",
+				http.StatusUnauthorized)
+			return
+		}
 	}
 	respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
 }
