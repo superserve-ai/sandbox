@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -305,23 +306,36 @@ func TestFreshenFirstPassOverlay(t *testing.T) {
 func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	root := t.TempDir()
 	vmID := "vm-abc"
-	snap := filepath.Join(root, vmID, "vmstate.snap")
-	mem := filepath.Join(root, vmID, "mem.diff")
+	dir := filepath.Join(root, vmID)
+	snap := filepath.Join(dir, "vmstate.2.snap") // newest (committed) vmstate
+	mem := filepath.Join(dir, "mem.2.diff")      // newest overlay
 	overlay := snap + ".overlay"
-	base := layeredBaseSidecarPath(mem) // mem.diff.base
-	for _, p := range []string{snap, mem, overlay, base} {
+	base := layeredBaseSidecarPath(mem)
+	// A multi-pause append chain leaves older per-layer vmstates + sidecars + the bridge
+	// offsets sidecar; the manifest names only the newest. All must be reclaimed on delete.
+	older := []string{
+		filepath.Join(dir, "vmstate.0.snap"), filepath.Join(dir, "vmstate.0.snap.overlay"),
+		filepath.Join(dir, "vmstate.1.snap"), filepath.Join(dir, "vmstate.1.snap.overlay"),
+		filepath.Join(dir, "mem.0.diff"), filepath.Join(dir, "mem.1.diff"),
+		filepath.Join(dir, bridgeDirtyOffsetsName),
+	}
+	for _, p := range append([]string{snap, mem, overlay, base}, older...) {
 		writeFile(t, p)
 	}
+	man := &snapshotManifest{Base: "/tpl/mem.snap", Overlays: []string{"mem.0.diff", "mem.1.diff", "mem.2.diff"}, Vmstate: "vmstate.2.snap"}
+	if err := writeManifestAtomic(dir, man); err != nil {
+		t.Fatal(err)
+	}
 
-	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: root}}
 	if err := mgr.DeleteSnapshotFiles(vmID, snap, mem); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	// A leftover sidecar would make a later restore mis-handle a non-layered
-	// mem file as a layered overlay — the fork-bug class both removals prevent.
-	for _, p := range []string{overlay, base} {
+	// Nothing snapshot-related must survive: leftover sidecars cause fork bugs, and leftover
+	// per-layer vmstates/overlays leak block-overlay data and keep the dir from being reclaimed.
+	for _, p := range append([]string{overlay, base}, older...) {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("sidecar still exists: %s (%v)", p, err)
+			t.Errorf("still exists after delete: %s (%v)", p, err)
 		}
 	}
 }
@@ -747,4 +761,79 @@ func TestIsTemplateMemPath(t *testing.T) {
 	if isOverlayMemFile("/x/mem.diff") != true || isOverlayMemFile("/x/mem.snap") != false {
 		t.Fatal("isOverlayMemFile basename detection wrong")
 	}
+}
+
+func TestIsOverlayMemFile(t *testing.T) {
+	// Append-chain layer names must be recognized as overlays too, so the manifest-absent
+	// safety guards refuse to load a sparse mem.N.diff standalone (zero-hole memory).
+	overlays := []string{"mem.diff", "/p/mem.0.diff", "/p/mem.5.diff", "mem.flat.0.diff", "/p/mem.flat.12.diff"}
+	for _, p := range overlays {
+		if !isOverlayMemFile(p) {
+			t.Errorf("isOverlayMemFile(%q) = false, want true (sparse overlay must need a base)", p)
+		}
+	}
+	notOverlays := []string{"mem.snap", "/p/vmstate.snap", "/p/mem.base", "memXdiff", "mem.diff.bak", "mem..diff"}
+	for _, p := range notOverlays {
+		if isOverlayMemFile(p) {
+			t.Errorf("isOverlayMemFile(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestResumableFromManifest(t *testing.T) {
+	// The reconciler uses this to avoid failing a paused sandbox whose DB-recorded snapshot path
+	// was deleted by an async/bridge flush failure but whose committed manifest chain is intact.
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.mem")
+	write := func(p string) {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(base)
+	write(filepath.Join(dir, "mem.0.diff"))
+	write(filepath.Join(dir, "vmstate.0.snap"))
+	man := &snapshotManifest{Base: base, Overlays: []string{"mem.0.diff"}, Vmstate: "vmstate.0.snap"}
+	if err := writeManifestAtomic(dir, man); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop()}
+
+	if !m.resumableFromManifest(dir) {
+		t.Fatal("want resumable: base + overlay + vmstate all present")
+	}
+	if err := os.Remove(filepath.Join(dir, "mem.0.diff")); err != nil {
+		t.Fatal(err)
+	}
+	if m.resumableFromManifest(dir) {
+		t.Fatal("want NOT resumable: a chain overlay is missing")
+	}
+	if m.resumableFromManifest(t.TempDir()) {
+		t.Fatal("want NOT resumable: no manifest present")
+	}
+}
+
+func TestEndFlushFlattenIdempotent(t *testing.T) {
+	// The deferred panic-safety nets in the background goroutines may call endFlush/endFlatten
+	// after the normal path already did; the guards must make the second call a no-op (a second
+	// close of flushDone/flattenDone would panic).
+	m := &Manager{}
+	inst := &VMInstance{ID: "x"}
+
+	m.beginFlush(inst)
+	m.endFlush(inst, nil)
+	m.endFlush(inst, errors.New("again")) // must not panic / double-close
+	if inst.flushing {
+		t.Fatal("flushing should be false after endFlush")
+	}
+
+	inst.flattening = true
+	inst.flattenDone = make(chan struct{})
+	m.endFlatten(inst)
+	m.endFlatten(inst) // must not panic / double-close
+	if inst.flattening {
+		t.Fatal("flattening should be false after endFlatten")
+	}
+	// A no-op endFlatten on an inst that never flattened must not panic on the nil channel.
+	m.endFlatten(&VMInstance{ID: "y"})
 }

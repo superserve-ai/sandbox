@@ -1445,6 +1445,16 @@ definitions:
         description: Optional base (template) memory file for a layered UffdInternal
           restore. When set, a page is served from backend_path if present there,
           else from this base. Only meaningful when backend_type is UffdInternal.
+      lower_overlay_paths:
+        type: array
+        items:
+          type: string
+        description: Optional intermediate overlay (diff) files between base_path and
+          backend_path, ordered oldest to newest, for a layered UffdInternal restore.
+          The chain is base_path -> lower_overlay_paths... -> backend_path (newest);
+          a page is served from the newest layer that owns it, else from base_path.
+          Empty for a single-overlay or non-layered restore. Only meaningful when
+          backend_type is UffdInternal; ignored otherwise.
       access_log_path:
         type: string
         description: Optional path to a recorded page-access trace replayed as
@@ -1608,6 +1618,14 @@ definitions:
           Directory for block device delta files. When set, overlay block
           devices write delta files (containing only dirty blocks) into this
           directory, named {drive_id}.delta.
+      async_snapshot:
+        type: boolean
+        default: false
+        description:
+          If true (and snapshot_type is Diff), write the memory diff on a
+          background thread and return at the snapshot point; the caller must
+          PUT /snapshot/complete to confirm durability. The vCPUs must stay
+          paused until then. Ignored for Full snapshots.
 
   NetworkOverride:
     type: object

@@ -36,6 +36,9 @@ type SnapshotLoadParams struct {
 	// When set to true, the vm is also resumed if the snapshot load is successful.
 	ResumeVM bool `json:"resume_vm,omitempty"`
 
+	// Back the restored guest memory with a memfd (MAP_SHARED) instead of an anonymous mapping.
+	SharedMem bool `json:"shared_mem,omitempty"`
+
 	// Path to the file that contains the microVM state to be loaded.
 	// Required: true
 	SnapshotPath *string `json:"snapshot_path"`

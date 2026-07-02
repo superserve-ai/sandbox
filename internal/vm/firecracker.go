@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -305,7 +306,13 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 //     dirty pages overwrite it and it stays a complete, standalone image.
 //   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
 //     changed pages — restored over a separate base, never loaded standalone.
-func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
+//
+// When async is true the VM's memory diff is written on a Firecracker background
+// thread and the create call returns at the snapshot point; the caller must then
+// call CompleteSnapshot to confirm the write is durable, and must keep the VM
+// paused (do not unpause) until it does. async is only honored for the layered
+// (sparse-overlay) case, where the writer target is a fresh file it owns alone.
+func CreateDiffSnapshot(socketPath, snapshotPath, memPath string, async bool) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
@@ -319,12 +326,82 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
 		Context: ctx,
 		Body: &models.SnapshotCreateParams{
-			SnapshotPath: &snapshotPath,
-			MemFilePath:  &memPath,
-			SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
+			SnapshotPath:  &snapshotPath,
+			MemFilePath:   &memPath,
+			SnapshotType:  models.SnapshotCreateParamsSnapshotTypeDiff,
+			AsyncSnapshot: async,
 		},
 	}); err != nil {
 		return fmt.Errorf("create diff snapshot: %w", err)
+	}
+	return nil
+}
+
+// CreateDiffSnapshotBridge takes the memfd-bridge variant of a diff pause: Firecracker
+// pauses the vCPUs, writes the microVM state to snapshotPath and the dirty page offsets to
+// dirtyOffsetsPath, and returns WITHOUT dumping guest memory. The caller holds the guest
+// memory memfd and copies exactly those pages from it (then stops Firecracker), so the VM
+// unit frees immediately for a fast resume. memPath is required by the API but unused here
+// (no memory dump happens). Requires shared_mem-backed guest memory.
+func CreateDiffSnapshotBridge(socketPath, snapshotPath, memPath, dirtyOffsetsPath string) error {
+	fc := newFCClient(socketPath)
+	ctx := context.Background()
+
+	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
+		Context: ctx,
+		Body:    &models.VM{State: strPtr(models.VMStatePaused)},
+	}); err != nil {
+		return fmt.Errorf("pause VM: %w", err)
+	}
+
+	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
+		Context: ctx,
+		Body: &models.SnapshotCreateParams{
+			SnapshotPath:     &snapshotPath,
+			MemFilePath:      &memPath,
+			SnapshotType:     models.SnapshotCreateParamsSnapshotTypeDiff,
+			DirtyOffsetsPath: dirtyOffsetsPath,
+		},
+	}); err != nil {
+		return fmt.Errorf("create bridge snapshot: %w", err)
+	}
+	return nil
+}
+
+// CompleteSnapshot waits (PUT /snapshot/complete) for an async snapshot's background
+// write + fsync to finish, so the diff is durable on return; a no-op on the FC side
+// when no async snapshot is active. Issued as a raw request over the UDS (the
+// generated client has no such operation); FC requires a body on PUT /snapshot/*, so
+// a "{}" is sent and ignored.
+func CompleteSnapshot(socketPath string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				addr, err := net.ResolveUnixAddr("unix", socketPath)
+				if err != nil {
+					return nil, err
+				}
+				return net.DialUnix("unix", nil, addr)
+			},
+		},
+		// Coarse backstop only: Firecracker owns real hang-detection (its writer trips a
+		// stall timeout if the dump stops making progress), so this just needs to exceed the
+		// longest legitimate write — generous so it never caps a large-but-progressing dump.
+		Timeout: 10 * time.Minute,
+	}
+	req, err := http.NewRequest(http.MethodPut, "http://localhost/snapshot/complete", strings.NewReader("{}"))
+	if err != nil {
+		return fmt.Errorf("complete snapshot: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("complete snapshot: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("complete snapshot: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
@@ -370,6 +447,42 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 			return fmt.Errorf("load snapshot (no-resume): %w: %v", ErrTornSnapshot, err)
 		}
 		return fmt.Errorf("load snapshot (no-resume): %w", err)
+	}
+	return nil
+}
+
+// LoadSnapshotNoResumeLayered loads a base + ordered overlay chain via the in-process
+// UFFD handler WITHOUT resuming the vCPUs (leaves the VM paused). For offline use —
+// verification and flatten — where the composed image must be read but not run.
+// memPath is the newest overlay; lowerOverlayPaths are the intermediate overlays
+// (oldest→newest); basePath is the template base. No dirty tracking is armed.
+func LoadSnapshotNoResumeLayered(socketPath, snapshotPath, memPath, basePath string, lowerOverlayPaths []string, ifaceID, tapDevice string) error {
+	overrides := []*models.NetworkOverride{}
+	if tapDevice != "" {
+		overrides = []*models.NetworkOverride{{IfaceID: &ifaceID, HostDevName: &tapDevice}}
+	}
+	fc := newFCClient(socketPath)
+	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
+		Context: context.Background(),
+		Body: &models.SnapshotLoadParams{
+			SnapshotPath: &snapshotPath,
+			MemBackend: &models.MemoryBackend{
+				BackendType:       strPtr(models.MemoryBackendBackendTypeUffdInternal),
+				BackendPath:       &memPath,
+				BasePath:          basePath,
+				LowerOverlayPaths: lowerOverlayPaths,
+			},
+			ResumeVM:         false,
+			NetworkOverrides: overrides,
+		},
+	}); err != nil {
+		if isTornSnapshotErr(err) {
+			return fmt.Errorf("load snapshot (no-resume layered): %w: %v", ErrTornSnapshot, err)
+		}
+		if isLayeredInvalidErr(err) {
+			return fmt.Errorf("load snapshot (no-resume layered): %w: %v", ErrLayeredInvalidSnapshot, err)
+		}
+		return fmt.Errorf("load snapshot (no-resume layered): %w", err)
 	}
 	return nil
 }
@@ -454,8 +567,9 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // page offset (template-build mode). When recordToPath is set, prefetch is
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
-	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
-	trackDirty, abortOnHandlerDeath bool,
+	socketPath, snapshotPath, memPath, basePath string, lowerOverlayPaths []string,
+	accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
+	trackDirty, abortOnHandlerDeath, sharedMem bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -468,9 +582,11 @@ func RestoreSnapshotUffdInternalWithOverrides(
 			MemBackend: &models.MemoryBackend{
 				BackendType: strPtr(models.MemoryBackendBackendTypeUffdInternal),
 				BackendPath: &memPath,
-				// Layered restore: pages absent from memPath (the overlay/diff) are
-				// served from this base (template). Empty ⇒ single-file restore.
+				// Layered restore: memPath is the newest overlay; pages absent from it
+				// fall through lowerOverlayPaths (oldest→newest) then to base (template).
+				// Empty base ⇒ single-file restore; empty chain ⇒ single-overlay restore.
 				BasePath:            basePath,
+				LowerOverlayPaths:   lowerOverlayPaths,
 				AccessLogPath:       accessLogPath,
 				RecordTo:            recordToPath,
 				AbortOnHandlerDeath: abortOnHandlerDeath,
@@ -479,6 +595,7 @@ func RestoreSnapshotUffdInternalWithOverrides(
 			// (Diff) snapshot instead of a Full one.
 			TrackDirtyPages: trackDirty,
 			ResumeVM:        true,
+			SharedMem:       sharedMem,
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},

@@ -29,6 +29,9 @@ type MemoryBackend struct {
 	// Optional base (template) memory file for a layered UffdInternal restore. When set, a page is served from backend_path if present there, else from this base. Only meaningful when backend_type is UffdInternal; ignored otherwise.
 	BasePath string `json:"base_path,omitempty"`
 
+	// Optional intermediate overlay (diff) files between base_path and backend_path, ordered oldest to newest, for a layered UffdInternal restore. The chain is base_path -> lower_overlay_paths... -> backend_path (newest); a page is served from the newest layer that owns it, else from base_path. Empty for a single-overlay or non-layered restore. Only meaningful when backend_type is UffdInternal; ignored otherwise.
+	LowerOverlayPaths []string `json:"lower_overlay_paths,omitempty"`
+
 	// Optional path to a recorded page-access trace replayed as prefetch on restore. Only meaningful when backend_type is UffdInternal; ignored otherwise.
 	AccessLogPath string `json:"access_log_path,omitempty"`
 
