@@ -397,9 +397,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			// Only stopping a live unit is destructive; charge the budget there.
-			// Gate on actual systemd liveness, not the cached status — a crashed
-			// VM often lingers as StatusRunning and must still clean up unbudgeted.
-			if r.isAlive(ctx, id) {
+			// Gate on the fail-closed `active` snapshot (the pass bailed if systemctl
+			// couldn't be listed) so an inconclusive check never frees a live VM's slot.
+			if active[id] {
 				if !r.consumeAutoFailBudget(id) {
 					r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "boltdb_present_db_missing")
 					continue
