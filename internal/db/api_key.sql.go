@@ -13,9 +13,9 @@ import (
 )
 
 const createAPIKeyV2 = `-- name: CreateAPIKeyV2 :one
-INSERT INTO api_key (team_id, key_hash, name, scopes, created_by, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, team_id, key_hash, name, scopes, created_by, expires_at, revoked_at, last_used_at, created_at
+INSERT INTO api_key (team_id, key_hash, name, scopes, created_by, expires_at, region)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, team_id, key_hash, name, scopes, created_by, expires_at, revoked_at, last_used_at, created_at, region
 `
 
 type CreateAPIKeyV2Params struct {
@@ -25,6 +25,7 @@ type CreateAPIKeyV2Params struct {
 	Scopes    []string           `json:"scopes"`
 	CreatedBy pgtype.UUID        `json:"created_by"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	Region    *string            `json:"region"`
 }
 
 func (q *Queries) CreateAPIKeyV2(ctx context.Context, arg CreateAPIKeyV2Params) (ApiKey, error) {
@@ -35,6 +36,7 @@ func (q *Queries) CreateAPIKeyV2(ctx context.Context, arg CreateAPIKeyV2Params) 
 		arg.Scopes,
 		arg.CreatedBy,
 		arg.ExpiresAt,
+		arg.Region,
 	)
 	var i ApiKey
 	err := row.Scan(
@@ -48,6 +50,7 @@ func (q *Queries) CreateAPIKeyV2(ctx context.Context, arg CreateAPIKeyV2Params) 
 		&i.RevokedAt,
 		&i.LastUsedAt,
 		&i.CreatedAt,
+		&i.Region,
 	)
 	return i, err
 }
@@ -63,7 +66,7 @@ func (q *Queries) DeleteExpiredAPIKeys(ctx context.Context) error {
 }
 
 const getAPIKeyByHashV2 = `-- name: GetAPIKeyByHashV2 :one
-SELECT id, team_id, key_hash, name, scopes, created_by, expires_at, revoked_at, last_used_at, created_at FROM api_key
+SELECT id, team_id, key_hash, name, scopes, created_by, expires_at, revoked_at, last_used_at, created_at, region FROM api_key
 WHERE key_hash = $1 AND revoked_at IS NULL
 `
 
@@ -81,12 +84,13 @@ func (q *Queries) GetAPIKeyByHashV2(ctx context.Context, keyHash string) (ApiKey
 		&i.RevokedAt,
 		&i.LastUsedAt,
 		&i.CreatedAt,
+		&i.Region,
 	)
 	return i, err
 }
 
 const listAPIKeysByTeam = `-- name: ListAPIKeysByTeam :many
-SELECT id, team_id, key_hash, name, scopes, created_by, expires_at, revoked_at, last_used_at, created_at FROM api_key
+SELECT id, team_id, key_hash, name, scopes, created_by, expires_at, revoked_at, last_used_at, created_at, region FROM api_key
 WHERE team_id = $1
 ORDER BY created_at DESC
 `
@@ -111,6 +115,7 @@ func (q *Queries) ListAPIKeysByTeam(ctx context.Context, teamID uuid.UUID) ([]Ap
 			&i.RevokedAt,
 			&i.LastUsedAt,
 			&i.CreatedAt,
+			&i.Region,
 		); err != nil {
 			return nil, err
 		}

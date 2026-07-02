@@ -24,7 +24,7 @@ import (
 
 func newAuthTestRouter(pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
-	r.Use(APIKeyAuth(pool))
+	r.Use(APIKeyAuth(pool, nil))
 	r.GET("/test", func(c *gin.Context) {
 		teamID, _ := c.Get("team_id")
 		c.JSON(http.StatusOK, gin.H{"team_id": teamID})

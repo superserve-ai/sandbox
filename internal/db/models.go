@@ -194,6 +194,7 @@ type ApiKey struct {
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	CreatedAt  time.Time          `json:"created_at"`
+	Region     *string            `json:"region"`
 }
 
 type AuditLog struct {
@@ -433,6 +434,7 @@ type Sandbox struct {
 	BasePath     *string     `json:"base_path"`
 	DeltaPath    *string     `json:"delta_path"`
 	DiskMib      int32       `json:"disk_mib"`
+	Region       string      `json:"region"`
 }
 
 type SandboxActiveInterval struct {
@@ -522,6 +524,7 @@ type Team struct {
 	CredentialStoreKind   string    `json:"credential_store_kind"`
 	CredentialStoreConfig []byte    `json:"credential_store_config"`
 	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
+	HomeRegion            string    `json:"home_region"`
 }
 
 type TeamBillingPeriod struct {

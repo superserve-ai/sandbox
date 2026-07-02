@@ -65,3 +65,14 @@ func respondErrorMsg(c *gin.Context, code string, message string, httpStatus int
 		},
 	})
 }
+
+func respondErrorFields(c *gin.Context, code string, message string, httpStatus int, fields gin.H) {
+	errBody := gin.H{
+		"code":    code,
+		"message": message,
+	}
+	for key, value := range fields {
+		errBody[key] = value
+	}
+	c.JSON(httpStatus, gin.H{"error": errBody})
+}

@@ -25,6 +25,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/region"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -320,6 +321,9 @@ func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
 		}
 		return nil
 	}
+	if !h.enforceSandboxRegion(c, sandbox) {
+		return nil
+	}
 	if sandbox.Status != db.SandboxStatusActive {
 		respondError(c, ErrInvalidState)
 		return nil
@@ -351,6 +355,9 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 		}
 		return nil
 	}
+	if !h.enforceSandboxRegion(c, sandbox) {
+		return nil
+	}
 	switch sandbox.Status {
 	case db.SandboxStatusActive:
 		return &sandbox
@@ -366,12 +373,32 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 	}
 }
 
+func (h *Handlers) enforceSandboxRegion(c *gin.Context, sandbox db.Sandbox) bool {
+	c.Set("sandbox_region", sandbox.Region)
+	if h == nil || h.Config == nil || sandbox.Region == "" {
+		return true
+	}
+	requestHost := stripPort(c.Request.Host)
+	if sandbox.Region == h.Config.Region || h.Config.IsDefaultAPIHost(requestHost) {
+		return true
+	}
+	endpoint := h.Config.RegionalAPIBaseURL(sandbox.Region)
+	msg := fmt.Sprintf("This sandbox is hosted in %s. Use %s.", sandbox.Region, endpoint)
+	c.Set("wrong_region", true)
+	respondErrorFields(c, "wrong_region", msg, http.StatusConflict, gin.H{
+		"region":   sandbox.Region,
+		"endpoint": endpoint,
+	})
+	return false
+}
+
 // resumePausedSandbox restores the VM, reapplies network config, and flips
 // the sandbox to active. Starts with an atomic paused→resuming DB claim so
 // concurrent resumes don't both call VMD; the loser gets 409. On any failure
 // after VMD resume succeeds, destroys the VM + reverts to paused.
 func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) bool {
 	sandboxID := sandbox.ID
+	publicSandboxID := sandboxPublicID(*sandbox)
 
 	if !sandbox.SnapshotID.Valid {
 		log.Error().Str("sandbox_id", sandboxID.String()).Msg("paused sandbox has no snapshot_id")
@@ -386,7 +413,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// 'resuming', those handlers see it under the lock and reject with 409.
 	claimResume := func(q *db.Queries) (db.Sandbox, error) {
 		if h.Pool != nil {
-			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), sandboxID.String()); lerr != nil {
+			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), publicSandboxID); lerr != nil {
 				return db.Sandbox{}, lerr
 			}
 		}
@@ -480,7 +507,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
 	// tokens as they were at pause; the current binding set is re-applied below
 	// once the VM is up, so a mutation made while paused takes effect.
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, publicSandboxID, snapshotPath, memPath)
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
@@ -488,7 +515,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, publicSandboxID, snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -532,7 +559,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// resumable 'paused' state. Prefer leak over loss.
 	pauseAndRevert := func() {
 		pctx, pcancel := context.WithTimeout(revertCtx, vmdTimeout)
-		snapPath, memPath, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
+		snapPath, memPath, perr := vmd.PauseInstance(pctx, publicSandboxID, "")
 		pcancel()
 		if perr != nil {
 			// VM unreachable — nothing to preserve; mark failed rather than
@@ -562,7 +589,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	// Apply egress rules before committing to 'active' so "active ⇒ rules
 	// applied" holds by construction.
-	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+	if err := h.reapplyNetworkConfig(postCtx, vmd, publicSandboxID, sandbox.NetworkConfig); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
 		pauseAndRevert()
 		respondError(c, ErrInternal)
@@ -608,7 +635,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
-	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
+	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": publicSandboxID})
 	return true
 }
 
@@ -697,14 +724,31 @@ func (h *Handlers) Health(c *gin.Context) {
 
 func parseSandboxID(c *gin.Context) (uuid.UUID, error) {
 	raw := c.Param("sandbox_id")
-	id, err := uuid.Parse(raw)
+	parsed, err := region.ParseSandboxID(raw)
 	if err != nil {
 		respondErrorMsg(c, "bad_request",
-			fmt.Sprintf("Invalid sandbox_id: %q is not a valid UUID", raw),
+			err.Error(),
 			http.StatusBadRequest)
 		return uuid.Nil, err
 	}
-	return id, nil
+	if parsed.Known {
+		c.Set("requested_sandbox_region", parsed.Region)
+	}
+	return parsed.UUID, nil
+}
+
+func sandboxPublicID(s db.Sandbox) string {
+	if s.Region == "" {
+		return s.ID.String()
+	}
+	return region.SandboxID(s.Region, s.ID)
+}
+
+func sandboxPublicIDFromParts(sandboxID uuid.UUID, sandboxRegion string) string {
+	if sandboxRegion == "" {
+		return sandboxID.String()
+	}
+	return region.SandboxID(sandboxRegion, sandboxID)
 }
 
 func teamIDFromContext(c *gin.Context) (uuid.UUID, error) {
@@ -732,6 +776,18 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+func requestTeamHomeRegion(c *gin.Context, cfg *config.Config) string {
+	if raw, ok := c.Get("team_home_region"); ok {
+		if homeRegion, ok := raw.(string); ok && homeRegion != "" {
+			return homeRegion
+		}
+	}
+	if cfg != nil && cfg.Region != "" {
+		return cfg.Region
+	}
+	return region.USE
 }
 
 // ownerIDFromContext returns the actor's UUID as a string, or "" when unknown.
@@ -797,17 +853,20 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		respondError(c, ErrInvalidState)
 		return
 	}
+	if !h.enforceSandboxRegion(c, sandbox) {
+		return
+	}
 
 	if !h.resumePausedSandbox(c, &sandbox, teamID) {
 		return
 	}
 
 	resp := gin.H{
-		"id":     sandboxID.String(),
+		"id":     sandboxPublicID(sandbox),
 		"status": string(db.SandboxStatusActive),
 	}
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxPublicID(sandbox))
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -844,6 +903,10 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	if !h.enforceSandboxRegion(c, sandbox) {
+		return
+	}
+	publicSandboxID := sandboxPublicID(sandbox)
 
 	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
 	// from a quiescent state (active/paused/failed) or a transitional state whose
@@ -882,7 +945,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// The revocation row is committed with the claim above; fan it out to the
 	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
 	// from the persisted row on restart.
-	go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+	go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.Region, sandbox.HostID)
 
 	// Tear down the VM best-effort and unconditionally: a sandbox claimed from a
 	// stale transition or a 'failed' state may still hold a VM, run dir, and netns
@@ -893,7 +956,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
 	} else {
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-		if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
+		if derr := vmd.DestroyInstance(vmdCtx, publicSandboxID, true); derr != nil && !isVMDNotFound(derr) {
 			log.Warn().Err(derr).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
 		}
 		vmdCancel()
@@ -902,7 +965,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// Best-effort cleanup of pause snapshots. Failures are logged but
 	// don't fail the delete — manual cleanup may be required if vmd was
 	// unreachable.
-	h.cleanupSandboxSnapshots(c.Request.Context(), sandboxID, sandbox.HostID)
+	h.cleanupSandboxSnapshots(c.Request.Context(), sandboxID, sandbox.Region, sandbox.HostID)
 
 	// Best-effort GC of the per-build artifact dir if this sandbox was the
 	// last reference and the template has since moved to a newer build.
@@ -910,7 +973,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 
 	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
-	h.capture(c, "sandbox_deleted", map[string]any{"sandbox_id": sandboxID.String()})
+	h.capture(c, "sandbox_deleted", map[string]any{"sandbox_id": publicSandboxID})
 
 	c.Status(http.StatusNoContent)
 }
@@ -961,7 +1024,7 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, sandbox db.Sandbo
 
 // cleanupSandboxSnapshots deletes the on-disk snapshot files via vmd and
 // the snapshot DB rows for a destroyed sandbox. Best-effort.
-func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, hostID string) {
+func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, sandboxRegion, hostID string) {
 	// List snapshot rows first: they feed the per-file fallback below and are
 	// cleared at the end.
 	snaps, err := h.DB.ListSnapshotsBySandbox(reqCtx, sandboxID)
@@ -978,7 +1041,8 @@ func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uui
 		log.Warn().Err(verr).Str("sandbox_id", sandboxID.String()).Msg("resolve vmd for snapshot cleanup; files may need GC")
 	} else {
 		ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
-		switch delErr := vmd.DeleteSandboxSnapshots(ctx, sandboxID.String()); {
+		publicSandboxID := sandboxPublicIDFromParts(sandboxID, sandboxRegion)
+		switch delErr := vmd.DeleteSandboxSnapshots(ctx, publicSandboxID); {
 		case delErr == nil || isVMDNotFound(delErr):
 		case isVMDUnimplemented(delErr):
 			for _, s := range snaps {
@@ -986,7 +1050,7 @@ func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uui
 				if s.MemPath != nil {
 					memPath = *s.MemPath
 				}
-				if e := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); e != nil && !isVMDNotFound(e) {
+				if e := vmd.DeleteSnapshot(ctx, publicSandboxID, s.Path, memPath); e != nil && !isVMDNotFound(e) {
 					log.Warn().Err(e).Str("sandbox_id", sandboxID.String()).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot (fallback) failed")
 				}
 			}
@@ -1059,7 +1123,7 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID              `json:"id"`
+	ID             string                 `json:"id"`
 	Name           string                 `json:"name"`
 	Status         string                 `json:"status"`
 	VcpuCount      int32                  `json:"vcpu_count"`
@@ -1084,7 +1148,7 @@ type sandboxSecretBinding struct {
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
-		ID:        s.ID,
+		ID:        sandboxPublicID(s),
 		Name:      s.Name,
 		Status:    string(s.Status),
 		VcpuCount: s.VcpuCount,
@@ -1128,7 +1192,7 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox) sandboxResponse {
 	resp := h.sandboxToResponse(s)
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
+		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxPublicID(s))
 	}
 	return resp
 }
@@ -1477,6 +1541,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// wait on the other. This hides the ~10-20ms INSERT roundtrip behind
 	// VMD's ~100-200ms create latency, shaving that much off the p50.
 	sandboxID := uuid.New()
+	publicSandboxID := sandboxPublicIDFromParts(sandboxID, requestTeamHomeRegion(c, h.Config))
 
 	insertCtx := context.WithoutCancel(c.Request.Context())
 	type insertResult struct {
@@ -1602,7 +1667,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, publicSandboxID, snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -1638,7 +1703,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// disconnect doesn't leak the VM.
 		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed, destroying orphan VM")
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+		_ = vmd.DestroyInstance(cleanupCtx, publicSandboxID, true)
 		cleanupCancel()
 		if templateRace {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
@@ -1698,23 +1763,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	var secretsJWT string
 	if len(secretMeta) > 0 {
-		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, secretMeta)
+		jwt, jerr := h.mintSecretsJWT(publicSandboxID, teamID.String(), ipAddress, secretMeta)
 		if jerr != nil {
 			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, publicSandboxID)
 			respondError(c, ErrInternal)
 			return
 		}
 		secretsJWT = jwt
 	}
-	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+	if injErr := vmd.InjectSandboxEnv(postCtx, publicSandboxID, envVarsToShip, secretsJWT); injErr != nil {
 		// A vmd without this RPC already applied these env vars during
 		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
 		if secretsJWT == "" && isVMDUnimplemented(injErr) {
 			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
 		} else {
 			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, publicSandboxID)
 			respondError(c, ErrInternal)
 			return
 		}
@@ -1727,7 +1792,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		go func() {
 			pctx, pcancel := context.WithTimeout(context.Background(), vmdTimeout)
 			defer pcancel()
-			if err := vmd.InvalidateSandboxRules(pctx, sandboxID.String()); err != nil {
+			if err := vmd.InvalidateSandboxRules(pctx, publicSandboxID); err != nil {
 				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("prime egress rules cache failed (fetch fallback)")
 			}
 		}()
@@ -1791,7 +1856,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			// network_config was persisted above (before env injection); this
 			// only pushes the nftables rules, which need the booted VM.
 			allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
-			if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+			if err := vmd.UpdateSandboxNetwork(postCtx, sandboxPublicID(sandbox), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
 			}
 		}()
@@ -1809,7 +1874,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 	h.capture(c, "sandbox_created", map[string]any{
-		"sandbox_id":  sandbox.ID.String(),
+		"sandbox_id":  sandboxPublicID(sandbox),
 		"template_id": fromTemplateID,
 	})
 
@@ -1880,6 +1945,13 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		respondError(c, ErrInvalidState)
 		return
 	}
+	if !h.enforceSandboxRegion(c, db.Sandbox{
+		ID:     sandbox.ID,
+		Region: sandbox.Region,
+	}) {
+		return
+	}
+	publicSandboxID := sandboxPublicIDFromParts(sandbox.ID, sandbox.Region)
 
 	// BeginPause's CTE atomically closed the open active interval together
 	// with the status transition; nothing to do here. If the pause
@@ -1896,7 +1968,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Call VMD to pause and snapshot the VM.
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sandboxID.String(), "")
+	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, publicSandboxID, "")
 	if err != nil {
 		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
 		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
@@ -1983,7 +2055,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Interval was already closed at BeginPause; FinalizePause is the
 	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
+	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": publicSandboxID})
 
 	c.Status(http.StatusNoContent)
 }
@@ -2042,7 +2114,7 @@ func (h *Handlers) ListSandboxFiles(c *gin.Context) {
 		return
 	}
 
-	entries, err := vmd.ListDir(c.Request.Context(), sandbox.ID.String(), path)
+	entries, err := vmd.ListDir(c.Request.Context(), sandboxPublicID(*sandbox), path)
 	if err != nil {
 		// A missing directory (boxd NotFound) is a 404, never a gone VM: boxd
 		// replying at all means the VM is alive, so we must not mark it failed.
@@ -2179,7 +2251,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		// Apply rules to the running VM via VMD.
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 		defer vmdCancel()
-		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
+		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxPublicID(sandbox), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
 			respondError(c, ErrInternal)
 			return
@@ -2211,7 +2283,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		go func() {
 			ictx, icancel := context.WithTimeout(context.Background(), vmdTimeout)
 			defer icancel()
-			if err := vmd.InvalidateSandboxRules(ictx, sandboxID.String()); err != nil {
+			if err := vmd.InvalidateSandboxRules(ictx, sandboxPublicID(sandbox)); err != nil {
 				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("PATCH: invalidate sandbox rules failed (TTL fallback)")
 			}
 		}()

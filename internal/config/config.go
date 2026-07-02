@@ -3,12 +3,14 @@ package config
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/region"
 )
 
 // Config holds all configuration for the Superserve Sandbox control plane.
@@ -30,6 +32,15 @@ type Config struct {
 	// DefaultHostID is the fallback host identifier used when no scheduler
 	// is configured. Set via DEFAULT_HOST_ID; defaults to "default".
 	DefaultHostID string
+
+	// Region is the public region code served by this deployment.
+	Region string
+
+	// DefaultAPIBaseURL is the migration-safe catch-all endpoint.
+	DefaultAPIBaseURL string
+
+	// RegionAPIBaseURLs maps public region code -> regional API endpoint.
+	RegionAPIBaseURLs map[string]string
 
 	// SystemTeamID owns curated templates that are visible to every team
 	// (python-3.11, node-22, etc.). Set via SYSTEM_TEAM_ID; empty means
@@ -76,13 +87,57 @@ func Load() (*Config, error) {
 		SandboxAccessTokenSeed: seed,
 		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
+		Region:                 envOrDefault("SUPERSERVE_REGION", region.USE),
+		DefaultAPIBaseURL:      envOrDefault("SUPERSERVE_DEFAULT_API_BASE_URL", "https://api.superserve.ai"),
 		SystemTeamID:           os.Getenv("SYSTEM_TEAM_ID"),
 		SentryDSN:              os.Getenv("SENTRY_DSN"),
 		KMSKeyResource:         os.Getenv("KMS_KEY_RESOURCE"),
 		SecretsSigningKey:      os.Getenv("SECRETS_SIGNING_KEY"),
 		SecretsSigningKeyID:    envOrDefault("SECRETS_SIGNING_KEY_ID", "v1"),
 	}
+	if !region.Valid(cfg.Region) {
+		return nil, fmt.Errorf("SUPERSERVE_REGION must be one of use, usw")
+	}
+	if err := loadRegionAPIBaseURLs(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+func loadRegionAPIBaseURLs(cfg *Config) error {
+	raw := os.Getenv("SUPERSERVE_REGION_API_BASE_URLS")
+	if raw == "" {
+		cfg.RegionAPIBaseURLs = map[string]string{
+			region.USE: "https://api-use.superserve.ai",
+			region.USW: "https://api-usw.superserve.ai",
+		}
+		return nil
+	}
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return fmt.Errorf("SUPERSERVE_REGION_API_BASE_URLS: %w", err)
+	}
+	for key := range parsed {
+		if !region.Valid(key) {
+			return fmt.Errorf("SUPERSERVE_REGION_API_BASE_URLS contains unsupported region %q", key)
+		}
+	}
+	cfg.RegionAPIBaseURLs = parsed
+	return nil
+}
+
+func (c *Config) RegionalAPIBaseURL(regionCode string) string {
+	if c == nil {
+		return ""
+	}
+	return c.RegionAPIBaseURLs[regionCode]
+}
+
+func (c *Config) IsDefaultAPIHost(host string) bool {
+	if c == nil {
+		return false
+	}
+	return region.Hostname(c.DefaultAPIBaseURL) == host
 }
 
 func loadSeed(envValue string, allowEphemeral bool) ([]byte, error) {

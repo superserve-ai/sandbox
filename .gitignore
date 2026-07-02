@@ -65,3 +65,5 @@ docs/
 
 # misc artifacts
 *:Zone.Identifier
+
+.envrc

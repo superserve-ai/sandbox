@@ -1,6 +1,6 @@
 -- name: CreateAPIKeyV2 :one
-INSERT INTO api_key (team_id, key_hash, name, scopes, created_by, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO api_key (team_id, key_hash, name, scopes, created_by, expires_at, region)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: GetAPIKeyByHashV2 :one

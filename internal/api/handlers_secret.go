@@ -958,7 +958,7 @@ func (h *Handlers) GetSandboxEgressRules(c *gin.Context) {
 
 // fanoutSandboxRevoke calls RevokeSandbox on the daemon at hostID. Best-effort;
 // the daemon picks it up via bootstrap on next restart if this call fails.
-func (h *Handlers) fanoutSandboxRevoke(ctx context.Context, sandboxID uuid.UUID, hostID string) {
+func (h *Handlers) fanoutSandboxRevoke(ctx context.Context, sandboxID uuid.UUID, sandboxRegion, hostID string) {
 	if h.Hosts == nil || hostID == "" {
 		return
 	}
@@ -969,7 +969,8 @@ func (h *Handlers) fanoutSandboxRevoke(ctx context.Context, sandboxID uuid.UUID,
 		log.Warn().Err(err).Str("host_id", hostID).Msg("fanout revoke: resolve host client")
 		return
 	}
-	if err := client.RevokeSandbox(ctx, sandboxID.String()); err != nil {
+	publicSandboxID := sandboxPublicIDFromParts(sandboxID, sandboxRegion)
+	if err := client.RevokeSandbox(ctx, publicSandboxID); err != nil {
 		log.Warn().Err(err).Str("host_id", hostID).Str("sandbox_id", sandboxID.String()).Msg("fanout revoke: RevokeSandbox failed")
 	}
 }
@@ -1170,12 +1171,12 @@ func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, 
 		if sandbox.IpAddress != nil {
 			sourceIP = sandbox.IpAddress.String()
 		}
-		jwt, err = h.mintSecretsJWT(sandbox.ID.String(), sandbox.TeamID.String(), sourceIP, meta)
+		jwt, err = h.mintSecretsJWT(sandboxPublicID(sandbox), sandbox.TeamID.String(), sourceIP, meta)
 		if err != nil {
 			return fmt.Errorf("mint secrets jwt: %w", err)
 		}
 	}
-	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), mergeEnvVarsWithSecrets(nil, meta), jwt); err != nil {
+	if err := vmd.InjectSandboxEnv(ctx, sandboxPublicID(sandbox), mergeEnvVarsWithSecrets(nil, meta), jwt); err != nil {
 		return fmt.Errorf("inject sandbox env: %w", err)
 	}
 	return nil

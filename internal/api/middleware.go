@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,12 +15,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/region"
 )
 
 // APIKeyAuth returns a Gin middleware that validates the X-API-Key header
 // by hashing the provided key and looking it up in the api_key table.
 // On success, sets "team_id" and "api_key_id" in the Gin context.
-func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
+func APIKeyAuth(pool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
@@ -30,14 +35,43 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		hash := sha256.Sum256([]byte(apiKey))
 		keyHash := hex.EncodeToString(hash[:])
 
-		var id, teamID string
+		var id, teamID, teamHomeRegion string
+		var apiKeyRegion *string
 		var createdBy pgtype.UUID
 		err := pool.QueryRow(c.Request.Context(),
-			"SELECT id, team_id, created_by FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
+			`SELECT k.id, k.team_id, k.created_by, k.region, t.home_region
+			FROM api_key k
+			JOIN team t ON t.id = k.team_id
+			WHERE k.key_hash = $1 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > now())`,
 			keyHash,
-		).Scan(&id, &teamID, &createdBy)
+		).Scan(&id, &teamID, &createdBy, &apiKeyRegion, &teamHomeRegion)
 		if err != nil {
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
+			c.Abort()
+			return
+		}
+
+		apiKeyRegionParse := region.ParseAPIKeyRegion(apiKey)
+		requestHost := stripPort(c.Request.Host)
+		if cfg != nil {
+			c.Set("request_region", cfg.Region)
+		}
+		c.Set("team_home_region", teamHomeRegion)
+		c.Set("wrong_region", false)
+		if apiKeyRegion != nil {
+			c.Set("api_key_region", *apiKeyRegion)
+		} else if apiKeyRegionParse.Known || apiKeyRegionParse.Unknown {
+			c.Set("api_key_region", apiKeyRegionParse.Region)
+		}
+
+		if cfg != nil && teamHomeRegion != "" && teamHomeRegion != cfg.Region && !cfg.IsDefaultAPIHost(requestHost) {
+			endpoint := cfg.RegionalAPIBaseURL(teamHomeRegion)
+			msg := fmt.Sprintf("This team is hosted in %s. Use %s.", teamHomeRegion, endpoint)
+			c.Set("wrong_region", true)
+			respondErrorFields(c, "wrong_region", msg, http.StatusConflict, gin.H{
+				"region":   teamHomeRegion,
+				"endpoint": endpoint,
+			})
 			c.Abort()
 			return
 		}
@@ -94,6 +128,11 @@ func RequestLogger() gin.HandlerFunc {
 			Dur("latency", latency).
 			Str("client_ip", clientIP).
 			Int("body_size", c.Writer.Size()).
+			Str("request_region", stringValue(c, "request_region")).
+			Str("team_home_region", stringValue(c, "team_home_region")).
+			Str("api_key_region", stringValue(c, "api_key_region")).
+			Str("sandbox_region", stringValue(c, "sandbox_region")).
+			Bool("wrong_region", boolValue(c, "wrong_region")).
 			Msg("request")
 	}
 }
@@ -107,6 +146,31 @@ func SecurityHeaders() gin.HandlerFunc {
 		c.Header("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		c.Next()
 	}
+}
+
+func stripPort(host string) string {
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		return host[:i]
+	}
+	return host
+}
+
+func stringValue(c *gin.Context, key string) string {
+	if v, ok := c.Get(key); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func boolValue(c *gin.Context, key string) bool {
+	if v, ok := c.Get(key); ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
 }
 
 // ErrorHandler returns a Gin middleware that recovers from panics and returns
