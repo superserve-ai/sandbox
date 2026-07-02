@@ -33,9 +33,25 @@ func ParseRequest(host string, headers http.Header, domain string) (port int, in
 		if !validInstanceID.MatchString(id) {
 			return 0, "", fmt.Errorf("proxy: invalid sandbox ID in %s header", headerSandboxID)
 		}
-		return boxdPort, id, nil
+		return boxdPort, normalizeInstanceID(id), nil
 	}
 	return ParseHost(host, domain)
+}
+
+// normalizeInstanceID strips the public region prefix (sb-<region>-) from a
+// sandbox ID, returning the bare UUID that VMD, the resolver cache, and the
+// HMAC access tokens are all keyed on. Region-tagged public IDs exist only
+// at the API boundary; clients build proxy hostnames from whichever form
+// the API returned, so both must resolve identically. IDs that don't match
+// the public shape pass through untouched.
+func normalizeInstanceID(id string) string {
+	const prefix = "sb-"
+	const uuidLen = 36
+	rest, ok := strings.CutPrefix(id, prefix)
+	if !ok || len(rest) < uuidLen+2 || rest[len(rest)-uuidLen-1] != '-' {
+		return id
+	}
+	return rest[len(rest)-uuidLen:]
 }
 
 // isSharedHost reports whether host (with any :port stripped) equals the configured domain.
@@ -104,6 +120,7 @@ func ParseHost(host, domain string) (port int, instanceID string, err error) {
 	if !validInstanceID.MatchString(instanceID) {
 		return 0, "", fmt.Errorf("proxy: instance ID %q contains invalid characters", instanceID)
 	}
+	instanceID = normalizeInstanceID(instanceID)
 
 	// Reserved label for boxd.
 	if routing == boxdHostLabel {

@@ -782,10 +782,10 @@ func (h *Handlers) Health(c *gin.Context) {
 
 func parseSandboxID(c *gin.Context) (uuid.UUID, error) {
 	raw := c.Param("sandbox_id")
-	id, err := uuid.Parse(raw)
+	id, err := parsePublicSandboxID(raw)
 	if err != nil {
 		respondErrorMsg(c, "bad_request",
-			fmt.Sprintf("Invalid sandbox_id: %q is not a valid UUID", raw),
+			fmt.Sprintf("Invalid sandbox_id: %q is not a valid sandbox ID", raw),
 			http.StatusBadRequest)
 		return uuid.Nil, err
 	}
@@ -1144,7 +1144,9 @@ type createSandboxRequest struct {
 }
 
 type sandboxResponse struct {
-	ID             uuid.UUID              `json:"id"`
+	// ID is the public sandbox ID: a bare UUID today, sb-<region>-<uuid>
+	// once SANDBOX_ID_REGION is set on the cell (see publicid.go).
+	ID             string                 `json:"id"`
 	Name           string                 `json:"name"`
 	Status         string                 `json:"status"`
 	VcpuCount      int32                  `json:"vcpu_count"`
@@ -1169,7 +1171,7 @@ type sandboxSecretBinding struct {
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
-		ID:        s.ID,
+		ID:        formatSandboxID(s.ID),
 		Name:      s.Name,
 		Status:    string(s.Status),
 		VcpuCount: s.VcpuCount,
