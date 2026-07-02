@@ -422,6 +422,24 @@ func roleIDByName(ctx context.Context, roleName string) (uuid.UUID, error) {
 // newRouter builds a router scoped to the current test. Using t.Context()
 // ensures the rate limiter's cleanup goroutine exits when the test ends,
 // preventing goroutine leaks across hundreds of test invocations.
+// testHandlers tracks every api.Handlers built for a test router so do()/
+// doBinary() can wait for fire-and-forget bookkeeping writes (ActivateSandbox,
+// FinalizePause) after each request. Integration tests chain lifecycle calls
+// (create → pause → resume) and assert DB state right after a response, so
+// they rely on transitions having landed; the async window itself is covered
+// by unit tests. Tests here never run in parallel, so a plain slice is fine.
+var testHandlers []*api.Handlers
+
+func registerTestHandlers(h *api.Handlers) {
+	testHandlers = append(testHandlers, h)
+}
+
+func waitBookkeeping() {
+	for _, h := range testHandlers {
+		h.WaitAsyncBookkeeping()
+	}
+}
+
 func newRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	cfg := &config.Config{
@@ -431,6 +449,7 @@ func newRouter(t *testing.T) *gin.Engine {
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
+	registerTestHandlers(h)
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 
@@ -446,6 +465,7 @@ func do(r *gin.Engine, method, path, apiKey, body string) *httptest.ResponseReco
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+	waitBookkeeping()
 	return w
 }
 
@@ -457,6 +477,7 @@ func doBinary(r *gin.Engine, method, path, apiKey string, body []byte) *httptest
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+	waitBookkeeping()
 	return w
 }
 

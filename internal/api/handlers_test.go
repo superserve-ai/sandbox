@@ -1177,8 +1177,10 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	}
 }
 
-// A DB activate failure after the VM is up must re-pause (preserve the
-// overlay), never destroy — the path that previously bricked a sandbox.
+// ActivateSandbox is fire-and-forget: the client gets a success response
+// once the VM is up, and a DB activate failure re-pauses in the background
+// (preserving the overlay), never destroys — the path that previously
+// bricked a sandbox.
 func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
@@ -1231,9 +1233,12 @@ func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
 
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	// The activate write is fire-and-forget — the VM is up, so the client
+	// sees success; the failure is compensated in the background.
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
 	}
+	h.WaitAsyncBookkeeping()
 	if got := atomic.LoadInt32(&destroyCalled); got != 0 {
 		t.Errorf("DestroyInstance calls = %d, want 0 (must not destroy a resumed VM)", got)
 	}
