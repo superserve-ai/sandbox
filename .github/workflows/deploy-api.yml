@@ -250,40 +250,23 @@ jobs:
           fi
           curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
 
-  # Cells deploy sequentially after the primary, reusing the SHA-tagged image
-  # it already pushed (Cloud Run pulls cross-region from Artifact Registry).
-  # Skipped entirely until CLOUD_RUN_SERVICE_USW is set, so this job is inert
-  # for forks and pre-cell setups. The variable must be REPOSITORY-level, not
-  # environment-scoped: job-level `if` evaluates before the job attaches to
-  # the production environment, so environment vars read as empty here.
-  deploy-production-usw:
-    if: vars.CLOUD_RUN_SERVICE_USW != '' && (github.event_name == 'push' || github.event.inputs.environment == 'production')
-    needs: [deploy-production]
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Deploy to Cloud Run (usw cell)
+      # The usw cell deploys as steps in this job — not a separate job — for
+      # the same reason CD Migrate's cell push is a step: a second job
+      # referencing the production environment would double any approval
+      # gate. Steps run after the primary verify, so a bad rollout stops at
+      # the primary. The cell reuses the SHA-tagged image pushed above
+      # (Cloud Run pulls cross-region from Artifact Registry); steps skip
+      # until CLOUD_RUN_SERVICE_USW is set (repo-level variable).
+      - name: Deploy usw cell to Cloud Run
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USW }} \
             --project ${{ vars.GCP_PROJECT }}
 
-      # Cloud Run only auto-routes to the new revision while traffic tracks
-      # "latest"; force it so a leftover pin can't keep the cell on the old one.
-      - name: Route traffic to the new revision
+      - name: Route usw cell traffic to the new revision
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
         run: |
           SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
           ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
@@ -295,10 +278,11 @@ jobs:
           fi
           gcloud run services update-traffic $SVC --to-latest $ARGS
 
-      # No /health curl here: the cell service has no public invoker binding
-      # until go-live, so an unauthenticated probe 403s regardless of health.
+      # No /health curl for the cell: it has no public invoker binding until
+      # go-live, so an unauthenticated probe 403s regardless of health.
       # Ready latest revision at 100% traffic is the deploy-success signal.
-      - name: Verify latest revision serves traffic
+      - name: Verify usw cell latest revision serves traffic
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
         run: |
           SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
           ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
