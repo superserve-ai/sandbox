@@ -31,6 +31,37 @@ func TestParseHost(t *testing.T) {
 			wantPort:       boxdPort,
 			wantInstanceID: "b150ee22-4956-4f5b-926a-f921ed8c37d6",
 		},
+		// Region-tagged public IDs (sb-<region>-<uuid>) normalize to the
+		// bare UUID that VMD and the token HMACs are keyed on.
+		{
+			host:           "boxd-sb-use-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
+			wantPort:       boxdPort,
+			wantInstanceID: "b150ee22-4956-4f5b-926a-f921ed8c37d6",
+		},
+		{
+			host:           "8080-sb-usw-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
+			wantPort:       8080,
+			wantInstanceID: "b150ee22-4956-4f5b-926a-f921ed8c37d6",
+		},
+		// "sb-" that isn't the public shape passes through untouched.
+		{
+			host:           "3000-sb-shortid.sandbox.superserve.ai",
+			wantPort:       3000,
+			wantInstanceID: "sb-shortid",
+		},
+		// Right length but not a UUID tail: no alias to an internal-looking ID.
+		{
+			host:           "3000-sb-use-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sandbox.superserve.ai",
+			wantPort:       3000,
+			wantInstanceID: "sb-use-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		// Hyphenated region segment: the API would never mint it, so the
+		// proxy passes it through rather than guessing a split.
+		{
+			host:           "3000-sb-us-east-1-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
+			wantPort:       3000,
+			wantInstanceID: "sb-us-east-1-b150ee22-4956-4f5b-926a-f921ed8c37d6",
+		},
 		// User application ports — numeric label
 		{
 			host:           "3000-mybox.sandbox.superserve.ai",

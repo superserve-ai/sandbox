@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // validInstanceID restricts instance IDs to alphanumeric + hyphen, max 64 chars.
@@ -33,9 +35,51 @@ func ParseRequest(host string, headers http.Header, domain string) (port int, in
 		if !validInstanceID.MatchString(id) {
 			return 0, "", fmt.Errorf("proxy: invalid sandbox ID in %s header", headerSandboxID)
 		}
-		return boxdPort, id, nil
+		return boxdPort, normalizeInstanceID(id), nil
 	}
 	return ParseHost(host, domain)
+}
+
+// normalizeInstanceID strips the public region prefix (sb-<region>-) from a
+// sandbox ID, returning the bare UUID that VMD, the resolver cache, and the
+// HMAC access tokens are all keyed on. Region-tagged public IDs exist only
+// at the API boundary; clients build proxy hostnames from whichever form
+// the API returned, so both must resolve identically.
+//
+// The shape check mirrors the API parser (internal/api/publicid.go): valid
+// region segment plus a parseable UUID tail. Anything else passes through
+// untouched, so a malformed tagged ID can't alias to an internal-looking
+// bare ID before VMD lookup or access-token verification.
+func normalizeInstanceID(id string) string {
+	const prefix = "sb-"
+	const uuidLen = 36
+	rest, ok := strings.CutPrefix(id, prefix)
+	if !ok || len(rest) < uuidLen+2 || rest[len(rest)-uuidLen-1] != '-' {
+		return id
+	}
+	region, tail := rest[:len(rest)-uuidLen-1], rest[len(rest)-uuidLen:]
+	if !validRegionCode(region) {
+		return id
+	}
+	if _, err := uuid.Parse(tail); err != nil {
+		return id
+	}
+	return tail
+}
+
+// validRegionCode mirrors the API's public-ID region rule: non-empty
+// lowercase alphanumeric. Hyphens are excluded so the region/uuid split
+// stays unambiguous.
+func validRegionCode(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // isSharedHost reports whether host (with any :port stripped) equals the configured domain.
@@ -104,6 +148,7 @@ func ParseHost(host, domain string) (port int, instanceID string, err error) {
 	if !validInstanceID.MatchString(instanceID) {
 		return 0, "", fmt.Errorf("proxy: instance ID %q contains invalid characters", instanceID)
 	}
+	instanceID = normalizeInstanceID(instanceID)
 
 	// Reserved label for boxd.
 	if routing == boxdHostLabel {
