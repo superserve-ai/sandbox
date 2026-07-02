@@ -4,7 +4,7 @@ The infrastructure powering [Superserve](https://superserve.ai) sandboxes — fa
 
 ## Overview
 
-Superserve Sandbox provides sub-second VM cold starts using Firecracker microVMs and copy-on-write (COW) snapshot pools. It powers the Superserve sandbox API.
+Superserve Sandbox provides fast (<50ms) VM cold starts using Firecracker microVMs and copy-on-write (COW) snapshot pools. It powers the Superserve sandbox API.
 
 **Key components:**
 
