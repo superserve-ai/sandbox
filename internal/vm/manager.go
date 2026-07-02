@@ -888,24 +888,13 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
-	// Gate StatusRunning on boxd answering inside the guest. Firecracker
-	// resuming the vCPUs doesn't make the data plane reachable — under host
-	// pressure boxd's first response can lag by seconds, and reporting
-	// running early sends the proxy dialing a dead port, so clients see
-	// slow 5xx instead of a fast, retriable "sandbox is paused". The
-	// template-restore path (restoreVMSnapshot) has the same gate.
-	tBoxdStart := time.Now()
-	if err := m.waitForBoxd(ctx, inst.IP, 5*time.Second); err != nil {
-		// Snapshot files are untouched, so the sandbox stays paused and
-		// the resume can be retried.
-		m.stopUnitDuringRestoreError(vmID)
-		return nil, fmt.Errorf("boxd not ready after resume: %w", err)
-	}
-
+	// Record run state before the readiness gate below: the guest is
+	// executing from here on, and the re-pause in the gate's failure path
+	// needs the true resume file + dirty-tracking facts to snapshot
+	// consistently.
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
-	inst.Status = StatusRunning
 	inst.DirtyTracked = dirtyTracked
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -915,6 +904,33 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.BaseMemPath = basePath // re-cache (may have come from the on-disk sidecar)
 	inst.mu.Unlock()
 
+	// Gate StatusRunning on boxd answering inside the guest. Firecracker
+	// resuming the vCPUs doesn't make the data plane reachable — under host
+	// pressure boxd's first response can lag by seconds, and reporting
+	// running early sends the proxy dialing a dead port, so clients see
+	// slow 5xx instead of a fast, retriable "sandbox is paused". The
+	// template-restore path (restoreVMSnapshot) has the same gate.
+	tBoxdStart := time.Now()
+	if err := m.waitForBoxd(ctx, inst.IP, 5*time.Second); err != nil {
+		// The guest has been executing since restoreForResume, so its disk
+		// has advanced past the snapshot pair we resumed from — resuming
+		// that pair again could restore stale memory over newer disk state.
+		// Re-pause to write a fresh, consistent pair before surfacing the
+		// failure; the sandbox stays paused and the resume is retriable.
+		// Detached ctx: the cleanup must run even if the caller gave up.
+		repauseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		if _, _, perr := m.PauseVM(repauseCtx, vmID, ""); perr != nil {
+			// Can't guarantee a consistent snapshot — fail the sandbox
+			// rather than leave a retriable-but-corruptible paused state.
+			m.stopUnitDuringRestoreError(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("boxd not ready after resume (re-pause also failed: %v): %w", perr, err)
+		}
+		return nil, fmt.Errorf("boxd not ready after resume; sandbox re-paused: %w", err)
+	}
+
+	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
 	log.Info().Int("pid", pid).
 		Int64("wait_boxd_ms", time.Since(tBoxdStart).Milliseconds()).
