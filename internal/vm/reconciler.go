@@ -259,7 +259,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if sb.Sandbox.Status != db.SandboxStatusActive {
 				continue
 			}
-			if r.isAlive(ctx, id) {
+			if active[id] {
 				r.clearDrift(id)
 				continue
 			}
@@ -286,7 +286,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if rec.Status != StatusRunning {
 				continue
 			}
-			if r.isAlive(ctx, id) {
+			if active[id] {
 				r.clearDrift(id)
 				continue
 			}
@@ -755,11 +755,6 @@ func dirSize(ctx context.Context, paths []string) int64 {
 		})
 	}
 	return total
-}
-
-// isAlive returns true when the VM's systemd unit is currently active.
-func (r *Reconciler) isAlive(ctx context.Context, vmID string) bool {
-	return isUnitActive(ctx, systemdUnitName(vmID))
 }
 
 // gracePeriodElapsed records the first-seen timestamp for a drifted ID and
