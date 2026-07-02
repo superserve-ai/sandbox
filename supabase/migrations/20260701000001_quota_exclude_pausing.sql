@@ -16,6 +16,11 @@
 --   * A failed pause reverts pausing→active, which re-enters the counted set
 --     and is capped like resume; if the team filled the slot in between, the
 --     revert fails with SS001 and the row waits for stale-transition cleanup.
+--   * A crash between BeginPause and the VMD pause leaves a running VM whose
+--     row sits in 'pausing', now uncounted (before this migration the same
+--     crash leaked the slot in the opposite direction: counted but stuck).
+--     Either way the row is stranded transitional; the reconciler follow-up
+--     that repairs transitional rows covers both.
 
 BEGIN;
 
