@@ -888,10 +888,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"id":     sandboxID.String(),
+		// Public form — clients refresh their stored ID from this response,
+		// so a bare UUID here would strand them off the tagged scheme.
+		"id":     formatSandboxID(sandboxID),
 		"status": string(db.SandboxStatusActive),
 	}
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		// The token HMAC stays keyed on the bare UUID: the proxy normalizes
+		// public IDs before verification.
 		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
 	}
 	c.JSON(http.StatusOK, resp)
