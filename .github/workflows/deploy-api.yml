@@ -42,9 +42,86 @@ on:
       - 'Dockerfile'
 
 jobs:
+  # A push that changes both migrations and code triggers CD — Migrate and
+  # this workflow with no ordering: if the new binary reaches Cloud Run
+  # before the migration applies, sqlc-generated queries name columns the
+  # old schema doesn't have and 500 until migrate-prod finishes. Gate the
+  # deploy on the same-SHA migrate run. Pushes that touch no migrations
+  # (the common case) pass through after one git diff.
+  wait-for-migrations:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Wait for same-SHA CD Migrate to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual dispatch — operator owns migration ordering; skipping gate."
+            exit 0
+          fi
+
+          # Diff the WHOLE pushed range, not just the tip commit — a
+          # multi-commit push can carry migrations in an earlier commit.
+          # An endpoint diff (before vs sha) is exactly "what changed on
+          # main since the last deployed tip", and works even for a force
+          # push where `before` is no longer an ancestor.
+          BEFORE="${{ github.event.before }}"
+          MIGRATIONS_CHANGED=unknown
+          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
+             git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
+            if git diff --name-only "$BEFORE" HEAD | grep -q '^supabase/migrations/'; then
+              MIGRATIONS_CHANGED=yes
+            else
+              MIGRATIONS_CHANGED=no
+            fi
+          fi
+
+          if [ "$MIGRATIONS_CHANGED" = "no" ]; then
+            echo "No migration changes in ${BEFORE}..${{ github.sha }}; skipping gate."
+            exit 0
+          fi
+
+          # If the range couldn't be computed (unfetchable `before`), fall
+          # through to run-detection: CD Migrate triggers off this same
+          # push, so its run appears within seconds when migrations
+          # changed. A short grace window distinguishes "no run will ever
+          # exist" from "run pending" without blind-failing the deploy.
+          echo "migrations_changed=$MIGRATIONS_CHANGED — checking CD Migrate for ${{ github.sha }}"
+          # ~20 min budget (60 × 20s), then fail closed: a deploy against a
+          # missing column is worse than a late deploy.
+          for i in $(seq 1 60); do
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/cd.yml/runs?head_sha=${{ github.sha }}&event=push" \
+              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
+            status=${run% *}; conclusion=${run#* }
+            echo "attempt $i: status=$status conclusion=$conclusion"
+            if [ "$status" = "absent" ] && [ "$MIGRATIONS_CHANGED" = "unknown" ] && [ "$i" -ge 6 ]; then
+              echo "No CD Migrate run appeared in ~2 min — push touched no migrations; proceeding."
+              exit 0
+            fi
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CD Migrate succeeded; proceeding."
+                exit 0
+              fi
+              echo "CD Migrate concluded '$conclusion' — refusing to deploy against an unmigrated schema."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for CD Migrate; refusing to deploy."
+          exit 1
+
   deploy-staging:
     runs-on: ubuntu-latest
     environment: staging
+    needs: [wait-for-migrations]
     permissions:
       contents: read
       id-token: write
