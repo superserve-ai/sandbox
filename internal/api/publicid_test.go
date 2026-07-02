@@ -50,6 +50,32 @@ func TestParsePublicSandboxID(t *testing.T) {
 	}
 }
 
+func TestValidateSandboxIDRegion(t *testing.T) {
+	for _, tc := range []struct {
+		env string
+		ok  bool
+	}{
+		{"", true},    // unset: legacy bare UUIDs
+		{"use", true},
+		{"usw", true},
+		{"euw1", true},
+		{"  use  ", true},      // whitespace is trimmed before minting too
+		{"us-east-1", false},   // hyphens break the region/uuid split
+		{"USE", false},         // uppercase is not DNS-label-safe here
+		{"ss_live", false},     // underscores are not DNS-safe
+		{"abcdefghijklmnopqr", false}, // 18 chars: over the DNS-label budget
+	} {
+		t.Setenv("SANDBOX_ID_REGION", tc.env)
+		err := ValidateSandboxIDRegion()
+		if tc.ok && err != nil {
+			t.Errorf("ValidateSandboxIDRegion(%q): unexpected error %v", tc.env, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("ValidateSandboxIDRegion(%q): expected error, got nil", tc.env)
+		}
+	}
+}
+
 func TestPublicSandboxIDRoundTrip(t *testing.T) {
 	t.Setenv("SANDBOX_ID_REGION", "usw")
 	id := uuid.New()

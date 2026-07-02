@@ -27,11 +27,32 @@ const sandboxIDPrefix = "sb-"
 // uuidStrLen is the canonical textual UUID length (8-4-4-4-12).
 const uuidStrLen = 36
 
+// maxRegionCodeLen bounds the region segment so the public ID still fits in a
+// DNS label when the proxy embeds it: "{port}-sb-<region>-<uuid>" with a
+// 5-digit port leaves 63 - 6 - 40 = 17 characters for the region.
+const maxRegionCodeLen = 17
+
 // sandboxIDRegionFromEnv returns the region code minted into new public
 // sandbox IDs, or "" to mint legacy bare UUIDs. Read per call: minting is
 // off the hot path and this keeps tests to t.Setenv.
 func sandboxIDRegionFromEnv() string {
 	return strings.TrimSpace(os.Getenv("SANDBOX_ID_REGION"))
+}
+
+// ValidateSandboxIDRegion rejects a malformed SANDBOX_ID_REGION at startup.
+// This env var is the tagged-ID rollout switch; a misconfigured cell (say
+// "us-east-1" or "USE") would otherwise mint public IDs that this same API's
+// parser and the proxy's data-plane routing reject — stranding every ID
+// returned until the config is fixed. Failing the boot is cheaper.
+func ValidateSandboxIDRegion() error {
+	region := sandboxIDRegionFromEnv()
+	if region == "" {
+		return nil
+	}
+	if !validRegionCode(region) || len(region) > maxRegionCodeLen {
+		return fmt.Errorf("SANDBOX_ID_REGION %q: must be 1-%d lowercase alphanumeric characters (no hyphens or uppercase — the region is embedded in public sandbox IDs and DNS labels)", region, maxRegionCodeLen)
+	}
+	return nil
 }
 
 // formatSandboxID renders a sandbox's public ID.
