@@ -49,6 +49,19 @@ func TestParseHost(t *testing.T) {
 			wantPort:       3000,
 			wantInstanceID: "sb-shortid",
 		},
+		// Right length but not a UUID tail: no alias to an internal-looking ID.
+		{
+			host:           "3000-sb-use-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sandbox.superserve.ai",
+			wantPort:       3000,
+			wantInstanceID: "sb-use-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		// Hyphenated region segment: the API would never mint it, so the
+		// proxy passes it through rather than guessing a split.
+		{
+			host:           "3000-sb-us-east-1-b150ee22-4956-4f5b-926a-f921ed8c37d6.sandbox.superserve.ai",
+			wantPort:       3000,
+			wantInstanceID: "sb-us-east-1-b150ee22-4956-4f5b-926a-f921ed8c37d6",
+		},
 		// User application ports — numeric label
 		{
 			host:           "3000-mybox.sandbox.superserve.ai",
