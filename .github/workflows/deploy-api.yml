@@ -252,8 +252,10 @@ jobs:
 
   # Cells deploy sequentially after the primary, reusing the SHA-tagged image
   # it already pushed (Cloud Run pulls cross-region from Artifact Registry).
-  # Skipped entirely until CLOUD_RUN_SERVICE_USW is set in the production
-  # environment, so this job is inert for forks and pre-cell setups.
+  # Skipped entirely until CLOUD_RUN_SERVICE_USW is set, so this job is inert
+  # for forks and pre-cell setups. The variable must be REPOSITORY-level, not
+  # environment-scoped: job-level `if` evaluates before the job attaches to
+  # the production environment, so environment vars read as empty here.
   deploy-production-usw:
     if: vars.CLOUD_RUN_SERVICE_USW != '' && (github.event_name == 'push' || github.event.inputs.environment == 'production')
     needs: [deploy-production]
