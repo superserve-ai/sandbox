@@ -180,6 +180,18 @@ const vmdTimeout = 30 * time.Second
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
+// activateSettleWindow bounds how long status-gated read paths wait for the
+// fire-and-forget activate write to land. Create/resume respond before the
+// starting/resuming→active flip commits, so the owner's immediate follow-up
+// (create then exec — the canonical SDK flow) may read the pre-flip status;
+// waiting briefly preserves read-your-writes instead of 409ing it. Normally
+// the write lands in single-digit ms; a genuinely lost write still 409s once
+// the window expires. Var, not const, so tests can shrink it.
+var activateSettleWindow = 2 * time.Second
+
+// activateSettlePoll is the re-read interval within activateSettleWindow.
+const activateSettlePoll = 50 * time.Millisecond
+
 // staleTransitionGrace is how long a sandbox must sit in a transitional state
 // (starting/resuming/pausing) before DELETE may claim it: past this, its worker
 // is provably gone (every VMD call caps at vmdTimeout and a live worker reverts),
@@ -376,7 +388,9 @@ func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
 }
 
 // loadActiveOrResumeSandbox is like loadActiveSandbox but auto-resumes a
-// paused sandbox. Any other non-active state returns 409.
+// paused sandbox, and waits out the activate settle window on a
+// starting/resuming row before giving up. Any other non-active state
+// returns 409.
 func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -386,31 +400,44 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 	if err != nil {
 		return nil
 	}
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
-		} else {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-			respondError(c, ErrInternal)
-		}
-		return nil
-	}
-	switch sandbox.Status {
-	case db.SandboxStatusActive:
-		return &sandbox
-	case db.SandboxStatusPaused:
-		if !h.resumePausedSandbox(c, &sandbox, teamID) {
+	deadline := time.Now().Add(activateSettleWindow)
+	for {
+		sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				respondError(c, ErrSandboxNotFound)
+			} else {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+				respondError(c, ErrInternal)
+			}
 			return nil
 		}
-		sandbox.Status = db.SandboxStatusActive
-		return &sandbox
-	default:
-		respondError(c, ErrInvalidState)
-		return nil
+		switch sandbox.Status {
+		case db.SandboxStatusActive:
+			return &sandbox
+		case db.SandboxStatusPaused:
+			if !h.resumePausedSandbox(c, &sandbox, teamID) {
+				return nil
+			}
+			sandbox.Status = db.SandboxStatusActive
+			return &sandbox
+		case db.SandboxStatusStarting, db.SandboxStatusResuming:
+			// Likely the fire-and-forget activate write in flight (or a
+			// concurrent create/resume finishing); wait for the flip
+			// rather than 409 the owner's own follow-up.
+			if time.Now().Before(deadline) {
+				time.Sleep(activateSettlePoll)
+				continue
+			}
+			respondError(c, ErrInvalidState)
+			return nil
+		default:
+			respondError(c, ErrInvalidState)
+			return nil
+		}
 	}
 }
 

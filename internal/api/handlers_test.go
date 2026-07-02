@@ -1365,6 +1365,12 @@ func TestActivateSandbox_NotFound(t *testing.T) {
 }
 
 func TestActivateSandbox_NonResumableStates_409(t *testing.T) {
+	// starting/resuming rows are polled for the settle window before the
+	// 409; shrink it so the persistent-transitional cases stay fast.
+	prev := activateSettleWindow
+	activateSettleWindow = 100 * time.Millisecond
+	defer func() { activateSettleWindow = prev }()
+
 	cases := []db.SandboxStatus{
 		db.SandboxStatusFailed,
 		db.SandboxStatusPausing,
@@ -1388,6 +1394,35 @@ func TestActivateSandbox_NonResumableStates_409(t *testing.T) {
 				t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
 			}
 		})
+	}
+}
+
+// The owner's follow-up right after create/resume may read the row before the
+// fire-and-forget activate write lands. The settle window must absorb that:
+// a 'starting' row that flips to 'active' mid-poll returns 200, not 409.
+func TestActivateSandbox_SettlesStartingToActive(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+
+	var reads int32
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			status := db.SandboxStatusStarting
+			if atomic.AddInt32(&reads, 1) > 1 {
+				status = db.SandboxStatusActive // async activate landed
+			}
+			return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: status, VcpuCount: 1, MemoryMib: 512})
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (settle window must absorb the async activate); body: %s", w.Code, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&reads); got < 2 {
+		t.Errorf("GetSandbox reads = %d, want >= 2 (must have polled)", got)
 	}
 }
 

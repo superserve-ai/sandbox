@@ -1099,6 +1099,50 @@ func TestIntegration_QuotaSlotFreedAtBeginPause(t *testing.T) {
 	}
 }
 
+// A pause revert (pausing→active) must never be quota-capped: the VM never
+// stopped, and the reaper escalates a failed revert to terminal 'failed' on a
+// healthy VM. At cap: A pausing, B created into the freed slot — reverting A
+// must succeed as a transient cap+1, not raise SS001.
+func TestIntegration_PauseRevertExemptFromQuota(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_sandboxes = 1 WHERE id = $1`, teamID); err != nil {
+		t.Fatalf("set max_sandboxes: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"revert-a"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create A: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{ID: sandboxID, TeamID: teamID}); err != nil {
+		t.Fatalf("BeginPause: %v", err)
+	}
+	if cwB := do(r, "POST", "/sandboxes", apiKey, `{"name":"revert-b"}`); cwB.Code != http.StatusCreated {
+		t.Fatalf("create B into freed slot: %d %s", cwB.Code, cwB.Body.String())
+	}
+
+	// The reaper/API revert path: pausing→active via UpdateSandboxStatus.
+	if err := testQueries.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+		ID:     sandboxID,
+		Status: db.SandboxStatusActive,
+		TeamID: teamID,
+	}); err != nil {
+		t.Fatalf("pausing→active revert must be exempt from the cap, got: %v", err)
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT active_sandbox_count FROM team WHERE id = $1`, teamID).Scan(&count); err != nil {
+		t.Fatalf("read count: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("active_sandbox_count = %d, want 2 (transient overcommit recorded, not blocked)", count)
+	}
+}
+
 func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)

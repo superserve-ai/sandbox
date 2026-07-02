@@ -13,9 +13,11 @@
 --   * While the VMD snapshot is in flight (seconds), a team can briefly run
 --     cap+1 physical VMs. The quota bounds sustained concurrency, not the
 --     instantaneous VM count.
---   * A failed pause reverts pausing→active, which re-enters the counted set
---     and is capped like resume; if the team filled the slot in between, the
---     revert fails with SS001 and the row waits for stale-transition cleanup.
+--   * A failed pause reverts pausing→active, re-entering the counted set.
+--     That revert is exempt from the cap (see sandbox_quota_on_update): the
+--     VM never stopped, so refusing the write can't reclaim anything — it
+--     would only strand truth, and the reaper's revert path escalates a
+--     failed revert to a terminal 'failed' on a healthy VM.
 --   * A crash between BeginPause and the VMD pause leaves a running VM whose
 --     row sits in 'pausing', now uncounted (before this migration the same
 --     crash leaked the slot in the opposite direction: counted but stuck).
@@ -74,15 +76,19 @@ BEGIN
     SET active_sandbox_count = GREATEST(active_sandbox_count - 1, 0)
     WHERE id = NEW.team_id;
   ELSIF NOT was_counted AND is_counted THEN
-    -- Entering the counted set (resume, or a pause revert) is capped like
-    -- creation.
     UPDATE team
     SET active_sandbox_count = active_sandbox_count + 1
     WHERE id = NEW.team_id
     RETURNING active_sandbox_count, max_sandboxes
     INTO new_count, effective_max;
 
-    IF new_count > effective_max THEN
+    -- Genuine admissions (resume: paused→resuming) are capped like creation.
+    -- A pause revert (pausing→active) is NOT: the VM never stopped, so the
+    -- write only records reality. Blocking it would let the reaper mark a
+    -- healthy VM 'failed' whenever a create raced into the freed slot —
+    -- routine under auto-pause, the default lifecycle. The transient cap+1
+    -- heals when the pause is retried.
+    IF OLD.status <> 'pausing' AND new_count > effective_max THEN
       RAISE EXCEPTION 'sandbox quota exceeded (count=%, max=%)', new_count, effective_max
         USING ERRCODE = 'SS001';
     END IF;
