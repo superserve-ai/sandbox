@@ -888,6 +888,20 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
+	// Gate StatusRunning on boxd answering inside the guest. Firecracker
+	// resuming the vCPUs doesn't make the data plane reachable — under host
+	// pressure boxd's first response can lag by seconds, and reporting
+	// running early sends the proxy dialing a dead port, so clients see
+	// slow 5xx instead of a fast, retriable "sandbox is paused". The
+	// template-restore path (restoreVMSnapshot) has the same gate.
+	tBoxdStart := time.Now()
+	if err := m.waitForBoxd(ctx, inst.IP, 5*time.Second); err != nil {
+		// Snapshot files are untouched, so the sandbox stays paused and
+		// the resume can be retried.
+		m.stopUnitDuringRestoreError(vmID)
+		return nil, fmt.Errorf("boxd not ready after resume: %w", err)
+	}
+
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
@@ -902,7 +916,9 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.mu.Unlock()
 
 	m.persistState(inst)
-	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
+	log.Info().Int("pid", pid).
+		Int64("wait_boxd_ms", time.Since(tBoxdStart).Milliseconds()).
+		Msg("VM resumed from snapshot")
 	return inst, nil
 }
 
