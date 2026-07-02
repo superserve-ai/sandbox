@@ -59,3 +59,14 @@ jobs:
         run: supabase db push --db-url "$DATABASE_URL"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+
+      # Every cell DB runs the identical migration set; a cell that misses a
+      # migration silently drifts until a deploy 500s against it. A step in
+      # this job — not a separate job — so a protected production environment
+      # gates ONE approval (a second env-referencing job would double-gate
+      # Deploy API, which waits on this whole workflow). Step order still
+      # stops a bad migration at the primary before it spreads.
+      - name: Push migrations to usw cell
+        run: supabase db push --db-url "$DATABASE_URL"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
