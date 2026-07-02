@@ -422,6 +422,24 @@ func roleIDByName(ctx context.Context, roleName string) (uuid.UUID, error) {
 // newRouter builds a router scoped to the current test. Using t.Context()
 // ensures the rate limiter's cleanup goroutine exits when the test ends,
 // preventing goroutine leaks across hundreds of test invocations.
+// testHandlers tracks every api.Handlers built for a test router so do()/
+// doBinary() can wait for fire-and-forget bookkeeping writes (ActivateSandbox,
+// FinalizePause) after each request. Integration tests chain lifecycle calls
+// (create → pause → resume) and assert DB state right after a response, so
+// they rely on transitions having landed; the async window itself is covered
+// by unit tests. Tests here never run in parallel, so a plain slice is fine.
+var testHandlers []*api.Handlers
+
+func registerTestHandlers(h *api.Handlers) {
+	testHandlers = append(testHandlers, h)
+}
+
+func waitBookkeeping() {
+	for _, h := range testHandlers {
+		h.WaitAsyncBookkeeping()
+	}
+}
+
 func newRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	cfg := &config.Config{
@@ -431,6 +449,7 @@ func newRouter(t *testing.T) *gin.Engine {
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
+	registerTestHandlers(h)
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 
@@ -446,6 +465,7 @@ func do(r *gin.Engine, method, path, apiKey, body string) *httptest.ResponseReco
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+	waitBookkeeping()
 	return w
 }
 
@@ -457,6 +477,7 @@ func doBinary(r *gin.Engine, method, path, apiKey string, body []byte) *httptest
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+	waitBookkeeping()
 	return w
 }
 
@@ -1044,6 +1065,81 @@ func TestIntegration_ResumeSandbox_QuotaBlocked(t *testing.T) {
 	}
 	if sb.Status != db.SandboxStatusPaused {
 		t.Errorf("A status = %q, want paused (resume must be rejected)", sb.Status)
+	}
+}
+
+// Quota frees the slot at BeginPause ('pausing' left the counted set), so the
+// documented pause-then-create workflow can't transiently 429 while the
+// fire-and-forget FinalizePause is still in flight. Exercise the window
+// directly: gate write only, no finalize, then create at the cap.
+func TestIntegration_QuotaSlotFreedAtBeginPause(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_sandboxes = 1 WHERE id = $1`, teamID); err != nil {
+		t.Fatalf("set max_sandboxes: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"gate-a"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create A: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	// The pause gate write alone — FinalizePause deliberately never runs,
+	// simulating the async bookkeeping still in flight (or lost to a crash).
+	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{ID: sandboxID, TeamID: teamID}); err != nil {
+		t.Fatalf("BeginPause: %v", err)
+	}
+
+	cwB := do(r, "POST", "/sandboxes", apiKey, `{"name":"gate-b"}`)
+	if cwB.Code != http.StatusCreated {
+		t.Fatalf("create B while A is 'pausing': %d %s (slot must free at BeginPause)", cwB.Code, cwB.Body.String())
+	}
+}
+
+// A pause revert (pausing→active) must never be quota-capped: the VM never
+// stopped, and the reaper escalates a failed revert to terminal 'failed' on a
+// healthy VM. At cap: A pausing, B created into the freed slot — reverting A
+// must succeed as a transient cap+1, not raise SS001.
+func TestIntegration_PauseRevertExemptFromQuota(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_sandboxes = 1 WHERE id = $1`, teamID); err != nil {
+		t.Fatalf("set max_sandboxes: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"revert-a"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create A: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{ID: sandboxID, TeamID: teamID}); err != nil {
+		t.Fatalf("BeginPause: %v", err)
+	}
+	if cwB := do(r, "POST", "/sandboxes", apiKey, `{"name":"revert-b"}`); cwB.Code != http.StatusCreated {
+		t.Fatalf("create B into freed slot: %d %s", cwB.Code, cwB.Body.String())
+	}
+
+	// The reaper/API revert path: pausing→active via UpdateSandboxStatus.
+	if err := testQueries.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+		ID:     sandboxID,
+		Status: db.SandboxStatusActive,
+		TeamID: teamID,
+	}); err != nil {
+		t.Fatalf("pausing→active revert must be exempt from the cap, got: %v", err)
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT active_sandbox_count FROM team WHERE id = $1`, teamID).Scan(&count); err != nil {
+		t.Fatalf("read count: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("active_sandbox_count = %d, want 2 (transient overcommit recorded, not blocked)", count)
 	}
 }
 

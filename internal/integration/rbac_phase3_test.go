@@ -128,6 +128,7 @@ func newTokenRouter(t *testing.T) *gin.Engine {
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
+	registerTestHandlers(h)
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 
@@ -141,6 +142,7 @@ func newSecretRouter(t *testing.T) *gin.Engine {
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
 	h.Encryptor = stubEncryptor{}
+	registerTestHandlers(h)
 	return api.SetupRouter(t.Context(), h, testPool)
 }
 

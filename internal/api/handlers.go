@@ -72,6 +72,54 @@ type Handlers struct {
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
 	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
+
+	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
+	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;
+	// production never waits. Not a sync.WaitGroup: concurrent requests Add
+	// while a test's Wait is in flight, which WaitGroup forbids once the
+	// counter can touch zero mid-wait (the race detector flags the reuse).
+	asyncMu    sync.Mutex
+	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
+	asyncCount int
+}
+
+// asyncBookkeeping runs a fire-and-forget post-VMD bookkeeping DB write in a
+// background goroutine. These writes are off the hot path by design: the gate
+// write (BeginPause/BeginResume/create INSERT) already owns the row, and every
+// subsequent transition is status-gated, so nothing can proceed until the
+// bookkeeping lands — a racing request just sees the transitional status and
+// 409s until the write commits.
+func (h *Handlers) asyncBookkeeping(name string, fn func()) {
+	h.asyncMu.Lock()
+	h.asyncCount++
+	h.asyncMu.Unlock()
+	go func() {
+		defer func() {
+			h.asyncMu.Lock()
+			h.asyncCount--
+			if h.asyncCount == 0 && h.asyncCond != nil {
+				h.asyncCond.Broadcast()
+			}
+			h.asyncMu.Unlock()
+		}()
+		defer sentrylog.Recover(name)
+		fn()
+	}()
+}
+
+// WaitAsyncBookkeeping blocks until no fire-and-forget bookkeeping goroutines
+// are in flight. Test-only: lets tests assert post-transition DB state
+// deterministically. Unlike WaitGroup.Wait it is safe to call while other
+// requests keep spawning bookkeeping work.
+func (h *Handlers) WaitAsyncBookkeeping() {
+	h.asyncMu.Lock()
+	defer h.asyncMu.Unlock()
+	if h.asyncCond == nil {
+		h.asyncCond = sync.NewCond(&h.asyncMu)
+	}
+	for h.asyncCount > 0 {
+		h.asyncCond.Wait()
+	}
 }
 
 // capture emits a usage event attributed to the API key's owner and team.
@@ -131,6 +179,18 @@ const vmdTimeout = 30 * time.Second
 
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
+
+// activateSettleWindow bounds how long status-gated read paths wait for the
+// fire-and-forget activate write to land. Create/resume respond before the
+// starting/resuming→active flip commits, so the owner's immediate follow-up
+// (create then exec — the canonical SDK flow) may read the pre-flip status;
+// waiting briefly preserves read-your-writes instead of 409ing it. Normally
+// the write lands in single-digit ms; a genuinely lost write still 409s once
+// the window expires. Var, not const, so tests can shrink it.
+var activateSettleWindow = 2 * time.Second
+
+// activateSettlePoll is the re-read interval within activateSettleWindow.
+const activateSettlePoll = 50 * time.Millisecond
 
 // staleTransitionGrace is how long a sandbox must sit in a transitional state
 // (starting/resuming/pausing) before DELETE may claim it: past this, its worker
@@ -328,7 +388,9 @@ func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
 }
 
 // loadActiveOrResumeSandbox is like loadActiveSandbox but auto-resumes a
-// paused sandbox. Any other non-active state returns 409.
+// paused sandbox, and waits out the activate settle window on a
+// starting/resuming row before giving up. Any other non-active state
+// returns 409.
 func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -338,31 +400,44 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 	if err != nil {
 		return nil
 	}
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
-		} else {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-			respondError(c, ErrInternal)
-		}
-		return nil
-	}
-	switch sandbox.Status {
-	case db.SandboxStatusActive:
-		return &sandbox
-	case db.SandboxStatusPaused:
-		if !h.resumePausedSandbox(c, &sandbox, teamID) {
+	deadline := time.Now().Add(activateSettleWindow)
+	for {
+		sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				respondError(c, ErrSandboxNotFound)
+			} else {
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+				respondError(c, ErrInternal)
+			}
 			return nil
 		}
-		sandbox.Status = db.SandboxStatusActive
-		return &sandbox
-	default:
-		respondError(c, ErrInvalidState)
-		return nil
+		switch sandbox.Status {
+		case db.SandboxStatusActive:
+			return &sandbox
+		case db.SandboxStatusPaused:
+			if !h.resumePausedSandbox(c, &sandbox, teamID) {
+				return nil
+			}
+			sandbox.Status = db.SandboxStatusActive
+			return &sandbox
+		case db.SandboxStatusStarting, db.SandboxStatusResuming:
+			// Likely the fire-and-forget activate write in flight (or a
+			// concurrent create/resume finishing); wait for the flip
+			// rather than 409 the owner's own follow-up.
+			if time.Now().Before(deadline) {
+				time.Sleep(activateSettlePoll)
+				continue
+			}
+			respondError(c, ErrInvalidState)
+			return nil
+		default:
+			respondError(c, ErrInvalidState)
+			return nil
+		}
 	}
 }
 
@@ -588,25 +663,35 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
-		ID:        sandboxID,
-		VcpuCount: int32(actualVcpu),
-		MemoryMib: int32(actualMemMiB),
-		IpAddress: ipAddr,
-		TeamID:    teamID,
-		ActorID:   actorUUID(actorIDFromContext(c)),
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ActivateSandbox failed")
-		pauseAndRevert()
-		respondError(c, ErrInternal)
-		return false
-	}
+	// Fire-and-forget: the resuming→active bookkeeping write is off the hot
+	// path. BeginResume's claim owns the row and every other transition is
+	// status-gated, so a racing pause/resume sees 'resuming' and 409s until
+	// this lands. On failure, re-pause in the background (overlay preserved);
+	// the client already holds a success response and the next request
+	// auto-resumes from the snapshot. Capture actor before the goroutine —
+	// gin.Context is recycled after ServeHTTP returns.
+	actorID := actorUUID(actorIDFromContext(c))
+	h.asyncBookkeeping("activate-sandbox", func() {
+		actx, acancel := context.WithTimeout(revertCtx, asyncTimeout)
+		defer acancel()
+		if err := h.DB.ActivateSandbox(actx, db.ActivateSandboxParams{
+			ID:        sandboxID,
+			VcpuCount: int32(actualVcpu),
+			MemoryMib: int32(actualMemMiB),
+			IpAddress: ipAddr,
+			TeamID:    teamID,
+			ActorID:   actorID,
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async DB ActivateSandbox failed — re-pausing")
+			pauseAndRevert()
+		}
+	})
 
 	sandbox.VcpuCount = int32(actualVcpu)
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
-	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
+	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
 	return true
@@ -1758,21 +1843,20 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandbox.MemoryMib = int32(actualMemMiB)
 	sandbox.IpAddress = ipAddr
 
-	// ActivateSandbox (DB UPDATE) and network rule application (VMD call
-	// + DB UPDATE) are independent — both read VMD's result and write to
-	// their own sink. Run them in parallel so the response latency is
-	// max(activate, network) instead of activate + network.
-	hasNetworkRules := req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0)
-
-	// Capture before goroutine — gin.Context is recycled after ServeHTTP
-	// returns. The CTE inside ActivateSandbox uses this to open the
-	// matching sandbox_active_interval row in the same statement.
+	// Fire-and-forget: the starting→active bookkeeping write is off the hot
+	// path. The create INSERT owns the row and every other transition is
+	// status-gated, so a racing pause/exec sees 'starting' and 409s until
+	// this lands. Capture actor before the goroutine — gin.Context is
+	// recycled after ServeHTTP returns. The CTE inside ActivateSandbox uses
+	// it to open the matching sandbox_active_interval row in the same
+	// statement. postCtx is cancelled when the handler returns, so the
+	// goroutine derives its own detached deadline.
 	actorID := actorIDFromContext(c)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := h.DB.ActivateSandbox(postCtx, db.ActivateSandboxParams{
+	activateCtx := context.WithoutCancel(c.Request.Context())
+	h.asyncBookkeeping("activate-sandbox", func() {
+		actx, acancel := context.WithTimeout(activateCtx, asyncTimeout)
+		defer acancel()
+		if err := h.DB.ActivateSandbox(actx, db.ActivateSandboxParams{
 			ID:        sandbox.ID,
 			VcpuCount: int32(actualVcpu),
 			MemoryMib: int32(actualMemMiB),
@@ -1780,23 +1864,20 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TeamID:    teamID,
 			ActorID:   actorUUID(actorID),
 		}); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ActivateSandbox failed")
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("async DB ActivateSandbox failed")
 		}
-	}()
+	})
 
-	if hasNetworkRules {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// network_config was persisted above (before env injection); this
-			// only pushes the nftables rules, which need the booted VM.
-			allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
-			if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
-				log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
-			}
-		}()
+	// Network rules stay blocking: a 201 must imply "egress rules applied",
+	// so the client can't reach the sandbox before its policy is in place.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		// network_config was persisted above (before env injection); this
+		// only pushes the nftables rules, which need the booted VM.
+		allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
+		if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
+		}
 	}
-	wg.Wait()
 	tPostDone := time.Now()
 
 	var createdMeta []byte
@@ -1806,7 +1887,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			"template_id":   fromTemplateID,
 		})
 	}
-	// ActivateSandbox's CTE atomically opened the sandbox_active_interval row.
+	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 	h.capture(c, "sandbox_created", map[string]any{
 		"sandbox_id":  sandbox.ID.String(),
@@ -1945,40 +2026,38 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		Str("mem_path", memPath).
 		Msg("VMD pause complete")
 
-	// Past this point the snapshot already exists on disk. Detach from
-	// cancellation so a client disconnect cannot orphan the snapshot
-	// files, but preserve the trace/span context so the snapshot row
-	// creation stays linked to the original pause request trace.
-	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-	defer postCancel()
-
-	// Atomic post-VMD bookkeeping: upsert the snapshot row (keyed on the
-	// partial unique index over (sandbox_id) WHERE saved=false), link it
-	// to the sandbox, and flip status pausing → paused in a single CTE.
-	// The upsert replaces the old "insert a new row + delete the previous"
-	// flow, so there's no explicit prev-snapshot cleanup to schedule here.
-	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
-		ID:        sandboxID,
-		TeamID:    teamID,
-		Path:      snapshotPath,
-		MemPath:   &memPath,
-		SizeBytes: 0,
-		Trigger:   "pause",
-	}); err != nil {
-		// ErrNoRows here means the sandbox was soft-deleted between
-		// BeginPause and FinalizePause (a rare race with DeleteSandbox).
-		// The VM is already stopped and its snapshot files are on disk —
-		// we can't finalize bookkeeping for a sandbox that no longer
-		// exists, so return 410 Gone.
-		if err == pgx.ErrNoRows {
-			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("FinalizePause: sandbox deleted mid-pause")
-			respondError(c, ErrSandboxGone)
-			return
+	// Past this point the snapshot already exists on disk — the pause has
+	// physically happened, so the bookkeeping (snapshot row upsert + status
+	// flip pausing → paused in a single CTE) is fire-and-forget. BeginPause's
+	// gate write owns the row and every other transition is status-gated, so
+	// a racing resume sees 'pausing' and 409s until this lands. Detached from
+	// cancellation so a client disconnect cannot orphan the bookkeeping;
+	// trace/span context preserved. The upsert replaces the old "insert a new
+	// row + delete the previous" flow, so there's no explicit prev-snapshot
+	// cleanup to schedule here.
+	finalizeCtx := context.WithoutCancel(c.Request.Context())
+	h.asyncBookkeeping("finalize-pause", func() {
+		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
+		defer fcancel()
+		if _, err := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
+			ID:        sandboxID,
+			TeamID:    teamID,
+			Path:      snapshotPath,
+			MemPath:   &memPath,
+			SizeBytes: 0,
+			Trigger:   "pause",
+		}); err != nil {
+			// ErrNoRows means the sandbox was soft-deleted between BeginPause
+			// and FinalizePause (a rare race with DeleteSandbox). The VM is
+			// already stopped and its snapshot files are on disk — nothing to
+			// finalize for a sandbox that no longer exists.
+			if err == pgx.ErrNoRows {
+				log.Warn().Str("sandbox_id", sandboxID.String()).Msg("FinalizePause: sandbox deleted mid-pause")
+				return
+			}
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async DB FinalizePause failed — sandbox may be stuck in 'pausing'")
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB FinalizePause failed")
-		respondError(c, ErrInternal)
-		return
-	}
+	})
 
 	// Interval was already closed at BeginPause; FinalizePause is the
 	// end of the VMD pause work, not the moment the sandbox left active.
