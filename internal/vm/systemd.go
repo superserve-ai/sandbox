@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -57,6 +58,25 @@ func stopUnit(ctx context.Context, unit string) error {
 func isUnitActive(ctx context.Context, unit string) bool {
 	cmd := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit)
 	return cmd.Run() == nil
+}
+
+// unitDefinitelyDead reports whether systemd definitively reports the unit
+// not-active. Unlike !isUnitActive it returns false on an inconclusive result
+// (ctx cancelled, systemctl timeout/error), so an overloaded or shutting-down
+// host never mistakes a live VM for a dead one. Only a clean non-zero exit counts.
+func unitDefinitelyDead(ctx context.Context, unit string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run()
+	if err == nil {
+		return false // active
+	}
+	if ctx.Err() != nil {
+		return false // cancelled or timed out mid-call, not a real answer
+	}
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
 }
 
 // listActiveFirecrackerUnits returns the sandbox IDs of all running

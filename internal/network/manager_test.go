@@ -36,6 +36,21 @@ func newTestManager() *Manager {
 	}
 }
 
+func TestReserveSlotsAbove(t *testing.T) {
+	m := newTestManager()
+	// nextSlot must jump past the highest occupied slot so the pool never hands
+	// out a slot a not-yet-reattached VM still holds. Unparseable names ignored.
+	m.ReserveSlotsAbove([]string{"ns-5", "ns-2", "bogus", "ns-9"})
+	if m.nextSlot != 10 {
+		t.Fatalf("nextSlot = %d, want 10 (past max slot 9)", m.nextSlot)
+	}
+	// A lower index must never pull nextSlot back down.
+	m.ReserveSlotsAbove([]string{"ns-3"})
+	if m.nextSlot != 10 {
+		t.Fatalf("nextSlot = %d, want 10 (unchanged by lower index)", m.nextSlot)
+	}
+}
+
 func TestSlotFromNamespace(t *testing.T) {
 	cases := []struct {
 		in      string

@@ -544,6 +544,20 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	return nil
 }
 
+// ReserveSlotsAbove bumps nextSlot past every slot index named by the given
+// namespaces, so the pre-allocation pool never hands out a fresh slot that
+// collides with a VM not yet reattached. Cheap: parses indices and bumps a
+// counter, no kernel work — safe to call before the full per-VM reattach.
+func (m *Manager) ReserveSlotsAbove(namespaces []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ns := range namespaces {
+		if idx, ok := slotFromNamespace(ns); ok && idx >= m.nextSlot {
+			m.nextSlot = idx + 1
+		}
+	}
+}
+
 // EnsureVMSlot guarantees the kernel network state for vmID is present and
 // tracked. Idempotent.
 //

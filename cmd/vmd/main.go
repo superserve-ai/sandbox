@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
@@ -423,15 +426,57 @@ func main() {
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
-	// ---- Reattach to running VMs from previous VMD lifetime ----
-	// Runs BEFORE StartPool so the Phase C orphan-namespace sweep can
-	// clear leaked ns-N/veth-N from prior lifetimes. Otherwise the pool
-	// burns startup retrying colliding slots and ends up with an empty
-	// fresh buffer ("initial pool fill incomplete").
-	reattached, stale := mgr.ReattachAll(ctx)
-	if reattached > 0 || stale > 0 {
-		log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
+	// ---- gRPC server ----
+	// Bind and serve BEFORE the reattach so a restart doesn't refuse connections
+	// during it; requests are gated Unavailable until startupReady flips.
+	startupReady := &atomic.Bool{}
+	notReady := func() error {
+		return status.Error(codes.Unavailable, "vmd is starting up (reattaching VMs), retry shortly")
 	}
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
+	if err != nil {
+		log.Fatal().Err(err).Int("port", cfg.GRPCPort).Msg("failed to listen")
+	}
+	grpcServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(64<<20), // 64 MiB
+		grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if !startupReady.Load() {
+				return nil, notReady()
+			}
+			return handler(ctx, req)
+		}),
+		grpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			if !startupReady.Load() {
+				return notReady()
+			}
+			return handler(srv, ss)
+		}),
+	)
+	adapter := vm.NewGRPCAdapter(mgr).
+		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
+	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
+	if cfg.SecretsProxySocket != "" {
+		log.Info().
+			Str("socket", cfg.SecretsProxySocket).
+			Str("sandbox_addr", cfg.SecretsProxySandboxAddr).
+			Msg("secretsproxy daemon integration enabled")
+	}
+	lc.start("grpc server", func() error {
+		log.Info().Int("port", cfg.GRPCPort).Msg("gRPC server listening")
+		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+			return fmt.Errorf("grpc serve: %w", err)
+		}
+		return nil
+	})
+	// Closer is registered later (after the manager/pool closers) so it runs
+	// first on shutdown — stop accepting before those are torn down.
+
+	// ---- Startup network prep (fast; must precede StartPool) ----
+	// Reserve slots held by existing VMs (so the pool can't hand out a colliding
+	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
+	// below; VMs it hasn't reached are loaded on-demand on first request.
+	mgr.ReserveStartupSlots()
+	mgr.SweepStartupOrphanNamespaces()
 
 	// ---- Pre-allocate network slots ----
 	// Keeps a buffer of ready-to-use network namespaces so sandbox creation
@@ -441,6 +486,18 @@ func main() {
 		NewSize: netPoolFresh,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+
+	// ---- Background full reattach ----
+	// Off the critical path (requests load their VM on demand); proactively
+	// populates the map and GCs stale records. Plain goroutine, not an lc
+	// service — a completing lc service trips lifecycle shutdown.
+	go func() {
+		defer sentrylog.Recover("startup reattach")
+		reattached, stale := mgr.ReattachAll(ctx)
+		if reattached > 0 || stale > 0 {
+			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
+		}
+	}()
 
 	// ---- Optional DB connection for the reconciler ----
 	// VMD does not need the DB for its request path (that stays on gRPC).
@@ -523,30 +580,8 @@ func main() {
 		return localHTTP.Shutdown(shutdownCtx)
 	})
 
-	// ---- gRPC server ----
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
-	if err != nil {
-		log.Fatal().Err(err).Int("port", cfg.GRPCPort).Msg("failed to listen")
-	}
-	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(64 << 20), // 64 MiB
-	)
-	adapter := vm.NewGRPCAdapter(mgr).
-		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
-	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
-	if cfg.SecretsProxySocket != "" {
-		log.Info().
-			Str("socket", cfg.SecretsProxySocket).
-			Str("sandbox_addr", cfg.SecretsProxySandboxAddr).
-			Msg("secretsproxy daemon integration enabled")
-	}
-	lc.start("grpc server", func() error {
-		log.Info().Int("port", cfg.GRPCPort).Msg("gRPC server listening")
-		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
-			return fmt.Errorf("grpc serve: %w", err)
-		}
-		return nil
-	})
+	// Registered last so it closes first on SIGTERM: stop accepting requests
+	// before the VM manager and network pool are torn down.
 	lc.addCloser("grpc server", func(shutdownCtx context.Context) error {
 		done := make(chan struct{})
 		go func() {
@@ -562,6 +597,12 @@ func main() {
 		}
 		return nil
 	})
+
+	// Fast pre-serve init is done (slots reserved, namespaces swept, pool primed).
+	// Open the gate; the full reattach continues in the background and requests
+	// load any not-yet-reattached VM on demand.
+	startupReady.Store(true)
+	log.Info().Msg("startup complete — gRPC serving requests")
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
