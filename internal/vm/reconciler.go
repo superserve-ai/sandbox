@@ -391,21 +391,20 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed("bolt-orphan:"+id, now) {
 				continue
 			}
-			if !r.consumeAutoFailBudget(id) {
-				r.writeAudit(ctx, id, "budget_exhausted", "stale_cleanup suppressed by rate limit", "boltdb_present_db_missing")
-				continue
-			}
 			rec, getErr := r.mgr.state.Get(id)
 			if getErr != nil || rec == nil {
 				r.clearDrift("bolt-orphan:" + id)
 				continue
 			}
-			log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
-				Msg("BoltDB entry with no DB row — cleaning up")
-			// Stop the unit if it's still live. If the stop fails the VM may
-			// still be running, so leave the entry for next pass — markStale
-			// frees the network slot, which must never happen for a live VM.
+			// Only stopping a live unit is destructive; charge the budget there.
+			// Dropping a stale entry for a dead VM is benign and must not be gated.
 			if rec.Status == StatusRunning {
+				if !r.consumeAutoFailBudget(id) {
+					r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "boltdb_present_db_missing")
+					continue
+				}
+				log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
+					Msg("live orphan systemd unit with no DB row — stopping")
 				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
 					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
 					continue

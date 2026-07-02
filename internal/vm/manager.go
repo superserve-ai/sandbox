@@ -1910,6 +1910,20 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("systemctl stop failed during restore error cleanup")
 	}
 	removeUnitDropIn(vmID)
+
+	// Slot is recycled right after this returns; SIGKILL by PID and wait for
+	// exit so the tap0 fd is released first (stopUnit can time out under load).
+	if inst, err := m.getInstance(vmID); err == nil {
+		inst.mu.RLock()
+		pid := inst.PID
+		inst.mu.RUnlock()
+		if pid > 0 {
+			if proc, err := os.FindProcess(pid); err == nil {
+				_ = proc.Signal(syscall.SIGKILL)
+				waitForPIDExit(pid, 500*time.Millisecond)
+			}
+		}
+	}
 }
 
 // RecordAccessPattern restores the snapshot in recording mode, waits a fixed
