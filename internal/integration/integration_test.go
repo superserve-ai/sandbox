@@ -1068,6 +1068,37 @@ func TestIntegration_ResumeSandbox_QuotaBlocked(t *testing.T) {
 	}
 }
 
+// Quota frees the slot at BeginPause ('pausing' left the counted set), so the
+// documented pause-then-create workflow can't transiently 429 while the
+// fire-and-forget FinalizePause is still in flight. Exercise the window
+// directly: gate write only, no finalize, then create at the cap.
+func TestIntegration_QuotaSlotFreedAtBeginPause(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_sandboxes = 1 WHERE id = $1`, teamID); err != nil {
+		t.Fatalf("set max_sandboxes: %v", err)
+	}
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"gate-a"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create A: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	// The pause gate write alone — FinalizePause deliberately never runs,
+	// simulating the async bookkeeping still in flight (or lost to a crash).
+	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{ID: sandboxID, TeamID: teamID}); err != nil {
+		t.Fatalf("BeginPause: %v", err)
+	}
+
+	cwB := do(r, "POST", "/sandboxes", apiKey, `{"name":"gate-b"}`)
+	if cwB.Code != http.StatusCreated {
+		t.Fatalf("create B while A is 'pausing': %d %s (slot must free at BeginPause)", cwB.Code, cwB.Body.String())
+	}
+}
+
 func TestIntegration_ResumeSandbox_ActiveConflict(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
