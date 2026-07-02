@@ -74,6 +74,12 @@ func run() error {
 	}
 	log.Info().Str("port", cfg.Port).Str("vmd_address", cfg.VMDAddress).Msg("configuration loaded")
 
+	// Fail closed on a malformed SANDBOX_ID_REGION rather than minting
+	// public sandbox IDs the API and proxy would reject.
+	if err := api.ValidateSandboxIDRegion(); err != nil {
+		return err
+	}
+
 	if cfg.SentryDSN != "" {
 		if err := sentry.Init(sentry.ClientOptions{Dsn: cfg.SentryDSN, EnableLogs: true}); err != nil {
 			return fmt.Errorf("sentry init: %w", err)
