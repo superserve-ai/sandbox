@@ -522,6 +522,7 @@ type Team struct {
 	CredentialStoreKind   string    `json:"credential_store_kind"`
 	CredentialStoreConfig []byte    `json:"credential_store_config"`
 	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
+	HomeRegion            string    `json:"home_region"`
 }
 
 type TeamBillingPeriod struct {
