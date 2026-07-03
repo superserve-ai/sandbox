@@ -141,7 +141,9 @@ jobs:
     if: github.event_name == 'push' || github.event.inputs.environment == 'production'
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 45
+    # Two blocking seeder invocations (primary, then the usw cell), each with
+    # the seeder's default 30-min build wait — 90 covers both plus slack.
+    timeout-minutes: 90
     needs: [seed-staging]
     steps:
       - uses: actions/checkout@v4
