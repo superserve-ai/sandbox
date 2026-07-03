@@ -42,21 +42,44 @@ WHERE base_path = $1 AND destroyed_at IS NULL;
 SELECT DISTINCT base_path FROM sandbox
 WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
 
--- name: ListSandboxesByTeam :many
+-- name: ListSandboxesByTeamPaged :many
+-- Paginated, sortable, filterable team sandbox list backing the console.
+--
+-- Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
+-- to match everything), status equality, and a case-insensitive name
+-- substring. Sort column/direction come from @sort_by + @sort_dir: exactly one
+-- guarded CASE term is active per query (the sort params are constant across
+-- rows, so every other term evaluates to NULL for all rows and acts as a
+-- no-op), with created_at DESC as the stable tiebreaker and default. A NULL
+-- @row_limit returns all rows, preserving the pre-pagination "return
+-- everything" default so unpaginated SDK/MCP callers are unaffected.
 SELECT * FROM sandbox
-WHERE team_id = $1 AND destroyed_at IS NULL
-ORDER BY created_at DESC;
-
--- name: ListSandboxesByTeamWithFilter :many
--- Same as ListSandboxesByTeam but additionally filters rows whose metadata
--- contains every key/value pair in $2 (jsonb @> containment). Pass an empty
--- object '{}'::jsonb to match everything — but prefer ListSandboxesByTeam
--- in that case so we don't pay the (still tiny) cost of the @> evaluation.
-SELECT * FROM sandbox
-WHERE team_id = $1
+WHERE team_id = @team_id
   AND destroyed_at IS NULL
-  AND metadata @> $2
-ORDER BY created_at DESC;
+  AND metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'asc'  THEN name END ASC,
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'desc' THEN name END DESC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc'  THEN status::text END ASC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN status::text END DESC,
+  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN created_at END ASC,
+  created_at DESC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
+
+-- name: CountSandboxesByTeamPaged :one
+-- Total rows matching the same filters as ListSandboxesByTeamPaged (ignoring
+-- pagination + sort). Backs the X-Total-Count response header.
+SELECT COUNT(*) FROM sandbox
+WHERE team_id = @team_id
+  AND destroyed_at IS NULL
+  AND metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%');
 
 -- name: UpdateSandboxStatus :exec
 UPDATE sandbox
