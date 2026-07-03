@@ -3,7 +3,9 @@ package vm
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -746,5 +748,52 @@ func TestIsTemplateMemPath(t *testing.T) {
 	}
 	if isOverlayMemFile("/x/mem.diff") != true || isOverlayMemFile("/x/mem.snap") != false {
 		t.Fatal("isOverlayMemFile basename detection wrong")
+	}
+}
+
+// waitForPIDExit is the primitive the restore-error tap0 fix relies on: after
+// SIGKILLing the lingering Firecracker, stopUnitDuringRestoreError must block
+// until the process is actually gone (its tap0 fd released) before the slot is
+// recycled. These pin both directions of that behavior.
+
+func TestWaitForPIDExit_LiveProcessWaitsFullTimeout(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	start := time.Now()
+	waitForPIDExit(pid, 200*time.Millisecond)
+	elapsed := time.Since(start)
+
+	// A live process is never reaped, so the wait must burn ~the full timeout —
+	// this is what forces the cleanup to wait for the tap fd before recycling.
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("returned after %v; expected to wait ~200ms for a live process", elapsed)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Errorf("process should still be alive after the wait: %v", err)
+	}
+}
+
+func TestWaitForPIDExit_DeadProcessReturnsPromptly(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait() // reap so kill(pid,0) sees ESRCH, mirroring systemd reaping the FC
+
+	start := time.Now()
+	waitForPIDExit(pid, 2*time.Second)
+	elapsed := time.Since(start)
+
+	// Once the process is gone the wait must return promptly, not stall the
+	// restore-error cleanup for the whole timeout.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("returned after %v; expected a prompt return once the process exited", elapsed)
 	}
 }
