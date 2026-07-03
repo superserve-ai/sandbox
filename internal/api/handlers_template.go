@@ -629,8 +629,8 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 	// `q` is the console's case-insensitive substring search; `name_prefix` is
 	// the pre-existing prefix filter kept for the SDKs/MCP. Both are optional
 	// and AND together when supplied.
-	nameSearch := optStr(c.Query("q"))
-	namePrefix := optStr(c.Query("name_prefix"))
+	nameSearch := searchTerm(c.Query("q"))
+	namePrefix := nullableStr(c.Query("name_prefix"))
 	systemTeamID := h.systemTeamID()
 
 	ctx := c.Request.Context()
@@ -651,22 +651,19 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 		return
 	}
 
-	// Unpaginated request → the slice is the full set, so len is the total.
-	// A limited page asks the DB for the unpaginated total via the count query.
-	total := int64(len(rows))
-	if pg.Limit != nil {
-		total, err = h.DB.CountTemplatesForTeamPaged(ctx, db.CountTemplatesForTeamPagedParams{
+	total, err := resolveTotal(pg, len(rows), func() (int64, error) {
+		return h.DB.CountTemplatesForTeamPaged(ctx, db.CountTemplatesForTeamPagedParams{
 			Owner:        owner,
 			TeamID:       teamID,
 			SystemTeamID: systemTeamID,
 			NameSearch:   nameSearch,
 			NamePrefix:   namePrefix,
 		})
-		if err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountTemplatesForTeamPaged failed")
-			respondError(c, ErrInternal)
-			return
-		}
+	})
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountTemplatesForTeamPaged failed")
+		respondError(c, ErrInternal)
+		return
 	}
 	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
 

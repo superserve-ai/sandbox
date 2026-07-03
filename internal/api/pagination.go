@@ -70,11 +70,38 @@ func parsePageParams(c *gin.Context, allowedSort []string, defaultSort string) (
 	return p, nil
 }
 
-// optStr maps an empty query value to nil and a non-empty one to a pointer —
-// the shape the generated sqlc params want for optional text filters.
-func optStr(s string) *string {
+// likeEscaper escapes the LIKE/ILIKE pattern metacharacters so a
+// user-supplied search term matches literally inside the '%…%' pattern the
+// queries build around it. Backslash is Postgres's default LIKE escape
+// character, so it must be escaped too (and first, which NewReplacer's
+// single-pass semantics guarantee).
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// searchTerm normalizes a search query value for the sqlc name_search params:
+// empty → nil (filter off), non-empty → pointer to the LIKE-escaped term.
+func searchTerm(s string) *string {
 	if s == "" {
 		return nil
 	}
-	return &s
+	escaped := likeEscaper.Replace(s)
+	return &escaped
+}
+
+// resolveTotal computes the X-Total-Count value for a list response: the
+// number of rows matching the filters, ignoring limit and offset. It avoids
+// the COUNT round trip whenever the returned page already proves the total —
+// a page shorter than the limit (or with no limit at all) ends the list, so
+// total = offset + pageLen. Only a full page, or an empty page at a nonzero
+// offset (which proves nothing about how many rows precede it), needs the DB
+// count.
+func resolveTotal(pg pageParams, pageLen int, count func() (int64, error)) (int64, error) {
+	var offset int64
+	if pg.Offset != nil {
+		offset = *pg.Offset
+	}
+	short := pg.Limit == nil || int64(pageLen) < *pg.Limit
+	if short && (pageLen > 0 || offset == 0) {
+		return offset + int64(pageLen), nil
+	}
+	return count()
 }

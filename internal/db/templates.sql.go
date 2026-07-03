@@ -887,10 +887,13 @@ ORDER BY
   CASE WHEN $6::text = 'name'     AND $7::text = 'desc' THEN name END DESC,
   CASE WHEN $6::text = 'status'   AND $7::text = 'asc'  THEN status::text END ASC,
   CASE WHEN $6::text = 'status'   AND $7::text = 'desc' THEN status::text END DESC,
+  -- size_bytes and built_at are NULL until a build succeeds. DESC defaults to
+  -- NULLS FIRST in Postgres, which would rank never-built templates above the
+  -- most recently built, so pin NULLS LAST (ASC already defaults to it).
   CASE WHEN $6::text = 'size'     AND $7::text = 'asc'  THEN size_bytes END ASC,
-  CASE WHEN $6::text = 'size'     AND $7::text = 'desc' THEN size_bytes END DESC,
+  CASE WHEN $6::text = 'size'     AND $7::text = 'desc' THEN size_bytes END DESC NULLS LAST,
   CASE WHEN $6::text = 'built_at' AND $7::text = 'asc'  THEN built_at END ASC,
-  CASE WHEN $6::text = 'built_at' AND $7::text = 'desc' THEN built_at END DESC,
+  CASE WHEN $6::text = 'built_at' AND $7::text = 'desc' THEN built_at END DESC NULLS LAST,
   CASE WHEN $6::text = 'created_at' AND $7::text = 'asc' THEN created_at END ASC,
   created_at DESC
 LIMIT $9::bigint

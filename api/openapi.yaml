@@ -389,9 +389,11 @@ paths:
         - name: status
           in: query
           required: false
-          description: Filter by exact sandbox status, e.g. `active` or `paused`.
+          description: Filter by exact sandbox status. Unknown values are a `400`.
           schema:
             type: string
+            enum:
+              [starting, active, pausing, paused, resuming, failed, deleted]
         - name: sort
           in: query
           required: false
@@ -1357,6 +1359,8 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/TemplateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":

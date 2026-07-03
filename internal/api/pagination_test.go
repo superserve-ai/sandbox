@@ -78,11 +78,62 @@ func TestParsePageParams_Rejects(t *testing.T) {
 	}
 }
 
-func TestOptStr(t *testing.T) {
-	if optStr("") != nil {
-		t.Error(`optStr("") should be nil`)
+func TestSearchTerm(t *testing.T) {
+	if searchTerm("") != nil {
+		t.Error(`searchTerm("") should be nil`)
 	}
-	if got := optStr("x"); got == nil || *got != "x" {
-		t.Errorf(`optStr("x") = %v, want pointer to "x"`, got)
+	cases := map[string]string{
+		"plain":   "plain",
+		"a_b":     `a\_b`,
+		"50%":     `50\%`,
+		`back\up`: `back\\up`,
+		`%_\`:    `\%\_\\`,
+	}
+	for in, want := range cases {
+		if got := searchTerm(in); got == nil || *got != want {
+			t.Errorf("searchTerm(%q) = %v, want %q", in, got, want)
+		}
+	}
+}
+
+func ptr64(n int64) *int64 { return &n }
+
+func TestResolveTotal(t *testing.T) {
+	countErr := func() (int64, error) {
+		t.Helper()
+		t.Error("count should not be called")
+		return 0, nil
+	}
+	count := func(n int64) func() (int64, error) {
+		return func() (int64, error) { return n, nil }
+	}
+
+	cases := []struct {
+		name  string
+		pg    pageParams
+		len   int
+		count func() (int64, error)
+		want  int64
+	}{
+		{"unpaginated", pageParams{}, 5, countErr, 5},
+		{"unpaginated empty", pageParams{}, 0, countErr, 0},
+		{"offset only", pageParams{Offset: ptr64(4)}, 1, countErr, 5},
+		{"offset only past end", pageParams{Offset: ptr64(10)}, 0, count(5), 5},
+		{"short page", pageParams{Limit: ptr64(10)}, 3, countErr, 3},
+		{"short page with offset", pageParams{Limit: ptr64(10), Offset: ptr64(4)}, 1, countErr, 5},
+		{"full page needs count", pageParams{Limit: ptr64(2)}, 2, count(9), 9},
+		{"empty page at offset needs count", pageParams{Limit: ptr64(2), Offset: ptr64(50)}, 0, count(7), 7},
+		{"empty page at zero offset", pageParams{Limit: ptr64(2)}, 0, countErr, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveTotal(tc.pg, tc.len, tc.count)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("total = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

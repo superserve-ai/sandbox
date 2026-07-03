@@ -108,10 +108,13 @@ ORDER BY
   CASE WHEN @sort_by::text = 'name'     AND @sort_dir::text = 'desc' THEN name END DESC,
   CASE WHEN @sort_by::text = 'status'   AND @sort_dir::text = 'asc'  THEN status::text END ASC,
   CASE WHEN @sort_by::text = 'status'   AND @sort_dir::text = 'desc' THEN status::text END DESC,
+  -- size_bytes and built_at are NULL until a build succeeds. DESC defaults to
+  -- NULLS FIRST in Postgres, which would rank never-built templates above the
+  -- most recently built, so pin NULLS LAST (ASC already defaults to it).
   CASE WHEN @sort_by::text = 'size'     AND @sort_dir::text = 'asc'  THEN size_bytes END ASC,
-  CASE WHEN @sort_by::text = 'size'     AND @sort_dir::text = 'desc' THEN size_bytes END DESC,
+  CASE WHEN @sort_by::text = 'size'     AND @sort_dir::text = 'desc' THEN size_bytes END DESC NULLS LAST,
   CASE WHEN @sort_by::text = 'built_at' AND @sort_dir::text = 'asc'  THEN built_at END ASC,
-  CASE WHEN @sort_by::text = 'built_at' AND @sort_dir::text = 'desc' THEN built_at END DESC,
+  CASE WHEN @sort_by::text = 'built_at' AND @sort_dir::text = 'desc' THEN built_at END DESC NULLS LAST,
   CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN created_at END ASC,
   created_at DESC
 LIMIT sqlc.narg('row_limit')::bigint

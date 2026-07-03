@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1252,6 +1253,21 @@ func decodeMetadata(raw []byte) map[string]string {
 // maps to a guarded ORDER BY term in ListSandboxesByTeamPaged.
 var sandboxSortColumns = []string{"created_at", "name", "status"}
 
+// sandboxStatusFilterValues are the values ListSandboxes accepts for
+// `?status=`, sourced from the sqlc-generated sandbox_status constants. An
+// unknown value would silently match zero rows in the SQL's text comparison,
+// so the handler rejects it with a 400 instead — mirroring the owner filter
+// on /templates.
+var sandboxStatusFilterValues = []string{
+	string(db.SandboxStatusStarting),
+	string(db.SandboxStatusActive),
+	string(db.SandboxStatusPausing),
+	string(db.SandboxStatusPaused),
+	string(db.SandboxStatusResuming),
+	string(db.SandboxStatusFailed),
+	string(db.SandboxStatusDeleted),
+}
+
 func (h *Handlers) ListSandboxes(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
@@ -1292,8 +1308,14 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
-	statusFilter := optStr(c.Query("status"))
-	nameSearch := optStr(c.Query("q"))
+	statusFilter := nullableStr(c.Query("status"))
+	if statusFilter != nil && !slices.Contains(sandboxStatusFilterValues, *statusFilter) {
+		respondErrorMsg(c, "bad_request",
+			"status must be one of: "+strings.Join(sandboxStatusFilterValues, ", "),
+			http.StatusBadRequest)
+		return
+	}
+	nameSearch := searchTerm(c.Query("q"))
 
 	ctx := c.Request.Context()
 	sandboxes, err := h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
@@ -1312,22 +1334,18 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		return
 	}
 
-	// When unpaginated (no limit) the returned slice is the whole result set,
-	// so its length is the total — skip the extra COUNT round trip. Only a
-	// limited page needs the DB to report the unpaginated total.
-	total := int64(len(sandboxes))
-	if pg.Limit != nil {
-		total, err = h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
+	total, err := resolveTotal(pg, len(sandboxes), func() (int64, error) {
+		return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
 			TeamID:     teamID,
 			Metadata:   metadataJSON,
 			Status:     statusFilter,
 			NameSearch: nameSearch,
 		})
-		if err != nil {
-			log.Error().Err(err).Msg("DB CountSandboxesByTeamPaged failed")
-			respondError(c, ErrInternal)
-			return
-		}
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("DB CountSandboxesByTeamPaged failed")
+		respondError(c, ErrInternal)
+		return
 	}
 	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
 
