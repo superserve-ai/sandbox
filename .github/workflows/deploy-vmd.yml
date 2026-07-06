@@ -3,6 +3,8 @@
 # Production NEVER deploys without staging first — same discipline as Deploy API.
 # The deploy-production job reuses the same step body as deploy-staging; env vars
 # like GCP_PROJECT resolve per-environment from GitHub environment vars.
+# The us-west2 cell host deploys as a final production step, after the
+# primary region succeeds — same shape as Deploy API's usw cell steps.
 
 name: Deploy VMD
 
@@ -71,9 +73,13 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      # GCP_REGION scopes label discovery to the primary region so the
+      # usw cell host (same project, same label) isn't folded into this
+      # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy to VMD instances
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
@@ -117,9 +123,36 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      # GCP_REGION keeps this fan-out on the primary region's hosts only;
+      # the usw cell host shares the project and label but deploys in the
+      # step below, after the primary succeeds.
       - name: Discover and deploy to VMD instances
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_SERVICE: ${{ vars.VMD_SERVICE }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python3 .github/workflows/scripts/deploy-vmd.py
+
+      # The usw cell deploys as a step in this job — not a separate job —
+      # for the same reason Deploy API / CD Migrate / Seed Templates do it
+      # this way: a second job referencing the production environment would
+      # double any approval gate. Running after the primary step means a bad
+      # rollout stops at the primary, and the step reuses the binaries built
+      # above (build once, deploy per region). Skipped until
+      # CLOUD_RUN_SERVICE_USW (the repo-level cell-exists flag) is set.
+      # Discovery is the same VMD_LABEL filter scoped to GCP_REGION_USW, so
+      # the cell host must carry the label; zero matches fails the deploy
+      # rather than silently skipping the cell.
+      - name: Deploy to usw cell VMD instances
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
