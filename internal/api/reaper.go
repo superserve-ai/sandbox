@@ -10,6 +10,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // ReaperConfig controls the timeout reaper loop.
@@ -198,6 +199,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Str("team_id", sbx.TeamID.String()).
 		Str("name", sbx.Name).
 		Logger()
+	started := time.Now()
 
 	// ClaimExpiredSandboxes's CTE atomically closed the open active
 	// interval together with the status transition; nothing to do here.
@@ -238,6 +240,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	}
 
 	l.Info().Msg("reaper: sandbox paused due to timeout")
+	RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	// Interval was already closed at the top of pauseExpired; FinalizePause
 	// is the end of the VMD pause work, not the leave-active moment.
 	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
@@ -330,6 +333,7 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 // that point the sandbox is stuck in 'pausing', but the reaper loop is
 // already bounded because future ticks only claim 'active' sandboxes.
 func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, reason string, l zerolog.Logger) {
+	started := time.Now()
 	failCtx, failCancel := context.WithTimeout(ctx, asyncTimeout)
 	defer failCancel()
 	// MarkSandboxFailedInTeam's CTE bundles the active-interval close into
@@ -338,8 +342,10 @@ func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSan
 		ID:     sbx.ID,
 		TeamID: sbx.TeamID,
 	}); err != nil {
+		RecordSandboxTransition(ctx, "fail", telemetry.ResultError, sbx.HostID, time.Since(started))
 		l.Error().Err(err).Str("reason", reason).Msg("reaper: TERMINAL — sandbox stuck in 'pausing', mark-failed also failed, manual recovery required")
 		return
 	}
+	RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	l.Error().Str("reason", reason).Msg("reaper: TERMINAL — sandbox marked 'failed', manual recovery required")
 }

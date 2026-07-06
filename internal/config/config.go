@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -52,6 +54,16 @@ type Config struct {
 	// SecretsSigningKeyID is the kid stamped on minted JWTs and served by
 	// the JWKS endpoint. Defaults to "v1".
 	SecretsSigningKeyID string
+
+	// OTelMetricsEnabled gates app-level operational metrics export. Defaults
+	// false so local/test behavior remains unchanged unless explicitly enabled.
+	OTelMetricsEnabled bool
+	OTelServiceName    string
+	OTelServiceVersion string
+	OTelEnvironment    string
+	OTelEndpoint       string
+	OTelInsecure       bool
+	OTelExportInterval time.Duration
 }
 
 // Load reads configuration from environment variables.
@@ -69,6 +81,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SANDBOX_ACCESS_TOKEN_SEED: %w", err)
 	}
 
+	exportInterval, err := durationEnv("OTEL_EXPORT_INTERVAL", 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Port:                   envOrDefault("API_PORT", "8080"),
 		VMDAddress:             envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
@@ -81,6 +98,13 @@ func Load() (*Config, error) {
 		KMSKeyResource:         os.Getenv("KMS_KEY_RESOURCE"),
 		SecretsSigningKey:      os.Getenv("SECRETS_SIGNING_KEY"),
 		SecretsSigningKeyID:    envOrDefault("SECRETS_SIGNING_KEY_ID", "v1"),
+		OTelMetricsEnabled:     boolEnv("OTEL_METRICS_ENABLED", false),
+		OTelServiceName:        envOrDefault("OTEL_SERVICE_NAME", "sandbox-controlplane"),
+		OTelServiceVersion:     os.Getenv("OTEL_SERVICE_VERSION"),
+		OTelEnvironment:        envOrDefault("OTEL_ENVIRONMENT", "dev"),
+		OTelEndpoint:           envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+		OTelInsecure:           boolEnv("OTEL_EXPORTER_OTLP_INSECURE", false),
+		OTelExportInterval:     exportInterval,
 	}
 	return cfg, nil
 }
@@ -113,4 +137,29 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func boolEnv(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Warn().Err(err).Str("key", key).Str("value", v).Bool("fallback", fallback).Msg("invalid boolean env var")
+		return fallback
+	}
+	return parsed
+}
+
+func durationEnv(key string, fallback time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return parsed, nil
 }
