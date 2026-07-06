@@ -54,9 +54,32 @@ DELETE FROM snapshot
 WHERE id = $1
 `
 
+// Invariant: only delete snapshots of destroyed sandboxes. fk_sandbox_snapshot
+// is ON DELETE SET NULL, so deleting a live/paused sandbox's snapshot silently
+// nulls its restore pointer (unrestorable) instead of erroring.
 func (q *Queries) DeleteSnapshot(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteSnapshot, id)
 	return err
+}
+
+const deleteSnapshotsOfDestroyedSandboxes = `-- name: DeleteSnapshotsOfDestroyedSandboxes :execrows
+DELETE FROM snapshot s
+USING sandbox sb
+WHERE s.sandbox_id = sb.id
+  AND sb.destroyed_at IS NOT NULL
+  AND sb.destroyed_at < now() - interval '1 hour'
+`
+
+// Backstop for destroy teardown that never ran (crash/shutdown before
+// cleanupSandboxSnapshots). Driven from snapshot (joined to sandbox by PK) so
+// it scans only un-cleaned rows, not every accumulating soft-deleted sandbox.
+// Files fall to the vm reconciler's disk scan.
+func (q *Queries) DeleteSnapshotsOfDestroyedSandboxes(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSnapshotsOfDestroyedSandboxes)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getSnapshot = `-- name: GetSnapshot :one

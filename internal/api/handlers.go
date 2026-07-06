@@ -972,20 +972,36 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	// The revocation row is committed with the claim above; fan it out to the
+	h.teardownDestroyedSandbox(c.Request.Context(), sandboxID, sandbox.HostID, sandbox.BasePath, sandbox.TemplateID)
+
+	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
+	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
+	h.capture(c, "sandbox_deleted", map[string]any{"sandbox_id": sandboxID.String()})
+
+	c.Status(http.StatusNoContent)
+}
+
+// teardownDestroyedSandbox reclaims host-side state for a sandbox whose
+// guarded soft-delete has already committed: the VM (with its run dir and
+// netns), pause snapshots, and the per-build artifact dir. Best-effort
+// throughout — the vm reconciler backstops anything missed here. Shared by
+// user-initiated deletes and the auto-delete reaper so the two paths cannot
+// diverge.
+func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.UUID, hostID string, basePath *string, templateID pgtype.UUID) {
+	// The revocation row is committed with the delete claim; fan it out to the
 	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
 	// from the persisted row on restart.
-	go h.fanoutSandboxRevoke(context.Background(), sandboxID, sandbox.HostID)
+	go h.fanoutSandboxRevoke(context.Background(), sandboxID, hostID)
 
 	// Tear down the VM best-effort and unconditionally: a sandbox claimed from a
 	// stale transition or a 'failed' state may still hold a VM, run dir, and netns
 	// that only DestroyInstance reclaims (an absent VM is an idempotent no-op). A
 	// failure here is reconciled by the vm reconciler, so a vmd hiccup must not fail
 	// an already-committed delete.
-	if vmd, lookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID); lookupErr != nil {
+	if vmd, lookupErr := h.vmdForHost(ctx, hostID); lookupErr != nil {
 		log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
 	} else {
-		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+		vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
 		if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
 			log.Warn().Err(derr).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
 		}
@@ -995,31 +1011,26 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// Best-effort cleanup of pause snapshots. Failures are logged but
 	// don't fail the delete — manual cleanup may be required if vmd was
 	// unreachable.
-	h.cleanupSandboxSnapshots(c.Request.Context(), sandboxID, sandbox.HostID)
+	h.cleanupSandboxSnapshots(ctx, sandboxID, hostID)
 
 	// Best-effort GC of the per-build artifact dir if this sandbox was the
 	// last reference and the template has since moved to a newer build.
-	h.gcOldBuildArtifacts(c.Request.Context(), sandbox)
-
-	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
-	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
-	h.capture(c, "sandbox_deleted", map[string]any{"sandbox_id": sandboxID.String()})
-
-	c.Status(http.StatusNoContent)
+	h.gcOldBuildArtifacts(ctx, hostID, basePath, templateID)
 }
 
-// gcOldBuildArtifacts deletes the per-build dir if this sandbox was the
-// last reference and the template has moved on. Best-effort.
-func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, sandbox db.Sandbox) {
-	if sandbox.BasePath == nil || !sandbox.TemplateID.Valid {
+// gcOldBuildArtifacts deletes the per-build dir if the just-destroyed sandbox
+// at sandboxBasePath was the last reference and the template has moved on.
+// Best-effort.
+func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) {
+	if sandboxBasePath == nil || !sandboxTemplateID.Valid {
 		return
 	}
-	basePath := *sandbox.BasePath
+	basePath := *sandboxBasePath
 	buildID := filepath.Base(filepath.Dir(basePath))
 	if buildID == "" || buildID == "." || buildID == string(filepath.Separator) {
 		return
 	}
-	templateID := uuid.UUID(sandbox.TemplateID.Bytes).String()
+	templateID := uuid.UUID(sandboxTemplateID.Bytes).String()
 
 	gcCtx, cancel := context.WithTimeout(reqCtx, 10*time.Second)
 	defer cancel()
@@ -1034,7 +1045,7 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, sandbox db.Sandbo
 	}
 	// Team-blind: sandbox's team may not own the template (system templates),
 	// so GetTemplateForOwner would falsely report "not in use" → over-delete.
-	tplBase, err := h.DB.GetTemplateBasePath(gcCtx, sandbox.TemplateID.Bytes)
+	tplBase, err := h.DB.GetTemplateBasePath(gcCtx, sandboxTemplateID.Bytes)
 	if err != nil {
 		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: GetTemplateBasePath")
 		return
@@ -1043,7 +1054,7 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, sandbox db.Sandbo
 		return
 	}
 
-	vmd, err := h.vmdForHost(gcCtx, sandbox.HostID)
+	vmd, err := h.vmdForHost(gcCtx, hostID)
 	if err != nil {
 		return
 	}
@@ -1111,19 +1122,17 @@ type createSandboxRequest struct {
 	FromTemplate *string               `json:"from_template,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
 
-	// TimeoutSeconds is a hard lifetime cap in seconds, measured from
-	// created_at. When set, the reaper pauses the sandbox that many seconds
-	// after creation if it is still active. Already-paused sandboxes are left
-	// alone. Matches the user intent "stop this sandbox in N seconds so it
-	// cannot burn resources indefinitely."
-	//
-	// The field name includes "_seconds" so the unit is obvious at every
-	// call site without having to read the docs.
-	//
-	// Nil means no cap — the sandbox lives until explicitly paused or
-	// deleted (this is the default philosophy of the platform: sandboxes
-	// don't die on their own).
+	// TimeoutSeconds auto-pauses the sandbox after it has been active this
+	// long. The window tracks the current active session (re-armed on each
+	// resume), not creation time. Nil means no timeout — the sandbox lives
+	// until explicitly paused or deleted. Settable at create and via PATCH.
 	TimeoutSeconds *int32 `json:"timeout_seconds,omitempty"`
+
+	// AutoDeleteSeconds deletes the sandbox once it has been continuously
+	// paused this long. Re-arms on every pause, cancelled by resume; 0 means
+	// delete as soon as it pauses; nil (default) keeps paused sandboxes
+	// forever. Also settable after creation via PATCH /sandboxes/:id.
+	AutoDeleteSeconds *int32 `json:"auto_delete_seconds,omitempty"`
 
 	// Metadata is a flat string→string map of user-supplied tags that get
 	// attached to the sandbox at creation. Updatable after creation via
@@ -1154,18 +1163,23 @@ type createSandboxRequest struct {
 type sandboxResponse struct {
 	// ID is the public sandbox ID: a bare UUID today, sb-<region>-<uuid>
 	// once SANDBOX_ID_REGION is set on the cell (see publicid.go).
-	ID             string                 `json:"id"`
-	Name           string                 `json:"name"`
-	Status         string                 `json:"status"`
-	VcpuCount      int32                  `json:"vcpu_count"`
-	MemoryMib      int32                  `json:"memory_mib"`
-	AccessToken    string                 `json:"access_token,omitempty"`
-	SnapshotID     *uuid.UUID             `json:"snapshot_id,omitempty"`
-	CreatedAt      time.Time              `json:"created_at"`
-	TimeoutSeconds *int32                 `json:"timeout_seconds,omitempty"`
-	Network        *networkConfigRequest  `json:"network,omitempty"`
-	Metadata       map[string]string      `json:"metadata"`
-	Secrets        []sandboxSecretBinding `json:"secrets,omitempty"`
+	ID                string     `json:"id"`
+	Name              string     `json:"name"`
+	Status            string     `json:"status"`
+	VcpuCount         int32      `json:"vcpu_count"`
+	MemoryMib         int32      `json:"memory_mib"`
+	AccessToken       string     `json:"access_token,omitempty"`
+	SnapshotID        *uuid.UUID `json:"snapshot_id,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	TimeoutSeconds    *int32     `json:"timeout_seconds,omitempty"`
+	AutoDeleteSeconds *int32     `json:"auto_delete_seconds,omitempty"`
+	// AutoDeleteAt is the concrete deletion deadline. Present only while the
+	// sandbox is paused with an auto-delete window configured, so clients can
+	// see exactly when the sandbox will be removed.
+	AutoDeleteAt *time.Time             `json:"auto_delete_at,omitempty"`
+	Network      *networkConfigRequest  `json:"network,omitempty"`
+	Metadata     map[string]string      `json:"metadata"`
+	Secrets      []sandboxSecretBinding `json:"secrets,omitempty"`
 }
 
 // sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
@@ -1193,6 +1207,12 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	}
 	if s.TimeoutSeconds != nil {
 		resp.TimeoutSeconds = s.TimeoutSeconds
+	}
+	if s.AutoDeleteSeconds != nil {
+		resp.AutoDeleteSeconds = s.AutoDeleteSeconds
+	}
+	if s.AutoDeleteAt.Valid {
+		resp.AutoDeleteAt = &s.AutoDeleteAt.Time
 	}
 	if len(s.NetworkConfig) > 0 {
 		var stored struct {
@@ -1471,19 +1491,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// timeout_seconds validation — 1 second to 7 days. Must be positive
-	// (zero would mean "destroy immediately" which makes no sense). The
-	// 7-day cap is a safety ceiling so runaway "I set timeout=huge and
-	// forgot" sandboxes cannot live forever, while still supporting
-	// genuinely long-running workloads. Per-team overrides can come later.
-	const maxTimeoutSeconds int32 = 7 * 24 * 3600 // 7 days
-	if req.TimeoutSeconds != nil {
-		if *req.TimeoutSeconds < 1 || *req.TimeoutSeconds > maxTimeoutSeconds {
-			respondErrorMsg(c, "bad_request",
-				fmt.Sprintf("timeout_seconds must be between 1 and %d (7 days)", maxTimeoutSeconds),
-				http.StatusBadRequest)
-			return
-		}
+	if err := validateTimeoutSeconds(req.TimeoutSeconds); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateAutoDeleteSeconds(req.AutoDeleteSeconds); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// Validate network rules up front so we fail before doing any DB or VMD work.
@@ -1648,39 +1662,41 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			// INSERT succeeds) or completes before us (we lose, 0 rows back).
 			// Pin artifact paths so a later rebuild can't shift them.
 			return q.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
-				ID:             sandboxID,
-				TeamID:         teamID,
-				Name:           req.Name,
-				Status:         db.SandboxStatusStarting,
-				VcpuCount:      1, // placeholders; real values land via ActivateSandbox
-				MemoryMib:      1,
-				HostID:         hostID,
-				TimeoutSeconds: req.TimeoutSeconds,
-				Metadata:       metadataJSON,
-				ID_2:           uuid.UUID(templateID.Bytes),
-				TeamID_2:       teamID,
-				TeamID_3:       h.systemTeamID(),
-				SnapshotPath:   nullableStr(snapshotPath),
-				MemPath:        nullableStr(snapshotMemPath),
-				BasePath:       nullableStr(basePath),
-				DeltaPath:      nullableStr(deltaPath),
+				ID:                sandboxID,
+				TeamID:            teamID,
+				Name:              req.Name,
+				Status:            db.SandboxStatusStarting,
+				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
+				MemoryMib:         1,
+				HostID:            hostID,
+				TimeoutSeconds:    req.TimeoutSeconds,
+				AutoDeleteSeconds: req.AutoDeleteSeconds,
+				Metadata:          metadataJSON,
+				ID_2:              uuid.UUID(templateID.Bytes),
+				TeamID_2:          teamID,
+				TeamID_3:          h.systemTeamID(),
+				SnapshotPath:      nullableStr(snapshotPath),
+				MemPath:           nullableStr(snapshotMemPath),
+				BasePath:          nullableStr(basePath),
+				DeltaPath:         nullableStr(deltaPath),
 			})
 		}
 		return q.CreateSandbox(insertCtx, db.CreateSandboxParams{
-			ID:             sandboxID,
-			TeamID:         teamID,
-			Name:           req.Name,
-			Status:         db.SandboxStatusStarting,
-			VcpuCount:      1,
-			MemoryMib:      1,
-			HostID:         hostID,
-			TimeoutSeconds: req.TimeoutSeconds,
-			Metadata:       metadataJSON,
-			TemplateID:     pgtype.UUID{Valid: false},
-			SnapshotPath:   nil,
-			MemPath:        nil,
-			BasePath:       nil,
-			DeltaPath:      nil,
+			ID:                sandboxID,
+			TeamID:            teamID,
+			Name:              req.Name,
+			Status:            db.SandboxStatusStarting,
+			VcpuCount:         1,
+			MemoryMib:         1,
+			HostID:            hostID,
+			TimeoutSeconds:    req.TimeoutSeconds,
+			AutoDeleteSeconds: req.AutoDeleteSeconds,
+			Metadata:          metadataJSON,
+			TemplateID:        pgtype.UUID{Valid: false},
+			SnapshotPath:      nil,
+			MemPath:           nil,
+			BasePath:          nil,
+			DeltaPath:         nil,
 		})
 	}
 	// insertWithBindings writes the sandbox row, and its secret bindings in the
@@ -2238,16 +2254,42 @@ func (h *Handlers) ListSandboxFiles(c *gin.Context) {
 // with 400. This guards against clients sending empty bodies by mistake and
 // silently no-opping.
 //
-// Patchable fields: `network` and `metadata`. Adding more in the future is
-// additive — declare a new pointer field and dispatch on its non-nil-ness.
+// Patchable fields: `network`, `metadata`, and `auto_delete_seconds`. Adding
+// more in the future is additive — declare a new pointer field and dispatch on
+// its non-nil-ness (or optionalInt32 when JSON null must mean "clear", which a
+// plain pointer can't distinguish from "absent").
 type patchSandboxRequest struct {
-	Network  *networkConfigRequest `json:"network,omitempty"`
-	Metadata map[string]string     `json:"metadata,omitempty"`
+	Network           *networkConfigRequest `json:"network,omitempty"`
+	Metadata          map[string]string     `json:"metadata,omitempty"`
+	AutoDeleteSeconds optionalInt32         `json:"auto_delete_seconds,omitempty"`
+	TimeoutSeconds    optionalInt32         `json:"timeout_seconds,omitempty"`
+}
+
+// optionalInt32 is a tri-state JSON field: absent (Set=false), explicit null
+// (Set=true, Value=nil), or a number (Set=true, Value=&n). UnmarshalJSON only
+// runs when the key is present, which is what distinguishes absent from null.
+type optionalInt32 struct {
+	Set   bool
+	Value *int32
+}
+
+func (o *optionalInt32) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(b) == "null" {
+		return nil
+	}
+	return json.Unmarshal(b, &o.Value)
 }
 
 // PatchSandbox applies a partial update to a sandbox.
-// - network: replaces egress rules; sandbox must be active.
-// - metadata: replaces metadata tags; can be patched in any non-deleted state.
+//   - network: replaces egress rules; sandbox must be active.
+//   - metadata: replaces metadata tags; can be patched in any non-deleted state.
+//   - auto_delete_seconds: sets/clears the paused-GC window; any non-deleted
+//     state. On an already-paused sandbox the deadline is armed from now, so
+//     the caller always gets the full window they asked for.
+//   - timeout_seconds: sets/clears the auto-pause timeout; any non-deleted
+//     state. Evaluated against the current active session on the next reaper
+//     tick, so lowering it below elapsed session time pauses promptly.
 func (h *Handlers) PatchSandbox(c *gin.Context) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -2269,9 +2311,22 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	// Reject empty patches.
-	if body.Network == nil && body.Metadata == nil {
-		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata)", http.StatusBadRequest)
+	if body.Network == nil && body.Metadata == nil && !body.AutoDeleteSeconds.Set && !body.TimeoutSeconds.Set {
+		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata, auto_delete_seconds, timeout_seconds)", http.StatusBadRequest)
 		return
+	}
+
+	if body.AutoDeleteSeconds.Set {
+		if err := validateAutoDeleteSeconds(body.AutoDeleteSeconds.Value); err != nil {
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if body.TimeoutSeconds.Set {
+		if err := validateTimeoutSeconds(body.TimeoutSeconds.Value); err != nil {
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	if body.Network != nil {
@@ -2389,7 +2444,79 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "metadata_updated", "success", &sandbox.Name, nil, nil)
 	}
 
+	if body.AutoDeleteSeconds.Set {
+		if !h.applyRowsAffectedPatch(c, sandbox, teamID, "auto_delete_updated", func() (int64, error) {
+			return h.DB.UpdateSandboxAutoDelete(c.Request.Context(), db.UpdateSandboxAutoDeleteParams{
+				ID:                sandboxID,
+				AutoDeleteSeconds: body.AutoDeleteSeconds.Value,
+				TeamID:            teamID,
+			})
+		}) {
+			return
+		}
+	}
+
+	if body.TimeoutSeconds.Set {
+		if !h.applyRowsAffectedPatch(c, sandbox, teamID, "timeout_updated", func() (int64, error) {
+			return h.DB.UpdateSandboxTimeout(c.Request.Context(), db.UpdateSandboxTimeoutParams{
+				ID:             sandboxID,
+				TimeoutSeconds: body.TimeoutSeconds.Value,
+				TeamID:         teamID,
+			})
+		}) {
+			return
+		}
+	}
+
 	c.Status(http.StatusNoContent)
+}
+
+// applyRowsAffectedPatch runs a rows-affected sandbox update and maps the
+// result: 500 on error, 404 on 0 rows (sandbox deleted between the read and the
+// update), activity log on success. Returns false if a response was written.
+func (h *Handlers) applyRowsAffectedPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID, action string, exec func() (int64, error)) bool {
+	rows, err := exec()
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Str("patch", action).Msg("DB sandbox patch failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+	if rows == 0 {
+		respondError(c, ErrSandboxNotFound)
+		return false
+	}
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", action, "success", &sandbox.Name, nil, nil)
+	return true
+}
+
+// maxAutoDeleteSeconds caps the auto-delete window at 30 days — generous for
+// any delayed-cleanup flow while keeping the deadline arithmetic within sane
+// bounds.
+const maxAutoDeleteSeconds int32 = 30 * 24 * 3600
+
+// maxTimeoutSeconds caps the auto-pause timeout at 7 days — a safety ceiling
+// so runaway "I set timeout=huge and forgot" sandboxes cannot stay active
+// forever, while still supporting genuinely long-running workloads.
+const maxTimeoutSeconds int32 = 7 * 24 * 3600
+
+// validateTimeoutSeconds bounds-checks a timeout_seconds value from create or
+// patch. Nil is valid — it means no auto-pause. Zero is rejected: "pause
+// immediately" is not a meaningful timeout.
+func validateTimeoutSeconds(v *int32) error {
+	if v != nil && (*v < 1 || *v > maxTimeoutSeconds) {
+		return fmt.Errorf("timeout_seconds must be between 1 and %d (7 days), or null to disable", maxTimeoutSeconds)
+	}
+	return nil
+}
+
+// validateAutoDeleteSeconds bounds-checks an auto_delete_seconds value from
+// create or patch. Nil is valid — it means auto-delete is disabled. Zero is
+// valid and means "delete as soon as the sandbox pauses".
+func validateAutoDeleteSeconds(v *int32) error {
+	if v != nil && (*v < 0 || *v > maxAutoDeleteSeconds) {
+		return fmt.Errorf("auto_delete_seconds must be between 0 and %d (30 days), or null to disable", maxAutoDeleteSeconds)
+	}
+	return nil
 }
 
 // bindJSONStrict decodes the request body into v and rejects unknown fields.

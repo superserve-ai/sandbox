@@ -533,6 +533,17 @@ paths:
           they survive a future pause/resume cycle.
         - `metadata` — replaces the sandbox's metadata tags. Can be updated
           regardless of sandbox state (active, paused).
+        - `auto_delete_seconds` — sets or clears (`null`) the
+          garbage-collection window for the paused state. Can be updated
+          regardless of sandbox state. When applied to an already-paused
+          sandbox, the deletion deadline counts from the moment of this
+          request — never retroactively from when the sandbox paused — so
+          you always get the full window.
+        - `timeout_seconds` — sets or clears (`null`) the auto-pause
+          timeout. Can be updated regardless of sandbox state; on a paused
+          sandbox it applies to the next active session. The timeout is
+          evaluated against the current active session, so lowering it
+          below already-elapsed time pauses the sandbox promptly.
       security:
         - apiKey: []
       requestBody:
@@ -1785,12 +1796,25 @@ components:
           minimum: 1
           maximum: 604800
           description: >
-            Optional hard lifetime cap in seconds, measured from sandbox
-            creation. When set, the sandbox is destroyed this many seconds
-            after creation regardless of state (active, paused) or
-            activity — the user asked for a hard deadline.
-            When unset, the sandbox lives until explicitly paused or
-            deleted. Maximum 604800 (7 days).
+            Optional auto-pause timeout in seconds. The sandbox is paused
+            once its current active session has run this long; each resume
+            starts a fresh window. When unset, the sandbox stays active
+            until explicitly paused. Also settable later via
+            `PATCH /sandboxes/{sandbox_id}`. Maximum 604800 (7 days).
+        auto_delete_seconds:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 2592000
+          description: >
+            Optional garbage-collection window for paused sandboxes, in
+            seconds. Once the sandbox has been continuously paused for this
+            long it is deleted automatically. The window arms each time the
+            sandbox pauses and is cancelled by resume, so a sandbox in use is
+            never eligible. `0` deletes the sandbox as soon as it pauses.
+            When unset, paused sandboxes are kept until explicitly deleted.
+            Also settable later via `PATCH /sandboxes/{sandbox_id}`.
+            Maximum 2592000 (30 days).
         metadata:
           type: object
           additionalProperties:
@@ -1876,8 +1900,22 @@ components:
           type: integer
           format: int32
           description: >
-            Hard lifetime cap in seconds from creation, if set at creation
-            time. Absent when no cap was configured.
+            Auto-pause timeout in seconds, if configured. Absent when
+            auto-pause is disabled.
+        auto_delete_seconds:
+          type: integer
+          format: int32
+          description: >
+            Garbage-collection window for the paused state, if configured.
+            Absent when auto-delete is disabled.
+        auto_delete_at:
+          type: string
+          format: date-time
+          description: >
+            When the sandbox will be deleted. Present only while the sandbox
+            is paused with `auto_delete_seconds` configured. The deadline is
+            armed when the sandbox pauses (or when the setting is applied to
+            an already-paused sandbox) and cleared on resume.
         network:
           $ref: "#/components/schemas/NetworkConfig"
           description: >
@@ -2092,6 +2130,30 @@ components:
             metadata — omitted keys are removed. Can be patched regardless of
             sandbox state. Same validation limits as on create (64 keys,
             256-byte keys, 2 KB values, 16 KB total).
+        auto_delete_seconds:
+          type: integer
+          format: int32
+          nullable: true
+          minimum: 0
+          maximum: 2592000
+          description: |
+            Set or clear the garbage-collection window for the paused state.
+            Once the sandbox has been continuously paused for this many
+            seconds it is deleted automatically. `0` deletes as soon as the
+            sandbox pauses; `null` disables auto-delete. On an already-paused
+            sandbox the deadline counts from this request, so the sandbox
+            gets the full window. Maximum 2592000 (30 days).
+        timeout_seconds:
+          type: integer
+          format: int32
+          nullable: true
+          minimum: 1
+          maximum: 604800
+          description: |
+            Set or clear the auto-pause timeout. Same semantics as on
+            create; `null` disables auto-pause. Evaluated against the
+            current active session, so lowering it below already-elapsed
+            time pauses the sandbox promptly. Maximum 604800 (7 days).
       example:
         metadata:
           env: prod
