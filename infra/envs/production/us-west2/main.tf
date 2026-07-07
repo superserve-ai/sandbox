@@ -79,6 +79,22 @@ data "google_service_account" "api_runner" {
   account_id = "superserve-api-runner"
 }
 
+data "google_service_account" "github_actions" {
+  project    = local.project_id
+  account_id = "superserve-github-actions"
+}
+
+# deploy-proxy.yml fetches this secret directly via `gcloud secrets versions
+# access` at deploy time for the usw cell step, instead of through a Cloud
+# Run secret binding — so the CI service account needs read access here too,
+# not just the Cloud Run runtime SA.
+resource "google_secret_manager_secret_iam_member" "github_actions_sandbox_access_token_seed" {
+  project   = local.project_id
+  secret_id = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${data.google_service_account.github_actions.email}"
+}
+
 module "api" {
   source = "../../../modules/api"
 
