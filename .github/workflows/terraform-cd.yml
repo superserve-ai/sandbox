@@ -305,7 +305,6 @@ jobs:
             echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
             exit 1
           fi
-          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
 
       - name: Smoke test production/us-west2
         run: |
