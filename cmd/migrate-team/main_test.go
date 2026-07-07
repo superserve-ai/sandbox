@@ -533,6 +533,15 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("refuses when source and dest are the same database", func(t *testing.T) {
+		cfg := f.cfg(phaseCopy)
+		cfg.destURL = cfg.sourceURL
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), "same database") {
+			t.Fatalf("same-DB DSNs must refuse every dest-touching phase, got: %v", err)
+		}
+	})
+
 	t.Run("copy refuses a failed sandbox", func(t *testing.T) {
 		failedID := uuid.New()
 		mustExec(t, srcPool, `

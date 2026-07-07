@@ -37,6 +37,21 @@ type config struct {
 	pathsOut        string
 }
 
+// dbIdentity fingerprints the database a pool is connected to: postmaster
+// start time (microsecond-unique per running instance), server address and
+// port as seen past any pooler, and the database name. Two DSN spellings of
+// one database — e.g. the transaction pooler and the direct host — collapse
+// to the same identity; distinct clusters practically never collide.
+func dbIdentity(ctx context.Context, pool *pgxpool.Pool) (string, error) {
+	var id string
+	err := pool.QueryRow(ctx, `
+		SELECT pg_postmaster_start_time()::text
+		       || '|' || coalesce(inet_server_addr()::text, 'local')
+		       || '|' || coalesce(inet_server_port()::text, '0')
+		       || '|' || current_database()`).Scan(&id)
+	return id, err
+}
+
 func run(ctx context.Context, cfg config) error {
 	src, err := pgxpool.New(ctx, cfg.sourceURL)
 	if err != nil {
@@ -51,6 +66,24 @@ func run(ctx context.Context, cfg config) error {
 			return fmt.Errorf("connect to dest: %w", err)
 		}
 		defer dst.Close()
+
+		// Fail fast if both DSNs land on the same database — string
+		// comparison can't catch pooler-vs-direct spellings of one DB, so
+		// compare live identity instead. With source == dest every later
+		// safeguard becomes a self-comparison: copy no-ops, validate
+		// passes against itself, and decommission would delete the only
+		// copy of the team.
+		srcID, err := dbIdentity(ctx, src)
+		if err != nil {
+			return fmt.Errorf("identify source database: %w", err)
+		}
+		dstID, err := dbIdentity(ctx, dst)
+		if err != nil {
+			return fmt.Errorf("identify dest database: %w", err)
+		}
+		if srcID == dstID {
+			return fmt.Errorf("--source-db and --dest-db resolve to the same database; refusing every dest-touching phase")
+		}
 	}
 
 	var teamName string
