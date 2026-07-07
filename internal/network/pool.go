@@ -47,8 +47,10 @@ type preallocSlot struct {
 	vethName string
 }
 
-// StartPool creates and starts the network slot pool. Blocks until the
-// initial batch of fresh slots is filled, then refills in the background.
+// StartPool creates the network slot pool and fills it in the background, so
+// startup (and the gRPC readiness gate) doesn't block on ~newSize slot setups;
+// SetupVM falls back to on-demand setup until it warms. m.pool is set before the
+// gate opens, and the fill only touches the pool's concurrency-safe channels.
 func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	newSize := cfg.NewSize
 	if newSize <= 0 {
@@ -67,25 +69,12 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		recycled: make(chan *preallocSlot, recycleSize),
 		stopCh:   make(chan struct{}),
 	}
+	m.pool = p
 
-	// Fill initial batch synchronously so the pool is warm on first create.
-	// Transient slot failures don't abort — the refill loop catches up.
-	filled := 0
-	for i := 0; i < newSize; i++ {
-		slot, err := p.allocate(ctx)
-		if err != nil {
-			p.log.Warn().Err(err).Int("attempt", i+1).Msg("initial pool slot failed; continuing")
-			continue
-		}
-		p.fresh <- slot
-		filled++
-	}
-	p.log.Info().Int("fresh", filled).Int("target", newSize).Int("recycle_cap", recycleSize).Msg("network pool ready")
-
+	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).Msg("network pool starting (filling in background)")
 	p.wg.Add(1)
 	go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
 
-	m.pool = p
 	return p
 }
 

@@ -1644,6 +1644,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// relinquished, so a resumable VM is unaffected.
 	if rec.Status != StatusPaused && m.netMgr.IsRelinquished(rec.Namespace) {
 		log.Warn().Str("namespace", rec.Namespace).Msg("refusing reattach — slot relinquished at startup (stale record)")
+		// Clean the residue (veth/slot the pool hasn't reused) and drop the record
+		// here, so a DELETE that beats the background pass doesn't reach DestroyVM
+		// with no namespace and leak it. Cleanup skips teardown if ns-N was reused.
+		m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
+		m.state.Delete(rec.ID)
 		return nil, false
 	}
 

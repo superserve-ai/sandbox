@@ -479,8 +479,9 @@ func main() {
 	mgr.SweepStartupOrphanNamespaces()
 
 	// ---- Pre-allocate network slots ----
-	// Keeps a buffer of ready-to-use network namespaces so sandbox creation
-	// claims one off the hot path instead of building it inline.
+	// Warm buffer of network namespaces so creation claims off the hot path.
+	// StartPool returns immediately and fills in the background, so the gate
+	// below isn't held for the fill; creates fall back to on-demand until warm.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "128"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
 		NewSize: netPoolFresh,
@@ -598,9 +599,9 @@ func main() {
 		return nil
 	})
 
-	// Fast pre-serve init is done (slots reserved, namespaces swept, pool primed).
-	// Open the gate; the full reattach continues in the background and requests
-	// load any not-yet-reattached VM on demand.
+	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
+	// backgrounded). Open the gate; pool warm-up and full reattach continue in
+	// the background, and requests load any not-yet-reattached VM on demand.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
 
