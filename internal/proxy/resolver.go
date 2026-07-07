@@ -48,6 +48,14 @@ const (
 	defaultCacheTTL  = 500 * time.Millisecond // VMD is on localhost, latency is negligible
 	negativeCacheTTL = 1 * time.Second        // cache "not found" slightly longer to absorb spam
 	maxCacheSize     = 10_000                  // cap against random instance ID amplification
+
+	// vmdRequestTimeout bounds a single resolve call. A steady-state lookup is a
+	// localhost map read (sub-ms), but a miss right after a VMD restart triggers
+	// an on-demand reattach (netlink/nftables setup that takes no client ctx and
+	// can run into the low seconds under host load). Keep this above VMD's own
+	// 5s per-VM reattach bound so a would-succeed reattach isn't cut short into a
+	// data-plane timeout; singleflight + the negative cache bound amplification.
+	vmdRequestTimeout = 6 * time.Second
 )
 
 type cacheEntry struct {
@@ -78,7 +86,7 @@ func NewVMDResolver(vmdAddr string) *VMDResolver {
 	return &VMDResolver{
 		vmdAddr: vmdAddr,
 		ttl:     defaultCacheTTL,
-		client:  &http.Client{Timeout: 2 * time.Second},
+		client:  &http.Client{Timeout: vmdRequestTimeout},
 		cache:   make(map[string]cacheEntry),
 	}
 }
