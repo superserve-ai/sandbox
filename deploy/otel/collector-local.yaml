@@ -1,0 +1,47 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        # Docker local debug binds to all container interfaces so host port
+        # publishing can reach the receiver. For a host-installed collector,
+        # prefer 127.0.0.1:4318 so OTLP is not exposed as network ingress.
+        endpoint: 0.0.0.0:4318
+      grpc:
+        # Docker local debug binds to all container interfaces so host port
+        # publishing can reach the receiver. For a host-installed collector,
+        # prefer 127.0.0.1:4317 so OTLP is not exposed as network ingress.
+        endpoint: 0.0.0.0:4317
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  attributes/drop_internal_high_cardinality:
+    actions:
+      - key: sandbox_id
+        action: delete
+      - key: team_id
+        action: delete
+      - key: user_id
+        action: delete
+      - key: api_key_id
+        action: delete
+      - key: request_id
+        action: delete
+      - key: url
+        action: delete
+      - key: error
+        action: delete
+  batch:
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/drop_internal_high_cardinality, batch]
+      exporters: [debug]
