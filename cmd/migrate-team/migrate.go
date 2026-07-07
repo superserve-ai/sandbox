@@ -110,8 +110,43 @@ func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
 	for _, b := range builds {
 		log.Warn().Str("build", b).Msg("plan: BLOCKER — template build in flight; copy will refuse")
 	}
+	liveKeys, err := unrevokedKeys(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	for _, k := range liveKeys {
+		log.Warn().Str("api_key", k).Msg("plan: BLOCKER — key not revoked; copy will refuse (freeze rotates keys)")
+	}
 
 	return reportArtifactDirs(ctx, src, cfg)
+}
+
+// unrevokedKeys returns the team's live API keys ("<id> (<name>)"). The
+// freeze must revoke every key before copy: key strings carry a plaintext
+// region prefix that hashes can't rewrite, so an un-revoked ss_live_use_
+// key would keep routing clients at the old cell after cutover — and its
+// hash, copied here, would silently authenticate against the new cell if
+// pointed there by hand. Revoked rows copy as history; live ones block.
+func unrevokedKeys(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, name FROM api_key
+		WHERE team_id = $1 AND revoked_at IS NULL
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list unrevoked keys: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s (%s)", id, name))
+	}
+	return out, rows.Err()
 }
 
 // activeBuilds returns in-flight template builds ("<id> status=<status>")
@@ -263,6 +298,14 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		return fmt.Errorf("refusing to copy: %d template build(s) in flight (wait or cancel):\n  %s",
 			len(builds), strings.Join(builds, "\n  "))
 	}
+	liveKeys, err := unrevokedKeys(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(liveKeys) > 0 {
+		return fmt.Errorf("refusing to copy: %d API key(s) not revoked (freeze step — the region prefix in the key string cannot follow the team):\n  %s",
+			len(liveKeys), strings.Join(liveKeys, "\n  "))
+	}
 
 	// The dest host must exist and live in the dest region before any
 	// sandbox row points at it.
@@ -303,6 +346,7 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		log.Info().Str("table", s.name).Str("reason", s.reason).Msg("copy: NOT copied")
 	}
 	log.Info().Int64("copied", totalCopied).Int64("skipped_existing", totalSkipped).Msg("copy: done")
+	log.Info().Msg("note: sandbox UUIDs are preserved but public IDs re-mint with the dest region prefix on next fetch — clients holding pre-migration sb-<region>- IDs or preview URLs must re-resolve after cutover")
 	return nil
 }
 

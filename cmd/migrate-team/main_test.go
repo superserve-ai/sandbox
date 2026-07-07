@@ -225,8 +225,10 @@ func seedFixture(t *testing.T) *fixture {
 		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id, granted_by)
 		SELECT $2, r.id, 'team', $1, $3 FROM roles r WHERE r.name = 'viewer'`, f.team, f.member, f.owner)
 
-	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, created_by) VALUES ($1, 'hash-'||$2::text, 'ci', $3)`, f.team, uuid.New(), f.owner)
-	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name) VALUES ($1, 'hash-'||$2::text, 'agent')`, f.team, uuid.New())
+	// Keys are revoked: the fixture models post-freeze state (the freeze
+	// rotates keys before copy; live keys block).
+	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, created_by, revoked_at) VALUES ($1, 'hash-'||$2::text, 'ci', $3, now())`, f.team, uuid.New(), f.owner)
+	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, revoked_at) VALUES ($1, 'hash-'||$2::text, 'agent', now())`, f.team, uuid.New())
 
 	mustExec(t, srcPool, `
 		INSERT INTO secret (id, team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id)
@@ -517,6 +519,17 @@ func TestTeamMigration(t *testing.T) {
 		err := run(ctx, f.cfg(phaseCopy))
 		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
 			t.Fatalf("in-flight build must block the copy, got: %v", err)
+		}
+	})
+
+	t.Run("copy refuses unrevoked API keys", func(t *testing.T) {
+		liveKey := uuid.New()
+		mustExec(t, srcPool, `INSERT INTO api_key (id, team_id, key_hash, name) VALUES ($1, $2, 'hash-live', 'still-live')`, liveKey, f.team)
+		defer mustExec(t, srcPool, `DELETE FROM api_key WHERE id = $1`, liveKey)
+
+		err := run(ctx, f.cfg(phaseCopy))
+		if err == nil || !strings.Contains(err.Error(), liveKey.String()) {
+			t.Fatalf("live key must block the copy (freeze rotates keys), got: %v", err)
 		}
 	})
 
