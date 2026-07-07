@@ -513,6 +513,19 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 		Msg("reclaimed network slot for untracked VM")
 }
 
+// Forget drops vmID from the in-memory device map without any kernel teardown,
+// slot reclamation, or egress change. It reverses a reattach that raced a
+// concurrent DestroyVM/markStale: that path already tore down (or recycled to
+// the pool) the slot, so tearing it down again here would double-free it or
+// clobber the new owner of a recycled ns/veth. The host IP is left registered
+// in the egress proxy — it is keyed by slot, so a reused slot's new owner may
+// already hold it.
+func (m *Manager) Forget(vmID string) {
+	m.mu.Lock()
+	delete(m.devices, vmID)
+	m.mu.Unlock()
+}
+
 // ReattachVM rebinds vmd's view of an already-running VM's network state
 // at startup. After this call: the slot is marked in-use (no SetupVM
 // collisions), devices[vmID] is populated (CleanupVM can tear it down),

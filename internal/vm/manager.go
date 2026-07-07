@@ -1624,7 +1624,14 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 		if rec.SocketPath != "" {
 			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
-				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — cleaning up")
+				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — stopping and cleaning up")
+				// The unit is still active, so stop Firecracker before we forget
+				// the record and tear down its netns — otherwise it keeps running
+				// as an orphan burning CPU/RAM and holding TAP fds in a namespace
+				// we're about to delete out from under it.
+				if err := stopUnit(ctx, systemdUnitName(rec.ID)); err != nil {
+					log.Warn().Err(err).Msg("systemctl stop failed for socket-missing VM")
+				}
 				m.state.Delete(rec.ID)
 				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 				return nil, false
@@ -1654,13 +1661,13 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// undo the in-memory reattach.
 	if rec.Status == StatusPaused {
 		if m.recordDeleted(rec.ID) {
-			m.undoReattach(rec.ID, inst.Namespace)
+			m.undoReattach(rec.ID)
 			return nil, false
 		}
 		log.Info().Msg("reattached paused VM")
 	} else {
 		if !m.persistStateIfPresent(inst) {
-			m.undoReattach(rec.ID, inst.Namespace)
+			m.undoReattach(rec.ID)
 			return nil, false
 		}
 		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
@@ -1976,14 +1983,15 @@ func (m *Manager) recordDeleted(vmID string) bool {
 }
 
 // undoReattach reverses an in-memory reattach when the record turns out to have
-// been deleted concurrently: drop it from the map and release its network slot.
-func (m *Manager) undoReattach(vmID, namespace string) {
+// been deleted concurrently. It only forgets the in-memory entries: whoever
+// deleted the record (DestroyVM or the reconciler's markStale) already tore down
+// or recycled the slot, so a second physical teardown here would double-free it
+// or clobber the new owner of a recycled ns/veth.
+func (m *Manager) undoReattach(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
 	m.mu.Unlock()
-	if namespace != "" {
-		m.netMgr.CleanupVMOrNamespace(vmID, namespace)
-	}
+	m.netMgr.Forget(vmID)
 }
 
 // deleteState removes a VM record from BoltDB.
