@@ -134,7 +134,8 @@ jobs:
       # rather than silently skipping the cell.
       #
       # The deploy rewrites /etc/sandbox/proxy.env on the host, so the cell
-      # MUST NOT reuse the prod values: its domain differs per SS-143
+      # MUST NOT reuse the prod values: its domain differs per the
+      # regional hostname scheme
       # (PROXY_DOMAIN_USW = usw-sandbox.superserve.ai) and its token seed
       # lives in Secret Manager (`sandbox-access-token-seed`), which is what
       # the cell control plane signs with — writing the primary's seed here
