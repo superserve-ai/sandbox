@@ -34,9 +34,9 @@ func DefaultReaperConfig() ReaperConfig {
 }
 
 // StartTimeoutReaper launches a background goroutine that periodically
-// pauses active sandboxes whose `timeout_seconds` hard cap has elapsed since
-// their creation. The hard cap is measured from `created_at`. Already-paused
-// sandboxes are left alone — they are already stopped.
+// pauses active sandboxes whose `timeout_seconds` has elapsed. The window
+// tracks the current active session (re-armed on each resume), not total
+// lifetime. Already-paused sandboxes are left alone — they are already stopped.
 //
 // The reaper exits cleanly when ctx is cancelled. Call once at control
 // plane startup with the process-lifetime context.
@@ -75,6 +75,10 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
 		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
+		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
+		// Auto-delete runs after the DB-only sweeps (interval/revocation/
+		// snapshot) so a slow host during its batch teardown can't delay them.
+		sentrylog.RunSafe("auto-delete", func() { h.reapAutoDeleteOnce(ctx, cfg.BatchSize, parallelism) })
 	}
 
 	// Run once immediately so a control plane restart does not delay
@@ -131,6 +135,29 @@ func (h *Handlers) cleanupExpiredRevocations(ctx context.Context) {
 	}
 }
 
+// dispatchBounded runs fn for each item with at most `parallelism` concurrent
+// goroutines, stopping dispatch early on ctx cancellation and waiting for all
+// started goroutines before returning.
+func dispatchBounded[T any](ctx context.Context, items []T, parallelism int, fn func(T)) {
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+dispatch:
+	for _, item := range items {
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(item T) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn(item)
+		}(item)
+	}
+	wg.Wait()
+}
+
 func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int) {
 	// Atomically claim expired active sandboxes and mark them 'pausing' in one
 	// CTE+UPDATE. FOR UPDATE SKIP LOCKED inside the query ensures that
@@ -151,28 +178,79 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 
 	log.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
 
-	sem := make(chan struct{}, parallelism)
-	var wg sync.WaitGroup
+	dispatchBounded(ctx, expired, parallelism, func(sbx db.ClaimExpiredSandboxesRow) {
+		h.pauseExpired(ctx, sbx)
+	})
+}
 
-dispatch:
-	for _, sbx := range expired {
-		// Labeled break: a plain break inside the select exits only the
-		// select, not the for loop.
-		select {
-		case <-ctx.Done():
-			break dispatch
-		case sem <- struct{}{}:
-		}
+// sweepOrphanedSnapshotRows deletes snapshot rows for long-destroyed
+// sandboxes — the backstop for destroy teardown that never ran (crash or
+// shutdown between the soft-delete claim and cleanupSandboxSnapshots).
+// Row deletion also unblocks the vm reconciler's disk scan, which reclaims
+// the now-orphaned files.
+func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context) {
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	n, err := h.DB.DeleteSnapshotsOfDestroyedSandboxes(qctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("reaper: DeleteSnapshotsOfDestroyedSandboxes failed")
+		return
+	}
+	if n > 0 {
+		log.Warn().Int64("deleted", n).Msg("reaper: removed snapshot rows orphaned by unfinished destroy teardown")
+	}
+}
 
-		wg.Add(1)
-		go func(sbx db.ClaimExpiredSandboxesRow) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			h.pauseExpired(ctx, sbx)
-		}(sbx)
+// reapAutoDeleteOnce deletes paused sandboxes whose auto-delete deadline has
+// passed. ClaimAutoDeleteSandboxes soft-deletes the rows (revocation written,
+// intervals closed) in one guarded statement, so everything after the claim is
+// best-effort teardown of VM state and artifacts — same contract as the
+// user-initiated DeleteSandbox, where the vm reconciler backstops any teardown
+// step that fails.
+func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, parallelism int) {
+	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
+	due, err := h.DB.ClaimAutoDeleteSandboxes(queryCtx, db.ClaimAutoDeleteSandboxesParams{
+		BatchSize:           batchSize,
+		RevocationExpiresAt: time.Now().Add(SecretsJWTLifetime),
+	})
+	queryCancel()
+	if err != nil {
+		log.Error().Err(err).Msg("reaper: ClaimAutoDeleteSandboxes failed")
+		return
 	}
 
-	wg.Wait()
+	if len(due) == 0 {
+		return
+	}
+
+	log.Info().Int("count", len(due)).Msg("reaper: deleting expired paused sandboxes")
+
+	dispatchBounded(ctx, due, parallelism, func(sbx db.ClaimAutoDeleteSandboxesRow) {
+		h.teardownAutoDeleted(ctx, sbx)
+	})
+}
+
+// autoDeleteTeardownTimeout bounds one sandbox's teardown in the reaper.
+// The VMD calls inside carry their own timeouts, but the snapshot DB calls
+// do not — without this umbrella a hung query would pin a dispatch slot and
+// wedge the reaper loop on wg.Wait.
+const autoDeleteTeardownTimeout = 2 * time.Minute
+
+// teardownAutoDeleted reclaims VM state for one sandbox already soft-deleted
+// by ClaimAutoDeleteSandboxes, via the same teardown path as DeleteSandbox.
+func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDeleteSandboxesRow) {
+	l := log.With().
+		Str("sandbox_id", sbx.ID.String()).
+		Str("team_id", sbx.TeamID.String()).
+		Str("name", sbx.Name).
+		Logger()
+
+	tctx, cancel := context.WithTimeout(ctx, autoDeleteTeardownTimeout)
+	defer cancel()
+	h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, sbx.BasePath, sbx.TemplateID)
+
+	l.Info().Msg("reaper: sandbox auto-deleted after paused window elapsed")
+	h.logSandboxActivity(tctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)
 }
 
 // pauseExpired pauses one sandbox that was atomically claimed by

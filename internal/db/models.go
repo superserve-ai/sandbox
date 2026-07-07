@@ -423,16 +423,18 @@ type Sandbox struct {
 	UpdatedAt     time.Time          `json:"updated_at"`
 	DestroyedAt   pgtype.Timestamptz `json:"destroyed_at"`
 	NetworkConfig []byte             `json:"network_config"`
-	// Hard lifetime cap in seconds from created_at. NULL = no cap. The reaper destroys the sandbox when now() > created_at + (timeout_seconds || ' seconds')::interval, regardless of state (active, paused, idle).
+	// Auto-pause timeout in seconds, evaluated against the current active session (re-armed on each resume). NULL = no timeout. Settable at create and via PATCH. The reaper pauses the sandbox on expiry; it does not delete it.
 	TimeoutSeconds *int32 `json:"timeout_seconds"`
 	// User-supplied flat string→string tags attached at creation. Immutable. Filterable on list endpoints via jsonb @> containment. Always non-null; an absent value is the empty object {}, never NULL.
-	Metadata     []byte      `json:"metadata"`
-	TemplateID   pgtype.UUID `json:"template_id"`
-	SnapshotPath *string     `json:"snapshot_path"`
-	MemPath      *string     `json:"mem_path"`
-	BasePath     *string     `json:"base_path"`
-	DeltaPath    *string     `json:"delta_path"`
-	DiskMib      int32       `json:"disk_mib"`
+	Metadata          []byte             `json:"metadata"`
+	TemplateID        pgtype.UUID        `json:"template_id"`
+	SnapshotPath      *string            `json:"snapshot_path"`
+	MemPath           *string            `json:"mem_path"`
+	BasePath          *string            `json:"base_path"`
+	DeltaPath         *string            `json:"delta_path"`
+	DiskMib           int32              `json:"disk_mib"`
+	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 }
 
 type SandboxActiveInterval struct {

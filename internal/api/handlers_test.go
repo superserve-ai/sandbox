@@ -159,10 +159,8 @@ func (emptyRows) RawValues() [][]byte                          { return nil }
 func (emptyRows) Conn() *pgx.Conn                              { return nil }
 
 // sandboxRow returns a mockRow that populates a Sandbox from GetSandbox's Scan
-// call (16 destination pointers matching the column order in sqlc-generated
-// queries: ID, TeamID, Name, Status, VcpuCount, MemoryMib, HostID, IpAddress,
-// Pid, SnapshotID, CreatedAt, UpdatedAt, DestroyedAt, NetworkConfig,
-// TimeoutSeconds, Metadata).
+// call, with destination pointers matching the sandbox column order in
+// sqlc-generated queries (see db.Sandbox field order in internal/db/models.go).
 func sandboxRow(s db.Sandbox) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = s.ID
@@ -181,6 +179,14 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[13].(*[]byte) = s.NetworkConfig
 		*dest[14].(**int32) = s.TimeoutSeconds
 		*dest[15].(*[]byte) = s.Metadata
+		*dest[16].(*pgtype.UUID) = s.TemplateID
+		*dest[17].(**string) = s.SnapshotPath
+		*dest[18].(**string) = s.MemPath
+		*dest[19].(**string) = s.BasePath
+		*dest[20].(**string) = s.DeltaPath
+		*dest[21].(*int32) = s.DiskMib
+		*dest[22].(**int32) = s.AutoDeleteSeconds
+		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
 		return nil
 	}}
 }
@@ -1132,11 +1138,11 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
 			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -1209,11 +1215,11 @@ func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
 			case strings.Contains(sql, "INSERT INTO snapshot"): // FinalizePause
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):

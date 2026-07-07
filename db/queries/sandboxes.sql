@@ -6,8 +6,8 @@
 -- template_id is optional (NULL when sandbox is not derived from a template).
 -- snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
 -- specific build's artifacts so a later template rebuild can't corrupt it.
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 RETURNING *;
 
 -- name: CreateSandboxFromTemplate :one
@@ -22,8 +22,8 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib FROM tpl
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
 RETURNING *;
 
 -- name: GetSandbox :one
@@ -134,11 +134,6 @@ FROM activated a
 WHERE feature_enabled('billing_metrics_write', a.team_id)
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
--- name: SetSandboxSnapshot :exec
-UPDATE sandbox
-SET snapshot_id = $2, updated_at = now()
-WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
-
 -- name: DestroySandbox :one
 -- Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
 -- (active/paused/failed) or from a transitional state (starting/resuming/pausing)
@@ -150,6 +145,9 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 -- so a crash after the claim can't strand a deleted sandbox with a live JWT or an
 -- open interval. Returns the claimed id; 0 rows means already-deleted or a still-live
 -- transition — the caller distinguishes the two with a re-read.
+--
+-- The revocation + interval-close CTEs are mirrored in ClaimAutoDeleteSandboxes;
+-- keep the side effects of both in sync.
 WITH destroyed AS (
   UPDATE sandbox
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
@@ -219,7 +217,10 @@ WHERE host_id = sqlc.arg(host_id)
 -- interval open and have analytics count the actor as active forever.
 WITH failed AS (
   UPDATE sandbox
-  SET status = 'failed', updated_at = now()
+  -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
+  -- and a stale one would resurface (or instantly fire) if the sandbox is
+  -- ever returned to 'paused' by a recovery path.
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
   RETURNING id
 ),
@@ -241,7 +242,7 @@ WHERE sandbox_id IN (SELECT id FROM failed)
 -- bundling of the active-interval close.
 WITH failed AS (
   UPDATE sandbox
-  SET status = 'failed', updated_at = now()
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   RETURNING id
 ),
@@ -301,7 +302,7 @@ LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id;
 -- already claimed the sandbox, or it's not in paused state. Used to
 -- serialize concurrent /exec and /resume requests.
 UPDATE sandbox
-SET status = 'resuming', updated_at = now()
+SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
 RETURNING *;
 
@@ -310,17 +311,26 @@ RETURNING *;
 -- Guarded on status = 'resuming' so we never clobber a concurrent transition
 -- (e.g., ActivateSandbox has already flipped to 'active').
 UPDATE sandbox
-SET status = 'paused', updated_at = now()
+SET status = 'paused',
+    -- Re-arm the auto-delete deadline cleared by BeginResume; the sandbox is
+    -- paused again, so it gets a fresh window.
+    auto_delete_at = now() + make_interval(secs => auto_delete_seconds),
+    updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 
 -- name: FinalizePause :one
 -- Upsert the sandbox's live snapshot row and flip status to 'paused'.
--- Returns 0 rows if the sandbox is missing or soft-deleted (→ ErrSandboxGone).
+-- Returns 0 rows if the sandbox is missing, soft-deleted, or no longer in a
+-- pause-eligible transition (→ ErrSandboxGone). The status guard keeps a
+-- stale or duplicate finalize from clobbering a terminal state — without it,
+-- a late-landing write could flip a 'failed' sandbox back to 'paused' and
+-- arm its auto-delete deadline.
 -- One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
 -- the UPSERT.
 WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+    AND status IN ('pausing', 'resuming')
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
@@ -336,9 +346,14 @@ upserted AS (
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM upserted),
     status = 'paused',
+    -- Arm the auto-delete deadline as the sandbox lands in 'paused'.
+    -- make_interval(NULL) propagates NULL, so an unset auto_delete_seconds
+    -- leaves the deadline NULL (never deleted).
+    auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
     updated_at = now()
 FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  AND sandbox.status IN ('pausing', 'resuming')
 RETURNING upserted.snap_id::uuid AS snapshot_id;
 
 -- name: UpdateSandboxNetworkConfig :exec
@@ -425,3 +440,89 @@ closed_billing_compute AS (
 SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
+
+-- name: UpdateSandboxAutoDelete :execrows
+-- Set or clear (NULL) the auto-delete window. The deadline counts continuous
+-- paused time since the setting was applied: on an already-paused sandbox it
+-- is armed from now() — never retroactively from the pause — so applying a
+-- window can never destroy the sandbox in the same instant. On a non-paused
+-- sandbox the deadline stays NULL and FinalizePause arms it at the next pause.
+UPDATE sandbox
+SET auto_delete_seconds = sqlc.narg(auto_delete_seconds),
+    auto_delete_at = CASE WHEN status = 'paused'
+      THEN now() + make_interval(secs => sqlc.narg(auto_delete_seconds))
+      ELSE NULL
+    END,
+    updated_at = now()
+WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
+
+-- name: UpdateSandboxTimeout :execrows
+-- Set or clear (NULL) the auto-pause timeout. Takes effect on the reaper's
+-- next tick: the window is evaluated against the current active session
+-- start, so lowering it below already-elapsed session time pauses the
+-- sandbox on the next sweep. On a paused sandbox it applies to the next
+-- active session after resume.
+UPDATE sandbox
+SET timeout_seconds = sqlc.narg(timeout_seconds),
+    updated_at = now()
+WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
+
+-- name: ClaimAutoDeleteSandboxes :many
+-- Atomically soft-deletes paused sandboxes whose auto-delete deadline has
+-- passed. Deliberately narrower than DestroySandbox: it claims from 'paused'
+-- only, with the deadline re-checked under the row lock, so a concurrent
+-- BeginResume (also guarded on 'paused') and this claim can never both win
+-- the same row. FOR UPDATE SKIP LOCKED lets concurrent reaper replicas skip
+-- in-flight rows.
+--
+-- Mirrors DestroySandbox's side effects: writes the revocation row and closes
+-- any open active/billing/storage intervals in the same statement, so a crash
+-- after the claim can't strand a deleted sandbox with a live JWT or an open
+-- interval. Returns the columns the caller needs for VM/artifact teardown.
+WITH due AS (
+  SELECT s.id
+  FROM sandbox s
+  WHERE s.destroyed_at IS NULL
+    AND s.status = 'paused'
+    AND s.auto_delete_at IS NOT NULL
+    AND s.auto_delete_at < now()
+  ORDER BY s.auto_delete_at ASC
+  LIMIT sqlc.arg(batch_size)
+  FOR UPDATE OF s SKIP LOCKED
+),
+destroyed AS (
+  UPDATE sandbox
+  SET destroyed_at = now(), status = 'deleted', updated_at = now()
+  FROM due
+  WHERE sandbox.id = due.id
+  RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
+            sandbox.base_path, sandbox.template_id
+),
+revoked AS (
+  INSERT INTO sandbox_revocation (sandbox_id, expires_at)
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
+closed_compute AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
+  WHERE sandbox_id IN (SELECT id FROM destroyed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
+  WHERE sandbox_id IN (SELECT id FROM destroyed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_storage AS (
+  UPDATE sandbox_storage_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
+  WHERE sandbox_id IN (SELECT id FROM destroyed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT d.id, d.team_id, d.name, d.host_id, d.base_path, d.template_id
+FROM destroyed d;
