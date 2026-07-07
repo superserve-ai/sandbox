@@ -81,7 +81,9 @@ jobs:
             exit 0
           fi
 
-          mapfile -t env_dirs < <(            find infra/envs -name main.tf -not -path '*/.terraform/*' -printf '%h\n' \              | grep -E '^infra/envs/(staging|production)/[^/]+$' \              | sort -u          )
+          mapfile -t env_dirs < <(
+            find infra/envs -mindepth 3 -maxdepth 3 -type f -name main.tf -not -path '*/.terraform/*' -printf '%h\n'               | sort -u
+          )
 
           if [[ ${#env_dirs[@]} -eq 0 ]]; then
             echo "No Terraform root modules were found under infra/envs." >> "$GITHUB_STEP_SUMMARY"
