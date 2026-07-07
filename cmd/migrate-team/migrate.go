@@ -143,12 +143,16 @@ func activeBuilds(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]s
 // activeSandboxes returns "<id> (<name>) status=<status>" for every sandbox
 // that must be paused or destroyed before copy may run. 'pausing' blocks
 // too: quota is already freed but snapshot finalization is in flight, so
-// the on-disk artifacts are not yet quiescent.
+// the on-disk artifacts are not yet quiescent. 'failed' blocks as well —
+// a failed sandbox may still hold a VM, rundir, and snapshot dir that the
+// destroy path tears down; migrating the row and then deleting it from the
+// source with raw SQL would strand those host resources. Destroy failed
+// sandboxes before the window.
 func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT id, name, status FROM sandbox
 		WHERE team_id = $1 AND destroyed_at IS NULL
-		  AND status IN ('active', 'starting', 'resuming', 'pausing')
+		  AND status IN ('active', 'starting', 'resuming', 'pausing', 'failed')
 		ORDER BY created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list active sandboxes: %w", err)
@@ -370,35 +374,45 @@ func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (m
 // dest is missing a referenced template — seed the dest cell first.
 func foreignTemplateRemap(ctx context.Context, src, dst *pgxpool.Pool, teamID uuid.UUID) (map[string]string, error) {
 	rows, err := src.Query(ctx, `
-		SELECT DISTINCT t.id::text, t.name
-		FROM sandbox s JOIN template t ON t.id = s.template_id
+		SELECT DISTINCT t.id::text, t.name, tm.name
+		FROM sandbox s
+		JOIN template t ON t.id = s.template_id
+		JOIN team tm ON tm.id = t.team_id
 		WHERE s.team_id = $1 AND t.team_id <> $1`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list foreign templates: %w", err)
 	}
 	defer rows.Close()
 
-	srcNames := map[string]string{}
+	type foreignTpl struct{ name, ownerName string }
+	srcTpls := map[string]foreignTpl{}
 	for rows.Next() {
-		var id, name string
-		if err := rows.Scan(&id, &name); err != nil {
+		var id, name, ownerName string
+		if err := rows.Scan(&id, &name, &ownerName); err != nil {
 			return nil, err
 		}
-		srcNames[id] = name
+		srcTpls[id] = foreignTpl{name: name, ownerName: ownerName}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
+	// Resolve in dest through the OWNING team's name, never "any other
+	// team": template names are only unique per team, so a customer
+	// template that happens to shadow a system name must not be chosen.
+	// Team names are unique per cell and the system team is seeded with
+	// the same name in every cell, so (owner name, template name) is a
+	// stable cross-cell identity.
 	remap := map[string]string{}
-	for id, name := range srcNames {
+	for id, tpl := range srcTpls {
 		var destID string
 		err := dst.QueryRow(ctx, `
-			SELECT id::text FROM template
-			WHERE name = $1 AND team_id <> $2 AND deleted_at IS NULL AND status = 'ready'
-			ORDER BY created_at DESC LIMIT 1`, name, teamID).Scan(&destID)
+			SELECT t.id::text FROM template t
+			JOIN team tm ON tm.id = t.team_id
+			WHERE t.name = $1 AND tm.name = $2 AND t.deleted_at IS NULL AND t.status = 'ready'
+			ORDER BY t.created_at DESC LIMIT 1`, tpl.name, tpl.ownerName).Scan(&destID)
 		if err != nil {
-			return nil, fmt.Errorf("system template %q (referenced by the team's sandboxes) has no ready counterpart in dest — run seed-templates against the dest cell first: %w", name, err)
+			return nil, fmt.Errorf("template %q owned by team %q (referenced by the migrating team's sandboxes) has no ready counterpart in dest — seed the dest cell first: %w", tpl.name, tpl.ownerName, err)
 		}
 		remap[id] = destID
 	}
@@ -759,6 +773,27 @@ func collectStrings(rows pgx.Rows) ([]string, error) {
 func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
 	if cfg.confirmTeamName != teamName {
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
+	}
+
+	// Re-check quiescence immediately before deleting: a sandbox resumed or
+	// a build started after the copy would survive validate (row-count
+	// parity doesn't see a status flip), and deleting its rows would pull
+	// the DB out from under a running VM.
+	blockers, err := activeSandboxes(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(blockers) > 0 {
+		return fmt.Errorf("aborting decommission: %d sandbox(es) no longer quiescent:\n  %s",
+			len(blockers), strings.Join(blockers, "\n  "))
+	}
+	builds, err := activeBuilds(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(builds) > 0 {
+		return fmt.Errorf("aborting decommission: %d template build(s) in flight:\n  %s",
+			len(builds), strings.Join(builds, "\n  "))
 	}
 
 	// A validate pass is a precondition in the same invocation — never

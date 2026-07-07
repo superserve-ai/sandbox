@@ -358,11 +358,20 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ($1, $2, 'superserve/base', 'ready', '{}', 1, 1024, 4096, '/srv/templates/sys/vmstate.snap', $3)`,
 		f.sysTplSrc, f.teamB, base)
 	sysTeamDst := uuid.New()
-	mustExec(t, dstPool, `INSERT INTO team (id, name) VALUES ($1, 'system-dest') ON CONFLICT DO NOTHING`, sysTeamDst)
+	mustExec(t, dstPool, `INSERT INTO team (id, name) VALUES ($1, 'bystander-team') ON CONFLICT DO NOTHING`, sysTeamDst)
 	mustExec(t, dstPool, `
 		INSERT INTO template (id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, snapshot_path, built_at)
 		VALUES ($1, $2, 'superserve/base', 'ready', '{}', 1, 1024, 4096, '/dstsrv/templates/sys/vmstate.snap', $3)`,
 		f.sysTplDst, sysTeamDst, base)
+	// Decoy: another dest team shadowing the system template's name with a
+	// NEWER ready template. The remap must resolve through the owning
+	// team's name and never pick this one.
+	decoyTeam := uuid.New()
+	mustExec(t, dstPool, `INSERT INTO team (id, name) VALUES ($1, 'decoy-team') ON CONFLICT DO NOTHING`, decoyTeam)
+	mustExec(t, dstPool, `
+		INSERT INTO template (id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, snapshot_path, built_at)
+		VALUES ($1, $2, 'superserve/base', 'ready', '{}', 1, 1024, 4096, '/dstsrv/templates/decoy/vmstate.snap', now())`,
+		uuid.New(), decoyTeam)
 	mustExec(t, srcPool, `
 		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, template_id,
 		                     snapshot_path, mem_path, base_path, delta_path)
@@ -511,6 +520,19 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("copy refuses a failed sandbox", func(t *testing.T) {
+		failedID := uuid.New()
+		mustExec(t, srcPool, `
+			INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id)
+			VALUES ($1, $2, 'crashed', 'failed', 1, 1024, $3)`, failedID, f.team, sourceHostID)
+		defer mustExec(t, srcPool, `DELETE FROM sandbox WHERE id = $1`, failedID)
+
+		err := run(ctx, f.cfg(phaseCopy))
+		if err == nil || !strings.Contains(err.Error(), failedID.String()) {
+			t.Fatalf("failed sandbox must block the copy (destroy it first), got: %v", err)
+		}
+	})
+
 	t.Run("copy round-trip", func(t *testing.T) {
 		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
 			t.Fatalf("copy: %v", err)
@@ -642,6 +664,18 @@ func TestTeamMigration(t *testing.T) {
 		}
 		if got := countScoped(t, srcPool, tableSpec{"team", "id = $1"}, f.team); got != 1 {
 			t.Fatal("refused decommission must not delete anything")
+		}
+	})
+
+	t.Run("decommission refuses when the source is no longer quiescent", func(t *testing.T) {
+		mustExec(t, srcPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
+		defer mustExec(t, srcPool, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, f.sb1)
+
+		cfg := f.cfg(phaseDecommission)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), f.sb1.String()) {
+			t.Fatalf("post-copy resume must block decommission, got: %v", err)
 		}
 	})
 
