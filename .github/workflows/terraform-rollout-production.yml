@@ -50,8 +50,11 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT}}
 
-      - name: Install validation dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Verify validation dependencies
+        run: |
+          set -euo pipefail
+          command -v jq
+          command -v curl
 
       - name: Terraform apply production/us-west2
         run: |
@@ -103,8 +106,11 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Install validation dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Verify validation dependencies
+        run: |
+          set -euo pipefail
+          command -v jq
+          command -v curl
 
       - name: Terraform apply production/us-central1
         run: |
