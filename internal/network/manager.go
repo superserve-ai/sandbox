@@ -544,15 +544,16 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	return nil
 }
 
-// ReserveSlotsAbove bumps nextSlot past every slot index named by the given
-// namespaces, so the pre-allocation pool never hands out a fresh slot that
-// collides with a VM not yet reattached. Cheap: parses indices and bumps a
-// counter, no kernel work — safe to call before the full per-VM reattach.
+// ReserveSlotsAbove bumps nextSlot past every slot index whose namespace still
+// exists in the kernel, so the pool won't hand out a slot a not-yet-reattached
+// VM holds. The nsExists guard is load-bearing: a stale record whose ns was
+// already swept must not bump nextSlot, or its (never-reclaimed) index strands
+// every slot below it and can push nextSlot past MaxSlots into ErrNoSlots.
 func (m *Manager) ReserveSlotsAbove(namespaces []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, ns := range namespaces {
-		if idx, ok := slotFromNamespace(ns); ok && idx >= m.nextSlot {
+		if idx, ok := slotFromNamespace(ns); ok && idx >= m.nextSlot && nsExists(ns) {
 			m.nextSlot = idx + 1
 		}
 	}

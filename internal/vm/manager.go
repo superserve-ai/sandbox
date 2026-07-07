@@ -1588,6 +1588,9 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 // and delete a live VM whenever systemctl is merely slow. Only the eager GC pass
 // sets it. Concurrent-safe: the map write is double-checked under the lock.
 func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale bool) (*VMInstance, bool) {
+	// Already present. A lazy load inserts optimistically (no liveness check), so
+	// a dead record it inserted isn't GC'd here — that's the reconciler's job
+	// (Drift 1/5 → markStale), deliberately, to avoid racing the request path.
 	m.mu.RLock()
 	if inst, ok := m.vms[rec.ID]; ok {
 		m.mu.RUnlock()
