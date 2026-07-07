@@ -1,0 +1,710 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"sort"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog/log"
+)
+
+const (
+	phasePlan         = "plan"
+	phaseCopy         = "copy"
+	phaseValidate     = "validate"
+	phaseDecommission = "decommission"
+
+	copyBatchSize = 500
+)
+
+type config struct {
+	teamID          uuid.UUID
+	sourceURL       string
+	destURL         string
+	destHostID      string
+	destRegion      string
+	phase           string
+	confirmTeamName string
+	pathsOut        string
+}
+
+func run(ctx context.Context, cfg config) error {
+	src, err := pgxpool.New(ctx, cfg.sourceURL)
+	if err != nil {
+		return fmt.Errorf("connect to source: %w", err)
+	}
+	defer src.Close()
+
+	var dst *pgxpool.Pool
+	if cfg.destURL != "" {
+		dst, err = pgxpool.New(ctx, cfg.destURL)
+		if err != nil {
+			return fmt.Errorf("connect to dest: %w", err)
+		}
+		defer dst.Close()
+	}
+
+	var teamName string
+	if err := src.QueryRow(ctx, `SELECT name FROM team WHERE id = $1`, cfg.teamID).Scan(&teamName); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("team %s not found in source", cfg.teamID)
+		}
+		return fmt.Errorf("look up team: %w", err)
+	}
+	log.Info().Str("phase", cfg.phase).Str("team", teamName).Str("team_id", cfg.teamID.String()).Msg("migrate-team")
+
+	switch cfg.phase {
+	case phasePlan:
+		return runPlan(ctx, src, cfg)
+	case phaseCopy:
+		return runCopy(ctx, src, dst, cfg)
+	case phaseValidate:
+		return runValidate(ctx, src, dst, cfg)
+	case phaseDecommission:
+		return runDecommission(ctx, src, dst, cfg, teamName)
+	}
+	return fmt.Errorf("unknown phase %q", cfg.phase)
+}
+
+// ---------------------------------------------------------------------------
+// plan
+
+func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
+	for _, t := range migratedTables {
+		var n int64
+		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope)
+		if err := src.QueryRow(ctx, q, cfg.teamID).Scan(&n); err != nil {
+			return fmt.Errorf("count %s: %w", t.name, err)
+		}
+		log.Info().Str("table", t.name).Int64("rows", n).Msg("plan: will copy")
+	}
+	for _, s := range skippedTables {
+		log.Info().Str("table", s.name).Str("reason", s.reason).Msg("plan: will NOT copy")
+	}
+
+	blockers, err := activeSandboxes(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(blockers) > 0 {
+		for _, b := range blockers {
+			log.Warn().Str("sandbox", b).Msg("plan: BLOCKER — sandbox not paused; copy will refuse")
+		}
+	} else {
+		log.Info().Msg("plan: no active sandboxes; copy can proceed")
+	}
+
+	return reportArtifactDirs(ctx, src, cfg)
+}
+
+// activeSandboxes returns "<id> (<name>) status=<status>" for every sandbox
+// that must be paused or destroyed before copy may run.
+func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, name, status FROM sandbox
+		WHERE team_id = $1 AND destroyed_at IS NULL
+		  AND status IN ('active', 'starting', 'resuming')
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list active sandboxes: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var name, status string
+		if err := rows.Scan(&id, &name, &status); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s (%s) status=%s", id, name, status))
+	}
+	return out, rows.Err()
+}
+
+// artifactDirs returns the distinct directories holding the team's template
+// and sandbox/snapshot artifacts on the source hosts. The runbook's GCS copy
+// step consumes this list. Soft-deleted templates and destroyed sandboxes are
+// excluded — their artifacts are already reaped.
+func artifactDirs(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT DISTINCT p FROM (
+			SELECT unnest(ARRAY[rootfs_path, snapshot_path, mem_path, base_path, delta_path]) AS p
+			FROM template WHERE team_id = $1 AND deleted_at IS NULL
+			UNION ALL
+			SELECT unnest(ARRAY[snapshot_path, mem_path, base_path, delta_path])
+			FROM sandbox WHERE team_id = $1 AND destroyed_at IS NULL
+			UNION ALL
+			SELECT unnest(ARRAY[sn.path, sn.mem_path])
+			FROM snapshot sn JOIN sandbox s ON s.id = sn.sandbox_id
+			WHERE sn.team_id = $1 AND s.destroyed_at IS NULL
+		) q WHERE p IS NOT NULL AND p <> ''`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list artifact paths: %w", err)
+	}
+	defer rows.Close()
+
+	dirs := map[string]struct{}{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		dirs[path.Dir(p)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(dirs))
+	for d := range dirs {
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// reportArtifactDirs logs the artifact directory list and, when --paths-out
+// is set, writes it one dir per line for the runbook's copy step.
+func reportArtifactDirs(ctx context.Context, src *pgxpool.Pool, cfg config) error {
+	dirs, err := artifactDirs(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	for _, d := range dirs {
+		log.Info().Str("dir", d).Msg("artifact directory (copy via GCS, out of scope for this tool)")
+	}
+	log.Info().Int("count", len(dirs)).Msg("artifact directories")
+	if cfg.pathsOut == "" {
+		return nil
+	}
+	var buf bytes.Buffer
+	for _, d := range dirs {
+		buf.WriteString(d)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(cfg.pathsOut, buf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write --paths-out: %w", err)
+	}
+	log.Info().Str("file", cfg.pathsOut).Msg("wrote artifact directory list")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// copy
+
+// rowTransform mutates a row (as a column→value map) before it is inserted
+// into the dest.
+type rowTransform func(row map[string]any) error
+
+func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
+	// The window requires everything paused or destroyed. Hard-stop otherwise.
+	blockers, err := activeSandboxes(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(blockers) > 0 {
+		return fmt.Errorf("refusing to copy: %d sandbox(es) not paused/destroyed:\n  %s",
+			len(blockers), strings.Join(blockers, "\n  "))
+	}
+
+	// The dest host must exist and live in the dest region before any
+	// sandbox row points at it.
+	var hostRegion string
+	if err := dst.QueryRow(ctx, `SELECT region FROM host WHERE id = $1`, cfg.destHostID).Scan(&hostRegion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("dest host %q not found in dest cell; insert the host row first", cfg.destHostID)
+		}
+		return fmt.Errorf("look up dest host: %w", err)
+	}
+	if hostRegion != cfg.destRegion {
+		return fmt.Errorf("dest host %q is in region %q, not --dest-region %q", cfg.destHostID, hostRegion, cfg.destRegion)
+	}
+
+	transforms, err := buildTransforms(ctx, src, dst, cfg)
+	if err != nil {
+		return err
+	}
+
+	var totalCopied, totalSkipped int64
+	for _, t := range migratedTables {
+		copied, skipped, err := copyTable(ctx, src, dst, t, cfg.teamID, transforms[t.name])
+		if err != nil {
+			return fmt.Errorf("copy %s: %w", t.name, err)
+		}
+		totalCopied += copied
+		totalSkipped += skipped
+		log.Info().Str("table", t.name).Int64("copied", copied).Int64("skipped", skipped).Msg("copy")
+	}
+
+	relinked, err := relinkSnapshots(ctx, src, dst, cfg.teamID)
+	if err != nil {
+		return fmt.Errorf("relink sandbox.snapshot_id: %w", err)
+	}
+	log.Info().Int64("relinked", relinked).Msg("copy: sandbox.snapshot_id relinked from source")
+
+	for _, s := range skippedTables {
+		log.Info().Str("table", s.name).Str("reason", s.reason).Msg("copy: NOT copied")
+	}
+	log.Info().Int64("copied", totalCopied).Int64("skipped_existing", totalSkipped).Msg("copy: done")
+	return nil
+}
+
+// buildTransforms wires up the per-table row rewrites: host remap, region
+// rehoming, snapshot-cycle break, and the role-id remap by role name.
+func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (map[string]rowTransform, error) {
+	srcRoleNames, err := roleNamesByID(ctx, src)
+	if err != nil {
+		return nil, fmt.Errorf("load source roles: %w", err)
+	}
+	destRoleIDs, err := roleIDsByName(ctx, dst)
+	if err != nil {
+		return nil, fmt.Errorf("load dest roles: %w", err)
+	}
+
+	return map[string]rowTransform{
+		"team": func(row map[string]any) error {
+			// Rehome on insert. ON CONFLICT DO NOTHING means an existing
+			// dest team row is never touched.
+			row["home_region"] = cfg.destRegion
+			// Dest quota triggers recount as sandbox rows land; starting
+			// from the source's counter would double-count.
+			row["active_sandbox_count"] = 0
+			return nil
+		},
+		"sandbox": func(row map[string]any) error {
+			row["host_id"] = cfg.destHostID
+			// Break the sandbox.snapshot_id ↔ snapshot.sandbox_id cycle:
+			// insert with NULL, relink after snapshots are in.
+			row["snapshot_id"] = nil
+			return nil
+		},
+		"user_role_assignments": func(row map[string]any) error {
+			// Role ids are migration-seeded per cell and differ; remap by
+			// role NAME through the dest's roles table.
+			roleID, _ := row["role_id"].(string)
+			name, ok := srcRoleNames[roleID]
+			if !ok {
+				return fmt.Errorf("role %s not found in source roles", roleID)
+			}
+			destID, ok := destRoleIDs[name]
+			if !ok {
+				return fmt.Errorf("role %q has no counterpart in dest roles; seed dest migrations first", name)
+			}
+			row["role_id"] = destID
+			return nil
+		},
+	}, nil
+}
+
+func roleNamesByID(ctx context.Context, pool *pgxpool.Pool) (map[string]string, error) {
+	rows, err := pool.Query(ctx, `SELECT id::text, name FROM roles`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		out[id] = name
+	}
+	return out, rows.Err()
+}
+
+func roleIDsByName(ctx context.Context, pool *pgxpool.Pool) (map[string]string, error) {
+	byID, err := roleNamesByID(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(byID))
+	for id, name := range byID {
+		out[name] = id
+	}
+	return out, nil
+}
+
+// copyTable streams the team-scoped rows of one table from source to dest.
+//
+// Rows travel as jsonb (to_jsonb on the source, jsonb_populate_recordset on
+// the dest), which round-trips every column type — uuid, enum, bytea, inet,
+// numeric, arrays, nested jsonb — without this tool naming a single column,
+// so schema drift in either cell surfaces as a loud error instead of silent
+// truncation. Inserts use a targetless ON CONFLICT DO NOTHING: re-runs skip
+// rows that already landed (by any unique constraint), which is what makes a
+// failed run safely re-runnable. A genuinely conflicting foreign row (same
+// unique key, different id) is also skipped — validate's count parity then
+// fails, so it cannot pass silently.
+func copyTable(ctx context.Context, src, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
+	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.scope)
+	insertQ := fmt.Sprintf(
+		`INSERT INTO %s SELECT * FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) ON CONFLICT DO NOTHING`,
+		t.name, t.name)
+
+	rows, err := src.Query(ctx, selectQ, teamID)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+
+	var total int64
+	batch := make([]json.RawMessage, 0, copyBatchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		payload, err := json.Marshal(batch)
+		if err != nil {
+			return err
+		}
+		tag, err := dst.Exec(ctx, insertQ, payload)
+		if err != nil {
+			return err
+		}
+		copied += tag.RowsAffected()
+		batch = batch[:0]
+		return nil
+	}
+
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return copied, 0, err
+		}
+		if transform != nil {
+			raw, err = transformRow(raw, transform)
+			if err != nil {
+				return copied, 0, err
+			}
+		}
+		batch = append(batch, json.RawMessage(raw))
+		total++
+		if len(batch) >= copyBatchSize {
+			if err := flush(); err != nil {
+				return copied, 0, err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return copied, 0, err
+	}
+	if err := flush(); err != nil {
+		return copied, 0, err
+	}
+	return copied, total - copied, nil
+}
+
+// transformRow decodes a row's jsonb, applies the transform, and re-encodes.
+// UseNumber keeps bigint/numeric values as exact decimal strings — float64
+// round-tripping would corrupt them.
+func transformRow(raw []byte, transform rowTransform) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	row := map[string]any{}
+	if err := dec.Decode(&row); err != nil {
+		return nil, err
+	}
+	if err := transform(row); err != nil {
+		return nil, err
+	}
+	return json.Marshal(row)
+}
+
+// relinkSnapshots restores sandbox.snapshot_id in the dest from the source's
+// values, after snapshot rows exist. Idempotent: IS DISTINCT FROM makes a
+// re-run a no-op.
+func relinkSnapshots(ctx context.Context, src, dst *pgxpool.Pool, teamID uuid.UUID) (int64, error) {
+	rows, err := src.Query(ctx,
+		`SELECT id, snapshot_id FROM sandbox WHERE team_id = $1 AND snapshot_id IS NOT NULL`, teamID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type pair struct{ sandboxID, snapshotID uuid.UUID }
+	var pairs []pair
+	for rows.Next() {
+		var p pair
+		if err := rows.Scan(&p.sandboxID, &p.snapshotID); err != nil {
+			return 0, err
+		}
+		pairs = append(pairs, p)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var relinked int64
+	b := &pgx.Batch{}
+	for _, p := range pairs {
+		b.Queue(`UPDATE sandbox SET snapshot_id = $2 WHERE id = $1 AND snapshot_id IS DISTINCT FROM $2`,
+			p.sandboxID, p.snapshotID)
+	}
+	br := dst.SendBatch(ctx, b)
+	defer br.Close()
+	for range pairs {
+		tag, err := br.Exec()
+		if err != nil {
+			return relinked, err
+		}
+		relinked += tag.RowsAffected()
+	}
+	return relinked, br.Close()
+}
+
+// ---------------------------------------------------------------------------
+// validate
+
+func runValidate(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
+	mismatches, err := validateTeam(ctx, src, dst, cfg)
+	if err != nil {
+		return err
+	}
+	if err := reportArtifactDirs(ctx, src, cfg); err != nil {
+		return err
+	}
+	if len(mismatches) > 0 {
+		for _, m := range mismatches {
+			log.Error().Msg("validate: MISMATCH — " + m)
+		}
+		return fmt.Errorf("validation failed: %d mismatch(es)", len(mismatches))
+	}
+	log.Info().Msg("validate: source and dest agree")
+	return nil
+}
+
+// validateTeam runs every read-only parity check and returns the list of
+// mismatches (empty = pass). Query errors are returned as err.
+func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]string, error) {
+	var mismatches []string
+	teamID := cfg.teamID
+
+	// 1. Per-table row-count parity over the team's scope.
+	for _, t := range migratedTables {
+		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope)
+		var srcN, dstN int64
+		if err := src.QueryRow(ctx, q, teamID).Scan(&srcN); err != nil {
+			return nil, fmt.Errorf("count source %s: %w", t.name, err)
+		}
+		if err := dst.QueryRow(ctx, q, teamID).Scan(&dstN); err != nil {
+			return nil, fmt.Errorf("count dest %s: %w", t.name, err)
+		}
+		if srcN != dstN {
+			mismatches = append(mismatches, fmt.Sprintf("%s: source=%d dest=%d rows", t.name, srcN, dstN))
+		} else {
+			log.Info().Str("table", t.name).Int64("rows", srcN).Msg("validate: count parity")
+		}
+	}
+
+	// 2. Billing sums. Compared as text — numeric must round-trip exactly.
+	billingSums := []struct{ name, query string }{
+		{"team_billing_usage_hourly sums", `SELECT COALESCE(SUM(vcpu_seconds), 0)::text || '|' ||
+			COALESCE(SUM(memory_mib_seconds), 0)::text || '|' ||
+			COALESCE(SUM(storage_mib_seconds), 0)::text
+			FROM team_billing_usage_hourly WHERE team_id = $1`},
+		{"team_billing_usage sums", `SELECT COALESCE(SUM(vcpu_seconds), 0)::text || '|' ||
+			COALESCE(SUM(memory_mib_seconds), 0)::text || '|' ||
+			COALESCE(SUM(storage_mib_seconds), 0)::text
+			FROM team_billing_usage WHERE team_id = $1`},
+		{"team_credit_grant sums", `SELECT COALESCE(SUM(amount_usd), 0)::text || '|' ||
+			COALESCE(SUM(remaining_usd), 0)::text
+			FROM team_credit_grant WHERE team_id = $1`},
+	}
+	for _, bs := range billingSums {
+		var srcV, dstV string
+		if err := src.QueryRow(ctx, bs.query, teamID).Scan(&srcV); err != nil {
+			return nil, fmt.Errorf("source %s: %w", bs.name, err)
+		}
+		if err := dst.QueryRow(ctx, bs.query, teamID).Scan(&dstV); err != nil {
+			return nil, fmt.Errorf("dest %s: %w", bs.name, err)
+		}
+		if srcV != dstV {
+			mismatches = append(mismatches, fmt.Sprintf("%s: source=%s dest=%s", bs.name, srcV, dstV))
+		}
+	}
+
+	// 3. Every live paused sandbox in the dest must carry its artifact paths;
+	// resume depends on them.
+	rows, err := dst.Query(ctx, `
+		SELECT id FROM sandbox
+		WHERE team_id = $1 AND destroyed_at IS NULL AND status = 'paused'
+		  AND (snapshot_path IS NULL OR mem_path IS NULL OR base_path IS NULL OR delta_path IS NULL)`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("check dest sandbox artifact paths: %w", err)
+	}
+	missing, err := collectStrings(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range missing {
+		mismatches = append(mismatches, fmt.Sprintf("dest sandbox %s: paused but missing artifact path column(s)", id))
+	}
+
+	// 4. Every member profile must exist in the dest.
+	rows, err = src.Query(ctx, `
+		SELECT profile_id::text FROM team_member WHERE team_id = $1
+		UNION SELECT user_id::text FROM team_memberships WHERE team_id = $1`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list source members: %w", err)
+	}
+	members, err := collectStrings(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range members {
+		var exists bool
+		if err := dst.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM profile WHERE id = $1)`, m).Scan(&exists); err != nil {
+			return nil, fmt.Errorf("check dest profile %s: %w", m, err)
+		}
+		if !exists {
+			mismatches = append(mismatches, fmt.Sprintf("member profile %s missing in dest", m))
+		}
+	}
+
+	// 5. Role assignments must resolve to the same (user, role name, active)
+	// set on both sides — this is what proves the by-name remap worked.
+	const assignmentQ = `
+		SELECT ura.user_id::text || '|' || r.name || '|' || (ura.revoked_at IS NULL)::text
+		FROM user_role_assignments ura JOIN roles r ON r.id = ura.role_id
+		WHERE ura.team_id = $1 ORDER BY 1`
+	srcRows, err := src.Query(ctx, assignmentQ, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("source role assignments: %w", err)
+	}
+	srcAssign, err := collectStrings(srcRows)
+	if err != nil {
+		return nil, err
+	}
+	dstRows, err := dst.Query(ctx, assignmentQ, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("dest role assignments: %w", err)
+	}
+	dstAssign, err := collectStrings(dstRows)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Join(srcAssign, "\n") != strings.Join(dstAssign, "\n") {
+		mismatches = append(mismatches, fmt.Sprintf(
+			"role assignments differ (source=%d dest=%d):\n  source: %v\n  dest:   %v",
+			len(srcAssign), len(dstAssign), srcAssign, dstAssign))
+	}
+
+	// 6. The sandbox↔snapshot relink must reproduce the source's pairs.
+	const pairQ = `SELECT id::text || '|' || COALESCE(snapshot_id::text, '') FROM sandbox WHERE team_id = $1 ORDER BY 1`
+	srcRows, err = src.Query(ctx, pairQ, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("source snapshot pairs: %w", err)
+	}
+	srcPairs, err := collectStrings(srcRows)
+	if err != nil {
+		return nil, err
+	}
+	dstRows, err = dst.Query(ctx, pairQ, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("dest snapshot pairs: %w", err)
+	}
+	dstPairs, err := collectStrings(dstRows)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Join(srcPairs, "\n") != strings.Join(dstPairs, "\n") {
+		mismatches = append(mismatches, "sandbox→snapshot links differ between source and dest")
+	}
+
+	// 7. When the dest host is known, every dest sandbox must point at it.
+	if cfg.destHostID != "" {
+		rows, err := dst.Query(ctx,
+			`SELECT id::text FROM sandbox WHERE team_id = $1 AND host_id <> $2`, teamID, cfg.destHostID)
+		if err != nil {
+			return nil, fmt.Errorf("check dest sandbox hosts: %w", err)
+		}
+		wrongHost, err := collectStrings(rows)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range wrongHost {
+			mismatches = append(mismatches, fmt.Sprintf("dest sandbox %s not on host %q", id, cfg.destHostID))
+		}
+	}
+
+	return mismatches, nil
+}
+
+func collectStrings(rows pgx.Rows) ([]string, error) {
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// decommission
+
+func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
+	if cfg.confirmTeamName != teamName {
+		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
+	}
+
+	// A validate pass is a precondition in the same invocation — never
+	// delete a source we haven't just proven the dest matches.
+	log.Info().Msg("decommission: running validate first")
+	mismatches, err := validateTeam(ctx, src, dst, cfg)
+	if err != nil {
+		return err
+	}
+	if len(mismatches) > 0 {
+		for _, m := range mismatches {
+			log.Error().Msg("decommission: MISMATCH — " + m)
+		}
+		return fmt.Errorf("aborting decommission: validate found %d mismatch(es); source not touched", len(mismatches))
+	}
+
+	// One transaction: the source either loses the whole team or nothing.
+	tx, err := src.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Break the sandbox↔snapshot cycle so snapshots can go before sandboxes.
+	if _, err := tx.Exec(ctx, `UPDATE sandbox SET snapshot_id = NULL WHERE team_id = $1`, cfg.teamID); err != nil {
+		return fmt.Errorf("null sandbox.snapshot_id: %w", err)
+	}
+
+	var total int64
+	for i := len(migratedTables) - 1; i >= 0; i-- {
+		t := migratedTables[i]
+		if t.name == "profile" {
+			// Profiles are global (multi-team, shared with Auth); they stay.
+			continue
+		}
+		tag, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, t.name, t.scope), cfg.teamID)
+		if err != nil {
+			return fmt.Errorf("delete from %s: %w", t.name, err)
+		}
+		total += tag.RowsAffected()
+		log.Info().Str("table", t.name).Int64("deleted", tag.RowsAffected()).Msg("decommission")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	log.Info().Int64("deleted", total).Msg("decommission: source rows removed (profiles and append-only audit tables retained)")
+	return nil
+}
