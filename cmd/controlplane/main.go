@@ -34,6 +34,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/supervisor"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -93,6 +94,31 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	recorder := telemetry.NewNoopRecorder()
+	if cfg.OTelMetricsEnabled {
+		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
+			ServiceName:    cfg.OTelServiceName,
+			ServiceVersion: cfg.OTelServiceVersion,
+			Environment:    cfg.OTelEnvironment,
+			Endpoint:       cfg.OTelEndpoint,
+			Insecure:       cfg.OTelInsecure,
+			ExportInterval: cfg.OTelExportInterval,
+		})
+		if err != nil {
+			return fmt.Errorf("init otel metrics: %w", err)
+		}
+		recorder = otelRecorder
+		defer func() {
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer flushCancel()
+			if err := otelRecorder.Shutdown(flushCtx); err != nil {
+				log.Warn().Err(err).Msg("otel metrics shutdown failed")
+			}
+		}()
+		log.Info().Str("endpoint", cfg.OTelEndpoint).Dur("interval", cfg.OTelExportInterval).Msg("otel metrics initialized")
+	}
+	api.SetTelemetryRecorder(recorder)
+
 	// Connect to PostgreSQL. DB_MAX_CONNS overrides the pool size; unset
 	// uses the pgxpool default of max(4, NumCPU).
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
@@ -119,6 +145,10 @@ func run() error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 	log.Info().Msg("connected to database")
+	if cfg.OTelMetricsEnabled {
+		telemetry.StartDBPoolSampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
+		telemetry.StartHostCapacitySampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
+	}
 
 	reconcileSystemTeamQuota(ctx, dbPool, cfg.SystemTeamID)
 
@@ -134,7 +164,8 @@ func run() error {
 	log.Info().Str("address", cfg.VMDAddress).Msg("connected to VMD gRPC")
 
 	// Build handlers and router.
-	vmdClient := newGRPCVMDClient(grpcConn)
+	var vmdClient vmdclient.Client = newGRPCVMDClient(grpcConn)
+	vmdClient = telemetry.WrapVMDClient(vmdClient, recorder, api.SandboxIDRegion(), cfg.DefaultHostID)
 	queries := dbq.New(dbPool)
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
@@ -177,7 +208,7 @@ func run() error {
 	// Host registry: resolves host_id → VMDClient via DB lookup + gRPC dial.
 	// Interceptors below fire onDead on codes.Unavailable so the registry
 	// drops stale cached clients.
-	dialVMD := func(addr string, onDead func()) (vmdclient.Client, error) {
+	dialVMD := func(hostID, addr string, onDead func()) (vmdclient.Client, error) {
 		// Retry runs inside the invoker; the dead-host interceptor sees the post-retry outcome only.
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -188,7 +219,7 @@ func run() error {
 		if err != nil {
 			return nil, err
 		}
-		return newGRPCVMDClient(conn), nil
+		return telemetry.WrapVMDClient(newGRPCVMDClient(conn), recorder, api.SandboxIDRegion(), hostID), nil
 	}
 	handlers.Hosts = hostreg.New(queries, dialVMD)
 	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}

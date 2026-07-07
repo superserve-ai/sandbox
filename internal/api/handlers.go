@@ -615,7 +615,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// VM unreachable — nothing to preserve; mark failed rather than
 			// wedge in 'resuming' (the CTE also closes any open interval).
 			log.Error().Err(perr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: PauseInstance failed, marking sandbox failed")
-			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID)
+			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID, sandbox.HostID)
 			return
 		}
 		// Fresh deadline so a slow snapshot above can't starve the DB write.
@@ -879,6 +879,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	SetTelemetryHostID(c, sandbox.HostID)
 
 	if sandbox.Status != db.SandboxStatusPaused {
 		respondError(c, ErrInvalidState)
@@ -936,6 +937,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
+	SetTelemetryHostID(c, sandbox.HostID)
 	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
 	// from a quiescent state (active/paused/failed) or a transitional state whose
 	// worker is provably gone (stale), so it serializes against a live resume/pause
@@ -1613,6 +1615,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	} else {
 		hostID = "default"
 	}
+	SetTelemetryHostID(c, hostID)
 
 	// Resolve the VMD client up front so we don't waste a DB INSERT on
 	// a host we can't reach.
@@ -1803,16 +1806,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	case vmdErr != nil:
 		// VMD failed but DB row exists — mark it failed so the reaper
-		// doesn't leave it stuck in "starting".
+		// doesn't leave it stuck in "starting". The request middleware
+		// records the create failure metric from the HTTP status, so avoid
+		// emitting a second request-scoped transition here.
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
 		failCtx, failCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
 		defer failCancel()
-		_ = h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
+		if err := h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
 			ID:     sandbox.ID,
 			Status: db.SandboxStatusFailed,
 			TeamID: teamID,
-		})
-		// Bindings are written before RestoreSnapshot, so a restore failure
+		}); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("mark failed after VMD create failure")
+		} // Bindings are written before RestoreSnapshot, so a restore failure
 		// leaves them; clear them or this dead sandbox still shows as bound.
 		_ = h.DB.DeleteSandboxSecrets(failCtx, sandbox.ID)
 		// FailedPrecondition from vmd = snapshot/mem file missing on host.
@@ -1852,7 +1858,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, secretMeta)
 		if jerr != nil {
 			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID, false)
 			respondError(c, ErrInternal)
 			return
 		}
@@ -1865,7 +1871,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
 		} else {
 			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String())
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID, false)
 			respondError(c, ErrInternal)
 			return
 		}
@@ -2027,6 +2033,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		respondError(c, ErrInvalidState)
 		return
 	}
+	SetTelemetryHostID(c, sandbox.HostID)
 
 	// BeginPause's CTE atomically closed the open active interval together
 	// with the status transition; nothing to do here. If the pause
@@ -2050,7 +2057,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		// already dead, "active" was a lie.
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
-			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID)
+			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID)
 			respondError(c, ErrSandboxGone)
 			return
 		}

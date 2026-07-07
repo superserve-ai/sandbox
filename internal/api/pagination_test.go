@@ -87,7 +87,7 @@ func TestSearchTerm(t *testing.T) {
 		"a_b":     `a\_b`,
 		"50%":     `50\%`,
 		`back\up`: `back\\up`,
-		`%_\`:    `\%\_\\`,
+		`%_\`:     `\%\_\\`,
 	}
 	for in, want := range cases {
 		if got := searchTerm(in); got == nil || *got != want {

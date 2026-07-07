@@ -12,7 +12,7 @@ import (
 // DialFunc creates a VMD client for the given gRPC address. onDead is
 // called when the transport reports the peer unreachable; the registry
 // wires it to Invalidate.
-type DialFunc func(addr string, onDead func()) (vmdclient.Client, error)
+type DialFunc func(hostID, addr string, onDead func()) (vmdclient.Client, error)
 
 // Registry maps host IDs to VMD clients, cached on first use.
 type Registry struct {
@@ -54,7 +54,7 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 		return nil, fmt.Errorf("get host %q: %w", hostID, err)
 	}
 
-	c, err = r.dial(host.VmdAddr, func() { r.Invalidate(hostID) })
+	c, err = r.dial(hostID, host.VmdAddr, func() { r.Invalidate(hostID) })
 	if err != nil {
 		return nil, fmt.Errorf("dial VMD at %s for host %q: %w", host.VmdAddr, hostID, err)
 	}

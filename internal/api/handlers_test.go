@@ -2252,7 +2252,7 @@ func TestFailSandboxAfterBootDestroysOnSandboxHost(t *testing.T) {
 	}
 	h := &Handlers{VMD: defaultVMD, DB: db.New(mock)}
 
-	h.failSandboxAfterBoot(context.Background(), hostVMD, uuid.New(), uuid.New(), "instance-xyz")
+	h.failSandboxAfterBoot(context.Background(), hostVMD, uuid.New(), uuid.New(), "instance-xyz", "host-a", false)
 
 	if hostDestroyed != "instance-xyz" {
 		t.Errorf("destroy routed to host client = %q, want instance-xyz", hostDestroyed)

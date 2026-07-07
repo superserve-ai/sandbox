@@ -5,6 +5,13 @@ import (
 	"time"
 )
 
+const (
+	ResultSuccess  = "success"
+	ResultError    = "error"
+	ResultConflict = "conflict"
+	ResultTimeout  = "timeout"
+)
+
 // SandboxTransition records low-cardinality operational lifecycle metrics.
 // Keep tenant, user, API key, and sandbox identifiers out of metric labels;
 // use logs or traces for per-sandbox investigation.
@@ -37,6 +44,18 @@ type HostCapacity struct {
 	Sandboxes     int64
 }
 
+// DBPoolStats records pgxpool pressure and acquisition health. The *Delta
+// fields are per-sample deltas from pgxpool.Stat() cumulative counters.
+type DBPoolStats struct {
+	AcquiredConns               int64
+	IdleConns                   int64
+	TotalConns                  int64
+	AcquireDelta                int64
+	EmptyAcquireDelta           int64
+	CanceledAcquireDelta        int64
+	AcquireDurationSecondsDelta float64
+}
+
 // Recorder is the operational metrics boundary. Implementations should emit
 // OpenTelemetry metrics through a collector; callers should not write ad hoc
 // operational metrics into Postgres.
@@ -44,6 +63,7 @@ type Recorder interface {
 	RecordSandboxTransition(context.Context, SandboxTransition)
 	RecordVMDCall(context.Context, VMDCall)
 	RecordHostCapacity(context.Context, HostCapacity)
+	RecordDBPoolStats(context.Context, DBPoolStats)
 }
 
 type noopRecorder struct{}
@@ -52,3 +72,4 @@ func NewNoopRecorder() Recorder                                                 
 func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition) {}
 func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                     {}
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)           {}
+func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)             {}

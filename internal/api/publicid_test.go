@@ -28,12 +28,12 @@ func TestParsePublicSandboxID(t *testing.T) {
 		want uuid.UUID
 		ok   bool
 	}{
-		{id.String(), id, true},              // legacy bare uuid
-		{"sb-use-" + id.String(), id, true},  // current region codes
+		{id.String(), id, true},             // legacy bare uuid
+		{"sb-use-" + id.String(), id, true}, // current region codes
 		{"sb-usw-" + id.String(), id, true},
-		{"sb-euw1-" + id.String(), id, true}, // future longer code
-		{"sb--" + id.String(), uuid.Nil, false},        // empty region
-		{"sb-USE-" + id.String(), uuid.Nil, false},     // uppercase region
+		{"sb-euw1-" + id.String(), id, true},       // future longer code
+		{"sb--" + id.String(), uuid.Nil, false},    // empty region
+		{"sb-USE-" + id.String(), uuid.Nil, false}, // uppercase region
 		{"sb-use-not-a-uuid-padded-to-36-chars!!", uuid.Nil, false},
 		{"sb-use-", uuid.Nil, false},
 		{"sb-" + id.String(), uuid.Nil, false}, // prefix but no region segment
@@ -55,14 +55,14 @@ func TestValidateSandboxIDRegion(t *testing.T) {
 		env string
 		ok  bool
 	}{
-		{"", true},    // unset: legacy bare UUIDs
+		{"", true}, // unset: legacy bare UUIDs
 		{"use", true},
 		{"usw", true},
 		{"euw1", true},
-		{"  use  ", true},      // whitespace is trimmed before minting too
-		{"us-east-1", false},   // hyphens break the region/uuid split
-		{"USE", false},         // uppercase is not DNS-label-safe here
-		{"ss_live", false},     // underscores are not DNS-safe
+		{"  use  ", true},             // whitespace is trimmed before minting too
+		{"us-east-1", false},          // hyphens break the region/uuid split
+		{"USE", false},                // uppercase is not DNS-label-safe here
+		{"ss_live", false},            // underscores are not DNS-safe
 		{"abcdefghijklmnopqr", false}, // 18 chars: over the DNS-label budget
 	} {
 		t.Setenv("SANDBOX_ID_REGION", tc.env)

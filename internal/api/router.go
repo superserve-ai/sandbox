@@ -30,7 +30,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// customer gets a dedicated bucket regardless of source IP. Behind a
 	// load balancer the per-IP limit collapses tenants onto one bucket
 	// and becomes meaningless for fairness.
-	api.Use(APIKeyAuth(pool), TeamRateLimit(ctx, DefaultTeamRateLimitConfig()))
+	api.Use(APIKeyAuth(pool), TeamRateLimit(ctx, DefaultTeamRateLimitConfig()), SandboxLifecycleTelemetry())
 	{
 		// Sandbox lifecycle.
 		api.POST("/sandboxes", h.CreateSandbox)
