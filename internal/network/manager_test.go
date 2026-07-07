@@ -33,6 +33,7 @@ func newTestManager() *Manager {
 		log:          zerolog.Nop(),
 		devices:      make(map[string]*VMNetInfo),
 		relinquished: make(map[int]bool),
+		inFlight:     make(map[int]bool),
 		nextSlot:     1,
 	}
 }
