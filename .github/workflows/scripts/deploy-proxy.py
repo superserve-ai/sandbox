@@ -4,6 +4,12 @@ configured label, in parallel.
 
 Env vars:
   GCP_PROJECT                required — project containing vmd hosts
+  GCP_REGION                 optional — only deploy to instances whose zone is
+                             in this region (e.g. us-central1). The prod
+                             project holds hosts for more than one cell, and
+                             the workflow deploys them sequentially, so an
+                             unscoped label filter would fold the cell host
+                             into the primary fan-out. Empty = no scoping.
   VMD_LABEL                  required — gcloud instances list label filter
   VMD_INSTALL_DIR            required — bin install dir on the host
   SHA                        required — commit SHA (only first 8 chars used)
@@ -24,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def main() -> int:
     project = os.environ["GCP_PROJECT"]
+    region = os.environ.get("GCP_REGION", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
@@ -69,11 +76,23 @@ def main() -> int:
         for r in [line.strip().split(",")]
     ]
 
+    # Region scoping happens here rather than in the gcloud filter: matching
+    # on the zone basename is unambiguous, while gcloud filter matching
+    # against zone URIs is easy to get subtly wrong. Zero matches is a hard
+    # failure either way — a deploy that silently skips a host is exactly
+    # the drift this script exists to prevent.
+    if region:
+        instances = [
+            inst for inst in instances
+            if inst["zone"].split("/")[-1].startswith(f"{region}-")
+        ]
+
+    where = f"{project} ({region})" if region else project
     if not instances:
-        print(f"No instances with label {label} found in {project}", file=sys.stderr)
+        print(f"No instances with label {label} found in {where}", file=sys.stderr)
         return 1
 
-    print(f"Deploying proxy to {len(instances)} instance(s)")
+    print(f"Deploying proxy to {len(instances)} instance(s) in {where}")
 
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
