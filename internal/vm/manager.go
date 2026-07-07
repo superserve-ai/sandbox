@@ -1652,6 +1652,30 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 
 	inst := toInstance(rec)
+
+	// Bail early if another caller (a request, or the background pass) already
+	// published this VM.
+	m.mu.RLock()
+	existing, present := m.vms[rec.ID]
+	m.mu.RUnlock()
+	if present {
+		return existing, true
+	}
+
+	// Restore network state (slot tracking, devices map, host firewall rules)
+	// BEFORE publishing to m.vms, so any concurrent getInstance that sees the
+	// map entry is guaranteed devices[vmID] is already populated — otherwise its
+	// UpdateSandboxNetwork/DestroyVM could race a half-restored VM. ReattachVM is
+	// idempotent, so a rare double restore (background pass and a request both
+	// reaching here) is harmless.
+	if inst.Namespace != "" && inst.IP != "" {
+		if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
+			log.Error().Err(err).Msg("reattach: restore network state failed")
+		}
+	}
+
+	// Publish, re-checking under the write lock in case another caller won the
+	// race while we restored network state; if so, keep theirs.
 	m.mu.Lock()
 	if existing, ok := m.vms[rec.ID]; ok {
 		m.mu.Unlock()
@@ -1659,14 +1683,6 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 	m.vms[rec.ID] = inst
 	m.mu.Unlock()
-
-	// Restore network state: slot tracking, devices map, host firewall rules
-	// (idempotent, in case the kernel rules were lost).
-	if inst.Namespace != "" && inst.IP != "" {
-		if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
-			log.Error().Err(err).Msg("reattach: restore network state failed")
-		}
-	}
 
 	// Commit only if a concurrent DestroyVM didn't delete the record during
 	// reattach (the gate is open, so deletes race the background pass); otherwise

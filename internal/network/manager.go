@@ -588,8 +588,15 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		MACAddress: macAddress,
 		Firewall:   fw, // nil if AttachFirewall failed; CleanupVM tolerates it
 	}
+	// Idempotent: if a concurrent reattach of the same VM already bound a handle,
+	// close it before replacing so a double restore doesn't leak the nftables
+	// connection.
+	prev := m.devices[vmID]
 	m.devices[vmID] = info
 	m.mu.Unlock()
+	if prev != nil && prev.Firewall != nil && prev.Firewall != fw {
+		_ = prev.Firewall.Close()
+	}
 	m.registerEgress(vmID, info)
 
 	m.log.Info().Str("vm_id", vmID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
