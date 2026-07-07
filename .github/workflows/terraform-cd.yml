@@ -1,73 +1,14 @@
-# Deploy API — control plane (Cloud Run).
-#
-# Triggers:
-#   - push to main on API-relevant paths: runs staging, then production
-#   - workflow_dispatch with environment=staging: staging only
-#   - workflow_dispatch with environment=production: staging FIRST, then production
-#
-# Production NEVER deploys without staging first — whether the trigger is a
-# push, a dispatch, or a forced production run. Selecting "production" does
-# not skip staging; it just promises to run production afterward. This is
-# intentional: keeping staging in sync with production avoids a drift hazard
-# where a hotfix to production leaves staging on an older revision.
-
-name: Deploy API
+name: Terraform CD
 
 on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Target environment (staging always runs first)'
-        required: false
-        type: choice
-        options:
-          - staging
-          - production
-
   push:
     branches: [main]
     paths:
-      - 'cmd/controlplane/**'
-      - 'internal/api/**'
-      - 'internal/config/**'
-      - 'internal/db/**'
-      - 'internal/hostreg/**'
-      - 'internal/scheduler/**'
-      - 'internal/secrets/**'
-      - 'internal/supervisor/**'
-      - 'internal/vmdclient/**'
-      - 'proto/**'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Dockerfile'
+      - 'infra/**'
 
 jobs:
-  detect-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      infra_changed: ${{ steps.changes.outputs.infra }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - uses: dorny/paths-filter@v3
-        id: changes
-        with:
-          filters: |
-            infra:
-              - 'infra/**'
-
-  # A push that changes both migrations and code triggers CD — Migrate and
-  # this workflow with no ordering: if the new binary reaches Cloud Run
-  # before the migration applies, sqlc-generated queries name columns the
-  # old schema doesn't have and 500 until migrate-prod finishes. Gate the
-  # deploy on the same-SHA migrate run. Pushes that touch no migrations
-  # (the common case) pass through after one git diff.
   wait-for-migrations:
     runs-on: ubuntu-latest
-    needs: [detect-changes]
-    if: github.event_name != 'push' || needs.detect-changes.outputs.infra_changed != 'true'
     permissions:
       actions: read
       contents: read
@@ -80,16 +21,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ github.event_name }}" != "push" ]; then
-            echo "Manual dispatch — operator owns migration ordering; skipping gate."
-            exit 0
-          fi
-
-          # Diff the WHOLE pushed range, not just the tip commit — a
-          # multi-commit push can carry migrations in an earlier commit.
-          # An endpoint diff (before vs sha) is exactly "what changed on
-          # main since the last deployed tip", and works even for a force
-          # push where `before` is no longer an ancestor.
           BEFORE="${{ github.event.before }}"
           MIGRATIONS_CHANGED=unknown
           if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
@@ -106,14 +37,7 @@ jobs:
             exit 0
           fi
 
-          # If the range couldn't be computed (unfetchable `before`), fall
-          # through to run-detection: CD Migrate triggers off this same
-          # push, so its run appears within seconds when migrations
-          # changed. A short grace window distinguishes "no run will ever
-          # exist" from "run pending" without blind-failing the deploy.
           echo "migrations_changed=$MIGRATIONS_CHANGED — checking CD Migrate for ${{ github.sha }}"
-          # ~20 min budget (60 × 20s), then fail closed: a deploy against a
-          # missing column is worse than a late deploy.
           for i in $(seq 1 60); do
             run=$(gh api "repos/${{ github.repository }}/actions/workflows/cd.yml/runs?head_sha=${{ github.sha }}&event=push" \
               --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
@@ -128,18 +52,18 @@ jobs:
                 echo "CD Migrate succeeded; proceeding."
                 exit 0
               fi
-              echo "CD Migrate concluded '$conclusion' — refusing to deploy against an unmigrated schema."
+              echo "CD Migrate concluded '$conclusion' — refusing rollout against an unmigrated schema."
               exit 1
             fi
             sleep 20
           done
-          echo "Timed out waiting for CD Migrate; refusing to deploy."
+          echo "Timed out waiting for CD Migrate; refusing rollout."
           exit 1
 
   build-api-image:
+    name: Build API image once
     runs-on: ubuntu-latest
-    needs: [detect-changes, wait-for-migrations]
-    if: github.event_name != 'push' || needs.detect-changes.outputs.infra_changed != 'true'
+    needs: [wait-for-migrations]
     permissions:
       contents: read
     steps:
@@ -157,14 +81,53 @@ jobs:
           path: /tmp/controlplane-image.tar.gz
           if-no-files-found: error
 
-  deploy-staging:
+  staging-infra:
+    name: Apply staging/us-central1
     runs-on: ubuntu-latest
-    environment: staging
-    needs: [detect-changes, wait-for-migrations, build-api-image]
-    if: github.event_name != 'push' || needs.detect-changes.outputs.infra_changed != 'true'
+    needs: [wait-for-migrations]
     permissions:
       contents: read
       id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install validation dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Terraform apply staging/us-central1
+        run: |
+          set -euo pipefail
+          echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
+          cd infra/envs/staging/us-central1
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
+
+  staging-api:
+    name: Deploy API staging/us-central1
+    runs-on: ubuntu-latest
+    environment: staging
+    needs: [build-api-image, staging-infra]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      API_BASE_URL: https://staging-api.superserve.ai
+      API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
+      SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
 
@@ -202,8 +165,6 @@ jobs:
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
-      # Cloud Run only auto-routes to the new revision while traffic tracks
-      # "latest"; force it so a leftover pin can't keep prod on the old one.
       - name: Route traffic to the new revision
         run: |
           SVC=${{ vars.CLOUD_RUN_SERVICE }}
@@ -216,8 +177,6 @@ jobs:
           fi
           gcloud run services update-traffic $SVC --to-latest $ARGS
 
-      # A plain /health curl hits whatever serves traffic, so confirm the
-      # just-deployed revision is the one actually at 100%.
       - name: Verify latest revision serves traffic
         run: |
           SVC=${{ vars.CLOUD_RUN_SERVICE }}
@@ -231,14 +190,176 @@ jobs:
           fi
           curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
 
-  deploy-production:
-    needs: [detect-changes, build-api-image, deploy-staging]
-    if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && (github.event_name != 'push' || needs.detect-changes.outputs.infra_changed != 'true')
+      - name: Smoke test staging/us-central1
+        run: |
+          set -euo pipefail
+          scripts/smoke-test-region.sh staging us-central1
+          echo "staging/us-central1 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
+
+  west2-infra:
+    name: Apply production/us-west2
     runs-on: ubuntu-latest
     environment: production
+    needs: [staging-api]
     permissions:
       contents: read
       id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install validation dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Terraform apply production/us-west2
+        run: |
+          set -euo pipefail
+          echo "## Terraform rollout: production/us-west2" >> "$GITHUB_STEP_SUMMARY"
+          cd infra/envs/production/us-west2
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
+
+  west2-api:
+    name: Deploy API production/us-west2
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [build-api-image, west2-infra]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      API_BASE_URL: https://usw-api.superserve.ai
+      API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+      SANDBOX_BASE_URL: https://usw-sandbox.superserve.ai
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download prebuilt controlplane image
+        uses: actions/download-artifact@v4
+        with:
+          name: controlplane-image-${{ github.sha }}
+          path: /tmp
+
+      - name: Configure Docker
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION_USW }}-docker.pkg.dev --quiet
+
+      - name: Load and push image
+        run: |
+          gzip -dc /tmp/controlplane-image.tar.gz | docker load
+          IMAGE="${{ vars.GCP_REGION_USW }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve-usw2/controlplane"
+          docker tag controlplane:${{ github.sha }} ${IMAGE}:latest
+          docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
+          docker push ${IMAGE}:latest
+          docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --image ${{ vars.GCP_REGION_USW }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve-usw2/controlplane:${{ github.sha }} \
+            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
+            --region ${{ vars.GCP_REGION_USW }} \
+            --project ${{ vars.GCP_PROJECT }}
+
+      - name: Route traffic to the new revision
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
+          ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
+          if [ "$SERVING" != "$LATEST" ]; then
+            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
+          fi
+          gcloud run services update-traffic $SVC --to-latest $ARGS
+
+      - name: Verify latest revision serves traffic
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
+          ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
+          if [ "$PCT" != "100" ]; then
+            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
+            exit 1
+          fi
+
+      - name: Smoke test production/us-west2
+        run: |
+          set -euo pipefail
+          scripts/smoke-test-region.sh production us-west2
+          echo "production/us-west2 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
+
+  central1-infra:
+    name: Apply production/us-central1
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [west2-api]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install validation dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Terraform apply production/us-central1
+        run: |
+          set -euo pipefail
+          echo "## Terraform rollout: production/us-central1" >> "$GITHUB_STEP_SUMMARY"
+          cd infra/envs/production/us-central1
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
+
+  central1-api:
+    name: Deploy API production/us-central1
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [build-api-image, central1-infra]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      API_BASE_URL: https://usc-api.superserve.ai
+      API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+      SANDBOX_BASE_URL: https://usc-sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
 
@@ -277,8 +398,6 @@ jobs:
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
-      # Cloud Run only auto-routes to the new revision while traffic tracks
-      # "latest"; force it so a leftover pin can't keep prod on the old one.
       - name: Route traffic to the new revision
         run: |
           SVC=${{ vars.CLOUD_RUN_SERVICE }}
@@ -291,8 +410,6 @@ jobs:
           fi
           gcloud run services update-traffic $SVC --to-latest $ARGS
 
-      # A plain /health curl hits whatever serves traffic, so confirm the
-      # just-deployed revision is the one actually at 100%.
       - name: Verify latest revision serves traffic
         run: |
           SVC=${{ vars.CLOUD_RUN_SERVICE }}
@@ -306,46 +423,8 @@ jobs:
           fi
           curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
 
-      # The usw cell deploys as steps in this job — not a separate job — for
-      # the same reason CD Migrate's cell push is a step: a second job
-      # referencing the production environment would double any approval
-      # gate. Steps run after the primary verify, so a bad rollout stops at
-      # the primary. The cell reuses the SHA-tagged image pushed above
-      # (Cloud Run pulls cross-region from Artifact Registry); steps skip
-      # until CLOUD_RUN_SERVICE_USW is set (repo-level variable).
-      - name: Deploy usw cell to Cloud Run
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
+      - name: Smoke test production/us-central1
         run: |
-          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
-            --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --region ${{ vars.GCP_REGION_USW }} \
-            --project ${{ vars.GCP_PROJECT }}
-
-      - name: Route usw cell traffic to the new revision
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
-        run: |
-          SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
-          ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
-          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
-          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
-          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
-          if [ "$SERVING" != "$LATEST" ]; then
-            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
-          fi
-          gcloud run services update-traffic $SVC --to-latest $ARGS
-
-      # No /health curl for the cell: it has no public invoker binding until
-      # go-live, so an unauthenticated probe 403s regardless of health.
-      # Ready latest revision at 100% traffic is the deploy-success signal.
-      - name: Verify usw cell latest revision serves traffic
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
-        run: |
-          SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
-          ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
-          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
-          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
-          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
-          if [ "$PCT" != "100" ]; then
-            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
-            exit 1
-          fi
+          set -euo pipefail
+          scripts/smoke-test-region.sh production us-central1
+          echo "production/us-central1 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
