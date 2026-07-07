@@ -1540,22 +1540,18 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
 	}
 
-	// Phase A: reattach from BoltDB. Requests take the same reattachRecord path
-	// on-demand, so this eager pass and any concurrent lazy load converge on the
-	// same in-memory state (deduped by the double-checked map write).
+	// Phase A: reattach from BoltDB. Routed through reattachByID (singleflight)
+	// so this eager pass and any concurrent lazy request serialize per VM — a
+	// lazy load can't run reattachRecord for a vmID while the eager pass is mid
+	// stale-cleanup for the same one. reattachByID re-reads the record inside the
+	// flight, so a DestroyVM between the snapshot and here can't resurrect it.
 	for _, snap := range records {
 		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
 		// would otherwise misfire the stale-cleanup path against live VMs.
 		if ctx.Err() != nil {
 			break
 		}
-		// Re-read: the record may have been deleted (DestroyVM) since the
-		// snapshot above, so acting on the stale copy could resurrect it.
-		rec, getErr := m.state.Get(snap.ID)
-		if getErr != nil || rec == nil {
-			continue
-		}
-		if _, ok := m.reattachRecord(ctx, *rec, true); ok {
+		if m.reattachByID(snap.ID, true) != nil {
 			reattached++
 		} else {
 			stale++
@@ -1708,6 +1704,20 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 // resolves it here instead of getting a spurious NotFound. Deduped per VM by
 // singleflight. Returns nil when the VM is unknown to this host (not in BoltDB).
 func (m *Manager) lazyReattach(vmID string) *VMInstance {
+	return m.reattachByID(vmID, false)
+}
+
+// reattachByID runs a single-flighted reattach for vmID. Routing BOTH the eager
+// startup pass and lazy request loads through the same singleflight group
+// serializes them per VM: only one reattachRecord runs for a given vmID at a
+// time, so the eager pass's stale-cleanup can't free a slot back to the pool
+// while a concurrent lazy load is mid-flight binding that VM's network state.
+//
+// cleanupStale is honored by whichever caller wins the flight; a joiner shares
+// that result. The reattach uses a detached, bounded context so a caller's
+// cancellation can't abort work another caller is waiting on. Returns nil when
+// the VM is unknown to this host or was cleaned up as stale.
+func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 	if m.state == nil {
 		return nil
 	}
@@ -1724,7 +1734,7 @@ func (m *Manager) lazyReattach(vmID string) *VMInstance {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		got, _ := m.reattachRecord(ctx, *rec, false)
+		got, _ := m.reattachRecord(ctx, *rec, cleanupStale)
 		return got, nil
 	})
 	inst, _ := v.(*VMInstance)
@@ -1781,32 +1791,37 @@ func (m *Manager) ReserveStartupSlots(ctx context.Context) {
 	for _, id := range activeUnits {
 		active[id] = true
 	}
-	livenessUnknown := listErr != nil
 
-	// resumable slots are reserved unconditionally; liveOnly slots are reserved
-	// only if their netns still exists (a dead FC's slot is free for reuse).
-	var resumable, liveOnly []string
+	resumable, liveOnly := classifyStartupSlots(recs, active, listErr != nil)
+	m.netMgr.ReserveSlotsAbove(resumable, liveOnly)
+}
+
+// classifyStartupSlots splits records into slots reserved unconditionally
+// (resumable) vs. reserved only if their netns still exists (liveOnly), given
+// the set of active firecracker unit IDs. Pure, so the reserve/relinquish
+// policy is unit-testable without systemd or BoltDB.
+//
+//   - paused: reserved — keeps its slot across a reboot, rebuilt on resume.
+//   - running + active unit (or liveness unknown): reserved — the FC still owns
+//     its namespace even if its /run/netns name was removed, so its slot must
+//     not be relinquished to the pool.
+//   - running + no active unit: liveOnly — a dead FC; reserve only if its netns
+//     lingers, else relinquish the slot for reuse.
+func classifyStartupSlots(recs []VMRecord, active map[string]bool, livenessUnknown bool) (resumable, liveOnly []string) {
 	for _, rec := range recs {
 		if rec.Namespace == "" {
 			continue
 		}
 		switch {
 		case rec.Status == StatusPaused:
-			// Paused VMs keep their slot across a host reboot (which wipes every
-			// netns) and rebuild it on resume.
 			resumable = append(resumable, rec.Namespace)
 		case livenessUnknown || active[rec.ID]:
-			// Running with a live unit (or liveness unknown): the FC still owns
-			// its namespace even if its /run/netns name is gone. Reserve the
-			// slot — never relinquish one a live VM may still hold.
 			resumable = append(resumable, rec.Namespace)
 		default:
-			// Running but no live unit — a dead FC (e.g. after a host reboot).
-			// Reserve only if its netns lingers; otherwise relinquish for reuse.
 			liveOnly = append(liveOnly, rec.Namespace)
 		}
 	}
-	m.netMgr.ReserveSlotsAbove(resumable, liveOnly)
+	return resumable, liveOnly
 }
 
 // ---------------------------------------------------------------------------
