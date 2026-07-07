@@ -1579,12 +1579,20 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 }
 
 // reattachRecord rebuilds one VM's in-memory and network state from its BoltDB
+// reattachHook, when non-nil, is invoked at the start of every reattachRecord
+// call. Test-only seam for asserting that concurrent reattaches of the same VM
+// dedupe through the singleflight group. Always nil in production.
+var reattachHook func(vmID string)
+
 // record. Returns (nil, false) when cleanupStale deleted a dead record.
 //
 // cleanupStale must be false on the request path: the dead-VM check would SIGKILL
 // and delete a live VM whenever systemctl is merely slow. Only the eager GC pass
 // sets it. Concurrent-safe: the map write is double-checked under the lock.
 func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale bool) (*VMInstance, bool) {
+	if reattachHook != nil {
+		reattachHook(rec.ID)
+	}
 	// Already present. A lazy load inserts optimistically (no liveness check), so
 	// a dead record it inserted isn't GC'd here — that's the reconciler's job
 	// (Drift 1/5 → markStale), deliberately, to avoid racing the request path.
