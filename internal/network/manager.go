@@ -90,6 +90,13 @@ type Manager struct {
 	// that stale cleanup must not tear the slot down once ns-N exists again.
 	relinquished map[int]bool
 
+	// inFlight marks slot indices whose kernel state is mid-mutation — claimed
+	// by an allocator but not yet built (nsExists still false), or being torn
+	// down by a stale-record cleanup. It closes the window between claimSlotIndex
+	// and setupSlot creating ns-N: without it, a concurrent relinquished cleanup
+	// sees nsExists==false and reclaims a slot the pool is actively building.
+	inFlight map[int]bool
+
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
 
@@ -196,6 +203,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 		log:            log.With().Str("component", "network").Logger(),
 		devices:        make(map[string]*VMNetInfo),
 		relinquished:   make(map[int]bool),
+		inFlight:       make(map[int]bool),
 		nextSlot:       1,
 		httpProxyPort:  DefaultHTTPProxyPort,
 		tlsProxyPort:   DefaultTLSProxyPort,
@@ -287,6 +295,15 @@ func hostIPForSlot(idx int) string {
 // nftables, routing) for a single slot index. Used by both SetupVM
 // (on-demand) and Pool (pre-allocation).
 func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, error) {
+	// Clear the in-flight mark once the slot is built (or on failure): on
+	// success ns-N now exists, so nsExists takes over guarding it against a
+	// stale-record cleanup; on failure the idx is abandoned. Runs on every exit.
+	defer func() {
+		m.mu.Lock()
+		delete(m.inFlight, idx)
+		m.mu.Unlock()
+	}()
+
 	hostIP := hostIPForSlot(idx)
 	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
 	vethIP := fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256)
@@ -487,19 +504,23 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	if !ok {
 		return
 	}
-	// A slot relinquished at startup may have been reused by the pool. If ns-N
-	// exists again it belongs to a new sandbox — tearing it down or reclaiming
-	// the slot would corrupt that live tenant, so leave it alone. (When the
-	// netns is still gone, the slot wasn't reused and the cleanup below safely
-	// reclaims it and removes any host-side veth the reboot didn't.)
+	// A slot relinquished at startup may have been claimed by the pool. If it's
+	// in-flight (claimed, ns-N not created yet) or ns-N already exists, it
+	// belongs to a new sandbox — tearing it down or reclaiming it would corrupt
+	// that tenant, so leave it alone. Both checks under one lock: the in-flight
+	// mark closes the claimSlotIndex→setupSlot window where nsExists is still
+	// false. Otherwise claim the slot ourselves (mark in-flight) so a concurrent
+	// allocator can't grab it while we mutate its kernel state below.
 	m.mu.Lock()
-	wasRelinquished := m.relinquished[idx]
-	m.mu.Unlock()
-	if wasRelinquished && nsExists(fallbackNamespace) {
+	if m.relinquished[idx] && (m.inFlight[idx] || nsExists(fallbackNamespace)) {
+		m.mu.Unlock()
 		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
-			Msg("stale cleanup skipped — relinquished slot reused by pool")
+			Msg("stale cleanup skipped — relinquished slot claimed/reused by pool")
 		return
 	}
+	m.inFlight[idx] = true
+	m.mu.Unlock()
+
 	// Tear down both sides even if the netns is already gone: `ip netns del`
 	// only removes the in-namespace side, so the host-side veth-N can outlive
 	// its namespace (a crash, or the peer moved back to the host before the ns
@@ -508,6 +529,7 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
 	m.mu.Lock()
 	m.freeSlots = append(m.freeSlots, idx)
+	delete(m.inFlight, idx)
 	m.mu.Unlock()
 	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
 		Msg("reclaimed network slot for untracked VM")
@@ -742,12 +764,16 @@ func (m *Manager) claimSlotIndex() (int, error) {
 			m.nextSlot++
 		}
 
-		if nsExists(fmt.Sprintf("ns-%d", idx)) {
-			// Discard; returning idx to freeSlots would loop on next call.
-			m.log.Warn().Int("slot", idx).Msg("allocator: skipping idx — kernel ns already exists")
+		if m.inFlight[idx] || nsExists(fmt.Sprintf("ns-%d", idx)) {
+			// Being built/torn down elsewhere, or already in use. Discard;
+			// returning idx to freeSlots would loop on next call.
+			m.log.Warn().Int("slot", idx).Msg("allocator: skipping idx — in-flight or kernel ns exists")
 			continue
 		}
 
+		// Mark claimed so a concurrent stale-record cleanup won't reclaim this
+		// slot in the window before setupSlot creates ns-N. setupSlot clears it.
+		m.inFlight[idx] = true
 		return idx, nil
 	}
 }

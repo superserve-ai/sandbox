@@ -313,6 +313,24 @@ func TestIsRelinquished(t *testing.T) {
 	}
 }
 
+// A relinquished slot the pool has CLAIMED but not yet built (ns-N doesn't
+// exist yet, but it's marked in-flight) must NOT be reclaimed by a stale-record
+// cleanup — otherwise the slot is double-owned and later handed out twice.
+func TestCleanupVMOrNamespace_RelinquishedInFlightSlotSkipped(t *testing.T) {
+	withTestNetnsDir(t) // ns-5 intentionally absent: allocator is mid-setupSlot
+	m := newTestManager()
+	m.ReserveSlotsAbove(nil, []string{"ns-5"}) // ns-5 relinquished at startup
+	m.mu.Lock()
+	m.inFlight[5] = true // pool claimed slot 5, before setupSlot creates ns-5
+	m.mu.Unlock()
+
+	m.CleanupVMOrNamespace("stale-vm", "ns-5")
+
+	if len(m.freeSlots) != 0 {
+		t.Errorf("freeSlots = %v, want [] (in-flight slot must not be reclaimed)", m.freeSlots)
+	}
+}
+
 // A relinquished slot the pool did NOT reuse — netns still gone — is safely
 // reclaimed (and any leftover host veth removed) by the deferred cleanup.
 func TestCleanupVMOrNamespace_RelinquishedUnusedSlotReclaimed(t *testing.T) {
