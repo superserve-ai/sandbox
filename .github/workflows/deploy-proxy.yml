@@ -133,11 +133,13 @@ jobs:
       # the cell host must carry the label; zero matches fails the deploy
       # rather than silently skipping the cell.
       #
-      # Proxy config (domain, token seed, origins) deliberately reuses the
-      # prod values: the deploy rewrites /etc/sandbox/proxy.env on the cell
-      # host, and the cells share the sandbox domain suffix and control
-      # plane token seed. If a cell ever diverges, introduce _USW variants
-      # here instead of skipping the env write.
+      # The deploy rewrites /etc/sandbox/proxy.env on the host, so the cell
+      # MUST NOT reuse the prod values: its domain differs per SS-143
+      # (PROXY_DOMAIN_USW = usw-sandbox.superserve.ai) and its token seed
+      # lives in Secret Manager (`sandbox-access-token-seed`), which is what
+      # the cell control plane signs with — writing the primary's seed here
+      # would break every access token in the cell. The seed is fetched at
+      # deploy time so Secret Manager stays the single source of truth.
       - name: Deploy proxy to usw cell VMD instances
         if: vars.CLOUD_RUN_SERVICE_USW != ''
         env:
@@ -146,10 +148,12 @@ jobs:
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
-          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
-          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
+          SANDBOX_ACCESS_TOKEN_SEED=$(gcloud secrets versions access latest \
+            --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
+          export SANDBOX_ACCESS_TOKEN_SEED
           python3 .github/workflows/scripts/deploy-proxy.py
