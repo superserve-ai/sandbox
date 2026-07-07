@@ -1574,9 +1574,10 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 
-	// Phase C: re-sweep orphan namespaces now that Phase A's stale deletions are
-	// reflected in BoltDB (startup already swept once before the pool filled).
-	m.SweepStartupOrphanNamespaces()
+	// No broad re-sweep here. Startup already swept once before StartPool filled
+	// the pool; re-sweeping now would delete the pool's warm netns (which are not
+	// BoltDB records). Stale records deleted in Phase A free their own namespace
+	// inline (see reattachRecord), so a re-sweep isn't needed.
 
 	return reattached, stale
 }
@@ -1616,12 +1617,16 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				}
 			}
 			m.state.Delete(rec.ID)
+			// Free this record's namespace/slot directly instead of a broad
+			// re-sweep (which would also delete the warm pool's netns).
+			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 			return nil, false
 		}
 		if rec.SocketPath != "" {
 			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
 				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — cleaning up")
 				m.state.Delete(rec.ID)
+				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 				return nil, false
 			}
 		}

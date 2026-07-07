@@ -37,17 +37,21 @@ func newTestManager() *Manager {
 }
 
 func TestReserveSlotsAbove(t *testing.T) {
+	dir := withTestNetnsDir(t)
 	m := newTestManager()
-	// nextSlot must jump past the highest occupied slot so the pool never hands
-	// out a slot a not-yet-reattached VM still holds. Unparseable names ignored.
+	// ns-5 and ns-2 exist; ns-9 does NOT — the nsExists guard must skip it, since
+	// a stale record whose namespace was already swept must not bump nextSlot.
+	touchNS(t, dir, "ns-5")
+	touchNS(t, dir, "ns-2")
 	m.ReserveSlotsAbove([]string{"ns-5", "ns-2", "bogus", "ns-9"})
-	if m.nextSlot != 10 {
-		t.Fatalf("nextSlot = %d, want 10 (past max slot 9)", m.nextSlot)
+	if m.nextSlot != 6 {
+		t.Fatalf("nextSlot = %d, want 6 (past existing ns-5; ns-9 skipped — no netns; bogus unparseable)", m.nextSlot)
 	}
-	// A lower index must never pull nextSlot back down.
+	// A lower existing index must never pull nextSlot back down.
+	touchNS(t, dir, "ns-3")
 	m.ReserveSlotsAbove([]string{"ns-3"})
-	if m.nextSlot != 10 {
-		t.Fatalf("nextSlot = %d, want 10 (unchanged by lower index)", m.nextSlot)
+	if m.nextSlot != 6 {
+		t.Fatalf("nextSlot = %d, want 6 (unchanged by lower index)", m.nextSlot)
 	}
 }
 

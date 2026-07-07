@@ -316,6 +316,13 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 		return nil, status.Error(codes.InvalidArgument, "egress config is required")
 	}
 
+	// This RPC reads netMgr state directly (below), which the background startup
+	// reattach may not have restored yet. Resolve the VM through getInstance first
+	// so it's reattached on demand (or NotFound if it's genuinely gone).
+	if _, err := a.mgr.getInstance(vmID); err != nil {
+		return nil, err
+	}
+
 	// Update nftables rules (non-TCP traffic).
 	if err := a.mgr.netMgr.UpdateFirewallRules(vmID, egress.GetAllowedCidrs(), egress.GetDeniedCidrs()); err != nil {
 		return nil, status.Errorf(codes.Internal, "update firewall rules: %v", err)
