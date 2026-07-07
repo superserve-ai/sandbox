@@ -1,0 +1,61 @@
+name: Terraform Rollout Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type apply to apply staging Terraform and run smoke validation'
+        required: true
+        type: string
+
+jobs:
+  staging:
+    name: Apply staging us-central1
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+      API_BASE_URL: https://staging-api.superserve.ai
+      API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
+      SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
+    steps:
+      - name: Confirm rollout
+        run: |
+          if [[ "${{ inputs.confirm }}" != "apply" ]]; then
+            echo "Refusing to run. Re-run with confirm=apply."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install validation dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Terraform apply staging/us-central1
+        run: |
+          set -euo pipefail
+          echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
+          cd infra/envs/staging/us-central1
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
+
+      - name: Smoke test staging/us-central1
+        run: |
+          set -euo pipefail
+          scripts/smoke-test-region.sh staging us-central1
+          echo "staging/us-central1 apply and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
