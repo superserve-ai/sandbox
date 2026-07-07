@@ -1639,6 +1639,18 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 	}
 
+	// A running record whose netns was gone at startup had its slot relinquished
+	// for the pool to reuse. The FC is dead (a live one always has its netns), so
+	// this record is stale: reattaching it would bind its vmID onto the namespace
+	// the pool has since handed to a new sandbox, and a later firewall update or
+	// destroy for the stale vmID would then corrupt that live tenant. Refuse; the
+	// reconciler formally clears the record. Paused records are reserved, never
+	// relinquished, so a resumable VM is unaffected.
+	if rec.Status != StatusPaused && m.netMgr.IsRelinquished(rec.Namespace) {
+		log.Warn().Str("namespace", rec.Namespace).Msg("refusing reattach — slot relinquished at startup (stale record)")
+		return nil, false
+	}
+
 	inst := toInstance(rec)
 	m.mu.Lock()
 	if existing, ok := m.vms[rec.ID]; ok {

@@ -289,6 +289,30 @@ func TestCleanupVMOrNamespace_RelinquishedReusedSlotSkipped(t *testing.T) {
 	}
 }
 
+// IsRelinquished reports true only for slots freed at startup (running record
+// with no netns), so the reattach path can refuse to bind a stale vmID onto a
+// slot the pool may have reused.
+func TestIsRelinquished(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	touchNS(t, dir, "ns-7") // ns-7 live → reserved, not relinquished
+	m.ReserveSlotsAbove(nil, []string{"ns-7", "ns-5"})
+
+	if !m.IsRelinquished("ns-5") {
+		t.Error("ns-5 (running, no netns) must be relinquished")
+	}
+	if m.IsRelinquished("ns-7") {
+		t.Error("ns-7 (live netns) must not be relinquished")
+	}
+	if m.IsRelinquished("ns-99") {
+		t.Error("ns-99 (never seen) must not be relinquished")
+	}
+	if m.IsRelinquished("bogus") {
+		t.Error("unparseable namespace must not be relinquished")
+	}
+}
+
 // A relinquished slot the pool did NOT reuse — netns still gone — is safely
 // reclaimed (and any leftover host veth removed) by the deferred cleanup.
 func TestCleanupVMOrNamespace_RelinquishedUnusedSlotReclaimed(t *testing.T) {

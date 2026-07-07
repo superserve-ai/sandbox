@@ -513,6 +513,20 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 		Msg("reclaimed network slot for untracked VM")
 }
 
+// IsRelinquished reports whether the slot for namespace was freed for reuse at
+// startup (a running record whose netns was already gone). Reattaching such a
+// record would bind its old vmID onto a slot the pool may have handed to a new
+// sandbox, so callers must refuse it.
+func (m *Manager) IsRelinquished(namespace string) bool {
+	idx, ok := slotFromNamespace(namespace)
+	if !ok {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.relinquished[idx]
+}
+
 // Forget drops vmID from the in-memory device map without any kernel teardown,
 // slot reclamation, or egress change. It reverses a reattach that raced a
 // concurrent DestroyVM/markStale: that path already tore down (or recycled to
