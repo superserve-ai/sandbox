@@ -117,6 +117,41 @@ func (s *StateStore) Delete(vmID string) error {
 	})
 }
 
+// PutIfPresent writes rec only if a record for rec.ID still exists, in a single
+// transaction. Returns false (no write) when the key is absent — e.g. a
+// concurrent Delete removed it. bbolt serializes write transactions, so the
+// get-then-put is atomic against Delete: a record deleted mid-startup can't be
+// resurrected by a stale reattach persist.
+func (s *StateStore) PutIfPresent(rec VMRecord) (bool, error) {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return false, fmt.Errorf("marshal vm record: %w", err)
+	}
+	wrote := false
+	err = s.db.Batch(func(tx *bolt.Tx) error {
+		// Batch may retry this closure (coalesced transactions), so recompute
+		// wrote each run — the final successful run is authoritative.
+		wrote = false
+		b := tx.Bucket(bucketName)
+		if b.Get([]byte(rec.ID)) == nil {
+			return nil
+		}
+		wrote = true
+		return b.Put([]byte(rec.ID), data)
+	})
+	return wrote, err
+}
+
+// Has reports whether a record for vmID exists.
+func (s *StateStore) Has(vmID string) (bool, error) {
+	exists := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		exists = tx.Bucket(bucketName).Get([]byte(vmID)) != nil
+		return nil
+	})
+	return exists, err
+}
+
 // All returns every persisted VM record.
 func (s *StateStore) All() ([]VMRecord, error) {
 	var records []VMRecord

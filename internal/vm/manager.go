@@ -1649,10 +1649,21 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 	}
 
+	// Commit only if the record wasn't deleted (DestroyVM) during reattach —
+	// the gate is open, so a delete can race the background pass. Running VMs
+	// persist atomically (write-if-present); paused VMs don't re-persist, so just
+	// re-check existence. Either way, undo the in-memory reattach if it's gone.
 	if rec.Status == StatusPaused {
+		if m.recordDeleted(rec.ID) {
+			m.undoReattach(rec.ID, inst.Namespace)
+			return nil, false
+		}
 		log.Info().Msg("reattached paused VM")
 	} else {
-		m.persistState(inst)
+		if !m.persistStateIfPresent(inst) {
+			m.undoReattach(rec.ID, inst.Namespace)
+			return nil, false
+		}
 		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
 	}
 	return inst, true
@@ -1928,6 +1939,44 @@ func (m *Manager) persistState(inst *VMInstance) {
 	}
 	if err := m.state.Put(toRecord(inst)); err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
+	}
+}
+
+// persistStateIfPresent persists inst only if its record still exists, atomically.
+// Returns false when the record was deleted (a DestroyVM landed during the
+// background reattach) so the caller undoes the in-memory reattach instead of
+// resurrecting a deleted sandbox. A missing store or transient error returns true
+// (nothing to resurrect / don't undo a live reattach on a flaky write).
+func (m *Manager) persistStateIfPresent(inst *VMInstance) bool {
+	if m.state == nil || isBuildVM(inst.ID) {
+		return true
+	}
+	wrote, err := m.state.PutIfPresent(toRecord(inst))
+	if err != nil {
+		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
+		return true
+	}
+	return wrote
+}
+
+// recordDeleted reports whether vmID's record is gone from the store (deleted
+// concurrently). False when there's no store or the read errors.
+func (m *Manager) recordDeleted(vmID string) bool {
+	if m.state == nil || isBuildVM(vmID) {
+		return false
+	}
+	present, err := m.state.Has(vmID)
+	return err == nil && !present
+}
+
+// undoReattach reverses an in-memory reattach when the record turns out to have
+// been deleted concurrently: drop it from the map and release its network slot.
+func (m *Manager) undoReattach(vmID, namespace string) {
+	m.mu.Lock()
+	delete(m.vms, vmID)
+	m.mu.Unlock()
+	if namespace != "" {
+		m.netMgr.CleanupVMOrNamespace(vmID, namespace)
 	}
 }
 
