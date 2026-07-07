@@ -117,11 +117,9 @@ func (s *StateStore) Delete(vmID string) error {
 	})
 }
 
-// PutIfPresent writes rec only if a record for rec.ID still exists, in a single
-// transaction. Returns false (no write) when the key is absent — e.g. a
-// concurrent Delete removed it. bbolt serializes write transactions, so the
-// get-then-put is atomic against Delete: a record deleted mid-startup can't be
-// resurrected by a stale reattach persist.
+// PutIfPresent writes rec only if its key still exists, returning false if not.
+// bbolt serializes writes, so the get-then-put is atomic against a concurrent
+// Delete — a record deleted mid-startup can't be resurrected by a stale persist.
 func (s *StateStore) PutIfPresent(rec VMRecord) (bool, error) {
 	data, err := json.Marshal(rec)
 	if err != nil {

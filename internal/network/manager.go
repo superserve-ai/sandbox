@@ -544,11 +544,10 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	return nil
 }
 
-// ReserveSlotsAbove bumps nextSlot past every slot index whose namespace still
-// exists in the kernel, so the pool won't hand out a slot a not-yet-reattached
-// VM holds. The nsExists guard is load-bearing: a stale record whose ns was
-// already swept must not bump nextSlot, or its (never-reclaimed) index strands
-// every slot below it and can push nextSlot past MaxSlots into ErrNoSlots.
+// ReserveSlotsAbove bumps nextSlot past every slot whose namespace still exists,
+// so the pool won't hand out a slot a not-yet-reattached VM holds. The nsExists
+// guard is load-bearing: reserving a swept stale record's high index would
+// strand the slots below it and could hit ErrNoSlots.
 func (m *Manager) ReserveSlotsAbove(namespaces []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

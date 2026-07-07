@@ -1649,10 +1649,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 	}
 
-	// Commit only if the record wasn't deleted (DestroyVM) during reattach —
-	// the gate is open, so a delete can race the background pass. Running VMs
-	// persist atomically (write-if-present); paused VMs don't re-persist, so just
-	// re-check existence. Either way, undo the in-memory reattach if it's gone.
+	// Commit only if a concurrent DestroyVM didn't delete the record during
+	// reattach (the gate is open, so deletes race the background pass); otherwise
+	// undo the in-memory reattach.
 	if rec.Status == StatusPaused {
 		if m.recordDeleted(rec.ID) {
 			m.undoReattach(rec.ID, inst.Namespace)
@@ -1942,11 +1941,9 @@ func (m *Manager) persistState(inst *VMInstance) {
 	}
 }
 
-// persistStateIfPresent persists inst only if its record still exists, atomically.
-// Returns false when the record was deleted (a DestroyVM landed during the
-// background reattach) so the caller undoes the in-memory reattach instead of
-// resurrecting a deleted sandbox. A missing store or transient error returns true
-// (nothing to resurrect / don't undo a live reattach on a flaky write).
+// persistStateIfPresent persists inst only if its record still exists (atomic),
+// returning false when a concurrent DestroyVM deleted it — so the caller undoes
+// the reattach instead of resurrecting it. No store / write error → true.
 func (m *Manager) persistStateIfPresent(inst *VMInstance) bool {
 	if m.state == nil || isBuildVM(inst.ID) {
 		return true
