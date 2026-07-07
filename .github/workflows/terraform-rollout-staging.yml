@@ -18,7 +18,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
-      API_BASE_URL: https://staging-api.superserve.ai
+      API_BASE_URL: https://api-staging.superserve.ai
       API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
       SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
     steps:
