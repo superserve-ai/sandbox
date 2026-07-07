@@ -169,6 +169,8 @@ type fixture struct {
 	owner, member           uuid.UUID
 	tpl, build              uuid.UUID
 	sb1, sb2, sb3, sbActive uuid.UUID
+	sb4                     uuid.UUID
+	sysTplSrc, sysTplDst    uuid.UUID
 	snap1, snap2            uuid.UUID
 	secret                  uuid.UUID
 	expectedCounts          map[string]int64
@@ -178,20 +180,23 @@ type fixture struct {
 func seedFixture(t *testing.T) *fixture {
 	t.Helper()
 	f := &fixture{
-		team:     uuid.New(),
-		teamB:    uuid.New(),
-		teamC:    uuid.New(),
-		owner:    uuid.New(),
-		member:   uuid.New(),
-		tpl:      uuid.New(),
-		build:    uuid.New(),
-		sb1:      uuid.New(),
-		sb2:      uuid.New(),
-		sb3:      uuid.New(),
-		sbActive: uuid.New(),
-		snap1:    uuid.New(),
-		snap2:    uuid.New(),
-		secret:   uuid.New(),
+		team:      uuid.New(),
+		teamB:     uuid.New(),
+		teamC:     uuid.New(),
+		owner:     uuid.New(),
+		member:    uuid.New(),
+		tpl:       uuid.New(),
+		build:     uuid.New(),
+		sb1:       uuid.New(),
+		sb2:       uuid.New(),
+		sb3:       uuid.New(),
+		sb4:       uuid.New(),
+		sbActive:  uuid.New(),
+		sysTplSrc: uuid.New(),
+		sysTplDst: uuid.New(),
+		snap1:     uuid.New(),
+		snap2:     uuid.New(),
+		secret:    uuid.New(),
 	}
 	base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
 
@@ -344,6 +349,26 @@ func seedFixture(t *testing.T) *fixture {
 
 	// A neighbor team that must survive decommission untouched.
 	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'bystander-team')`, f.teamB)
+
+	// System template: owned by another team in source; the dest cell has
+	// its own seeded copy under a different id. sb4 boots from it, so the
+	// copy must remap sandbox.template_id by name.
+	mustExec(t, srcPool, `
+		INSERT INTO template (id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, snapshot_path, built_at)
+		VALUES ($1, $2, 'superserve/base', 'ready', '{}', 1, 1024, 4096, '/srv/templates/sys/vmstate.snap', $3)`,
+		f.sysTplSrc, f.teamB, base)
+	sysTeamDst := uuid.New()
+	mustExec(t, dstPool, `INSERT INTO team (id, name) VALUES ($1, 'system-dest') ON CONFLICT DO NOTHING`, sysTeamDst)
+	mustExec(t, dstPool, `
+		INSERT INTO template (id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, snapshot_path, built_at)
+		VALUES ($1, $2, 'superserve/base', 'ready', '{}', 1, 1024, 4096, '/dstsrv/templates/sys/vmstate.snap', $3)`,
+		f.sysTplDst, sysTeamDst, base)
+	mustExec(t, srcPool, `
+		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, template_id,
+		                     snapshot_path, mem_path, base_path, delta_path)
+		VALUES ($1, $2, 'drill-sb-sys', 'paused', 1, 1024, $3, $4,
+		        '/srv/sandboxes/sys/vmstate.snap', '/srv/sandboxes/sys/mem.snap', '/srv/sandboxes/sys/base.ext4', '/srv/sandboxes/sys/delta.ext4')`,
+		f.sb4, f.team, sourceHostID, f.sysTplSrc)
 	mustExec(t, srcPool, `
 		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id)
 		VALUES ($1, $2, 'bystander-sb', 'paused', 1, 1024, $3)`, uuid.New(), f.teamB, sourceHostID)
@@ -364,7 +389,7 @@ func seedFixture(t *testing.T) *fixture {
 		"secret":                             1,
 		"template":                           1,
 		"template_build":                     1,
-		"sandbox":                            3,
+		"sandbox":                            4,
 		"snapshot":                           2,
 		"sandbox_secret":                     1,
 		"sandbox_active_interval":            2,
@@ -390,6 +415,7 @@ func seedFixture(t *testing.T) *fixture {
 		tplDir,
 		"/srv/sandboxes/" + f.sb1.String(),
 		"/srv/sandboxes/" + f.sb2.String(),
+		"/srv/sandboxes/sys",
 		"/srv/snapshots/" + f.sb1.String(),
 		"/srv/snapshots/" + f.sb2.String(),
 	}
@@ -462,6 +488,29 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("copy refuses a pausing sandbox", func(t *testing.T) {
+		mustExec(t, srcPool, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, f.sb1)
+		defer mustExec(t, srcPool, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, f.sb1)
+
+		err := run(ctx, f.cfg(phaseCopy))
+		if err == nil || !strings.Contains(err.Error(), f.sb1.String()) {
+			t.Fatalf("mid-pause sandbox must block the copy, got: %v", err)
+		}
+	})
+
+	t.Run("copy refuses in-flight template builds", func(t *testing.T) {
+		buildID := uuid.New()
+		mustExec(t, srcPool, `
+			INSERT INTO template_build (id, template_id, team_id, status, build_spec_hash, vmd_host_id)
+			VALUES ($1, $2, $3, 'building', 'inflight-hash', $4)`, buildID, f.tpl, f.team, sourceHostID)
+		defer mustExec(t, srcPool, `DELETE FROM template_build WHERE id = $1`, buildID)
+
+		err := run(ctx, f.cfg(phaseCopy))
+		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
+			t.Fatalf("in-flight build must block the copy, got: %v", err)
+		}
+	})
+
 	t.Run("copy round-trip", func(t *testing.T) {
 		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
 			t.Fatalf("copy: %v", err)
@@ -509,6 +558,16 @@ func TestTeamMigration(t *testing.T) {
 		// Circular FK relinked.
 		if got := scanString(t, dstPool, `SELECT snapshot_id::text FROM sandbox WHERE id = $1`, f.sb1); got != f.snap1.String() {
 			t.Errorf("dest sb1.snapshot_id = %s, want %s", got, f.snap1)
+		}
+
+		// System-template references remap to the dest cell's seeded copy.
+		gotTpl := scanString(t, dstPool, `SELECT template_id::text FROM sandbox WHERE id = $1`, f.sb4)
+		if gotTpl != f.sysTplDst.String() {
+			t.Fatalf("sb4 template_id: got %s, want dest system template %s", gotTpl, f.sysTplDst)
+		}
+		// The team's own template keeps its id.
+		if got := scanString(t, dstPool, `SELECT template_id::text FROM sandbox WHERE id = $1`, f.sb1); got != f.tpl.String() {
+			t.Fatalf("sb1 template_id: got %s, want preserved %s", got, f.tpl)
 		}
 
 		// Secret ciphertext copies byte-for-byte; numerics keep every digit.

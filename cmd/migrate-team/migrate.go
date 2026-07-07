@@ -103,16 +103,52 @@ func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
 		log.Info().Msg("plan: no active sandboxes; copy can proceed")
 	}
 
+	builds, err := activeBuilds(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	for _, b := range builds {
+		log.Warn().Str("build", b).Msg("plan: BLOCKER — template build in flight; copy will refuse")
+	}
+
 	return reportArtifactDirs(ctx, src, cfg)
 }
 
+// activeBuilds returns in-flight template builds ("<id> status=<status>")
+// for the team. The freeze must wait these out (or cancel them): copying
+// mid-build template rows would strand half-written artifacts, and the
+// build rows themselves are pinned to source-cell build VMs.
+func activeBuilds(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, status FROM template_build
+		WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting')
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list active builds: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s status=%s", id, status))
+	}
+	return out, rows.Err()
+}
+
 // activeSandboxes returns "<id> (<name>) status=<status>" for every sandbox
-// that must be paused or destroyed before copy may run.
+// that must be paused or destroyed before copy may run. 'pausing' blocks
+// too: quota is already freed but snapshot finalization is in flight, so
+// the on-disk artifacts are not yet quiescent.
 func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT id, name, status FROM sandbox
 		WHERE team_id = $1 AND destroyed_at IS NULL
-		  AND status IN ('active', 'starting', 'resuming')
+		  AND status IN ('active', 'starting', 'resuming', 'pausing')
 		ORDER BY created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list active sandboxes: %w", err)
@@ -215,6 +251,14 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		return fmt.Errorf("refusing to copy: %d sandbox(es) not paused/destroyed:\n  %s",
 			len(blockers), strings.Join(blockers, "\n  "))
 	}
+	builds, err := activeBuilds(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(builds) > 0 {
+		return fmt.Errorf("refusing to copy: %d template build(s) in flight (wait or cancel):\n  %s",
+			len(builds), strings.Join(builds, "\n  "))
+	}
 
 	// The dest host must exist and live in the dest region before any
 	// sandbox row points at it.
@@ -269,6 +313,10 @@ func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (m
 	if err != nil {
 		return nil, fmt.Errorf("load dest roles: %w", err)
 	}
+	foreignTemplates, err := foreignTemplateRemap(ctx, src, dst, cfg.teamID)
+	if err != nil {
+		return nil, err
+	}
 
 	return map[string]rowTransform{
 		"team": func(row map[string]any) error {
@@ -285,6 +333,15 @@ func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (m
 			// Break the sandbox.snapshot_id ↔ snapshot.sandbox_id cycle:
 			// insert with NULL, relink after snapshots are in.
 			row["snapshot_id"] = nil
+			// Sandboxes booted from a system template reference the SYSTEM
+			// team's template row, which is seeded per cell under a
+			// different id — remap by name. The team's own templates copy
+			// with their ids preserved and pass through untouched.
+			if tid, ok := row["template_id"].(string); ok && tid != "" {
+				if destID, foreign := foreignTemplates[tid]; foreign {
+					row["template_id"] = destID
+				}
+			}
 			return nil
 		},
 		"user_role_assignments": func(row map[string]any) error {
@@ -303,6 +360,49 @@ func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (m
 			return nil
 		},
 	}, nil
+}
+
+// foreignTemplateRemap maps source template ids that the team's sandboxes
+// reference but the team does NOT own (system templates, e.g.
+// superserve/base) to the dest cell's template of the same name. System
+// templates are seeded per cell with fresh ids, so copying sandbox rows
+// verbatim would point their template_id FK at nothing. Fails fast when the
+// dest is missing a referenced template — seed the dest cell first.
+func foreignTemplateRemap(ctx context.Context, src, dst *pgxpool.Pool, teamID uuid.UUID) (map[string]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT DISTINCT t.id::text, t.name
+		FROM sandbox s JOIN template t ON t.id = s.template_id
+		WHERE s.team_id = $1 AND t.team_id <> $1`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list foreign templates: %w", err)
+	}
+	defer rows.Close()
+
+	srcNames := map[string]string{}
+	for rows.Next() {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		srcNames[id] = name
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	remap := map[string]string{}
+	for id, name := range srcNames {
+		var destID string
+		err := dst.QueryRow(ctx, `
+			SELECT id::text FROM template
+			WHERE name = $1 AND team_id <> $2 AND deleted_at IS NULL AND status = 'ready'
+			ORDER BY created_at DESC LIMIT 1`, name, teamID).Scan(&destID)
+		if err != nil {
+			return nil, fmt.Errorf("system template %q (referenced by the team's sandboxes) has no ready counterpart in dest — run seed-templates against the dest cell first: %w", name, err)
+		}
+		remap[id] = destID
+	}
+	return remap, nil
 }
 
 func roleNamesByID(ctx context.Context, pool *pgxpool.Pool) (map[string]string, error) {

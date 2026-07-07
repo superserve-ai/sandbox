@@ -49,7 +49,11 @@ var migratedTables = []tableSpec{
 	// copy as-is.
 	{"secret", "team_id = $1"},
 	{"template", "team_id = $1"},
-	{"template_build", "team_id = $1"},
+	// Only terminal builds travel: a copied 'pending' row would be
+	// dispatched by the dest build supervisor, and 'building'/'snapshotting'
+	// rows reference in-flight build VMs that don't exist in the dest cell.
+	// In-flight builds additionally block the copy phase (see activeBuilds).
+	{"template_build", "team_id = $1 AND status NOT IN ('pending', 'building', 'snapshotting')"},
 	// sandbox inserts with snapshot_id NULL; snapshots follow; then the
 	// circular sandbox.snapshot_id ↔ snapshot.sandbox_id FK is relinked.
 	{"sandbox", "team_id = $1"},
