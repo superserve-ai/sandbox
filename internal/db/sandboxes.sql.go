@@ -338,6 +338,37 @@ func (q *Queries) CountActiveSandboxesAtBasePath(ctx context.Context, basePath *
 	return column_1, err
 }
 
+const countSandboxesByTeamPaged = `-- name: CountSandboxesByTeamPaged :one
+SELECT COUNT(*) FROM sandbox
+WHERE team_id = $1
+  AND destroyed_at IS NULL
+  AND metadata @> $2
+  AND ($3::text IS NULL OR status::text = $3::text)
+  AND ($4::text IS NULL
+       OR name ILIKE '%' || $4::text || '%')
+`
+
+type CountSandboxesByTeamPagedParams struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Metadata   []byte    `json:"metadata"`
+	Status     *string   `json:"status"`
+	NameSearch *string   `json:"name_search"`
+}
+
+// Total rows matching the same filters as ListSandboxesByTeamPaged (ignoring
+// pagination + sort). Backs the X-Total-Count response header.
+func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandboxesByTeamPagedParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countSandboxesByTeamPaged,
+		arg.TeamID,
+		arg.Metadata,
+		arg.Status,
+		arg.NameSearch,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createSandbox = `-- name: CreateSandbox :one
 INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
@@ -828,74 +859,57 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 	return items, nil
 }
 
-const listSandboxesByTeam = `-- name: ListSandboxesByTeam :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib FROM sandbox
-WHERE team_id = $1 AND destroyed_at IS NULL
-ORDER BY created_at DESC
-`
-
-func (q *Queries) ListSandboxesByTeam(ctx context.Context, teamID uuid.UUID) ([]Sandbox, error) {
-	rows, err := q.db.Query(ctx, listSandboxesByTeam, teamID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Sandbox{}
-	for rows.Next() {
-		var i Sandbox
-		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.BasePath,
-			&i.DeltaPath,
-			&i.DiskMib,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listSandboxesByTeamWithFilter = `-- name: ListSandboxesByTeamWithFilter :many
+const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
 SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
-ORDER BY created_at DESC
+  AND ($3::text IS NULL OR status::text = $3::text)
+  AND ($4::text IS NULL
+       OR name ILIKE '%' || $4::text || '%')
+ORDER BY
+  CASE WHEN $5::text = 'name'   AND $6::text = 'asc'  THEN name END ASC,
+  CASE WHEN $5::text = 'name'   AND $6::text = 'desc' THEN name END DESC,
+  CASE WHEN $5::text = 'status' AND $6::text = 'asc'  THEN status::text END ASC,
+  CASE WHEN $5::text = 'status' AND $6::text = 'desc' THEN status::text END DESC,
+  CASE WHEN $5::text = 'created_at' AND $6::text = 'asc' THEN created_at END ASC,
+  created_at DESC
+LIMIT $8::bigint
+OFFSET COALESCE($7::bigint, 0)
 `
 
-type ListSandboxesByTeamWithFilterParams struct {
-	TeamID   uuid.UUID `json:"team_id"`
-	Metadata []byte    `json:"metadata"`
+type ListSandboxesByTeamPagedParams struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Metadata   []byte    `json:"metadata"`
+	Status     *string   `json:"status"`
+	NameSearch *string   `json:"name_search"`
+	SortBy     string    `json:"sort_by"`
+	SortDir    string    `json:"sort_dir"`
+	RowOffset  *int64    `json:"row_offset"`
+	RowLimit   *int64    `json:"row_limit"`
 }
 
-// Same as ListSandboxesByTeam but additionally filters rows whose metadata
-// contains every key/value pair in $2 (jsonb @> containment). Pass an empty
-// object '{}'::jsonb to match everything — but prefer ListSandboxesByTeam
-// in that case so we don't pay the (still tiny) cost of the @> evaluation.
-func (q *Queries) ListSandboxesByTeamWithFilter(ctx context.Context, arg ListSandboxesByTeamWithFilterParams) ([]Sandbox, error) {
-	rows, err := q.db.Query(ctx, listSandboxesByTeamWithFilter, arg.TeamID, arg.Metadata)
+// Paginated, sortable, filterable team sandbox list backing the console.
+//
+// Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
+// to match everything), status equality, and a case-insensitive name
+// substring. Sort column/direction come from @sort_by + @sort_dir: exactly one
+// guarded CASE term is active per query (the sort params are constant across
+// rows, so every other term evaluates to NULL for all rows and acts as a
+// no-op), with created_at DESC as the stable tiebreaker and default. A NULL
+// @row_limit returns all rows, preserving the pre-pagination "return
+// everything" default so unpaginated SDK/MCP callers are unaffected.
+func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxesByTeamPagedParams) ([]Sandbox, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByTeamPaged,
+		arg.TeamID,
+		arg.Metadata,
+		arg.Status,
+		arg.NameSearch,
+		arg.SortBy,
+		arg.SortDir,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

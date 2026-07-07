@@ -84,23 +84,56 @@ LIMIT 1;
 SELECT COUNT(*)::bigint FROM template
 WHERE team_id = $1 AND deleted_at IS NULL AND status != 'failed';
 
--- name: ListTemplatesForTeam :many
--- Return the caller's team's templates plus all system-team templates
--- (curated base set visible to everyone). Ordered by created_at desc.
+-- name: ListTemplatesForTeamPaged :many
+-- Paginated, sortable, filterable template list backing the console. The
+-- caller sees its own team's templates plus the curated system-team set; the
+-- @owner selector ('all' | 'team' | 'system') narrows which of the two shelves
+-- to return. Optional case-insensitive name substring filter. Sort follows the
+-- same guarded-CASE pattern as ListSandboxesByTeamPaged — exactly one term is
+-- active per query — with created_at DESC as the default + tiebreaker. A NULL
+-- @row_limit returns all rows, preserving the pre-pagination default.
 SELECT * FROM template
 WHERE deleted_at IS NULL
-  AND (team_id = $1 OR team_id = $2)
-ORDER BY created_at DESC;
-
--- name: ListTemplatesForTeamFiltered :many
--- Same as ListTemplatesForTeam with an optional name prefix filter. Pass
--- NULL to get the unfiltered list (but prefer the unfiltered query then).
-SELECT * FROM template
-WHERE deleted_at IS NULL
-  AND (team_id = $1 OR team_id = $2)
+  AND (
+    (@owner::text = 'all'    AND (team_id = @team_id OR team_id = @system_team_id))
+    OR (@owner::text = 'team'   AND team_id = @team_id)
+    OR (@owner::text = 'system' AND team_id = @system_team_id)
+  )
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
   AND (sqlc.narg('name_prefix')::text IS NULL
-       OR name LIKE sqlc.narg('name_prefix') || '%')
-ORDER BY created_at DESC;
+       OR name LIKE sqlc.narg('name_prefix')::text || '%')
+ORDER BY
+  CASE WHEN @sort_by::text = 'name'     AND @sort_dir::text = 'asc'  THEN name END ASC,
+  CASE WHEN @sort_by::text = 'name'     AND @sort_dir::text = 'desc' THEN name END DESC,
+  CASE WHEN @sort_by::text = 'status'   AND @sort_dir::text = 'asc'  THEN status::text END ASC,
+  CASE WHEN @sort_by::text = 'status'   AND @sort_dir::text = 'desc' THEN status::text END DESC,
+  -- size_bytes and built_at are NULL until a build succeeds. DESC defaults to
+  -- NULLS FIRST in Postgres, which would rank never-built templates above the
+  -- most recently built, so pin NULLS LAST (ASC already defaults to it).
+  CASE WHEN @sort_by::text = 'size'     AND @sort_dir::text = 'asc'  THEN size_bytes END ASC,
+  CASE WHEN @sort_by::text = 'size'     AND @sort_dir::text = 'desc' THEN size_bytes END DESC NULLS LAST,
+  CASE WHEN @sort_by::text = 'built_at' AND @sort_dir::text = 'asc'  THEN built_at END ASC,
+  CASE WHEN @sort_by::text = 'built_at' AND @sort_dir::text = 'desc' THEN built_at END DESC NULLS LAST,
+  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN created_at END ASC,
+  created_at DESC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
+
+-- name: CountTemplatesForTeamPaged :one
+-- Total rows matching the same filters as ListTemplatesForTeamPaged (ignoring
+-- pagination + sort). Backs the X-Total-Count response header.
+SELECT COUNT(*) FROM template
+WHERE deleted_at IS NULL
+  AND (
+    (@owner::text = 'all'    AND (team_id = @team_id OR team_id = @system_team_id))
+    OR (@owner::text = 'team'   AND team_id = @team_id)
+    OR (@owner::text = 'system' AND team_id = @system_team_id)
+  )
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+  AND (sqlc.narg('name_prefix')::text IS NULL
+       OR name LIKE sqlc.narg('name_prefix')::text || '%');
 
 -- name: SoftDeleteTemplateIfUnused :one
 -- Soft-deletes a template only if no live sandbox references it AND no

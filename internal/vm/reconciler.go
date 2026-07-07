@@ -259,7 +259,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if sb.Sandbox.Status != db.SandboxStatusActive {
 				continue
 			}
-			if r.isAlive(ctx, id) {
+			if active[id] {
 				r.clearDrift(id)
 				continue
 			}
@@ -286,7 +286,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if rec.Status != StatusRunning {
 				continue
 			}
-			if r.isAlive(ctx, id) {
+			if active[id] {
 				r.clearDrift(id)
 				continue
 			}
@@ -391,21 +391,21 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed("bolt-orphan:"+id, now) {
 				continue
 			}
-			if !r.consumeAutoFailBudget(id) {
-				r.writeAudit(ctx, id, "budget_exhausted", "stale_cleanup suppressed by rate limit", "boltdb_present_db_missing")
-				continue
-			}
 			rec, getErr := r.mgr.state.Get(id)
 			if getErr != nil || rec == nil {
 				r.clearDrift("bolt-orphan:" + id)
 				continue
 			}
-			log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
-				Msg("BoltDB entry with no DB row — cleaning up")
-			// Stop the unit if it's still live. If the stop fails the VM may
-			// still be running, so leave the entry for next pass — markStale
-			// frees the network slot, which must never happen for a live VM.
-			if rec.Status == StatusRunning {
+			// Only stopping a live unit is destructive; charge the budget there.
+			// Gate on the fail-closed `active` snapshot (the pass bailed if systemctl
+			// couldn't be listed) so an inconclusive check never frees a live VM's slot.
+			if active[id] {
+				if !r.consumeAutoFailBudget(id) {
+					r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "boltdb_present_db_missing")
+					continue
+				}
+				log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
+					Msg("live orphan systemd unit with no DB row — stopping")
 				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
 					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
 					continue
@@ -755,11 +755,6 @@ func dirSize(ctx context.Context, paths []string) int64 {
 		})
 	}
 	return total
-}
-
-// isAlive returns true when the VM's systemd unit is currently active.
-func (r *Reconciler) isAlive(ctx context.Context, vmID string) bool {
-	return isUnitActive(ctx, systemdUnitName(vmID))
 }
 
 // gracePeriodElapsed records the first-seen timestamp for a drifted ID and

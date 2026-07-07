@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1247,6 +1249,25 @@ func decodeMetadata(raw []byte) map[string]string {
 // Sandbox List + Get
 // ---------------------------------------------------------------------------
 
+// sandboxSortColumns are the columns ListSandboxes accepts for `?sort=`. Each
+// maps to a guarded ORDER BY term in ListSandboxesByTeamPaged.
+var sandboxSortColumns = []string{"created_at", "name", "status"}
+
+// sandboxStatusFilterValues are the values ListSandboxes accepts for
+// `?status=`, sourced from the sqlc-generated sandbox_status constants. An
+// unknown value would silently match zero rows in the SQL's text comparison,
+// so the handler rejects it with a 400 instead — mirroring the owner filter
+// on /templates.
+var sandboxStatusFilterValues = []string{
+	string(db.SandboxStatusStarting),
+	string(db.SandboxStatusActive),
+	string(db.SandboxStatusPausing),
+	string(db.SandboxStatusPaused),
+	string(db.SandboxStatusResuming),
+	string(db.SandboxStatusFailed),
+	string(db.SandboxStatusDeleted),
+}
+
 func (h *Handlers) ListSandboxes(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
@@ -1272,22 +1293,61 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	var sandboxes []db.Sandbox
-	if len(filter) == 0 {
-		sandboxes, err = h.DB.ListSandboxesByTeam(c.Request.Context(), teamID)
-	} else {
-		filterJSON, _ := json.Marshal(filter) // map[string]string never fails
-		sandboxes, err = h.DB.ListSandboxesByTeamWithFilter(c.Request.Context(), db.ListSandboxesByTeamWithFilterParams{
-			TeamID:   teamID,
-			Metadata: filterJSON,
-		})
+	// Always a valid jsonb value: '{}' matches every row under @> containment,
+	// so the single paged query serves both filtered and unfiltered requests.
+	metadataJSON := []byte("{}")
+	if len(filter) > 0 {
+		metadataJSON, _ = json.Marshal(filter) // map[string]string never fails
 	}
+
+	// Pagination + sort + optional status/name filters. Omitting `limit`
+	// returns the full list in created_at-desc order — the pre-pagination
+	// contract that unpaginated SDK/MCP callers still rely on.
+	pg, err := parsePageParams(c, sandboxSortColumns, "created_at")
 	if err != nil {
-		log.Error().Err(err).Msg("DB ListSandboxesByTeam failed")
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	statusFilter := nullableStr(c.Query("status"))
+	if statusFilter != nil && !slices.Contains(sandboxStatusFilterValues, *statusFilter) {
+		respondErrorMsg(c, "bad_request",
+			"status must be one of: "+strings.Join(sandboxStatusFilterValues, ", "),
+			http.StatusBadRequest)
+		return
+	}
+	nameSearch := searchTerm(c.Query("q"))
+
+	ctx := c.Request.Context()
+	sandboxes, err := h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
+		TeamID:     teamID,
+		Metadata:   metadataJSON,
+		Status:     statusFilter,
+		NameSearch: nameSearch,
+		SortBy:     pg.SortBy,
+		SortDir:    pg.SortDir,
+		RowOffset:  pg.Offset,
+		RowLimit:   pg.Limit,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("DB ListSandboxesByTeamPaged failed")
 		respondError(c, ErrInternal)
 		return
 	}
+
+	total, err := resolveTotal(pg, len(sandboxes), func() (int64, error) {
+		return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
+			TeamID:     teamID,
+			Metadata:   metadataJSON,
+			Status:     statusFilter,
+			NameSearch: nameSearch,
+		})
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("DB CountSandboxesByTeamPaged failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {

@@ -102,6 +102,43 @@ func (q *Queries) CountInFlightBuildsForTeam(ctx context.Context, teamID uuid.UU
 	return count, err
 }
 
+const countTemplatesForTeamPaged = `-- name: CountTemplatesForTeamPaged :one
+SELECT COUNT(*) FROM template
+WHERE deleted_at IS NULL
+  AND (
+    ($1::text = 'all'    AND (team_id = $2 OR team_id = $3))
+    OR ($1::text = 'team'   AND team_id = $2)
+    OR ($1::text = 'system' AND team_id = $3)
+  )
+  AND ($4::text IS NULL
+       OR name ILIKE '%' || $4::text || '%')
+  AND ($5::text IS NULL
+       OR name LIKE $5::text || '%')
+`
+
+type CountTemplatesForTeamPagedParams struct {
+	Owner        string    `json:"owner"`
+	TeamID       uuid.UUID `json:"team_id"`
+	SystemTeamID uuid.UUID `json:"system_team_id"`
+	NameSearch   *string   `json:"name_search"`
+	NamePrefix   *string   `json:"name_prefix"`
+}
+
+// Total rows matching the same filters as ListTemplatesForTeamPaged (ignoring
+// pagination + sort). Backs the X-Total-Count response header.
+func (q *Queries) CountTemplatesForTeamPaged(ctx context.Context, arg CountTemplatesForTeamPagedParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTemplatesForTeamPaged,
+		arg.Owner,
+		arg.TeamID,
+		arg.SystemTeamID,
+		arg.NameSearch,
+		arg.NamePrefix,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createTemplate = `-- name: CreateTemplate :one
 INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -833,79 +870,67 @@ func (q *Queries) ListPendingBuildsOrdered(ctx context.Context, limit int32) ([]
 	return items, nil
 }
 
-const listTemplatesForTeam = `-- name: ListTemplatesForTeam :many
+const listTemplatesForTeamPaged = `-- name: ListTemplatesForTeamPaged :many
 SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM template
 WHERE deleted_at IS NULL
-  AND (team_id = $1 OR team_id = $2)
-ORDER BY created_at DESC
+  AND (
+    ($1::text = 'all'    AND (team_id = $2 OR team_id = $3))
+    OR ($1::text = 'team'   AND team_id = $2)
+    OR ($1::text = 'system' AND team_id = $3)
+  )
+  AND ($4::text IS NULL
+       OR name ILIKE '%' || $4::text || '%')
+  AND ($5::text IS NULL
+       OR name LIKE $5::text || '%')
+ORDER BY
+  CASE WHEN $6::text = 'name'     AND $7::text = 'asc'  THEN name END ASC,
+  CASE WHEN $6::text = 'name'     AND $7::text = 'desc' THEN name END DESC,
+  CASE WHEN $6::text = 'status'   AND $7::text = 'asc'  THEN status::text END ASC,
+  CASE WHEN $6::text = 'status'   AND $7::text = 'desc' THEN status::text END DESC,
+  -- size_bytes and built_at are NULL until a build succeeds. DESC defaults to
+  -- NULLS FIRST in Postgres, which would rank never-built templates above the
+  -- most recently built, so pin NULLS LAST (ASC already defaults to it).
+  CASE WHEN $6::text = 'size'     AND $7::text = 'asc'  THEN size_bytes END ASC,
+  CASE WHEN $6::text = 'size'     AND $7::text = 'desc' THEN size_bytes END DESC NULLS LAST,
+  CASE WHEN $6::text = 'built_at' AND $7::text = 'asc'  THEN built_at END ASC,
+  CASE WHEN $6::text = 'built_at' AND $7::text = 'desc' THEN built_at END DESC NULLS LAST,
+  CASE WHEN $6::text = 'created_at' AND $7::text = 'asc' THEN created_at END ASC,
+  created_at DESC
+LIMIT $9::bigint
+OFFSET COALESCE($8::bigint, 0)
 `
 
-type ListTemplatesForTeamParams struct {
-	TeamID   uuid.UUID `json:"team_id"`
-	TeamID_2 uuid.UUID `json:"team_id_2"`
+type ListTemplatesForTeamPagedParams struct {
+	Owner        string    `json:"owner"`
+	TeamID       uuid.UUID `json:"team_id"`
+	SystemTeamID uuid.UUID `json:"system_team_id"`
+	NameSearch   *string   `json:"name_search"`
+	NamePrefix   *string   `json:"name_prefix"`
+	SortBy       string    `json:"sort_by"`
+	SortDir      string    `json:"sort_dir"`
+	RowOffset    *int64    `json:"row_offset"`
+	RowLimit     *int64    `json:"row_limit"`
 }
 
-// Return the caller's team's templates plus all system-team templates
-// (curated base set visible to everyone). Ordered by created_at desc.
-func (q *Queries) ListTemplatesForTeam(ctx context.Context, arg ListTemplatesForTeamParams) ([]Template, error) {
-	rows, err := q.db.Query(ctx, listTemplatesForTeam, arg.TeamID, arg.TeamID_2)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Template{}
-	for rows.Next() {
-		var i Template
-		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.BuildSpec,
-			&i.Vcpu,
-			&i.MemoryMib,
-			&i.DiskMib,
-			&i.RootfsPath,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.SizeBytes,
-			&i.ErrorMessage,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.BuiltAt,
-			&i.DeletedAt,
-			&i.BasePath,
-			&i.DeltaPath,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listTemplatesForTeamFiltered = `-- name: ListTemplatesForTeamFiltered :many
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM template
-WHERE deleted_at IS NULL
-  AND (team_id = $1 OR team_id = $2)
-  AND ($3::text IS NULL
-       OR name LIKE $3 || '%')
-ORDER BY created_at DESC
-`
-
-type ListTemplatesForTeamFilteredParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	TeamID_2   uuid.UUID `json:"team_id_2"`
-	NamePrefix *string   `json:"name_prefix"`
-}
-
-// Same as ListTemplatesForTeam with an optional name prefix filter. Pass
-// NULL to get the unfiltered list (but prefer the unfiltered query then).
-func (q *Queries) ListTemplatesForTeamFiltered(ctx context.Context, arg ListTemplatesForTeamFilteredParams) ([]Template, error) {
-	rows, err := q.db.Query(ctx, listTemplatesForTeamFiltered, arg.TeamID, arg.TeamID_2, arg.NamePrefix)
+// Paginated, sortable, filterable template list backing the console. The
+// caller sees its own team's templates plus the curated system-team set; the
+// @owner selector ('all' | 'team' | 'system') narrows which of the two shelves
+// to return. Optional case-insensitive name substring filter. Sort follows the
+// same guarded-CASE pattern as ListSandboxesByTeamPaged — exactly one term is
+// active per query — with created_at DESC as the default + tiebreaker. A NULL
+// @row_limit returns all rows, preserving the pre-pagination default.
+func (q *Queries) ListTemplatesForTeamPaged(ctx context.Context, arg ListTemplatesForTeamPagedParams) ([]Template, error) {
+	rows, err := q.db.Query(ctx, listTemplatesForTeamPaged,
+		arg.Owner,
+		arg.TeamID,
+		arg.SystemTeamID,
+		arg.NameSearch,
+		arg.NamePrefix,
+		arg.SortBy,
+		arg.SortDir,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

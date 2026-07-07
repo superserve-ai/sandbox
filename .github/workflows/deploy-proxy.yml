@@ -1,7 +1,8 @@
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
 # Production NEVER deploys without staging first. Same pattern as Deploy API /
-# Deploy VMD.
+# Deploy VMD. The us-west2 cell host deploys as a final production step,
+# after the primary region succeeds — same shape as Deploy API's usw steps.
 
 name: Deploy Proxy
 
@@ -54,9 +55,13 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      # GCP_REGION scopes label discovery to the primary region so the
+      # usw cell host (same project, same label) isn't folded into this
+      # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy proxy to VMD instances
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
@@ -99,9 +104,13 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      # GCP_REGION keeps this fan-out on the primary region's hosts only;
+      # the usw cell host shares the project and label but deploys in the
+      # step below, after the primary succeeds.
       - name: Discover and deploy proxy to VMD instances
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
@@ -111,4 +120,40 @@ jobs:
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
+          python3 .github/workflows/scripts/deploy-proxy.py
+
+      # The usw cell deploys as a step in this job — not a separate job —
+      # for the same reason Deploy API / CD Migrate / Seed Templates do it
+      # this way: a second job referencing the production environment would
+      # double any approval gate. Running after the primary step means a bad
+      # rollout stops at the primary, and the step reuses the binary built
+      # above (build once, deploy per region). Skipped until
+      # CLOUD_RUN_SERVICE_USW (the repo-level cell-exists flag) is set.
+      # Discovery is the same VMD_LABEL filter scoped to GCP_REGION_USW, so
+      # the cell host must carry the label; zero matches fails the deploy
+      # rather than silently skipping the cell.
+      #
+      # The deploy rewrites /etc/sandbox/proxy.env on the host, so the cell
+      # MUST NOT reuse the prod values: its domain differs per SS-143
+      # (PROXY_DOMAIN_USW = usw-sandbox.superserve.ai) and its token seed
+      # lives in Secret Manager (`sandbox-access-token-seed`), which is what
+      # the cell control plane signs with — writing the primary's seed here
+      # would break every access token in the cell. The seed is fetched at
+      # deploy time so Secret Manager stays the single source of truth.
+      - name: Deploy proxy to usw cell VMD instances
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USW }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
+          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          SANDBOX_ACCESS_TOKEN_SEED=$(gcloud secrets versions access latest \
+            --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
+          export SANDBOX_ACCESS_TOKEN_SEED
           python3 .github/workflows/scripts/deploy-proxy.py

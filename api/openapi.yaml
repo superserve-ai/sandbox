@@ -355,8 +355,16 @@ paths:
       tags: [Sandboxes]
       summary: List all sandboxes
       description: |
-        Returns sandboxes belonging to the authenticated team, optionally
-        filtered by metadata tags.
+        Returns sandboxes belonging to the authenticated team, ordered by
+        creation time (newest first) by default.
+
+        ## Pagination, sorting, and search
+
+        Pass `limit` (and `offset`) to fetch one page at a time; the
+        `X-Total-Count` response header reports the total across all pages.
+        Omitting `limit` returns the full list, so existing unpaginated
+        callers are unaffected. Sort with `sort` + `order`, filter by exact
+        `status`, and search names with `q` (case-insensitive substring).
 
         ## Filtering by metadata
 
@@ -377,9 +385,32 @@ paths:
             are always strings. Example: `?metadata.env=prod`.
           schema:
             type: string
+        - $ref: "#/components/parameters/ListSearch"
+        - name: status
+          in: query
+          required: false
+          description: Filter by exact sandbox status. Unknown values are a `400`.
+          schema:
+            type: string
+            enum:
+              [starting, active, pausing, paused, resuming, failed, deleted]
+        - name: sort
+          in: query
+          required: false
+          description: Column to sort by (paired with `order`).
+          schema:
+            type: string
+            enum: [created_at, name, status]
+            default: created_at
+        - $ref: "#/components/parameters/SortOrder"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
       responses:
         "200":
           description: List of sandboxes belonging to the authenticated team
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/TotalCount"
           content:
             application/json:
               schema:
@@ -1274,25 +1305,62 @@ paths:
       description: |
         Returns the caller's team's templates plus the curated system
         templates (available to everyone, identified by the `superserve/` name
-        prefix — e.g. `superserve/base`, `superserve/python-3.11`, `superserve/node-22`). Filter
-        by `name_prefix=<text>`.
+        prefix — e.g. `superserve/base`, `superserve/python-3.11`, `superserve/node-22`),
+        ordered by creation time (newest first) by default.
+
+        ## Pagination, sorting, and search
+
+        Pass `limit` (and `offset`) to page; `X-Total-Count` reports the total
+        across all pages. Omitting `limit` returns the full list. Narrow the
+        shelves with `owner`, sort with `sort` + `order`, and search names with
+        `q` (case-insensitive substring). The legacy `name_prefix` prefix
+        filter is still honored for backward compatibility.
       security:
         - apiKey: []
       parameters:
         - name: name_prefix
           in: query
           required: false
+          description: Prefix match on the template `name` (legacy; prefer `q`).
           schema:
             type: string
+        - $ref: "#/components/parameters/ListSearch"
+        - name: owner
+          in: query
+          required: false
+          description: |
+            Which shelf to return: `all` (team + system, the default), `team`
+            (only the caller's own templates), or `system` (only the curated
+            Superserve templates).
+          schema:
+            type: string
+            enum: [all, team, system]
+            default: all
+        - name: sort
+          in: query
+          required: false
+          description: Column to sort by (paired with `order`).
+          schema:
+            type: string
+            enum: [created_at, name, status, size, built_at]
+            default: created_at
+        - $ref: "#/components/parameters/SortOrder"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
       responses:
         "200":
           description: List of templates
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/TotalCount"
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/TemplateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -1629,6 +1697,57 @@ components:
         type: string
         enum: [2xx, 3xx, 4xx, 5xx, errors]
       description: Narrow by HTTP status class; `errors` includes 4xx and 5xx.
+
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Maximum rows to return (page size). Omit to return the full list
+        unpaginated — the default, preserved for backward compatibility with
+        callers that page client-side. Values above 200 are clamped to 200.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+
+    PageOffset:
+      name: offset
+      in: query
+      required: false
+      description: Rows to skip before the page. Combine with `limit` to paginate.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+    SortOrder:
+      name: order
+      in: query
+      required: false
+      description: Sort direction applied to `sort`.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+
+    ListSearch:
+      name: q
+      in: query
+      required: false
+      description: Case-insensitive substring match on the resource `name`.
+      schema:
+        type: string
+
+  headers:
+    TotalCount:
+      description: |
+        Total rows matching the query across all pages, ignoring `limit` and
+        `offset`. Read this alongside a `limit`/`offset` request to render
+        pagination controls (page count, "X–Y of Z").
+      schema:
+        type: integer
+        format: int64
 
   schemas:
     PublicSandboxId:

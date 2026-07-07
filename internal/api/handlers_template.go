@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -596,6 +597,11 @@ func (h *Handlers) GetTemplate(c *gin.Context) {
 	c.JSON(http.StatusOK, toTemplateResponse(tpl))
 }
 
+// templateSortColumns are the columns ListTemplates accepts for `?sort=`. Each
+// maps to a guarded ORDER BY term in ListTemplatesForTeamPaged ("size" →
+// size_bytes, "built_at" → the last successful build time).
+var templateSortColumns = []string{"created_at", "name", "status", "size", "built_at"}
+
 func (h *Handlers) ListTemplates(c *gin.Context) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
@@ -605,26 +611,61 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 		return
 	}
 
-	namePrefix := c.Query("name_prefix")
-
-	var rows []db.Template
-	if namePrefix == "" {
-		rows, err = h.DB.ListTemplatesForTeam(c.Request.Context(), db.ListTemplatesForTeamParams{
-			TeamID:   teamID,
-			TeamID_2: h.systemTeamID(),
-		})
-	} else {
-		rows, err = h.DB.ListTemplatesForTeamFiltered(c.Request.Context(), db.ListTemplatesForTeamFilteredParams{
-			TeamID:     teamID,
-			TeamID_2:   h.systemTeamID(),
-			NamePrefix: &namePrefix,
-		})
+	// owner selects which shelf to return: the caller's team, the curated
+	// system templates, or both. Defaults to both (the pre-pagination
+	// behavior). An empty/unknown value would match no rows in the SQL, so
+	// reject it up front with a clear message.
+	owner := c.DefaultQuery("owner", "all")
+	if owner != "all" && owner != "team" && owner != "system" {
+		respondErrorMsg(c, "bad_request", "owner must be one of: all, team, system", http.StatusBadRequest)
+		return
 	}
+
+	pg, err := parsePageParams(c, templateSortColumns, "created_at")
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB ListTemplates failed")
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	// `q` is the console's case-insensitive substring search; `name_prefix` is
+	// the pre-existing prefix filter kept for the SDKs/MCP. Both are optional
+	// and AND together when supplied.
+	nameSearch := searchTerm(c.Query("q"))
+	namePrefix := nullableStr(c.Query("name_prefix"))
+	systemTeamID := h.systemTeamID()
+
+	ctx := c.Request.Context()
+	rows, err := h.DB.ListTemplatesForTeamPaged(ctx, db.ListTemplatesForTeamPagedParams{
+		Owner:        owner,
+		TeamID:       teamID,
+		SystemTeamID: systemTeamID,
+		NameSearch:   nameSearch,
+		NamePrefix:   namePrefix,
+		SortBy:       pg.SortBy,
+		SortDir:      pg.SortDir,
+		RowOffset:    pg.Offset,
+		RowLimit:     pg.Limit,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB ListTemplatesForTeamPaged failed")
 		respondError(c, ErrInternal)
 		return
 	}
+
+	total, err := resolveTotal(pg, len(rows), func() (int64, error) {
+		return h.DB.CountTemplatesForTeamPaged(ctx, db.CountTemplatesForTeamPagedParams{
+			Owner:        owner,
+			TeamID:       teamID,
+			SystemTeamID: systemTeamID,
+			NameSearch:   nameSearch,
+			NamePrefix:   namePrefix,
+		})
+	})
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB CountTemplatesForTeamPaged failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
 
 	out := make([]templateResponse, 0, len(rows))
 	for _, t := range rows {
