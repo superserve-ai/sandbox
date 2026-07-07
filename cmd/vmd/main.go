@@ -475,7 +475,7 @@ func main() {
 	// Reserve slots held by existing VMs (so the pool can't hand out a colliding
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
-	mgr.ReserveStartupSlots()
+	mgr.ReserveStartupSlots(ctx)
 	mgr.SweepStartupOrphanNamespaces()
 
 	// ---- Pre-allocate network slots ----

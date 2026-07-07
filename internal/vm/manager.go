@@ -1739,8 +1739,9 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 // ReserveStartupSlots bumps the network pool's slot high-water mark past every
 // slot an existing VM occupies, so StartPool can run before the backgrounded
 // per-VM reattach without the pool handing out a slot that collides with a
-// not-yet-reattached VM. Cheap: parses slot indices, no kernel work.
-func (m *Manager) ReserveStartupSlots() {
+// not-yet-reattached VM. One systemctl call for the whole fleet; otherwise just
+// parses slot indices, no kernel work.
+func (m *Manager) ReserveStartupSlots(ctx context.Context) {
 	if m.state == nil {
 		return
 	}
@@ -1749,18 +1750,43 @@ func (m *Manager) ReserveStartupSlots() {
 		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
 		return
 	}
-	// Paused VMs keep their slot across a host reboot (which wipes every netns)
-	// and rebuild the same slot on resume, so reserve them unconditionally.
-	// Running records only hold a slot while their process — and thus their
-	// netns — is live; the network layer drops any whose netns is already gone.
+
+	// Authoritative liveness for running records, one call for the whole fleet.
+	// A running FC keeps its network namespace alive even if the /run/netns name
+	// was removed, so nsExists alone would wrongly relinquish a live VM's slot
+	// and hand it to the pool. Fail closed: if the list errors, treat every
+	// running record as live and reserve its slot rather than risk giving one
+	// away.
+	activeUnits, listErr := listActiveFirecrackerUnits(ctx)
+	if listErr != nil {
+		m.log.Warn().Err(listErr).Msg("startup slot reservation: active-unit list failed — reserving all running slots")
+	}
+	active := make(map[string]bool, len(activeUnits))
+	for _, id := range activeUnits {
+		active[id] = true
+	}
+	livenessUnknown := listErr != nil
+
+	// resumable slots are reserved unconditionally; liveOnly slots are reserved
+	// only if their netns still exists (a dead FC's slot is free for reuse).
 	var resumable, liveOnly []string
 	for _, rec := range recs {
 		if rec.Namespace == "" {
 			continue
 		}
-		if rec.Status == StatusPaused {
+		switch {
+		case rec.Status == StatusPaused:
+			// Paused VMs keep their slot across a host reboot (which wipes every
+			// netns) and rebuild it on resume.
 			resumable = append(resumable, rec.Namespace)
-		} else {
+		case livenessUnknown || active[rec.ID]:
+			// Running with a live unit (or liveness unknown): the FC still owns
+			// its namespace even if its /run/netns name is gone. Reserve the
+			// slot — never relinquish one a live VM may still hold.
+			resumable = append(resumable, rec.Namespace)
+		default:
+			// Running but no live unit — a dead FC (e.g. after a host reboot).
+			// Reserve only if its netns lingers; otherwise relinquish for reuse.
 			liveOnly = append(liveOnly, rec.Namespace)
 		}
 	}
