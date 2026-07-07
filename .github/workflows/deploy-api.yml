@@ -35,6 +35,7 @@ on:
       - 'internal/scheduler/**'
       - 'internal/secrets/**'
       - 'internal/supervisor/**'
+      - 'internal/telemetry/**'
       - 'internal/vmdclient/**'
       - 'proto/**'
       - 'go.mod'
@@ -273,7 +274,6 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 

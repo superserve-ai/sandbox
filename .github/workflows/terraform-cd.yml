@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'infra/**'
+      - '.github/workflows/terraform-cd.yml'
 
 jobs:
   wait-for-migrations:
@@ -81,7 +82,7 @@ jobs:
           path: /tmp/controlplane-image.tar.gz
           if-no-files-found: error
 
-  staging-infra:
+  staging-us-central1-infra:
     name: Apply staging/us-central1
     runs-on: ubuntu-latest
     needs: [wait-for-migrations]
@@ -103,8 +104,11 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Install validation dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Verify validation dependencies
+        run: |
+          set -euo pipefail
+          command -v jq
+          command -v curl
 
       - name: Terraform apply staging/us-central1
         run: |
@@ -116,11 +120,11 @@ jobs:
           terraform plan -input=false -out=tfplan
           terraform apply -input=false -auto-approve tfplan
 
-  staging-api:
+  staging-us-central1-api:
     name: Deploy API staging/us-central1
     runs-on: ubuntu-latest
     environment: staging
-    needs: [build-api-image, staging-infra]
+    needs: [build-api-image, staging-us-central1-infra]
     permissions:
       contents: read
       id-token: write
@@ -179,6 +183,7 @@ jobs:
 
       - name: Verify latest revision serves traffic
         run: |
+          set -euo pipefail
           SVC=${{ vars.CLOUD_RUN_SERVICE }}
           ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
           DESC=$(gcloud run services describe $SVC $ARGS --format=json)
@@ -188,7 +193,7 @@ jobs:
             echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
             exit 1
           fi
-          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health" >/dev/null
 
       - name: Smoke test staging/us-central1
         run: |
@@ -196,11 +201,11 @@ jobs:
           scripts/smoke-test-region.sh staging us-central1
           echo "staging/us-central1 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
 
-  west2-infra:
+  production-us-west2-infra:
     name: Apply production/us-west2
     runs-on: ubuntu-latest
     environment: production
-    needs: [staging-api]
+    needs: [staging-us-central1-api]
     permissions:
       contents: read
       id-token: write
@@ -219,8 +224,11 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Install validation dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Verify validation dependencies
+        run: |
+          set -euo pipefail
+          command -v jq
+          command -v curl
 
       - name: Terraform apply production/us-west2
         run: |
@@ -232,11 +240,11 @@ jobs:
           terraform plan -input=false -out=tfplan
           terraform apply -input=false -auto-approve tfplan
 
-  west2-api:
+  production-us-west2-api:
     name: Deploy API production/us-west2
     runs-on: ubuntu-latest
     environment: production
-    needs: [build-api-image, west2-infra]
+    needs: [build-api-image, production-us-west2-infra]
     permissions:
       contents: read
       id-token: write
@@ -278,7 +286,6 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
             --image ${{ vars.GCP_REGION_USW }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve-usw2/controlplane:${{ github.sha }} \
-            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION_USW }} \
             --project ${{ vars.GCP_PROJECT }}
 
@@ -306,17 +313,11 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke test production/us-west2
-        run: |
-          set -euo pipefail
-          scripts/smoke-test-region.sh production us-west2
-          echo "production/us-west2 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
-
-  central1-infra:
+  production-us-central1-infra:
     name: Apply production/us-central1
     runs-on: ubuntu-latest
     environment: production
-    needs: [west2-api]
+    needs: [production-us-west2-api]
     permissions:
       contents: read
       id-token: write
@@ -335,8 +336,11 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Install validation dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Verify validation dependencies
+        run: |
+          set -euo pipefail
+          command -v jq
+          command -v curl
 
       - name: Terraform apply production/us-central1
         run: |
@@ -348,11 +352,11 @@ jobs:
           terraform plan -input=false -out=tfplan
           terraform apply -input=false -auto-approve tfplan
 
-  central1-api:
+  production-us-central1-api:
     name: Deploy API production/us-central1
     runs-on: ubuntu-latest
     environment: production
-    needs: [build-api-image, central1-infra]
+    needs: [build-api-image, production-us-central1-infra]
     permissions:
       contents: read
       id-token: write
@@ -394,7 +398,6 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
@@ -412,6 +415,7 @@ jobs:
 
       - name: Verify latest revision serves traffic
         run: |
+          set -euo pipefail
           SVC=${{ vars.CLOUD_RUN_SERVICE }}
           ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
           DESC=$(gcloud run services describe $SVC $ARGS --format=json)
@@ -421,10 +425,10 @@ jobs:
             echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
             exit 1
           fi
-          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health" >/dev/null
 
       - name: Smoke test production/us-central1
         run: |
           set -euo pipefail
           scripts/smoke-test-region.sh production us-central1
-          echo "production/us-central1 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
+          echo "production/us-central1 deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"

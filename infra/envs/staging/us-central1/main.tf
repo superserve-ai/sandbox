@@ -5,6 +5,18 @@ terraform {
     bucket = "superserve-terraform-state"
     prefix = "staging/us-central1"
   }
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 7.0"
+    }
+  }
+}
+
+provider "google" {
+  project = local.project_id
+  region  = local.region
 }
 
 locals {
@@ -19,6 +31,8 @@ locals {
     managed_by  = "terraform"
     region      = local.region
   }
+
+  staging_otlp_endpoint = "http://10.0.0.2:4318"
 }
 
 module "network" {
@@ -56,6 +70,19 @@ module "network" {
       ]
       description = null
     }
+    api_to_host_otel = {
+      name          = "superserve-staging-api-to-host-otel"
+      direction     = "INGRESS"
+      source_ranges = ["10.8.0.0/28"]
+      target_tags   = ["superserve-vmd"]
+      allow = [
+        {
+          protocol = "tcp"
+          ports    = ["4317", "4318", "50051"]
+        }
+      ]
+      description = "Allow Cloud Run staging connector traffic to host-local VMD and OTEL Collector endpoints."
+    }
   }
   labels = local.common_labels
 }
@@ -77,6 +104,12 @@ module "iam" {
     superserve_github_actions = {
       account_id   = "superserve-github-actions"
       display_name = "GitHub Actions CI/CD Service Account"
+    }
+  }
+  project_bindings = {
+    staging_host_collector_metric_writer = {
+      role    = "roles/monitoring.metricWriter"
+      members = ["serviceAccount:superserve-api@${local.project_id}.iam.gserviceaccount.com"]
     }
   }
   labels = local.common_labels
@@ -108,10 +141,15 @@ module "api" {
   service_account_email = module.iam.service_account_emails["superserve_api"]
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
-    API_PORT          = "8080"
-    EDGE_PROXY_DOMAIN = "staging-sandbox.superserve.ai"
-    SUPABASE_URL      = var.supabase_url
-    VMD_GRPC_ADDRESS  = "10.0.0.2:50051"
+    API_PORT                    = "8080"
+    EDGE_PROXY_DOMAIN           = "staging-sandbox.superserve.ai"
+    OTEL_ENVIRONMENT            = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT = local.staging_otlp_endpoint
+    OTEL_EXPORT_INTERVAL        = "15s"
+    OTEL_METRICS_ENABLED        = "true"
+    OTEL_SERVICE_NAME           = "sandbox-controlplane"
+    SUPABASE_URL                = var.supabase_url
+    VMD_GRPC_ADDRESS            = "10.0.0.2:50051"
   }
   secrets = {
     SANDBOX_ACCESS_TOKEN_SEED = {
@@ -125,6 +163,9 @@ module "api" {
     }
     INTERNAL_API_TOKEN = {
       secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
+    }
+    SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn-${local.resource_suffix}")
     }
   }
   vpc_connector = module.network.vpc_connector_id
@@ -195,6 +236,16 @@ module "observability" {
 
   project_id  = local.project_id
   environment = local.environment
+  dashboards = {
+    sandbox_phase2_operations = {
+      display_name = "Sandbox Telemetry / Staging Operations"
+      definition   = file("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-staging-operations.json")
+    }
+    sandbox_phase2_collector = {
+      display_name = "Sandbox Telemetry / Collector"
+      definition   = file("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-collector.json")
+    }
+  }
   uptime_checks = {
     api = {
       display_name = "superserve-api-staging"
