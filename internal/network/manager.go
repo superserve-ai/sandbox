@@ -466,7 +466,7 @@ func (m *Manager) CleanupVM(vmID string) {
 // pool). When it is not tracked — e.g. a reattached VM whose network state was
 // never restored into devices — it reclaims the slot directly from the
 // namespace so the ns/veth/slot isn't leaked until the next restart sweep.
-// A no-op when the namespace is empty, malformed, or already gone.
+// A no-op only when the namespace is empty or malformed.
 func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	m.mu.Lock()
 	_, tracked := m.devices[vmID]
@@ -477,9 +477,14 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	}
 
 	idx, ok := slotFromNamespace(fallbackNamespace)
-	if !ok || !nsExists(fallbackNamespace) {
+	if !ok {
 		return
 	}
+	// Tear down both sides even if the netns is already gone: `ip netns del`
+	// only removes the in-namespace side, so the host-side veth-N can outlive
+	// its namespace (a crash, or the peer moved back to the host before the ns
+	// delete). Both deletes are best-effort; then reclaim the slot so the pool
+	// reuses it instead of stranding it as a gap below nextSlot.
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
 	m.mu.Lock()
 	m.freeSlots = append(m.freeSlots, idx)
@@ -544,16 +549,29 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	return nil
 }
 
-// ReserveSlotsAbove bumps nextSlot past every slot whose namespace still exists,
-// so the pool won't hand out a slot a not-yet-reattached VM holds. The nsExists
-// guard is load-bearing: reserving a swept stale record's high index would
-// strand the slots below it and could hit ErrNoSlots.
-func (m *Manager) ReserveSlotsAbove(namespaces []string) {
+// ReserveSlotsAbove bumps nextSlot past slots owned by existing VMs so the pool
+// can't hand out a slot a not-yet-reattached VM will reclaim.
+//
+// resumable slots (paused VMs) are reserved unconditionally: a paused VM keeps
+// its slot across a host reboot even though the reboot wipes its netns, and it
+// rebuilds that exact slot on resume — so a missing netns must NOT free it.
+// liveOnly slots (running VMs) are reserved only when their netns still exists;
+// a running record with no netns is stale (the process died, e.g. across a
+// reboot) and its slot is free, so reserving it would strand every lower slot.
+func (m *Manager) ReserveSlotsAbove(resumable, liveOnly []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, ns := range namespaces {
-		if idx, ok := slotFromNamespace(ns); ok && idx >= m.nextSlot && nsExists(ns) {
+	bump := func(ns string) {
+		if idx, ok := slotFromNamespace(ns); ok && idx >= m.nextSlot {
 			m.nextSlot = idx + 1
+		}
+	}
+	for _, ns := range resumable {
+		bump(ns)
+	}
+	for _, ns := range liveOnly {
+		if nsExists(ns) {
+			bump(ns)
 		}
 	}
 }

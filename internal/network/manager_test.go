@@ -39,19 +39,23 @@ func newTestManager() *Manager {
 func TestReserveSlotsAbove(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	m := newTestManager()
-	// ns-5 and ns-2 exist; ns-9 does NOT — the nsExists guard must skip it, since
-	// a stale record whose namespace was already swept must not bump nextSlot.
+	// liveOnly: ns-5 exists (reserved), ns-9 does NOT (stale running record —
+	// skipped so its slot stays free). bogus is unparseable.
 	touchNS(t, dir, "ns-5")
-	touchNS(t, dir, "ns-2")
-	m.ReserveSlotsAbove([]string{"ns-5", "ns-2", "bogus", "ns-9"})
+	m.ReserveSlotsAbove(nil, []string{"ns-5", "bogus", "ns-9"})
 	if m.nextSlot != 6 {
-		t.Fatalf("nextSlot = %d, want 6 (past existing ns-5; ns-9 skipped — no netns; bogus unparseable)", m.nextSlot)
+		t.Fatalf("nextSlot = %d, want 6 (past live ns-5; ns-9 skipped — no netns)", m.nextSlot)
+	}
+	// resumable: a paused VM's slot must be reserved even though its netns is
+	// gone (host reboot wiped it) — it rebuilds ns-20 on resume.
+	m.ReserveSlotsAbove([]string{"ns-20"}, nil)
+	if m.nextSlot != 21 {
+		t.Fatalf("nextSlot = %d, want 21 (paused ns-20 reserved despite missing netns)", m.nextSlot)
 	}
 	// A lower existing index must never pull nextSlot back down.
-	touchNS(t, dir, "ns-3")
-	m.ReserveSlotsAbove([]string{"ns-3"})
-	if m.nextSlot != 6 {
-		t.Fatalf("nextSlot = %d, want 6 (unchanged by lower index)", m.nextSlot)
+	m.ReserveSlotsAbove([]string{"ns-3"}, []string{"ns-4"})
+	if m.nextSlot != 21 {
+		t.Fatalf("nextSlot = %d, want 21 (unchanged by lower index)", m.nextSlot)
 	}
 }
 
@@ -240,14 +244,16 @@ func TestCleanupVMOrNamespace_EmptyAndInvalidNamespaceNoop(t *testing.T) {
 	}
 }
 
-func TestCleanupVMOrNamespace_MissingNamespaceNoop(t *testing.T) {
-	withTestNetnsDir(t) // ns-5 intentionally not touched → nsExists is false
+func TestCleanupVMOrNamespace_MissingNamespaceStillReclaims(t *testing.T) {
+	withTestNetnsDir(t) // ns-5 intentionally not touched → netns already gone
 	m := newTestManager()
 
+	// The host-side veth-N can outlive its netns, so cleanup must still tear it
+	// down and reclaim the slot even when the namespace itself is already gone.
 	m.CleanupVMOrNamespace("vm-u", "ns-5")
 
-	if len(m.freeSlots) != 0 {
-		t.Errorf("freeSlots = %v, want [] (namespace gone, nothing to reclaim)", m.freeSlots)
+	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
+		t.Errorf("freeSlots = %v, want [5] (slot reclaimed despite missing netns)", m.freeSlots)
 	}
 }
 

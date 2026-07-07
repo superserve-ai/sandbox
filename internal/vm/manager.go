@@ -1730,13 +1730,22 @@ func (m *Manager) ReserveStartupSlots() {
 		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
 		return
 	}
-	nss := make([]string, 0, len(recs))
+	// Paused VMs keep their slot across a host reboot (which wipes every netns)
+	// and rebuild the same slot on resume, so reserve them unconditionally.
+	// Running records only hold a slot while their process — and thus their
+	// netns — is live; the network layer drops any whose netns is already gone.
+	var resumable, liveOnly []string
 	for _, rec := range recs {
-		if rec.Namespace != "" {
-			nss = append(nss, rec.Namespace)
+		if rec.Namespace == "" {
+			continue
+		}
+		if rec.Status == StatusPaused {
+			resumable = append(resumable, rec.Namespace)
+		} else {
+			liveOnly = append(liveOnly, rec.Namespace)
 		}
 	}
-	m.netMgr.ReserveSlotsAbove(nss)
+	m.netMgr.ReserveSlotsAbove(resumable, liveOnly)
 }
 
 // ---------------------------------------------------------------------------
