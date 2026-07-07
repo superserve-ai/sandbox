@@ -84,6 +84,12 @@ type Manager struct {
 	freeSlots []int // recycled slot indices
 	nextSlot  int   // next new slot (used when freeSlots is empty)
 
+	// relinquished holds slot indices freed for reuse at startup (running
+	// records whose netns was already gone). The pool may hand these to new
+	// sandboxes before the background reattach cleans up the stale record, so
+	// that stale cleanup must not tear the slot down once ns-N exists again.
+	relinquished map[int]bool
+
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
 
@@ -189,6 +195,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 		hostInterface:  hostInterface,
 		log:            log.With().Str("component", "network").Logger(),
 		devices:        make(map[string]*VMNetInfo),
+		relinquished:   make(map[int]bool),
 		nextSlot:       1,
 		httpProxyPort:  DefaultHTTPProxyPort,
 		tlsProxyPort:   DefaultTLSProxyPort,
@@ -480,6 +487,19 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	if !ok {
 		return
 	}
+	// A slot relinquished at startup may have been reused by the pool. If ns-N
+	// exists again it belongs to a new sandbox — tearing it down or reclaiming
+	// the slot would corrupt that live tenant, so leave it alone. (When the
+	// netns is still gone, the slot wasn't reused and the cleanup below safely
+	// reclaims it and removes any host-side veth the reboot didn't.)
+	m.mu.Lock()
+	wasRelinquished := m.relinquished[idx]
+	m.mu.Unlock()
+	if wasRelinquished && nsExists(fallbackNamespace) {
+		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+			Msg("stale cleanup skipped — relinquished slot reused by pool")
+		return
+	}
 	// Tear down both sides even if the netns is already gone: `ip netns del`
 	// only removes the in-namespace side, so the host-side veth-N can outlive
 	// its namespace (a crash, or the peer moved back to the host before the ns
@@ -572,6 +592,14 @@ func (m *Manager) ReserveSlotsAbove(resumable, liveOnly []string) {
 	for _, ns := range liveOnly {
 		if nsExists(ns) {
 			bump(ns)
+			continue
+		}
+		// Running record with no netns — the process is gone (a host reboot
+		// wipes every netns). Its slot is free for the pool to reuse; record
+		// that so a later stale-record cleanup won't tear the slot down again
+		// once the pool has handed ns-N to a new sandbox.
+		if idx, ok := slotFromNamespace(ns); ok {
+			m.relinquished[idx] = true
 		}
 	}
 }

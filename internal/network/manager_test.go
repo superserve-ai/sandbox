@@ -30,9 +30,10 @@ func touchNS(t *testing.T, dir, name string) {
 
 func newTestManager() *Manager {
 	return &Manager{
-		log:      zerolog.Nop(),
-		devices:  make(map[string]*VMNetInfo),
-		nextSlot: 1,
+		log:          zerolog.Nop(),
+		devices:      make(map[string]*VMNetInfo),
+		relinquished: make(map[int]bool),
+		nextSlot:     1,
 	}
 }
 
@@ -266,5 +267,38 @@ func TestCleanupVMOrNamespace_ReclaimsUntrackedSlot(t *testing.T) {
 
 	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
 		t.Errorf("freeSlots = %v, want [5] (slot reclaimed)", m.freeSlots)
+	}
+}
+
+// A slot relinquished at startup (running record whose netns was gone) that the
+// pool has since reused — ns-5 exists again — must NOT be torn down or reclaimed
+// by the stale record's deferred cleanup, or it corrupts the new sandbox.
+func TestCleanupVMOrNamespace_RelinquishedReusedSlotSkipped(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	// Startup: running record at ns-5 has no netns → relinquished.
+	m.ReserveSlotsAbove(nil, []string{"ns-5"})
+	// Pool reuses slot 5 for a new sandbox (recreates the netns).
+	touchNS(t, dir, "ns-5")
+
+	m.CleanupVMOrNamespace("stale-vm", "ns-5")
+
+	if len(m.freeSlots) != 0 {
+		t.Errorf("freeSlots = %v, want [] (reused slot must not be reclaimed)", m.freeSlots)
+	}
+}
+
+// A relinquished slot the pool did NOT reuse — netns still gone — is safely
+// reclaimed (and any leftover host veth removed) by the deferred cleanup.
+func TestCleanupVMOrNamespace_RelinquishedUnusedSlotReclaimed(t *testing.T) {
+	withTestNetnsDir(t) // ns-5 never recreated → still gone
+	m := newTestManager()
+
+	m.ReserveSlotsAbove(nil, []string{"ns-5"})
+	m.CleanupVMOrNamespace("stale-vm", "ns-5")
+
+	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
+		t.Errorf("freeSlots = %v, want [5] (unused relinquished slot reclaimed)", m.freeSlots)
 	}
 }
