@@ -447,10 +447,12 @@ LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 -- is armed from now() — never retroactively from the pause — so applying a
 -- window can never destroy the sandbox in the same instant. On a non-paused
 -- sandbox the deadline stays NULL and FinalizePause arms it at the next pause.
+-- Keep the ::int::double precision cast: the param is used as both the integer
+-- column and make_interval's double arg; without it Postgres errors 42P08.
 UPDATE sandbox
 SET auto_delete_seconds = sqlc.narg(auto_delete_seconds),
     auto_delete_at = CASE WHEN status = 'paused'
-      THEN now() + make_interval(secs => sqlc.narg(auto_delete_seconds))
+      THEN now() + make_interval(secs => sqlc.narg(auto_delete_seconds)::int::double precision)
       ELSE NULL
     END,
     updated_at = now()
