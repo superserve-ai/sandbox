@@ -115,6 +115,8 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 
 		p.mgr.mu.Lock()
 		p.mgr.devices[vmID] = slot.info
+		// Transfer ownership of the index from the pool to this VM.
+		p.mgr.assignSlotLocked(slot.idx, vmID)
 		p.mgr.mu.Unlock()
 		tDone := time.Now()
 
@@ -134,10 +136,17 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 // configured — the next Claim reuses them with zero setup cost.
 // If the recycled pool is full, the slot is torn down instead.
 func (p *Pool) Return(slot *preallocSlot) {
+	// Transfer ownership back to the pool under the lock BEFORE handing the slot
+	// off: a concurrent Claim that pops it can't be clobbered by a late poolOwner
+	// write, and the recycle-full cleanup below releases poolOwner, not a leak.
+	p.mgr.mu.Lock()
+	p.mgr.assignSlotLocked(slot.idx, poolOwner)
+	p.mgr.mu.Unlock()
+
 	select {
 	case p.recycled <- slot:
 	default:
-		// Recycle pool full — tear down.
+		// Recycle pool full — tear down (cleanup releases the pool's ownership).
 		p.cleanup(slot)
 	}
 }
@@ -216,7 +225,7 @@ func (p *Pool) mustAllocate(ctx context.Context) *preallocSlot {
 }
 
 func (p *Pool) allocate(ctx context.Context) (*preallocSlot, error) {
-	idx, err := p.mgr.claimSlotIndex()
+	idx, err := p.mgr.claimSlotIndex(poolOwner)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +234,9 @@ func (p *Pool) allocate(ctx context.Context) (*preallocSlot, error) {
 	// This is the expensive part we're moving off the hot path.
 	info, vethName, err := p.mgr.setupSlot(ctx, idx)
 	if err != nil {
-		// idx stays consumed — reusing a colliding idx would loop.
+		// Build failed — release the pool's index so it isn't leaked.
+		// claimSlotIndex's nsExists guard prevents re-looping on a colliding idx.
+		p.mgr.releaseIfOwned(idx, poolOwner)
 		return nil, err
 	}
 
@@ -238,7 +249,6 @@ func (p *Pool) cleanup(slot *preallocSlot) {
 	}
 	nsName := slot.info.Namespace
 	p.mgr.cleanupFull(nsName, slot.vethName)
-	p.mgr.mu.Lock()
-	p.mgr.freeSlots = append(p.mgr.freeSlots, slot.idx)
-	p.mgr.mu.Unlock()
+	// The pool slot is gone — release its index back to the recycle list.
+	p.mgr.releaseIfOwned(slot.idx, poolOwner)
 }

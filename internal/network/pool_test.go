@@ -19,6 +19,9 @@ func TestPoolClaim_DiscardsPhantomReturnsNil(t *testing.T) {
 		stopCh:   make(chan struct{}),
 	}
 
+	// A slot in the pool is owned by poolOwner (allocate → claimSlotIndex).
+	// cleanup releases it back to freeSlots only because that ownership holds.
+	m.assignSlotLocked(1, poolOwner)
 	p.fresh <- &preallocSlot{
 		idx:      1,
 		info:     &VMNetInfo{Namespace: "ns-1", HostIP: "10.11.0.1"},

@@ -1643,23 +1643,6 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 	}
 
-	// A running record whose netns was gone at startup had its slot relinquished
-	// for the pool to reuse. The FC is dead (a live one always has its netns), so
-	// this record is stale: reattaching it would bind its vmID onto the namespace
-	// the pool has since handed to a new sandbox, and a later firewall update or
-	// destroy for the stale vmID would then corrupt that live tenant. Refuse; the
-	// reconciler formally clears the record. Paused records are reserved, never
-	// relinquished, so a resumable VM is unaffected.
-	if rec.Status != StatusPaused && m.netMgr.IsRelinquished(rec.Namespace) {
-		log.Warn().Str("namespace", rec.Namespace).Msg("refusing reattach — slot relinquished at startup (stale record)")
-		// Clean the residue (veth/slot the pool hasn't reused) and drop the record
-		// here, so a DELETE that beats the background pass doesn't reach DestroyVM
-		// with no namespace and leak it. Cleanup skips teardown if ns-N was reused.
-		m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
-		m.state.Delete(rec.ID)
-		return nil, false
-	}
-
 	inst := toInstance(rec)
 
 	// Bail early if another caller (a request, or the background pass) already
@@ -1775,12 +1758,13 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 	}
 }
 
-// ReserveStartupSlots bumps the network pool's slot high-water mark past every
-// slot an existing VM occupies, so StartPool can run before the backgrounded
-// per-VM reattach without the pool handing out a slot that collides with a
-// not-yet-reattached VM. One systemctl call for the whole fleet; otherwise just
-// parses slot indices, no kernel work.
-func (m *Manager) ReserveStartupSlots(ctx context.Context) {
+// ReserveStartupSlots reserves every existing record's slot index in the network
+// allocator's owned set (and bumps the high-water mark past it) so StartPool can
+// run before the backgrounded per-VM reattach without the pool ever building on
+// an index a record holds. Every record is reserved unconditionally — a dead
+// record's slot is reclaimed later when the reattach cleans it up. Cheap: parses
+// slot indices, no kernel work, no systemctl.
+func (m *Manager) ReserveStartupSlots(context.Context) {
 	if m.state == nil {
 		return
 	}
@@ -1789,52 +1773,19 @@ func (m *Manager) ReserveStartupSlots(ctx context.Context) {
 		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
 		return
 	}
-
-	// Authoritative liveness for running records, one call for the whole fleet.
-	// A running FC keeps its network namespace alive even if the /run/netns name
-	// was removed, so nsExists alone would wrongly relinquish a live VM's slot
-	// and hand it to the pool. Fail closed: if the list errors, treat every
-	// running record as live and reserve its slot rather than risk giving one
-	// away.
-	activeUnits, listErr := listActiveFirecrackerUnits(ctx)
-	if listErr != nil {
-		m.log.Warn().Err(listErr).Msg("startup slot reservation: active-unit list failed — reserving all running slots")
-	}
-	active := make(map[string]bool, len(activeUnits))
-	for _, id := range activeUnits {
-		active[id] = true
-	}
-
-	resumable, liveOnly := classifyStartupSlots(recs, active, listErr != nil)
-	m.netMgr.ReserveSlotsAbove(resumable, liveOnly)
+	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
 }
 
-// classifyStartupSlots splits records into slots reserved unconditionally
-// (resumable) vs. reserved only if their netns still exists (liveOnly), given
-// the set of active firecracker unit IDs. Pure, so the reserve/relinquish
-// policy is unit-testable without systemd or BoltDB.
-//
-//   - paused: reserved — keeps its slot across a reboot, rebuilt on resume.
-//   - running + active unit (or liveness unknown): reserved — the FC still owns
-//     its namespace even if its /run/netns name was removed, so its slot must
-//     not be relinquished to the pool.
-//   - running + no active unit: liveOnly — a dead FC; reserve only if its netns
-//     lingers, else relinquish the slot for reuse.
-func classifyStartupSlots(recs []VMRecord, active map[string]bool, livenessUnknown bool) (resumable, liveOnly []string) {
+// collectStartupSlots returns vmID→namespace for every record that has one, so
+// each slot is reserved under its owner. Pure — unit-testable without BoltDB.
+func collectStartupSlots(recs []VMRecord) map[string]string {
+	out := make(map[string]string, len(recs))
 	for _, rec := range recs {
-		if rec.Namespace == "" {
-			continue
-		}
-		switch {
-		case rec.Status == StatusPaused:
-			resumable = append(resumable, rec.Namespace)
-		case livenessUnknown || active[rec.ID]:
-			resumable = append(resumable, rec.Namespace)
-		default:
-			liveOnly = append(liveOnly, rec.Namespace)
+		if rec.Namespace != "" {
+			out[rec.ID] = rec.Namespace
 		}
 	}
-	return resumable, liveOnly
+	return out
 }
 
 // ---------------------------------------------------------------------------
