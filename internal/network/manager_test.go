@@ -136,6 +136,32 @@ func TestReserveSlot_NoCollisionWithSandbox(t *testing.T) {
 	}
 }
 
+// TestClaimSlotIndex_ExactSlotDoesNotAdvance pins the WithExactSlot invariant: a
+// Manager bounded to one slot claims exactly that index or fails — it never
+// advances to idx+1, which vmd would not have reserved for the build.
+func TestClaimSlotIndex_ExactSlotDoesNotAdvance(t *testing.T) {
+	withTestNetnsDir(t)
+
+	// Pinned slot already taken → must fail, not fall through to 8.
+	taken := newTestManager()
+	taken.nextSlot, taken.maxSlot = 7, 7 // WithExactSlot(7)
+	taken.slotOwner[7] = "other"
+	if _, err := taken.claimSlotIndex("build-x"); err == nil {
+		t.Fatal("want ErrNoSlots when the pinned slot is taken, got nil (advanced past the pin)")
+	}
+
+	// Pinned slot free → claims exactly 7.
+	free := newTestManager()
+	free.nextSlot, free.maxSlot = 7, 7
+	idx, err := free.claimSlotIndex("build-x")
+	if err != nil {
+		t.Fatalf("claimSlotIndex: %v", err)
+	}
+	if idx != 7 {
+		t.Errorf("idx = %d, want 7 (pinned)", idx)
+	}
+}
+
 func TestClaimSlotIndex_PrefersFreeSlotsLIFO(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()

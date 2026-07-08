@@ -361,7 +361,7 @@ func fsyncBuildArtifacts(snapDir string, paths ...string) error {
 func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID string) (*network.Manager, *network.VMNetInfo, func(), error) {
 	log := newLogger("network")
 	mgr, err := network.NewManager(ctx, hostIface, log,
-		network.WithStartSlot(slotIndex),
+		network.WithExactSlot(slotIndex),
 		network.WithHTTPProxyPort(0), // no egress proxy for builds
 	)
 	if err != nil {

@@ -83,6 +83,7 @@ type Manager struct {
 	devices   map[string]*VMNetInfo
 	freeSlots []int // recycled slot indices, guaranteed absent from slotOwner
 	nextSlot  int   // next new slot (used when freeSlots is empty)
+	maxSlot   int   // upper bound for new-slot allocation (0 = MaxSlots); WithExactSlot pins to one
 
 	// slotOwner is the single source of truth for slot allocation AND identity:
 	// slotOwner[idx] == the current owner of slot index idx, one of
@@ -151,12 +152,13 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 // ManagerOption configures optional Manager behavior.
 type ManagerOption func(*Manager)
 
-// WithStartSlot sets the starting slot index for network allocation. Used by a
-// template-builder subprocess to build exactly the one slot vmd reserved for it
-// via ReserveSlot — the reservation, not a disjoint range, is what keeps a build
-// from colliding with vmd's sandbox slots.
-func WithStartSlot(idx int) ManagerOption {
-	return func(m *Manager) { m.nextSlot = idx }
+// WithExactSlot pins the Manager to exactly slot idx: it claims that one index
+// or fails with ErrNoSlots, never advancing to idx+1. A template-builder
+// subprocess uses this to build precisely the slot vmd reserved for it via
+// ReserveSlot; if that slot is somehow unavailable the build fails cleanly
+// instead of silently running on an index vmd never reserved.
+func WithExactSlot(idx int) ManagerOption {
+	return func(m *Manager) { m.nextSlot = idx; m.maxSlot = idx }
 }
 
 // WithHTTPProxyPort sets the HTTP proxy port for egress REDIRECT rules.
@@ -764,10 +766,17 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 // kernel network state. The caller — a template-builder subprocess — creates
 // ns-<idx>/veth-<idx> itself; the reservation is what stops vmd's sandbox
 // allocator from handing the same index to a VM, so builds and sandboxes draw
-// from one authoritative allocator instead of racing disjoint ranges. Release it
-// (and tear down any residue) with CleanupVMOrNamespace(owner, "ns-<idx>").
+// from one authoritative allocator instead of racing disjoint ranges. Pair every
+// ReserveSlot with a ReleaseSlot.
 func (m *Manager) ReserveSlot(owner string) (int, error) {
 	return m.claimSlotIndex(owner)
+}
+
+// ReleaseSlot frees a slot reserved via ReserveSlot and tears down any ns/veth
+// the caller built at idx. The inverse of ReserveSlot; it owns the namespace
+// naming so callers never reconstruct "ns-<idx>" themselves.
+func (m *Manager) ReleaseSlot(owner string, idx int) {
+	m.CleanupVMOrNamespace(owner, fmt.Sprintf("ns-%d", idx))
 }
 
 // claimSlotIndex picks a slot idx that is unowned and not present in the kernel,
@@ -783,7 +792,11 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 			idx = m.freeSlots[len(m.freeSlots)-1]
 			m.freeSlots = m.freeSlots[:len(m.freeSlots)-1]
 		} else {
-			if m.nextSlot > MaxSlots {
+			ceiling := MaxSlots
+			if m.maxSlot > 0 {
+				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
+			}
+			if m.nextSlot > ceiling {
 				return 0, ErrNoSlots
 			}
 			idx = m.nextSlot

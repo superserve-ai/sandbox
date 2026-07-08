@@ -121,7 +121,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	if err != nil {
 		return nil, fmt.Errorf("reserve build network slot: %w", err)
 	}
-	defer m.netMgr.CleanupVMOrNamespace(buildVMID, fmt.Sprintf("ns-%d", slotIndex))
+	defer m.netMgr.ReleaseSlot(buildVMID, slotIndex)
 
 	cmd := exec.CommandContext(ctx, m.cfg.TemplateBuilderBin,
 		"--template-id", req.TemplateID,
