@@ -1773,20 +1773,19 @@ func (m *Manager) ReserveStartupSlots(context.Context) {
 		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
 		return
 	}
-	nss := collectStartupSlots(recs)
-	m.netMgr.ReserveSlotsAbove(nss)
+	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
 }
 
-// collectStartupSlots returns the namespace of every record that has one. Pure,
-// so the reservation input is unit-testable without BoltDB.
-func collectStartupSlots(recs []VMRecord) []string {
-	nss := make([]string, 0, len(recs))
+// collectStartupSlots returns vmID→namespace for every record that has one, so
+// each slot is reserved under its owner. Pure — unit-testable without BoltDB.
+func collectStartupSlots(recs []VMRecord) map[string]string {
+	out := make(map[string]string, len(recs))
 	for _, rec := range recs {
 		if rec.Namespace != "" {
-			nss = append(nss, rec.Namespace)
+			out[rec.ID] = rec.Namespace
 		}
 	}
-	return nss
+	return out
 }
 
 // ---------------------------------------------------------------------------

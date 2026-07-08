@@ -31,30 +31,28 @@ func touchNS(t *testing.T, dir, name string) {
 
 func newTestManager() *Manager {
 	return &Manager{
-		log:      zerolog.Nop(),
-		devices:  make(map[string]*VMNetInfo),
-		owned:    make(map[int]struct{}),
-		nextSlot: 1,
+		log:       zerolog.Nop(),
+		devices:   make(map[string]*VMNetInfo),
+		slotOwner: make(map[int]string),
+		nextSlot:  1,
 	}
 }
 
 func TestReserveSlotsAbove(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
-	// Every record's slot is reserved into owned and bumps nextSlot — including
-	// ns-9 whose netns is absent (a dead record still holds its index until the
-	// reattach reclaims it). bogus is unparseable and skipped.
-	m.ReserveSlotsAbove([]string{"ns-5", "bogus", "ns-9"})
+	// Every record's slot is reserved under its vmID and bumps nextSlot —
+	// including ns-9 whose netns is absent (a dead record still holds its index
+	// until the reattach reclaims it). bogus is unparseable and skipped.
+	m.ReserveSlotsAbove(map[string]string{"vm-5": "ns-5", "vm-b": "bogus", "vm-9": "ns-9"})
 	if m.nextSlot != 10 {
 		t.Fatalf("nextSlot = %d, want 10 (past highest reserved ns-9)", m.nextSlot)
 	}
-	for _, idx := range []int{5, 9} {
-		if _, ok := m.owned[idx]; !ok {
-			t.Errorf("slot %d must be owned after reservation", idx)
-		}
+	if m.slotOwner[5] != "vm-5" || m.slotOwner[9] != "vm-9" {
+		t.Errorf("slots must be owned by their vmIDs: slotOwner=%v", m.slotOwner)
 	}
 	// A lower index reserves but must never pull nextSlot back down.
-	m.ReserveSlotsAbove([]string{"ns-3"})
+	m.ReserveSlotsAbove(map[string]string{"vm-3": "ns-3"})
 	if m.nextSlot != 10 {
 		t.Fatalf("nextSlot = %d, want 10 (unchanged by lower index)", m.nextSlot)
 	}
@@ -94,7 +92,7 @@ func TestClaimSlotIndex_FreshNextSlot(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
 
-	idx, err := m.claimSlotIndex()
+	idx, err := m.claimSlotIndex(poolOwner)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -111,7 +109,7 @@ func TestClaimSlotIndex_PrefersFreeSlotsLIFO(t *testing.T) {
 	m := newTestManager()
 	m.freeSlots = []int{5, 7}
 
-	idx, err := m.claimSlotIndex()
+	idx, err := m.claimSlotIndex(poolOwner)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -132,7 +130,7 @@ func TestClaimSlotIndex_SkipsPhantomFromNextSlot(t *testing.T) {
 	touchNS(t, dir, "ns-2")
 	m := newTestManager()
 
-	idx, err := m.claimSlotIndex()
+	idx, err := m.claimSlotIndex(poolOwner)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -150,7 +148,7 @@ func TestClaimSlotIndex_SkipsPhantomFromFreeSlots(t *testing.T) {
 	m := newTestManager()
 	m.freeSlots = []int{5, 7}
 
-	idx, err := m.claimSlotIndex()
+	idx, err := m.claimSlotIndex(poolOwner)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -167,7 +165,7 @@ func TestClaimSlotIndex_ErrNoSlotsWhenExhausted(t *testing.T) {
 	m := newTestManager()
 	m.nextSlot = MaxSlots + 1
 
-	_, err := m.claimSlotIndex()
+	_, err := m.claimSlotIndex(poolOwner)
 	if !errors.Is(err, ErrNoSlots) {
 		t.Errorf("err = %v, want ErrNoSlots", err)
 	}
@@ -248,6 +246,7 @@ func TestCleanupVMOrNamespace_EmptyAndInvalidNamespaceNoop(t *testing.T) {
 func TestCleanupVMOrNamespace_MissingNamespaceStillReclaims(t *testing.T) {
 	withTestNetnsDir(t) // ns-5 intentionally not touched → netns already gone
 	m := newTestManager()
+	m.slotOwner[5] = "vm-u" // vm-u owns slot 5 (reserved record)
 
 	// The host-side veth-N can outlive its netns, so cleanup must still tear it
 	// down and reclaim the slot even when the namespace itself is already gone.
@@ -262,11 +261,34 @@ func TestCleanupVMOrNamespace_ReclaimsUntrackedSlot(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-5")
 	m := newTestManager()
+	m.slotOwner[5] = "vm-u" // vm-u owns slot 5
 
 	m.CleanupVMOrNamespace("vm-u", "ns-5")
 
 	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
 		t.Errorf("freeSlots = %v, want [5] (slot reclaimed)", m.freeSlots)
+	}
+	if _, ok := m.slotOwner[5]; ok {
+		t.Error("slot 5 must be released from slotOwner")
+	}
+}
+
+// Identity guard (the core fix): a stale cleanup for an old vmID must NOT tear
+// down or reclaim a slot the pool/another VM has since reused.
+func TestCleanupVMOrNamespace_SkipsSlotReusedByAnotherOwner(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-5")
+	m := newTestManager()
+	m.slotOwner[5] = "new-tenant" // slot 5 was freed and reused by a new VM
+
+	// A late cleanup for the OLD owner of ns-5 must be a no-op.
+	m.CleanupVMOrNamespace("old-vm", "ns-5")
+
+	if m.slotOwner[5] != "new-tenant" {
+		t.Errorf("slot 5 ownership must be untouched, got %q", m.slotOwner[5])
+	}
+	if len(m.freeSlots) != 0 {
+		t.Errorf("freeSlots = %v, want [] (must not reclaim a reused slot)", m.freeSlots)
 	}
 }
 
@@ -275,16 +297,16 @@ func TestCleanupVMOrNamespace_ReclaimsUntrackedSlot(t *testing.T) {
 func TestClaimSlotIndex_SkipsOwned(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
-	m.owned[1] = struct{}{} // idx 1 reserved/owned; nextSlot still 1
+	m.slotOwner[1] = "vm-a" // idx 1 owned by a VM; nextSlot still 1
 
-	idx, err := m.claimSlotIndex()
+	idx, err := m.claimSlotIndex(poolOwner)
 	if err != nil {
 		t.Fatalf("claimSlotIndex: %v", err)
 	}
 	if idx == 1 {
 		t.Fatal("claimSlotIndex returned owned idx 1")
 	}
-	if _, ok := m.owned[idx]; !ok {
+	if _, ok := m.slotOwner[idx]; !ok {
 		t.Errorf("returned idx %d must be marked owned", idx)
 	}
 }
@@ -296,9 +318,9 @@ func TestClaimSlotIndex_SkipsOwned(t *testing.T) {
 func TestClaimSlotIndex_PhantomRevivalPrevented(t *testing.T) {
 	withTestNetnsDir(t) // ns-1 absent: the warm slot's netns was deleted (phantom)
 	m := newTestManager()
-	m.owned[1] = struct{}{} // idx 1 is a warm pool slot, still owned
+	m.slotOwner[1] = poolOwner // idx 1 is a warm pool slot, still owned
 
-	idx, err := m.claimSlotIndex()
+	idx, err := m.claimSlotIndex(poolOwner)
 	if err != nil {
 		t.Fatalf("claimSlotIndex: %v", err)
 	}
@@ -319,7 +341,7 @@ func TestClaimSlotIndex_ConcurrentDistinct(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			idx, err := m.claimSlotIndex()
+			idx, err := m.claimSlotIndex(poolOwner)
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -342,11 +364,11 @@ func TestClaimSlotIndex_ConcurrentDistinct(t *testing.T) {
 func TestCleanupVMOrNamespace_ReleasesOwnership(t *testing.T) {
 	withTestNetnsDir(t) // ns-5 absent
 	m := newTestManager()
-	m.ReserveSlotsAbove([]string{"ns-5"}) // ns-5 owned (reserved record)
+	m.ReserveSlotsAbove(map[string]string{"stale-vm": "ns-5"}) // stale-vm owns ns-5
 
 	m.CleanupVMOrNamespace("stale-vm", "ns-5")
 
-	if _, ok := m.owned[5]; ok {
+	if _, ok := m.slotOwner[5]; ok {
 		t.Error("slot 5 must be released from owned after cleanup")
 	}
 	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {

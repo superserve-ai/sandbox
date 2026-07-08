@@ -81,32 +81,27 @@ type Manager struct {
 
 	mu        sync.Mutex
 	devices   map[string]*VMNetInfo
-	freeSlots []int // recycled slot indices, guaranteed NOT in owned
+	freeSlots []int // recycled slot indices, guaranteed absent from slotOwner
 	nextSlot  int   // next new slot (used when freeSlots is empty)
 
-	// owned is the single source of truth for "slot index N is allocated": to a
-	// mid-build, a warm pool slot, a live VM, or a reserved existing record. An
-	// index is free (claimable by claimSlotIndex) iff it is NOT in owned.
+	// slotOwner is the single source of truth for slot allocation AND identity:
+	// slotOwner[idx] == the current owner of slot index idx, one of
+	//   - a VM/record vmID   (a live VM, or a record reserving its index)
+	//   - poolOwner          (a warm/mid-build pool slot not yet handed to a VM)
+	//   - teardownOwner      (a slot being torn down; held so no one re-claims it)
+	// An index is free (claimable) iff it has NO entry.
 	//
-	// This closes the slot-duplication class of bug: because a warm pool slot's
-	// index stays owned for its whole life (build → warm-in-channel → claimed),
-	// claimSlotIndex can never rebuild the same index into a second warm slot,
-	// and because existing records reserve their index here, the pool can never
-	// build on an index a record already holds. Ownership by index (not by
-	// namespace name, which is reused) is what makes it collision-proof.
+	// Identity is load-bearing, not decoration: a release/teardown acts ONLY when
+	// the caller still owns the index (releaseIfOwned), so a stale cleanup for an
+	// old vmID cannot tear down or free a slot the pool/another VM has since
+	// reused. And because a warm pool slot's index stays owned for its whole life
+	// (build → warm → claimed), claimSlotIndex can never rebuild the same index
+	// into a second warm slot — the root guarantee against slot duplication.
 	//
-	// Every slot path must maintain this invariant. The full transition table:
-	//   claimSlotIndex picks idx ∉ owned        → add(idx)
-	//   setupSlot fails (via caller)            → del(idx) + freeSlots
-	//   pool.Claim hands warm slot to a VM      → keep (pool→VM transfer)
-	//   pool.cleanup (phantom/drain)            → del(idx) + freeSlots
-	//   pool.Return recycles a slot             → keep (pool holds it)
-	//   CleanupVM full teardown                 → del(idx) + freeSlots
-	//   CleanupVM pool-return                   → keep
-	//   CleanupVMOrNamespace reclaim            → del(idx) + freeSlots
-	//   ReattachVM / EnsureVMSlot (records)     → add(idx) (idempotent; reserved)
-	//   ReserveSlotsAbove (startup)             → add(idx) for every record
-	owned map[int]struct{}
+	// The transition helpers below are the ONLY way slotOwner/freeSlots change;
+	// every slot path must route through them so ownership can never be dropped
+	// (leak) or duplicated (double hand-out).
+	slotOwner map[int]string
 
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
@@ -213,7 +208,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 		hostInterface:  hostInterface,
 		log:            log.With().Str("component", "network").Logger(),
 		devices:        make(map[string]*VMNetInfo),
-		owned:          make(map[int]struct{}),
+		slotOwner:      make(map[int]string),
 		nextSlot:       1,
 		httpProxyPort:  DefaultHTTPProxyPort,
 		tlsProxyPort:   DefaultTLSProxyPort,
@@ -270,15 +265,16 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		m.log.Info().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
 	}
 
-	idx, err := m.claimSlotIndex()
+	idx, err := m.claimSlotIndex(vmID)
 	if err != nil {
 		return nil, err
 	}
 
 	info, _, err := m.setupSlot(ctx, idx)
 	if err != nil {
-		// Build failed — release the index so it isn't leaked from owned.
-		m.freeSlot(idx)
+		// Build failed — release the index (we are its sole owner) so it isn't
+		// leaked. releaseIfOwned keeps it correct even if state moved under us.
+		m.releaseIfOwned(idx, vmID)
 		return nil, err
 	}
 
@@ -446,8 +442,11 @@ func (m *Manager) CleanupVM(vmID string) {
 		return
 	}
 
-	var idx int
-	fmt.Sscanf(info.Namespace, "ns-%d", &idx)
+	idx, parsed := slotFromNamespace(info.Namespace)
+	if !parsed {
+		m.log.Warn().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("cleanup: unparseable namespace — skipping slot reclaim")
+		return
+	}
 	vethName := fmt.Sprintf("veth-%d", idx)
 
 	// Remove per-sandbox egress proxy rules.
@@ -459,16 +458,16 @@ func (m *Manager) CleanupVM(vmID string) {
 	// nftables stay configured; the next Claim re-adds vmID-specific
 	// rules. Skipped when info.Firewall is nil (reattached VM whose
 	// in-ns handle couldn't be rebound) — pooling would let the next
-	// Claim silently lose per-VM egress filtering.
+	// Claim silently lose per-VM egress filtering. Return transfers ownership
+	// from this VM back to the pool.
 	if m.pool != nil && info.Firewall != nil {
 		_ = info.Firewall.ReplaceUserRules(nil, nil)
 		m.pool.Return(&preallocSlot{idx: idx, info: info, vethName: vethName})
 		return
 	}
 
-	// No pool — full teardown. Release the index from owned (the pool-return
-	// path above keeps it owned because the pool still holds the slot).
-	m.freeSlot(idx)
+	// No pool — full teardown. Release the index only if this VM still owns it.
+	m.releaseIfOwned(idx, vmID)
 
 	if info.Firewall != nil {
 		if err := info.Firewall.Close(); err != nil {
@@ -508,29 +507,46 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	if !ok {
 		return
 	}
-	// This slot belongs to the stale record being cleaned up. Because existing
-	// records reserve their index in owned at startup, the pool never builds on
-	// it, so there is no live tenant to protect here — tear it down and release
-	// the index. Tear down both sides even if the netns is already gone:
-	// `ip netns del` only removes the in-namespace side, so the host-side veth-N
-	// can outlive its namespace.
+	// Only tear down + reclaim if this vmID still owns the index. A stale cleanup
+	// (e.g. a DELETE that captured the old namespace) that races the pool reusing
+	// the slot for a new tenant must NOT destroy the new tenant's ns/veth. Claim
+	// the teardown atomically (vmID → teardownOwner) so a concurrent claimSlotIndex
+	// can't grab the index while we run cleanupFull below.
+	m.mu.Lock()
+	if m.slotOwner[idx] != vmID {
+		m.mu.Unlock()
+		return
+	}
+	m.slotOwner[idx] = teardownOwner
+	m.mu.Unlock()
+
+	// Tear down both sides even if the netns is already gone: `ip netns del`
+	// only removes the in-namespace side, so the host-side veth-N can outlive it.
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
-	m.freeSlot(idx)
+	m.releaseIfOwned(idx, teardownOwner)
 	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
 		Msg("reclaimed network slot for untracked VM")
 }
 
-// Forget drops vmID from the in-memory device map without any kernel teardown,
-// slot reclamation, or egress change. It reverses a reattach that raced a
-// concurrent DestroyVM/markStale: that path already tore down (or recycled to
-// the pool) the slot, so tearing it down again here would double-free it or
-// clobber the new owner of a recycled ns/veth. The host IP is left registered
-// in the egress proxy — it is keyed by slot, so a reused slot's new owner may
-// already hold it.
+// Forget reverses an in-memory reattach that raced a concurrent DestroyVM/
+// markStale: it drops vmID from devices and releases the reattach's slot
+// reservation — but ONLY the index this vmID still owns (releaseIfOwned). If the
+// racing destroy already freed or the pool already reused the index, ownership
+// has moved on and Forget leaves it untouched, so it neither double-frees nor
+// clobbers a new tenant. No kernel teardown here (the destroy path did that);
+// the host IP is left registered in the egress proxy (keyed by slot, a reused
+// slot's new owner may already hold it).
 func (m *Manager) Forget(vmID string) {
 	m.mu.Lock()
+	info, ok := m.devices[vmID]
 	delete(m.devices, vmID)
 	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	if idx, parsed := slotFromNamespace(info.Namespace); parsed {
+		m.releaseIfOwned(idx, vmID)
+	}
 }
 
 // ReattachVM rebinds vmd's view of an already-running VM's network state
@@ -567,10 +583,11 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	}
 
 	m.mu.Lock()
-	// Reserve this record's index in owned so the pool can't build on it, and
-	// bump nextSlot past it. (Startup reservation usually did this already; this
-	// keeps a lazy reattach safe too.)
-	m.ownSlotLocked(idx)
+	// Reserve this record's index under its vmID so the pool can't build on it,
+	// and bump nextSlot past it. (Startup reservation usually did this already;
+	// this keeps a lazy reattach safe too.) reserveSlotLocked also removes idx
+	// from freeSlots, keeping freeSlots ∩ slotOwner disjoint.
+	m.reserveSlotLocked(idx, vmID)
 	if idx >= m.nextSlot {
 		m.nextSlot = idx + 1
 	}
@@ -598,25 +615,27 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	return nil
 }
 
-// ReserveSlotsAbove reserves every existing record's slot index in owned (and
-// bumps nextSlot past it) so the pool can never build on an index a record
-// holds. Called once at startup with every record namespace, BEFORE StartPool.
+// ReserveSlotsAbove reserves every existing record's slot index under its vmID
+// (and bumps nextSlot past it) so the pool can never build on an index a record
+// holds. Called once at startup with vmID→namespace for every record, BEFORE
+// StartPool. Reserving under the vmID means a later stale cleanup for that vmID
+// can identity-match and release exactly its own index.
 //
 // Every record is reserved unconditionally — including a stale/dead one whose
 // netns is gone. Reserving a dead slot only strands it transiently: the
-// background reattach reclaims it (freeSlot) when it cleans the stale record, so
-// the index returns to the recycle list. This is deliberately simpler (and
-// safer) than trying to free dead slots up front, which is what let the pool
-// collide with a record and duplicate a slot.
-func (m *Manager) ReserveSlotsAbove(namespaces []string) {
+// background reattach reclaims it when it cleans the stale record, so the index
+// returns to the recycle list. This is deliberately simpler (and safer) than
+// trying to free dead slots up front, which is what let the pool collide with a
+// record and duplicate a slot.
+func (m *Manager) ReserveSlotsAbove(reservations map[string]string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, ns := range namespaces {
+	for vmID, ns := range reservations {
 		idx, ok := slotFromNamespace(ns)
 		if !ok {
 			continue
 		}
-		m.ownSlotLocked(idx)
+		m.reserveSlotLocked(idx, vmID)
 		if idx >= m.nextSlot {
 			m.nextSlot = idx + 1
 		}
@@ -635,8 +654,15 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		return nil, fmt.Errorf("ensure %s: cannot parse slot from namespace %q", vmID, namespace)
 	}
 
+	// Reserve this record's index under its vmID BEFORE any rebuild, so the pool
+	// can't claim idx during the cleanupFull/setupSlot window below. Ownership was
+	// almost always taken at startup already; this is idempotent.
 	m.mu.Lock()
 	existing, hasDevice := m.devices[vmID]
+	m.reserveSlotLocked(idx, vmID)
+	if idx >= m.nextSlot {
+		m.nextSlot = idx + 1
+	}
 	m.mu.Unlock()
 
 	var info *VMNetInfo
@@ -671,18 +697,6 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 	}
 
 	m.mu.Lock()
-	// Reserve this record's index in owned so the pool can't build on it while
-	// this VM holds it, and remove it from the recycle list if present.
-	m.ownSlotLocked(idx)
-	if idx >= m.nextSlot {
-		m.nextSlot = idx + 1
-	}
-	for i, s := range m.freeSlots {
-		if s == idx {
-			m.freeSlots = append(m.freeSlots[:i], m.freeSlots[i+1:]...)
-			break
-		}
-	}
 	m.devices[vmID] = info
 	m.mu.Unlock()
 	m.registerEgress(vmID, info)
@@ -709,30 +723,55 @@ func slotFromNamespace(namespace string) (int, bool) {
 	return idx, true
 }
 
-// ownSlotLocked marks idx allocated. Caller must hold m.mu. Idempotent.
-func (m *Manager) ownSlotLocked(idx int) { m.owned[idx] = struct{}{} }
+// Sentinel owners (see slotOwner). Prefixed with NUL so they can never collide
+// with a real vmID.
+const (
+	poolOwner     = "\x00pool"     // warm/mid-build pool slot, not yet a VM's
+	teardownOwner = "\x00teardown" // slot mid-teardown; held so it isn't reclaimed
+)
 
-// freeSlotLocked releases idx — drops ownership and returns it to the recycle
-// list so a later claimSlotIndex can reuse it. Caller must hold m.mu. This is
-// the ONLY way a slot leaves owned, so every teardown path must route through
-// it (directly or via freeSlot) to avoid leaking the index.
-func (m *Manager) freeSlotLocked(idx int) {
-	delete(m.owned, idx)
-	m.freeSlots = append(m.freeSlots, idx)
+// assignSlotLocked sets the owner of idx (a fresh claim or an owner transfer,
+// e.g. pool→VM on Claim). Caller must hold m.mu and must have already removed
+// idx from freeSlots (claimSlotIndex pops it; transfers keep it out).
+func (m *Manager) assignSlotLocked(idx int, owner string) { m.slotOwner[idx] = owner }
+
+// reserveSlotLocked marks idx owned by a record and removes it from the recycle
+// list if present — the record-path acquire that keeps freeSlots ∩ slotOwner
+// disjoint. Caller must hold m.mu.
+func (m *Manager) reserveSlotLocked(idx int, owner string) {
+	m.slotOwner[idx] = owner
+	m.removeFromFreeSlotsLocked(idx)
 }
 
-// freeSlot releases idx, taking the lock.
-func (m *Manager) freeSlot(idx int) {
+func (m *Manager) removeFromFreeSlotsLocked(idx int) {
+	for i, s := range m.freeSlots {
+		if s == idx {
+			m.freeSlots = append(m.freeSlots[:i], m.freeSlots[i+1:]...)
+			return
+		}
+	}
+}
+
+// releaseIfOwned releases idx only when it is still owned by owner, returning
+// whether it did. This is the identity guard that stops a stale cleanup for an
+// old vmID from freeing a slot the pool or another VM has since reused.
+func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	m.mu.Lock()
-	m.freeSlotLocked(idx)
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	if m.slotOwner[idx] != owner {
+		return false
+	}
+	delete(m.slotOwner, idx)
+	m.freeSlots = append(m.freeSlots, idx)
+	return true
 }
 
-// claimSlotIndex picks a slot idx that is unowned (see the owned invariant) and
-// not present in the kernel, marks it owned, and returns it. Ownership persists
-// until the slot is genuinely torn down, so the same idx can never be handed to
-// two builds — the root guarantee against slot duplication.
-func (m *Manager) claimSlotIndex() (int, error) {
+// claimSlotIndex picks a slot idx that is unowned and not present in the kernel,
+// assigns it to owner, and returns it. Ownership persists until the slot is
+// genuinely torn down, so the same idx can never be handed to two builds — the
+// root guarantee against slot duplication. owner is poolOwner for pool
+// pre-allocation, or the vmID for an on-demand SetupVM.
+func (m *Manager) claimSlotIndex(owner string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -749,14 +788,14 @@ func (m *Manager) claimSlotIndex() (int, error) {
 			m.nextSlot++
 		}
 
-		if _, isOwned := m.owned[idx]; isOwned || nsExists(fmt.Sprintf("ns-%d", idx)) {
+		if _, isOwned := m.slotOwner[idx]; isOwned || nsExists(fmt.Sprintf("ns-%d", idx)) {
 			// Owned by a live slot/record/build, or its kernel ns already
 			// exists. Discard; returning idx to freeSlots would loop.
 			m.log.Warn().Int("slot", idx).Msg("allocator: skipping idx — owned or kernel ns exists")
 			continue
 		}
 
-		m.ownSlotLocked(idx)
+		m.assignSlotLocked(idx, owner)
 		return idx, nil
 	}
 }
