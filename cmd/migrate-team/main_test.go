@@ -664,6 +664,42 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("retry converges after the source changed mid-window", func(t *testing.T) {
+		// A background writer (or an aborted first attempt) mutates a source
+		// row after it landed in dest. The re-run must overwrite the stale
+		// dest row, not skip it.
+		mustExec(t, srcPool, `UPDATE secret SET name = 'anthropic-rotated' WHERE id = $1`, f.secret)
+		defer mustExec(t, srcPool, `UPDATE secret SET name = 'anthropic' WHERE id = $1`, f.secret)
+
+		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
+			t.Fatalf("re-copy: %v", err)
+		}
+		got := scanString(t, dstPool, `SELECT name FROM secret WHERE id = $1`, f.secret)
+		if got != "anthropic-rotated" {
+			t.Fatalf("dest kept the stale row: name=%q, want the re-copied value", got)
+		}
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatalf("validate after converging re-copy: %v", err)
+		}
+	})
+
+	t.Run("validate catches content drift behind equal counts", func(t *testing.T) {
+		// Same row count on both sides, different content — count parity
+		// passes, the checksum pass must not.
+		mustExec(t, srcPool, `UPDATE secret SET hosts = ARRAY['api.example.com'] WHERE id = $1`, f.secret)
+		defer func() {
+			mustExec(t, srcPool, `UPDATE secret SET hosts = ARRAY['api.anthropic.com'] WHERE id = $1`, f.secret)
+			if err := run(ctx, f.cfg(phaseCopy)); err != nil {
+				t.Fatalf("restore copy: %v", err)
+			}
+		}()
+
+		err := run(ctx, f.cfg(phaseValidate))
+		if err == nil || !strings.Contains(err.Error(), "content drift") {
+			t.Fatalf("checksums must flag drift the counts cannot see, got: %v", err)
+		}
+	})
+
 	t.Run("validate catches a mismatch", func(t *testing.T) {
 		mustExec(t, dstPool, `DELETE FROM activity WHERE team_id = $1 AND resource_type = 'secret'`, f.team)
 		if err := run(ctx, f.cfg(phaseValidate)); err == nil {

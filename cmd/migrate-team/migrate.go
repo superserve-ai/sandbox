@@ -401,8 +401,8 @@ func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (m
 
 	return map[string]rowTransform{
 		"team": func(row map[string]any) error {
-			// Rehome on insert. ON CONFLICT DO NOTHING means an existing
-			// dest team row is never touched.
+			// Rehome on every write — upserts converge, so a retry
+			// re-asserts the dest region rather than trusting a stale row.
 			row["home_region"] = cfg.destRegion
 			// Dest quota triggers recount as sandbox rows land; starting
 			// from the source's counter would double-count.
@@ -525,22 +525,84 @@ func roleIDsByName(ctx context.Context, pool *pgxpool.Pool) (map[string]string, 
 	return out, nil
 }
 
+// conflictClause builds the ON CONFLICT arm for a table's upsert: update
+// every non-key column from EXCLUDED, keyed on the primary key. No primary
+// key (nothing to target) degrades to DO NOTHING.
+// insertOnlyTables never update an existing dest row. profile rows are
+// per-cell projections of global identity shared across ALL of a user's
+// teams in that cell — the migration promises a member's profile EXISTS in
+// the dest, never that it overwrites what the user's other teams already
+// maintain there. Content checksums skip these for the same reason; count
+// parity over the member scope still applies.
+var insertOnlyTables = map[string]bool{
+	"profile": true,
+}
+
+func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (string, error) {
+	if insertOnlyTables[table] {
+		return "ON CONFLICT DO NOTHING", nil
+	}
+	rows, err := dst.Query(ctx, `
+		SELECT a.attname, COALESCE(i.indisprimary, false)
+		FROM pg_attribute a
+		LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
+			AND a.attnum = ANY (i.indkey)
+		WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped
+		ORDER BY a.attnum`, table)
+	if err != nil {
+		return "", fmt.Errorf("introspect %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	var pks, updates []string
+	for rows.Next() {
+		var col string
+		var isPK bool
+		if err := rows.Scan(&col, &isPK); err != nil {
+			return "", err
+		}
+		if isPK {
+			pks = append(pks, pgx.Identifier{col}.Sanitize())
+		} else {
+			q := pgx.Identifier{col}.Sanitize()
+			updates = append(updates, q+" = EXCLUDED."+q)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(pks) == 0 {
+		log.Warn().Str("table", table).Msg("no primary key — upsert degrades to DO NOTHING; checksum validation is the backstop")
+		return "ON CONFLICT DO NOTHING", nil
+	}
+	if len(updates) == 0 {
+		return fmt.Sprintf("ON CONFLICT (%s) DO NOTHING", strings.Join(pks, ", ")), nil
+	}
+	return fmt.Sprintf("ON CONFLICT (%s) DO UPDATE SET %s", strings.Join(pks, ", "), strings.Join(updates, ", ")), nil
+}
+
 // copyTable streams the team-scoped rows of one table from source to dest.
 //
 // Rows travel as jsonb (to_jsonb on the source, jsonb_populate_recordset on
 // the dest), which round-trips every column type — uuid, enum, bytea, inet,
 // numeric, arrays, nested jsonb — without this tool naming a single column,
 // so schema drift in either cell surfaces as a loud error instead of silent
-// truncation. Inserts use a targetless ON CONFLICT DO NOTHING: re-runs skip
-// rows that already landed (by any unique constraint), which is what makes a
-// failed run safely re-runnable. A genuinely conflicting foreign row (same
-// unique key, different id) is also skipped — validate's count parity then
-// fails, so it cannot pass silently.
+// truncation. Inserts upsert on the table's primary key (DO UPDATE with
+// every non-key column from EXCLUDED): re-runs CONVERGE the dest onto the
+// source's current content instead of skipping rows that already landed —
+// a retry after a partial copy must never preserve a stale dest row while
+// the source moved on (background writers keep running through the freeze).
+// Tables without a primary key fall back to DO NOTHING with a warning;
+// validate's per-row checksums remain the backstop either way.
 func copyTable(ctx context.Context, src, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
 	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.scope)
+	conflict, err := conflictClause(ctx, dst, t.name)
+	if err != nil {
+		return 0, 0, err
+	}
 	insertQ := fmt.Sprintf(
-		`INSERT INTO %s SELECT * FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) ON CONFLICT DO NOTHING`,
-		t.name, t.name)
+		`INSERT INTO %s SELECT * FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) %s`,
+		t.name, t.name, conflict)
 
 	rows, err := src.Query(ctx, selectQ, teamID)
 	if err != nil {
@@ -668,7 +730,8 @@ func runValidate(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error 
 		for _, m := range mismatches {
 			log.Error().Msg("validate: MISMATCH — " + m)
 		}
-		return fmt.Errorf("validation failed: %d mismatch(es)", len(mismatches))
+		return fmt.Errorf("validation failed: %d mismatch(es):\n  %s",
+			len(mismatches), strings.Join(mismatches, "\n  "))
 	}
 	log.Info().Msg("validate: source and dest agree")
 	return nil
@@ -694,6 +757,48 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 			mismatches = append(mismatches, fmt.Sprintf("%s: source=%d dest=%d rows", t.name, srcN, dstN))
 		} else {
 			log.Info().Str("table", t.name).Int64("rows", srcN).Msg("validate: count parity")
+		}
+	}
+
+	// 1b. Per-row content checksums, transform-aware. Counts can match while
+	// a source row changed after the copy (background writers run through
+	// the freeze); decommission must be gated on content equality.
+	transforms, err := buildTransforms(ctx, src, dst, cfg)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range migratedTables {
+		if insertOnlyTables[t.name] {
+			continue // existence-only promise; see insertOnlyTables.
+		}
+		tf := transforms[t.name]
+		if t.name == "sandbox" {
+			copyTf := tf
+			// The copy nulls snapshot_id and relinks afterwards; a settled
+			// dest row carries the source's value, so validation keeps it.
+			tf = func(row map[string]any) error {
+				keep := row["snapshot_id"]
+				if err := copyTf(row); err != nil {
+					return err
+				}
+				row["snapshot_id"] = keep
+				return nil
+			}
+		}
+		srcSums, err := rowChecksums(ctx, src, t, teamID, tf)
+		if err != nil {
+			return nil, err
+		}
+		dstSums, err := rowChecksums(ctx, dst, t, teamID, nil)
+		if err != nil {
+			return nil, err
+		}
+		if srcOnly, dstOnly := diffChecksums(srcSums, dstSums); srcOnly+dstOnly > 0 {
+			mismatches = append(mismatches, fmt.Sprintf(
+				"%s: content drift — %d source row(s) and %d dest row(s) without an equal counterpart (source changed after copy? re-run copy)",
+				t.name, srcOnly, dstOnly))
+		} else {
+			log.Info().Str("table", t.name).Msg("validate: content parity")
 		}
 	}
 
