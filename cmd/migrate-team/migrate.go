@@ -534,6 +534,18 @@ func roleIDsByName(ctx context.Context, pool *pgxpool.Pool) (map[string]string, 
 // the dest, never that it overwrites what the user's other teams already
 // maintain there. Content checksums skip these for the same reason; count
 // parity over the member scope still applies.
+// validationExemptTables are copied for safety but never gated on:
+// sandbox_revocation and revoked_proxy_token rows self-expire, and the
+// SOURCE reaper prunes expired rows on its own schedule while this tool
+// never deletes dest rows — so parity between the two sides is expected to
+// drift and carries no migration-correctness signal. The rows exist to stop
+// stale sandbox JWTs from replaying against the dest proxy; extras are
+// harmless, missing expired ones equally so.
+var validationExemptTables = map[string]bool{
+	"sandbox_revocation":  true,
+	"revoked_proxy_token": true,
+}
+
 var insertOnlyTables = map[string]bool{
 	"profile": true,
 }
@@ -745,6 +757,9 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 
 	// 1. Per-table row-count parity over the team's scope.
 	for _, t := range migratedTables {
+		if validationExemptTables[t.name] {
+			continue // self-expiring advisory rows; see validationExemptTables.
+		}
 		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope)
 		var srcN, dstN int64
 		if err := src.QueryRow(ctx, q, teamID).Scan(&srcN); err != nil {
@@ -768,8 +783,8 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 		return nil, err
 	}
 	for _, t := range migratedTables {
-		if insertOnlyTables[t.name] {
-			continue // existence-only promise; see insertOnlyTables.
+		if insertOnlyTables[t.name] || validationExemptTables[t.name] {
+			continue // see insertOnlyTables / validationExemptTables.
 		}
 		tf := transforms[t.name]
 		if t.name == "sandbox" {
@@ -990,6 +1005,22 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 			log.Error().Msg("decommission: MISMATCH — " + m)
 		}
 		return fmt.Errorf("aborting decommission: validate found %d mismatch(es); source not touched", len(mismatches))
+	}
+
+	// Validate takes real time; a sandbox resume or build dispatch could
+	// slip in behind the checks above. Re-run both blockers immediately
+	// before the deletes — with the team's keys revoked (a copy
+	// precondition) only internal actors can still race this window, and
+	// they lose by one statement rather than by the whole validate pass.
+	if blockers, err := activeSandboxes(ctx, src, cfg.teamID); err != nil {
+		return err
+	} else if len(blockers) > 0 {
+		return fmt.Errorf("aborting decommission: sandbox became non-quiescent during validate:\n  %s", strings.Join(blockers, "\n  "))
+	}
+	if builds, err := activeBuilds(ctx, src, cfg.teamID); err != nil {
+		return err
+	} else if len(builds) > 0 {
+		return fmt.Errorf("aborting decommission: template build started during validate:\n  %s", strings.Join(builds, "\n  "))
 	}
 
 	// One transaction: the source either loses the whole team or nothing.

@@ -725,6 +725,35 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("validate tolerates source-side expiry of revocation rows", func(t *testing.T) {
+		// The source reaper prunes expired revocation rows on its own
+		// schedule; the dest keeps its copy. Parity must not gate on it.
+		var n int
+		if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_revocation WHERE sandbox_id = $1`, f.sb1).Scan(&n); err != nil || n == 0 {
+			t.Fatalf("fixture should seed a revocation row (n=%d, err=%v)", n, err)
+		}
+		mustExec(t, srcPool, `DELETE FROM sandbox_revocation WHERE sandbox_id = $1`, f.sb1)
+
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatalf("validate must not gate on self-expiring rows: %v", err)
+		}
+	})
+
+	t.Run("decommission refuses when a build starts during validate", func(t *testing.T) {
+		buildID := uuid.New()
+		mustExec(t, srcPool, `
+			INSERT INTO template_build (id, template_id, team_id, status, build_spec_hash, vmd_host_id)
+			VALUES ($1, $2, $3, 'pending', 'race-hash', $4)`, buildID, f.tpl, f.team, sourceHostID)
+		defer mustExec(t, srcPool, `DELETE FROM template_build WHERE id = $1`, buildID)
+
+		cfg := f.cfg(phaseDecommission)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
+			t.Fatalf("in-flight build must block decommission, got: %v", err)
+		}
+	})
+
 	t.Run("decommission refuses when the source is no longer quiescent", func(t *testing.T) {
 		mustExec(t, srcPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
 		defer mustExec(t, srcPool, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, f.sb1)
