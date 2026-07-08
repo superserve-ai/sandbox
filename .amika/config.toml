@@ -1,0 +1,6 @@
+[filesystem]
+repos = [
+  "https://github.com/superserve-ai/superserve",
+  "https://github.com/superserve-ai/sandbox",
+  "https://github.com/superserve-ai/website"
+]
