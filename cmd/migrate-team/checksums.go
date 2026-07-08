@@ -104,17 +104,19 @@ func diffChecksums(src, dst map[string]int) (srcOnly, dstOnly int) {
 	return srcOnly, dstOnly
 }
 
-// sandboxDriftUnderLock re-compares the sandbox table's content between the
-// locked source transaction and the dest, transform-aware, so decommission's
-// deletes act on exactly the rows validation approved. Runs on the
-// transaction (not the pool) — the FOR UPDATE locks it holds are the point.
-func sandboxDriftUnderLock(ctx context.Context, tx pgx.Tx, dst *pgxpool.Pool, cfg config) (bool, error) {
+// contentDriftUnderLock re-compares the mutation-prone tables — sandbox
+// rows and secret bindings — between the locked source transaction and the
+// dest, transform-aware, so decommission's deletes act on exactly the rows
+// validation approved. Runs on the transaction (not the pool): the FOR
+// UPDATE row locks and per-sandbox advisory locks it holds are the point.
+// Returns the first drifted table's name, or "".
+func contentDriftUnderLock(ctx context.Context, tx pgx.Tx, dst *pgxpool.Pool, cfg config) (string, error) {
 	transforms, err := buildTransforms(ctx, tx, dst, cfg)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	copyTf := transforms["sandbox"]
-	tf := func(row map[string]any) error {
+	sandboxTf := func(row map[string]any) error {
 		keep := row["snapshot_id"]
 		if err := copyTf(row); err != nil {
 			return err
@@ -123,31 +125,47 @@ func sandboxDriftUnderLock(ctx context.Context, tx pgx.Tx, dst *pgxpool.Pool, cf
 		return nil
 	}
 
-	srcSums := map[string]int{}
-	rows, err := tx.Query(ctx, `SELECT to_jsonb(t) FROM sandbox t WHERE team_id = $1`, cfg.teamID)
-	if err != nil {
-		return false, fmt.Errorf("locked sandbox read: %w", err)
+	checks := []struct {
+		spec tableSpec
+		tf   rowTransform
+	}{
+		{tableSpec{name: "sandbox", scope: "team_id = $1"}, sandboxTf},
+		{tableSpec{name: "sandbox_secret", scope: sandboxScope}, nil},
+		{tableSpec{name: "secret", scope: "team_id = $1"}, nil},
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var raw json.RawMessage
-		if err := rows.Scan(&raw); err != nil {
-			return false, err
-		}
-		h, err := checksumRow("sandbox", raw, tf)
+	for _, chk := range checks {
+		srcSums := map[string]int{}
+		rows, err := tx.Query(ctx,
+			fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, chk.spec.name, chk.spec.scope), cfg.teamID)
 		if err != nil {
-			return false, err
+			return "", fmt.Errorf("locked %s read: %w", chk.spec.name, err)
 		}
-		srcSums[h]++
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
+		for rows.Next() {
+			var raw json.RawMessage
+			if err := rows.Scan(&raw); err != nil {
+				rows.Close()
+				return "", err
+			}
+			h, err := checksumRow(chk.spec.name, raw, chk.tf)
+			if err != nil {
+				rows.Close()
+				return "", err
+			}
+			srcSums[h]++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return "", err
+		}
+		rows.Close()
 
-	dstSums, err := rowChecksums(ctx, dst, tableSpec{name: "sandbox", scope: "team_id = $1"}, cfg.teamID, nil)
-	if err != nil {
-		return false, err
+		dstSums, err := rowChecksums(ctx, dst, chk.spec, cfg.teamID, nil)
+		if err != nil {
+			return "", err
+		}
+		if srcOnly, dstOnly := diffChecksums(srcSums, dstSums); srcOnly+dstOnly > 0 {
+			return chk.spec.name, nil
+		}
 	}
-	srcOnly, dstOnly := diffChecksums(srcSums, dstSums)
-	return srcOnly+dstOnly > 0, nil
+	return "", nil
 }

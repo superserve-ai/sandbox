@@ -1100,15 +1100,23 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	if _, err := tx.Exec(ctx, `SELECT id FROM sandbox WHERE team_id = $1 FOR UPDATE`, cfg.teamID); err != nil {
 		return fmt.Errorf("lock sandboxes: %w", err)
 	}
-	// Under the lock, re-verify sandbox content still matches the dest —
-	// catches anything (auto-delete included) that mutated sandboxes
-	// between validate and the locks landing.
-	drift, err := sandboxDriftUnderLock(ctx, tx, dst, cfg)
+	// Secret attach/detach paths don't touch the sandbox row — they
+	// serialize on the app's per-sandbox advisory lock instead
+	// (LockSandboxForSecretWrites). Take the identical lock for every
+	// sandbox so a detach on a paused sandbox blocks behind this
+	// transaction rather than racing the deletes.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(id::text)::bigint) FROM sandbox WHERE team_id = $1`, cfg.teamID); err != nil {
+		return fmt.Errorf("advisory-lock sandboxes: %w", err)
+	}
+	// Under the locks, re-verify that sandbox rows and secret bindings
+	// still match the dest — catches anything (auto-delete, secret detach)
+	// that mutated them between validate and the locks landing.
+	drift, err := contentDriftUnderLock(ctx, tx, dst, cfg)
 	if err != nil {
 		return err
 	}
-	if drift {
-		return fmt.Errorf("aborting decommission: sandbox rows changed after validate (auto-delete or resume raced the window) — re-run copy and validate")
+	if drift != "" {
+		return fmt.Errorf("aborting decommission: %s changed after validate (auto-delete, resume, or secret detach raced the window) — re-run copy and validate", drift)
 	}
 
 	// Break the sandbox↔snapshot cycle so snapshots can go before sandboxes.
