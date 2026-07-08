@@ -486,9 +486,11 @@ func main() {
 	// Warm buffer of network namespaces so creation claims off the hot path.
 	// StartPool returns immediately and fills in the background, so the gate
 	// below isn't held for the fill; creates fall back to on-demand until warm.
-	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "128"))
+	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
+	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize: netPoolFresh,
+		NewSize:     netPoolFresh,
+		RecycleSize: netPoolRecycle,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 
