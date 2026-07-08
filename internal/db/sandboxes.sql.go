@@ -1195,7 +1195,7 @@ const updateSandboxAutoDelete = `-- name: UpdateSandboxAutoDelete :execrows
 UPDATE sandbox
 SET auto_delete_seconds = $2,
     auto_delete_at = CASE WHEN status = 'paused'
-      THEN now() + make_interval(secs => $2)
+      THEN now() + make_interval(secs => $2::int::double precision)
       ELSE NULL
     END,
     updated_at = now()
@@ -1213,6 +1213,8 @@ type UpdateSandboxAutoDeleteParams struct {
 // is armed from now() — never retroactively from the pause — so applying a
 // window can never destroy the sandbox in the same instant. On a non-paused
 // sandbox the deadline stays NULL and FinalizePause arms it at the next pause.
+// Keep the ::int::double precision cast: the param is used as both the integer
+// column and make_interval's double arg; without it Postgres errors 42P08.
 func (q *Queries) UpdateSandboxAutoDelete(ctx context.Context, arg UpdateSandboxAutoDeleteParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateSandboxAutoDelete, arg.ID, arg.AutoDeleteSeconds, arg.TeamID)
 	if err != nil {
