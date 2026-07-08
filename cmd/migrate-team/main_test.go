@@ -647,25 +647,38 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("copy leaves the dest rollup flag matching the source", func(t *testing.T) {
-		// The fixture's source flag is an explicit TRUE — the hold must not
-		// leak (dest false) nor the hold be overwritten mid-copy silently;
-		// after the copy the dest carries the source's value.
+	t.Run("rollup hold persists through copy and releases at cutover", func(t *testing.T) {
+		// The fixture's source flag is an explicit TRUE, but the dest must
+		// stay HELD (false) through copy and validate — releasing early
+		// lets the dest scheduler mint rollup state that wedges validate.
 		var enabled bool
 		if err := dstPool.QueryRow(ctx, `
 			SELECT enabled FROM team_feature_flag
 			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil {
-			t.Fatalf("restored flag row missing: %v", err)
+			t.Fatalf("hold row missing after copy: %v", err)
 		}
-		if !enabled {
-			t.Fatal("dest rollup flag left FALSE — the hold leaked past the copy")
+		if enabled {
+			t.Fatal("dest rollup flag TRUE after copy — the hold leaked before cutover")
 		}
 
-		// And with no source row at all, a re-copy removes the hold row.
+		// Cutover: release restores the source's value.
+		if err := run(ctx, f.cfg(phaseReleaseRollups)); err != nil {
+			t.Fatalf("release-rollups: %v", err)
+		}
+		if err := dstPool.QueryRow(ctx, `
+			SELECT enabled FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil {
+			t.Fatalf("flag row missing after release: %v", err)
+		}
+		if !enabled {
+			t.Fatal("release did not restore the source's TRUE flag")
+		}
+
+		// With no source row at all, release removes the hold entirely.
 		mustExec(t, srcPool, `DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team)
 		defer mustExec(t, srcPool, `INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_hourly_rollups', true)`, f.team)
-		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
-			t.Fatalf("re-copy: %v", err)
+		if err := run(ctx, f.cfg(phaseReleaseRollups)); err != nil {
+			t.Fatalf("release-rollups (absent source row): %v", err)
 		}
 		var n int
 		if err := dstPool.QueryRow(ctx, `
@@ -674,7 +687,11 @@ func TestTeamMigration(t *testing.T) {
 			t.Fatal(err)
 		}
 		if n != 0 {
-			t.Fatalf("rollup hold not cleaned up: %d override row(s) remain in dest", n)
+			t.Fatalf("hold not removed: %d override row(s) remain in dest", n)
+		}
+		// Leave dest matching the restored source state for later subtests.
+		if err := run(ctx, f.cfg(phaseReleaseRollups)); err != nil {
+			t.Fatalf("re-release: %v", err)
 		}
 	})
 

@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	phasePlan         = "plan"
-	phaseCopy         = "copy"
-	phaseValidate     = "validate"
-	phaseDecommission = "decommission"
+	phasePlan           = "plan"
+	phaseCopy           = "copy"
+	phaseValidate       = "validate"
+	phaseDecommission   = "decommission"
+	phaseReleaseRollups = "release-rollups"
 
 	copyBatchSize = 500
 )
@@ -112,8 +113,44 @@ func run(ctx context.Context, cfg config) error {
 		return runValidate(ctx, src, dst, cfg)
 	case phaseDecommission:
 		return runDecommission(ctx, src, dst, cfg, teamName)
+	case phaseReleaseRollups:
+		return runReleaseRollups(ctx, src, dst, cfg)
 	}
 	return fmt.Errorf("unknown phase %q", cfg.phase)
+}
+
+// ---------------------------------------------------------------------------
+// release-rollups
+// ---------------------------------------------------------------------------
+
+// runReleaseRollups lifts the copy's rollup hold at cutover: any earlier and
+// the dest scheduler can mint rollup state from the copied intervals that
+// never existed in source, wedging validate or drifting after it. Restores
+// the source's actual flag state — its value when a row exists there,
+// absence when none does.
+func runReleaseRollups(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
+	var srcEnabled *bool
+	if err := src.QueryRow(ctx, `
+		SELECT enabled FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`,
+		cfg.teamID).Scan(&srcEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check source rollup flag: %w", err)
+	}
+	if srcEnabled == nil {
+		if _, err := dst.Exec(ctx, `
+			DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, cfg.teamID); err != nil {
+			return fmt.Errorf("release dest rollup hold: %w", err)
+		}
+		log.Info().Msg("release-rollups: hold removed; dest follows the default")
+		return nil
+	}
+	if _, err := dst.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_hourly_rollups', $2)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = $2`, cfg.teamID, *srcEnabled); err != nil {
+		return fmt.Errorf("restore dest rollup flag: %w", err)
+	}
+	log.Info().Bool("enabled", *srcEnabled).Msg("release-rollups: dest flag restored to the source state")
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -399,27 +436,7 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	}
 	log.Info().Int64("relinked", relinked).Msg("copy: sandbox.snapshot_id relinked from source")
 
-	// Release the rollup hold: the flag table itself was copied above (a
-	// converging upsert overwrote the hold when the source has an explicit
-	// row), so cleanup is only needed when the source has NO override —
-	// then the hold row is ours to remove, restoring default behavior.
-	var srcEnabled *bool
-	if err := src.QueryRow(ctx, `
-		SELECT enabled FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`,
-		cfg.teamID).Scan(&srcEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("check source rollup flag: %w", err)
-	}
-	if srcEnabled == nil {
-		if _, err := dst.Exec(ctx, `
-			DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, cfg.teamID); err != nil {
-			return fmt.Errorf("release dest rollup hold: %w", err)
-		}
-	} else if _, err := dst.Exec(ctx, `
-		INSERT INTO team_feature_flag (team_id, key, enabled)
-		VALUES ($1, 'billing_hourly_rollups', $2)
-		ON CONFLICT (team_id, key) DO UPDATE SET enabled = $2`, cfg.teamID, *srcEnabled); err != nil {
-		return fmt.Errorf("restore dest rollup flag: %w", err)
-	}
+	log.Info().Msg("copy: dest rollups remain HELD for this team — run --phase release-rollups at cutover, after validate (and decommission, if deleting)")
 
 	for _, s := range skippedTables {
 		log.Info().Str("table", s.name).Str("reason", s.reason).Msg("copy: NOT copied")

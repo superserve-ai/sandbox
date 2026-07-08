@@ -64,7 +64,7 @@ func main() {
 	flag.StringVar(&cfg.destURL, "dest-db", os.Getenv("DEST_DATABASE_URL"), "dest cell Postgres URL (defaults to DEST_DATABASE_URL)")
 	flag.StringVar(&cfg.destHostID, "dest-host-id", "", "host row id in the dest cell (e.g. usw2); required for copy")
 	flag.StringVar(&cfg.destRegion, "dest-region", "", "dest region token (e.g. usw); required for copy")
-	flag.StringVar(&cfg.phase, "phase", phasePlan, "plan | copy | validate | decommission")
+	flag.StringVar(&cfg.phase, "phase", phasePlan, "plan | copy | validate | decommission | release-rollups")
 	flag.StringVar(&confirmTeamName, "confirm-team-name", "", "exact team name; required for decommission")
 	flag.StringVar(&cfg.pathsOut, "paths-out", "", "file to write the artifact directory list to, one dir per line (plan/validate)")
 	flag.Parse()
@@ -85,7 +85,7 @@ func main() {
 	switch cfg.phase {
 	case phasePlan:
 		// Read-only; dest is optional.
-	case phaseCopy, phaseValidate, phaseDecommission:
+	case phaseCopy, phaseValidate, phaseDecommission, phaseReleaseRollups:
 		if cfg.destURL == "" {
 			log.Fatal().Msg("--dest-db (or DEST_DATABASE_URL) is required for " + cfg.phase)
 		}
@@ -96,7 +96,7 @@ func main() {
 	// the same transforms when checksumming the source, so running them
 	// without the flags would compare against empty rewrites and report
 	// false drift on every team and sandbox row.
-	if cfg.phase != phasePlan && (cfg.destHostID == "" || cfg.destRegion == "") {
+	if cfg.phase != phasePlan && cfg.phase != phaseReleaseRollups && (cfg.destHostID == "" || cfg.destRegion == "") {
 		log.Fatal().Msg("--dest-host-id and --dest-region are required for " + cfg.phase)
 	}
 	if cfg.phase == phaseDecommission && cfg.confirmTeamName == "" {
