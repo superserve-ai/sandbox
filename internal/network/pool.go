@@ -225,7 +225,9 @@ func (p *Pool) allocate(ctx context.Context) (*preallocSlot, error) {
 	// This is the expensive part we're moving off the hot path.
 	info, vethName, err := p.mgr.setupSlot(ctx, idx)
 	if err != nil {
-		// idx stays consumed — reusing a colliding idx would loop.
+		// Build failed — release the index so it isn't leaked from owned.
+		// claimSlotIndex's nsExists guard prevents re-looping on a colliding idx.
+		p.mgr.freeSlot(idx)
 		return nil, err
 	}
 
@@ -238,7 +240,6 @@ func (p *Pool) cleanup(slot *preallocSlot) {
 	}
 	nsName := slot.info.Namespace
 	p.mgr.cleanupFull(nsName, slot.vethName)
-	p.mgr.mu.Lock()
-	p.mgr.freeSlots = append(p.mgr.freeSlots, slot.idx)
-	p.mgr.mu.Unlock()
+	// The slot is gone — release its index from owned back to the recycle list.
+	p.mgr.freeSlot(slot.idx)
 }
