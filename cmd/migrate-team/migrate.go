@@ -37,18 +37,26 @@ type config struct {
 	pathsOut        string
 }
 
-// dbIdentity fingerprints the database a pool is connected to: postmaster
-// start time (microsecond-unique per running instance), server address and
-// port as seen past any pooler, and the database name. Two DSN spellings of
-// one database — e.g. the transaction pooler and the direct host — collapse
-// to the same identity; distinct clusters practically never collide.
+// dbIdentity fingerprints the database a pool is connected to by cluster
+// identity plus database name — never by connection endpoint. The same
+// database reached through a pooler and directly must collapse to ONE
+// identity (endpoint-based fingerprints pass the guard and turn
+// copy/validate into self-comparisons before decommission deletes the only
+// copy), while two databases in one cluster stay distinct via
+// current_database(). system_identifier is initdb-unique and stable across
+// restarts; where a managed provider restricts pg_control_system(), the
+// postmaster start time is a practically-collision-free stand-in.
 func dbIdentity(ctx context.Context, pool *pgxpool.Pool) (string, error) {
 	var id string
 	err := pool.QueryRow(ctx, `
-		SELECT pg_postmaster_start_time()::text
-		       || '|' || coalesce(inet_server_addr()::text, 'local')
-		       || '|' || coalesce(inet_server_port()::text, '0')
-		       || '|' || current_database()`).Scan(&id)
+		SELECT system_identifier::text || '|' || current_database()
+		FROM pg_control_system()`).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	log.Warn().Err(err).Msg("pg_control_system() unavailable; falling back to postmaster start time for the same-DB guard")
+	err = pool.QueryRow(ctx, `
+		SELECT pg_postmaster_start_time()::text || '|' || current_database()`).Scan(&id)
 	return id, err
 }
 
@@ -1161,7 +1169,15 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	// commits mid-transaction survives our DELETE's snapshot and then
 	// fails the team-row delete's FK check — the transaction rolls back
 	// and a re-run sweeps it too.
-	for _, name := range []string{"activity", "sandbox_revocation", "revoked_proxy_token"} {
+	// Rollup workers on the SOURCE keep running too — a tick after
+	// validate can upsert jobs, advance the backfill cursor, or rewrite
+	// hourly rows from the already-copied intervals, none of which touch
+	// the locked sandbox/secret rows. Same remedy as the async writers:
+	// sweep them into dest under this transaction before deleting.
+	for _, name := range []string{
+		"activity", "sandbox_revocation", "revoked_proxy_token",
+		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+	} {
 		spec, ok := tableByName(name)
 		if !ok {
 			return fmt.Errorf("sweep: unknown table %s", name)
