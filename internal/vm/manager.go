@@ -144,7 +144,7 @@ type ManagerConfig struct {
 	HostInterface      string // Host network interface (e.g. "ens4").
 	// MaxConcurrentRestores caps parallel RestoreVMSnapshot operations to
 	// prevent a spike of concurrent sandbox creates from saturating host
-	// file I/O, netns setup, and Firecracker boots. 0 → default 100.
+	// file I/O, netns setup, and Firecracker boots. 0 → default 500.
 	MaxConcurrentRestores int
 
 	// UffdEnabled gates the UFFD lazy-restore path. false → fresh
@@ -226,7 +226,7 @@ type Manager struct {
 func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) (*Manager, error) {
 	maxRestores := cfg.MaxConcurrentRestores
 	if maxRestores <= 0 {
-		maxRestores = 100
+		maxRestores = 500
 	}
 	// Magic mount target — every per-VM start script mounts tmpfs over it.
 	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
