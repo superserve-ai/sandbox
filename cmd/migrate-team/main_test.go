@@ -273,7 +273,7 @@ func seedFixture(t *testing.T) *fixture {
 		        '/srv/sandboxes/gone/base.ext4', '/srv/sandboxes/gone/delta.ext4', $4)`,
 		f.sb3, f.team, sourceHostID, base)
 
-	mustExec(t, srcPool, `INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key) VALUES ($1, $2, 'ANTHROPIC_API_KEY')`, f.sb1, f.secret)
+	mustExec(t, srcPool, `INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key) VALUES ($1, $2, 'EXAMPLE_API_KEY')`, f.sb1, f.secret)
 
 	for _, sb := range []uuid.UUID{f.sb1, f.sb2} {
 		mustExec(t, srcPool, `
@@ -879,6 +879,16 @@ func TestTeamMigration(t *testing.T) {
 		cfg.confirmTeamName = "migration-drill"
 		if err := run(ctx, cfg); err != nil {
 			t.Fatalf("decommission: %v", err)
+		}
+
+		// Decommission captures the source flag before deleting and
+		// restores it into dest itself — the fixture's explicit TRUE must
+		// survive even though the source rows are gone.
+		var enabled bool
+		if err := dstPool.QueryRow(ctx, `
+			SELECT enabled FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil || !enabled {
+			t.Fatalf("dest rollup flag not restored after decommission (enabled=%v, err=%v)", enabled, err)
 		}
 
 		for _, spec := range migratedTables {

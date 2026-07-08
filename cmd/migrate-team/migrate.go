@@ -135,21 +135,29 @@ func runReleaseRollups(ctx context.Context, src, dst *pgxpool.Pool, cfg config) 
 		cfg.teamID).Scan(&srcEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("check source rollup flag: %w", err)
 	}
+	return restoreRollupFlag(ctx, dst, cfg.teamID, srcEnabled)
+}
+
+// restoreRollupFlag writes the source's rollup-flag state into the dest: the
+// source's value when a row existed, absence when none did. Shared by the
+// standalone release-rollups phase (source still present) and decommission
+// (which captures the state before deleting the source).
+func restoreRollupFlag(ctx context.Context, dst *pgxpool.Pool, teamID uuid.UUID, srcEnabled *bool) error {
 	if srcEnabled == nil {
 		if _, err := dst.Exec(ctx, `
-			DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, cfg.teamID); err != nil {
+			DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, teamID); err != nil {
 			return fmt.Errorf("release dest rollup hold: %w", err)
 		}
-		log.Info().Msg("release-rollups: hold removed; dest follows the default")
+		log.Info().Msg("rollup hold removed; dest follows the default")
 		return nil
 	}
 	if _, err := dst.Exec(ctx, `
 		INSERT INTO team_feature_flag (team_id, key, enabled)
 		VALUES ($1, 'billing_hourly_rollups', $2)
-		ON CONFLICT (team_id, key) DO UPDATE SET enabled = $2`, cfg.teamID, *srcEnabled); err != nil {
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = $2`, teamID, *srcEnabled); err != nil {
 		return fmt.Errorf("restore dest rollup flag: %w", err)
 	}
-	log.Info().Bool("enabled", *srcEnabled).Msg("release-rollups: dest flag restored to the source state")
+	log.Info().Bool("enabled", *srcEnabled).Msg("dest rollup flag restored to the source state")
 	return nil
 }
 
@@ -231,7 +239,7 @@ func unrevokedKeys(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]
 // for the team. The freeze must wait these out (or cancel them): copying
 // mid-build template rows would strand half-written artifacts, and the
 // build rows themselves are pinned to source-cell build VMs.
-func activeBuilds(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
+func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT id, status FROM template_build
 		WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting')
@@ -436,7 +444,7 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	}
 	log.Info().Int64("relinked", relinked).Msg("copy: sandbox.snapshot_id relinked from source")
 
-	log.Info().Msg("copy: dest rollups remain HELD for this team — run --phase release-rollups at cutover, after validate (and decommission, if deleting)")
+	log.Info().Msg("copy: dest rollups remain HELD for this team — decommission releases the hold itself; for migrations that keep the source, run --phase release-rollups at cutover after validate")
 
 	for _, s := range skippedTables {
 		log.Info().Str("table", s.name).Str("reason", s.reason).Msg("copy: NOT copied")
@@ -1171,6 +1179,28 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(id::text)::bigint) FROM sandbox WHERE team_id = $1`, cfg.teamID); err != nil {
 		return fmt.Errorf("advisory-lock sandboxes: %w", err)
 	}
+	// Build admission serializes on the app's per-TEAM advisory lock
+	// (CountInFlightBuildsForTeam's caller contract) — take it so a
+	// CreateTemplateBuild that would slip a pending row past the earlier
+	// check blocks behind this transaction, then recheck under the lock.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cfg.teamID.String()); err != nil {
+		return fmt.Errorf("advisory-lock team builds: %w", err)
+	}
+	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(builds) > 0 {
+		return fmt.Errorf("aborting decommission: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
+	}
+	// The source rows die below, so capture the rollup-flag state now and
+	// restore it into the dest after the deletes commit — decommissioned
+	// migrations must not depend on a later release-rollups run that would
+	// find no source to read.
+	var srcRollupEnabled *bool
+	if err := tx.QueryRow(ctx, `
+		SELECT enabled FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`,
+		cfg.teamID).Scan(&srcRollupEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("capture source rollup flag: %w", err)
+	}
 	// Under the locks, re-verify that sandbox rows and secret bindings
 	// still match the dest — catches anything (auto-delete, secret detach)
 	// that mutated them between validate and the locks landing.
@@ -1235,6 +1265,10 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
+	if err := restoreRollupFlag(ctx, dst, cfg.teamID, srcRollupEnabled); err != nil {
+		return fmt.Errorf("source deleted but dest rollup flag not restored — apply release-rollups semantics by hand: %w", err)
+	}
+	log.Info().Msg("decommission: dest rollup hold released to the source's pre-delete state")
 
 	log.Info().Int64("deleted", total).Msg("decommission: source rows removed (profiles and append-only audit tables retained)")
 	return nil
