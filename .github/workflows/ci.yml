@@ -201,7 +201,7 @@ jobs:
       - name: Run integration tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
-        run: go test -v -tags integration -count=1 -race -timeout 10m ./internal/integration/
+        run: go test -v -tags integration -count=1 -race -timeout 10m ./internal/integration/ ./cmd/migrate-team/
 
   build:
     name: Build
