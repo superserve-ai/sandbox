@@ -95,3 +95,13 @@ var skippedTables = []struct{ name, reason string }{
 	{"billing_rollup_scheduler_lease, billing_rollup_backfill_state", "global scheduler state, not team-scoped"},
 	{"early_access_request", "not team-scoped"},
 }
+
+// tableByName finds a migrated table's spec.
+func tableByName(name string) (tableSpec, bool) {
+	for _, t := range migratedTables {
+		if t.name == name {
+			return t, true
+		}
+	}
+	return tableSpec{}, false
+}

@@ -664,7 +664,7 @@ func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (strin
 // the source moved on (background writers keep running through the freeze).
 // Tables without a primary key fall back to DO NOTHING with a warning;
 // validate's per-row checksums remain the backstop either way.
-func copyTable(ctx context.Context, src, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
+func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
 	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.scope)
 	conflict, err := conflictClause(ctx, dst, t.name)
 	if err != nil {
@@ -1117,6 +1117,29 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	}
 	if drift != "" {
 		return fmt.Errorf("aborting decommission: %s changed after validate (auto-delete, resume, or secret detach raced the window) — re-run copy and validate", drift)
+	}
+
+	// Async writers (logSandboxActivity fires-and-forgets; revocation rows
+	// arrive from workers) can land rows after validate without holding any
+	// lock we can take, and locking the shared tables would block the whole
+	// platform. Instead of aborting on stragglers, sweep them: re-copy
+	// those tables from this transaction's view into the dest, so whatever
+	// the deletes below can see has already been preserved. A row that
+	// commits mid-transaction survives our DELETE's snapshot and then
+	// fails the team-row delete's FK check — the transaction rolls back
+	// and a re-run sweeps it too.
+	for _, name := range []string{"activity", "sandbox_revocation", "revoked_proxy_token"} {
+		spec, ok := tableByName(name)
+		if !ok {
+			return fmt.Errorf("sweep: unknown table %s", name)
+		}
+		copied, _, err := copyTable(ctx, tx, dst, spec, cfg.teamID, nil)
+		if err != nil {
+			return fmt.Errorf("final sweep of %s: %w", name, err)
+		}
+		if copied > 0 {
+			log.Info().Str("table", name).Int64("swept", copied).Msg("decommission: straggler rows copied to dest before delete")
+		}
 	}
 
 	// Break the sandbox↔snapshot cycle so snapshots can go before sandboxes.

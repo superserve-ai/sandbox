@@ -765,6 +765,37 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("straggler sweep copies the transaction's own view", func(t *testing.T) {
+		// The decommission sweep runs copyTable off the locked transaction
+		// so rows that landed after validate — invisible to any earlier
+		// pass — still reach the dest before the deletes. Simulate by
+		// sweeping from a transaction that holds an uncommitted straggler.
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		strag := uuid.New()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO activity (id, sandbox_id, team_id, actor_id, category, action, resource_type, sandbox_name)
+			VALUES ($1, $2, $3, $4, 'sandbox', 'pause', 'sandbox', 'drill-sb-1')`, strag, f.sb1, f.team, f.owner); err != nil {
+			t.Fatalf("straggler insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM activity WHERE id = $1`, strag)
+
+		spec, ok := tableByName("activity")
+		if !ok {
+			t.Fatal("activity spec missing")
+		}
+		if _, _, err := copyTable(ctx, tx, dstPool, spec, f.team, nil); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		var n int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM activity WHERE id = $1`, strag).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("straggler not swept to dest (n=%d, err=%v)", n, err)
+		}
+	})
+
 	t.Run("decommission refuses when a build starts during validate", func(t *testing.T) {
 		buildID := uuid.New()
 		mustExec(t, srcPool, `
