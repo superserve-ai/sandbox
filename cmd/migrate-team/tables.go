@@ -36,6 +36,7 @@ type tableSpec struct {
 var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},
+	{"team_feature_flag", "team_id = $1"},
 	{"team_member", "team_id = $1"},
 	// team_memberships before user_role_assignments: a dest-side trigger
 	// requires an active membership before accepting an active team-scoped
@@ -68,7 +69,6 @@ var migratedTables = []tableSpec{
 	{"billing_period_anomaly", "team_id = $1"},
 	{"billing_rollup_job", "team_id = $1"},
 	{"billing_rollup_team_backfill_state", "team_id = $1"},
-	{"team_feature_flag", "team_id = $1"},
 	{"team_pricing_plan", "team_id = $1"},
 	{"team_credit_grant", "team_id = $1"},
 	{"team_credit_ledger", "team_id = $1"},

@@ -644,6 +644,21 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("copy leaves the dest rollup flag matching the source", func(t *testing.T) {
+		// The copy holds dest rollups with a temporary false override; the
+		// fixture team has no rollup-flag row in source, so the hold must
+		// be gone once the copy finishes — default behavior restored.
+		var n int
+		if err := dstPool.QueryRow(ctx, `
+			SELECT count(*) FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("rollup hold not cleaned up: %d override row(s) remain in dest", n)
+		}
+	})
+
 	t.Run("copy is idempotent", func(t *testing.T) {
 		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
 			t.Fatalf("re-copy: %v", err)

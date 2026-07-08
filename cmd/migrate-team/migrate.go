@@ -361,6 +361,22 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	var totalCopied, totalSkipped int64
 	for _, t := range migratedTables {
 		copied, skipped, err := copyTable(ctx, src, dst, t, cfg.teamID, transforms[t.name])
+		if err == nil && t.name == "team" {
+			// The moment intervals land, the dest scheduler could discover
+			// this team under the default-TRUE rollup flag and mint jobs,
+			// cursors, and hourly rows that never existed in source —
+			// dest-only rows this tool never deletes, wedging validate.
+			// Hold rollups off with an explicit false override as soon as
+			// the team row (FK target) exists; team_feature_flag copies
+			// next and converges over this row when the source has its own,
+			// and the post-loop cleanup removes it when the source has none.
+			if _, herr := dst.Exec(ctx, `
+				INSERT INTO team_feature_flag (team_id, key, enabled)
+				VALUES ($1, 'billing_hourly_rollups', false)
+				ON CONFLICT (team_id, key) DO UPDATE SET enabled = false`, cfg.teamID); herr != nil {
+				return fmt.Errorf("hold dest rollups: %w", herr)
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("copy %s: %w", t.name, err)
 		}
@@ -374,6 +390,23 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		return fmt.Errorf("relink sandbox.snapshot_id: %w", err)
 	}
 	log.Info().Int64("relinked", relinked).Msg("copy: sandbox.snapshot_id relinked from source")
+
+	// Release the rollup hold: the flag table itself was copied above (a
+	// converging upsert overwrote the hold when the source has an explicit
+	// row), so cleanup is only needed when the source has NO override —
+	// then the hold row is ours to remove, restoring default behavior.
+	var srcHasFlag bool
+	if err := src.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups')`,
+		cfg.teamID).Scan(&srcHasFlag); err != nil {
+		return fmt.Errorf("check source rollup flag: %w", err)
+	}
+	if !srcHasFlag {
+		if _, err := dst.Exec(ctx, `
+			DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, cfg.teamID); err != nil {
+			return fmt.Errorf("release dest rollup hold: %w", err)
+		}
+	}
 
 	for _, s := range skippedTables {
 		log.Info().Str("table", s.name).Str("reason", s.reason).Msg("copy: NOT copied")
