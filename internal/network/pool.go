@@ -136,14 +136,18 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 // configured — the next Claim reuses them with zero setup cost.
 // If the recycled pool is full, the slot is torn down instead.
 func (p *Pool) Return(slot *preallocSlot) {
+	// Transfer ownership from the VM back to the pool BEFORE handing the slot
+	// off. Doing it under the lock first means a concurrent Claim that pops the
+	// slot can't be clobbered by a late poolOwner write, and the recycle-full
+	// cleanup below releases the right owner (poolOwner) instead of leaking.
+	p.mgr.mu.Lock()
+	p.mgr.assignSlotLocked(slot.idx, poolOwner)
+	p.mgr.mu.Unlock()
+
 	select {
 	case p.recycled <- slot:
-		// Ownership transfers back from the VM to the pool.
-		p.mgr.mu.Lock()
-		p.mgr.assignSlotLocked(slot.idx, poolOwner)
-		p.mgr.mu.Unlock()
 	default:
-		// Recycle pool full — tear down (cleanup releases ownership).
+		// Recycle pool full — tear down (cleanup releases the pool's ownership).
 		p.cleanup(slot)
 	}
 }

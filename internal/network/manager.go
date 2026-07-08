@@ -519,11 +519,13 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	}
 	m.slotOwner[idx] = teardownOwner
 	m.mu.Unlock()
+	// Release even if cleanupFull panics — otherwise the index stays stuck as
+	// teardownOwner forever (no other path releases that sentinel).
+	defer m.releaseIfOwned(idx, teardownOwner)
 
 	// Tear down both sides even if the netns is already gone: `ip netns del`
 	// only removes the in-namespace side, so the host-side veth-N can outlive it.
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
-	m.releaseIfOwned(idx, teardownOwner)
 	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
 		Msg("reclaimed network slot for untracked VM")
 }
