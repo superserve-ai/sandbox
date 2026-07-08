@@ -385,7 +385,14 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 
 // buildTransforms wires up the per-table row rewrites: host remap, region
 // rehoming, snapshot-cycle break, and the role-id remap by role name.
-func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (map[string]rowTransform, error) {
+// querier is the read surface shared by pgxpool.Pool and pgx.Tx, so the
+// transform builders can run against a locked transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func buildTransforms(ctx context.Context, src, dst querier, cfg config) (map[string]rowTransform, error) {
 	srcRoleNames, err := roleNamesByID(ctx, src)
 	if err != nil {
 		return nil, fmt.Errorf("load source roles: %w", err)
@@ -449,7 +456,7 @@ func buildTransforms(ctx context.Context, src, dst *pgxpool.Pool, cfg config) (m
 // templates are seeded per cell with fresh ids, so copying sandbox rows
 // verbatim would point their template_id FK at nothing. Fails fast when the
 // dest is missing a referenced template — seed the dest cell first.
-func foreignTemplateRemap(ctx context.Context, src, dst *pgxpool.Pool, teamID uuid.UUID) (map[string]string, error) {
+func foreignTemplateRemap(ctx context.Context, src, dst querier, teamID uuid.UUID) (map[string]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT DISTINCT t.id::text, t.name, tm.name
 		FROM sandbox s
@@ -496,7 +503,7 @@ func foreignTemplateRemap(ctx context.Context, src, dst *pgxpool.Pool, teamID uu
 	return remap, nil
 }
 
-func roleNamesByID(ctx context.Context, pool *pgxpool.Pool) (map[string]string, error) {
+func roleNamesByID(ctx context.Context, pool querier) (map[string]string, error) {
 	rows, err := pool.Query(ctx, `SELECT id::text, name FROM roles`)
 	if err != nil {
 		return nil, err
@@ -513,7 +520,7 @@ func roleNamesByID(ctx context.Context, pool *pgxpool.Pool) (map[string]string, 
 	return out, rows.Err()
 }
 
-func roleIDsByName(ctx context.Context, pool *pgxpool.Pool) (map[string]string, error) {
+func roleIDsByName(ctx context.Context, pool querier) (map[string]string, error) {
 	byID, err := roleNamesByID(ctx, pool)
 	if err != nil {
 		return nil, err
@@ -550,9 +557,60 @@ var insertOnlyTables = map[string]bool{
 	"profile": true,
 }
 
+// allColumns lists a table's column names in attnum order.
+func allColumns(ctx context.Context, dst *pgxpool.Pool, table string) ([]string, error) {
+	rows, err := dst.Query(ctx, `
+		SELECT a.attname FROM pg_attribute a
+		WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped
+		ORDER BY a.attnum`, table)
+	if err != nil {
+		return nil, fmt.Errorf("columns of %s: %w", table, err)
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
+}
+
+// conflictTargets overrides the upsert's conflict column set where a table's
+// natural uniqueness isn't its primary key. billing_rollup_job: the DEST
+// cell's own rollup scheduler enqueues (team_id, hour_start) rows the moment
+// the copied team + intervals become visible, under a fresh id — a PK-keyed
+// upsert then hits the (team_id, hour_start) unique constraint and can never
+// converge. Conflicting on the natural key instead lets the copy overwrite
+// scheduler-created rows (id included) and re-runs stay idempotent.
+var conflictTargets = map[string]string{
+	"billing_rollup_job": "(team_id, hour_start)",
+}
+
 func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (string, error) {
 	if insertOnlyTables[table] {
 		return "ON CONFLICT DO NOTHING", nil
+	}
+	if target, ok := conflictTargets[table]; ok {
+		cols, err := allColumns(ctx, dst, table)
+		if err != nil {
+			return "", err
+		}
+		targetCols := map[string]bool{}
+		for _, c := range strings.Split(strings.Trim(target, "()"), ",") {
+			targetCols[strings.TrimSpace(c)] = true
+		}
+		var updates []string
+		for _, col := range cols {
+			if targetCols[col] {
+				continue
+			}
+			q := pgx.Identifier{col}.Sanitize()
+			updates = append(updates, q+" = EXCLUDED."+q)
+		}
+		return fmt.Sprintf("ON CONFLICT %s DO UPDATE SET %s", target, strings.Join(updates, ", ")), nil
 	}
 	rows, err := dst.Query(ctx, `
 		SELECT a.attname, COALESCE(i.indisprimary, false)
@@ -1029,6 +1087,29 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 		return fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	// Lock the team's rows first: the auto-delete worker claims paused
+	// sandboxes past their deadline with an UPDATE, which now blocks behind
+	// these locks instead of racing the deletes (its claim matches zero
+	// rows once we commit). activeSandboxes can't see that worker — it
+	// flips rows straight to destroyed — so locking is the only guard that
+	// closes the window rather than shrinking it.
+	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id = $1 FOR UPDATE`, cfg.teamID); err != nil {
+		return fmt.Errorf("lock team: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM sandbox WHERE team_id = $1 FOR UPDATE`, cfg.teamID); err != nil {
+		return fmt.Errorf("lock sandboxes: %w", err)
+	}
+	// Under the lock, re-verify sandbox content still matches the dest —
+	// catches anything (auto-delete included) that mutated sandboxes
+	// between validate and the locks landing.
+	drift, err := sandboxDriftUnderLock(ctx, tx, dst, cfg)
+	if err != nil {
+		return err
+	}
+	if drift {
+		return fmt.Errorf("aborting decommission: sandbox rows changed after validate (auto-delete or resume raced the window) — re-run copy and validate")
+	}
 
 	// Break the sandbox↔snapshot cycle so snapshots can go before sandboxes.
 	if _, err := tx.Exec(ctx, `UPDATE sandbox SET snapshot_id = NULL WHERE team_id = $1`, cfg.teamID); err != nil {

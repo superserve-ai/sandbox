@@ -725,6 +725,32 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("copy converges over a scheduler-created rollup job", func(t *testing.T) {
+		// The dest cell's rollup scheduler can enqueue (team_id, hour_start)
+		// the moment the copied team becomes visible — under a fresh id.
+		// The natural-key upsert must overwrite it instead of wedging on
+		// the unique constraint.
+		var hourStart, hourEnd time.Time
+		if err := srcPool.QueryRow(ctx, `SELECT hour_start, hour_end FROM billing_rollup_job WHERE team_id = $1`, f.team).Scan(&hourStart, &hourEnd); err != nil {
+			t.Fatalf("read fixture rollup hour: %v", err)
+		}
+		mustExec(t, dstPool, `DELETE FROM billing_rollup_job WHERE team_id = $1`, f.team)
+		mustExec(t, dstPool, `
+			INSERT INTO billing_rollup_job (team_id, hour_start, hour_end, status)
+			VALUES ($1, $2, $3, 'pending')`, f.team, hourStart, hourEnd)
+
+		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
+			t.Fatalf("copy must converge over the scheduler's row: %v", err)
+		}
+		got := scanString(t, dstPool, `SELECT status FROM billing_rollup_job WHERE team_id = $1 AND hour_start = $2`, f.team, hourStart)
+		if got != "completed" {
+			t.Fatalf("scheduler row not overwritten: status=%q", got)
+		}
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatalf("validate after convergence: %v", err)
+		}
+	})
+
 	t.Run("validate tolerates source-side expiry of revocation rows", func(t *testing.T) {
 		// The source reaper prunes expired revocation rows on its own
 		// schedule; the dest keeps its copy. Parity must not gate on it.
