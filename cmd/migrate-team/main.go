@@ -92,8 +92,12 @@ func main() {
 	default:
 		log.Fatal().Str("phase", cfg.phase).Msg("unknown phase; want plan | copy | validate | decommission")
 	}
-	if cfg.phase == phaseCopy && (cfg.destHostID == "" || cfg.destRegion == "") {
-		log.Fatal().Msg("--dest-host-id and --dest-region are required for copy")
+	// copy rewrites rows with these values; validate and decommission apply
+	// the same transforms when checksumming the source, so running them
+	// without the flags would compare against empty rewrites and report
+	// false drift on every team and sandbox row.
+	if cfg.phase != phasePlan && (cfg.destHostID == "" || cfg.destRegion == "") {
+		log.Fatal().Msg("--dest-host-id and --dest-region are required for " + cfg.phase)
 	}
 	if cfg.phase == phaseDecommission && cfg.confirmTeamName == "" {
 		log.Fatal().Msg("--confirm-team-name is required for decommission")

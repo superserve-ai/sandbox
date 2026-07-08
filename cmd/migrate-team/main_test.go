@@ -232,7 +232,7 @@ func seedFixture(t *testing.T) *fixture {
 
 	mustExec(t, srcPool, `
 		INSERT INTO secret (id, team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id)
-		VALUES ($1, $2, 'anthropic', 'bearer', ARRAY['api.anthropic.com'], '\x0102aabb'::bytea, '\x0304ccdd'::bytea,
+		VALUES ($1, $2, 'example-provider', 'bearer', ARRAY['api.example.com'], '\x0102aabb'::bytea, '\x0304ccdd'::bytea,
 		        'projects/ss/locations/global/keyRings/secrets/cryptoKeys/kek')`, f.secret, f.team)
 
 	tplDir := "/srv/templates/" + f.tpl.String()
@@ -331,7 +331,7 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ($1, $2, $3, 'template', 'build', 'template')`, f.tpl, f.team, f.owner)
 	mustExec(t, srcPool, `
 		INSERT INTO activity (team_id, actor_id, category, action, resource_type, secret_id, secret_name)
-		VALUES ($1, $2, 'secret', 'create', 'secret', $3, 'anthropic')`, f.team, f.owner, f.secret)
+		VALUES ($1, $2, 'secret', 'create', 'secret', $3, 'example-provider')`, f.team, f.owner, f.secret)
 
 	mustExec(t, srcPool, `INSERT INTO sandbox_revocation (sandbox_id, expires_at) VALUES ($1, $2)`, f.sb1, base.Add(48*time.Hour))
 	mustExec(t, srcPool, `INSERT INTO revoked_proxy_token (sandbox_id, proxy_token, expires_at) VALUES ($1, 'tok-1', $2)`, f.sb1, base.Add(48*time.Hour))
@@ -342,10 +342,10 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ('dev-'||$1::text, 'usr-'||$1::text, $2, 'approved', $3)`, uuid.New(), f.owner, base.Add(time.Hour))
 	mustExec(t, srcPool, `
 		INSERT INTO proxy_audit (team_id, sandbox_id, secret_id, method, host, path, status)
-		VALUES ($1, $2, $3, 'POST', 'api.anthropic.com', '/v1/messages', 200)`, f.team, f.sb1, f.secret)
+		VALUES ($1, $2, $3, 'POST', 'api.example.com', '/v1/messages', 200)`, f.team, f.sb1, f.secret)
 	mustExec(t, srcPool, `
 		INSERT INTO net_flow (team_id, sandbox_id, protocol, host, dst_ip, dst_port, verdict)
-		VALUES ($1, $2, 'tls', 'api.anthropic.com', '160.79.104.10', 443, 'allowed')`, f.team, f.sb1)
+		VALUES ($1, $2, 'tls', 'api.example.com', '192.0.2.10', 443, 'allowed')`, f.team, f.sb1)
 	mustExec(t, srcPool, `
 		INSERT INTO audit_logs (actor_user_id, team_id, event_type) VALUES ($1, $2, 'role_granted')`, f.owner, f.team)
 
@@ -668,14 +668,14 @@ func TestTeamMigration(t *testing.T) {
 		// A background writer (or an aborted first attempt) mutates a source
 		// row after it landed in dest. The re-run must overwrite the stale
 		// dest row, not skip it.
-		mustExec(t, srcPool, `UPDATE secret SET name = 'anthropic-rotated' WHERE id = $1`, f.secret)
-		defer mustExec(t, srcPool, `UPDATE secret SET name = 'anthropic' WHERE id = $1`, f.secret)
+		mustExec(t, srcPool, `UPDATE secret SET name = 'example-provider-rotated' WHERE id = $1`, f.secret)
+		defer mustExec(t, srcPool, `UPDATE secret SET name = 'example-provider' WHERE id = $1`, f.secret)
 
 		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
 			t.Fatalf("re-copy: %v", err)
 		}
 		got := scanString(t, dstPool, `SELECT name FROM secret WHERE id = $1`, f.secret)
-		if got != "anthropic-rotated" {
+		if got != "example-provider-rotated" {
 			t.Fatalf("dest kept the stale row: name=%q, want the re-copied value", got)
 		}
 		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
@@ -686,9 +686,9 @@ func TestTeamMigration(t *testing.T) {
 	t.Run("validate catches content drift behind equal counts", func(t *testing.T) {
 		// Same row count on both sides, different content — count parity
 		// passes, the checksum pass must not.
-		mustExec(t, srcPool, `UPDATE secret SET hosts = ARRAY['api.example.com'] WHERE id = $1`, f.secret)
+		mustExec(t, srcPool, `UPDATE secret SET hosts = ARRAY['drift.example.org'] WHERE id = $1`, f.secret)
 		defer func() {
-			mustExec(t, srcPool, `UPDATE secret SET hosts = ARRAY['api.anthropic.com'] WHERE id = $1`, f.secret)
+			mustExec(t, srcPool, `UPDATE secret SET hosts = ARRAY['drift.example.org'] WHERE id = $1`, f.secret)
 			if err := run(ctx, f.cfg(phaseCopy)); err != nil {
 				t.Fatalf("restore copy: %v", err)
 			}
