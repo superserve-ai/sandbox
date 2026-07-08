@@ -104,6 +104,38 @@ func TestClaimSlotIndex_FreshNextSlot(t *testing.T) {
 	}
 }
 
+// TestReserveSlot_NoCollisionWithSandbox pins the build-slot invariant: a slot
+// reserved for a template build goes through the one authoritative allocator, so
+// a concurrent sandbox claim can't get the same index — and the index is
+// reclaimed once the build releases it (what CleanupVMOrNamespace does on exit).
+func TestReserveSlot_NoCollisionWithSandbox(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+
+	build, err := m.ReserveSlot("build-tmpl")
+	if err != nil {
+		t.Fatalf("ReserveSlot: %v", err)
+	}
+	sandbox, err := m.claimSlotIndex("vm-1")
+	if err != nil {
+		t.Fatalf("claimSlotIndex: %v", err)
+	}
+	if build == sandbox {
+		t.Fatalf("build and sandbox got the same slot %d", build)
+	}
+
+	if !m.releaseIfOwned(build, "build-tmpl") {
+		t.Fatalf("releaseIfOwned(%d, build-tmpl) = false, want true", build)
+	}
+	reused, err := m.claimSlotIndex("vm-2")
+	if err != nil {
+		t.Fatalf("claimSlotIndex after release: %v", err)
+	}
+	if reused != build {
+		t.Errorf("reused = %d, want %d (released build slot reclaimed)", reused, build)
+	}
+}
+
 func TestClaimSlotIndex_PrefersFreeSlotsLIFO(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()

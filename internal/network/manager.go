@@ -151,9 +151,10 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 // ManagerOption configures optional Manager behavior.
 type ManagerOption func(*Manager)
 
-// WithStartSlot sets the starting slot index for network allocation.
-// Use to avoid collision when multiple processes manage VMs on the
-// same host (e.g. vmd uses 1-100, template-builder uses 200+).
+// WithStartSlot sets the starting slot index for network allocation. Used by a
+// template-builder subprocess to build exactly the one slot vmd reserved for it
+// via ReserveSlot — the reservation, not a disjoint range, is what keeps a build
+// from colliding with vmd's sandbox slots.
 func WithStartSlot(idx int) ManagerOption {
 	return func(m *Manager) { m.nextSlot = idx }
 }
@@ -757,6 +758,16 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	delete(m.slotOwner, idx)
 	m.freeSlots = append(m.freeSlots, idx)
 	return true
+}
+
+// ReserveSlot claims a fresh, unused slot index under owner without building any
+// kernel network state. The caller — a template-builder subprocess — creates
+// ns-<idx>/veth-<idx> itself; the reservation is what stops vmd's sandbox
+// allocator from handing the same index to a VM, so builds and sandboxes draw
+// from one authoritative allocator instead of racing disjoint ranges. Release it
+// (and tear down any residue) with CleanupVMOrNamespace(owner, "ns-<idx>").
+func (m *Manager) ReserveSlot(owner string) (int, error) {
+	return m.claimSlotIndex(owner)
 }
 
 // claimSlotIndex picks a slot idx that is unowned and not present in the kernel,

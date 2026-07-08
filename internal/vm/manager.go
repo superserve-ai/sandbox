@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -215,11 +214,6 @@ type Manager struct {
 	// until process exit so late pollers can read terminal outcomes.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
-
-	// nextBuildSlot assigns unique network slot indices to concurrent
-	// template-builder subprocesses. Starts at 200 to avoid collision
-	// with vmd's sandbox pool (indices 1-100).
-	nextBuildSlot atomic.Int32
 }
 
 // NewManager creates a new VM manager.
