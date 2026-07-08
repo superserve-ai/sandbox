@@ -33,6 +33,24 @@ type tableSpec struct {
 	scope string
 }
 
+// copyScopes narrows what copy and validation see for a table; decommission
+// still deletes by the full scope. Used to carve rows out of the generic
+// pipeline that the tool manages explicitly: the rollup-hold flag row must
+// not be copied, or an explicit TRUE from the source would overwrite the
+// hold mid-copy and reopen the dest scheduler window before the interval
+// and rollup tables have landed.
+var copyScopes = map[string]string{
+	"team_feature_flag": "team_id = $1 AND key <> 'billing_hourly_rollups'",
+}
+
+// effectiveCopyScope is the WHERE clause copy and validation share.
+func (t tableSpec) effectiveCopyScope() string {
+	if s, ok := copyScopes[t.name]; ok {
+		return s
+	}
+	return t.scope
+}
+
 var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},

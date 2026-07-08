@@ -311,6 +311,9 @@ func seedFixture(t *testing.T) *fixture {
 		INSERT INTO billing_rollup_team_backfill_state (team_id, next_hour_start) VALUES ($1, $2)`, f.team, base.Add(2*time.Hour))
 
 	mustExec(t, srcPool, `INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'tenant_usage_dashboard', true)`, f.team)
+	// Explicit TRUE rollup flag: the copy must hold dest rollups FALSE for
+	// the whole run anyway, then restore this value at the end.
+	mustExec(t, srcPool, `INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_hourly_rollups', true)`, f.team)
 	mustExec(t, srcPool, `INSERT INTO team_pricing_plan (team_id, plan_key, assigned_by) VALUES ($1, 'payg', $2)`, f.team, f.owner)
 
 	grantID := uuid.New()
@@ -412,7 +415,7 @@ func seedFixture(t *testing.T) *fixture {
 		"billing_period_anomaly":             1,
 		"billing_rollup_job":                 1,
 		"billing_rollup_team_backfill_state": 1,
-		"team_feature_flag":                  1,
+		"team_feature_flag":                  2,
 		"team_pricing_plan":                  1,
 		"team_credit_grant":                  1,
 		"team_credit_ledger":                 1,
@@ -645,9 +648,25 @@ func TestTeamMigration(t *testing.T) {
 	})
 
 	t.Run("copy leaves the dest rollup flag matching the source", func(t *testing.T) {
-		// The copy holds dest rollups with a temporary false override; the
-		// fixture team has no rollup-flag row in source, so the hold must
-		// be gone once the copy finishes — default behavior restored.
+		// The fixture's source flag is an explicit TRUE — the hold must not
+		// leak (dest false) nor the hold be overwritten mid-copy silently;
+		// after the copy the dest carries the source's value.
+		var enabled bool
+		if err := dstPool.QueryRow(ctx, `
+			SELECT enabled FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil {
+			t.Fatalf("restored flag row missing: %v", err)
+		}
+		if !enabled {
+			t.Fatal("dest rollup flag left FALSE — the hold leaked past the copy")
+		}
+
+		// And with no source row at all, a re-copy removes the hold row.
+		mustExec(t, srcPool, `DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team)
+		defer mustExec(t, srcPool, `INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_hourly_rollups', true)`, f.team)
+		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
+			t.Fatalf("re-copy: %v", err)
+		}
 		var n int
 		if err := dstPool.QueryRow(ctx, `
 			SELECT count(*) FROM team_feature_flag

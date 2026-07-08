@@ -122,7 +122,7 @@ func run(ctx context.Context, cfg config) error {
 func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
 	for _, t := range migratedTables {
 		var n int64
-		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope)
+		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope())
 		if err := src.QueryRow(ctx, q, cfg.teamID).Scan(&n); err != nil {
 			return fmt.Errorf("count %s: %w", t.name, err)
 		}
@@ -403,17 +403,22 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	// converging upsert overwrote the hold when the source has an explicit
 	// row), so cleanup is only needed when the source has NO override —
 	// then the hold row is ours to remove, restoring default behavior.
-	var srcHasFlag bool
+	var srcEnabled *bool
 	if err := src.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups')`,
-		cfg.teamID).Scan(&srcHasFlag); err != nil {
+		SELECT enabled FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`,
+		cfg.teamID).Scan(&srcEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("check source rollup flag: %w", err)
 	}
-	if !srcHasFlag {
+	if srcEnabled == nil {
 		if _, err := dst.Exec(ctx, `
 			DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, cfg.teamID); err != nil {
 			return fmt.Errorf("release dest rollup hold: %w", err)
 		}
+	} else if _, err := dst.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_hourly_rollups', $2)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = $2`, cfg.teamID, *srcEnabled); err != nil {
+		return fmt.Errorf("restore dest rollup flag: %w", err)
 	}
 
 	for _, s := range skippedTables {
@@ -706,7 +711,7 @@ func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (strin
 // Tables without a primary key fall back to DO NOTHING with a warning;
 // validate's per-row checksums remain the backstop either way.
 func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
-	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.scope)
+	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.effectiveCopyScope())
 	conflict, err := conflictClause(ctx, dst, t.name)
 	if err != nil {
 		return 0, 0, err
@@ -859,7 +864,7 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 		if validationExemptTables[t.name] {
 			continue // self-expiring advisory rows; see validationExemptTables.
 		}
-		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope)
+		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope())
 		var srcN, dstN int64
 		if err := src.QueryRow(ctx, q, teamID).Scan(&srcN); err != nil {
 			return nil, fmt.Errorf("count source %s: %w", t.name, err)
