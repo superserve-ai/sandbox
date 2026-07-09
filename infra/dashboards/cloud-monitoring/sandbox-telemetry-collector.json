@@ -1,0 +1,112 @@
+{
+  "displayName": "Sandbox Telemetry / Collector",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "xPos": 0,
+        "yPos": 0,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Exporter Failures",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (exporter) (rate(otelcol_exporter_send_failed_metric_points[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{exporter}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "points/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 0,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Dropped Metric Points",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (processor) (rate(otelcol_processor_dropped_metric_points[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{processor}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "points/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Exporter Queue Pressure",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (exporter) (otelcol_exporter_queue_size / clamp_min(otelcol_exporter_queue_capacity, 1))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{exporter}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "ratio",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Memory Limiter Refusals",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (processor) (rate(otelcol_processor_refused_metric_points{processor=~\"memory_limiter.*\"}[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{processor}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "points/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

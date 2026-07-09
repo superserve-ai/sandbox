@@ -115,6 +115,7 @@ module "api" {
   env = {
     API_PORT          = "8080"
     EDGE_PROXY_DOMAIN = "usw-sandbox.superserve.ai"
+    SANDBOX_ID_REGION = "usw"
     SUPABASE_URL      = var.supabase_url
     VMD_GRPC_ADDRESS  = "10.1.0.2:50051"
   }
@@ -131,6 +132,9 @@ module "api" {
     }
     SECRETS_SIGNING_KEY = {
       secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
+    }
+    SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn-${local.resource_suffix}")
     }
   }
 

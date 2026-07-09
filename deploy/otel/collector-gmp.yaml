@@ -1,0 +1,70 @@
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        # Cloud Run reaches the collector over the host's internal IP.
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  attributes/drop_internal_high_cardinality:
+    actions:
+      - key: sandbox_id
+        action: delete
+      - key: team_id
+        action: delete
+      - key: user_id
+        action: delete
+      - key: api_key_id
+        action: delete
+      - key: request_id
+        action: delete
+      - key: url
+        action: delete
+      - key: error
+        action: delete
+  batch:
+    send_batch_size: 256
+    timeout: 5s
+
+exporters:
+  googlemanagedprometheus:
+    project: ${env:GCP_PROJECT}
+    user_agent: superserve-sandbox-otel-collector/{{version}}
+    metric:
+      grpc_pool_size: 1
+      add_metric_suffixes: false
+      extra_metrics_config:
+        enable_scope_info: false
+        enable_target_info: true
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 512
+
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      address: 127.0.0.1:8888
+  pipelines:
+    metrics:
+      receivers: [otlp, prometheus/self]
+      processors: [memory_limiter, attributes/drop_internal_high_cardinality, batch]
+      exporters: [googlemanagedprometheus]

@@ -2,6 +2,13 @@ terraform {
   required_version = ">= 1.5.0"
 }
 
+resource "google_monitoring_dashboard" "dashboards" {
+  for_each = var.dashboards
+
+  project        = var.project_id
+  dashboard_json = each.value.definition
+}
+
 locals {
   observability_contract = {
     project_id         = var.project_id

@@ -133,25 +133,18 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 // Used by CreateSandbox when a post-restore step (env injection, JWT mint) fails:
 // the VM is already running but unusable. vmd must be the client for the host the
 // VM booted on — destroying through the default client would leave the VM running
-// on a non-default host.
-func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sandboxID, teamID uuid.UUID, instanceID, hostID string, recordTransition bool) {
+// on a non-default host. Request middleware records the create failure metric
+// from the HTTP response, so this helper only updates state and logs.
+func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sandboxID, teamID uuid.UUID, instanceID, hostID string) {
 	if err := vmd.DestroyInstance(ctx, instanceID, true); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy after failed boot")
 	}
-	started := time.Now()
 	if err := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
 		ID:     sandboxID,
 		Status: db.SandboxStatusFailed,
 		TeamID: teamID,
 	}); err != nil {
-		if recordTransition {
-			RecordSandboxTransition(ctx, "fail", telemetry.ResultError, hostID, time.Since(started))
-		}
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("mark-failed after destroy")
-	} else {
-		if recordTransition {
-			RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, hostID, time.Since(started))
-		}
 	}
 	// A failed sandbox keeps status=failed with destroyed_at NULL, and the
 	// secret-binding queries filter only on destroyed_at, so clear the bindings
