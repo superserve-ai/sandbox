@@ -144,7 +144,7 @@ func TestClaimSlotIndex_ExactSlotDoesNotAdvance(t *testing.T) {
 
 	// Pinned slot already taken → must fail, not fall through to 8.
 	taken := newTestManager()
-	taken.nextSlot, taken.maxSlot = 7, 7 // WithExactSlot(7)
+	taken.nextSlot, taken.maxSlot, taken.slotPinned = 7, 7, true // WithExactSlot(7)
 	taken.slotOwner[7] = "other"
 	if _, err := taken.claimSlotIndex("build-x"); err == nil {
 		t.Fatal("want ErrNoSlots when the pinned slot is taken, got nil (advanced past the pin)")
@@ -152,7 +152,7 @@ func TestClaimSlotIndex_ExactSlotDoesNotAdvance(t *testing.T) {
 
 	// Pinned slot free → claims exactly 7.
 	free := newTestManager()
-	free.nextSlot, free.maxSlot = 7, 7
+	free.nextSlot, free.maxSlot, free.slotPinned = 7, 7, true
 	idx, err := free.claimSlotIndex("build-x")
 	if err != nil {
 		t.Fatalf("claimSlotIndex: %v", err)

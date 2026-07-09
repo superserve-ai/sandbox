@@ -82,8 +82,9 @@ type Manager struct {
 	mu        sync.Mutex
 	devices   map[string]*VMNetInfo
 	freeSlots []int // recycled slot indices, guaranteed absent from slotOwner
-	nextSlot  int   // next new slot (used when freeSlots is empty)
-	maxSlot   int   // upper bound for new-slot allocation (0 = MaxSlots); WithExactSlot pins to one
+	nextSlot   int  // next new slot (used when freeSlots is empty)
+	maxSlot    int  // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
+	slotPinned bool // WithExactSlot: allocate exactly maxSlot or fail, never advance
 
 	// slotOwner is the single source of truth for slot allocation AND identity:
 	// slotOwner[idx] == the current owner of slot index idx, one of
@@ -158,7 +159,7 @@ type ManagerOption func(*Manager)
 // ReserveSlot; if that slot is somehow unavailable the build fails cleanly
 // instead of silently running on an index vmd never reserved.
 func WithExactSlot(idx int) ManagerOption {
-	return func(m *Manager) { m.nextSlot = idx; m.maxSlot = idx }
+	return func(m *Manager) { m.nextSlot = idx; m.maxSlot = idx; m.slotPinned = true }
 }
 
 // WithHTTPProxyPort sets the HTTP proxy port for egress REDIRECT rules.
@@ -793,7 +794,7 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 			m.freeSlots = m.freeSlots[:len(m.freeSlots)-1]
 		} else {
 			ceiling := MaxSlots
-			if m.maxSlot > 0 {
+			if m.slotPinned {
 				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
 			}
 			if m.nextSlot > ceiling {
