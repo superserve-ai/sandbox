@@ -880,6 +880,36 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("detach refuses when the source is no longer quiescent", func(t *testing.T) {
+		mustExec(t, srcPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
+		defer mustExec(t, srcPool, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, f.sb1)
+
+		cfg := f.cfg(phaseDetach)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), f.sb1.String()) {
+			t.Fatalf("post-copy resume must block detach, got: %v", err)
+		}
+	})
+
+	t.Run("detach refuses when a build is in flight", func(t *testing.T) {
+		buildID := uuid.New()
+		mustExec(t, srcPool, `
+			INSERT INTO template_build (id, template_id, team_id, status, build_spec_hash, vmd_host_id)
+			VALUES ($1, $2, $3, 'building', 'race-hash', $4)`, buildID, f.tpl, f.team, sourceHostID)
+		defer mustExec(t, srcPool, `DELETE FROM template_build WHERE id = $1`, buildID)
+
+		cfg := f.cfg(phaseDetach)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
+			t.Fatalf("in-flight build must block detach, got: %v", err)
+		}
+		if got := countScoped(t, srcPool, tableSpec{"team_memberships", "team_id = $1"}, f.team); got != 2 {
+			t.Fatal("refused detach must not delete anything")
+		}
+	})
+
 	t.Run("detach requires the exact team name", func(t *testing.T) {
 		cfg := f.cfg(phaseDetach)
 		cfg.confirmTeamName = "migration-dril" // one letter off
@@ -892,10 +922,25 @@ func TestTeamMigration(t *testing.T) {
 	})
 
 	t.Run("detach removes only the membership rows", func(t *testing.T) {
+		// Re-impose the copy's rollup hold on the dest (an earlier subtest
+		// released it via the standalone phase): detach is the cutover
+		// moment and must lift the hold itself, or the migrated team's
+		// hourly rollups stay suppressed for the whole soak.
+		mustExec(t, dstPool, `UPDATE team_feature_flag SET enabled = false WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team)
+
 		cfg := f.cfg(phaseDetach)
 		cfg.confirmTeamName = "migration-drill"
 		if err := run(ctx, cfg); err != nil {
 			t.Fatalf("detach: %v", err)
+		}
+
+		var rollups bool
+		if err := dstPool.QueryRow(ctx, `SELECT enabled FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&rollups); err != nil {
+			t.Fatal(err)
+		}
+		if !rollups {
+			t.Fatal("detach must restore the source rollup flag in the dest at cutover")
 		}
 
 		// The RBAC chain is gone from the source; every other table keeps

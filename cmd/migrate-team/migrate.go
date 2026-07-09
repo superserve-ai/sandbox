@@ -1157,6 +1157,28 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
 	}
 
+	// Same quiescence re-check as purge: a sandbox resumed or a build
+	// started after the copy is invisible to validate (in-flight build rows
+	// sit outside the migration scope entirely), and detach would sever the
+	// only reachable copy while that work still writes source rows and
+	// artifacts that were never copied.
+	blockers, err := activeSandboxes(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(blockers) > 0 {
+		return fmt.Errorf("aborting detach: %d sandbox(es) no longer quiescent:\n  %s",
+			len(blockers), strings.Join(blockers, "\n  "))
+	}
+	builds, err := activeBuilds(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(builds) > 0 {
+		return fmt.Errorf("aborting detach: %d template build(s) in flight:\n  %s",
+			len(builds), strings.Join(builds, "\n  "))
+	}
+
 	// A validate pass is a precondition in the same invocation — after
 	// detach the dest is the only copy anyone can reach, so never sever
 	// access to a source we haven't just proven the dest matches.
@@ -1197,6 +1219,16 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		return fmt.Errorf("commit: %w", err)
 	}
 	log.Info().Int64("deleted", total).Msg("detach: source membership rows removed; everything else stays as a cold fallback until purge")
+
+	// Detach is the cutover moment, so it lifts the copy's rollup hold
+	// itself — leaving that to purge would suppress the team's hourly
+	// rollups in the dest for the whole soak. The source flag row outlives
+	// detach (team_feature_flag is not a membership table), so this is the
+	// same source-state restore as the standalone release-rollups phase,
+	// and a no-op when the runbook already ran that phase at cutover.
+	if err := runReleaseRollups(ctx, src, dst, cfg); err != nil {
+		return fmt.Errorf("detach: release rollup hold: %w", err)
+	}
 	return nil
 }
 
