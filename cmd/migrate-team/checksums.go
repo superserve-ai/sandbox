@@ -106,7 +106,7 @@ func diffChecksums(src, dst map[string]int) (srcOnly, dstOnly int) {
 
 // contentDriftUnderLock re-compares the mutation-prone tables — sandbox
 // rows and secret bindings — between the locked source transaction and the
-// dest, transform-aware, so decommission's deletes act on exactly the rows
+// dest, transform-aware, so purge's deletes act on exactly the rows
 // validation approved. Runs on the transaction (not the pool): the FOR
 // UPDATE row locks and per-sandbox advisory locks it holds are the point.
 // Returns the first drifted table's name, or "".
