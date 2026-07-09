@@ -1463,7 +1463,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	tBoxdStart := time.Now()
-	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
+	// Same window as first boot: a restore that has to fault its memory and
+	// overlay from cold storage (first resume of a migrated VM, page cache
+	// evicted) legitimately needs more than a warm same-host resume, and a
+	// timeout here is destructive — the error path below tears down the VM.
+	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
