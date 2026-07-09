@@ -199,6 +199,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Preview access control. Runs before the status check so an
+	// unauthenticated caller probing a private sandbox can't learn its
+	// state from the paused/running 503 detail.
+	if !h.enforcePreviewAccess(w, r, instanceID, port, info) {
+		return
+	}
+
 	if info.Status != "running" {
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, fmt.Sprintf("sandbox is %s", info.Status), http.StatusServiceUnavailable)
@@ -219,6 +226,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.ipConns.release(clientIP)
+
+	// The preview credential authenticates to the proxy, never to the app —
+	// strip every carrier before the request enters the VM.
+	scrubPreviewCredentials(r)
 
 	transport := h.transports.get(instanceID, info)
 

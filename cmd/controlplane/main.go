@@ -412,16 +412,18 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewTokenVersion int64, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		BasePath:     basePath,
-		DeltaDir:     deltaDir,
-		TeamId:       teamID,
-		OwnerId:      ownerID,
-		EnvVars:      envVars,
+		VmId:                vmID,
+		SnapshotPath:        snapshotPath,
+		MemFilePath:         memPath,
+		BasePath:            basePath,
+		DeltaDir:            deltaDir,
+		TeamId:              teamID,
+		OwnerId:             ownerID,
+		PreviewAccess:       previewAccess,
+		PreviewTokenVersion: previewTokenVersion,
+		EnvVars:             envVars,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
@@ -521,6 +523,18 @@ func (c *grpcVMDClient) DeleteTemplateArtifacts(ctx context.Context, templateID 
 	})
 	if err != nil {
 		return fmt.Errorf("gRPC DeleteTemplateArtifacts: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, vmID, previewAccess string, previewTokenVersion int64) error {
+	_, err := c.client.UpdateSandboxPreviewPolicy(ctx, &vmdpb.UpdateSandboxPreviewPolicyRequest{
+		VmId:                vmID,
+		PreviewAccess:       previewAccess,
+		PreviewTokenVersion: previewTokenVersion,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC UpdateSandboxPreviewPolicy: %w", err)
 	}
 	return nil
 }

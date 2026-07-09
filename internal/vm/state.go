@@ -51,6 +51,11 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// Persisted so the preview-access policy survives a vmd restart —
+	// otherwise a reattach would silently reopen a private sandbox's ports.
+	// Absent in records that predate the feature → zero values → public.
+	PreviewAccess       string `json:"preview_access,omitempty"`
+	PreviewTokenVersion int64  `json:"preview_token_version,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -206,6 +211,9 @@ func toRecord(inst *VMInstance) VMRecord {
 		BasePath:     inst.Config.BasePath,
 		TeamID:       inst.TeamID,
 		OwnerID:      inst.OwnerID,
+
+		PreviewAccess:       inst.PreviewAccess,
+		PreviewTokenVersion: inst.PreviewTokenVersion,
 	}
 }
 
@@ -230,6 +238,10 @@ func toInstance(rec VMRecord) *VMInstance {
 		Metadata:     rec.Metadata,
 		TeamID:       rec.TeamID,
 		OwnerID:      rec.OwnerID,
+
+		PreviewAccess:       rec.PreviewAccess,
+		PreviewTokenVersion: rec.PreviewTokenVersion,
+
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
 			MemoryMiB: rec.MemoryMiB,

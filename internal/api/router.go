@@ -41,6 +41,10 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
+		// Preview URL auth: mint is a read (like the access_token on GET),
+		// rotate mutates the token generation and is a write.
+		api.POST("/sandboxes/:sandbox_id/preview-token", h.MintSandboxPreviewToken)
+		api.POST("/sandboxes/:sandbox_id/preview-token/rotate", h.RotateSandboxPreviewToken)
 		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
 		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 

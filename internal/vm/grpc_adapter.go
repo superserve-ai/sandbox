@@ -115,7 +115,17 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		}
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId())
+	// Reject malformed preview policy up front — booting a VM whose record
+	// carries a value the proxy can't classify helps nobody. Empty is fine
+	// (older control planes; means public).
+	if pa := req.GetPreviewAccess(); pa != "" && pa != "public" && pa != "private" {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, \"public\" or \"private\", got %q", pa)
+	}
+	if req.GetPreviewAccess() == "private" && req.GetPreviewTokenVersion() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "private preview_access requires preview_token_version > 0")
+	}
+
+	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), req.GetPreviewTokenVersion())
 	if err != nil {
 		return nil, err
 	}
@@ -342,6 +352,28 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 	}
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
+}
+
+// UpdateSandboxPreviewPolicy replaces the preview-access policy on the
+// instance record. Valid in any VM state — the record, not the VM, is what
+// the edge proxy reads. NotFound (no record on this host) is surfaced to the
+// caller, which treats it as "the policy will apply on the next restore".
+func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(ctx context.Context, req *vmdpb.UpdateSandboxPreviewPolicyRequest) (*vmdpb.UpdateSandboxPreviewPolicyResponse, error) {
+	vmID := req.GetVmId()
+	if vmID == "" {
+		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+	access := req.GetPreviewAccess()
+	if access != "public" && access != "private" {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be \"public\" or \"private\", got %q", access)
+	}
+	if req.GetPreviewTokenVersion() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "preview_token_version must be > 0")
+	}
+	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, req.GetPreviewTokenVersion()); err != nil {
+		return nil, err
+	}
+	return &vmdpb.UpdateSandboxPreviewPolicyResponse{VmId: vmID}, nil
 }
 
 // InvalidateSecret forwards the invalidate call to the local secretsproxy daemon.

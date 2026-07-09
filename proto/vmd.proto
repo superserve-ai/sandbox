@@ -69,6 +69,13 @@ service VMDaemon {
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
 
+  // UpdateSandboxPreviewPolicy replaces the preview-access policy on the
+  // instance record (any state — the record, not the VM, is what the edge
+  // proxy reads). Used by the control plane for live public/private toggles
+  // and preview-token rotation; restores carry the policy on
+  // RestoreSnapshotRequest instead.
+  rpc UpdateSandboxPreviewPolicy(UpdateSandboxPreviewPolicyRequest) returns (UpdateSandboxPreviewPolicyResponse);
+
   // InvalidateSecret drops any cached cleartext for the given secret in the
   // local secretsproxy daemon. Idempotent.
   rpc InvalidateSecret(InvalidateSecretRequest) returns (InvalidateSecretResponse);
@@ -337,6 +344,12 @@ message RestoreSnapshotRequest {
   // attribute exec/file activity without a database. Both may be empty.
   string team_id = 10;
   string owner_id = 11;
+  // Preview-access policy carried onto the instance record so the edge proxy
+  // can gate numeric-port traffic without a database. "private" requires a
+  // preview token; empty (older control planes) means public. The version is
+  // the token generation preview tokens must match; must be > 0 when private.
+  string preview_access = 12;
+  int64 preview_token_version = 13;
 }
 
 message RestoreSnapshotResponse {
@@ -504,6 +517,20 @@ message UpdateSandboxNetworkRequest {
 }
 
 message UpdateSandboxNetworkResponse {
+  string vm_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// UpdateSandboxPreviewPolicy
+// ---------------------------------------------------------------------------
+
+message UpdateSandboxPreviewPolicyRequest {
+  string vm_id = 1;
+  string preview_access = 2;        // "public" | "private"
+  int64 preview_token_version = 3;  // current token generation; must be > 0
+}
+
+message UpdateSandboxPreviewPolicyResponse {
   string vm_id = 1;
 }
 

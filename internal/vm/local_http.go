@@ -83,6 +83,10 @@ type instanceResponse struct {
 	StartedAt int64  `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
 	TeamID    string `json:"team_id,omitempty"`
 	OwnerID   string `json:"owner_id,omitempty"`
+	// Preview-access policy for the edge proxy's numeric-port gate.
+	// Omitted (→ zero values) for sandboxes that predate the feature = public.
+	PreviewAccess       string `json:"preview_access,omitempty"`
+	PreviewTokenVersion int64  `json:"preview_token_version,omitempty"`
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -111,6 +115,9 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		StartedAt: info.CreatedAt.UnixNano(),
 		TeamID:    info.TeamID,
 		OwnerID:   info.OwnerID,
+
+		PreviewAccess:       info.PreviewAccess,
+		PreviewTokenVersion: info.PreviewTokenVersion,
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
 	}

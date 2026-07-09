@@ -21,6 +21,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
@@ -565,7 +567,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
+			// Carry the row's preview policy: the stateless restore builds a
+			// fresh instance record, and omitting it would silently reopen a
+			// private sandbox's ports.
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), sandbox.PreviewAccess, int64(sandbox.PreviewTokenVersion), nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -1158,6 +1163,22 @@ type createSandboxRequest struct {
 	// Secrets binds team-stored credentials to env-var names; the agent sees a
 	// per-binding proxy token, swapped for the real value at egress.
 	Secrets map[string]string `json:"secrets,omitempty"`
+
+	// PreviewAccess sets the preview-URL policy: "public" (default —
+	// today's unauthenticated behavior) or "private", which makes the edge
+	// proxy require a preview token on every {port}-{id} request. Setting it
+	// at create means the sandbox is never publicly reachable, not even
+	// briefly. Also settable via PATCH /sandboxes/:id.
+	PreviewAccess *string `json:"preview_access,omitempty"`
+}
+
+// validatePreviewAccess rejects anything but the two policy values. nil is
+// allowed (create defaults to public; PATCH treats nil as "not patched").
+func validatePreviewAccess(v *string) error {
+	if v == nil || *v == auth.PreviewAccessPublic || *v == auth.PreviewAccessPrivate {
+		return nil
+	}
+	return fmt.Errorf("preview_access must be %q or %q", auth.PreviewAccessPublic, auth.PreviewAccessPrivate)
 }
 
 type sandboxResponse struct {
@@ -1180,6 +1201,10 @@ type sandboxResponse struct {
 	Network      *networkConfigRequest  `json:"network,omitempty"`
 	Metadata     map[string]string      `json:"metadata"`
 	Secrets      []sandboxSecretBinding `json:"secrets,omitempty"`
+	// PreviewAccess is the preview-URL policy ("public" | "private").
+	// The preview token itself is never included here — mint it via
+	// POST /sandboxes/:id/preview-token.
+	PreviewAccess string `json:"preview_access"`
 }
 
 // sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
@@ -1193,13 +1218,14 @@ type sandboxSecretBinding struct {
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
-		ID:        formatSandboxID(s.ID),
-		Name:      s.Name,
-		Status:    string(s.Status),
-		VcpuCount: s.VcpuCount,
-		MemoryMib: s.MemoryMib,
-		CreatedAt: s.CreatedAt,
-		Metadata:  decodeMetadata(s.Metadata),
+		ID:            formatSandboxID(s.ID),
+		Name:          s.Name,
+		Status:        string(s.Status),
+		VcpuCount:     s.VcpuCount,
+		MemoryMib:     s.MemoryMib,
+		CreatedAt:     s.CreatedAt,
+		Metadata:      decodeMetadata(s.Metadata),
+		PreviewAccess: s.PreviewAccess,
 	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
@@ -1519,6 +1545,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validatePreviewAccess(req.PreviewAccess); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := validateSecretsRefs(req.Secrets); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
@@ -1553,6 +1583,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
+
+	// Preview policy applies from the very first moment the VM is routable:
+	// it rides the RestoreSnapshot call itself, so a "private" sandbox never
+	// has a public window. New sandboxes always start at token version 1
+	// (the DB column default — the INSERT below runs in parallel).
+	previewAccess := auth.PreviewAccessPublic
+	if req.PreviewAccess != nil {
+		previewAccess = *req.PreviewAccess
+	}
+	const initialPreviewTokenVersion = 1
 
 	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
 	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
@@ -1679,6 +1719,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				MemPath:           nullableStr(snapshotMemPath),
 				BasePath:          nullableStr(basePath),
 				DeltaPath:         nullableStr(deltaPath),
+				PreviewAccess:     previewAccess,
 			})
 		}
 		return q.CreateSandbox(insertCtx, db.CreateSandboxParams{
@@ -1697,6 +1738,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			MemPath:           nil,
 			BasePath:          nil,
 			DeltaPath:         nil,
+			PreviewAccess:     previewAccess,
 		})
 	}
 	// insertWithBindings writes the sandbox row, and its secret bindings in the
@@ -1772,7 +1814,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, initialPreviewTokenVersion, req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -2263,6 +2305,10 @@ type patchSandboxRequest struct {
 	Metadata          map[string]string     `json:"metadata,omitempty"`
 	AutoDeleteSeconds optionalInt32         `json:"auto_delete_seconds,omitempty"`
 	TimeoutSeconds    optionalInt32         `json:"timeout_seconds,omitempty"`
+	// PreviewAccess toggles the preview-URL policy ("public" | "private").
+	// Applied to the host's instance record first (live enforcement), then
+	// persisted; works in any non-deleted state.
+	PreviewAccess *string `json:"preview_access,omitempty"`
 }
 
 // optionalInt32 is a tri-state JSON field: absent (Set=false), explicit null
@@ -2311,8 +2357,13 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	// Reject empty patches.
-	if body.Network == nil && body.Metadata == nil && !body.AutoDeleteSeconds.Set && !body.TimeoutSeconds.Set {
-		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata, auto_delete_seconds, timeout_seconds)", http.StatusBadRequest)
+	if body.Network == nil && body.Metadata == nil && !body.AutoDeleteSeconds.Set && !body.TimeoutSeconds.Set && body.PreviewAccess == nil {
+		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata, auto_delete_seconds, timeout_seconds, preview_access)", http.StatusBadRequest)
+		return
+	}
+
+	if err := validatePreviewAccess(body.PreviewAccess); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -2468,7 +2519,61 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		}
 	}
 
+	if body.PreviewAccess != nil {
+		if !h.applyPreviewAccessPatch(c, sandbox, teamID, *body.PreviewAccess) {
+			return
+		}
+	}
+
 	c.Status(http.StatusNoContent)
+}
+
+// applyPreviewAccessPatch toggles the preview-URL policy. Order matters: the
+// host's instance record (what the edge proxy enforces) is updated first,
+// the DB row second — so a success response never means "recorded but not
+// enforced". A DB failure after the vmd push is a hard 500, not a warning:
+// silently drifting a security policy is worse than asking the caller to
+// retry. NotFound from vmd is fine — no record on the host means the next
+// restore seeds the policy from the row this handler is about to write.
+func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID, access string) bool {
+	vmd, err := h.vmdForHost(c.Request.Context(), sandbox.HostID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for preview-access patch failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+
+	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
+	defer vmdCancel()
+	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), access, int64(sandbox.PreviewTokenVersion))
+	if err != nil && status.Code(err) != codes.NotFound {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD UpdateSandboxPreviewPolicy failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+
+	rows, err := h.DB.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
+		ID:            sandbox.ID,
+		PreviewAccess: access,
+		TeamID:        teamID,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxPreviewAccess failed (host record already updated)")
+		respondError(c, ErrInternal)
+		return false
+	}
+	if rows == 0 {
+		respondError(c, ErrSandboxNotFound)
+		return false
+	}
+
+	detail, _ := json.Marshal(map[string]string{"preview_access": access})
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_access_updated", "success", &sandbox.Name, nil, detail)
+	h.capture(c, "sandbox_preview_access_updated", map[string]any{
+		"sandbox_id":     sandbox.ID.String(),
+		"preview_access": access,
+	})
+	return true
 }
 
 // applyRowsAffectedPatch runs a rows-affected sandbox update and maps the

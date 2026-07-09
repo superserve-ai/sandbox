@@ -19,9 +19,13 @@ type Client interface {
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +
 	// deltaDir are populated for overlay-mode templates, empty for legacy.
-	// For sandboxes with secrets the caller passes envVars=nil here and uses
-	// InjectSandboxEnv below once the source IP is known and a JWT is minted.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// previewAccess + previewTokenVersion seed the instance record's
+	// preview-URL policy (the edge proxy's numeric-port gate); callers pass
+	// the sandbox row's current values so a restore never resets a private
+	// sandbox to public. For sandboxes with secrets the caller passes
+	// envVars=nil here and uses InjectSandboxEnv below once the source IP is
+	// known and a JWT is minted.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewTokenVersion int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -47,6 +51,12 @@ type Client interface {
 	// of boxd version.
 	ListDir(ctx context.Context, instanceID, path string) ([]DirEntry, error)
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+
+	// UpdateSandboxPreviewPolicy replaces the preview-URL access policy on
+	// the host's instance record (any VM state — the record is what the edge
+	// proxy reads). gRPC NotFound means the host has no record; callers treat
+	// that as "applies on the next restore" since restores carry the policy.
+	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewTokenVersion int64) error
 
 	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the
 	// cached cleartext for secretID. Used by the control plane to push

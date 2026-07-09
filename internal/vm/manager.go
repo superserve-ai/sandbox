@@ -100,6 +100,15 @@ type VMInstance struct {
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
 
+	// PreviewAccess gates numeric-port (preview URL) traffic at the edge
+	// proxy: "private" requires a preview token; empty means public
+	// (sandboxes that predate the field). PreviewTokenVersion is the token
+	// generation preview tokens must match; rotating it invalidates every
+	// previously minted token. Carried like TeamID so the proxy needs no
+	// database.
+	PreviewAccess       string
+	PreviewTokenVersion int64
+
 	// BaseMemPath is the immutable base (template) memory file for a layered
 	// snapshot. Set at create-from-template; non-empty ⇒ this VM's pauses write a
 	// Diff overlay (mem.diff) against this base, and resume loads layered
@@ -1203,8 +1212,9 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
+	previewAccess string, previewTokenVersion int64,
 ) (*VMInstance, error) {
-	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
+	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewTokenVersion, "")
 }
 
 // restoreVMSnapshot is the implementation. recordToPath is empty for normal
@@ -1212,7 +1222,8 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 // recording, in which case the in-firecracker UFFD handler writes each served
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
-	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID, recordToPath string,
+	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
+	previewAccess string, previewTokenVersion int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -1257,6 +1268,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		MemFilePath:  memPath,
 		TeamID:       teamID,
 		OwnerID:      ownerID,
+
+		PreviewAccess:       previewAccess,
+		PreviewTokenVersion: previewTokenVersion,
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -1920,6 +1934,9 @@ type InstanceInfo struct {
 	CreatedAt time.Time
 	TeamID    string
 	OwnerID   string
+
+	PreviewAccess       string
+	PreviewTokenVersion int64
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -1942,9 +1959,31 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		CreatedAt: inst.CreatedAt,
 		TeamID:    inst.TeamID,
 		OwnerID:   inst.OwnerID,
+
+		PreviewAccess:       inst.PreviewAccess,
+		PreviewTokenVersion: inst.PreviewTokenVersion,
 	}
 	inst.mu.RUnlock()
 	return info, true
+}
+
+// UpdateSandboxPreviewPolicy replaces the preview-access policy on the
+// instance record and persists it, so the edge proxy picks the change up on
+// its next resolver refresh. Works in any VM state — the policy lives on the
+// record, not in the VM. Returns NotFound when this host has no record of
+// the sandbox; the caller treats that as "will apply on the next restore",
+// since restores carry the policy from the control-plane database.
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewTokenVersion int64) error {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return err
+	}
+	inst.mu.Lock()
+	inst.PreviewAccess = previewAccess
+	inst.PreviewTokenVersion = previewTokenVersion
+	inst.mu.Unlock()
+	m.persistState(inst)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2168,7 +2207,7 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		return nil
 	}
 
-	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", outputPath)
+	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", "", 0, outputPath)
 	if err != nil {
 		return fmt.Errorf("restore for recording: %w", err)
 	}

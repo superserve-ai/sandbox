@@ -435,6 +435,10 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	// Preview URL access policy: 'public' (unauthenticated, the default) or 'private' (requires a preview token at the edge proxy). Settable at create and via PATCH.
+	PreviewAccess string `json:"preview_access"`
+	// Preview token generation. Tokens embed this version; bumping it (POST /sandboxes/:id/preview-token/rotate) revokes all outstanding ones.
+	PreviewTokenVersion int32 `json:"preview_token_version"`
 }
 
 type SandboxActiveInterval struct {

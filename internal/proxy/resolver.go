@@ -24,6 +24,15 @@ type InstanceInfo struct {
 	StartedAt int64 // Unix nanoseconds; changes on restart — used as transport lifecycle key
 	TeamID    string // owning team, for usage attribution
 	OwnerID   string // creating user, for usage attribution; empty when unknown
+
+	// PreviewAccess gates numeric-port (preview URL) traffic: "private"
+	// requires a preview token; anything else — including empty, for
+	// sandboxes that predate the field — is public.
+	PreviewAccess string
+	// PreviewTokenVersion is the token generation preview tokens must match.
+	// Zero on a private sandbox means the version was never plumbed; the
+	// proxy fails closed and rejects every token.
+	PreviewTokenVersion int64
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -120,11 +129,13 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP      string `json:"vm_ip"`
-	Status    string `json:"status"`
-	StartedAt int64  `json:"started_at"`
-	TeamID    string `json:"team_id"`
-	OwnerID   string `json:"owner_id"`
+	VMIP                string `json:"vm_ip"`
+	Status              string `json:"status"`
+	StartedAt           int64  `json:"started_at"`
+	TeamID              string `json:"team_id"`
+	OwnerID             string `json:"owner_id"`
+	PreviewAccess       string `json:"preview_access"`
+	PreviewTokenVersion int64  `json:"preview_token_version"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, error) {
@@ -153,7 +164,15 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInf
 		return InstanceInfo{}, fmt.Errorf("resolver: decode response: %w", err)
 	}
 
-	info := InstanceInfo{VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt, TeamID: raw.TeamID, OwnerID: raw.OwnerID}
+	info := InstanceInfo{
+		VMIP:                raw.VMIP,
+		Status:              raw.Status,
+		StartedAt:           raw.StartedAt,
+		TeamID:              raw.TeamID,
+		OwnerID:             raw.OwnerID,
+		PreviewAccess:       raw.PreviewAccess,
+		PreviewTokenVersion: raw.PreviewTokenVersion,
+	}
 	r.store(instanceID, info, nil, r.ttl)
 	return info, nil
 }

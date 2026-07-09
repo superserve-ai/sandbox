@@ -544,6 +544,12 @@ paths:
           sandbox it applies to the next active session. The timeout is
           evaluated against the current active session, so lowering it
           below already-elapsed time pauses the sandbox promptly.
+        - `preview_access` — toggles the preview URL policy (`public` /
+          `private`). Can be updated regardless of sandbox state and takes
+          effect immediately on a running sandbox: switching to `private`
+          closes the ports to unauthenticated traffic mid-flight; switching
+          to `public` reopens them. Outstanding preview tokens survive the
+          toggle (rotate them explicitly if they should not).
       security:
         - apiKey: []
       requestBody:
@@ -561,6 +567,90 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-token:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    post:
+      operationId: mintSandboxPreviewToken
+      tags: [Sandboxes]
+      summary: Mint a preview token
+      description: |
+        Mints a token that authenticates requests to the sandbox's preview
+        URLs (`https://{port}-{id}.<sandbox-domain>`) while `preview_access`
+        is `private`.
+
+        Two ways to present it:
+        - **Header** (machine clients, reverse proxies): send the token in
+          the header named by `header` in the response.
+        - **Signed link** (browsers): append `?<query_param>=<token>` to the
+          preview URL. The edge proxy verifies it, moves it into a
+          host-scoped cookie, and redirects to the URL with the token
+          stripped — subsequent requests (including WebSockets) ride the
+          cookie.
+
+        The body is optional. An empty body mints a sandbox-wide token with
+        no expiry, valid until it is rotated. Scope it to one port and/or
+        give it an expiry for shareable links.
+
+        Tokens are minted, never stored: this endpoint can be called any
+        number of times and does not invalidate previous tokens. Revocation
+        is `POST /sandboxes/{sandbox_id}/preview-token/rotate`.
+      security:
+        - apiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PreviewTokenRequest"
+      responses:
+        "200":
+          description: Freshly minted preview token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewTokenResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-token/rotate:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    post:
+      operationId: rotateSandboxPreviewToken
+      tags: [Sandboxes]
+      summary: Rotate the preview token generation
+      description: |
+        Advances the sandbox's preview-token generation, immediately
+        invalidating **every** previously minted preview token (headers,
+        signed links, and browser cookies alike), and returns a fresh
+        sandbox-wide token minted against the new generation.
+
+        Use this when a token may have leaked, or on a schedule for hygiene.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: New generation and a fresh token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewTokenResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -1971,6 +2061,19 @@ components:
           example:
             ANTHROPIC_API_KEY: anthropic-prod
             GITHUB_TOKEN: ghp-readonly
+        preview_access:
+          type: string
+          enum: [public, private]
+          default: public
+          description: |
+            Preview URL access policy. `public` (the default) keeps today's
+            behavior: any process listening on a port is reachable at
+            `https://{port}-{id}.<sandbox-domain>` without authentication.
+            `private` makes the edge proxy require a preview token on every
+            request to those URLs — set it at create and the sandbox is
+            never publicly reachable, not even briefly. Mint tokens via
+            `POST /sandboxes/{sandbox_id}/preview-token`; toggle the policy
+            later via `PATCH /sandboxes/{sandbox_id}`.
 
     ActivityResponse:
       description: One audit-log activity row returned by the activity list endpoint.
@@ -2091,6 +2194,14 @@ components:
           example:
             env: prod
             owner: agent-7
+        preview_access:
+          type: string
+          enum: [public, private]
+          description: >
+            Preview URL access policy. `private` means preview URLs require
+            a preview token; `public` means they are reachable without
+            authentication. The token itself is never included in sandbox
+            responses — mint it via `POST /sandboxes/{sandbox_id}/preview-token`.
 
     SandboxResponse:
       description: Single-sandbox shape — `SandboxListItem` plus `access_token` and bound secrets.
@@ -2313,10 +2424,76 @@ components:
             create; `null` disables auto-pause. Evaluated against the
             current active session, so lowering it below already-elapsed
             time pauses the sandbox promptly. Maximum 604800 (7 days).
+        preview_access:
+          type: string
+          enum: [public, private]
+          description: |
+            Toggle the preview URL policy. `private` makes the edge proxy
+            require a preview token on `https://{port}-{id}.<sandbox-domain>`
+            requests; `public` restores unauthenticated access. Takes effect
+            immediately on a running sandbox and persists across
+            pause/resume. Outstanding preview tokens are not revoked by the
+            toggle — use `POST /sandboxes/{sandbox_id}/preview-token/rotate`
+            for that.
       example:
         metadata:
           env: prod
           owner: agent-7
+
+    PreviewTokenRequest:
+      type: object
+      description: |
+        Optional constraints for a minted preview token. Omit the body (or
+        send `{}`) for a sandbox-wide, non-expiring token.
+      properties:
+        port:
+          type: integer
+          minimum: 1024
+          maximum: 65535
+          description: >
+            Scope the token to a single preview port. Omitted means the
+            token authenticates every port on the sandbox.
+        expires_in_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 604800
+          description: >
+            Give the token a lifetime, in seconds (maximum 604800 = 7 days).
+            Omitted means the token lives until the generation is rotated.
+
+    PreviewTokenResponse:
+      type: object
+      required: [token, header, query_param, preview_access, preview_token_version]
+      properties:
+        token:
+          type: string
+          description: The preview token. Treat it as a secret.
+        header:
+          type: string
+          description: >
+            Request header to present the token in (machine clients).
+          example: X-Superserve-Preview-Token
+        query_param:
+          type: string
+          description: >
+            URL query parameter for browser bootstrap links; the edge proxy
+            exchanges it for a host-scoped cookie and strips it from the URL.
+          example: superserve_preview_token
+        expires_at:
+          type: string
+          format: date-time
+          description: Present only when the token was minted with an expiry.
+        preview_access:
+          type: string
+          enum: [public, private]
+          description: >
+            The sandbox's current policy — when `public`, the token is not
+            actually required yet.
+        preview_token_version:
+          type: integer
+          format: int32
+          description: The generation this token was minted against.
 
     BuildSpec:
       type: object

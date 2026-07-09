@@ -6,8 +6,8 @@
 -- template_id is optional (NULL when sandbox is not derived from a template).
 -- snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
 -- specific build's artifacts so a later template rebuild can't corrupt it.
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, preview_access)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 RETURNING *;
 
 -- name: CreateSandboxFromTemplate :one
@@ -22,8 +22,8 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, preview_access)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, $21 FROM tpl
 RETURNING *;
 
 -- name: GetSandbox :one
@@ -365,6 +365,20 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 UPDATE sandbox
 SET metadata = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
+
+-- name: UpdateSandboxPreviewAccess :execrows
+UPDATE sandbox
+SET preview_access = $2, updated_at = now()
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
+
+-- name: BumpSandboxPreviewTokenVersion :one
+-- Revokes every outstanding preview token by advancing the generation the
+-- proxy verifies against. Returns the new version for the vmd push + the
+-- freshly minted replacement token.
+UPDATE sandbox
+SET preview_token_version = preview_token_version + 1, updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+RETURNING preview_token_version;
 
 -- name: GetSandboxNetworkConfig :one
 SELECT network_config FROM sandbox

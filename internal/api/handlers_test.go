@@ -33,6 +33,7 @@ type stubVMD struct {
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
 	deleteSnapsFn    func(ctx context.Context, id string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	updatePreviewFn  func(ctx context.Context, id, previewAccess string, previewTokenVersion int64) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
 }
@@ -56,7 +57,7 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ string, _ int64, _ map[string]string) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -89,6 +90,12 @@ func (s *stubVMD) ListDir(ctx context.Context, id, path string) ([]vmdclient.Dir
 func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, denied, domains []string) error {
 	if s.updateNetworkFn != nil {
 		return s.updateNetworkFn(ctx, id, allowed, denied, domains)
+	}
+	return nil
+}
+func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, previewAccess string, previewTokenVersion int64) error {
+	if s.updatePreviewFn != nil {
+		return s.updatePreviewFn(ctx, id, previewAccess, previewTokenVersion)
 	}
 	return nil
 }
@@ -187,6 +194,8 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[21].(*int32) = s.DiskMib
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
+		*dest[24].(*string) = s.PreviewAccess
+		*dest[25].(*int32) = s.PreviewTokenVersion
 		return nil
 	}}
 }
