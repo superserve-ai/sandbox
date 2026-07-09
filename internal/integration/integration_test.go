@@ -522,6 +522,14 @@ func assertFloatNear(t *testing.T, got, want float64) {
 	}
 }
 
+func assertFloatBetween(t *testing.T, got, min, max float64) {
+	t.Helper()
+	const epsilon = 0.000000000001
+	if got < min-epsilon || got > max+epsilon {
+		t.Fatalf("got %v, want between %v and %v", got, min, max)
+	}
+}
+
 func TestIntegration_Auth_HealthNoKeyRequired(t *testing.T) {
 	w := do(newRouter(t), "GET", "/health", "", "")
 	if w.Code != http.StatusOK {
@@ -581,6 +589,269 @@ func TestIntegration_GetBillingPricing(t *testing.T) {
 
 	body := decodeBillingPricingResponse(t, w)
 	assertPaygPricingResponse(t, body)
+}
+
+func TestIntegration_GetBillingSummary(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-summary-box"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
+	end := now.Add(-30 * time.Minute)
+	start := end.Add(-1 * time.Hour)
+	if start.Before(periodStart) {
+		start = periodStart
+		end = start.Add(time.Hour)
+		if end.After(now) {
+			end = now
+		}
+	}
+	if !end.After(start) {
+		t.Fatalf("test clock is too close to the billing period start: start=%s end=%s", start, end)
+	}
+	seconds := end.Sub(start).Seconds()
+	openStart := now.Add(-15 * time.Minute)
+	if openStart.Before(periodStart) {
+		openStart = periodStart
+	}
+	if !now.After(openStart) {
+		t.Fatalf("test clock is too close to the billing period start for open interval: now=%s openStart=%s", now, openStart)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 2, 2048, $3, $4, 'paused')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed compute billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 10240, $3, $4, 'deleted')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed storage billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at
+		)
+		VALUES ($1, $2, 1, 512, $3)
+	`, sandboxID, teamID, openStart); err != nil {
+		t.Fatalf("seed open compute billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at
+		)
+		VALUES ($1, $2, 5120, $3)
+	`, sandboxID, teamID, openStart); err != nil {
+		t.Fatalf("seed open storage billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 0.100000, 0.100000, 'integration test credit')
+	`, teamID); err != nil {
+		t.Fatalf("seed billing credit: %v", err)
+	}
+
+	requestStarted := time.Now().UTC()
+	w := do(r, "GET", "/billing/summary", viewerKey, "")
+	requestFinished := time.Now().UTC()
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "private, max-age=60" {
+		t.Fatalf("Cache-Control = %q, want private, max-age=60", got)
+	}
+	if got := w.Header().Get("Vary"); got != "X-API-Key" {
+		t.Fatalf("Vary = %q, want X-API-Key", got)
+	}
+
+	body := mustJSON(t, w)
+	breakdown, ok := body["cost_breakdown_usd"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
+	}
+	closedCompute := 2 * seconds * 0.000014
+	closedMemory := 2 * seconds * 0.0000045
+	closedStorage := 10 * seconds * 0.00000003
+	minOpenSeconds := requestStarted.Sub(openStart).Seconds()
+	maxOpenSeconds := requestFinished.Sub(openStart).Seconds()
+	if minOpenSeconds < 0 {
+		minOpenSeconds = 0
+	}
+	if maxOpenSeconds < minOpenSeconds {
+		maxOpenSeconds = minOpenSeconds
+	}
+	compute := breakdown["compute"].(float64)
+	memory := breakdown["memory"].(float64)
+	storage := breakdown["storage"].(float64)
+	assertFloatBetween(t, compute, closedCompute+minOpenSeconds*0.000014, closedCompute+maxOpenSeconds*0.000014)
+	assertFloatBetween(t, memory, closedMemory+0.5*minOpenSeconds*0.0000045, closedMemory+0.5*maxOpenSeconds*0.0000045)
+	assertFloatBetween(t, storage, closedStorage+5*minOpenSeconds*0.00000003, closedStorage+5*maxOpenSeconds*0.00000003)
+
+	currentCharges := body["current_charges_usd"].(float64)
+	creditsApplied := math.Min(currentCharges, 0.1)
+	assertFloatNear(t, currentCharges, compute+memory+storage)
+	assertFloatNear(t, body["credits_applied_usd"].(float64), creditsApplied)
+	assertFloatNear(t, body["credits_remaining_usd"].(float64), 0.1-creditsApplied)
+	assertFloatNear(t, body["expected_invoice_amount_usd"].(float64), currentCharges-creditsApplied)
+
+	period, ok := body["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", body["billing_period"])
+	}
+	if got := period["start"].(string); got != periodStart.Format(time.RFC3339) {
+		t.Fatalf("period start = %q, want %q", got, periodStart.Format(time.RFC3339))
+	}
+	if got := period["end"].(string); got != periodEnd.Format(time.RFC3339) {
+		t.Fatalf("period end = %q, want %q", got, periodEnd.Format(time.RFC3339))
+	}
+	tier, ok := body["pricing_tier"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("pricing_tier not an object: %v", body["pricing_tier"])
+	}
+	if tier["plan_key"] != "payg" || tier["plan_name"] != "Pay-as-you-go" || tier["currency"] != "USD" {
+		t.Fatalf("pricing tier = %v, want payg/Pay-as-you-go/USD", tier)
+	}
+	if _, ok := body["calculated_at"].(string); !ok {
+		t.Fatalf("calculated_at missing or not a string: %v", body["calculated_at"])
+	}
+}
+
+func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-custom-period"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	periodStart := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(12 * time.Hour)
+	start := periodStart.Add(2 * time.Hour)
+	end := start.Add(45 * time.Minute)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("upsert custom billing period: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 2, 2048, $3, $4, 'paused')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed custom compute billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 10240, $3, $4, 'deleted')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed custom storage billing usage: %v", err)
+	}
+
+	w := do(r, "GET", "/billing/summary", viewerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := mustJSON(t, w)
+	period, ok := body["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", body["billing_period"])
+	}
+	gotStart, err := time.Parse(time.RFC3339, period["start"].(string))
+	if err != nil {
+		t.Fatalf("parse period start: %v", err)
+	}
+	if !gotStart.Equal(periodStart) {
+		t.Fatalf("period start = %s, want %s", gotStart, periodStart)
+	}
+	gotEnd, err := time.Parse(time.RFC3339, period["end"].(string))
+	if err != nil {
+		t.Fatalf("parse period end: %v", err)
+	}
+	if !gotEnd.Equal(periodEnd) {
+		t.Fatalf("period end = %s, want %s", gotEnd, periodEnd)
+	}
+}
+
+func TestIntegration_GetBillingSummaryDeniesUserAdmin(t *testing.T) {
+	_, apiKey, _ := seedTeamAndKeyWithRole(t, "user_admin")
+	r := newRouter(t)
+
+	w := do(r, "GET", "/billing/summary", apiKey, "")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetBillingSummaryNoActivePricingRatesReturns503(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
+	planKey := "empty-rate-plan-" + uuid.New().String()
+	now := time.Now().UTC()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Empty rate integration pricing', 'USD', true)
+	`, planKey); err != nil {
+		t.Fatalf("insert pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("assign pricing plan: %v", err)
+	}
+
+	w := do(newRouter(t), "GET", "/billing/summary", apiKey, "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for empty pricing rates, got %d: %s", w.Code, w.Body.String())
+	}
 }
 
 func TestIntegration_GetPublicBillingPricing(t *testing.T) {
@@ -1573,11 +1844,7 @@ func TestIntegration_FinalizeBillingPeriodFinalizesUsage(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("export period: %v", err)
 	}
-	if _, err := testQueries.FinalizeTeamBillingPeriod(ctx, db.FinalizeTeamBillingPeriodParams{
-		TeamID:      teamID,
-		PeriodStart: periodStart,
-		PeriodEnd:   periodEnd,
-	}); err != nil {
+	if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, periodStart, periodEnd); err != nil {
 		t.Fatalf("finalize period: %v", err)
 	}
 
@@ -1639,6 +1906,22 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 		PeriodEnd:   periodEnd,
 	}); err != nil {
 		t.Fatalf("expected billing export after enabling flag: %v", err)
+	}
+}
+
+func TestIntegration_TenantUsageDashboardEnabledByDefaultForNewTeams(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	enabled, err := testQueries.IsFeatureEnabledForTeam(ctx, db.IsFeatureEnabledForTeamParams{
+		Key:    "tenant_usage_dashboard",
+		TeamID: pgtype.UUID{Bytes: teamID, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("check tenant_usage_dashboard default: %v", err)
+	}
+	if !enabled {
+		t.Fatal("tenant_usage_dashboard disabled for newly created team")
 	}
 }
 
@@ -2343,6 +2626,808 @@ func TestIntegration_TeamCreditLedgerRejectsCrossTeamGrant(t *testing.T) {
 	`, ledgerTeamID, grantID)
 	if err == nil {
 		t.Fatal("expected cross-team credit ledger grant reference to fail")
+	}
+}
+
+type billingFinalizationGrantSpec struct {
+	amountUsd float64
+	createdAt *time.Time
+	expiresAt *time.Time
+}
+
+type billingFinalizationScenario struct {
+	teamID       uuid.UUID
+	periodStart  time.Time
+	periodEnd    time.Time
+	grantIDs     []uuid.UUID
+	grossCharges float64
+}
+
+func setupBillingFinalizationScenario(
+	t *testing.T,
+	ctx context.Context,
+	teamID uuid.UUID,
+	vcpuSeconds float64,
+	grants []billingFinalizationGrantSpec,
+) billingFinalizationScenario {
+	t.Helper()
+
+	periodStart := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+	return setupBillingFinalizationScenarioAt(t, ctx, teamID, periodStart, periodEnd, vcpuSeconds, grants)
+}
+
+func setupBillingFinalizationScenarioAt(
+	t *testing.T,
+	ctx context.Context,
+	teamID uuid.UUID,
+	periodStart, periodEnd time.Time,
+	vcpuSeconds float64,
+	grants []billingFinalizationGrantSpec,
+) billingFinalizationScenario {
+	t.Helper()
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage (
+			team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, $4, 0, 0)
+		ON CONFLICT (team_id, period_start, period_end) DO UPDATE
+		SET vcpu_seconds = EXCLUDED.vcpu_seconds,
+		    memory_mib_seconds = EXCLUDED.memory_mib_seconds,
+		    storage_mib_seconds = EXCLUDED.storage_mib_seconds
+	`, teamID, periodStart, periodEnd, vcpuSeconds); err != nil {
+		t.Fatalf("insert billing usage row: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "approved",
+	}); err != nil {
+		t.Fatalf("upsert billing period: %v", err)
+	}
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("mark billing period exported: %v", err)
+	}
+
+	grantIDs := make([]uuid.UUID, 0, len(grants))
+	for _, grant := range grants {
+		var grantID uuid.UUID
+		createdAt := periodEnd.Add(-time.Hour)
+		if grant.createdAt != nil {
+			createdAt = *grant.createdAt
+		}
+		if grant.expiresAt != nil {
+			if err := testPool.QueryRow(ctx, `
+				INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at, updated_at, expires_at)
+				VALUES ($1, $2, $2, 'test grant', $3, $3, $4)
+				RETURNING id
+			`, teamID, grant.amountUsd, createdAt, *grant.expiresAt).Scan(&grantID); err != nil {
+				t.Fatalf("insert credit grant: %v", err)
+			}
+		} else {
+			if err := testPool.QueryRow(ctx, `
+				INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at, updated_at)
+				VALUES ($1, $2, $2, 'test grant', $3, $3)
+				RETURNING id
+			`, teamID, grant.amountUsd, createdAt).Scan(&grantID); err != nil {
+				t.Fatalf("insert credit grant: %v", err)
+			}
+		}
+		grantIDs = append(grantIDs, grantID)
+	}
+
+	rates, err := testQueries.ListActivePricingRatesForTeamCurrent(ctx, teamID)
+	if err != nil {
+		t.Fatalf("list pricing rates: %v", err)
+	}
+	planRates, err := billing.ValidateSummaryPricingRates(rates)
+	if err != nil {
+		t.Fatalf("validate pricing rates: %v", err)
+	}
+	charges := billing.CalculateSummaryCharges(
+		vcpuSeconds,
+		0,
+		0,
+		numericFloat64(t, planRates["vcpu"].PriceUsd),
+		0,
+		0,
+		0,
+	)
+
+	return billingFinalizationScenario{
+		teamID:       teamID,
+		periodStart:  periodStart,
+		periodEnd:    periodEnd,
+		grantIDs:     grantIDs,
+		grossCharges: charges.CurrentChargesUSD,
+	}
+}
+
+func expectedBillingFinalizationConsumption(
+	grants []billingFinalizationGrantSpec,
+	grantIDs []uuid.UUID,
+	periodEnd time.Time,
+	grossCharges float64,
+) (map[uuid.UUID]float64, map[uuid.UUID]float64) {
+	type activeGrant struct {
+		index     int
+		grantID   uuid.UUID
+		amountUsd float64
+		expiresAt *time.Time
+	}
+
+	active := make([]activeGrant, 0, len(grants))
+	remainingByGrant := make([]float64, len(grants))
+	for i, grant := range grants {
+		remainingByGrant[i] = grant.amountUsd
+		createdAt := periodEnd.Add(-time.Hour)
+		if grant.createdAt != nil {
+			createdAt = *grant.createdAt
+		}
+		if !createdAt.Before(periodEnd) {
+			continue
+		}
+		if grant.expiresAt != nil && grant.expiresAt.Before(periodEnd) {
+			continue
+		}
+		active = append(active, activeGrant{
+			index:     i,
+			grantID:   grantIDs[i],
+			amountUsd: grant.amountUsd,
+			expiresAt: grant.expiresAt,
+		})
+	}
+
+	sort.Slice(active, func(i, j int) bool {
+		left := active[i]
+		right := active[j]
+		switch {
+		case left.expiresAt == nil && right.expiresAt == nil:
+			return left.index < right.index
+		case left.expiresAt == nil:
+			return false
+		case right.expiresAt == nil:
+			return true
+		case left.expiresAt.Equal(*right.expiresAt):
+			return left.index < right.index
+		default:
+			return left.expiresAt.Before(*right.expiresAt)
+		}
+	})
+
+	remainingToApply := grossCharges
+	ledgerAmountsByGrantID := make(map[uuid.UUID]float64, len(active))
+	for _, grant := range active {
+		if remainingToApply <= 0 {
+			break
+		}
+		consume := math.Min(remainingToApply, grant.amountUsd)
+		if consume <= 0 {
+			continue
+		}
+		ledgerAmountsByGrantID[grant.grantID] = consume
+		remainingByGrant[grant.index] -= consume
+		remainingToApply -= consume
+	}
+
+	remainingByGrantByID := make(map[uuid.UUID]float64, len(grants))
+	for i := range grants {
+		remainingByGrantByID[grantIDs[i]] = remainingByGrant[i]
+	}
+	return remainingByGrantByID, ledgerAmountsByGrantID
+}
+
+func readBillingFinalizationState(t *testing.T, ctx context.Context, teamID uuid.UUID, periodStart, periodEnd time.Time) (db.TeamBillingPeriod, []db.TeamCreditGrant, []db.TeamCreditLedger) {
+	t.Helper()
+
+	var period db.TeamBillingPeriod
+	if err := testPool.QueryRow(ctx, `
+		SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by,
+		       approved_at, exported_at, finalized_at, created_at, updated_at,
+		       gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+		FROM team_billing_period
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, periodStart, periodEnd).Scan(
+		&period.TeamID,
+		&period.PeriodStart,
+		&period.PeriodEnd,
+		&period.Status,
+		&period.BlockedReason,
+		&period.BlockedAt,
+		&period.ApprovedBy,
+		&period.ApprovedAt,
+		&period.ExportedAt,
+		&period.FinalizedAt,
+		&period.CreatedAt,
+		&period.UpdatedAt,
+		&period.GrossChargesUsd,
+		&period.CreditsAppliedUsd,
+		&period.NetInvoiceAmountUsd,
+	); err != nil {
+		t.Fatalf("read billing period: %v", err)
+	}
+	var grants []db.TeamCreditGrant
+	rows, err := testPool.Query(ctx, `
+		SELECT id, team_id, amount_usd, remaining_usd, currency, reason, expires_at, created_by, created_at, updated_at
+		FROM team_credit_grant
+		WHERE team_id = $1
+		ORDER BY created_at ASC, id ASC
+	`, teamID)
+	if err != nil {
+		t.Fatalf("query credit grants: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var grant db.TeamCreditGrant
+		if err := rows.Scan(
+			&grant.ID,
+			&grant.TeamID,
+			&grant.AmountUsd,
+			&grant.RemainingUsd,
+			&grant.Currency,
+			&grant.Reason,
+			&grant.ExpiresAt,
+			&grant.CreatedBy,
+			&grant.CreatedAt,
+			&grant.UpdatedAt,
+		); err != nil {
+			t.Fatalf("scan credit grant: %v", err)
+		}
+		grants = append(grants, grant)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate credit grants: %v", err)
+	}
+
+	var ledger []db.TeamCreditLedger
+	lrows, err := testPool.Query(ctx, `
+		SELECT id, team_id, grant_id, billing_period_start, billing_period_end, amount_usd, reason, created_by, created_at
+		FROM team_credit_ledger
+		WHERE team_id = $1
+		ORDER BY created_at ASC, id ASC
+	`, teamID)
+	if err != nil {
+		t.Fatalf("query credit ledger: %v", err)
+	}
+	defer lrows.Close()
+	for lrows.Next() {
+		var entry db.TeamCreditLedger
+		if err := lrows.Scan(
+			&entry.ID,
+			&entry.TeamID,
+			&entry.GrantID,
+			&entry.BillingPeriodStart,
+			&entry.BillingPeriodEnd,
+			&entry.AmountUsd,
+			&entry.Reason,
+			&entry.CreatedBy,
+			&entry.CreatedAt,
+		); err != nil {
+			t.Fatalf("scan credit ledger: %v", err)
+		}
+		ledger = append(ledger, entry)
+	}
+	if err := lrows.Err(); err != nil {
+		t.Fatalf("iterate credit ledger: %v", err)
+	}
+
+	return period, grants, ledger
+}
+
+func assertBillingFinalizationState(
+	t *testing.T,
+	teamID uuid.UUID,
+	periodStart, periodEnd time.Time,
+	result billing.FinalizeTeamBillingPeriodResult,
+	wantApplied float64,
+	wantGrantRemaining map[uuid.UUID]float64,
+	wantLedgerAmounts map[uuid.UUID]float64,
+) {
+	t.Helper()
+
+	ctx := context.Background()
+	period, grants, ledger := readBillingFinalizationState(t, ctx, teamID, periodStart, periodEnd)
+	if !period.FinalizedAt.Valid {
+		t.Fatal("billing period not finalized")
+	}
+	if got := numericFloat64(t, period.GrossChargesUsd); math.Abs(got-result.Charges.CurrentChargesUSD) > 1e-9 {
+		t.Fatalf("gross charges = %v, want %v", got, result.Charges.CurrentChargesUSD)
+	}
+	if got := numericFloat64(t, period.CreditsAppliedUsd); math.Abs(got-wantApplied) > 1e-9 {
+		t.Fatalf("credits applied = %v, want %v", got, wantApplied)
+	}
+	if got := numericFloat64(t, period.NetInvoiceAmountUsd); math.Abs(got-(result.Charges.CurrentChargesUSD-wantApplied)) > 1e-9 {
+		t.Fatalf("net invoice = %v, want %v", got, result.Charges.CurrentChargesUSD-wantApplied)
+	}
+	if math.Abs(result.Charges.CreditsAppliedUSD-wantApplied) > 1e-9 {
+		t.Fatalf("result credits applied = %v, want %v", result.Charges.CreditsAppliedUSD, wantApplied)
+	}
+	if math.Abs(result.Charges.ExpectedInvoiceAmountUSD-(result.Charges.CurrentChargesUSD-wantApplied)) > 1e-9 {
+		t.Fatalf("result invoice = %v, want %v", result.Charges.ExpectedInvoiceAmountUSD, result.Charges.CurrentChargesUSD-wantApplied)
+	}
+	if len(grants) != len(wantGrantRemaining) {
+		t.Fatalf("grant count = %d, want %d", len(grants), len(wantGrantRemaining))
+	}
+	for _, grant := range grants {
+		wantRemaining, ok := wantGrantRemaining[grant.ID]
+		if !ok {
+			t.Fatalf("unexpected grant id %v", grant.ID)
+		}
+		if got := numericFloat64(t, grant.RemainingUsd); math.Abs(got-wantRemaining) > 1e-9 {
+			t.Fatalf("grant %v remaining = %v, want %v", grant.ID, got, wantRemaining)
+		}
+	}
+	if len(ledger) != len(wantLedgerAmounts) {
+		t.Fatalf("ledger count = %d, want %d", len(ledger), len(wantLedgerAmounts))
+	}
+	for _, entry := range ledger {
+		if !entry.GrantID.Valid {
+			t.Fatal("ledger entry missing grant id")
+		}
+		wantAmount, ok := wantLedgerAmounts[uuid.UUID(entry.GrantID.Bytes)]
+		if !ok {
+			t.Fatalf("unexpected ledger grant id %v", entry.GrantID.Bytes)
+		}
+		if got := numericFloat64(t, entry.AmountUsd); math.Abs(got-wantAmount) > 1e-9 {
+			t.Fatalf("ledger grant %v amount = %v, want %v", entry.GrantID.Bytes, got, wantAmount)
+		}
+		if !entry.BillingPeriodStart.Valid || !entry.BillingPeriodStart.Time.Equal(periodStart) {
+			t.Fatalf("ledger grant %v billing period start = %v, want %v", entry.GrantID.Bytes, entry.BillingPeriodStart, periodStart)
+		}
+		if !entry.BillingPeriodEnd.Valid || !entry.BillingPeriodEnd.Time.Equal(periodEnd) {
+			t.Fatalf("ledger grant %v billing period end = %v, want %v", entry.GrantID.Bytes, entry.BillingPeriodEnd, periodEnd)
+		}
+	}
+}
+
+func TestIntegration_BillingPeriodFinalizationAppliesCredits(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	rates, err := testQueries.ListActivePricingRatesForTeamCurrent(ctx, teamID)
+	if err != nil {
+		t.Fatalf("list pricing rates: %v", err)
+	}
+	planRates, err := billing.ValidateSummaryPricingRates(rates)
+	if err != nil {
+		t.Fatalf("validate pricing rates: %v", err)
+	}
+	computeRate := numericFloat64(t, planRates["vcpu"].PriceUsd)
+	vcpuSeconds := 100000.0
+	gross := vcpuSeconds * computeRate
+	if gross <= 0 {
+		t.Fatal("expected positive gross charge")
+	}
+
+	future1 := time.Now().UTC().Add(1 * time.Hour)
+	future2 := time.Now().UTC().Add(2 * time.Hour)
+	future3 := time.Now().UTC().Add(3 * time.Hour)
+	expired := time.Now().UTC().Add(-1 * time.Hour)
+
+	cases := []struct {
+		name   string
+		grants []billingFinalizationGrantSpec
+	}{
+		{
+			name: "one grant partially consumed",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: gross * 1.50, expiresAt: &future1},
+			},
+		},
+		{
+			name: "multiple grants consumed in expiration order",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: gross * 0.25, expiresAt: &future3},
+				{amountUsd: gross * 0.25, expiresAt: &future1},
+				{amountUsd: gross * 0.50, expiresAt: &future2},
+				{amountUsd: gross * 0.50, expiresAt: nil},
+			},
+		},
+		{
+			name: "non-expiring grant consumed after expiring grants",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: gross * 0.25, expiresAt: &future2},
+				{amountUsd: gross * 0.25, expiresAt: &future1},
+				{amountUsd: gross * 1.00, expiresAt: nil},
+			},
+		},
+		{
+			name: "expired grants ignored",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: gross * 1.00, expiresAt: &expired},
+				{amountUsd: gross * 0.50, expiresAt: &future1},
+			},
+		},
+		{
+			name: "credits smaller than charges",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: gross * 0.25, expiresAt: &future1},
+				{amountUsd: gross * 0.25, expiresAt: &future2},
+			},
+		},
+		{
+			name: "credits larger than charges",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: gross * 0.75, expiresAt: &future1},
+				{amountUsd: gross * 0.75, expiresAt: &future2},
+				{amountUsd: gross * 0.75, expiresAt: nil},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			teamID, _ := seedTeamAndKey(t)
+			scenario := setupBillingFinalizationScenario(t, ctx, teamID, vcpuSeconds, tc.grants)
+			result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+			if err != nil {
+				t.Fatalf("finalize billing period: %v", err)
+			}
+			if math.Abs(result.Charges.CurrentChargesUSD-scenario.grossCharges) > 1e-9 {
+				t.Fatalf("current charges = %v, want %v", result.Charges.CurrentChargesUSD, scenario.grossCharges)
+			}
+			wantGrantRemaining, wantLedgerAmounts := expectedBillingFinalizationConsumption(tc.grants, scenario.grantIDs, scenario.periodEnd, scenario.grossCharges)
+			assertBillingFinalizationState(t, teamID, scenario.periodStart, scenario.periodEnd, result, result.Charges.CreditsAppliedUSD, wantGrantRemaining, wantLedgerAmounts)
+		})
+	}
+}
+
+func TestIntegration_BillingPeriodFinalizationIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	rates, err := testQueries.ListActivePricingRatesForTeamCurrent(ctx, teamID)
+	if err != nil {
+		t.Fatalf("list pricing rates: %v", err)
+	}
+	planRates, err := billing.ValidateSummaryPricingRates(rates)
+	if err != nil {
+		t.Fatalf("validate pricing rates: %v", err)
+	}
+	grossRate := numericFloat64(t, planRates["vcpu"].PriceUsd)
+	scenario := setupBillingFinalizationScenario(t, ctx, teamID, 100000, []billingFinalizationGrantSpec{
+		{amountUsd: grossRate * 100000 * 0.75, expiresAt: func() *time.Time { v := time.Now().UTC().Add(1 * time.Hour); return &v }()},
+		{amountUsd: grossRate * 100000 * 0.75, expiresAt: func() *time.Time { v := time.Now().UTC().Add(2 * time.Hour); return &v }()},
+	})
+
+	first, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+	if err != nil {
+		t.Fatalf("first finalize: %v", err)
+	}
+	second, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+	if err != nil {
+		t.Fatalf("second finalize: %v", err)
+	}
+	if math.Abs(first.Charges.CreditsAppliedUSD-second.Charges.CreditsAppliedUSD) > 1e-9 {
+		t.Fatalf("credits applied changed on retry: %v vs %v", first.Charges.CreditsAppliedUSD, second.Charges.CreditsAppliedUSD)
+	}
+	wantGrantRemaining, wantLedgerAmounts := expectedBillingFinalizationConsumption([]billingFinalizationGrantSpec{
+		{amountUsd: grossRate * 100000 * 0.75, expiresAt: func() *time.Time { v := time.Now().UTC().Add(1 * time.Hour); return &v }()},
+		{amountUsd: grossRate * 100000 * 0.75, expiresAt: func() *time.Time { v := time.Now().UTC().Add(2 * time.Hour); return &v }()},
+	}, scenario.grantIDs, scenario.periodEnd, first.Charges.CurrentChargesUSD)
+	assertBillingFinalizationState(t, teamID, scenario.periodStart, scenario.periodEnd, second, second.Charges.CreditsAppliedUSD, wantGrantRemaining, wantLedgerAmounts)
+}
+
+func TestIntegration_BillingPeriodFinalizationUsesPeriodPricingAndUsageUnits(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	periodStart := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage (
+			team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, 100, 2048, 4096)
+	`, teamID, periodStart, periodEnd); err != nil {
+		t.Fatalf("seed billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "approved",
+	}); err != nil {
+		t.Fatalf("upsert period: %v", err)
+	}
+	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	}); err != nil {
+		t.Fatalf("export period: %v", err)
+	}
+
+	planAKey := "period-plan-a-" + uuid.New().String()
+	planBKey := "period-plan-b-" + uuid.New().String()
+	currentPlanAt := time.Now().UTC()
+	periodPlanAt := periodStart.Add(-time.Hour)
+	insertPricingPlanForTest(t, ctx, planAKey, true)
+	insertPricingPlanForTest(t, ctx, planBKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000010, $2),
+			($1, 'memory_gib', 'second', 0.000004, $2),
+			($1, 'storage_gib', 'second', 0.00000002, $2)
+	`, planAKey, periodPlanAt); err != nil {
+		t.Fatalf("insert plan A pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000020, $2),
+			($1, 'memory_gib', 'second', 0.000008, $2),
+			($1, 'storage_gib', 'second', 0.00000004, $2)
+	`, planBKey, currentPlanAt); err != nil {
+		t.Fatalf("insert pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES
+			($1, $2, $3),
+			($1, $4, $5)
+	`, teamID, planAKey, periodStart.Add(-time.Hour), planBKey, currentPlanAt); err != nil {
+		t.Fatalf("assign pricing plans: %v", err)
+	}
+
+	result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, periodStart, periodEnd)
+	if err != nil {
+		t.Fatalf("finalize period: %v", err)
+	}
+	if !result.Period.FinalizedAt.Valid {
+		t.Fatal("finalized_at is NULL")
+	}
+
+	want := billing.CalculateSummaryCharges(
+		100,
+		2048/1024.0,
+		4096/1024.0,
+		0.000010,
+		0.000004,
+		0.00000002,
+		0,
+	)
+	wantCurrent := math.Round(want.CurrentChargesUSD*1e6) / 1e6
+	assertFloatNear(t, result.Charges.CurrentChargesUSD, wantCurrent)
+	assertFloatNear(t, result.Charges.CreditsAppliedUSD, 0)
+	assertFloatNear(t, result.Charges.ExpectedInvoiceAmountUSD, wantCurrent)
+	if got := numericFloat64(t, result.Period.GrossChargesUsd); math.Abs(got-wantCurrent) > 1e-9 {
+		t.Fatalf("gross charges = %v, want %v", got, wantCurrent)
+	}
+	if got := numericFloat64(t, result.Period.NetInvoiceAmountUsd); math.Abs(got-wantCurrent) > 1e-9 {
+		t.Fatalf("net invoice = %v, want %v", got, wantCurrent)
+	}
+}
+
+func TestIntegration_BillingPeriodFinalizationRoundsFinancialValuesAtMicroBoundary(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	rates, err := testQueries.ListActivePricingRatesForTeamCurrent(ctx, teamID)
+	if err != nil {
+		t.Fatalf("list pricing rates: %v", err)
+	}
+	planRates, err := billing.ValidateSummaryPricingRates(rates)
+	if err != nil {
+		t.Fatalf("validate pricing rates: %v", err)
+	}
+	vcpuRate := numericFloat64(t, planRates["vcpu"].PriceUsd)
+
+	desiredGross := 0.1234565
+	vcpuSeconds := desiredGross / vcpuRate
+	periodStart := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+	scenario := setupBillingFinalizationScenarioAt(t, ctx, teamID, periodStart, periodEnd, vcpuSeconds, []billingFinalizationGrantSpec{
+		{amountUsd: 0.123456},
+	})
+
+	result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+	if err != nil {
+		t.Fatalf("finalize billing period: %v", err)
+	}
+
+	assertFloatNear(t, numericFloat64(t, result.Period.GrossChargesUsd), 0.123457)
+	assertFloatNear(t, numericFloat64(t, result.Period.CreditsAppliedUsd), 0.123456)
+	assertFloatNear(t, numericFloat64(t, result.Period.NetInvoiceAmountUsd), 0.000001)
+	assertFloatNear(t, numericFloat64(t, result.Period.GrossChargesUsd)-numericFloat64(t, result.Period.CreditsAppliedUsd), numericFloat64(t, result.Period.NetInvoiceAmountUsd))
+}
+
+func TestIntegration_BillingPeriodFinalizationCreditEligibilityUsesPeriodEnd(t *testing.T) {
+	ctx := context.Background()
+	periodStart := time.Now().UTC().Add(-72 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+
+	futureExpiry := periodEnd.Add(2 * time.Hour)
+	exactExpiry := periodEnd
+	beforeFinalizationCreated := periodEnd.Add(-4 * time.Hour)
+	afterPeriodCreated := periodEnd.Add(time.Hour)
+
+	cases := []struct {
+		name             string
+		grants           []billingFinalizationGrantSpec
+		eligibleAtPeriod bool
+		wantLedger       int
+	}{
+		{
+			name: "valid at period end but expired before delayed finalization",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: 100, createdAt: &beforeFinalizationCreated, expiresAt: &futureExpiry},
+			},
+			eligibleAtPeriod: true,
+			wantLedger:       1,
+		},
+		{
+			name: "created after period end",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: 100, createdAt: &afterPeriodCreated, expiresAt: nil},
+			},
+			eligibleAtPeriod: false,
+			wantLedger:       0,
+		},
+		{
+			name: "expires exactly at period end",
+			grants: []billingFinalizationGrantSpec{
+				{amountUsd: 100, createdAt: &beforeFinalizationCreated, expiresAt: &exactExpiry},
+			},
+			eligibleAtPeriod: true,
+			wantLedger:       1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			teamID, _ := seedTeamAndKey(t)
+			result := setupBillingFinalizationScenarioAt(t, ctx, teamID, periodStart, periodEnd, 100, tc.grants)
+			out, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, result.periodStart, result.periodEnd)
+			if err != nil {
+				t.Fatalf("finalize billing period: %v", err)
+			}
+			wantApplied := 0.0
+			if tc.eligibleAtPeriod {
+				wantApplied = out.Charges.CurrentChargesUSD
+			}
+			assertFloatNear(t, out.Charges.CreditsAppliedUSD, wantApplied)
+			assertFloatNear(t, out.Charges.ExpectedInvoiceAmountUSD, out.Charges.CurrentChargesUSD-wantApplied)
+			_, _, ledger := readBillingFinalizationState(t, ctx, teamID, result.periodStart, result.periodEnd)
+			if len(ledger) != tc.wantLedger {
+				t.Fatalf("ledger rows = %d, want %d", len(ledger), tc.wantLedger)
+			}
+		})
+	}
+}
+
+func TestIntegration_BillingPeriodFinalizationConcurrentDoesNotDoubleConsumeCredits(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	scenario := setupBillingFinalizationScenario(t, ctx, teamID, 100000, []billingFinalizationGrantSpec{
+		{amountUsd: 1.0, expiresAt: func() *time.Time { v := time.Now().UTC().Add(1 * time.Hour); return &v }()},
+		{amountUsd: 1.0, expiresAt: func() *time.Time { v := time.Now().UTC().Add(2 * time.Hour); return &v }()},
+	})
+
+	start := make(chan struct{})
+	type result struct {
+		out billing.FinalizeTeamBillingPeriodResult
+		err error
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			out, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+			results <- result{out: out, err: err}
+		}()
+	}
+	close(start)
+	first := <-results
+	second := <-results
+	if first.err != nil {
+		t.Fatalf("first finalize: %v", first.err)
+	}
+	if second.err != nil {
+		t.Fatalf("second finalize: %v", second.err)
+	}
+	if math.Abs(first.out.Charges.CreditsAppliedUSD-second.out.Charges.CreditsAppliedUSD) > 1e-9 {
+		t.Fatalf("concurrent finalization credits differ: %v vs %v", first.out.Charges.CreditsAppliedUSD, second.out.Charges.CreditsAppliedUSD)
+	}
+	wantGrantRemaining, wantLedgerAmounts := expectedBillingFinalizationConsumption([]billingFinalizationGrantSpec{
+		{amountUsd: 1.0, expiresAt: func() *time.Time { v := time.Now().UTC().Add(1 * time.Hour); return &v }()},
+		{amountUsd: 1.0, expiresAt: func() *time.Time { v := time.Now().UTC().Add(2 * time.Hour); return &v }()},
+	}, scenario.grantIDs, scenario.periodEnd, first.out.Charges.CurrentChargesUSD)
+	assertBillingFinalizationState(t, teamID, scenario.periodStart, scenario.periodEnd, first.out, first.out.Charges.CreditsAppliedUSD, wantGrantRemaining, wantLedgerAmounts)
+	_, _, ledger := readBillingFinalizationState(t, ctx, teamID, scenario.periodStart, scenario.periodEnd)
+	if len(ledger) != 2 {
+		t.Fatalf("ledger rows = %d, want 2", len(ledger))
+	}
+}
+
+func TestIntegration_BillingFinalizationBatchContinuesAfterFailure(t *testing.T) {
+	ctx := context.Background()
+
+	failingTeamID, _ := seedTeamAndKey(t)
+	failingPeriodStart := time.Now().UTC().Add(-96 * time.Hour).Truncate(time.Hour)
+	failingPeriodEnd := failingPeriodStart.Add(24 * time.Hour)
+	_ = setupBillingFinalizationScenarioAt(t, ctx, failingTeamID, failingPeriodStart, failingPeriodEnd, 100, nil)
+	if _, err := testPool.Exec(ctx, `
+		DELETE FROM team_billing_usage
+		WHERE team_id = $1
+		  AND period_start = $2
+		  AND period_end = $3
+	`, failingTeamID, failingPeriodStart, failingPeriodEnd); err != nil {
+		t.Fatalf("delete failing usage row: %v", err)
+	}
+	laterSameTeamScenario := setupBillingFinalizationScenarioAt(t, ctx, failingTeamID, failingPeriodStart.Add(24*time.Hour), failingPeriodEnd.Add(24*time.Hour), 100, nil)
+
+	passingTeamID, _ := seedTeamAndKey(t)
+	passingScenario := setupBillingFinalizationScenarioAt(t, ctx, passingTeamID, failingPeriodStart.Add(24*time.Hour), failingPeriodEnd.Add(24*time.Hour), 100, nil)
+
+	finalized, err := billing.FinalizeExportedBillingPeriods(ctx, testPool, 1000)
+	if err == nil {
+		t.Fatal("expected batch finalization to report the failing period")
+	}
+	if finalized == 0 {
+		t.Fatal("expected batch finalization to continue after the first failure")
+	}
+
+	failingPeriod, _, _ := readBillingFinalizationState(t, ctx, failingTeamID, failingPeriodStart, failingPeriodEnd)
+	if failingPeriod.FinalizedAt.Valid {
+		t.Fatal("failing period should remain unfinalized")
+	}
+	laterSameTeamPeriod, _, _ := readBillingFinalizationState(t, ctx, failingTeamID, laterSameTeamScenario.periodStart, laterSameTeamScenario.periodEnd)
+	if laterSameTeamPeriod.FinalizedAt.Valid {
+		t.Fatal("later period for same team should remain unfinalized until the earlier failure is resolved")
+	}
+
+	period, _, _ := readBillingFinalizationState(t, ctx, passingTeamID, passingScenario.periodStart, passingScenario.periodEnd)
+	if !period.FinalizedAt.Valid {
+		t.Fatal("passing period was not finalized")
+	}
+}
+
+func TestIntegration_BillingEndpointsRespectTenantUsageDashboardFlag(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'tenant_usage_dashboard', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable tenant_usage_dashboard: %v", err)
+	}
+
+	for _, path := range []string{"/billing/summary", "/billing/pricing"} {
+		w := do(r, "GET", path, apiKey, "")
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s: expected 404, got %d: %s", path, w.Code, w.Body.String())
+		}
+		body := mustJSON(t, w)
+		errBody, ok := body["error"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s: error response missing error object: %v", path, body)
+		}
+		if errBody["code"] != "not_found" {
+			t.Fatalf("%s: error code = %v, want not_found", path, errBody["code"])
+		}
 	}
 }
 

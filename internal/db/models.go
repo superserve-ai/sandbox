@@ -528,18 +528,21 @@ type Team struct {
 }
 
 type TeamBillingPeriod struct {
-	TeamID        uuid.UUID          `json:"team_id"`
-	PeriodStart   time.Time          `json:"period_start"`
-	PeriodEnd     time.Time          `json:"period_end"`
-	Status        string             `json:"status"`
-	BlockedReason *string            `json:"blocked_reason"`
-	BlockedAt     pgtype.Timestamptz `json:"blocked_at"`
-	ApprovedBy    pgtype.UUID        `json:"approved_by"`
-	ApprovedAt    pgtype.Timestamptz `json:"approved_at"`
-	ExportedAt    pgtype.Timestamptz `json:"exported_at"`
-	FinalizedAt   pgtype.Timestamptz `json:"finalized_at"`
-	CreatedAt     time.Time          `json:"created_at"`
-	UpdatedAt     time.Time          `json:"updated_at"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	PeriodStart         time.Time          `json:"period_start"`
+	PeriodEnd           time.Time          `json:"period_end"`
+	Status              string             `json:"status"`
+	BlockedReason       *string            `json:"blocked_reason"`
+	BlockedAt           pgtype.Timestamptz `json:"blocked_at"`
+	ApprovedBy          pgtype.UUID        `json:"approved_by"`
+	ApprovedAt          pgtype.Timestamptz `json:"approved_at"`
+	ExportedAt          pgtype.Timestamptz `json:"exported_at"`
+	FinalizedAt         pgtype.Timestamptz `json:"finalized_at"`
+	CreatedAt           time.Time          `json:"created_at"`
+	UpdatedAt           time.Time          `json:"updated_at"`
+	GrossChargesUsd     pgtype.Numeric     `json:"gross_charges_usd"`
+	CreditsAppliedUsd   pgtype.Numeric     `json:"credits_applied_usd"`
+	NetInvoiceAmountUsd pgtype.Numeric     `json:"net_invoice_amount_usd"`
 }
 
 type TeamBillingUsage struct {

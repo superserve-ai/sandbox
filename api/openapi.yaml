@@ -95,6 +95,49 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/summary:
+    get:
+      operationId: getBillingSummary
+      tags: [Billing]
+      summary: Get billing summary
+      description: |
+        Returns team-level financial information for the authenticated team's
+        current billing period. All charge fields are monetary USD values, not
+        raw usage metrics. The team is derived from authentication; callers
+        cannot select a team by query parameter.
+
+        Access requires `billing:read` and the `tenant_usage_dashboard`
+        rollout gate to be enabled for the team.
+
+        Phase 1 assumes no pricing tier or rate changes within the current
+        billing period. The summary applies the team's currently active pricing
+        rates to all current-period usage.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Current billing period financial summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSummaryResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          description: Pricing is not available for the authenticated team's active plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /billing/pricing:
     get:
       operationId: getBillingPricing
@@ -104,6 +147,9 @@ paths:
         Returns the authenticated team's active pricing plan and current
         resource rates for billing UI display. The team is derived from
         authentication; callers cannot select a team by query parameter.
+
+        Access requires `billing:read` and the `tenant_usage_dashboard`
+        rollout gate to be enabled for the team.
       security:
         - apiKey: []
       responses:
@@ -117,6 +163,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "503":
@@ -1872,6 +1920,80 @@ components:
         `sb-<region>-<uuid>` (e.g. `sb-use-1b4e28ba-…`). Treat as an opaque
         string; the tagged form routes the request to the sandbox's home
         region. Endpoints accept both forms interchangeably.
+    BillingSummaryResponse:
+      type: object
+      required:
+        - current_charges_usd
+        - credits_applied_usd
+        - credits_remaining_usd
+        - expected_invoice_amount_usd
+        - cost_breakdown_usd
+        - billing_period
+        - pricing_tier
+        - calculated_at
+      properties:
+        current_charges_usd:
+          type: number
+          format: double
+          description: Current period charges before credits.
+        credits_applied_usd:
+          type: number
+          format: double
+          description: Credits applied against the current period charges.
+        # Phase 1 exposes float USD values for billing UI display. Invoice-grade
+        # exports should use decimal/cents fields before becoming customer-visible
+        # bills to avoid rounding artifacts.
+        credits_remaining_usd:
+          type: number
+          format: double
+          description: Credits still available after applying current period charges.
+        expected_invoice_amount_usd:
+          type: number
+          format: double
+          description: Expected invoice amount after credits.
+        cost_breakdown_usd:
+          type: object
+          required: [compute, memory, storage]
+          properties:
+            compute:
+              type: number
+              format: double
+              description: vCPU charges for the current period.
+            memory:
+              type: number
+              format: double
+              description: memory charges for the current period.
+            storage:
+              type: number
+              format: double
+              description: storage charges for the current period.
+        billing_period:
+          type: object
+          required: [start, end]
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        pricing_tier:
+          type: object
+          required: [plan_key, plan_name, currency]
+          properties:
+            plan_key:
+              type: string
+              example: payg
+            plan_name:
+              type: string
+              example: Pay-as-you-go
+            currency:
+              type: string
+              example: USD
+        calculated_at:
+          type: string
+          format: date-time
+          description: Timestamp when this live billing summary was calculated.
 
     CreateSandboxRequest:
       type: object
