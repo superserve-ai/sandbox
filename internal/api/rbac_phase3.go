@@ -71,6 +71,9 @@ func (h *Handlers) requireTeamPermissionFromContext(c *gin.Context, permission s
 // sandbox-specific helpers at call sites so a future sandboxes:* permission split
 // can be made centrally without touching every handler again.
 func (h *Handlers) requireTeamSandboxRead(c *gin.Context, teamID uuid.UUID) bool {
+	if isConsoleImpersonation(c) && apiKeyHasScope(c, "platform:sandbox:read") {
+		return true
+	}
 	return h.requireCustomerTeamPermission(c, teamID, "settings:read")
 }
 
@@ -84,4 +87,11 @@ func (h *Handlers) requireTeamSettingsRead(c *gin.Context, teamID uuid.UUID) boo
 
 func (h *Handlers) requireTeamSettingsWrite(c *gin.Context, teamID uuid.UUID) bool {
 	return h.requireCustomerTeamPermission(c, teamID, "settings:write")
+}
+
+func (h *Handlers) requireTeamTemplateRead(c *gin.Context, teamID uuid.UUID) bool {
+	if isConsoleImpersonation(c) && apiKeyHasScope(c, "platform:template:read") {
+		return true
+	}
+	return h.requireCustomerTeamPermission(c, teamID, "settings:read")
 }

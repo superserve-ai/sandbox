@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,24 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+const consoleImpersonationKeyName = "__console_impersonation__"
+
+func isConsoleImpersonation(c *gin.Context) bool {
+	return c.GetString("api_key_name") == consoleImpersonationKeyName
+}
+
+func apiKeyHasScope(c *gin.Context, scope string) bool {
+	raw, ok := c.Get("api_key_scopes")
+	if !ok {
+		return false
+	}
+	scopes, ok := raw.([]string)
+	if !ok {
+		return false
+	}
+	return slices.Contains(scopes, scope)
+}
 
 // APIKeyAuth returns a Gin middleware that validates the X-API-Key header
 // by hashing the provided key and looking it up in the api_key table.
@@ -51,21 +70,24 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				touchLastUsed(context.WithoutCancel(c.Request.Context()), entry.id)
 			}
 			c.Set("api_key_id", entry.id)
+			c.Set("api_key_name", entry.name)
+			c.Set("api_key_scopes", entry.scopes)
 			c.Set("team_id", entry.teamID)
-			if entry.createdBy.Valid {
+			if entry.createdBy.Valid && !isConsoleImpersonation(c) {
 				c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
 			}
 			c.Next()
 			return
 		}
 
-		var id, teamID string
+		var id, teamID, name string
+		var scopes []string
 		var createdBy pgtype.UUID
 		var expiresAt pgtype.Timestamptz
 		err := pool.QueryRow(c.Request.Context(),
-			"SELECT id, team_id, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
+			"SELECT id, team_id, name, scopes, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
 			keyHash,
-		).Scan(&id, &teamID, &createdBy, &expiresAt)
+		).Scan(&id, &teamID, &name, &scopes, &createdBy, &expiresAt)
 		if err != nil {
 			// Lookup failed — usually a bad key, but with per-cell databases
 			// it is also how a valid key presented to the wrong cell fails.
@@ -78,14 +100,18 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		cache.put(keyHash, apiKeyCacheEntry{
 			id:        id,
 			teamID:    teamID,
+			name:      name,
+			scopes:    scopes,
 			createdBy: createdBy,
 			expiresAt: expiresAt,
 		}, time.Now())
 		touchLastUsed(context.WithoutCancel(c.Request.Context()), id)
 
 		c.Set("api_key_id", id)
+		c.Set("api_key_name", name)
+		c.Set("api_key_scopes", scopes)
 		c.Set("team_id", teamID)
-		if createdBy.Valid {
+		if createdBy.Valid && !isConsoleImpersonation(c) {
 			c.Set("actor_id", uuid.UUID(createdBy.Bytes))
 		}
 		c.Next()

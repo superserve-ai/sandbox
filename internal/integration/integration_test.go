@@ -355,6 +355,31 @@ func seedTeamAndKeyNoCreator(t *testing.T) (uuid.UUID, string) {
 	return team.ID, rawKey
 }
 
+func seedConsoleImpersonationKey(t *testing.T, teamID uuid.UUID, scopes []string, expiresAt *time.Time) string {
+	t.Helper()
+	ctx := context.Background()
+
+	rawKey := "sk-test-" + uuid.New().String()
+	hash := sha256.Sum256([]byte(rawKey))
+	keyHash := hex.EncodeToString(hash[:])
+
+	params := db.CreateAPIKeyV2Params{
+		TeamID:  teamID,
+		KeyHash: keyHash,
+		Name:    "__console_impersonation__",
+		Scopes:  append([]string{}, scopes...),
+	}
+	if expiresAt != nil {
+		params.ExpiresAt = pgtype.Timestamptz{Time: *expiresAt, Valid: true}
+	}
+
+	if _, err := testQueries.CreateAPIKeyV2(ctx, params); err != nil {
+		t.Fatalf("seedConsoleImpersonationKey: create api key: %v", err)
+	}
+
+	return rawKey
+}
+
 // seedTeamKeyAndProfile is like seedTeamAndKey but also seeds a profile row
 // and sets api_key.created_by to it. Returns (teamID, rawKey, profileID).
 func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
@@ -3287,4 +3312,3 @@ func TestIntegration_CreateTemplate_DuplicateLiveNameReturns409(t *testing.T) {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
 	}
 }
-
