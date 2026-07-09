@@ -1189,6 +1189,19 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
 	}
 
+	// A re-run during the soak must be a pure no-op, not a replay: the
+	// sweep and the rollup release below write to the dest, which has been
+	// live-owned since the first detach — replaying them would upsert
+	// frozen source rows (rollup cursor included) over live dest state.
+	alreadyDetached, err := sourceDetached(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if alreadyDetached {
+		log.Info().Msg("detach: source is already detached; nothing to do")
+		return nil
+	}
+
 	// Same quiescence re-check as purge: a sandbox resumed or a build
 	// started after the copy is invisible to validate (in-flight build rows
 	// sit outside the migration scope entirely), and detach would sever the

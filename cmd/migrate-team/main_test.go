@@ -993,9 +993,22 @@ func TestTeamMigration(t *testing.T) {
 			t.Fatalf("validate on a detached source: %v", err)
 		}
 
-		// Detach is re-runnable: a second pass deletes nothing and passes.
+		// Detach is re-runnable as a pure no-op: a second pass during the
+		// soak must not replay the cutover sweep or the rollup release over
+		// the now-live dest. The sentinel cursor would be overwritten by a
+		// replayed sweep (the source's frozen cursor differs).
+		sentinel := time.Date(2032, 6, 1, 0, 0, 0, 0, time.UTC)
+		mustExec(t, dstPool, `UPDATE billing_rollup_team_backfill_state SET next_hour_start = $2 WHERE team_id = $1`, f.team, sentinel)
 		if err := run(ctx, cfg); err != nil {
 			t.Fatalf("re-detach: %v", err)
+		}
+		var cursor time.Time
+		if err := dstPool.QueryRow(ctx, `
+			SELECT next_hour_start FROM billing_rollup_team_backfill_state WHERE team_id = $1`, f.team).Scan(&cursor); err != nil {
+			t.Fatal(err)
+		}
+		if !cursor.Equal(sentinel) {
+			t.Fatalf("re-detach replayed the cutover sweep over the live dest (cursor=%v)", cursor)
 		}
 	})
 
