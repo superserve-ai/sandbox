@@ -1272,6 +1272,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
+	// Failure cleanup must not delete an overlay this attempt didn't create:
+	// see cleanupRunDirKeepOverlay.
+	cleanupAfterRestoreFailure := func() {
+		if plan.action == restoreReuseOverlay {
+			m.cleanupRunDirKeepOverlay(vmID)
+		} else {
+			m.cleanupRunDir(vmID)
+		}
+	}
 	var diskPath string
 	var diskErr error
 	switch plan.action {
@@ -1308,7 +1317,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if tapDevice == "" {
 		netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, netCfg)
 		if netErr != nil {
-			m.cleanupRunDir(vmID)
+			cleanupAfterRestoreFailure()
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("setup network: %w", netErr)
 		}
@@ -1343,7 +1352,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
-		m.cleanupRunDir(vmID)
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
@@ -1437,7 +1446,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
-		m.cleanupRunDir(vmID)
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		// armLayered may have set DirtyTracked=true on inst before the restore call;
 		// clear it on failure so a lingering instance can't later take a Diff against a
@@ -2105,6 +2114,35 @@ func (m *Manager) cleanupRunDir(dirName string) {
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.RemoveAll(vmDir); err != nil {
 		m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to remove rundir")
+	}
+}
+
+// cleanupRunDirKeepOverlay removes the VM's rundir contents except
+// overlay.ext4. Restore failures use it when the overlay pre-existed the
+// attempt (restoreReuseOverlay): the overlay is the sandbox's persistent
+// disk — for a VM whose artifacts were placed on this host by a migration,
+// it may be the only local copy — and deleting it turns a transient restore
+// failure (network claim, timeout) into data loss that poisons every retry.
+func (m *Manager) cleanupRunDirKeepOverlay(dirName string) {
+	if !isLeafName(dirName) || isReservedRunDirName(dirName) {
+		m.log.Error().Str("dir", dirName).Msg("refusing to clean unsafe or reserved rundir name")
+		return
+	}
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	entries, err := os.ReadDir(vmDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to read rundir for selective cleanup")
+		}
+		return
+	}
+	for _, e := range entries {
+		if e.Name() == "overlay.ext4" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(vmDir, e.Name())); err != nil {
+			m.log.Warn().Err(err).Str("dir", dirName).Str("entry", e.Name()).Msg("failed to remove rundir entry")
+		}
 	}
 }
 
