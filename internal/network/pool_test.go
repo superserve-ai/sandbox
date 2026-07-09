@@ -12,7 +12,7 @@ import (
 // restores it on cleanup — the seam Return's verifyAndRecycle uses instead
 // of the real /proc scan, so tests can simulate an occupied or clear
 // namespace without a real kernel netns/process.
-func stubPidsInNs(t *testing.T, fn func(ns string) []int) {
+func stubPidsInNs(t *testing.T, fn func(ns string) ([]int, bool)) {
 	t.Helper()
 	old := pidsInNsFunc
 	pidsInNsFunc = fn
@@ -97,7 +97,7 @@ func TestPoolClaim_EmptyChannelsReturnsNil(t *testing.T) {
 func TestPoolReturn_RecyclesOnceNamespaceIsClear(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-1")
-	stubPidsInNs(t, func(string) []int { return nil })
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
 
 	m := newTestManager()
 	p := newTestPool(t, m)
@@ -137,11 +137,11 @@ func TestPoolReturn_WaitsForNamespaceToClearBeforeRecycling(t *testing.T) {
 	// "not recycled yet" check below, so that check can't pass by luck of
 	// goroutine scheduling.
 	var calls atomic.Int32
-	stubPidsInNs(t, func(string) []int {
+	stubPidsInNs(t, func(string) ([]int, bool) {
 		if calls.Add(1) <= 20 {
-			return []int{999999} // still occupied for the first few checks
+			return []int{999999}, true // still occupied for the first few checks
 		}
-		return nil
+		return nil, true
 	})
 
 	m := newTestManager()
@@ -181,7 +181,7 @@ func TestPoolReturn_WaitsForNamespaceToClearBeforeRecycling(t *testing.T) {
 func TestPoolReturn_TearsDownInsteadOfRecyclingIfNamespaceNeverClears(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-1")
-	stubPidsInNs(t, func(string) []int { return []int{999999} }) // never clears
+	stubPidsInNs(t, func(string) ([]int, bool) { return []int{999999}, true }) // never clears
 
 	m := newTestManager()
 	p := newTestPool(t, m)
@@ -210,5 +210,48 @@ func TestPoolReturn_TearsDownInsteadOfRecyclingIfNamespaceNeverClears(t *testing
 	m.mu.Unlock()
 	if stillOwned || !freed {
 		t.Errorf("slot 1 not released to freeSlots after giving up on recycling (owned=%v freed=%v)", stillOwned, freed)
+	}
+}
+
+// TestPoolReturn_FailedScanIsNotTreatedAsClear pins pidsInNs's ok=false
+// contract: a transient /proc scan failure must not read as "namespace
+// empty," or a still-occupied slot would get recycled — the exact race this
+// whole mechanism exists to prevent. Only a successful, empty scan clears.
+func TestPoolReturn_FailedScanIsNotTreatedAsClear(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+
+	// 20 failed scans at a 5ms poll interval is a ~100ms minimum before
+	// verifyAndRecycle can possibly clear — comfortably longer than the
+	// "not recycled yet" check below.
+	var calls atomic.Int32
+	stubPidsInNs(t, func(string) ([]int, bool) {
+		if calls.Add(1) <= 20 {
+			return nil, false // scan failed — pids empty, but NOT confirmed clear
+		}
+		return nil, true
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.verifyPollInterval = 5 * time.Millisecond
+	p.verifyMaxWait = 500 * time.Millisecond
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	select {
+	case slot := <-p.recycled:
+		t.Fatalf("slot %+v recycled on a failed (ok=false) scan — should have kept polling", slot)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	select {
+	case slot := <-p.recycled:
+		if slot.idx != 1 {
+			t.Errorf("recycled slot idx = %d, want 1", slot.idx)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slot never recycled once scans started succeeding")
 	}
 }

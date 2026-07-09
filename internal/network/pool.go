@@ -58,7 +58,13 @@ type preallocSlot struct {
 var pidsInNsFunc = pidsInNs
 
 const (
-	defaultVerifyPollInterval = 25 * time.Millisecond
+	// defaultVerifyPollInterval trades a small amount of slot-reuse latency
+	// (negligible against the 10s+ stop window it's guarding) for meaningfully
+	// less /proc scanning: each poll is a full readdir + per-pid stat, and the
+	// case that makes verification take a while — host I/O contention slowing
+	// process teardown — is exactly the case where many verifiers end up
+	// polling concurrently, adding VFS load to an already-contended host.
+	defaultVerifyPollInterval = 150 * time.Millisecond
 	// defaultVerifyMaxWait comfortably exceeds firecracker@.service's
 	// TimeoutStopSec=10 (systemd's own worst case for a unit that ignores
 	// SIGTERM) plus margin for kernel teardown under host I/O contention.
@@ -199,7 +205,13 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 	killProcessesInNs(ns)
 
 	deadline := time.Now().Add(maxWait)
-	for len(pidsInNsFunc(ns)) > 0 {
+	for {
+		pids, ok := pidsInNsFunc(ns)
+		// A failed scan (ok=false) is "don't know," not "clear" — keep
+		// polling rather than risk recycling a namespace that's still held.
+		if ok && len(pids) == 0 {
+			break
+		}
 		if time.Now().After(deadline) {
 			p.log.Error().Str("namespace", ns).Int("slot", slot.idx).
 				Msg("pool: namespace still occupied after max wait — tearing down instead of recycling")
