@@ -890,28 +890,26 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 	var mismatches []string
 	teamID := cfg.teamID
 
-	// After detach the source's membership tables are empty by design while
-	// the dest keeps its rows, so purge's validate pass must not read that
-	// asymmetry as data loss. The detached state also empties the source
-	// side of profileScope's membership-derived branches and the source
-	// role-assignment set, so those comparisons are skipped with it. A
-	// source that was never detached (the pre-split decommission path)
-	// still gets the full comparison.
+	// Parity validation only means something while the source is the live
+	// copy. Detach proved source==dest at cutover and then made the dest
+	// the team's only live home — from that point the dest legitimately
+	// diverges (new sandboxes, activity, rollups) while the source is a
+	// frozen fallback, so requiring parity would make a post-soak purge
+	// unsatisfiable by design. Once detached, validation reduces to the
+	// one thing purge still must know: the dest really holds the team.
 	detached, err := sourceDetached(ctx, src, teamID)
 	if err != nil {
 		return nil, err
 	}
 	if detached {
-		log.Info().Msg("validate: source is detached; membership-derived comparisons are skipped")
+		log.Info().Msg("validate: source is detached; parity no longer applies, checking dest liveness instead")
+		return validateDetachedDest(ctx, dst, cfg)
 	}
 
 	// 1. Per-table row-count parity over the team's scope.
 	for _, t := range migratedTables {
 		if validationExemptTables[t.name] {
 			continue // self-expiring advisory rows; see validationExemptTables.
-		}
-		if detached && (membershipTables[t.name] || t.name == "profile") {
-			continue // deleted on the source by detach; see above.
 		}
 		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope())
 		var srcN, dstN int64
@@ -938,9 +936,6 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 	for _, t := range migratedTables {
 		if insertOnlyTables[t.name] || validationExemptTables[t.name] {
 			continue // see insertOnlyTables / validationExemptTables.
-		}
-		if detached && membershipTables[t.name] {
-			continue // deleted on the source by detach.
 		}
 		tf := transforms[t.name]
 		if t.name == "sandbox" {
@@ -1040,39 +1035,35 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 
 	// 5. Role assignments must resolve to the same (user, role name, active)
 	// set on both sides — this is what proves the by-name remap worked.
-	// Skipped once detached: the source set is deliberately empty then, and
-	// the remap was proven by the validate pass detach itself ran.
-	if !detached {
-		const assignmentQ = `
-			SELECT ura.user_id::text || '|' || r.name || '|' || (ura.revoked_at IS NULL)::text
-			FROM user_role_assignments ura JOIN roles r ON r.id = ura.role_id
-			WHERE ura.team_id = $1 ORDER BY 1`
-		srcRows, err := src.Query(ctx, assignmentQ, teamID)
-		if err != nil {
-			return nil, fmt.Errorf("source role assignments: %w", err)
-		}
-		srcAssign, err := collectStrings(srcRows)
-		if err != nil {
-			return nil, err
-		}
-		dstRows, err := dst.Query(ctx, assignmentQ, teamID)
-		if err != nil {
-			return nil, fmt.Errorf("dest role assignments: %w", err)
-		}
-		dstAssign, err := collectStrings(dstRows)
-		if err != nil {
-			return nil, err
-		}
-		if strings.Join(srcAssign, "\n") != strings.Join(dstAssign, "\n") {
-			mismatches = append(mismatches, fmt.Sprintf(
-				"role assignments differ (source=%d dest=%d):\n  source: %v\n  dest:   %v",
-				len(srcAssign), len(dstAssign), srcAssign, dstAssign))
-		}
+	const assignmentQ = `
+		SELECT ura.user_id::text || '|' || r.name || '|' || (ura.revoked_at IS NULL)::text
+		FROM user_role_assignments ura JOIN roles r ON r.id = ura.role_id
+		WHERE ura.team_id = $1 ORDER BY 1`
+	srcRows, err := src.Query(ctx, assignmentQ, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("source role assignments: %w", err)
+	}
+	srcAssign, err := collectStrings(srcRows)
+	if err != nil {
+		return nil, err
+	}
+	dstRows, err := dst.Query(ctx, assignmentQ, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("dest role assignments: %w", err)
+	}
+	dstAssign, err := collectStrings(dstRows)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Join(srcAssign, "\n") != strings.Join(dstAssign, "\n") {
+		mismatches = append(mismatches, fmt.Sprintf(
+			"role assignments differ (source=%d dest=%d):\n  source: %v\n  dest:   %v",
+			len(srcAssign), len(dstAssign), srcAssign, dstAssign))
 	}
 
 	// 6. The sandbox↔snapshot relink must reproduce the source's pairs.
 	const pairQ = `SELECT id::text || '|' || COALESCE(snapshot_id::text, '') FROM sandbox WHERE team_id = $1 ORDER BY 1`
-	srcRows, err := src.Query(ctx, pairQ, teamID)
+	srcRows, err = src.Query(ctx, pairQ, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("source snapshot pairs: %w", err)
 	}
@@ -1080,7 +1071,7 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 	if err != nil {
 		return nil, err
 	}
-	dstRows, err := dst.Query(ctx, pairQ, teamID)
+	dstRows, err = dst.Query(ctx, pairQ, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("dest snapshot pairs: %w", err)
 	}
@@ -1146,6 +1137,47 @@ func sourceDetached(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) (b
 	return true, nil
 }
 
+// validateDetachedDest is what validation means after detach: the source is
+// a frozen fallback and the dest diverges legitimately, so parity is
+// unprovable and no longer the point. The one disaster purge must still rule
+// out is deleting the source while the dest no longer actually holds the
+// team — so check that the dest has the team row, homed in the expected
+// region, with a live membership chain.
+func validateDetachedDest(ctx context.Context, dst *pgxpool.Pool, cfg config) ([]string, error) {
+	var mismatches []string
+
+	var homeRegion string
+	err := dst.QueryRow(ctx, `SELECT home_region FROM team WHERE id = $1`, cfg.teamID).Scan(&homeRegion)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return []string{"dest has no team row — the source is the only copy left"}, nil
+	case err != nil:
+		return nil, fmt.Errorf("check dest team: %w", err)
+	case cfg.destRegion != "" && homeRegion != cfg.destRegion:
+		mismatches = append(mismatches, fmt.Sprintf(
+			"dest team home_region is %q, want %q", homeRegion, cfg.destRegion))
+	}
+
+	for _, t := range migratedTables {
+		if !membershipTables[t.name] {
+			continue
+		}
+		var n int64
+		if err := dst.QueryRow(ctx,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope), cfg.teamID).Scan(&n); err != nil {
+			return nil, fmt.Errorf("count dest %s: %w", t.name, err)
+		}
+		if n == 0 {
+			mismatches = append(mismatches, fmt.Sprintf(
+				"dest %s is empty — the team has no live membership chain there", t.name))
+		}
+	}
+	if len(mismatches) == 0 {
+		log.Info().Msg("validate: dest holds the team with a live membership chain")
+	}
+	return mismatches, nil
+}
+
 // runDetach deletes the team's membership rows — the RBAC chain — from the
 // source. With user_role_assignments, team_memberships, and team_member gone
 // no console or API path resolves the team in the source cell, so the dest
@@ -1194,6 +1226,18 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		return fmt.Errorf("aborting detach: validate found %d mismatch(es); source not touched", len(mismatches))
 	}
 
+	// Validate takes real time; re-run the blockers behind it, same as
+	// purge. For sandboxes this is a recheck, not a lock: detach keeps the
+	// rows, so a resume that lands after commit is a soak-window fact of
+	// life that purge's own guards catch — the recheck only closes the
+	// validate-sized gap. The build race IS closed for real below, under
+	// the app's build-admission lock.
+	if blockers, err := activeSandboxes(ctx, src, cfg.teamID); err != nil {
+		return err
+	} else if len(blockers) > 0 {
+		return fmt.Errorf("aborting detach: sandbox became non-quiescent during validate:\n  %s", strings.Join(blockers, "\n  "))
+	}
+
 	// One transaction: the RBAC chain goes atomically or not at all — a
 	// partial delete would leave the team half-reachable in the source cell.
 	tx, err := src.Begin(ctx)
@@ -1201,6 +1245,44 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		return fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	// Build admission serializes on the app's per-TEAM advisory lock
+	// (CountInFlightBuildsForTeam's caller contract) — take it so a
+	// CreateTemplateBuild that would slip a pending row past the earlier
+	// check blocks behind this transaction, then recheck under the lock.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cfg.teamID.String()); err != nil {
+		return fmt.Errorf("advisory-lock team builds: %w", err)
+	}
+	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(builds) > 0 {
+		return fmt.Errorf("aborting detach: template build slipped in before the lock:\n  %s", strings.Join(builds, "\n  "))
+	}
+
+	// Detach is the last moment the dest is guaranteed un-diverged, so the
+	// straggler sweep happens HERE, not at purge: async writers (activity,
+	// revocations from the freeze's key revocations, rollup ticks over
+	// already-copied intervals) may have landed source rows since copy, and
+	// upserting them into the dest is only safe before the dest goes live.
+	// A detached purge deliberately never sweeps — by then the dest is
+	// authoritative and a sweep would overwrite its live rows (e.g. the
+	// rollup backfill cursor) with the frozen source's.
+	for _, name := range []string{
+		"activity", "sandbox_revocation", "revoked_proxy_token",
+		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+	} {
+		spec, ok := tableByName(name)
+		if !ok {
+			return fmt.Errorf("sweep: unknown table %s", name)
+		}
+		copied, _, err := copyTable(ctx, tx, dst, spec, cfg.teamID, nil)
+		if err != nil {
+			return fmt.Errorf("cutover sweep of %s: %w", name, err)
+		}
+		if copied > 0 {
+			log.Info().Str("table", name).Int64("swept", copied).Msg("detach: straggler rows copied to dest at cutover")
+		}
+	}
 
 	var total int64
 	for i := len(migratedTables) - 1; i >= 0; i-- {
@@ -1238,6 +1320,19 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
 	if cfg.confirmTeamName != teamName {
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
+	}
+
+	// A detached source flips purge's relationship to the dest: the dest
+	// has been the live home since detach, so source↔dest comparisons and
+	// dest writes (drift check, straggler sweep, rollup restore) are
+	// skipped below — detach already did each of those at cutover, and
+	// doing them again would judge or overwrite a legitimately diverged
+	// dest. The state can't change mid-run: only detach empties the
+	// membership tables, and re-inserting rows mid-purge flips nothing
+	// we've already read.
+	detached, err := sourceDetached(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
 	}
 
 	// Re-check quiescence immediately before deleting: a sandbox resumed or
@@ -1342,13 +1437,16 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	}
 	// Under the locks, re-verify that sandbox rows and secret bindings
 	// still match the dest — catches anything (auto-delete, secret detach)
-	// that mutated them between validate and the locks landing.
-	drift, err := contentDriftUnderLock(ctx, tx, dst, cfg)
-	if err != nil {
-		return err
-	}
-	if drift != "" {
-		return fmt.Errorf("aborting purge: %s changed after validate (auto-delete, resume, or secret detach raced the window) — re-run copy and validate", drift)
+	// that mutated them between validate and the locks landing. Meaningless
+	// once detached: the dest diverged legitimately during the soak.
+	if !detached {
+		drift, err := contentDriftUnderLock(ctx, tx, dst, cfg)
+		if err != nil {
+			return err
+		}
+		if drift != "" {
+			return fmt.Errorf("aborting purge: %s changed after validate (auto-delete, resume, or secret detach raced the window) — re-run copy and validate", drift)
+		}
 	}
 
 	// Async writers (logSandboxActivity fires-and-forgets; revocation rows
@@ -1365,20 +1463,26 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// hourly rows from the already-copied intervals, none of which touch
 	// the locked sandbox/secret rows. Same remedy as the async writers:
 	// sweep them into dest under this transaction before deleting.
-	for _, name := range []string{
-		"activity", "sandbox_revocation", "revoked_proxy_token",
-		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
-	} {
-		spec, ok := tableByName(name)
-		if !ok {
-			return fmt.Errorf("sweep: unknown table %s", name)
-		}
-		copied, _, err := copyTable(ctx, tx, dst, spec, cfg.teamID, nil)
-		if err != nil {
-			return fmt.Errorf("final sweep of %s: %w", name, err)
-		}
-		if copied > 0 {
-			log.Info().Str("table", name).Int64("swept", copied).Msg("purge: straggler rows copied to dest before delete")
+	// Never once detached: detach swept at cutover, and sweeping now would
+	// overwrite the live dest's rows (rollup cursor included) with the
+	// frozen source's — post-detach source stragglers are byproducts of a
+	// dead cell, not customer data.
+	if !detached {
+		for _, name := range []string{
+			"activity", "sandbox_revocation", "revoked_proxy_token",
+			"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+		} {
+			spec, ok := tableByName(name)
+			if !ok {
+				return fmt.Errorf("sweep: unknown table %s", name)
+			}
+			copied, _, err := copyTable(ctx, tx, dst, spec, cfg.teamID, nil)
+			if err != nil {
+				return fmt.Errorf("final sweep of %s: %w", name, err)
+			}
+			if copied > 0 {
+				log.Info().Str("table", name).Int64("swept", copied).Msg("purge: straggler rows copied to dest before delete")
+			}
 		}
 	}
 
@@ -1404,10 +1508,15 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
-	if err := restoreRollupFlag(ctx, dst, cfg.teamID, srcRollupEnabled); err != nil {
-		return fmt.Errorf("source deleted but dest rollup flag not restored — apply release-rollups semantics by hand: %w", err)
+	// Detached: the dest's flag has been live-owned since detach released
+	// the hold at cutover — restoring the frozen source's value now would
+	// clobber any change support made during the soak.
+	if !detached {
+		if err := restoreRollupFlag(ctx, dst, cfg.teamID, srcRollupEnabled); err != nil {
+			return fmt.Errorf("source deleted but dest rollup flag not restored — apply release-rollups semantics by hand: %w", err)
+		}
+		log.Info().Msg("purge: dest rollup hold released to the source's pre-delete state")
 	}
-	log.Info().Msg("purge: dest rollup hold released to the source's pre-delete state")
 
 	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles and append-only audit tables retained)")
 	return nil

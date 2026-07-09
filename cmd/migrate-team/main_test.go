@@ -999,21 +999,77 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("purge after detach removes the source copy", func(t *testing.T) {
+	t.Run("purge refuses when the dest lost the team", func(t *testing.T) {
+		// Blow away the dest membership chain: purge must refuse to delete
+		// what is now the only reachable copy of those rows.
+		rows, err := dstPool.Query(ctx, `SELECT user_id, status FROM team_memberships WHERE team_id = $1`, f.team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type membership struct {
+			userID uuid.UUID
+			status string
+		}
+		var saved []membership
+		for rows.Next() {
+			var m membership
+			if err := rows.Scan(&m.userID, &m.status); err != nil {
+				t.Fatal(err)
+			}
+			saved = append(saved, m)
+		}
+		rows.Close()
+		mustExec(t, dstPool, `DELETE FROM team_memberships WHERE team_id = $1`, f.team)
+		defer func() {
+			for _, m := range saved {
+				mustExec(t, dstPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, $3)`, f.team, m.userID, m.status)
+			}
+		}()
+
+		cfg := f.cfg(phasePurge)
+		cfg.confirmTeamName = "migration-drill"
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "mismatch") {
+			t.Fatalf("purge with an empty dest membership chain must refuse, got: %v", err)
+		}
+		if got := countScoped(t, srcPool, tableSpec{"sandbox", "team_id = $1"}, f.team); got != f.expectedCounts["sandbox"] {
+			t.Fatal("refused purge must not delete source rows")
+		}
+	})
+
+	t.Run("purge after a live detached soak removes the source copy", func(t *testing.T) {
+		// Simulate the soak: the dest is the live home and diverges — a
+		// sandbox resumes, a dest-only activity row lands, the rollup
+		// backfill cursor advances, and support flips the rollup flag off.
+		// None of that may block purge, and none of it may be overwritten
+		// by purge's dest writes (sweep, rollup restore) afterwards.
+		mustExec(t, dstPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
+		mustExec(t, dstPool, `INSERT INTO activity (sandbox_id, team_id, actor_id, category, action, resource_type, sandbox_name)
+			VALUES ($1, $2, $3, 'sandbox', 'create', 'sandbox', 'drill-soak-sb')`, f.sb1, f.team, f.owner)
+		soakCursor := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+		mustExec(t, dstPool, `UPDATE billing_rollup_team_backfill_state SET next_hour_start = $2 WHERE team_id = $1`, f.team, soakCursor)
+		mustExec(t, dstPool, `UPDATE team_feature_flag SET enabled = false WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team)
+
 		cfg := f.cfg(phasePurge)
 		cfg.confirmTeamName = "migration-drill"
 		if err := run(ctx, cfg); err != nil {
 			t.Fatalf("purge: %v", err)
 		}
 
-		// Purge captures the source flag before deleting and restores it
-		// into dest itself — the fixture's explicit TRUE must survive even
-		// though the source rows are gone.
+		// The dest's live state survives: purge must not re-restore the
+		// frozen source's flag or sweep the frozen cursor over the live one.
 		var enabled bool
 		if err := dstPool.QueryRow(ctx, `
 			SELECT enabled FROM team_feature_flag
-			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil || !enabled {
-			t.Fatalf("dest rollup flag not restored after purge (enabled=%v, err=%v)", enabled, err)
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil || enabled {
+			t.Fatalf("detached purge clobbered the dest's live rollup flag (enabled=%v, err=%v)", enabled, err)
+		}
+		var cursor time.Time
+		if err := dstPool.QueryRow(ctx, `
+			SELECT next_hour_start FROM billing_rollup_team_backfill_state WHERE team_id = $1`, f.team).Scan(&cursor); err != nil {
+			t.Fatal(err)
+		}
+		if !cursor.Equal(soakCursor) {
+			t.Fatalf("detached purge rewound the dest's live backfill cursor to %v", cursor)
 		}
 
 		for _, spec := range migratedTables {
@@ -1054,7 +1110,11 @@ func TestTeamMigration(t *testing.T) {
 			t.Errorf("bystander team lost its sandbox (count=%d)", n)
 		}
 		for _, spec := range migratedTables {
-			if got, want := countScoped(t, dstPool, spec, f.team), f.expectedCounts[spec.name]; got != want {
+			want := f.expectedCounts[spec.name]
+			if spec.name == "activity" {
+				want++ // the dest-only soak-divergence row above
+			}
+			if got := countScoped(t, dstPool, spec, f.team); got != want {
 				t.Errorf("after purge, dest %s: got %d rows, want %d", spec.name, got, want)
 			}
 		}
