@@ -133,9 +133,6 @@ module "api" {
     SECRETS_SIGNING_KEY = {
       secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
     }
-    SENTRY_DSN = {
-      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn-${local.resource_suffix}")
-    }
   }
 
   vpc_connector  = null

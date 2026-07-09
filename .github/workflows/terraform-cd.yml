@@ -166,6 +166,7 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
@@ -286,6 +287,7 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
             --image ${{ vars.GCP_REGION_USW }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve-usw2/controlplane:${{ github.sha }} \
+            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION_USW }} \
             --project ${{ vars.GCP_PROJECT }}
 
@@ -398,6 +400,7 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
