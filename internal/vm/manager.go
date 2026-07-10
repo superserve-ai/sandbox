@@ -1481,7 +1481,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
-		m.cleanupRunDir(vmID)
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
