@@ -82,7 +82,9 @@ type Manager struct {
 	mu        sync.Mutex
 	devices   map[string]*VMNetInfo
 	freeSlots []int // recycled slot indices, guaranteed absent from slotOwner
-	nextSlot  int   // next new slot (used when freeSlots is empty)
+	nextSlot   int  // next new slot (used when freeSlots is empty)
+	maxSlot    int  // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
+	slotPinned bool // WithExactSlot: allocate exactly maxSlot or fail, never advance
 
 	// slotOwner is the single source of truth for slot allocation AND identity:
 	// slotOwner[idx] == the current owner of slot index idx, one of
@@ -151,11 +153,13 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 // ManagerOption configures optional Manager behavior.
 type ManagerOption func(*Manager)
 
-// WithStartSlot sets the starting slot index for network allocation.
-// Use to avoid collision when multiple processes manage VMs on the
-// same host (e.g. vmd uses 1-100, template-builder uses 200+).
-func WithStartSlot(idx int) ManagerOption {
-	return func(m *Manager) { m.nextSlot = idx }
+// WithExactSlot pins the Manager to exactly slot idx: it claims that one index
+// or fails with ErrNoSlots, never advancing to idx+1. A template-builder
+// subprocess uses this to build precisely the slot vmd reserved for it via
+// ReserveSlot; if that slot is somehow unavailable the build fails cleanly
+// instead of silently running on an index vmd never reserved.
+func WithExactSlot(idx int) ManagerOption {
+	return func(m *Manager) { m.nextSlot = idx; m.maxSlot = idx; m.slotPinned = true }
 }
 
 // WithHTTPProxyPort sets the HTTP proxy port for egress REDIRECT rules.
@@ -759,6 +763,40 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	return true
 }
 
+// ClaimFreshSlot claims a fresh, unused slot index under owner without building
+// any kernel network state. The caller — a template-builder subprocess —
+// creates ns-<idx>/veth-<idx> itself; the reservation is what stops vmd's
+// sandbox allocator from handing the same index to a VM, so builds and
+// sandboxes draw from one authoritative allocator instead of racing disjoint
+// ranges. Distinct from ReserveSlotsAbove, which pins already-known indices
+// via reserveSlotLocked (bypassing the owned/nsExists checks). Pair every
+// ClaimFreshSlot with a ReleaseSlot.
+func (m *Manager) ClaimFreshSlot(owner string) (int, error) {
+	return m.claimSlotIndex(owner)
+}
+
+// ReleaseSlot frees a slot claimed via ClaimFreshSlot and tears down any ns/veth
+// the caller built at idx. It releases strictly by (owner, idx) — never routing
+// through the tracked-VM path — so a caller-supplied build ID that collides with
+// a live sandbox's VM ID can't tear down that sandbox's namespace or leak the
+// reserved index. Owns the namespace naming so callers never reconstruct
+// "ns-<idx>"; a no-op if owner no longer owns idx (already reclaimed/reused).
+func (m *Manager) ReleaseSlot(owner string, idx int) {
+	// Claim the teardown atomically (owner → teardownOwner) so claimSlotIndex
+	// can't grab idx while cleanupFull runs below.
+	m.mu.Lock()
+	if m.slotOwner[idx] != owner {
+		m.mu.Unlock()
+		return
+	}
+	m.slotOwner[idx] = teardownOwner
+	m.mu.Unlock()
+	// Release even if cleanupFull panics — otherwise idx stays stuck as
+	// teardownOwner forever (no other path releases that sentinel).
+	defer m.releaseIfOwned(idx, teardownOwner)
+	m.cleanupFull(fmt.Sprintf("ns-%d", idx), fmt.Sprintf("veth-%d", idx))
+}
+
 // claimSlotIndex picks a slot idx that is unowned and not present in the kernel,
 // assigns it to owner, and returns it. owner is poolOwner for pool pre-allocation
 // or the vmID for an on-demand SetupVM.
@@ -768,11 +806,18 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 
 	for {
 		var idx int
-		if len(m.freeSlots) > 0 {
+		// A pinned Manager (WithExactSlot) must claim exactly maxSlot or fail —
+		// so it never draws from freeSlots (which could hand back a different
+		// index); it only takes the pinned nextSlot path below.
+		if !m.slotPinned && len(m.freeSlots) > 0 {
 			idx = m.freeSlots[len(m.freeSlots)-1]
 			m.freeSlots = m.freeSlots[:len(m.freeSlots)-1]
 		} else {
-			if m.nextSlot > MaxSlots {
+			ceiling := MaxSlots
+			if m.slotPinned {
+				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
+			}
+			if m.nextSlot > ceiling {
 				return 0, ErrNoSlots
 			}
 			idx = m.nextSlot
@@ -850,19 +895,38 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 }
 
 // killProcessesInNs SIGKILLs every process whose net namespace matches
-// /run/netns/<name>. Returns the number of pids signalled.
+// /run/netns/<name>. Returns the number of pids signalled. Best-effort: a
+// failed /proc scan (see pidsInNs) just means nothing gets killed this pass.
 func killProcessesInNs(name string) int {
+	pids, _ := pidsInNs(name)
+	killed := 0
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			killed++
+		}
+	}
+	return killed
+}
+
+// pidsInNs returns the PIDs whose net namespace matches /run/netns/<name>,
+// found by comparing /proc/<pid>/ns/net's inode against the namespace file's.
+// ok is false only when the /proc scan itself failed (e.g. transient
+// resource pressure) — a genuine "don't know" that callers must not treat as
+// "clear" the way an actually-empty scan is; conflating the two would let a
+// still-occupied namespace be recycled, reintroducing the exact race this
+// guards against. A namespace file that no longer exists can't have
+// anything attached to it, so that case is a confident (nil, true).
+func pidsInNs(name string) (pids []int, ok bool) {
 	nsPath := netnsDir + "/" + name
 	nsStat, err := os.Stat(nsPath)
 	if err != nil {
-		return 0
+		return nil, true
 	}
 	nsIno := nsStat.Sys().(*syscall.Stat_t).Ino
 	procs, err := os.ReadDir("/proc")
 	if err != nil {
-		return 0
+		return nil, false
 	}
-	killed := 0
 	for _, e := range procs {
 		if !e.IsDir() {
 			continue
@@ -878,11 +942,9 @@ func killProcessesInNs(name string) int {
 		if procNsStat.Sys().(*syscall.Stat_t).Ino != nsIno {
 			continue
 		}
-		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
-			killed++
-		}
+		pids = append(pids, pid)
 	}
-	return killed
+	return pids, true
 }
 
 // listHostVeths returns all veth-N interfaces visible in the host namespace.

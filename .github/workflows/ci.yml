@@ -70,6 +70,7 @@ jobs:
           HAS_GCP_AUTH: ${{ env.HAS_GCP_AUTH }}
         run: |
           set +euo pipefail
+          had_failures=0
 
           echo "## Terraform plan summary" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
@@ -107,6 +108,7 @@ jobs:
             terraform init -input=false -no-color > "$init_log" 2>&1
             init_status=$?
             if [[ $init_status -ne 0 ]]; then
+              had_failures=1
               echo "::warning title=Terraform init failed::${env_name} terraform init failed; see artifact ${safe_name}.init.txt"
               echo "terraform init failed. See artifact \`${safe_name}.init.txt\`." >> "$GITHUB_STEP_SUMMARY"
               echo >> "$GITHUB_STEP_SUMMARY"
@@ -117,6 +119,7 @@ jobs:
             terraform validate -no-color > "$validate_log" 2>&1
             validate_status=$?
             if [[ $validate_status -ne 0 ]]; then
+              had_failures=1
               echo "::warning title=Terraform validate failed::${env_name} terraform validate failed; see artifact ${safe_name}.validate.txt"
               echo "terraform validate failed. See artifact \`${safe_name}.validate.txt\`." >> "$GITHUB_STEP_SUMMARY"
               echo >> "$GITHUB_STEP_SUMMARY"
@@ -142,6 +145,7 @@ jobs:
               grep -E '^  # ' "$plan_log" | sed 's/^  # //' | head -n 80 >> "$GITHUB_STEP_SUMMARY" || true
               echo '```' >> "$GITHUB_STEP_SUMMARY"
             else
+              had_failures=1
               echo "::warning title=Terraform plan failed::${env_name} terraform plan failed; see artifact ${safe_name}.plan.txt"
               echo "terraform plan failed. See artifact \`${safe_name}.plan.txt\`." >> "$GITHUB_STEP_SUMMARY"
             fi
@@ -149,6 +153,11 @@ jobs:
             echo >> "$GITHUB_STEP_SUMMARY"
             popd >/dev/null
           done
+
+          if [[ $had_failures -ne 0 ]]; then
+            echo "One or more Terraform roots failed init, validate, or plan. See uploaded artifacts for details." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
           exit 0
 

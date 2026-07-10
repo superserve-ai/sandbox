@@ -1874,7 +1874,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		jwt, jerr := h.mintSecretsJWT(sandboxID.String(), teamID.String(), ipAddress, secretMeta)
 		if jerr != nil {
 			log.Error().Err(jerr).Str("sandbox_id", sandboxID.String()).Msg("mint secrets JWT")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID, false)
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
 			respondError(c, ErrInternal)
 			return
 		}
@@ -1887,7 +1887,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
 		} else {
 			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID, false)
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
 			respondError(c, ErrInternal)
 			return
 		}

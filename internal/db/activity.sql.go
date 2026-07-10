@@ -12,6 +12,45 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActivityByTeamPaged = `-- name: CountActivityByTeamPaged :one
+SELECT COUNT(*) FROM activity
+WHERE team_id = $1
+  AND ($2::text IS NULL OR category = $2::text)
+  AND ($3::text IS NULL OR status = $3::text)
+  AND ($4::text IS NULL
+       OR sandbox_name ILIKE '%' || $4::text || '%'
+       OR secret_name ILIKE '%' || $4::text || '%'
+       OR action ILIKE '%' || $4::text || '%'
+       OR category ILIKE '%' || $4::text || '%')
+  AND ($5::timestamptz IS NULL OR created_at >= $5::timestamptz)
+  AND ($6::timestamptz IS NULL OR created_at <= $6::timestamptz)
+`
+
+type CountActivityByTeamPagedParams struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	Category      *string            `json:"category"`
+	Status        *string            `json:"status"`
+	Search        *string            `json:"search"`
+	CreatedAfter  pgtype.Timestamptz `json:"created_after"`
+	CreatedBefore pgtype.Timestamptz `json:"created_before"`
+}
+
+// Total rows matching the same filters as ListActivityByTeamPaged (ignoring
+// pagination). Backs the X-Total-Count response header.
+func (q *Queries) CountActivityByTeamPaged(ctx context.Context, arg CountActivityByTeamPagedParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countActivityByTeamPaged,
+		arg.TeamID,
+		arg.Category,
+		arg.Status,
+		arg.Search,
+		arg.CreatedAfter,
+		arg.CreatedBefore,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createActivity = `-- name: CreateActivity :one
 INSERT INTO activity (
   sandbox_id, template_id, secret_id, secret_name, resource_type,
@@ -245,6 +284,98 @@ type ListActivityByTeamParams struct {
 
 func (q *Queries) ListActivityByTeam(ctx context.Context, arg ListActivityByTeamParams) ([]Activity, error) {
 	rows, err := q.db.Query(ctx, listActivityByTeam, arg.TeamID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Activity{}
+	for rows.Next() {
+		var i Activity
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.TeamID,
+			&i.ActorID,
+			&i.Category,
+			&i.Action,
+			&i.Status,
+			&i.SandboxName,
+			&i.DurationMs,
+			&i.Error,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.TemplateID,
+			&i.ResourceType,
+			&i.SecretID,
+			&i.SecretName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listActivityByTeamPaged = `-- name: ListActivityByTeamPaged :many
+SELECT id, sandbox_id, team_id, actor_id, category, action, status, sandbox_name, duration_ms, error, metadata, created_at, template_id, resource_type, secret_id, secret_name FROM activity
+WHERE team_id = $1
+  AND ($2::text IS NULL OR category = $2::text)
+  AND ($3::text IS NULL OR status = $3::text)
+  AND ($4::text IS NULL
+       OR sandbox_name ILIKE '%' || $4::text || '%'
+       OR secret_name ILIKE '%' || $4::text || '%'
+       OR action ILIKE '%' || $4::text || '%'
+       OR category ILIKE '%' || $4::text || '%')
+  AND ($5::timestamptz IS NULL OR created_at >= $5::timestamptz)
+  AND ($6::timestamptz IS NULL OR created_at <= $6::timestamptz)
+ORDER BY
+  CASE WHEN $7::text = 'created_at' AND $8::text = 'asc' THEN created_at END ASC,
+  created_at DESC,
+  -- id is a stable final tiebreaker so rows sharing a created_at (bulk events
+  -- written in one operation) keep a deterministic order across page boundaries.
+  id DESC
+LIMIT $10::bigint
+OFFSET COALESCE($9::bigint, 0)
+`
+
+type ListActivityByTeamPagedParams struct {
+	TeamID        uuid.UUID          `json:"team_id"`
+	Category      *string            `json:"category"`
+	Status        *string            `json:"status"`
+	Search        *string            `json:"search"`
+	CreatedAfter  pgtype.Timestamptz `json:"created_after"`
+	CreatedBefore pgtype.Timestamptz `json:"created_before"`
+	SortBy        string             `json:"sort_by"`
+	SortDir       string             `json:"sort_dir"`
+	RowOffset     *int64             `json:"row_offset"`
+	RowLimit      *int64             `json:"row_limit"`
+}
+
+// Paginated, filterable team activity list backing the console audit log.
+//
+// Filters (all optional, AND'd): category equality, status equality (the
+// console sends status='error' for the Errors tab), a case-insensitive
+// substring across sandbox_name/secret_name/action/category, and a created_at
+// window. Sort is created_at only (asc via the guarded CASE, otherwise the
+// created_at DESC default + stable tiebreaker). A NULL @row_limit returns all
+// rows, preserving the pre-pagination "return everything" default so
+// unpaginated callers are unaffected.
+func (q *Queries) ListActivityByTeamPaged(ctx context.Context, arg ListActivityByTeamPagedParams) ([]Activity, error) {
+	rows, err := q.db.Query(ctx, listActivityByTeamPaged,
+		arg.TeamID,
+		arg.Category,
+		arg.Status,
+		arg.Search,
+		arg.CreatedAfter,
+		arg.CreatedBefore,
+		arg.SortBy,
+		arg.SortDir,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

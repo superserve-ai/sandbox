@@ -286,6 +286,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
+		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
 		return
 	}
@@ -297,6 +298,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		// VM never stopped — safe to revert DB to active so the reaper
 		// retries on the next tick.
 		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
+		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, err, l)
 		return
 	}
@@ -313,6 +315,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Trigger:   "timeout",
 	}); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
+		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
 	}

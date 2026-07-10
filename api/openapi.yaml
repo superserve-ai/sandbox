@@ -1196,6 +1196,109 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /activity:
+    get:
+      operationId: listActivity
+      tags: [Activity]
+      summary: List team audit-log activity
+      description: |
+        Returns audit-log activity for the authenticated team, ordered by
+        creation time (newest first) by default. Backs the console Audit Logs
+        page.
+
+        Pass `limit` (and `offset`) to fetch one page at a time; the
+        `X-Total-Count` response header reports the total across all pages.
+        The activity log grows without bound, so omitting `limit` returns only
+        the most recent page (up to the 200-row maximum) — page through older
+        history with `limit` + `offset`. Filter by exact `category` or
+        `status`, restrict to a window with `start`/`end`, and search with `q`
+        (case-insensitive substring across sandbox name, secret name, action,
+        and category).
+      security:
+        - apiKey: []
+      parameters:
+        - name: category
+          in: query
+          required: false
+          description: >
+            Filter by exact activity category (e.g. `sandbox`, `template`,
+            `secret`, `network`).
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          description: Filter by exact status. Pass `error` to show only failed events.
+          schema:
+            type: string
+        - name: q
+          in: query
+          required: false
+          description: >
+            Case-insensitive substring match across sandbox name, secret name,
+            action, and category.
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          description: Only include events at or after this RFC3339 timestamp.
+          schema:
+            type: string
+            format: date-time
+        - name: end
+          in: query
+          required: false
+          description: Only include events at or before this RFC3339 timestamp.
+          schema:
+            type: string
+            format: date-time
+        - name: sort
+          in: query
+          required: false
+          description: Column to sort by (paired with `order`).
+          schema:
+            type: string
+            enum: [created_at]
+            default: created_at
+        - $ref: "#/components/parameters/SortOrder"
+        # Not the shared PageLimit param: the activity log is unbounded, so
+        # omitting `limit` returns only the most recent page (not the full
+        # list, as it does for the bounded sandbox/template lists).
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum rows to return (page size). The activity log is unbounded,
+            so omitting `limit` returns only the most recent page (200 rows) —
+            not the full history. Values above 200 are clamped to 200.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 200
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: Audit-log activity for the authenticated team
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/TotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ActivityResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /providers:
     get:
       operationId: listProviders
@@ -1868,6 +1971,62 @@ components:
           example:
             ANTHROPIC_API_KEY: anthropic-prod
             GITHUB_TOKEN: ghp-readonly
+
+    ActivityResponse:
+      description: One audit-log activity row returned by the activity list endpoint.
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sandbox_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set on sandbox events; null for events not tied to a sandbox.
+        template_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set on template events; null otherwise.
+        actor_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: >
+            The team member who performed the action; null for
+            system-initiated events (e.g. auto-pause, auto-delete).
+        category:
+          type: string
+        action:
+          type: string
+        status:
+          type: string
+          nullable: true
+        sandbox_name:
+          type: string
+          nullable: true
+        secret_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set on secret events; null once the secret is purged.
+        secret_name:
+          type: string
+          nullable: true
+        duration_ms:
+          type: integer
+          format: int32
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
 
     SandboxListItem:
       description: Sandbox shape returned by list endpoints.

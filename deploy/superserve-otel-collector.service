@@ -1,0 +1,31 @@
+[Unit]
+Description=Superserve OpenTelemetry Collector (GMP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/otelcol-contrib --config=/etc/sandbox/otel/collector-gmp.yaml
+Restart=always
+RestartSec=2
+
+# Collector auth comes from the attached GCE service account. Keep project-
+# specific overrides in a local env file rather than editing the unit.
+EnvironmentFile=-/etc/sandbox/otel/collector.env
+Environment=GCP_PROJECT=rayai-dev
+
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=otelcol
+
+[Install]
+WantedBy=multi-user.target

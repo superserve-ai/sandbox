@@ -104,6 +104,97 @@ func TestClaimSlotIndex_FreshNextSlot(t *testing.T) {
 	}
 }
 
+// TestClaimFreshSlot_NoCollisionWithSandbox pins the build-slot invariant: a
+// slot claimed for a template build goes through the one authoritative
+// allocator, so a concurrent sandbox claim can't get the same index — and the
+// index is reclaimed once the build releases it.
+func TestClaimFreshSlot_NoCollisionWithSandbox(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+
+	build, err := m.ClaimFreshSlot("build-tmpl")
+	if err != nil {
+		t.Fatalf("ClaimFreshSlot: %v", err)
+	}
+	sandbox, err := m.claimSlotIndex("vm-1")
+	if err != nil {
+		t.Fatalf("claimSlotIndex: %v", err)
+	}
+	if build == sandbox {
+		t.Fatalf("build and sandbox got the same slot %d", build)
+	}
+
+	if !m.releaseIfOwned(build, "build-tmpl") {
+		t.Fatalf("releaseIfOwned(%d, build-tmpl) = false, want true", build)
+	}
+	reused, err := m.claimSlotIndex("vm-2")
+	if err != nil {
+		t.Fatalf("claimSlotIndex after release: %v", err)
+	}
+	if reused != build {
+		t.Errorf("reused = %d, want %d (released build slot reclaimed)", reused, build)
+	}
+}
+
+// TestReleaseSlot_ReleasesByIndexNotTrackedVM pins the collision guard: when a
+// build's owner id happens to match a live sandbox's tracked VM id, ReleaseSlot
+// must free only the build's reserved index and leave the sandbox's slot and
+// devices entry untouched — never route through CleanupVM.
+func TestReleaseSlot_ReleasesByIndexNotTrackedVM(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+
+	// A live sandbox tracked under a vm id, holding slot 3...
+	m.devices["collide"] = &VMNetInfo{Namespace: "ns-3"}
+	m.assignSlotLocked(3, "collide")
+	// ...and a build that reserved slot 5 under the SAME id.
+	m.assignSlotLocked(5, "collide")
+
+	m.ReleaseSlot("collide", 5)
+
+	m.mu.Lock()
+	_, buildStillOwned := m.slotOwner[5]
+	_, sandboxStillOwned := m.slotOwner[3]
+	_, stillTracked := m.devices["collide"]
+	m.mu.Unlock()
+
+	if buildStillOwned {
+		t.Errorf("slot 5 still owned after ReleaseSlot — build index not freed")
+	}
+	if !sandboxStillOwned {
+		t.Errorf("sandbox slot 3 was released — ReleaseSlot tore down a tracked VM")
+	}
+	if !stillTracked {
+		t.Errorf("sandbox devices entry removed — ReleaseSlot routed through CleanupVM")
+	}
+}
+
+// TestClaimSlotIndex_ExactSlotDoesNotAdvance pins the WithExactSlot invariant: a
+// Manager bounded to one slot claims exactly that index or fails — it never
+// advances to idx+1, which vmd would not have reserved for the build.
+func TestClaimSlotIndex_ExactSlotDoesNotAdvance(t *testing.T) {
+	withTestNetnsDir(t)
+
+	// Pinned slot already taken → must fail, not fall through to 8.
+	taken := newTestManager()
+	taken.nextSlot, taken.maxSlot, taken.slotPinned = 7, 7, true // WithExactSlot(7)
+	taken.slotOwner[7] = "other"
+	if _, err := taken.claimSlotIndex("build-x"); err == nil {
+		t.Fatal("want ErrNoSlots when the pinned slot is taken, got nil (advanced past the pin)")
+	}
+
+	// Pinned slot free → claims exactly 7.
+	free := newTestManager()
+	free.nextSlot, free.maxSlot, free.slotPinned = 7, 7, true
+	idx, err := free.claimSlotIndex("build-x")
+	if err != nil {
+		t.Fatalf("claimSlotIndex: %v", err)
+	}
+	if idx != 7 {
+		t.Errorf("idx = %d, want 7 (pinned)", idx)
+	}
+}
+
 func TestClaimSlotIndex_PrefersFreeSlotsLIFO(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()

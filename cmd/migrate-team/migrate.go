@@ -18,9 +18,13 @@ import (
 )
 
 const (
-	phasePlan           = "plan"
-	phaseCopy           = "copy"
-	phaseValidate       = "validate"
+	phasePlan     = "plan"
+	phaseCopy     = "copy"
+	phaseValidate = "validate"
+	phaseDetach   = "detach"
+	phasePurge    = "purge"
+	// Deprecated alias for purge, from before detach split the phase in two;
+	// main normalizes it away.
 	phaseDecommission   = "decommission"
 	phaseReleaseRollups = "release-rollups"
 
@@ -42,7 +46,7 @@ type config struct {
 // identity plus database name — never by connection endpoint. The same
 // database reached through a pooler and directly must collapse to ONE
 // identity (endpoint-based fingerprints pass the guard and turn
-// copy/validate into self-comparisons before decommission deletes the only
+// copy/validate into self-comparisons before purge deletes the only
 // copy), while two databases in one cluster stay distinct via
 // current_database(). system_identifier is initdb-unique and stable across
 // restarts; where a managed provider restricts pg_control_system(), the
@@ -80,8 +84,8 @@ func run(ctx context.Context, cfg config) error {
 		// comparison can't catch pooler-vs-direct spellings of one DB, so
 		// compare live identity instead. With source == dest every later
 		// safeguard becomes a self-comparison: copy no-ops, validate
-		// passes against itself, and decommission would delete the only
-		// copy of the team.
+		// passes against itself, and purge would delete the only copy of
+		// the team.
 		srcID, err := dbIdentity(ctx, src)
 		if err != nil {
 			return fmt.Errorf("identify source database: %w", err)
@@ -111,8 +115,10 @@ func run(ctx context.Context, cfg config) error {
 		return runCopy(ctx, src, dst, cfg)
 	case phaseValidate:
 		return runValidate(ctx, src, dst, cfg)
-	case phaseDecommission:
-		return runDecommission(ctx, src, dst, cfg, teamName)
+	case phaseDetach:
+		return runDetach(ctx, src, dst, cfg, teamName)
+	case phasePurge:
+		return runPurge(ctx, src, dst, cfg, teamName)
 	case phaseReleaseRollups:
 		return runReleaseRollups(ctx, src, dst, cfg)
 	}
@@ -140,7 +146,7 @@ func runReleaseRollups(ctx context.Context, src, dst *pgxpool.Pool, cfg config) 
 
 // restoreRollupFlag writes the source's rollup-flag state into the dest: the
 // source's value when a row existed, absence when none did. Shared by the
-// standalone release-rollups phase (source still present) and decommission
+// standalone release-rollups phase (source still present) and purge
 // (which captures the state before deleting the source).
 func restoreRollupFlag(ctx context.Context, dst *pgxpool.Pool, teamID uuid.UUID, srcEnabled *bool) error {
 	if srcEnabled == nil {
@@ -444,7 +450,7 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	}
 	log.Info().Int64("relinked", relinked).Msg("copy: sandbox.snapshot_id relinked from source")
 
-	log.Info().Msg("copy: dest rollups remain HELD for this team — decommission releases the hold itself; for migrations that keep the source, run --phase release-rollups at cutover after validate")
+	log.Info().Msg("copy: dest rollups remain HELD for this team — purge releases the hold itself; for migrations that keep the source, run --phase release-rollups at cutover after validate")
 
 	for _, s := range skippedTables {
 		log.Info().Str("table", s.name).Str("reason", s.reason).Msg("copy: NOT copied")
@@ -884,6 +890,22 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 	var mismatches []string
 	teamID := cfg.teamID
 
+	// Parity validation only means something while the source is the live
+	// copy. Detach proved source==dest at cutover and then made the dest
+	// the team's only live home — from that point the dest legitimately
+	// diverges (new sandboxes, activity, rollups) while the source is a
+	// frozen fallback, so requiring parity would make a post-soak purge
+	// unsatisfiable by design. Once detached, validation reduces to the
+	// one thing purge still must know: the dest really holds the team.
+	detached, err := sourceDetached(ctx, src, teamID)
+	if err != nil {
+		return nil, err
+	}
+	if detached {
+		log.Info().Msg("validate: source is detached; parity no longer applies, checking dest liveness instead")
+		return validateDetachedDest(ctx, dst, cfg)
+	}
+
 	// 1. Per-table row-count parity over the team's scope.
 	for _, t := range migratedTables {
 		if validationExemptTables[t.name] {
@@ -906,7 +928,7 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 
 	// 1b. Per-row content checksums, transform-aware. Counts can match while
 	// a source row changed after the copy (background writers run through
-	// the freeze); decommission must be gated on content equality.
+	// the freeze); purge must be gated on content equality.
 	transforms, err := buildTransforms(ctx, src, dst, cfg)
 	if err != nil {
 		return nil, err
@@ -1094,11 +1116,236 @@ func collectStrings(rows pgx.Rows) ([]string, error) {
 }
 
 // ---------------------------------------------------------------------------
-// decommission
+// detach
 
-func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
+// sourceDetached reports whether the source has already been through detach:
+// every membership table empty for the team.
+func sourceDetached(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) (bool, error) {
+	for _, t := range migratedTables {
+		if !membershipTables[t.name] {
+			continue
+		}
+		var n int64
+		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope)
+		if err := src.QueryRow(ctx, q, teamID).Scan(&n); err != nil {
+			return false, fmt.Errorf("count source %s: %w", t.name, err)
+		}
+		if n > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// validateDetachedDest is what validation means after detach: the source is
+// a frozen fallback and the dest diverges legitimately, so parity is
+// unprovable and no longer the point. The one disaster purge must still rule
+// out is deleting the source while the dest no longer actually holds the
+// team — so check that the dest has the team row, homed in the expected
+// region, with a live membership chain.
+func validateDetachedDest(ctx context.Context, dst *pgxpool.Pool, cfg config) ([]string, error) {
+	var mismatches []string
+
+	var homeRegion string
+	err := dst.QueryRow(ctx, `SELECT home_region FROM team WHERE id = $1`, cfg.teamID).Scan(&homeRegion)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return []string{"dest has no team row — the source is the only copy left"}, nil
+	case err != nil:
+		return nil, fmt.Errorf("check dest team: %w", err)
+	case cfg.destRegion != "" && homeRegion != cfg.destRegion:
+		mismatches = append(mismatches, fmt.Sprintf(
+			"dest team home_region is %q, want %q", homeRegion, cfg.destRegion))
+	}
+
+	for _, t := range migratedTables {
+		if !membershipTables[t.name] {
+			continue
+		}
+		var n int64
+		if err := dst.QueryRow(ctx,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.scope), cfg.teamID).Scan(&n); err != nil {
+			return nil, fmt.Errorf("count dest %s: %w", t.name, err)
+		}
+		if n == 0 {
+			mismatches = append(mismatches, fmt.Sprintf(
+				"dest %s is empty — the team has no live membership chain there", t.name))
+		}
+	}
+	if len(mismatches) == 0 {
+		log.Info().Msg("validate: dest holds the team with a live membership chain")
+	}
+	return mismatches, nil
+}
+
+// runDetach deletes the team's membership rows — the RBAC chain — from the
+// source. With user_role_assignments, team_memberships, and team_member gone
+// no console or API path resolves the team in the source cell, so the dest
+// is the team's only live home, while every other row (and the artifacts)
+// stays as a cold fallback for the soak period before purge. Rollback is
+// re-inserting the membership rows, or running the tool in reverse.
+func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
 	if cfg.confirmTeamName != teamName {
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
+	}
+
+	// A re-run during the soak must be a pure no-op, not a replay: the
+	// sweep and the rollup release below write to the dest, which has been
+	// live-owned since the first detach — replaying them would upsert
+	// frozen source rows (rollup cursor included) over live dest state.
+	alreadyDetached, err := sourceDetached(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if alreadyDetached {
+		log.Info().Msg("detach: source is already detached; nothing to do")
+		return nil
+	}
+
+	// Same quiescence re-check as purge: a sandbox resumed or a build
+	// started after the copy is invisible to validate (in-flight build rows
+	// sit outside the migration scope entirely), and detach would sever the
+	// only reachable copy while that work still writes source rows and
+	// artifacts that were never copied.
+	blockers, err := activeSandboxes(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(blockers) > 0 {
+		return fmt.Errorf("aborting detach: %d sandbox(es) no longer quiescent:\n  %s",
+			len(blockers), strings.Join(blockers, "\n  "))
+	}
+	builds, err := activeBuilds(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(builds) > 0 {
+		return fmt.Errorf("aborting detach: %d template build(s) in flight:\n  %s",
+			len(builds), strings.Join(builds, "\n  "))
+	}
+
+	// A validate pass is a precondition in the same invocation — after
+	// detach the dest is the only copy anyone can reach, so never sever
+	// access to a source we haven't just proven the dest matches.
+	log.Info().Msg("detach: running validate first")
+	mismatches, err := validateTeam(ctx, src, dst, cfg)
+	if err != nil {
+		return err
+	}
+	if len(mismatches) > 0 {
+		for _, m := range mismatches {
+			log.Error().Msg("detach: MISMATCH — " + m)
+		}
+		return fmt.Errorf("aborting detach: validate found %d mismatch(es); source not touched", len(mismatches))
+	}
+
+	// Validate takes real time; re-run the blockers behind it, same as
+	// purge. For sandboxes this is a recheck, not a lock: detach keeps the
+	// rows, so a resume that lands after commit is a soak-window fact of
+	// life that purge's own guards catch — the recheck only closes the
+	// validate-sized gap. The build race IS closed for real below, under
+	// the app's build-admission lock.
+	if blockers, err := activeSandboxes(ctx, src, cfg.teamID); err != nil {
+		return err
+	} else if len(blockers) > 0 {
+		return fmt.Errorf("aborting detach: sandbox became non-quiescent during validate:\n  %s", strings.Join(blockers, "\n  "))
+	}
+
+	// One transaction: the RBAC chain goes atomically or not at all — a
+	// partial delete would leave the team half-reachable in the source cell.
+	tx, err := src.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Build admission serializes on the app's per-TEAM advisory lock
+	// (CountInFlightBuildsForTeam's caller contract) — take it so a
+	// CreateTemplateBuild that would slip a pending row past the earlier
+	// check blocks behind this transaction, then recheck under the lock.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cfg.teamID.String()); err != nil {
+		return fmt.Errorf("advisory-lock team builds: %w", err)
+	}
+	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(builds) > 0 {
+		return fmt.Errorf("aborting detach: template build slipped in before the lock:\n  %s", strings.Join(builds, "\n  "))
+	}
+
+	// Detach is the last moment the dest is guaranteed un-diverged, so the
+	// straggler sweep happens HERE, not at purge: async writers (activity,
+	// revocations from the freeze's key revocations, rollup ticks over
+	// already-copied intervals) may have landed source rows since copy, and
+	// upserting them into the dest is only safe before the dest goes live.
+	// A detached purge deliberately never sweeps — by then the dest is
+	// authoritative and a sweep would overwrite its live rows (e.g. the
+	// rollup backfill cursor) with the frozen source's.
+	for _, name := range []string{
+		"activity", "sandbox_revocation", "revoked_proxy_token",
+		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+	} {
+		spec, ok := tableByName(name)
+		if !ok {
+			return fmt.Errorf("sweep: unknown table %s", name)
+		}
+		copied, _, err := copyTable(ctx, tx, dst, spec, cfg.teamID, nil)
+		if err != nil {
+			return fmt.Errorf("cutover sweep of %s: %w", name, err)
+		}
+		if copied > 0 {
+			log.Info().Str("table", name).Int64("swept", copied).Msg("detach: straggler rows copied to dest at cutover")
+		}
+	}
+
+	var total int64
+	for i := len(migratedTables) - 1; i >= 0; i-- {
+		t := migratedTables[i]
+		if !membershipTables[t.name] {
+			continue
+		}
+		tag, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, t.name, t.scope), cfg.teamID)
+		if err != nil {
+			return fmt.Errorf("delete from %s: %w", t.name, err)
+		}
+		total += tag.RowsAffected()
+		log.Info().Str("table", t.name).Int64("deleted", tag.RowsAffected()).Msg("detach")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	log.Info().Int64("deleted", total).Msg("detach: source membership rows removed; everything else stays as a cold fallback until purge")
+
+	// Detach is the cutover moment, so it lifts the copy's rollup hold
+	// itself — leaving that to purge would suppress the team's hourly
+	// rollups in the dest for the whole soak. The source flag row outlives
+	// detach (team_feature_flag is not a membership table), so this is the
+	// same source-state restore as the standalone release-rollups phase,
+	// and a no-op when the runbook already ran that phase at cutover.
+	if err := runReleaseRollups(ctx, src, dst, cfg); err != nil {
+		return fmt.Errorf("detach: release rollup hold: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// purge
+
+func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
+	if cfg.confirmTeamName != teamName {
+		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
+	}
+
+	// A detached source flips purge's relationship to the dest: the dest
+	// has been the live home since detach, so source↔dest comparisons and
+	// dest writes (drift check, straggler sweep, rollup restore) are
+	// skipped below — detach already did each of those at cutover, and
+	// doing them again would judge or overwrite a legitimately diverged
+	// dest. The state can't change mid-run: only detach empties the
+	// membership tables, and re-inserting rows mid-purge flips nothing
+	// we've already read.
+	detached, err := sourceDetached(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
 	}
 
 	// Re-check quiescence immediately before deleting: a sandbox resumed or
@@ -1110,7 +1357,7 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 		return err
 	}
 	if len(blockers) > 0 {
-		return fmt.Errorf("aborting decommission: %d sandbox(es) no longer quiescent:\n  %s",
+		return fmt.Errorf("aborting purge: %d sandbox(es) no longer quiescent:\n  %s",
 			len(blockers), strings.Join(blockers, "\n  "))
 	}
 	builds, err := activeBuilds(ctx, src, cfg.teamID)
@@ -1118,22 +1365,22 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 		return err
 	}
 	if len(builds) > 0 {
-		return fmt.Errorf("aborting decommission: %d template build(s) in flight:\n  %s",
+		return fmt.Errorf("aborting purge: %d template build(s) in flight:\n  %s",
 			len(builds), strings.Join(builds, "\n  "))
 	}
 
 	// A validate pass is a precondition in the same invocation — never
 	// delete a source we haven't just proven the dest matches.
-	log.Info().Msg("decommission: running validate first")
+	log.Info().Msg("purge: running validate first")
 	mismatches, err := validateTeam(ctx, src, dst, cfg)
 	if err != nil {
 		return err
 	}
 	if len(mismatches) > 0 {
 		for _, m := range mismatches {
-			log.Error().Msg("decommission: MISMATCH — " + m)
+			log.Error().Msg("purge: MISMATCH — " + m)
 		}
-		return fmt.Errorf("aborting decommission: validate found %d mismatch(es); source not touched", len(mismatches))
+		return fmt.Errorf("aborting purge: validate found %d mismatch(es); source not touched", len(mismatches))
 	}
 
 	// Validate takes real time; a sandbox resume or build dispatch could
@@ -1144,12 +1391,12 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	if blockers, err := activeSandboxes(ctx, src, cfg.teamID); err != nil {
 		return err
 	} else if len(blockers) > 0 {
-		return fmt.Errorf("aborting decommission: sandbox became non-quiescent during validate:\n  %s", strings.Join(blockers, "\n  "))
+		return fmt.Errorf("aborting purge: sandbox became non-quiescent during validate:\n  %s", strings.Join(blockers, "\n  "))
 	}
 	if builds, err := activeBuilds(ctx, src, cfg.teamID); err != nil {
 		return err
 	} else if len(builds) > 0 {
-		return fmt.Errorf("aborting decommission: template build started during validate:\n  %s", strings.Join(builds, "\n  "))
+		return fmt.Errorf("aborting purge: template build started during validate:\n  %s", strings.Join(builds, "\n  "))
 	}
 
 	// One transaction: the source either loses the whole team or nothing.
@@ -1189,10 +1436,10 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
 		return err
 	} else if len(builds) > 0 {
-		return fmt.Errorf("aborting decommission: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
+		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
 	}
 	// The source rows die below, so capture the rollup-flag state now and
-	// restore it into the dest after the deletes commit — decommissioned
+	// restore it into the dest after the deletes commit — purged
 	// migrations must not depend on a later release-rollups run that would
 	// find no source to read.
 	var srcRollupEnabled *bool
@@ -1203,13 +1450,16 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	}
 	// Under the locks, re-verify that sandbox rows and secret bindings
 	// still match the dest — catches anything (auto-delete, secret detach)
-	// that mutated them between validate and the locks landing.
-	drift, err := contentDriftUnderLock(ctx, tx, dst, cfg)
-	if err != nil {
-		return err
-	}
-	if drift != "" {
-		return fmt.Errorf("aborting decommission: %s changed after validate (auto-delete, resume, or secret detach raced the window) — re-run copy and validate", drift)
+	// that mutated them between validate and the locks landing. Meaningless
+	// once detached: the dest diverged legitimately during the soak.
+	if !detached {
+		drift, err := contentDriftUnderLock(ctx, tx, dst, cfg)
+		if err != nil {
+			return err
+		}
+		if drift != "" {
+			return fmt.Errorf("aborting purge: %s changed after validate (auto-delete, resume, or secret detach raced the window) — re-run copy and validate", drift)
+		}
 	}
 
 	// Async writers (logSandboxActivity fires-and-forgets; revocation rows
@@ -1226,20 +1476,26 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 	// hourly rows from the already-copied intervals, none of which touch
 	// the locked sandbox/secret rows. Same remedy as the async writers:
 	// sweep them into dest under this transaction before deleting.
-	for _, name := range []string{
-		"activity", "sandbox_revocation", "revoked_proxy_token",
-		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
-	} {
-		spec, ok := tableByName(name)
-		if !ok {
-			return fmt.Errorf("sweep: unknown table %s", name)
-		}
-		copied, _, err := copyTable(ctx, tx, dst, spec, cfg.teamID, nil)
-		if err != nil {
-			return fmt.Errorf("final sweep of %s: %w", name, err)
-		}
-		if copied > 0 {
-			log.Info().Str("table", name).Int64("swept", copied).Msg("decommission: straggler rows copied to dest before delete")
+	// Never once detached: detach swept at cutover, and sweeping now would
+	// overwrite the live dest's rows (rollup cursor included) with the
+	// frozen source's — post-detach source stragglers are byproducts of a
+	// dead cell, not customer data.
+	if !detached {
+		for _, name := range []string{
+			"activity", "sandbox_revocation", "revoked_proxy_token",
+			"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+		} {
+			spec, ok := tableByName(name)
+			if !ok {
+				return fmt.Errorf("sweep: unknown table %s", name)
+			}
+			copied, _, err := copyTable(ctx, tx, dst, spec, cfg.teamID, nil)
+			if err != nil {
+				return fmt.Errorf("final sweep of %s: %w", name, err)
+			}
+			if copied > 0 {
+				log.Info().Str("table", name).Int64("swept", copied).Msg("purge: straggler rows copied to dest before delete")
+			}
 		}
 	}
 
@@ -1260,16 +1516,21 @@ func runDecommission(ctx context.Context, src, dst *pgxpool.Pool, cfg config, te
 			return fmt.Errorf("delete from %s: %w", t.name, err)
 		}
 		total += tag.RowsAffected()
-		log.Info().Str("table", t.name).Int64("deleted", tag.RowsAffected()).Msg("decommission")
+		log.Info().Str("table", t.name).Int64("deleted", tag.RowsAffected()).Msg("purge")
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
-	if err := restoreRollupFlag(ctx, dst, cfg.teamID, srcRollupEnabled); err != nil {
-		return fmt.Errorf("source deleted but dest rollup flag not restored — apply release-rollups semantics by hand: %w", err)
+	// Detached: the dest's flag has been live-owned since detach released
+	// the hold at cutover — restoring the frozen source's value now would
+	// clobber any change support made during the soak.
+	if !detached {
+		if err := restoreRollupFlag(ctx, dst, cfg.teamID, srcRollupEnabled); err != nil {
+			return fmt.Errorf("source deleted but dest rollup flag not restored — apply release-rollups semantics by hand: %w", err)
+		}
+		log.Info().Msg("purge: dest rollup hold released to the source's pre-delete state")
 	}
-	log.Info().Msg("decommission: dest rollup hold released to the source's pre-delete state")
 
-	log.Info().Int64("deleted", total).Msg("decommission: source rows removed (profiles and append-only audit tables retained)")
+	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles and append-only audit tables retained)")
 	return nil
 }

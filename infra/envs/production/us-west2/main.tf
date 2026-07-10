@@ -115,6 +115,7 @@ module "api" {
   env = {
     API_PORT          = "8080"
     EDGE_PROXY_DOMAIN = "usw-sandbox.superserve.ai"
+    SANDBOX_ID_REGION = "usw"
     SUPABASE_URL      = var.supabase_url
     VMD_GRPC_ADDRESS  = "10.1.0.2:50051"
   }

@@ -352,8 +352,14 @@ func seedFixture(t *testing.T) *fixture {
 	mustExec(t, srcPool, `
 		INSERT INTO audit_logs (actor_user_id, team_id, event_type) VALUES ($1, $2, 'role_granted')`, f.owner, f.team)
 
-	// A neighbor team that must survive decommission untouched.
+	// A neighbor team that must survive detach and purge untouched. It
+	// shares the owner, so detach's membership deletes must scope by team.
 	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'bystander-team')`, f.teamB)
+	mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, f.teamB, f.owner)
+	mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, f.teamB, f.owner)
+	mustExec(t, srcPool, `
+		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id, granted_by)
+		SELECT $2, r.id, 'team', $1, $2 FROM roles r WHERE r.name = 'team_owner'`, f.teamB, f.owner)
 
 	// System template: owned by another team in source; the dest cell has
 	// its own seeded copy under a different id. sb4 boots from it, so the
@@ -765,14 +771,14 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("decommission requires the exact team name", func(t *testing.T) {
-		cfg := f.cfg(phaseDecommission)
+	t.Run("purge requires the exact team name", func(t *testing.T) {
+		cfg := f.cfg(phasePurge)
 		cfg.confirmTeamName = "migration-dril" // one letter off
 		if err := run(ctx, cfg); err == nil {
-			t.Fatal("decommission with a wrong --confirm-team-name must fail")
+			t.Fatal("purge with a wrong --confirm-team-name must fail")
 		}
 		if got := countScoped(t, srcPool, tableSpec{"team", "id = $1"}, f.team); got != 1 {
-			t.Fatal("refused decommission must not delete anything")
+			t.Fatal("refused purge must not delete anything")
 		}
 	})
 
@@ -817,7 +823,7 @@ func TestTeamMigration(t *testing.T) {
 	})
 
 	t.Run("straggler sweep copies the transaction's own view", func(t *testing.T) {
-		// The decommission sweep runs copyTable off the locked transaction
+		// The purge sweep runs copyTable off the locked transaction
 		// so rows that landed after validate — invisible to any earlier
 		// pass — still reach the dest before the deletes. Simulate by
 		// sweeping from a transaction that holds an uncommitted straggler.
@@ -847,48 +853,236 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("decommission refuses when a build starts during validate", func(t *testing.T) {
+	t.Run("purge refuses when a build starts during validate", func(t *testing.T) {
 		buildID := uuid.New()
 		mustExec(t, srcPool, `
 			INSERT INTO template_build (id, template_id, team_id, status, build_spec_hash, vmd_host_id)
 			VALUES ($1, $2, $3, 'pending', 'race-hash', $4)`, buildID, f.tpl, f.team, sourceHostID)
 		defer mustExec(t, srcPool, `DELETE FROM template_build WHERE id = $1`, buildID)
 
-		cfg := f.cfg(phaseDecommission)
+		cfg := f.cfg(phasePurge)
 		cfg.confirmTeamName = "migration-drill"
 		err := run(ctx, cfg)
 		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
-			t.Fatalf("in-flight build must block decommission, got: %v", err)
+			t.Fatalf("in-flight build must block purge, got: %v", err)
 		}
 	})
 
-	t.Run("decommission refuses when the source is no longer quiescent", func(t *testing.T) {
+	t.Run("purge refuses when the source is no longer quiescent", func(t *testing.T) {
 		mustExec(t, srcPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
 		defer mustExec(t, srcPool, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, f.sb1)
 
-		cfg := f.cfg(phaseDecommission)
+		cfg := f.cfg(phasePurge)
 		cfg.confirmTeamName = "migration-drill"
 		err := run(ctx, cfg)
 		if err == nil || !strings.Contains(err.Error(), f.sb1.String()) {
-			t.Fatalf("post-copy resume must block decommission, got: %v", err)
+			t.Fatalf("post-copy resume must block purge, got: %v", err)
 		}
 	})
 
-	t.Run("decommission removes the source copy", func(t *testing.T) {
-		cfg := f.cfg(phaseDecommission)
+	t.Run("detach refuses when the source is no longer quiescent", func(t *testing.T) {
+		mustExec(t, srcPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
+		defer mustExec(t, srcPool, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, f.sb1)
+
+		cfg := f.cfg(phaseDetach)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), f.sb1.String()) {
+			t.Fatalf("post-copy resume must block detach, got: %v", err)
+		}
+	})
+
+	t.Run("detach refuses when a build is in flight", func(t *testing.T) {
+		buildID := uuid.New()
+		mustExec(t, srcPool, `
+			INSERT INTO template_build (id, template_id, team_id, status, build_spec_hash, vmd_host_id)
+			VALUES ($1, $2, $3, 'building', 'race-hash', $4)`, buildID, f.tpl, f.team, sourceHostID)
+		defer mustExec(t, srcPool, `DELETE FROM template_build WHERE id = $1`, buildID)
+
+		cfg := f.cfg(phaseDetach)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
+			t.Fatalf("in-flight build must block detach, got: %v", err)
+		}
+		if got := countScoped(t, srcPool, tableSpec{"team_memberships", "team_id = $1"}, f.team); got != 2 {
+			t.Fatal("refused detach must not delete anything")
+		}
+	})
+
+	t.Run("detach requires the exact team name", func(t *testing.T) {
+		cfg := f.cfg(phaseDetach)
+		cfg.confirmTeamName = "migration-dril" // one letter off
+		if err := run(ctx, cfg); err == nil {
+			t.Fatal("detach with a wrong --confirm-team-name must fail")
+		}
+		if got := countScoped(t, srcPool, tableSpec{"team_memberships", "team_id = $1"}, f.team); got != 2 {
+			t.Fatal("refused detach must not delete anything")
+		}
+	})
+
+	t.Run("detach removes only the membership rows", func(t *testing.T) {
+		// Re-impose the copy's rollup hold on the dest (an earlier subtest
+		// released it via the standalone phase): detach is the cutover
+		// moment and must lift the hold itself, or the migrated team's
+		// hourly rollups stay suppressed for the whole soak.
+		mustExec(t, dstPool, `UPDATE team_feature_flag SET enabled = false WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team)
+
+		cfg := f.cfg(phaseDetach)
 		cfg.confirmTeamName = "migration-drill"
 		if err := run(ctx, cfg); err != nil {
-			t.Fatalf("decommission: %v", err)
+			t.Fatalf("detach: %v", err)
 		}
 
-		// Decommission captures the source flag before deleting and
-		// restores it into dest itself — the fixture's explicit TRUE must
-		// survive even though the source rows are gone.
+		var rollups bool
+		if err := dstPool.QueryRow(ctx, `SELECT enabled FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&rollups); err != nil {
+			t.Fatal(err)
+		}
+		if !rollups {
+			t.Fatal("detach must restore the source rollup flag in the dest at cutover")
+		}
+
+		// The RBAC chain is gone from the source; every other table keeps
+		// its rows as the cold fallback. profile is asserted by id below —
+		// its scope is derived from the deleted membership rows — and the
+		// self-expiring exempt tables were pruned by an earlier subtest.
+		for _, spec := range migratedTables {
+			if spec.name == "profile" || validationExemptTables[spec.name] {
+				continue
+			}
+			want := f.expectedCounts[spec.name]
+			if membershipTables[spec.name] {
+				want = 0
+			}
+			if got := countScoped(t, srcPool, spec, f.team); got != want {
+				t.Errorf("after detach, source %s: got %d rows, want %d", spec.name, got, want)
+			}
+		}
+		for _, id := range []uuid.UUID{f.owner, f.member} {
+			var exists bool
+			if err := srcPool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM profile WHERE id = $1)`, id).Scan(&exists); err != nil {
+				t.Fatal(err)
+			}
+			if !exists {
+				t.Errorf("profile %s deleted from source; detach must not touch profiles", id)
+			}
+		}
+
+		// The bystander team's memberships (same owner) survive.
+		for _, table := range []string{"team_member", "team_memberships", "user_role_assignments"} {
+			var n int64
+			if err := srcPool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s WHERE team_id = $1`, table), f.teamB).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != 1 {
+				t.Errorf("bystander %s: got %d rows, want 1", table, n)
+			}
+		}
+
+		// The dest is untouched, memberships included.
+		for _, spec := range migratedTables {
+			if got, want := countScoped(t, dstPool, spec, f.team), f.expectedCounts[spec.name]; got != want {
+				t.Errorf("after detach, dest %s: got %d rows, want %d", spec.name, got, want)
+			}
+		}
+
+		// A standalone validate during the soak must not read the detached
+		// membership tables as data loss.
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatalf("validate on a detached source: %v", err)
+		}
+
+		// Detach is re-runnable as a pure no-op: a second pass during the
+		// soak must not replay the cutover sweep or the rollup release over
+		// the now-live dest. The sentinel cursor would be overwritten by a
+		// replayed sweep (the source's frozen cursor differs).
+		sentinel := time.Date(2032, 6, 1, 0, 0, 0, 0, time.UTC)
+		mustExec(t, dstPool, `UPDATE billing_rollup_team_backfill_state SET next_hour_start = $2 WHERE team_id = $1`, f.team, sentinel)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("re-detach: %v", err)
+		}
+		var cursor time.Time
+		if err := dstPool.QueryRow(ctx, `
+			SELECT next_hour_start FROM billing_rollup_team_backfill_state WHERE team_id = $1`, f.team).Scan(&cursor); err != nil {
+			t.Fatal(err)
+		}
+		if !cursor.Equal(sentinel) {
+			t.Fatalf("re-detach replayed the cutover sweep over the live dest (cursor=%v)", cursor)
+		}
+	})
+
+	t.Run("purge refuses when the dest lost the team", func(t *testing.T) {
+		// Blow away the dest membership chain: purge must refuse to delete
+		// what is now the only reachable copy of those rows.
+		rows, err := dstPool.Query(ctx, `SELECT user_id, status FROM team_memberships WHERE team_id = $1`, f.team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type membership struct {
+			userID uuid.UUID
+			status string
+		}
+		var saved []membership
+		for rows.Next() {
+			var m membership
+			if err := rows.Scan(&m.userID, &m.status); err != nil {
+				t.Fatal(err)
+			}
+			saved = append(saved, m)
+		}
+		rows.Close()
+		mustExec(t, dstPool, `DELETE FROM team_memberships WHERE team_id = $1`, f.team)
+		defer func() {
+			for _, m := range saved {
+				mustExec(t, dstPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, $3)`, f.team, m.userID, m.status)
+			}
+		}()
+
+		cfg := f.cfg(phasePurge)
+		cfg.confirmTeamName = "migration-drill"
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "mismatch") {
+			t.Fatalf("purge with an empty dest membership chain must refuse, got: %v", err)
+		}
+		if got := countScoped(t, srcPool, tableSpec{"sandbox", "team_id = $1"}, f.team); got != f.expectedCounts["sandbox"] {
+			t.Fatal("refused purge must not delete source rows")
+		}
+	})
+
+	t.Run("purge after a live detached soak removes the source copy", func(t *testing.T) {
+		// Simulate the soak: the dest is the live home and diverges — a
+		// sandbox resumes, a dest-only activity row lands, the rollup
+		// backfill cursor advances, and support flips the rollup flag off.
+		// None of that may block purge, and none of it may be overwritten
+		// by purge's dest writes (sweep, rollup restore) afterwards.
+		mustExec(t, dstPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
+		mustExec(t, dstPool, `INSERT INTO activity (sandbox_id, team_id, actor_id, category, action, resource_type, sandbox_name)
+			VALUES ($1, $2, $3, 'sandbox', 'create', 'sandbox', 'drill-soak-sb')`, f.sb1, f.team, f.owner)
+		soakCursor := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+		mustExec(t, dstPool, `UPDATE billing_rollup_team_backfill_state SET next_hour_start = $2 WHERE team_id = $1`, f.team, soakCursor)
+		mustExec(t, dstPool, `UPDATE team_feature_flag SET enabled = false WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team)
+
+		cfg := f.cfg(phasePurge)
+		cfg.confirmTeamName = "migration-drill"
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+
+		// The dest's live state survives: purge must not re-restore the
+		// frozen source's flag or sweep the frozen cursor over the live one.
 		var enabled bool
 		if err := dstPool.QueryRow(ctx, `
 			SELECT enabled FROM team_feature_flag
-			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil || !enabled {
-			t.Fatalf("dest rollup flag not restored after decommission (enabled=%v, err=%v)", enabled, err)
+			WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, f.team).Scan(&enabled); err != nil || enabled {
+			t.Fatalf("detached purge clobbered the dest's live rollup flag (enabled=%v, err=%v)", enabled, err)
+		}
+		var cursor time.Time
+		if err := dstPool.QueryRow(ctx, `
+			SELECT next_hour_start FROM billing_rollup_team_backfill_state WHERE team_id = $1`, f.team).Scan(&cursor); err != nil {
+			t.Fatal(err)
+		}
+		if !cursor.Equal(soakCursor) {
+			t.Fatalf("detached purge rewound the dest's live backfill cursor to %v", cursor)
 		}
 
 		for _, spec := range migratedTables {
@@ -929,9 +1123,92 @@ func TestTeamMigration(t *testing.T) {
 			t.Errorf("bystander team lost its sandbox (count=%d)", n)
 		}
 		for _, spec := range migratedTables {
-			if got, want := countScoped(t, dstPool, spec, f.team), f.expectedCounts[spec.name]; got != want {
-				t.Errorf("after decommission, dest %s: got %d rows, want %d", spec.name, got, want)
+			want := f.expectedCounts[spec.name]
+			if spec.name == "activity" {
+				want++ // the dest-only soak-divergence row above
+			}
+			if got := countScoped(t, dstPool, spec, f.team); got != want {
+				t.Errorf("after purge, dest %s: got %d rows, want %d", spec.name, got, want)
 			}
 		}
 	})
+}
+
+// TestPurgeWithoutDetach proves purge still stands alone: a source that never
+// went through detach keeps its membership rows, so the internal validate
+// must compare them in full (nothing is skipped) and the deletes take the
+// whole team in one pass — the pre-split decommission behavior.
+func TestPurgeWithoutDetach(t *testing.T) {
+	ctx := context.Background()
+	team := uuid.New()
+	owner := uuid.New()
+	sb := uuid.New()
+
+	mustExec(t, dstPool, `
+		INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+		VALUES ($1, '10.1.0.1:50051', '10.1.0.1:8080', $2, 65536, 32)
+		ON CONFLICT (id) DO NOTHING`, destHostID, destRegion)
+
+	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'purge-direct-drill')`, team)
+	mustExec(t, srcPool, `INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, 'direct-owner@example.com', 'google', 'google-direct')`, owner)
+	mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, team, owner)
+	mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, team, owner)
+	mustExec(t, srcPool, `
+		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id, granted_by)
+		SELECT $2, r.id, 'team', $1, $2 FROM roles r WHERE r.name = 'team_owner'`, team, owner)
+	sbDir := "/srv/sandboxes/" + sb.String()
+	mustExec(t, srcPool, `
+		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id,
+		                     snapshot_path, mem_path, base_path, delta_path)
+		VALUES ($1, $2, 'direct-sb', 'paused', 1, 1024, $3,
+		        $4||'/vmstate.snap', $4||'/mem.snap', $4||'/base.ext4', $4||'/delta.ext4')`,
+		sb, team, sourceHostID, sbDir)
+
+	cfg := config{
+		teamID:     team,
+		sourceURL:  srcURL,
+		destURL:    dstURL,
+		destHostID: destHostID,
+		destRegion: destRegion,
+	}
+
+	cfg.phase = phaseCopy
+	if err := run(ctx, cfg); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	cfg.phase = phasePurge
+	cfg.confirmTeamName = "purge-direct-drill"
+	if err := run(ctx, cfg); err != nil {
+		t.Fatalf("purge without a prior detach: %v", err)
+	}
+
+	for _, table := range []string{"team_member", "team_memberships", "sandbox"} {
+		var n int64
+		if err := srcPool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s WHERE team_id = $1`, table), team).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("source %s still has %d team rows", table, n)
+		}
+	}
+	var n int64
+	if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE id = $1`, team).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("source team row survived the purge")
+	}
+	for table, want := range map[string]int64{"team": 1, "team_member": 1, "team_memberships": 1, "sandbox": 1} {
+		q := `SELECT count(*) FROM ` + table + ` WHERE team_id = $1`
+		if table == "team" {
+			q = `SELECT count(*) FROM team WHERE id = $1`
+		}
+		if err := dstPool.QueryRow(ctx, q, team).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Errorf("dest %s: got %d rows, want %d", table, n, want)
+		}
+	}
 }
