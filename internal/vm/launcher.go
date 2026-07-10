@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,9 +142,7 @@ func ensurePrivateMount(ctx context.Context, dir string) error {
 // has private propagation. Scans /proc/self/mountinfo: fields left of " - " are
 // mount id, parent, major:minor, root, mount point, opts, then optional
 // propagation tags (shared:/master:/propagate_from:) — a private mount has none,
-// so exactly 6 left-fields. ponytail: compares the mount point raw — fine for the
-// fixed internal pin dir (/run/vmd, no spaces); a path with spaces would arrive
-// octal-escaped (\040) and need unescaping.
+// so exactly 6 left-fields.
 func mountState(dir string) (mounted, private bool, err error) {
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
@@ -159,11 +158,36 @@ func parseMountState(mountinfo []byte, dir string) (mounted, private bool) {
 		if !ok {
 			continue
 		}
-		if f := strings.Fields(left); len(f) >= 5 && f[4] == dir {
+		// The mount point (field 5) is octal-escaped by the kernel, so unescape it
+		// before comparing — otherwise a pin dir with a space matches nothing, is
+		// treated as unmounted, and stacks a fresh bind on every restart.
+		if f := strings.Fields(left); len(f) >= 5 && unescapeMountinfo(f[4]) == dir {
 			return true, len(f) == 6
 		}
 	}
 	return false, false
+}
+
+// unescapeMountinfo decodes the octal escapes the kernel writes for special
+// bytes in /proc/self/mountinfo path fields (space \040, tab \011, newline \012,
+// backslash \134). Other bytes pass through untouched.
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // StartMountCountSampler periodically logs the host mount-table size so the

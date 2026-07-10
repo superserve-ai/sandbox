@@ -133,14 +133,17 @@ func TestParseMountState(t *testing.T) {
 	// A private mount (no propagation tags) vs a shared one, plus an absent dir.
 	mountinfo := []byte(
 		"36 35 0:1 / /run/vmd rw,relatime - tmpfs tmpfs rw\n" +
-			"37 35 0:2 / /run rw,relatime shared:23 - tmpfs tmpfs rw\n")
+			"37 35 0:2 / /run rw,relatime shared:23 - tmpfs tmpfs rw\n" +
+			`38 35 0:3 / /run/my\040launcher rw,relatime - tmpfs tmpfs rw` + "\n")
 	cases := []struct {
 		dir                  string
 		wantMounted, private bool
 	}{
-		{"/run/vmd", true, true}, // dedicated private pin dir
-		{"/run", true, false},    // shared host mount — must not be made private
-		{"/nope", false, false},  // not present
+		{"/run/vmd", true, true},              // dedicated private pin dir
+		{"/run", true, false},                 // shared host mount — must not be made private
+		{"/run/my launcher", true, true},      // escaped mount point must unescape to match
+		{`/run/my\040launcher`, false, false}, // literal escaped form must NOT match
+		{"/nope", false, false},               // not present
 	}
 	for _, tc := range cases {
 		mounted, private := parseMountState(mountinfo, tc.dir)
