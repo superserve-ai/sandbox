@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -39,6 +40,10 @@ func main() {
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
 	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
 	domains := proxyDomains()
+	if legacy := os.Getenv("PROXY_DOMAIN"); legacy != "" && !slices.Contains(domains, legacy) {
+		log.Warn().Str("proxy_domain", legacy).Strs("effective_domains", domains).
+			Msg("PROXY_DOMAIN is set but not in the effective domain list — PROXY_DOMAINS overrides it and this host will stop serving it")
+	}
 
 	log.Info().
 		Str("addr", addr).
@@ -101,21 +106,11 @@ func main() {
 
 	// Health check for the GCP LB. Only responds on non-sandbox hosts
 	// so the boxd-label lockdown isn't bypassed.
-	domainSuffixes := make([]string, len(domains))
-	for i, d := range domains {
-		domainSuffixes[i] = "." + d
-	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if i := strings.IndexByte(host, ':'); i >= 0 {
-			host = host[:i]
-		}
-		for _, suffix := range domainSuffixes {
-			if strings.HasSuffix(host, suffix) {
-				proxyHandler.ServeHTTP(w, r)
-				return
-			}
+		if proxyHandler.ServesHost(r.Host) {
+			proxyHandler.ServeHTTP(w, r)
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 	})

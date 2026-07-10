@@ -246,6 +246,33 @@ func TestParseHost_MultiDomain(t *testing.T) {
 	}
 }
 
+// ServesHost backs the LB health-check gate, so it must accept exactly the
+// hosts ParseHost would route and reject everything else.
+func TestServesHost(t *testing.T) {
+	domains := []string{testDomain, "usw-sandbox.superserve.ai"}
+	h := NewHandler(domains, &stubResolver{}, zerolog.Nop())
+
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"boxd-abc123." + testDomain, true},
+		{"boxd-abc123.usw-sandbox.superserve.ai", true},
+		{"boxd-abc123.usw-sandbox.superserve.ai:443", true},
+		{testDomain, false}, // bare domain: shared-host form, not a subdomain
+		{"boxd-abc123.euw-sandbox.superserve.ai", false},
+		{"boxd-abc123." + testDomain + ".attacker.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			if got := h.ServesHost(tt.host); got != tt.want {
+				t.Errorf("ServesHost(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
 // Shared-host header routing works on any configured domain, not just the first.
 func TestParseRequest_MultiDomainSharedHost(t *testing.T) {
 	const sandboxID = "b150ee22-4956-4f5b-926a-f921ed8c37d6"

@@ -56,9 +56,9 @@ const (
 type Handler struct {
 	// domains are the accepted hostname suffixes, e.g.
 	// ["sandbox.superserve.ai", "usw-sandbox.superserve.ai"]. All entries
-	// are valid for routing; the first is canonical should the proxy ever
-	// need to construct a sandbox URL (today it only validates Hosts and
-	// echoes them back, so ordering has no runtime effect).
+	// are equivalent for validation — the proxy only checks whether a
+	// Host ends in one of them and echoes the Host back, it never picks
+	// one to construct a URL from.
 	domains      []string
 	resolver     Resolver
 	transports   *transportCache
@@ -129,6 +129,18 @@ func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handle
 		log:          log,
 	}
 	return h
+}
+
+// ServesHost reports whether host (with any :port stripped) is a subdomain
+// of one of the configured domains — the same check ParseHost applies.
+// Used by the LB health-check gate so its accept set can't drift from
+// routing's via a second hand-rolled copy.
+func (h *Handler) ServesHost(host string) bool {
+	hostname, _, err := net.SplitHostPort(host)
+	if err != nil {
+		hostname = host
+	}
+	return matchesDomain(hostname, h.domains)
 }
 
 // WithAnalytics enables data-plane usage events (exec/files).
