@@ -57,6 +57,10 @@ jobs:
           command -v curl
 
       - name: Terraform apply production/us-west2
+        env:
+          TF_VAR_sentry_dsn: ${{ secrets.SENTRY_DSN }}
+          TF_VAR_posthog_key: ${{ secrets.POSTHOG_KEY }}
+          TF_VAR_slack_quota_alert_webhook: ${{ secrets.SLACK_QUOTA_ALERT_WEBHOOK }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-west2" >> "$GITHUB_STEP_SUMMARY"
@@ -113,6 +117,10 @@ jobs:
           command -v curl
 
       - name: Terraform apply production/us-central1
+        env:
+          TF_VAR_sentry_dsn: ${{ secrets.SENTRY_DSN }}
+          TF_VAR_posthog_key: ${{ secrets.POSTHOG_KEY }}
+          TF_VAR_slack_quota_alert_webhook: ${{ secrets.SLACK_QUOTA_ALERT_WEBHOOK }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-central1" >> "$GITHUB_STEP_SUMMARY"

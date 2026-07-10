@@ -112,10 +112,18 @@ module "api" {
   image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   env = {
-    API_PORT          = "8080"
-    EDGE_PROXY_DOMAIN = "usc-sandbox.superserve.ai"
-    SUPABASE_URL      = var.supabase_url
-    VMD_GRPC_ADDRESS  = "10.0.0.3:50051"
+    ALLOW_EPHEMERAL_SEED      = var.allow_ephemeral_seed
+    API_PORT                  = "8080"
+    DB_MAX_CONNS              = tostring(var.db_max_conns)
+    EDGE_PROXY_DOMAIN         = "usc-sandbox.superserve.ai"
+    KMS_KEY_RESOURCE          = var.kms_key_resource
+    POSTHOG_KEY               = var.posthog_key
+    SECRETS_SIGNING_KEY_ID    = var.secrets_signing_key_id
+    SENTRY_DSN                = var.sentry_dsn
+    SLACK_QUOTA_ALERT_WEBHOOK = var.slack_quota_alert_webhook
+    SUPABASE_URL              = var.supabase_url
+    SYSTEM_TEAM_ID            = var.system_team_id
+    VMD_GRPC_ADDRESS          = "10.0.0.3:50051"
   }
 
   secrets = {

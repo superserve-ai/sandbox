@@ -88,6 +88,65 @@ variable "sentry_dsn_secret_name" {
   default     = null
 }
 
+# These five track live Cloud Run config that predates this Terraform env and
+# was previously only set by hand — Terraform's env map had never declared
+# them, so an apply here would have reconciled the service down to the map's
+# contents and deleted them.
+variable "kms_key_resource" {
+  description = "KMS CryptoKey resource used to wrap/unwrap stored credentials."
+  type        = string
+  default     = null
+}
+
+variable "secrets_signing_key_id" {
+  description = "Key ID/version label exposed to the app as SECRETS_SIGNING_KEY_ID, alongside the SECRETS_SIGNING_KEY secret."
+  type        = string
+  default     = null
+}
+
+variable "system_team_id" {
+  description = "UUID of this region's team that owns curated templates visible to every team."
+  type        = string
+  default     = null
+}
+
+variable "db_max_conns" {
+  description = "Max DB connections per API instance."
+  type        = number
+  default     = 12
+}
+
+variable "allow_ephemeral_seed" {
+  description = "Whether the API accepts an ephemeral SANDBOX_ACCESS_TOKEN_SEED (0/1)."
+  type        = string
+  default     = "0"
+}
+
+# Unlike the vars above, these three are credential material — no default,
+# not set in terraform.tfvars. Passed at apply time via -var from GitHub
+# Actions secrets (see terraform-rollout-production.yml) so they never touch
+# the repo in plaintext.
+variable "sentry_dsn" {
+  description = "Sentry DSN for the Cloud Run API service."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "posthog_key" {
+  description = "PostHog project API key for the Cloud Run API service."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "slack_quota_alert_webhook" {
+  description = "Slack webhook URL for quota alert notifications."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
 variable "create_network" {
   type    = bool
   default = false
