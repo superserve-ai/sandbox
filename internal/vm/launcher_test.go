@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -112,6 +113,18 @@ func TestFCStartScript_NoShellInjection(t *testing.T) {
 	if _, err := os.Stat(marker); err == nil {
 		_ = os.Remove(marker)
 		t.Fatal("SHELL INJECTION: embedded command substitution executed")
+	}
+}
+
+func TestIsMountpoint(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("isMountpoint reads /proc/self/mountinfo (linux only)")
+	}
+	if ok, err := isMountpoint("/"); err != nil || !ok {
+		t.Errorf(`isMountpoint("/") = %v, %v; want true, nil`, ok, err)
+	}
+	if ok, err := isMountpoint("/no/such/mount/xyz"); err != nil || ok {
+		t.Errorf(`isMountpoint("/no/such/mount/xyz") = %v, %v; want false, nil`, ok, err)
 	}
 }
 

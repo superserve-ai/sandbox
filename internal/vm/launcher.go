@@ -62,6 +62,7 @@ func (m *Manager) EnsureLauncherNamespace(ctx context.Context) error {
 	if !launcherNSValid(ctx, pinPath) {
 		return fmt.Errorf("launcher namespace %s built but still contains /run/netns (prune incomplete)", pinPath)
 	}
+	m.launcherBuilt.Store(true)
 	m.launcherReady.Store(true)
 	m.log.Info().Str("path", pinPath).Dur("took", time.Since(start)).
 		Msg("launcher namespace: built")
@@ -121,7 +122,15 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 // (bind-mounting it to itself first if it isn't already a mount point).
 // Idempotent: a dir that is already a private mount is left as-is.
 func ensurePrivateMount(ctx context.Context, dir string) error {
-	if exec.CommandContext(ctx, "mountpoint", "-q", dir).Run() != nil {
+	// Detect the existing self-bind by reading /proc/self/mountinfo directly,
+	// not via the `mountpoint` binary — it isn't in vmd's preflight tool set, so
+	// on a minimal image its absence would be misread as "not a mount point" and
+	// stack a fresh bind mount on every restart, growing the host mount table.
+	mounted, err := isMountpoint(dir)
+	if err != nil {
+		return fmt.Errorf("check mountpoint %s: %w", dir, err)
+	}
+	if !mounted {
 		if out, err := exec.CommandContext(ctx, "mount", "--bind", dir, dir).CombinedOutput(); err != nil {
 			return fmt.Errorf("bind %s: %v: %s", dir, err, strings.TrimSpace(string(out)))
 		}
@@ -130,6 +139,23 @@ func ensurePrivateMount(ctx context.Context, dir string) error {
 		return fmt.Errorf("make-private %s: %v: %s", dir, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// isMountpoint reports whether path is a mount point by scanning
+// /proc/self/mountinfo, whose 5th field is the mount point. ponytail: compares
+// the field raw — fine for the fixed internal pin dir (/run/vmd, no spaces); a
+// path with spaces would arrive octal-escaped (\040) and need unescaping.
+func isMountpoint(path string) (bool, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if f := strings.Fields(line); len(f) >= 5 && f[4] == path {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // StartMountCountSampler periodically logs the host mount-table size so the
@@ -157,8 +183,13 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 // revalidateLauncher keeps launcherReady in sync with the live pin. The startup
 // check is a point-in-time snapshot; if the pin is later unmounted/deleted while
 // vmd runs, every launch would keep building nsenter --mount=<stale-path> and
-// fail. Re-check each tick: drop to the legacy path if the pin went bad, resume
-// the launcher path if it's valid again. No-op when launcher mode is disabled.
+// fail. Re-check each tick: drop to the legacy path if the pin went bad, and
+// resume ONLY the pin this boot built (launcherBuilt) if a transient check blip
+// cleared. A pin that merely looks valid again — e.g. a previous-boot pin left
+// mounted after this boot's rebuild failed — must not re-enable the launcher
+// path: it can be missing launch-critical mounts that rebuild-on-boot exists to
+// pick up. Recovery from a failed boot build is a vmd restart. No-op when
+// launcher mode is disabled.
 func (m *Manager) revalidateLauncher(ctx context.Context) {
 	pin := m.launcherNSPath()
 	if pin == "" {
@@ -169,7 +200,7 @@ func (m *Manager) revalidateLauncher(ctx context.Context) {
 	case !valid && m.launcherReady.Load():
 		m.launcherReady.Store(false)
 		m.log.Error().Str("path", pin).Msg("launcher pin no longer valid — falling back to legacy launch path")
-	case valid && !m.launcherReady.Load():
+	case valid && m.launcherBuilt.Load() && !m.launcherReady.Load():
 		m.launcherReady.Store(true)
 		m.log.Info().Str("path", pin).Msg("launcher pin valid again — resuming launcher launch path")
 	}

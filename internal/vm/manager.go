@@ -214,6 +214,11 @@ type Manager struct {
 	// legacy path. Set when the namespace is built/validated; kept in sync by
 	// revalidateLauncher.
 	launcherReady atomic.Bool
+	// launcherBuilt is true only after EnsureLauncherNamespace built and pinned
+	// the launcher THIS boot. revalidateLauncher requires it before re-enabling
+	// launcherReady, so a stale pin left mounted from a previous boot (whose
+	// rebuild failed) can never resurrect the launcher path.
+	launcherBuilt atomic.Bool
 
 	mu  sync.RWMutex
 	vms map[string]*VMInstance
