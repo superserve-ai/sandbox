@@ -82,6 +82,12 @@ variable "secrets_signing_key_secret_name" {
   default     = null
 }
 
+variable "sentry_dsn_secret_name" {
+  description = "Secret Manager secret name for SENTRY_DSN."
+  type        = string
+  default     = null
+}
+
 variable "create_network" {
   type    = bool
   default = false

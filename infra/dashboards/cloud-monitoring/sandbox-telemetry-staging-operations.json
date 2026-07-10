@@ -1,0 +1,294 @@
+{
+  "displayName": "Sandbox Telemetry / Staging Operations",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "xPos": 0,
+        "yPos": 0,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Pool Pressure",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max(db_pool_acquired_conns{environment=\"staging\"} / clamp_min(db_pool_total_conns{environment=\"staging\"}, 1))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "acquired / total",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "ratio",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 0,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Acquire Latency Avg",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "rate(db_pool_acquire_duration_seconds_total{environment=\"staging\"}[5m]) / clamp_min(rate(db_pool_acquire_total{environment=\"staging\"}[5m]), 1)"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "avg wait",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "seconds",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Sandbox Lifecycle Outcomes",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (operation, result) (rate(sandbox_transition_total{environment=\"staging\"}[5m]))"
+                },
+                "plotType": "STACKED_BAR",
+                "legendTemplate": "{{operation}} {{result}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "ops/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Sandbox Lifecycle p95 Latency",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, operation) (rate(sandbox_transition_duration_seconds_bucket{environment=\"staging\"}[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{operation}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "seconds",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "VMD Error Rate by Host",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (host_id, method) (rate(vmd_call_total{environment=\"staging\",result=\"error\"}[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{host_id}} {{method}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "errors/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "VMD p95 Latency by Host",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, host_id, method) (rate(vmd_call_duration_seconds_bucket{environment=\"staging\"}[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{host_id}} {{method}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "seconds",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 12,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "Used vCPU",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (host_id) (host_capacity_used_vcpu{environment=\"staging\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{host_id}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "vCPU",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 4,
+        "yPos": 12,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "Used Memory",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (host_id) (host_capacity_used_memory_mib{environment=\"staging\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{host_id}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "MiB",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 8,
+        "yPos": 12,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "Running Sandboxes",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (host_id) (host_capacity_running_sandboxes{environment=\"staging\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "{{host_id}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "sandboxes",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 16,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Sandbox Create Rate",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum(rate(sandbox_transition_total{environment=\"staging\",operation=\"create\",result=\"success\"}[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "create success",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "creates/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 16,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Possible Abuse Signals",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (result) (rate(sandbox_transition_total{environment=\"staging\",operation=\"create\",result=~\"conflict|error|timeout\"}[5m]))"
+                },
+                "plotType": "STACKED_BAR",
+                "legendTemplate": "{{result}}",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "events/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

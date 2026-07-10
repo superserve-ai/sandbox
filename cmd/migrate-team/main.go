@@ -23,9 +23,19 @@
 //	              billing usage sums, artifact path completeness, member
 //	              profile presence, and role-assignment resolution. Exits
 //	              non-zero with a report on any mismatch.
-//	decommission  deletes the team's rows from the SOURCE in reverse FK order.
-//	              Requires --confirm-team-name to match the team's exact name,
-//	              and runs validate internally first — any mismatch aborts.
+//	detach        deletes ONLY the team's membership rows from the SOURCE —
+//	              user_role_assignments (team-scoped), team_memberships, and
+//	              team_member — in one transaction, after running validate
+//	              internally. With the RBAC chain gone no console or API path
+//	              reaches the source copy, so the team has exactly one live
+//	              home; everything else stays as a cold fallback for the soak
+//	              period. Requires --confirm-team-name. Reversible: re-insert
+//	              the membership rows, or run the tool in reverse.
+//	purge         deletes the team's rows from the SOURCE in reverse FK order,
+//	              run after the post-detach soak. Requires --confirm-team-name
+//	              to match the team's exact name, and runs validate internally
+//	              first — any mismatch aborts. (--phase decommission is a
+//	              deprecated alias.)
 //
 // Deliberately out of scope:
 //   - Artifact files on hosts (template rootfs/snapshots, sandbox snapshots)
@@ -64,8 +74,8 @@ func main() {
 	flag.StringVar(&cfg.destURL, "dest-db", os.Getenv("DEST_DATABASE_URL"), "dest cell Postgres URL (defaults to DEST_DATABASE_URL)")
 	flag.StringVar(&cfg.destHostID, "dest-host-id", "", "host row id in the dest cell (e.g. usw2); required for copy")
 	flag.StringVar(&cfg.destRegion, "dest-region", "", "dest region token (e.g. usw); required for copy")
-	flag.StringVar(&cfg.phase, "phase", phasePlan, "plan | copy | validate | decommission | release-rollups")
-	flag.StringVar(&confirmTeamName, "confirm-team-name", "", "exact team name; required for decommission")
+	flag.StringVar(&cfg.phase, "phase", phasePlan, "plan | copy | validate | detach | purge | release-rollups (decommission is a deprecated alias for purge)")
+	flag.StringVar(&confirmTeamName, "confirm-team-name", "", "exact team name; required for detach and purge")
 	flag.StringVar(&cfg.pathsOut, "paths-out", "", "file to write the artifact directory list to, one dir per line (plan/validate)")
 	flag.Parse()
 
@@ -79,28 +89,33 @@ func main() {
 	cfg.teamID = teamID
 	cfg.confirmTeamName = confirmTeamName
 
+	if cfg.phase == phaseDecommission {
+		log.Warn().Msg("--phase decommission is deprecated; running purge (the membership-only cutover step is --phase detach)")
+		cfg.phase = phasePurge
+	}
+
 	if cfg.sourceURL == "" {
 		log.Fatal().Msg("--source-db (or SOURCE_DATABASE_URL) is required")
 	}
 	switch cfg.phase {
 	case phasePlan:
 		// Read-only; dest is optional.
-	case phaseCopy, phaseValidate, phaseDecommission, phaseReleaseRollups:
+	case phaseCopy, phaseValidate, phaseDetach, phasePurge, phaseReleaseRollups:
 		if cfg.destURL == "" {
 			log.Fatal().Msg("--dest-db (or DEST_DATABASE_URL) is required for " + cfg.phase)
 		}
 	default:
-		log.Fatal().Str("phase", cfg.phase).Msg("unknown phase; want plan | copy | validate | decommission")
+		log.Fatal().Str("phase", cfg.phase).Msg("unknown phase; want plan | copy | validate | detach | purge | release-rollups")
 	}
-	// copy rewrites rows with these values; validate and decommission apply
+	// copy rewrites rows with these values; validate, detach, and purge apply
 	// the same transforms when checksumming the source, so running them
 	// without the flags would compare against empty rewrites and report
 	// false drift on every team and sandbox row.
 	if cfg.phase != phasePlan && cfg.phase != phaseReleaseRollups && (cfg.destHostID == "" || cfg.destRegion == "") {
 		log.Fatal().Msg("--dest-host-id and --dest-region are required for " + cfg.phase)
 	}
-	if cfg.phase == phaseDecommission && cfg.confirmTeamName == "" {
-		log.Fatal().Msg("--confirm-team-name is required for decommission")
+	if (cfg.phase == phaseDetach || cfg.phase == phasePurge) && cfg.confirmTeamName == "" {
+		log.Fatal().Msg("--confirm-team-name is required for " + cfg.phase)
 	}
 
 	if err := run(context.Background(), cfg); err != nil {

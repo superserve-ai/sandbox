@@ -36,6 +36,12 @@ type Pool struct {
 	recycled chan *preallocSlot // returned from destroyed sandboxes
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+
+	// verifyPollInterval/verifyMaxWait tune Return's pre-recycle liveness
+	// check (see verifyAndRecycle). Zero means use the package defaults;
+	// tests override these to run the timeout path without a real 20s wait.
+	verifyPollInterval time.Duration
+	verifyMaxWait      time.Duration
 }
 
 // preallocSlot holds a fully configured network namespace ready to be
@@ -46,6 +52,24 @@ type preallocSlot struct {
 	// vethName is needed for cleanup if the slot is never claimed.
 	vethName string
 }
+
+// pidsInNsFunc is a seam over pidsInNs so tests can simulate a namespace
+// that's still occupied (or clear) without a real kernel netns/process.
+var pidsInNsFunc = pidsInNs
+
+const (
+	// defaultVerifyPollInterval trades a small amount of slot-reuse latency
+	// (negligible against the 10s+ stop window it's guarding) for meaningfully
+	// less /proc scanning: each poll is a full readdir + per-pid stat, and the
+	// case that makes verification take a while — host I/O contention slowing
+	// process teardown — is exactly the case where many verifiers end up
+	// polling concurrently, adding VFS load to an already-contended host.
+	defaultVerifyPollInterval = 150 * time.Millisecond
+	// defaultVerifyMaxWait comfortably exceeds firecracker@.service's
+	// TimeoutStopSec=10 (systemd's own worst case for a unit that ignores
+	// SIGTERM) plus margin for kernel teardown under host I/O contention.
+	defaultVerifyMaxWait = 20 * time.Second
+)
 
 // StartPool creates the network slot pool and fills it in the background, so
 // startup (and the gRPC readiness gate) doesn't block on ~newSize slot setups;
@@ -131,20 +155,84 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 	}
 }
 
-// Return puts a slot back into the recycled pool after a sandbox is
-// destroyed. The network namespace, veth, TAP, and nftables stay
-// configured — the next Claim reuses them with zero setup cost.
-// If the recycled pool is full, the slot is torn down instead.
+// Return reclaims a sandbox's network slot after destroy. The previous
+// occupant's process being gone from vmd's/systemd's point of view (SIGKILL
+// sent, unit reported inactive, etc.) is not proof the kernel has finished
+// releasing its TAP fd — SIGKILL is asynchronous with respect to a process
+// blocked in an uninterruptible wait (e.g. a UFFD page fault resolving
+// against local SSD), and "systemd unit not active" also covers "still
+// deactivating." Handing the slot straight to a new VM on that basis is what
+// produced the "Open tap device failed: Device or resource busy" incident:
+// the new VM's Firecracker raced the old one's still-open tap0 fd.
+//
+// So Return doesn't decide fast vs. full teardown itself — it verifies. The
+// slot stays owned by the pool (not claimable — Claim only ever reads from
+// p.recycled) while verifyAndRecycle confirms the namespace is actually
+// empty of processes, off the caller's hot path.
 func (p *Pool) Return(slot *preallocSlot) {
-	// Transfer ownership back to the pool under the lock BEFORE handing the slot
-	// off: a concurrent Claim that pops it can't be clobbered by a late poolOwner
-	// write, and the recycle-full cleanup below releases poolOwner, not a leak.
 	p.mgr.mu.Lock()
 	p.mgr.assignSlotLocked(slot.idx, poolOwner)
 	p.mgr.mu.Unlock()
 
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer sentrylog.Recover("netpool-verify-return")
+		p.verifyAndRecycle(slot)
+	}()
+}
+
+// verifyAndRecycle blocks (in its own goroutine, never the caller's) until
+// slot's namespace has no attached processes, then makes it claimable. It
+// re-kills defensively first — this is also the backstop for the DestroyVM
+// paths that skip or race their own kill (an untracked VM after a vmd
+// restart, or a reconciler markStale that never sent a signal at all).
+//
+// A namespace still occupied after verifyMaxWait isn't a slow teardown, it's
+// stuck — recycling it would poison the pool, so it's torn down for real
+// instead of being handed to the next VM.
+func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
+	pollInterval := p.verifyPollInterval
+	if pollInterval <= 0 {
+		pollInterval = defaultVerifyPollInterval
+	}
+	maxWait := p.verifyMaxWait
+	if maxWait <= 0 {
+		maxWait = defaultVerifyMaxWait
+	}
+	ns := slot.info.Namespace
+
+	killProcessesInNs(ns)
+
+	deadline := time.Now().Add(maxWait)
+	for {
+		pids, ok := pidsInNsFunc(ns)
+		// A failed scan (ok=false) is "don't know," not "clear" — keep
+		// polling rather than risk recycling a namespace that's still held.
+		if ok && len(pids) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			p.log.Error().Str("namespace", ns).Int("slot", slot.idx).
+				Msg("pool: namespace still occupied after max wait — tearing down instead of recycling")
+			p.cleanup(slot)
+			return
+		}
+		select {
+		case <-time.After(pollInterval):
+		case <-p.stopCh:
+			p.cleanup(slot)
+			return
+		}
+	}
+
 	select {
 	case p.recycled <- slot:
+	case <-p.stopCh:
+		// Stop() closes p.recycled only after p.wg.Wait() returns, and this
+		// goroutine holds a wg slot until it returns — so stopCh firing here
+		// (pool shutting down mid-verify) can't race a send on a closed channel.
+		p.cleanup(slot)
 	default:
 		// Recycle pool full — tear down (cleanup releases the pool's ownership).
 		p.cleanup(slot)

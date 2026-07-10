@@ -36,6 +36,9 @@ func TestSafeMethodBoundsValues(t *testing.T) {
 	if got := safeMethod("https://raw-url.example/vm/123"); got != "unknown" {
 		t.Fatalf("unexpected fallback method: %q", got)
 	}
+	if got := safeMethod("RestoreSnapshot"); got != "CreateVM" {
+		t.Fatalf("safeMethod(%q) = %q", "RestoreSnapshot", got)
+	}
 }
 
 func TestDeltasNeverNegative(t *testing.T) {

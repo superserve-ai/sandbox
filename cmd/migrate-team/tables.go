@@ -1,7 +1,7 @@
 package main
 
 // The team's dataset, in FK dependency order. copy walks this list forward;
-// decommission walks it backward (profiles excluded — they are global and may
+// purge walks it backward (profiles excluded — they are global and may
 // belong to other teams).
 //
 // Scope conditions take the team id as $1 and must be valid in both a SELECT
@@ -33,7 +33,7 @@ type tableSpec struct {
 	scope string
 }
 
-// copyScopes narrows what copy and validation see for a table; decommission
+// copyScopes narrows what copy and validation see for a table; purge
 // still deletes by the full scope. Used to carve rows out of the generic
 // pipeline that the tool manages explicitly: the rollup-hold flag row must
 // not be copied, or an explicit TRUE from the source would overwrite the
@@ -49,6 +49,15 @@ func (t tableSpec) effectiveCopyScope() string {
 		return s
 	}
 	return t.scope
+}
+
+// membershipTables are the team's RBAC chain — the rows detach deletes so
+// the source copy stays unreachable through the console and API while the
+// rest of the dataset waits out the soak period as a cold fallback.
+var membershipTables = map[string]bool{
+	"team_member":           true,
+	"team_memberships":      true,
+	"user_role_assignments": true,
 }
 
 var migratedTables = []tableSpec{

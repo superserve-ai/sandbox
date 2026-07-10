@@ -143,7 +143,7 @@ type ManagerConfig struct {
 	HostInterface      string // Host network interface (e.g. "ens4").
 	// MaxConcurrentRestores caps parallel RestoreVMSnapshot operations to
 	// prevent a spike of concurrent sandbox creates from saturating host
-	// file I/O, netns setup, and Firecracker boots. 0 → default 100.
+	// file I/O, netns setup, and Firecracker boots. 0 → default 500.
 	MaxConcurrentRestores int
 
 	// UffdEnabled gates the UFFD lazy-restore path. false → fresh
@@ -220,7 +220,7 @@ type Manager struct {
 func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) (*Manager, error) {
 	maxRestores := cfg.MaxConcurrentRestores
 	if maxRestores <= 0 {
-		maxRestores = 100
+		maxRestores = 500
 	}
 	// Magic mount target — every per-VM start script mounts tmpfs over it.
 	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
@@ -1266,6 +1266,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
+	// Failure cleanup must not delete an overlay this attempt didn't create:
+	// see cleanupRunDirKeepOverlay.
+	cleanupAfterRestoreFailure := func() {
+		if plan.action == restoreReuseOverlay {
+			m.cleanupRunDirKeepOverlay(vmID)
+		} else {
+			m.cleanupRunDir(vmID)
+		}
+	}
 	var diskPath string
 	var diskErr error
 	switch plan.action {
@@ -1302,7 +1311,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if tapDevice == "" {
 		netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, netCfg)
 		if netErr != nil {
-			m.cleanupRunDir(vmID)
+			cleanupAfterRestoreFailure()
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("setup network: %w", netErr)
 		}
@@ -1337,7 +1346,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
-		m.cleanupRunDir(vmID)
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("start firecracker: %w", startErr)
 	}
@@ -1431,7 +1440,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
-		m.cleanupRunDir(vmID)
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		// armLayered may have set DirtyTracked=true on inst before the restore call;
 		// clear it on failure so a lingering instance can't later take a Diff against a
@@ -1457,12 +1466,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	tBoxdStart := time.Now()
-	if err := m.waitForBoxd(ctx, hostIP, 5*time.Second); err != nil {
+	// Same window as first boot: a restore that has to fault its memory and
+	// overlay from cold storage (first resume of a migrated VM, page cache
+	// evicted) legitimately needs more than a warm same-host resume, and a
+	// timeout here is destructive — the error path below tears down the VM.
+	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
-		m.cleanupRunDir(vmID)
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
@@ -2095,6 +2108,35 @@ func (m *Manager) cleanupRunDir(dirName string) {
 	vmDir := filepath.Join(m.cfg.RunDir, dirName)
 	if err := os.RemoveAll(vmDir); err != nil {
 		m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to remove rundir")
+	}
+}
+
+// cleanupRunDirKeepOverlay removes the VM's rundir contents except
+// overlay.ext4. Restore failures use it when the overlay pre-existed the
+// attempt (restoreReuseOverlay): the overlay is the sandbox's persistent
+// disk — for a VM whose artifacts were placed on this host by a migration,
+// it may be the only local copy — and deleting it turns a transient restore
+// failure (network claim, timeout) into data loss that poisons every retry.
+func (m *Manager) cleanupRunDirKeepOverlay(dirName string) {
+	if !isLeafName(dirName) || isReservedRunDirName(dirName) {
+		m.log.Error().Str("dir", dirName).Msg("refusing to clean unsafe or reserved rundir name")
+		return
+	}
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	entries, err := os.ReadDir(vmDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Str("dir", dirName).Msg("failed to read rundir for selective cleanup")
+		}
+		return
+	}
+	for _, e := range entries {
+		if e.Name() == "overlay.ext4" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(vmDir, e.Name())); err != nil {
+			m.log.Warn().Err(err).Str("dir", dirName).Str("entry", e.Name()).Msg("failed to remove rundir entry")
+		}
 	}
 }
 

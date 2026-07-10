@@ -69,6 +69,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/secrets/:name/audit", h.GetSecretAudit)
 		api.GET("/secrets/:name/sandboxes", h.GetSecretSandboxes)
 
+		// Team-wide audit log backing the console Audit Logs page.
+		// Paginated + filterable. Unlike the bounded sandbox/template lists,
+		// the activity table is unbounded, so an omitted `limit` returns only
+		// the most recent page (capped at maxPageSize), not the full history.
+		api.GET("/activity", h.ListActivity)
+
 		api.GET("/providers", h.ListProviders)
 
 		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)

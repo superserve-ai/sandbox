@@ -1,5 +1,13 @@
 # observability
 
-Terraform skeleton for logging, alerting, uptime checks, and dashboards.
+Terraform support for shared observability resources.
 
-No observability resources were explicitly inventoried in this snapshot, so this module is a forward-looking placeholder.
+Current scope:
+
+- Cloud Monitoring dashboards from checked-in JSON definitions
+
+Still intentionally out of scope here:
+
+- log buckets
+- alert policies
+- uptime checks

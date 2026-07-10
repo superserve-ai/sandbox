@@ -17,6 +17,8 @@ resource "google_project_iam_member" "project_bindings" {
   project = var.project_id
   role    = each.value.role
   member  = one(each.value.members)
+
+  depends_on = [google_service_account.service_accounts]
 }
 
 resource "google_service_account_iam_member" "service_bindings" {

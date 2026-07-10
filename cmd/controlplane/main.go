@@ -105,16 +105,18 @@ func run() error {
 			ExportInterval: cfg.OTelExportInterval,
 		})
 		if err != nil {
-			return fmt.Errorf("init otel metrics: %w", err)
+			log.Warn().Err(err).Msg("otel metrics init failed; continuing with noop recorder")
+		} else {
+			recorder = otelRecorder
+			defer func() {
+				flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer flushCancel()
+				if err := otelRecorder.Shutdown(flushCtx); err != nil {
+					log.Warn().Err(err).Msg("otel metrics shutdown failed")
+				}
+			}()
+			log.Info().Str("endpoint", cfg.OTelEndpoint).Dur("interval", cfg.OTelExportInterval).Msg("otel metrics initialized")
 		}
-		recorder = otelRecorder
-		defer func() {
-			flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer flushCancel()
-			if err := otelRecorder.Shutdown(flushCtx); err != nil {
-				log.Warn().Err(err).Msg("otel metrics shutdown failed")
-			}
-		}()
 		log.Info().Str("endpoint", cfg.OTelEndpoint).Dur("interval", cfg.OTelExportInterval).Msg("otel metrics initialized")
 	}
 	api.SetTelemetryRecorder(recorder)

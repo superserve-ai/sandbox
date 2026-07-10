@@ -353,7 +353,7 @@ func main() {
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
-	maxRestores, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_RESTORES", "100"))
+	maxRestores, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_RESTORES", "500"))
 	uffdEnabled := envOrDefault("VMD_UFFD_ENABLED", "true") != "false"
 	uffdPrefetchEnabled := envOrDefault("VMD_UFFD_PREFETCH_ENABLED", "true") != "false"
 	uffdRecordMaxSeconds, _ := strconv.Atoi(envOrDefault("VMD_UFFD_RECORD_MAX_SECONDS", "10"))
@@ -437,7 +437,11 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Int("port", cfg.GRPCPort).Msg("failed to listen")
 	}
+	// Set explicitly, else gRPC clients self-cap at 100 streams/conn
+	// (defaultMaxStreamsClient) because the server advertises no limit by default.
+	maxStreams, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_STREAMS", "2000"))
 	grpcServer := grpc.NewServer(
+		grpc.MaxConcurrentStreams(uint32(maxStreams)),
 		grpc.MaxRecvMsgSize(64<<20), // 64 MiB
 		grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			if !startupReady.Load() {
@@ -482,9 +486,11 @@ func main() {
 	// Warm buffer of network namespaces so creation claims off the hot path.
 	// StartPool returns immediately and fills in the background, so the gate
 	// below isn't held for the fill; creates fall back to on-demand until warm.
-	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "128"))
+	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
+	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize: netPoolFresh,
+		NewSize:     netPoolFresh,
+		RecycleSize: netPoolRecycle,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 
