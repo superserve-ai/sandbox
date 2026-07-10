@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/shellquote"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -183,6 +185,17 @@ type ManagerConfig struct {
 	// page fault). The dead VM then surfaces via the unit-inactive → reconciler path
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
+
+	// LaunchViaLauncherNS routes the Firecracker launch through a long-lived,
+	// pruned "launcher" mount namespace (pinned at LauncherNSPath); see
+	// fcStartScript for the mechanism. Keeps per-VM launch cost independent of
+	// fleet size. Default false; the legacy `ip netns exec` path is the fallback.
+	LaunchViaLauncherNS bool
+
+	// LauncherNSPath is where the launcher mount namespace is pinned (persisted
+	// via `unshare --mount`). Only used when LaunchViaLauncherNS is true.
+	// Empty → defaultLauncherNSPath.
+	LauncherNSPath string
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +209,15 @@ type Manager struct {
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
+
+	// launcherReady gates the launcher launch path: false → launches use the
+	// legacy path. Set when the namespace is built/validated; kept in sync by
+	// revalidateLauncher.
+	launcherReady atomic.Bool
+	// launcherBuilt is true only after a successful build THIS boot; gates
+	// revalidateLauncher's re-enable so a stale previous-boot pin can't resurrect
+	// the launcher path.
+	launcherBuilt atomic.Bool
 
 	mu  sync.RWMutex
 	vms map[string]*VMInstance
@@ -2313,6 +2335,64 @@ func (m *Manager) startFirecrackerColdBoot(ctx context.Context, vmID, socketPath
 	return pid, nil
 }
 
+// defaultLauncherNSPath is where the pruned launcher mount namespace is pinned
+// when LaunchViaLauncherNS is enabled without an explicit LauncherNSPath.
+const defaultLauncherNSPath = "/run/vmd/launcher.mntns"
+
+// launcherNSPath returns the launcher mount-namespace pin path when the
+// launcher launch mode is enabled, or "" to select the legacy launch path.
+func (m *Manager) launcherNSPath() string {
+	if !m.cfg.LaunchViaLauncherNS {
+		return ""
+	}
+	if m.cfg.LauncherNSPath != "" {
+		return m.cfg.LauncherNSPath
+	}
+	return defaultLauncherNSPath
+}
+
+// fcSetupCmds builds the rootfs-setup portion of the launch script — mount the
+// per-VM tmpfs and symlink the rootfs into it. Caller-influenced paths
+// (basePath, perVMRootfs) are single-quoted so they can't inject shell.
+func fcSetupCmds(templateDir, basePath, perVMRootfs string) string {
+	if basePath != "" {
+		baseLink := filepath.Join(templateDir, "base.ext4")
+		overlayLink := filepath.Join(templateDir, "overlay.ext4")
+		return fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %s && ln -s %s %s && ln -s %s %s",
+			shellquote.Single(templateDir), shellquote.Single(basePath), shellquote.Single(baseLink),
+			shellquote.Single(perVMRootfs), shellquote.Single(overlayLink))
+	}
+	rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
+	return fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %s && ln -s %s %s",
+		shellquote.Single(templateDir), shellquote.Single(perVMRootfs), shellquote.Single(rootfsLink))
+}
+
+// fcStartScript renders the per-VM start.sh that systemd's ExecStart runs.
+//
+// launcherNSPath == "" → legacy: `ip netns exec <ns> unshare -m …`.
+// launcherNSPath != "" → launcher: `nsenter --net=<ns> --mount=<pin> -- unshare
+// -m …`, so the per-VM clone copies the launcher's small table, not the full host
+// table. nsenter opens both fds from the host mount view before setns, so the
+// netns resolves even though the launcher has /run/netns pruned — which is why
+// `ip netns exec` (resolves the netns from inside the mount ns) can't be used.
+func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID string) string {
+	prefix := fmt.Sprintf("ip netns exec %s", netNS)
+	sysfs := ""
+	if launcherNSPath != "" {
+		prefix = fmt.Sprintf("nsenter --net=/run/netns/%s --mount=%s --", netNS, shellquote.Single(launcherNSPath))
+		// nsenter, unlike `ip netns exec`, doesn't remount /sys, so /sys/class/net
+		// would show the host's interfaces, not the VM's tap. Remount a netns-aware
+		// sysfs inside the per-VM ns (after make-rprivate, so it can't reach the host).
+		sysfs = " && mount -t sysfs sysfs /sys"
+	}
+	// Each value is single-quoted, then the whole inner script is single-quoted as
+	// the `sh -c` arg — two shellquote.Single layers, so a caller-influenced path
+	// (base_path, perVMRootfs) can't close a quote and inject shell as root.
+	inner := fmt.Sprintf("%s%s && exec %s --api-sock %s --id %s",
+		setupCmds, sysfs, shellquote.Single(fcBin), shellquote.Single(socketPath), shellquote.Single(vmID))
+	return fmt.Sprintf("#!/bin/sh\nexec %s unshare -m -- sh -c %s\n", prefix, shellquote.Single(inner))
+}
+
 // startFirecrackerViaSystemd writes the start script and launches Firecracker
 // as a standalone systemd unit. The VM survives VMD restarts because systemd
 // owns the process, not VMD. Non-empty basePath switches the start script to
@@ -2325,21 +2405,24 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	templateDir := m.templateRunDir()
 
-	var setupCmds string
-	if basePath != "" {
-		baseLink := filepath.Join(templateDir, "base.ext4")
-		overlayLink := filepath.Join(templateDir, "overlay.ext4")
-		setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q",
-			templateDir, basePath, baseLink, perVMRootfs, overlayLink)
-	} else {
-		rootfsLink := filepath.Join(templateDir, "rootfs.ext4")
-		setupCmds = fmt.Sprintf("mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q",
-			templateDir, perVMRootfs, rootfsLink)
-	}
+	setupCmds := fcSetupCmds(templateDir, basePath, perVMRootfs)
 
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	scriptContent := fmt.Sprintf("#!/bin/sh\nexec ip netns exec %s unshare -m -- sh -c '%s && exec %q --api-sock %q --id %q'\n",
-		netNS, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
+	// Re-check the pin here, not just launcherReady: a pin unmounted since the
+	// last revalidation tick would otherwise bake a dead nsenter --mount into
+	// start.sh and hard-fail. pinIsMounted is one statfs — no fork on the hot
+	// path, no transient exec failure under burst load. On failure fall back to
+	// legacy for THIS launch only; launcherReady stays with the sampler, so one
+	// blip can't knock the whole fleet onto the O(fleet) legacy path for a tick.
+	launcherPath := ""
+	if m.launcherReady.Load() {
+		if pin := m.launcherNSPath(); pinIsMounted(pin) {
+			launcherPath = pin
+		} else {
+			m.log.Warn().Str("path", pin).Msg("launcher pin not mounted at launch — using legacy path for this launch")
+		}
+	}
+	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
 		return 0, fmt.Errorf("write start script: %w", err)
 	}

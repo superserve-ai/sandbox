@@ -361,6 +361,7 @@ func main() {
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
+	launchViaLauncherNS := envOrDefault("VMD_LAUNCH_VIA_LAUNCHER_NS", "false") == "true"
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:             cfg.FirecrackerBin,
@@ -380,6 +381,8 @@ func main() {
 		VerifySnapshotEnabled:      verifySnapshotEnabled,
 		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
 		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
+		LaunchViaLauncherNS:        launchViaLauncherNS,
+		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -481,6 +484,21 @@ func main() {
 	// below; VMs it hasn't reached are loaded on-demand on first request.
 	mgr.ReserveStartupSlots(ctx)
 	mgr.SweepStartupOrphanNamespaces()
+
+	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
+	if launchViaLauncherNS {
+		// Build the pruned launcher mount namespace in the background: the prune is
+		// O(fleet) (up to launcherBuildTimeout), and launches fall back to legacy
+		// until the pin is ready, so boot and the warm pool aren't held behind it.
+		go func() {
+			defer sentrylog.Recover("launcher namespace build")
+			if err := mgr.EnsureLauncherNamespace(ctx); err != nil {
+				log.Error().Err(err).Msg("launcher namespace unavailable — using legacy launch path")
+			}
+		}()
+		// Periodically log the host mount-table size + revalidate the pin.
+		mgr.StartMountCountSampler(ctx, time.Minute)
+	}
 
 	// ---- Pre-allocate network slots ----
 	// Warm buffer of network namespaces so creation claims off the hot path.
