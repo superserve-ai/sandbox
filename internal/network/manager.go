@@ -850,19 +850,38 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 }
 
 // killProcessesInNs SIGKILLs every process whose net namespace matches
-// /run/netns/<name>. Returns the number of pids signalled.
+// /run/netns/<name>. Returns the number of pids signalled. Best-effort: a
+// failed /proc scan (see pidsInNs) just means nothing gets killed this pass.
 func killProcessesInNs(name string) int {
+	pids, _ := pidsInNs(name)
+	killed := 0
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			killed++
+		}
+	}
+	return killed
+}
+
+// pidsInNs returns the PIDs whose net namespace matches /run/netns/<name>,
+// found by comparing /proc/<pid>/ns/net's inode against the namespace file's.
+// ok is false only when the /proc scan itself failed (e.g. transient
+// resource pressure) — a genuine "don't know" that callers must not treat as
+// "clear" the way an actually-empty scan is; conflating the two would let a
+// still-occupied namespace be recycled, reintroducing the exact race this
+// guards against. A namespace file that no longer exists can't have
+// anything attached to it, so that case is a confident (nil, true).
+func pidsInNs(name string) (pids []int, ok bool) {
 	nsPath := netnsDir + "/" + name
 	nsStat, err := os.Stat(nsPath)
 	if err != nil {
-		return 0
+		return nil, true
 	}
 	nsIno := nsStat.Sys().(*syscall.Stat_t).Ino
 	procs, err := os.ReadDir("/proc")
 	if err != nil {
-		return 0
+		return nil, false
 	}
-	killed := 0
 	for _, e := range procs {
 		if !e.IsDir() {
 			continue
@@ -878,11 +897,9 @@ func killProcessesInNs(name string) int {
 		if procNsStat.Sys().(*syscall.Stat_t).Ino != nsIno {
 			continue
 		}
-		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
-			killed++
-		}
+		pids = append(pids, pid)
 	}
-	return killed
+	return pids, true
 }
 
 // listHostVeths returns all veth-N interfaces visible in the host namespace.
