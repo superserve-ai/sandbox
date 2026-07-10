@@ -114,10 +114,10 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		return nil, fmt.Errorf("marshal spec: %w", err)
 	}
 
-	// Reserve a slot from vmd's authoritative allocator so the subprocess's
+	// Claim a slot from vmd's authoritative allocator so the subprocess's
 	// ns-<idx>/veth-<idx> can't collide with a sandbox slot, and release it (with
 	// any kernel residue) when the build exits — success, failure, or panic.
-	slotIndex, err := m.netMgr.ReserveSlot(buildVMID)
+	slotIndex, err := m.netMgr.ClaimFreshSlot(buildVMID)
 	if err != nil {
 		return nil, fmt.Errorf("reserve build network slot: %w", err)
 	}

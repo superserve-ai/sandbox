@@ -763,21 +763,38 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	return true
 }
 
-// ReserveSlot claims a fresh, unused slot index under owner without building any
-// kernel network state. The caller — a template-builder subprocess — creates
-// ns-<idx>/veth-<idx> itself; the reservation is what stops vmd's sandbox
-// allocator from handing the same index to a VM, so builds and sandboxes draw
-// from one authoritative allocator instead of racing disjoint ranges. Pair every
-// ReserveSlot with a ReleaseSlot.
-func (m *Manager) ReserveSlot(owner string) (int, error) {
+// ClaimFreshSlot claims a fresh, unused slot index under owner without building
+// any kernel network state. The caller — a template-builder subprocess —
+// creates ns-<idx>/veth-<idx> itself; the reservation is what stops vmd's
+// sandbox allocator from handing the same index to a VM, so builds and
+// sandboxes draw from one authoritative allocator instead of racing disjoint
+// ranges. Distinct from ReserveSlotsAbove, which pins already-known indices
+// via reserveSlotLocked (bypassing the owned/nsExists checks). Pair every
+// ClaimFreshSlot with a ReleaseSlot.
+func (m *Manager) ClaimFreshSlot(owner string) (int, error) {
 	return m.claimSlotIndex(owner)
 }
 
-// ReleaseSlot frees a slot reserved via ReserveSlot and tears down any ns/veth
-// the caller built at idx. The inverse of ReserveSlot; it owns the namespace
-// naming so callers never reconstruct "ns-<idx>" themselves.
+// ReleaseSlot frees a slot claimed via ClaimFreshSlot and tears down any ns/veth
+// the caller built at idx. It releases strictly by (owner, idx) — never routing
+// through the tracked-VM path — so a caller-supplied build ID that collides with
+// a live sandbox's VM ID can't tear down that sandbox's namespace or leak the
+// reserved index. Owns the namespace naming so callers never reconstruct
+// "ns-<idx>"; a no-op if owner no longer owns idx (already reclaimed/reused).
 func (m *Manager) ReleaseSlot(owner string, idx int) {
-	m.CleanupVMOrNamespace(owner, fmt.Sprintf("ns-%d", idx))
+	// Claim the teardown atomically (owner → teardownOwner) so claimSlotIndex
+	// can't grab idx while cleanupFull runs below.
+	m.mu.Lock()
+	if m.slotOwner[idx] != owner {
+		m.mu.Unlock()
+		return
+	}
+	m.slotOwner[idx] = teardownOwner
+	m.mu.Unlock()
+	// Release even if cleanupFull panics — otherwise idx stays stuck as
+	// teardownOwner forever (no other path releases that sentinel).
+	defer m.releaseIfOwned(idx, teardownOwner)
+	m.cleanupFull(fmt.Sprintf("ns-%d", idx), fmt.Sprintf("veth-%d", idx))
 }
 
 // claimSlotIndex picks a slot idx that is unowned and not present in the kernel,
@@ -789,7 +806,10 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 
 	for {
 		var idx int
-		if len(m.freeSlots) > 0 {
+		// A pinned Manager (WithExactSlot) must claim exactly maxSlot or fail —
+		// so it never draws from freeSlots (which could hand back a different
+		// index); it only takes the pinned nextSlot path below.
+		if !m.slotPinned && len(m.freeSlots) > 0 {
 			idx = m.freeSlots[len(m.freeSlots)-1]
 			m.freeSlots = m.freeSlots[:len(m.freeSlots)-1]
 		} else {
