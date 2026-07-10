@@ -96,7 +96,7 @@ const (
 	maxName = 128
 
 	// Platform ceiling — applies to every team including system.
-	absoluteMaxVcpu      = 4
+	absoluteMaxVcpu      = 8
 	absoluteMaxMemoryMib = 10240
 	absoluteMaxDiskMib   = 20480
 
