@@ -105,9 +105,10 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 	return nil
 }
 
-// ensurePrivateMount makes dir its own mount with private propagation
-// (bind-mounting it to itself first if it isn't already a mount point).
-// Idempotent: a dir that is already a private mount is left as-is.
+// ensurePrivateMount makes dir its own mount with private propagation by
+// self-binding it. Idempotent: an already-private dir (our bind from a prior
+// boot) is reused; a pre-existing NON-private mount is refused — never
+// make-private a mount we didn't create.
 func ensurePrivateMount(ctx context.Context, dir string) error {
 	// Read propagation from /proc/self/mountinfo, not the `mountpoint` binary: it
 	// isn't preflighted, so on a minimal image its absence would read as "not a
