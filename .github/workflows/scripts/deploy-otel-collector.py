@@ -120,13 +120,26 @@ def main() -> int:
                 "gcloud", "compute", "ssh", name,
                 f"--zone={zone}", f"--project={project}",
                 "--quiet", "--tunnel-through-iap",
-                "--command", "uname -m",
+                "--command",
+                'printf "__OTEL_ARCH__=%s\\n" "$(uname -m)"',
             ],
             check=True,
             capture_output=True,
             text=True,
         )
-        host_uname = host_arch_result.stdout.strip()
+
+        host_uname = None
+        for line in host_arch_result.stdout.splitlines():
+            if line.startswith("__OTEL_ARCH__="):
+                host_uname = line.removeprefix("__OTEL_ARCH__=").strip()
+                break
+
+        if not host_uname:
+            raise RuntimeError(
+                "could not determine host architecture\\n"
+                f"--- stdout ---\\n{host_arch_result.stdout}\\n"
+                f"--- stderr ---\\n{host_arch_result.stderr}"
+            )
 
         selected_arch = None
         for otel_arch, uname_arch in OTEL_ARCHITECTURES.items():
