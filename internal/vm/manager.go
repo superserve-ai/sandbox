@@ -214,10 +214,9 @@ type Manager struct {
 	// legacy path. Set when the namespace is built/validated; kept in sync by
 	// revalidateLauncher.
 	launcherReady atomic.Bool
-	// launcherBuilt is true only after EnsureLauncherNamespace built and pinned
-	// the launcher THIS boot. revalidateLauncher requires it before re-enabling
-	// launcherReady, so a stale pin left mounted from a previous boot (whose
-	// rebuild failed) can never resurrect the launcher path.
+	// launcherBuilt is true only after a successful build THIS boot; gates
+	// revalidateLauncher's re-enable so a stale previous-boot pin can't resurrect
+	// the launcher path.
 	launcherBuilt atomic.Bool
 
 	mu  sync.RWMutex
@@ -2370,31 +2369,25 @@ func fcSetupCmds(templateDir, basePath, perVMRootfs string) string {
 
 // fcStartScript renders the per-VM start.sh that systemd's ExecStart runs.
 //
-// launcherNSPath == "" → legacy path: `ip netns exec <ns> unshare -m …`.
-// launcherNSPath != "" → launcher path: enter the VM's netns AND vmd's pruned
-// launcher mount namespace via nsenter, then `unshare -m` — so the per-VM
-// mount-namespace clone copies the launcher's small table instead of the
-// full host table. nsenter opens the netns + launcher fds from the host mount
-// view before setns, so entering the netns works even though the launcher
-// namespace has /run/netns pruned; `ip netns exec` cannot be used there
-// because it resolves /run/netns/<ns> from inside the (pruned) mount namespace.
+// launcherNSPath == "" → legacy: `ip netns exec <ns> unshare -m …`.
+// launcherNSPath != "" → launcher: `nsenter --net=<ns> --mount=<pin> -- unshare
+// -m …`, so the per-VM clone copies the launcher's small table, not the full host
+// table. nsenter opens both fds from the host mount view before setns, so the
+// netns resolves even though the launcher has /run/netns pruned — which is why
+// `ip netns exec` (resolves the netns from inside the mount ns) can't be used.
 func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID string) string {
 	prefix := fmt.Sprintf("ip netns exec %s", netNS)
 	sysfs := ""
 	if launcherNSPath != "" {
 		prefix = fmt.Sprintf("nsenter --net=/run/netns/%s --mount=%s --", netNS, shellquote.Single(launcherNSPath))
-		// nsenter — unlike `ip netns exec` — does not remount /sys, so
-		// /sys/class/net would reflect the host netns, not the VM's (the tap
-		// device would be absent). Remount a fresh, netns-aware sysfs inside the
-		// per-VM mount namespace (after make-rprivate, so it can't propagate to
-		// the host) so anything reading /sys sees the VM's interfaces.
+		// nsenter, unlike `ip netns exec`, doesn't remount /sys, so /sys/class/net
+		// would show the host's interfaces, not the VM's tap. Remount a netns-aware
+		// sysfs inside the per-VM ns (after make-rprivate, so it can't reach the host).
 		sysfs = " && mount -t sysfs sysfs /sys"
 	}
-	// Every value is single-quoted: setupCmds quoted its paths, the fc args are
-	// quoted here, and the whole inner script is then quoted as the `sh -c`
-	// argument. Two applications of shellquote.Single (once for the value, once
-	// for the outer sh -c arg) — so a caller-influenced path (base_path,
-	// perVMRootfs) can't close a quote and inject shell that runs as root.
+	// Each value is single-quoted, then the whole inner script is single-quoted as
+	// the `sh -c` arg — two shellquote.Single layers, so a caller-influenced path
+	// (base_path, perVMRootfs) can't close a quote and inject shell as root.
 	inner := fmt.Sprintf("%s%s && exec %s --api-sock %s --id %s",
 		setupCmds, sysfs, shellquote.Single(fcBin), shellquote.Single(socketPath), shellquote.Single(vmID))
 	return fmt.Sprintf("#!/bin/sh\nexec %s unshare -m -- sh -c %s\n", prefix, shellquote.Single(inner))
@@ -2415,12 +2408,9 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	setupCmds := fcSetupCmds(templateDir, basePath, perVMRootfs)
 
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	// Launcher path only when the namespace is ready AND still valid at this
-	// moment — re-checking here (not just launcherReady) closes the window where
-	// a pin that went bad since the last revalidation tick would otherwise bake a
-	// dead nsenter --mount into start.sh and hard-fail the launch. On failure,
-	// fall back to legacy for this launch and stop trusting the pin until
-	// revalidateLauncher rebuilds/reconfirms it.
+	// Re-check validity here, not just launcherReady: a pin that went bad since the
+	// last revalidation tick would otherwise bake a dead nsenter --mount into
+	// start.sh and hard-fail. On failure, fall back to legacy and drop the pin.
 	launcherPath := ""
 	if m.launcherReady.Load() {
 		if pin := m.launcherNSPath(); launcherNSValid(ctx, pin) {

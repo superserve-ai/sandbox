@@ -12,35 +12,25 @@ import (
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
-// launcherPruneScript reduces a freshly cloned mount namespace to a minimal
-// table by removing every /run/netns nsfs mount. A single `umount /run/netns`
-// only detaches the parent layer — one nsfs mount per netns remains, stacked on
-// the individual /run/netns/ns-N paths — so we also unmount each surviving
-// entry. make-rprivate MUST succeed before any umount — it severs the cloned
-// namespace's propagation from the host; without it, a umount could propagate
-// back and detach the host's live /run/netns pins. `|| exit 1` aborts before any
-// umount if it fails, so the build errors and launches fall back to legacy with
-// the host untouched.
+// launcherPruneScript strips every /run/netns nsfs mount from a freshly cloned
+// namespace. A single `umount /run/netns` detaches only the parent layer; the
+// per-netns nsfs mounts remain stacked on /run/netns/ns-N, so we unmount each.
+// make-rprivate MUST run first (|| exit 1) to sever propagation from the host —
+// without it a umount could propagate back and detach the host's live pins.
 const launcherPruneScript = `mount --make-rprivate / || exit 1
 umount -l /run/netns 2>/dev/null || true
 for m in $(grep ' /run/netns/' /proc/self/mounts | awk '{print $2}'); do umount -l "$m" 2>/dev/null || true; done`
 
-// EnsureLauncherNamespace makes sure the pruned launcher mount namespace exists
-// and is pinned at m.launcherNSPath(), building it if missing or stale. No-op
-// when the launcher launch mode is disabled.
-//
-// The pin is a point-in-time snapshot of the host mount table (propagation
-// severed), so we REBUILD it every boot rather than reuse a prior pin — a
-// launch-critical mount added since the last build (new storage volume, updated
-// firecracker binary) would otherwise be invisible in a stale pin and fail
-// launches. vmd restarts are the deploy/mount-change boundary, so rebuilding
-// then keeps the pin current; the O(fleet) prune cost is off the hot path.
-// launcherBuildTimeout bounds the boot-time launcher setup (mount/unshare/nsenter
-// execs), which run before vmd serves. It must exceed the O(fleet) prune, so it's
-// far larger than the 5s used for single host execs elsewhere; a wedged mount or
-// /run then degrades to a logged failure + legacy fallback instead of hanging boot.
+// launcherBuildTimeout bounds the boot-time launcher build. It must exceed the
+// O(fleet) prune, so it's far larger than the 5s single-exec bound used
+// elsewhere; on timeout the build errors and launches fall back to legacy.
 const launcherBuildTimeout = 90 * time.Second
 
+// EnsureLauncherNamespace builds and pins the pruned launcher mount namespace at
+// m.launcherNSPath(). No-op when launcher mode is disabled. The pin snapshots the
+// host mount table, so it's rebuilt every boot rather than reused — a launch-
+// critical mount added since the last build would be invisible in a stale pin,
+// and vmd restart is the mount-change boundary that keeps it current.
 func (m *Manager) EnsureLauncherNamespace(ctx context.Context) error {
 	pinPath := m.launcherNSPath()
 	if pinPath == "" {
@@ -87,14 +77,10 @@ func launcherNSValid(ctx context.Context, pinPath string) bool {
 }
 
 // buildLauncherNamespace creates a fresh mount namespace, prunes /run/netns from
-// it, and persists it at pinPath so it outlives the builder.
-//
-// util-linux `unshare --mount=<file>` persists the new mount namespace by
-// binding the process's OWN /proc/self/ns/mnt to the file — the kernel-supported
-// operation. (Binding another process's mount namespace cross-namespace is
-// rejected by the kernel, which is what a manual parent-side bind hit.) The
-// prune runs inside that same namespace, so the persisted pin refers to the
-// pruned table.
+// it, and persists it at pinPath. `unshare --mount=<file>` self-persists by
+// binding the process's own /proc/self/ns/mnt (binding another process's mount
+// namespace is kernel-rejected), and runs the prune in that same namespace so the
+// pin refers to the pruned table.
 func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 	dir := filepath.Dir(pinPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -122,10 +108,9 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 // (bind-mounting it to itself first if it isn't already a mount point).
 // Idempotent: a dir that is already a private mount is left as-is.
 func ensurePrivateMount(ctx context.Context, dir string) error {
-	// Detect the existing self-bind by reading /proc/self/mountinfo directly,
-	// not via the `mountpoint` binary — it isn't in vmd's preflight tool set, so
-	// on a minimal image its absence would be misread as "not a mount point" and
-	// stack a fresh bind mount on every restart, growing the host mount table.
+	// Detect the self-bind via /proc/self/mountinfo, not the `mountpoint` binary:
+	// it isn't preflighted, so on a minimal image its absence would read as "not a
+	// mount point" and stack a fresh bind on every restart.
 	mounted, err := isMountpoint(dir)
 	if err != nil {
 		return fmt.Errorf("check mountpoint %s: %w", dir, err)
@@ -180,16 +165,11 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 	}()
 }
 
-// revalidateLauncher keeps launcherReady in sync with the live pin. The startup
-// check is a point-in-time snapshot; if the pin is later unmounted/deleted while
-// vmd runs, every launch would keep building nsenter --mount=<stale-path> and
-// fail. Re-check each tick: drop to the legacy path if the pin went bad, and
-// resume ONLY the pin this boot built (launcherBuilt) if a transient check blip
-// cleared. A pin that merely looks valid again — e.g. a previous-boot pin left
-// mounted after this boot's rebuild failed — must not re-enable the launcher
-// path: it can be missing launch-critical mounts that rebuild-on-boot exists to
-// pick up. Recovery from a failed boot build is a vmd restart. No-op when
-// launcher mode is disabled.
+// revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to
+// legacy if the pin went bad, and re-enable only the pin THIS boot built
+// (launcherBuilt) — a previous-boot pin left mounted after a failed rebuild may
+// be missing launch-critical mounts, so it must never resurrect the launcher
+// path. No-op when launcher mode is disabled.
 func (m *Manager) revalidateLauncher(ctx context.Context) {
 	pin := m.launcherNSPath()
 	if pin == "" {
