@@ -108,17 +108,28 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 // (bind-mounting it to itself first if it isn't already a mount point).
 // Idempotent: a dir that is already a private mount is left as-is.
 func ensurePrivateMount(ctx context.Context, dir string) error {
-	// Detect the self-bind via /proc/self/mountinfo, not the `mountpoint` binary:
-	// it isn't preflighted, so on a minimal image its absence would read as "not a
+	// Read propagation from /proc/self/mountinfo, not the `mountpoint` binary: it
+	// isn't preflighted, so on a minimal image its absence would read as "not a
 	// mount point" and stack a fresh bind on every restart.
-	mounted, err := isMountpoint(dir)
+	mounted, private, err := mountState(dir)
 	if err != nil {
-		return fmt.Errorf("check mountpoint %s: %w", dir, err)
+		return fmt.Errorf("mount state %s: %w", dir, err)
 	}
-	if !mounted {
-		if out, err := exec.CommandContext(ctx, "mount", "--bind", dir, dir).CombinedOutput(); err != nil {
-			return fmt.Errorf("bind %s: %v: %s", dir, err, strings.TrimSpace(string(out)))
+	if mounted {
+		// Already a mount. If private, it's our pin-dir bind from a prior boot —
+		// reuse it. If not, dir is a pre-existing host mount the pin path points
+		// under (e.g. VMD_LAUNCHER_NS_PATH directly beneath /run or /); refuse
+		// rather than make-private it, which would flip that mount's propagation
+		// host-wide. Legacy fallback covers the misconfiguration safely.
+		if !private {
+			return fmt.Errorf("pin dir %s is a pre-existing non-private mount; set VMD_LAUNCHER_NS_PATH under a dedicated directory", dir)
 		}
+		return nil
+	}
+	// Fresh dir: create a dedicated self-bind and make ONLY it private, so the pin
+	// gets a private parent without touching any host mount's propagation.
+	if out, err := exec.CommandContext(ctx, "mount", "--bind", dir, dir).CombinedOutput(); err != nil {
+		return fmt.Errorf("bind %s: %v: %s", dir, err, strings.TrimSpace(string(out)))
 	}
 	if out, err := exec.CommandContext(ctx, "mount", "--make-private", dir).CombinedOutput(); err != nil {
 		return fmt.Errorf("make-private %s: %v: %s", dir, err, strings.TrimSpace(string(out)))
@@ -126,21 +137,33 @@ func ensurePrivateMount(ctx context.Context, dir string) error {
 	return nil
 }
 
-// isMountpoint reports whether path is a mount point by scanning
-// /proc/self/mountinfo, whose 5th field is the mount point. ponytail: compares
-// the field raw — fine for the fixed internal pin dir (/run/vmd, no spaces); a
-// path with spaces would arrive octal-escaped (\040) and need unescaping.
-func isMountpoint(path string) (bool, error) {
+// mountState reports whether dir is a mount point and, if so, whether that mount
+// has private propagation. Scans /proc/self/mountinfo: fields left of " - " are
+// mount id, parent, major:minor, root, mount point, opts, then optional
+// propagation tags (shared:/master:/propagate_from:) — a private mount has none,
+// so exactly 6 left-fields. ponytail: compares the mount point raw — fine for the
+// fixed internal pin dir (/run/vmd, no spaces); a path with spaces would arrive
+// octal-escaped (\040) and need unescaping.
+func mountState(dir string) (mounted, private bool, err error) {
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if f := strings.Fields(line); len(f) >= 5 && f[4] == path {
-			return true, nil
+	mounted, private = parseMountState(data, dir)
+	return mounted, private, nil
+}
+
+func parseMountState(mountinfo []byte, dir string) (mounted, private bool) {
+	for _, line := range strings.Split(string(mountinfo), "\n") {
+		left, _, ok := strings.Cut(line, " - ")
+		if !ok {
+			continue
+		}
+		if f := strings.Fields(left); len(f) >= 5 && f[4] == dir {
+			return true, len(f) == 6
 		}
 	}
-	return false, nil
+	return false, false
 }
 
 // StartMountCountSampler periodically logs the host mount-table size so the

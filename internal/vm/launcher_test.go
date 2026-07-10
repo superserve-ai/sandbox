@@ -116,15 +116,38 @@ func TestFCStartScript_NoShellInjection(t *testing.T) {
 	}
 }
 
-func TestIsMountpoint(t *testing.T) {
+func TestMountState(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("isMountpoint reads /proc/self/mountinfo (linux only)")
+		t.Skip("mountState reads /proc/self/mountinfo (linux only)")
 	}
-	if ok, err := isMountpoint("/"); err != nil || !ok {
-		t.Errorf(`isMountpoint("/") = %v, %v; want true, nil`, ok, err)
+	// "/" is always a mount point; a made-up path never is.
+	if mounted, _, err := mountState("/"); err != nil || !mounted {
+		t.Errorf(`mountState("/") mounted = %v, %v; want true, nil`, mounted, err)
 	}
-	if ok, err := isMountpoint("/no/such/mount/xyz"); err != nil || ok {
-		t.Errorf(`isMountpoint("/no/such/mount/xyz") = %v, %v; want false, nil`, ok, err)
+	if mounted, _, err := mountState("/no/such/mount/xyz"); err != nil || mounted {
+		t.Errorf(`mountState("/no/such/mount/xyz") mounted = %v, %v; want false, nil`, mounted, err)
+	}
+}
+
+func TestParseMountState(t *testing.T) {
+	// A private mount (no propagation tags) vs a shared one, plus an absent dir.
+	mountinfo := []byte(
+		"36 35 0:1 / /run/vmd rw,relatime - tmpfs tmpfs rw\n" +
+			"37 35 0:2 / /run rw,relatime shared:23 - tmpfs tmpfs rw\n")
+	cases := []struct {
+		dir                  string
+		wantMounted, private bool
+	}{
+		{"/run/vmd", true, true}, // dedicated private pin dir
+		{"/run", true, false},    // shared host mount — must not be made private
+		{"/nope", false, false},  // not present
+	}
+	for _, tc := range cases {
+		mounted, private := parseMountState(mountinfo, tc.dir)
+		if mounted != tc.wantMounted || private != tc.private {
+			t.Errorf("parseMountState(%q) = (%v, %v); want (%v, %v)",
+				tc.dir, mounted, private, tc.wantMounted, tc.private)
+		}
 	}
 }
 
