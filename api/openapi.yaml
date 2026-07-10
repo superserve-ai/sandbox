@@ -2420,17 +2420,17 @@ components:
         vcpu:
           type: integer
           minimum: 1
-          maximum: 4
+          maximum: 8
           default: 1
         memory_mib:
           type: integer
           minimum: 256
-          maximum: 4096
+          maximum: 10240
           default: 1024
         disk_mib:
           type: integer
           minimum: 1024
-          maximum: 8192
+          maximum: 20480
           default: 4096
         build_spec:
           $ref: "#/components/schemas/BuildSpec"
