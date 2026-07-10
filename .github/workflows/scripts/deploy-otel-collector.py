@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy the OTEL Collector config and systemd unit to VMD hosts."""
+"""Deploy the OTEL Collector binary, config, and systemd unit to VMD hosts."""
 
 import os
 import re
@@ -7,6 +7,9 @@ import subprocess
 import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+OTEL_COLLECTOR_VERSION = "0.104.0"
 
 
 def main() -> int:
@@ -32,16 +35,17 @@ def main() -> int:
     )
 
     instances = [
-        {"name": r[0], "zone": r[1]}
+        {"name": row[0], "zone": row[1]}
         for line in result.stdout.strip().splitlines()
         if line.strip()
-        for r in [line.strip().split(",")]
+        for row in [line.strip().split(",")]
     ]
 
     if region:
         instances = [
-            inst for inst in instances
-            if inst["zone"].split("/")[-1].startswith(f"{region}-")
+            instance
+            for instance in instances
+            if instance["zone"].split("/")[-1].startswith(f"{region}-")
         ]
 
     where = f"{project} ({region})" if region else project
@@ -51,13 +55,18 @@ def main() -> int:
 
     print(f"Deploying OTEL Collector to {len(instances)} instance(s) in {where}")
 
-    def deploy(inst):
-        name, zone = inst["name"], inst["zone"]
+    def deploy(instance: dict[str, str]) -> None:
+        name = instance["name"]
+        zone = instance["zone"]
+        zone_name = zone.split("/")[-1]
         tag = f"{name}/{zone}"
 
         uploads = [
             ("deploy/otel/collector-gmp.yaml", "/tmp/collector-gmp.yaml"),
-            ("deploy/superserve-otel-collector.service", "/tmp/superserve-otel-collector.service"),
+            (
+                "deploy/superserve-otel-collector.service",
+                "/tmp/superserve-otel-collector.service",
+            ),
         ]
 
         for src, dst in uploads:
@@ -69,19 +78,75 @@ def main() -> int:
                 ],
                 check=True,
                 capture_output=True,
+                text=True,
             )
 
         print(f"[{tag}] collector files uploaded")
 
-        deploy_script = textwrap.dedent(f"""
+        deploy_script = textwrap.dedent(
+            f"""
             set -euo pipefail
 
-            sudo install -D -m 0644 /tmp/collector-gmp.yaml /etc/sandbox/otel/collector-gmp.yaml
-            sudo install -D -m 0644 /tmp/superserve-otel-collector.service /etc/systemd/system/superserve-otel-collector.service
+            OTEL_VERSION="{OTEL_COLLECTOR_VERSION}"
+            OTEL_BINARY="/usr/local/bin/otelcol-contrib"
+
+            install_collector() {{
+              case "$(uname -m)" in
+                x86_64)
+                  OTEL_ARCH="amd64"
+                  ;;
+                aarch64|arm64)
+                  OTEL_ARCH="arm64"
+                  ;;
+                *)
+                  echo "ERROR: unsupported architecture: $(uname -m)" >&2
+                  exit 1
+                  ;;
+              esac
+
+              TMP_DIR="$(mktemp -d)"
+              trap 'rm -rf "$TMP_DIR"' EXIT
+
+              ARCHIVE="$TMP_DIR/otelcol-contrib.tar.gz"
+              DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v$OTEL_VERSION/otelcol-contrib_${{OTEL_VERSION}}_linux_${{OTEL_ARCH}}.tar.gz"
+
+              echo "Installing otelcol-contrib v$OTEL_VERSION for $OTEL_ARCH"
+
+              curl --fail --location --silent --show-error \
+                "$DOWNLOAD_URL" \
+                --output "$ARCHIVE"
+
+              tar -xzf "$ARCHIVE" -C "$TMP_DIR"
+
+              if [ ! -x "$TMP_DIR/otelcol-contrib" ]; then
+                echo "ERROR: downloaded archive did not contain otelcol-contrib" >&2
+                exit 1
+              fi
+
+              sudo install -m 0755 \
+                "$TMP_DIR/otelcol-contrib" \
+                "$OTEL_BINARY"
+            }}
+
+            if [ ! -x "$OTEL_BINARY" ] || \
+               ! "$OTEL_BINARY" --version 2>/dev/null | grep -Fq "$OTEL_VERSION"; then
+              install_collector
+            else
+              echo "otelcol-contrib v$OTEL_VERSION is already installed"
+            fi
+
+            sudo install -D -m 0644 \
+              /tmp/collector-gmp.yaml \
+              /etc/sandbox/otel/collector-gmp.yaml
+
+            sudo install -D -m 0644 \
+              /tmp/superserve-otel-collector.service \
+              /etc/systemd/system/superserve-otel-collector.service
 
             sudo mkdir -p /etc/sandbox/otel
             sudo tee /etc/sandbox/otel/collector.env >/dev/null <<'OTELENV'
             GCP_PROJECT={collector_project}
+            GCP_ZONE={zone_name}
             OTELENV
             sudo chmod 0644 /etc/sandbox/otel/collector.env
 
@@ -92,17 +157,18 @@ def main() -> int:
             sleep 5
 
             sudo systemctl is-active --quiet superserve-otel-collector || (
-                echo "ERROR: superserve-otel-collector failed to become active after restart" >&2
-                sudo systemctl status --no-pager superserve-otel-collector >&2 || true
-                sudo journalctl -u superserve-otel-collector --no-pager -n 80 >&2 || true
-                exit 1
+              echo "ERROR: superserve-otel-collector failed to become active after restart" >&2
+              sudo systemctl status --no-pager --full superserve-otel-collector >&2 || true
+              sudo journalctl -u superserve-otel-collector --no-pager -n 80 >&2 || true
+              exit 1
             )
 
             curl -sf http://127.0.0.1:13133/ >/dev/null
             curl -sf http://127.0.0.1:8888/metrics | grep -q '^otelcol_'
-        """)
+            """
+        )
 
-        r = subprocess.run(
+        result = subprocess.run(
             [
                 "gcloud", "compute", "ssh", name,
                 f"--zone={zone}", f"--project={project}",
@@ -113,24 +179,27 @@ def main() -> int:
             text=True,
         )
 
-        if r.returncode != 0:
+        if result.returncode != 0:
             raise RuntimeError(
-                f"collector not healthy\n"
-                f"--- stdout ---\n{r.stdout}\n"
-                f"--- stderr ---\n{r.stderr}"
+                "collector not healthy\n"
+                f"--- stdout ---\n{result.stdout}\n"
+                f"--- stderr ---\n{result.stderr}"
             )
 
         print(f"[{tag}] collector active")
 
-    failed = []
-    with ThreadPoolExecutor(max_workers=len(instances)) as ex:
-        futures = {ex.submit(deploy, inst): inst for inst in instances}
+    failed: list[str] = []
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        futures = {
+            executor.submit(deploy, instance): instance
+            for instance in instances
+        }
         for future in as_completed(futures):
-            inst = futures[future]
+            instance = futures[future]
             try:
                 future.result()
             except Exception as exc:
-                tag = f"{inst['name']}/{inst['zone']}"
+                tag = f"{instance['name']}/{instance['zone']}"
                 print(f"[{tag}] FAILED: {exc}", file=sys.stderr)
                 failed.append(tag)
 
