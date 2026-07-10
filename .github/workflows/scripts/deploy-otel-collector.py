@@ -6,10 +6,63 @@ import re
 import subprocess
 import sys
 import textwrap
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 
 OTEL_COLLECTOR_VERSION = "0.104.0"
+OTEL_ARCHITECTURES = {
+    "amd64": "x86_64",
+    "arm64": "aarch64",
+}
+
+
+def prepare_collector_binaries() -> dict[str, str]:
+    tmp_dir = tempfile.mkdtemp(prefix="otel-collector-")
+    binaries: dict[str, str] = {}
+
+    for otel_arch in OTEL_ARCHITECTURES:
+        archive_path = Path(tmp_dir) / f"otelcol-contrib_{otel_arch}.tar.gz"
+        extract_dir = Path(tmp_dir) / f"extract_{otel_arch}"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        download_url = (
+            "https://github.com/open-telemetry/opentelemetry-collector-releases/"
+            f"releases/download/v{OTEL_COLLECTOR_VERSION}/"
+            f"otelcol-contrib_{OTEL_COLLECTOR_VERSION}_linux_{otel_arch}.tar.gz"
+        )
+
+        subprocess.run(
+            [
+                "curl",
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                download_url,
+                "--output",
+                str(archive_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["tar", "-xzf", str(archive_path), "-C", str(extract_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        binary_path = extract_dir / "otelcol-contrib"
+        if not binary_path.is_file():
+            raise RuntimeError(
+                f"downloaded archive for {otel_arch} did not contain otelcol-contrib"
+            )
+        binary_path.chmod(0o755)
+        binaries[otel_arch] = str(binary_path)
+
+    return binaries
 
 
 def main() -> int:
@@ -53,6 +106,7 @@ def main() -> int:
         print(f"No instances with label {label} found in {where}", file=sys.stderr)
         return 1
 
+    collector_binaries = prepare_collector_binaries()
     print(f"Deploying OTEL Collector to {len(instances)} instance(s) in {where}")
 
     def deploy(instance: dict[str, str]) -> None:
@@ -61,12 +115,34 @@ def main() -> int:
         zone_name = zone.split("/")[-1]
         tag = f"{name}/{zone}"
 
+        host_arch_result = subprocess.run(
+            [
+                "gcloud", "compute", "ssh", name,
+                f"--zone={zone}", f"--project={project}",
+                "--quiet", "--tunnel-through-iap",
+                "--command", "uname -m",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        host_uname = host_arch_result.stdout.strip()
+
+        selected_arch = None
+        for otel_arch, uname_arch in OTEL_ARCHITECTURES.items():
+            if host_uname == uname_arch:
+                selected_arch = otel_arch
+                break
+        if selected_arch is None:
+            raise RuntimeError(f"unsupported host architecture: {host_uname}")
+
         uploads = [
             ("deploy/otel/collector-gmp.yaml", "/tmp/collector-gmp.yaml"),
             (
                 "deploy/superserve-otel-collector.service",
                 "/tmp/superserve-otel-collector.service",
             ),
+            (collector_binaries[selected_arch], "/tmp/otelcol-contrib"),
         ]
 
         for src, dst in uploads:
@@ -90,47 +166,10 @@ def main() -> int:
             OTEL_VERSION="{OTEL_COLLECTOR_VERSION}"
             OTEL_BINARY="/usr/local/bin/otelcol-contrib"
 
-            install_collector() {{
-              case "$(uname -m)" in
-                x86_64)
-                  OTEL_ARCH="amd64"
-                  ;;
-                aarch64|arm64)
-                  OTEL_ARCH="arm64"
-                  ;;
-                *)
-                  echo "ERROR: unsupported architecture: $(uname -m)" >&2
-                  exit 1
-                  ;;
-              esac
-
-              TMP_DIR="$(mktemp -d)"
-              trap 'rm -rf "$TMP_DIR"' EXIT
-
-              ARCHIVE="$TMP_DIR/otelcol-contrib.tar.gz"
-              DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v$OTEL_VERSION/otelcol-contrib_${{OTEL_VERSION}}_linux_${{OTEL_ARCH}}.tar.gz"
-
-              echo "Installing otelcol-contrib v$OTEL_VERSION for $OTEL_ARCH"
-
-              curl --fail --location --silent --show-error \
-                "$DOWNLOAD_URL" \
-                --output "$ARCHIVE"
-
-              tar -xzf "$ARCHIVE" -C "$TMP_DIR"
-
-              if [ ! -x "$TMP_DIR/otelcol-contrib" ]; then
-                echo "ERROR: downloaded archive did not contain otelcol-contrib" >&2
-                exit 1
-              fi
-
-              sudo install -m 0755 \
-                "$TMP_DIR/otelcol-contrib" \
-                "$OTEL_BINARY"
-            }}
-
             if [ ! -x "$OTEL_BINARY" ] || \
                ! "$OTEL_BINARY" --version 2>/dev/null | grep -Fq "$OTEL_VERSION"; then
-              install_collector
+              echo "Installing otelcol-contrib v$OTEL_VERSION from uploaded artifact"
+              sudo install -m 0755 /tmp/otelcol-contrib "$OTEL_BINARY"
             else
               echo "otelcol-contrib v$OTEL_VERSION is already installed"
             fi
