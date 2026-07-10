@@ -42,6 +42,12 @@ def main() -> int:
     if not re.fullmatch(r"[A-Za-z0-9.\-]+", proxy_domain):
         print("ERROR: PROXY_DOMAIN contains disallowed characters", file=sys.stderr)
         return 1
+    # Optional multi-domain set for DNS/hostname transitions; the proxy
+    # prefers PROXY_DOMAINS over PROXY_DOMAIN when both are present.
+    proxy_domains = os.environ.get("PROXY_DOMAINS", "")
+    if proxy_domains and not re.fullmatch(r"[A-Za-z0-9.,\- ]+", proxy_domains):
+        print("ERROR: PROXY_DOMAINS contains disallowed characters", file=sys.stderr)
+        return 1
     access_seed = os.environ.get("SANDBOX_ACCESS_TOKEN_SEED", "")
     if access_seed and not re.fullmatch(r"[0-9a-fA-F]{64,}", access_seed):
         print("ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)", file=sys.stderr)
@@ -125,6 +131,7 @@ def main() -> int:
             sudo mkdir -p /etc/sandbox
             sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
             PROXY_DOMAIN={proxy_domain}
+            PROXY_DOMAINS={proxy_domains}
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
