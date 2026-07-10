@@ -38,19 +38,19 @@ func main() {
 	addr := envOrDefault("PROXY_ADDR", ":5007")
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
 	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
-	domain := envOrDefault("PROXY_DOMAIN", "sandbox.superserve.ai")
+	domains := proxyDomains()
 
 	log.Info().
 		Str("addr", addr).
 		Str("vmd_addr", vmdAddr).
-		Str("domain", domain).
+		Strs("domains", domains).
 		Msg("starting edge proxy")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
-	proxyHandler := proxy.NewHandler(domain, resolver, log)
+	proxyHandler := proxy.NewHandler(domains, resolver, log)
 	proxyHandler.StartSweeper(ctx)
 
 	// Product-usage analytics for exec/files — no-op when POSTHOG_KEY is unset.
@@ -101,16 +101,21 @@ func main() {
 
 	// Health check for the GCP LB. Only responds on non-sandbox hosts
 	// so the boxd-label lockdown isn't bypassed.
-	domainSuffix := "." + domain
+	domainSuffixes := make([]string, len(domains))
+	for i, d := range domains {
+		domainSuffixes[i] = "." + d
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
-		if strings.HasSuffix(host, domainSuffix) {
-			proxyHandler.ServeHTTP(w, r)
-			return
+		for _, suffix := range domainSuffixes {
+			if strings.HasSuffix(host, suffix) {
+				proxyHandler.ServeHTTP(w, r)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 	})
@@ -146,6 +151,18 @@ func main() {
 	_ = redirectSrv.Shutdown(shutCtx)
 
 	log.Info().Msg("proxy stopped")
+}
+
+// proxyDomains resolves the set of sandbox domains the proxy accepts.
+// PROXY_DOMAINS (comma-separated) takes precedence so one deploy can serve
+// both the legacy hostname and the region-prefixed hostname during a DNS
+// transition; otherwise the single-value PROXY_DOMAIN keeps existing
+// deploys unchanged.
+func proxyDomains() []string {
+	if domains := splitCSV(os.Getenv("PROXY_DOMAINS")); len(domains) > 0 {
+		return domains
+	}
+	return []string{envOrDefault("PROXY_DOMAIN", "sandbox.superserve.ai")}
 }
 
 func envOrDefault(key, fallback string) string {

@@ -20,14 +20,14 @@ const headerSandboxID = "X-Superserve-Sandbox-Id"
 // ParseRequest resolves the target sandbox + port from an incoming request.
 // Two routing modes:
 //
-//   - Shared-host: Host equals the configured domain and the
+//   - Shared-host: Host equals one of the configured domains and the
 //     X-Superserve-Sandbox-Id header carries the ID. Always boxdPort.
 //
 //   - Subdomain: Host is "{label}-{id}.{domain}", same as ParseHost.
 //
 // A subdomain-form Host is never overridden by a routing header.
-func ParseRequest(host string, headers http.Header, domain string) (port int, instanceID string, err error) {
-	if isSharedHost(host, domain) {
+func ParseRequest(host string, headers http.Header, domains []string) (port int, instanceID string, err error) {
+	if isSharedHost(host, domains) {
 		id := headers.Get(headerSandboxID)
 		if id == "" {
 			return 0, "", fmt.Errorf("proxy: shared host %q requires %s header", host, headerSandboxID)
@@ -37,7 +37,7 @@ func ParseRequest(host string, headers http.Header, domain string) (port int, in
 		}
 		return boxdPort, normalizeInstanceID(id), nil
 	}
-	return ParseHost(host, domain)
+	return ParseHost(host, domains)
 }
 
 // normalizeInstanceID strips the public region prefix (sb-<region>-) from a
@@ -82,13 +82,32 @@ func validRegionCode(s string) bool {
 	return true
 }
 
-// isSharedHost reports whether host (with any :port stripped) equals the configured domain.
-func isSharedHost(host, domain string) bool {
+// isSharedHost reports whether host (with any :port stripped) equals one of
+// the configured domains.
+func isSharedHost(host string, domains []string) bool {
 	hostname, _, err := net.SplitHostPort(host)
 	if err != nil {
 		hostname = host
 	}
-	return hostname == domain
+	for _, d := range domains {
+		if hostname == d {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesDomain reports whether hostname ends in "." plus one of the
+// configured domains. Each domain gets the same case-sensitive suffix
+// check the single-domain proxy used, so per-domain semantics are
+// unchanged — only the number of accepted suffixes grows.
+func matchesDomain(hostname string, domains []string) bool {
+	for _, d := range domains {
+		if strings.HasSuffix(hostname, "."+d) {
+			return true
+		}
+	}
+	return false
 }
 
 // boxdHostLabel is the reserved left-most label that addresses boxd's
@@ -114,10 +133,10 @@ const boxdHostLabel = "boxd"
 //     threshold, which routes to that user-application port on the
 //     VM.
 //
-// Returns ErrInvalidHost if the host doesn't end with the expected
-// domain suffix, so the proxy rejects forged Host headers pointing at
+// Returns an error if the host doesn't end with any of the expected
+// domain suffixes, so the proxy rejects forged Host headers pointing at
 // arbitrary backends.
-func ParseHost(host, domain string) (port int, instanceID string, err error) {
+func ParseHost(host string, domains []string) (port int, instanceID string, err error) {
 	// Strip TCP port from Host if present (e.g. "boxd-abc.sandbox.superserve.ai:443")
 	hostname, _, splitErr := net.SplitHostPort(host)
 	if splitErr != nil {
@@ -125,8 +144,8 @@ func ParseHost(host, domain string) (port int, instanceID string, err error) {
 	}
 
 	// Validate domain suffix — prevents accepting any Host: label-id.attacker.com
-	if !strings.HasSuffix(hostname, "."+domain) {
-		return 0, "", fmt.Errorf("proxy: host %q does not end in .%s", hostname, domain)
+	if !matchesDomain(hostname, domains) {
+		return 0, "", fmt.Errorf("proxy: host %q does not end in any accepted domain %v", hostname, domains)
 	}
 
 	// Take the leftmost label only: "boxd-abc123" or "3000-mybox"

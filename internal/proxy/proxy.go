@@ -54,7 +54,12 @@ const (
 
 // Handler is the core reverse proxy handler.
 type Handler struct {
-	domain       string // expected hostname suffix, e.g. "sandbox.superserve.ai"
+	// domains are the accepted hostname suffixes, e.g.
+	// ["sandbox.superserve.ai", "usw-sandbox.superserve.ai"]. All entries
+	// are valid for routing; the first is canonical should the proxy ever
+	// need to construct a sandbox URL (today it only validates Hosts and
+	// echoes them back, so ordering has no runtime effect).
+	domains      []string
 	resolver     Resolver
 	transports   *transportCache
 	sandboxConns *connLimiter
@@ -113,10 +118,10 @@ func (h *Handler) originAllowed(origin string) bool {
 }
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
-// header ends in ".{domain}".
-func NewHandler(domain string, resolver Resolver, log zerolog.Logger) *Handler {
+// header ends in ".{domain}" for one of the given domains.
+func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handler {
 	h := &Handler{
-		domain:       domain,
+		domains:      domains,
 		resolver:     resolver,
 		transports:   newTransportCache(),
 		sandboxConns: newConnLimiter(maxConnsPerSandbox),
@@ -161,7 +166,7 @@ func (h *Handler) StartSweeper(ctx context.Context) {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	port, instanceID, err := ParseRequest(r.Host, r.Header, h.domain)
+	port, instanceID, err := ParseRequest(r.Host, r.Header, h.domains)
 	if err != nil {
 		h.log.Warn().Err(err).Str("host", r.Host).Msg("bad host")
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)
