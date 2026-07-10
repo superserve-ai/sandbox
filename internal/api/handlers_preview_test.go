@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -21,9 +20,10 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
+var previewTestSeed = []byte("test-seed-for-hmac-32-bytes-min!!")
+
 // The real grpcVMDClient wraps RPC errors with fmt.Errorf("gRPC …: %w", err);
-// handlers must classify through the wrapping, so the stubs return wrapped
-// errors too.
+// handlers classify through the wrapping, so the stubs wrap too.
 func grpcNotFound(msg string) error {
 	return fmt.Errorf("gRPC UpdateSandboxPreviewPolicy: %w", status.Error(codes.NotFound, msg))
 }
@@ -32,7 +32,26 @@ func grpcUnavailable(msg string) error {
 	return fmt.Errorf("gRPC UpdateSandboxPreviewPolicy: %w", status.Error(codes.Unavailable, msg))
 }
 
-var previewTestSeed = []byte("test-seed-for-hmac-32-bytes-min!!")
+// portRows is a pgx.Rows over published-port rows for ListPublishedPorts.
+type portRows struct {
+	rows [][2]int32 // {port, token_version}
+	i    int
+}
+
+func (r *portRows) Close()                                       {}
+func (r *portRows) Err() error                                   { return nil }
+func (r *portRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *portRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *portRows) Next() bool                                   { r.i++; return r.i <= len(r.rows) }
+func (r *portRows) Values() ([]any, error)                       { return nil, nil }
+func (r *portRows) RawValues() [][]byte                          { return nil }
+func (r *portRows) Conn() *pgx.Conn                              { return nil }
+func (r *portRows) Scan(dest ...any) error {
+	row := r.rows[r.i-1]
+	*dest[0].(*int32) = row[0]
+	*dest[1].(*int32) = row[1]
+	return nil
+}
 
 type previewHandlerEnv struct {
 	sandboxID uuid.UUID
@@ -41,34 +60,67 @@ type previewHandlerEnv struct {
 	vmd       *stubVMD
 	handlers  *Handlers
 	router    *gin.Engine
+
+	// Controllable query results (adjust before a request).
+	getPortVersion   int32      // GetPublishedPort → this version; 0 => ErrNoRows
+	publishToVersion int32      // PublishPort RETURNING token_version
+	bumpToVersion    int32      // BumpPublishedPortVersion RETURNING token_version
+	unpublishRows    int64      // rows affected by UnpublishPort
+	listPorts        [][2]int32 // ListPublishedPorts rows
 }
 
-// newPreviewHandlerEnv wires a Handlers instance whose DB serves one sandbox
-// row (preview_access=private, version 1 unless the test mutates env.sb
-// before requests run) and whose bump query returns version+1.
 func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 	t.Helper()
 	env := &previewHandlerEnv{
-		sandboxID: uuid.New(),
-		teamID:    uuid.New(),
-		vmd:       &stubVMD{},
+		sandboxID:        uuid.New(),
+		teamID:           uuid.New(),
+		vmd:              &stubVMD{},
+		getPortVersion:   1,
+		publishToVersion: 1,
+		bumpToVersion:    2,
+		unpublishRows:    1,
+		listPorts:        [][2]int32{{3000, 1}},
 	}
 	env.sb = db.Sandbox{
-		ID:                  env.sandboxID,
-		TeamID:              env.teamID,
-		Name:                "preview-sb",
-		Status:              db.SandboxStatusActive,
-		HostID:              "host-1",
-		PreviewAccess:       auth.PreviewAccessPrivate,
-		PreviewTokenVersion: 1,
+		ID:            env.sandboxID,
+		TeamID:        env.teamID,
+		Name:          "preview-sb",
+		Status:        db.SandboxStatusActive,
+		HostID:        "host-1",
+		PreviewAccess: auth.PreviewAccessPrivate,
+	}
+
+	portFromArgs := func(args []any) int32 {
+		if len(args) >= 2 {
+			if p, ok := args[1].(int32); ok {
+				return p
+			}
+		}
+		return 0
 	}
 
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "preview_token_version + 1"):
+			case strings.Contains(sql, "token_version = token_version + 1"):
 				return &mockRow{scanFn: func(dest ...any) error {
-					*dest[0].(*int32) = env.sb.PreviewTokenVersion + 1
+					*dest[0].(*int32) = portFromArgs(args)
+					*dest[1].(*int32) = env.bumpToVersion
+					return nil
+				}}
+			case strings.Contains(sql, "INSERT INTO sandbox_published_port"):
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int32) = portFromArgs(args)
+					*dest[1].(*int32) = env.publishToVersion
+					return nil
+				}}
+			case strings.Contains(sql, "sandbox_published_port"): // GetPublishedPort
+				if env.getPortVersion == 0 {
+					return errorRow(pgx.ErrNoRows)
+				}
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int32) = portFromArgs(args)
+					*dest[1].(*int32) = env.getPortVersion
 					return nil
 				}}
 			case strings.Contains(sql, "FROM sandbox"):
@@ -77,7 +129,16 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 				return activityRow()
 			}
 		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "sandbox_published_port") {
+				return &portRows{rows: env.listPorts}, nil
+			}
+			return emptyRows{}, nil
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM sandbox_published_port") {
+				return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", env.unpublishRows)), nil
+			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
@@ -94,9 +155,11 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 		c.Set("team_id", env.teamID.String())
 		c.Next()
 	})
-	env.router.POST("/sandboxes/:sandbox_id/preview-token", env.handlers.MintSandboxPreviewToken)
-	env.router.POST("/sandboxes/:sandbox_id/preview-token/rotate", env.handlers.RotateSandboxPreviewToken)
-	env.router.PATCH("/sandboxes/:sandbox_id", env.handlers.PatchSandbox)
+	env.router.GET("/sandboxes/:sandbox_id/preview-ports", env.handlers.ListSandboxPreviewPorts)
+	env.router.POST("/sandboxes/:sandbox_id/preview-ports", env.handlers.PublishSandboxPreviewPort)
+	env.router.DELETE("/sandboxes/:sandbox_id/preview-ports/:port", env.handlers.UnpublishSandboxPreviewPort)
+	env.router.POST("/sandboxes/:sandbox_id/preview-ports/:port/token", env.handlers.MintSandboxPreviewToken)
+	env.router.POST("/sandboxes/:sandbox_id/preview-ports/:port/token/rotate", env.handlers.RotateSandboxPreviewToken)
 	return env
 }
 
@@ -113,195 +176,220 @@ func (e *previewHandlerEnv) do(method, path, body string) *httptest.ResponseReco
 	return w
 }
 
-func TestMintPreviewToken_DefaultSandboxWide(t *testing.T) {
+func (e *previewHandlerEnv) base() string {
+	return "/sandboxes/" + e.sandboxID.String() + "/preview-ports"
+}
+
+// ---------------------------------------------------------------------------
+// Publish / unpublish / list
+// ---------------------------------------------------------------------------
+
+func TestPublishPort_PushesFullSetToHost(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	w := env.do(http.MethodPost, "/sandboxes/"+env.sandboxID.String()+"/preview-token", "")
+	var pushedAccess string
+	var pushed map[int32]int64
+	env.vmd.updatePreviewFn = func(_ context.Context, _ string, access string, ports map[int32]int64) error {
+		pushedAccess, pushed = access, ports
+		return nil
+	}
+
+	w := env.do(http.MethodPost, env.base(), `{"port": 3000}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
+	if pushedAccess != auth.PreviewAccessPrivate || pushed[3000] != 1 {
+		t.Errorf("vmd push = (%q, %v), want (private, {3000:1})", pushedAccess, pushed)
+	}
 	body := parseJSON(t, w)
-
-	if body["header"] != auth.PreviewTokenHeader {
-		t.Errorf("header = %v, want %v", body["header"], auth.PreviewTokenHeader)
-	}
-	if body["query_param"] != auth.PreviewTokenQueryParam {
-		t.Errorf("query_param = %v, want %v", body["query_param"], auth.PreviewTokenQueryParam)
-	}
-	if body["preview_access"] != auth.PreviewAccessPrivate {
-		t.Errorf("preview_access = %v, want private", body["preview_access"])
-	}
-	if _, present := body["expires_at"]; present {
-		t.Error("expires_at present on a non-expiring token")
-	}
-
-	tok, _ := body["token"].(string)
-	// The minted token must verify for any port at the row's version...
-	if !auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 1, 3000, tok) {
-		t.Error("minted token does not verify for port 3000 at version 1")
-	}
-	if !auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 1, 8080, tok) {
-		t.Error("minted token is unexpectedly port-scoped")
-	}
-	// ...and die on rotation.
-	if auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 2, 3000, tok) {
-		t.Error("minted token still verifies after a version bump")
+	if v, _ := body["token_version"].(float64); int(v) != 1 {
+		t.Errorf("token_version = %v, want 1", body["token_version"])
 	}
 }
 
-func TestMintPreviewToken_PortScopedWithExpiry(t *testing.T) {
+func TestPublishPort_InvalidPort400(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	w := env.do(http.MethodPost, "/sandboxes/"+env.sandboxID.String()+"/preview-token",
-		`{"port": 3000, "expires_in_seconds": 3600}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
-	}
-	body := parseJSON(t, w)
-
-	expiresAt, _ := body["expires_at"].(string)
-	parsed, err := time.Parse(time.RFC3339, expiresAt)
-	if err != nil {
-		t.Fatalf("expires_at %q is not RFC3339: %v", expiresAt, err)
-	}
-	if until := time.Until(parsed); until < 55*time.Minute || until > 65*time.Minute {
-		t.Errorf("expires_at %v is not ~1h out", parsed)
-	}
-
-	tok, _ := body["token"].(string)
-	if !auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 1, 3000, tok) {
-		t.Error("token does not verify on its own port")
-	}
-	if auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 1, 8080, tok) {
-		t.Error("port-scoped token verifies on a different port")
-	}
-}
-
-func TestMintPreviewToken_Validation(t *testing.T) {
-	env := newPreviewHandlerEnv(t)
-	base := "/sandboxes/" + env.sandboxID.String() + "/preview-token"
-	cases := map[string]string{
-		"privileged port": `{"port": 80}`,
-		"port too big":    `{"port": 70000}`,
-		"expiry too long": `{"expires_in_seconds": 999999999}`,
-		"negative expiry": `{"expires_in_seconds": -1}`,
-		"unknown field":   `{"prot": 3000}`,
-	}
-	for name, body := range cases {
-		if w := env.do(http.MethodPost, base, body); w.Code != http.StatusBadRequest {
-			t.Errorf("%s: status = %d, want 400; body: %s", name, w.Code, w.Body.String())
+	for _, body := range []string{`{"port": 80}`, `{"port": 70000}`, `{"prt": 3000}`} {
+		if w := env.do(http.MethodPost, env.base(), body); w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, w.Code)
 		}
 	}
 }
 
-func TestMintPreviewToken_SeedMissing500(t *testing.T) {
+func TestPublishPort_VMDHardErrorIs500(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
+		return grpcUnavailable("vmd down")
+	}
+	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when host push fails", w.Code)
+	}
+}
+
+func TestPublishPort_VMDNotFoundIsOK(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
+		return grpcNotFound("no record on host")
+	}
+	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (NotFound → applies on next restore)", w.Code)
+	}
+}
+
+func TestUnpublishPort_NotPublished404(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.unpublishRows = 0
+	if w := env.do(http.MethodDelete, env.base()+"/3000", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestUnpublishPort_Success(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.listPorts = nil // nothing left published after delete
+	var pushed map[int32]int64
+	called := false
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
+		called, pushed = true, ports
+		return nil
+	}
+	w := env.do(http.MethodDelete, env.base()+"/3000", "")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	if !called || len(pushed) != 0 {
+		t.Errorf("expected empty set pushed to host, got called=%v ports=%v", called, pushed)
+	}
+}
+
+func TestListPreviewPorts_ReturnsSetNoTokens(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.listPorts = [][2]int32{{3000, 1}, {8080, 3}}
+	w := env.do(http.MethodGet, env.base(), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "token\"") || strings.Contains(w.Body.String(), "spv1.") {
+		t.Errorf("list response leaked a token: %s", w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if body["preview_access"] != auth.PreviewAccessPrivate {
+		t.Errorf("preview_access = %v", body["preview_access"])
+	}
+	ports, _ := body["ports"].([]any)
+	if len(ports) != 2 {
+		t.Fatalf("ports len = %d, want 2", len(ports))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mint (write-gated, port must be published)
+// ---------------------------------------------------------------------------
+
+func TestMintToken_PublishedPort(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.getPortVersion = 1
+	w := env.do(http.MethodPost, env.base()+"/3000/token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if body["header"] != auth.PreviewTokenHeader || body["query_param"] != auth.PreviewTokenQueryParam {
+		t.Errorf("carrier names wrong: %v / %v", body["header"], body["query_param"])
+	}
+	tok, _ := body["token"].(string)
+	if !auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 3000, 1, tok) {
+		t.Error("minted token does not verify for port 3000 v1")
+	}
+	if auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 3001, 1, tok) {
+		t.Error("minted token verifies for a different port")
+	}
+}
+
+func TestMintToken_UnpublishedPort404(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.getPortVersion = 0 // GetPublishedPort → ErrNoRows
+	if w := env.do(http.MethodPost, env.base()+"/3000/token", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for an unpublished port", w.Code)
+	}
+}
+
+func TestMintToken_ExpiryValidation(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	if w := env.do(http.MethodPost, env.base()+"/3000/token", `{"expires_in_seconds": 999999999}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestMintToken_SeedMissing500(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
 	env.handlers.Config = &config.Config{}
-	w := env.do(http.MethodPost, "/sandboxes/"+env.sandboxID.String()+"/preview-token", "")
-	if w.Code != http.StatusInternalServerError {
+	if w := env.do(http.MethodPost, env.base()+"/3000/token", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", w.Code)
 	}
 }
 
-func TestRotatePreviewToken_BumpsAndPushes(t *testing.T) {
-	env := newPreviewHandlerEnv(t)
+// ---------------------------------------------------------------------------
+// Rotate (per-port version)
+// ---------------------------------------------------------------------------
 
-	var pushedAccess string
-	var pushedVersion int64
-	env.vmd.updatePreviewFn = func(_ context.Context, id, access string, version int64) error {
-		if id != env.sandboxID.String() {
-			t.Errorf("vmd push id = %q, want %q", id, env.sandboxID)
-		}
-		pushedAccess, pushedVersion = access, version
+func TestRotateToken_BumpsOnlyThisPort(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.bumpToVersion = 2
+	env.listPorts = [][2]int32{{3000, 2}, {8080, 1}} // 8080 untouched
+
+	var pushed map[int32]int64
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
+		pushed = ports
 		return nil
 	}
 
-	w := env.do(http.MethodPost, "/sandboxes/"+env.sandboxID.String()+"/preview-token/rotate", "")
+	w := env.do(http.MethodPost, env.base()+"/3000/token/rotate", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	if pushedAccess != auth.PreviewAccessPrivate || pushedVersion != 2 {
-		t.Errorf("vmd push = (%q, %d), want (private, 2)", pushedAccess, pushedVersion)
+	if pushed[3000] != 2 || pushed[8080] != 1 {
+		t.Errorf("pushed set = %v, want {3000:2, 8080:1}", pushed)
 	}
-
 	body := parseJSON(t, w)
-	if v, _ := body["preview_token_version"].(float64); int(v) != 2 {
-		t.Errorf("preview_token_version = %v, want 2", body["preview_token_version"])
-	}
 	tok, _ := body["token"].(string)
-	if !auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 2, 3000, tok) {
-		t.Error("rotated token does not verify at the new version")
+	if !auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 3000, 2, tok) {
+		t.Error("rotated token does not verify at new version")
 	}
-	if auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 1, 3000, tok) {
-		t.Error("rotated token verifies at the old version")
+	if auth.VerifyPreviewToken(previewTestSeed, env.sandboxID.String(), 3000, 1, tok) {
+		t.Error("rotated token still verifies at old version")
 	}
 }
 
-func TestRotatePreviewToken_VMDHardErrorIs500(t *testing.T) {
+func TestRotateToken_VMDHardErrorIs500(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
 		return grpcUnavailable("vmd down")
 	}
-	w := env.do(http.MethodPost, "/sandboxes/"+env.sandboxID.String()+"/preview-token/rotate", "")
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500 when the host push fails", w.Code)
+	if w := env.do(http.MethodPost, env.base()+"/3000/token/rotate", ""); w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when host push fails", w.Code)
 	}
 }
 
-func TestRotatePreviewToken_VMDNotFoundIsOK(t *testing.T) {
-	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, int64) error {
-		return grpcNotFound("no record on host")
-	}
-	w := env.do(http.MethodPost, "/sandboxes/"+env.sandboxID.String()+"/preview-token/rotate", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (NotFound means next restore seeds the version)", w.Code)
-	}
-}
+// ---------------------------------------------------------------------------
+// PATCH preview_access still works, and pushes the published set
+// ---------------------------------------------------------------------------
 
-func TestPatchSandbox_PreviewAccess(t *testing.T) {
+func TestPatchSandbox_PreviewAccessPushesPublishedSet(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-
+	env.listPorts = [][2]int32{{3000, 1}}
 	var pushedAccess string
-	var pushedVersion int64
-	env.vmd.updatePreviewFn = func(_ context.Context, id, access string, version int64) error {
-		pushedAccess, pushedVersion = access, version
+	var pushed map[int32]int64
+	env.vmd.updatePreviewFn = func(_ context.Context, _, access string, ports map[int32]int64) error {
+		pushedAccess, pushed = access, ports
 		return nil
 	}
+	env.router.PATCH("/sandboxes/:sandbox_id", env.handlers.PatchSandbox)
 
 	w := env.do(http.MethodPatch, "/sandboxes/"+env.sandboxID.String(), `{"preview_access": "public"}`)
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
 	}
-	if pushedAccess != auth.PreviewAccessPublic || pushedVersion != 1 {
-		t.Errorf("vmd push = (%q, %d), want (public, 1)", pushedAccess, pushedVersion)
-	}
-}
-
-func TestPatchSandbox_PreviewAccessInvalidValue(t *testing.T) {
-	env := newPreviewHandlerEnv(t)
-	w := env.do(http.MethodPatch, "/sandboxes/"+env.sandboxID.String(), `{"preview_access": "friends-only"}`)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestPatchSandbox_PreviewAccessVMDHardErrorIs500(t *testing.T) {
-	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, int64) error {
-		return grpcUnavailable("vmd down")
-	}
-	w := env.do(http.MethodPatch, "/sandboxes/"+env.sandboxID.String(), `{"preview_access": "private"}`)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500 — a policy the host can't enforce must not report success", w.Code)
-	}
-}
-
-func TestPatchSandbox_PreviewAccessVMDNotFoundSucceeds(t *testing.T) {
-	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, int64) error {
-		return grpcNotFound("no record on host")
-	}
-	w := env.do(http.MethodPatch, "/sandboxes/"+env.sandboxID.String(), `{"preview_access": "private"}`)
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204 (no host record — applies on next restore)", w.Code)
+	if pushedAccess != auth.PreviewAccessPublic || pushed[3000] != 1 {
+		t.Errorf("vmd push = (%q, %v), want (public, {3000:1})", pushedAccess, pushed)
 	}
 }

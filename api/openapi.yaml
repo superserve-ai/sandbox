@@ -572,35 +572,122 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /sandboxes/{sandbox_id}/preview-token:
+  /sandboxes/{sandbox_id}/preview-ports:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
+
+    get:
+      operationId: listSandboxPreviewPorts
+      tags: [Sandboxes]
+      summary: List published preview ports
+      description: |
+        Returns the sandbox's preview policy and its set of published ports.
+        On a `private` sandbox, only the ports listed here are reachable at
+        `https://{port}-{id}.<sandbox-domain>` — every other port returns 404
+        at the edge (deny-by-default). Tokens are never included; mint them
+        per port.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: The sandbox's policy and published-port set
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewPortList"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: publishSandboxPreviewPort
+      tags: [Sandboxes]
+      summary: Publish a preview port
+      description: |
+        Publishes a port so it becomes reachable on a `private` sandbox.
+        Idempotent: re-publishing an already-published port keeps its current
+        token version (so live tokens are not revoked). Publishing does not by
+        itself require auth on the port — mint a token per published port via
+        `POST /sandboxes/{sandbox_id}/preview-ports/{port}/token`.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishPortRequest"
+      responses:
+        "200":
+          description: The published port
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewPort"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports/{port}:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
+
+    delete:
+      operationId: unpublishSandboxPreviewPort
+      tags: [Sandboxes]
+      summary: Unpublish a preview port
+      description: |
+        Removes a port from the published set. On a `private` sandbox it is
+        immediately no longer routable (404 at the edge) and its outstanding
+        tokens stop working.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Port unpublished
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports/{port}/token:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
 
     post:
       operationId: mintSandboxPreviewToken
       tags: [Sandboxes]
-      summary: Mint a preview token
+      summary: Mint a preview token for a published port
       description: |
-        Mints a token that authenticates requests to the sandbox's preview
-        URLs (`https://{port}-{id}.<sandbox-domain>`) while `preview_access`
-        is `private`.
+        Mints a token that authenticates requests to `{port}-{id}` while the
+        sandbox is `private`. The port must already be published (`404`
+        otherwise). Every token is scoped to this one port — it never
+        authenticates another.
 
         Two ways to present it:
-        - **Header** (machine clients, reverse proxies): send the token in
-          the header named by `header` in the response.
+        - **Header** (machine clients, reverse proxies): send the token in the
+          header named by `header` in the response.
         - **Signed link** (browsers): append `?<query_param>=<token>` to the
-          preview URL. The edge proxy verifies it, moves it into a
-          host-scoped cookie, and redirects to the URL with the token
-          stripped — subsequent requests (including WebSockets) ride the
-          cookie.
+          preview URL. The edge proxy verifies it, moves it into a host-scoped
+          cookie, and redirects to the URL with the token stripped —
+          subsequent requests (including WebSockets) ride the cookie.
 
-        The body is optional. An empty body mints a sandbox-wide token with
-        no expiry, valid until it is rotated. Scope it to one port and/or
-        give it an expiry for shareable links.
-
-        Tokens are minted, never stored: this endpoint can be called any
-        number of times and does not invalidate previous tokens. Revocation
-        is `POST /sandboxes/{sandbox_id}/preview-token/rotate`.
+        The body is optional; omit it for a token that lives until this port's
+        version is rotated, or set `expires_in_seconds` for a shareable link.
+        Minting requires sandbox write access — a token is a live credential
+        into the running sandbox.
       security:
         - apiKey: []
       requestBody:
@@ -625,21 +712,20 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /sandboxes/{sandbox_id}/preview-token/rotate:
+  /sandboxes/{sandbox_id}/preview-ports/{port}/token/rotate:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
 
     post:
       operationId: rotateSandboxPreviewToken
       tags: [Sandboxes]
-      summary: Rotate the preview token generation
+      summary: Rotate a published port's token generation
       description: |
-        Advances the sandbox's preview-token generation, immediately
-        invalidating **every** previously minted preview token (headers,
-        signed links, and browser cookies alike), and returns a fresh
-        sandbox-wide token minted against the new generation.
-
-        Use this when a token may have leaked, or on a schedule for hygiene.
+        Advances **only this port's** token generation, immediately
+        invalidating its outstanding tokens (headers, signed links, and
+        browser cookies alike) while leaving every other published port's
+        tokens valid. Returns a fresh token for the port.
       security:
         - apiKey: []
       responses:
@@ -1848,6 +1934,16 @@ components:
         $ref: "#/components/schemas/PublicSandboxId"
       description: The unique identifier of the sandbox.
 
+    PreviewPort:
+      name: port
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1024
+        maximum: 65535
+      description: A preview port number.
+
     TemplateId:
       name: template_id
       in: path
@@ -2069,11 +2165,11 @@ components:
             Preview URL access policy. `public` (the default) keeps today's
             behavior: any process listening on a port is reachable at
             `https://{port}-{id}.<sandbox-domain>` without authentication.
-            `private` makes the edge proxy require a preview token on every
-            request to those URLs — set it at create and the sandbox is
-            never publicly reachable, not even briefly. Mint tokens via
-            `POST /sandboxes/{sandbox_id}/preview-token`; toggle the policy
-            later via `PATCH /sandboxes/{sandbox_id}`.
+            `private` is deny-by-default: only ports explicitly published via
+            `POST /sandboxes/{sandbox_id}/preview-ports` are reachable, and
+            each requires a per-port token. Set it at create and the sandbox is
+            never publicly reachable, not even briefly. Toggle the policy later
+            via `PATCH /sandboxes/{sandbox_id}`.
 
     ActivityResponse:
       description: One audit-log activity row returned by the activity list endpoint.
@@ -2198,10 +2294,10 @@ components:
           type: string
           enum: [public, private]
           description: >
-            Preview URL access policy. `private` means preview URLs require
-            a preview token; `public` means they are reachable without
-            authentication. The token itself is never included in sandbox
-            responses — mint it via `POST /sandboxes/{sandbox_id}/preview-token`.
+            Preview URL access policy. `private` is deny-by-default (only
+            published ports route, each token-gated); `public` means every
+            port is reachable without authentication. Manage ports and tokens
+            under `/sandboxes/{sandbox_id}/preview-ports`.
 
     SandboxResponse:
       description: Single-sandbox shape — `SandboxListItem` plus `access_token` and bound secrets.
@@ -2428,31 +2524,62 @@ components:
           type: string
           enum: [public, private]
           description: |
-            Toggle the preview URL policy. `private` makes the edge proxy
-            require a preview token on `https://{port}-{id}.<sandbox-domain>`
-            requests; `public` restores unauthenticated access. Takes effect
-            immediately on a running sandbox and persists across
-            pause/resume. Outstanding preview tokens are not revoked by the
-            toggle — use `POST /sandboxes/{sandbox_id}/preview-token/rotate`
-            for that.
+            Toggle the preview URL policy. `private` is deny-by-default (only
+            published ports route, each token-gated); `public` restores
+            unauthenticated access to every port. Takes effect immediately on a
+            running sandbox and persists across pause/resume. The published-port
+            set and outstanding tokens are unchanged by the toggle — manage them
+            under `/sandboxes/{sandbox_id}/preview-ports`.
       example:
         metadata:
           env: prod
           owner: agent-7
 
-    PreviewTokenRequest:
+    PublishPortRequest:
       type: object
-      description: |
-        Optional constraints for a minted preview token. Omit the body (or
-        send `{}`) for a sandbox-wide, non-expiring token.
+      required: [port]
       properties:
         port:
           type: integer
           minimum: 1024
           maximum: 65535
+          description: The port to publish.
+
+    PreviewPort:
+      type: object
+      required: [port, token_version]
+      properties:
+        port:
+          type: integer
+          description: The published port.
+        token_version:
+          type: integer
+          format: int32
           description: >
-            Scope the token to a single preview port. Omitted means the
-            token authenticates every port on the sandbox.
+            The port's current token generation. Tokens embed it; rotating the
+            port advances it and invalidates the port's outstanding tokens.
+
+    PreviewPortList:
+      type: object
+      required: [preview_access, ports]
+      properties:
+        preview_access:
+          type: string
+          enum: [public, private]
+          description: >
+            The sandbox's policy. `ports` only gate traffic when this is
+            `private`.
+        ports:
+          type: array
+          items:
+            $ref: "#/components/schemas/PreviewPort"
+
+    PreviewTokenRequest:
+      type: object
+      description: |
+        Optional constraints for a minted preview token. Omit the body (or
+        send `{}`) for a token that lives until the port's version is rotated.
+      properties:
         expires_in_seconds:
           type: integer
           format: int64
@@ -2460,15 +2587,18 @@ components:
           maximum: 604800
           description: >
             Give the token a lifetime, in seconds (maximum 604800 = 7 days).
-            Omitted means the token lives until the generation is rotated.
+            Omitted means the token lives until the port's version is rotated.
 
     PreviewTokenResponse:
       type: object
-      required: [token, header, query_param, preview_access, preview_token_version]
+      required: [token, port, header, query_param, preview_access, token_version]
       properties:
         token:
           type: string
           description: The preview token. Treat it as a secret.
+        port:
+          type: integer
+          description: The published port this token authorizes.
         header:
           type: string
           description: >
@@ -2490,10 +2620,10 @@ components:
           description: >
             The sandbox's current policy — when `public`, the token is not
             actually required yet.
-        preview_token_version:
+        token_version:
           type: integer
           format: int32
-          description: The generation this token was minted against.
+          description: The port generation this token was minted against.
 
     BuildSpec:
       type: object

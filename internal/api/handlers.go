@@ -567,10 +567,18 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			// Carry the row's preview policy: the stateless restore builds a
-			// fresh instance record, and omitting it would silently reopen a
-			// private sandbox's ports.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), sandbox.PreviewAccess, int64(sandbox.PreviewTokenVersion), nil)
+			// Carry the row's preview policy AND published-port set: the
+			// stateless restore builds a fresh instance record, and omitting
+			// either would silently reopen a private sandbox's ports (empty
+			// set → everything 404s → fail closed, not open).
+			previewPorts, ppErr := h.loadPreviewPorts(c.Request.Context(), sandboxID)
+			if ppErr != nil {
+				log.Error().Err(ppErr).Str("sandbox_id", sandboxID.String()).Msg("load published ports for resume failed")
+				revertToPaused()
+				respondError(c, ErrInternal)
+				return false
+			}
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), sandbox.PreviewAccess, previewPorts, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -1586,13 +1594,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Preview policy applies from the very first moment the VM is routable:
 	// it rides the RestoreSnapshot call itself, so a "private" sandbox never
-	// has a public window. New sandboxes always start at token version 1
-	// (the DB column default — the INSERT below runs in parallel).
+	// has a public window. A brand-new sandbox has no published ports yet —
+	// deny-by-default means every port 404s until one is explicitly published
+	// via POST /sandboxes/:id/preview-ports.
 	previewAccess := auth.PreviewAccessPublic
 	if req.PreviewAccess != nil {
 		previewAccess = *req.PreviewAccess
 	}
-	const initialPreviewTokenVersion = 1
 
 	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
 	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
@@ -1814,7 +1822,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, initialPreviewTokenVersion, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -2543,9 +2551,16 @@ func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, t
 		return false
 	}
 
+	previewPorts, err := h.loadPreviewPorts(c.Request.Context(), sandbox.ID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("load published ports for preview-access patch failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 	defer vmdCancel()
-	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), access, int64(sandbox.PreviewTokenVersion))
+	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), access, previewPorts)
 	if err != nil && status.Code(err) != codes.NotFound {
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD UpdateSandboxPreviewPolicy failed")
 		respondError(c, ErrInternal)

@@ -32,25 +32,42 @@ const (
 
 // enforcePreviewAccess gates a numeric-port request against the sandbox's
 // preview policy. It returns true when the request may proceed to the
-// reverse proxy; false when it has already written a response (401 or the
-// cookie-bootstrap redirect).
+// reverse proxy; false when it has already written a response (404 for an
+// unpublished port, 401 for a missing/invalid token, or the cookie-bootstrap
+// redirect).
 //
-// It runs before the status check on purpose: an unauthenticated caller
-// probing a private sandbox learns nothing — not even whether the sandbox
-// is running or paused. Every rejection is the same 401.
+// The order is deny-by-default → auth → status, all before the reverse proxy:
+//   - A private sandbox routes ONLY explicitly published ports. Any other
+//     port returns 404, even with a valid token for a different port —
+//     publishing 3001 never makes 3000 reachable.
+//   - A published port then requires a token scoped to that exact port and
+//     its current version.
+//   - Auth runs before the status check, so an unauthenticated caller can't
+//     even learn whether the sandbox is running or paused.
 func (h *Handler) enforcePreviewAccess(w http.ResponseWriter, r *http.Request, instanceID string, port int, info InstanceInfo) bool {
 	switch info.PreviewAccess {
 	case "", auth.PreviewAccessPublic:
-		// Empty = the record predates the feature; both mean open.
+		// Empty = the record predates the feature; both mean open (legacy:
+		// every listening port is routable with no auth).
 		return true
 	}
 	// "private" — and any unknown future policy value, which an older proxy
 	// must interpret as the most restrictive thing it knows how to enforce,
 	// never as public.
 
+	// Deny-by-default allowlist. A port is reachable only if it has been
+	// explicitly published; everything else is 404 before any auth or status
+	// is revealed. A nil/empty set (private sandbox with nothing published,
+	// or an older vmd record) therefore denies every port — fail closed.
+	version, published := info.PreviewPorts[port]
+	if !published {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return false
+	}
+
 	// CORS preflights carry no credentials or custom headers by spec —
 	// blocking them would break every authenticated cross-origin fetch.
-	// The app answers them; preflight responses expose only CORS policy.
+	// Only reached for a published port; the app answers it.
 	if r.Method == http.MethodOptions {
 		return true
 	}
@@ -66,7 +83,7 @@ func (h *Handler) enforcePreviewAccess(w http.ResponseWriter, r *http.Request, i
 	}
 
 	verify := func(tok string) bool {
-		return auth.VerifyPreviewToken(h.seedKey, instanceID, info.PreviewTokenVersion, port, tok)
+		return auth.VerifyPreviewToken(h.seedKey, instanceID, port, version, tok)
 	}
 
 	// Carriers are tried independently — a stale cookie must not lock out a

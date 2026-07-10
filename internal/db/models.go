@@ -435,10 +435,8 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
-	// Preview URL access policy: 'public' (unauthenticated, the default) or 'private' (requires a preview token at the edge proxy). Settable at create and via PATCH.
+	// Preview URL access policy: 'public' (unauthenticated, all ports, the default) or 'private' (deny-by-default; only published ports route, each token-gated). Settable at create and via PATCH.
 	PreviewAccess string `json:"preview_access"`
-	// Preview token generation. Tokens embed this version; bumping it (POST /sandboxes/:id/preview-token/rotate) revokes all outstanding ones.
-	PreviewTokenVersion int32 `json:"preview_token_version"`
 }
 
 type SandboxActiveInterval struct {
@@ -460,6 +458,15 @@ type SandboxComputeBillingInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+}
+
+// Explicitly published preview ports for a private sandbox. Presence of a row is what makes a port routable at the edge; token_version is the per-port credential generation used for independent rotation.
+type SandboxPublishedPort struct {
+	SandboxID    uuid.UUID `json:"sandbox_id"`
+	Port         int32     `json:"port"`
+	TokenVersion int32     `json:"token_version"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type SandboxRevocation struct {

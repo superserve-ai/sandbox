@@ -49,18 +49,21 @@ const (
 	maxPreviewTokenLen = 512
 )
 
-// PreviewClaims is the authenticated payload of a preview token.
+// PreviewClaims is the authenticated payload of a preview token. Every token
+// is scoped to exactly one published port: there is no sandbox-wide token, so
+// a leaked or shared credential can never reach a port other than the one it
+// was minted for.
 type PreviewClaims struct {
 	// SandboxID is the bare sandbox UUID (region prefix stripped), matching
 	// what the edge proxy derives from the request host.
 	SandboxID string `json:"sid"`
-	// Version must equal the sandbox's current preview_token_version.
-	// Rotating the version invalidates every previously minted token.
+	// Port is the single published port this token authorizes. Required.
+	Port int `json:"p"`
+	// Version must equal that port's current token_version. Rotating one
+	// port's version invalidates only that port's outstanding tokens.
 	Version int64 `json:"v"`
-	// Port restricts the token to one preview port; 0 means any port.
-	Port int `json:"p,omitempty"`
 	// ExpiresAt is a Unix-seconds expiry; 0 means no expiry (the token lives
-	// until the version rotates or the sandbox goes public/away).
+	// until the port's version rotates or the port is unpublished).
 	ExpiresAt int64 `json:"exp,omitempty"`
 }
 
@@ -75,11 +78,11 @@ func ComputePreviewToken(seed []byte, claims PreviewClaims) (string, error) {
 	if claims.SandboxID == "" {
 		return "", fmt.Errorf("auth: preview token requires a sandbox ID")
 	}
+	if claims.Port < 1 || claims.Port > 65535 {
+		return "", fmt.Errorf("auth: preview token requires a port in [1, 65535], got %d", claims.Port)
+	}
 	if claims.Version <= 0 {
 		return "", fmt.Errorf("auth: preview token requires a positive version")
-	}
-	if claims.Port < 0 || claims.Port > 65535 {
-		return "", fmt.Errorf("auth: preview token port out of range: %d", claims.Port)
 	}
 	if claims.ExpiresAt < 0 {
 		return "", fmt.Errorf("auth: preview token expiry must not be negative")
@@ -93,13 +96,15 @@ func ComputePreviewToken(seed []byte, claims PreviewClaims) (string, error) {
 }
 
 // VerifyPreviewToken checks a presented token against the sandbox identity
-// derived from the request host, the record's current token version, and the
-// requested port. It fails closed: any parse error, signature mismatch, claim
-// mismatch, or a non-positive record version rejects the token. The MAC is
-// verified before the payload is decoded, so unauthenticated bytes never
-// reach the JSON parser.
-func VerifyPreviewToken(seed []byte, sandboxID string, recordVersion int64, port int, presented string) bool {
-	if len(seed) == 0 || sandboxID == "" || recordVersion <= 0 {
+// derived from the request host, the requested port, and that published
+// port's current token version. It fails closed: any parse error, signature
+// mismatch, claim mismatch, or a non-positive published version rejects the
+// token. The MAC is verified before the payload is decoded, so unauthenticated
+// bytes never reach the JSON parser. The caller is responsible for having
+// already confirmed the port is published (deny-by-default 404) — this only
+// authenticates the token for an established port.
+func VerifyPreviewToken(seed []byte, sandboxID string, port int, publishedVersion int64, presented string) bool {
+	if len(seed) == 0 || sandboxID == "" || port <= 0 || publishedVersion <= 0 {
 		return false
 	}
 	if presented == "" || len(presented) > maxPreviewTokenLen {
@@ -129,10 +134,11 @@ func VerifyPreviewToken(seed []byte, sandboxID string, recordVersion int64, port
 	if claims.SandboxID != sandboxID {
 		return false
 	}
-	if claims.Version != recordVersion {
+	// Port is mandatory and exact — no sandbox-wide tokens.
+	if claims.Port != port {
 		return false
 	}
-	if claims.Port != 0 && claims.Port != port {
+	if claims.Version != publishedVersion {
 		return false
 	}
 	if claims.ExpiresAt != 0 && time.Now().Unix() >= claims.ExpiresAt {

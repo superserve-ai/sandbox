@@ -54,8 +54,8 @@ type VMRecord struct {
 	// Persisted so the preview-access policy survives a vmd restart —
 	// otherwise a reattach would silently reopen a private sandbox's ports.
 	// Absent in records that predate the feature → zero values → public.
-	PreviewAccess       string `json:"preview_access,omitempty"`
-	PreviewTokenVersion int64  `json:"preview_token_version,omitempty"`
+	PreviewAccess string          `json:"preview_access,omitempty"`
+	PreviewPorts  map[int32]int64 `json:"preview_ports,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -212,8 +212,8 @@ func toRecord(inst *VMInstance) VMRecord {
 		TeamID:       inst.TeamID,
 		OwnerID:      inst.OwnerID,
 
-		PreviewAccess:       inst.PreviewAccess,
-		PreviewTokenVersion: inst.PreviewTokenVersion,
+		PreviewAccess: inst.PreviewAccess,
+		PreviewPorts:  inst.PreviewPorts,
 	}
 }
 
@@ -239,8 +239,8 @@ func toInstance(rec VMRecord) *VMInstance {
 		TeamID:       rec.TeamID,
 		OwnerID:      rec.OwnerID,
 
-		PreviewAccess:       rec.PreviewAccess,
-		PreviewTokenVersion: rec.PreviewTokenVersion,
+		PreviewAccess: rec.PreviewAccess,
+		PreviewPorts:  rec.PreviewPorts,
 
 		Config: VMConfig{
 			VCPU:      rec.VCPU,

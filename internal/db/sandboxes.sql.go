@@ -87,7 +87,7 @@ WITH paused AS (
     AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access, preview_token_version
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access
 ),
 closed_interval AS (
   UPDATE sandbox_active_interval
@@ -103,7 +103,7 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.preview_access, p.preview_token_version
+SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.preview_access
 FROM paused p
 LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
@@ -114,32 +114,31 @@ type BeginPauseParams struct {
 }
 
 type BeginPauseRow struct {
-	ID                  uuid.UUID          `json:"id"`
-	TeamID              uuid.UUID          `json:"team_id"`
-	Name                string             `json:"name"`
-	Status              SandboxStatus      `json:"status"`
-	VcpuCount           int32              `json:"vcpu_count"`
-	MemoryMib           int32              `json:"memory_mib"`
-	HostID              string             `json:"host_id"`
-	IpAddress           *netip.Addr        `json:"ip_address"`
-	Pid                 *int32             `json:"pid"`
-	SnapshotID          pgtype.UUID        `json:"snapshot_id"`
-	CreatedAt           time.Time          `json:"created_at"`
-	UpdatedAt           time.Time          `json:"updated_at"`
-	DestroyedAt         pgtype.Timestamptz `json:"destroyed_at"`
-	NetworkConfig       []byte             `json:"network_config"`
-	TimeoutSeconds      *int32             `json:"timeout_seconds"`
-	Metadata            []byte             `json:"metadata"`
-	TemplateID          pgtype.UUID        `json:"template_id"`
-	SnapshotPath        *string            `json:"snapshot_path"`
-	MemPath             *string            `json:"mem_path"`
-	BasePath            *string            `json:"base_path"`
-	DeltaPath           *string            `json:"delta_path"`
-	DiskMib             int32              `json:"disk_mib"`
-	AutoDeleteSeconds   *int32             `json:"auto_delete_seconds"`
-	AutoDeleteAt        pgtype.Timestamptz `json:"auto_delete_at"`
-	PreviewAccess       string             `json:"preview_access"`
-	PreviewTokenVersion int32              `json:"preview_token_version"`
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Name              string             `json:"name"`
+	Status            SandboxStatus      `json:"status"`
+	VcpuCount         int32              `json:"vcpu_count"`
+	MemoryMib         int32              `json:"memory_mib"`
+	HostID            string             `json:"host_id"`
+	IpAddress         *netip.Addr        `json:"ip_address"`
+	Pid               *int32             `json:"pid"`
+	SnapshotID        pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DestroyedAt       pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig     []byte             `json:"network_config"`
+	TimeoutSeconds    *int32             `json:"timeout_seconds"`
+	Metadata          []byte             `json:"metadata"`
+	TemplateID        pgtype.UUID        `json:"template_id"`
+	SnapshotPath      *string            `json:"snapshot_path"`
+	MemPath           *string            `json:"mem_path"`
+	BasePath          *string            `json:"base_path"`
+	DeltaPath         *string            `json:"delta_path"`
+	DiskMib           int32              `json:"disk_mib"`
+	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	PreviewAccess     string             `json:"preview_access"`
 }
 
 // Atomic ownership + state check + transition to 'pausing' AND close of any
@@ -181,7 +180,6 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.PreviewAccess,
-		&i.PreviewTokenVersion,
 	)
 	return i, err
 }
@@ -190,7 +188,7 @@ const beginResume = `-- name: BeginResume :one
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access, preview_token_version
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access
 `
 
 type BeginResumeParams struct {
@@ -231,31 +229,35 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.PreviewAccess,
-		&i.PreviewTokenVersion,
 	)
 	return i, err
 }
 
-const bumpSandboxPreviewTokenVersion = `-- name: BumpSandboxPreviewTokenVersion :one
-UPDATE sandbox
-SET preview_token_version = preview_token_version + 1, updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-RETURNING preview_token_version
+const bumpPublishedPortVersion = `-- name: BumpPublishedPortVersion :one
+UPDATE sandbox_published_port
+SET token_version = token_version + 1, updated_at = now()
+WHERE sandbox_id = $1 AND port = $2
+RETURNING port, token_version
 `
 
-type BumpSandboxPreviewTokenVersionParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
+type BumpPublishedPortVersionParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
 }
 
-// Revokes every outstanding preview token by advancing the generation the
-// proxy verifies against. Returns the new version for the vmd push + the
-// freshly minted replacement token.
-func (q *Queries) BumpSandboxPreviewTokenVersion(ctx context.Context, arg BumpSandboxPreviewTokenVersionParams) (int32, error) {
-	row := q.db.QueryRow(ctx, bumpSandboxPreviewTokenVersion, arg.ID, arg.TeamID)
-	var preview_token_version int32
-	err := row.Scan(&preview_token_version)
-	return preview_token_version, err
+type BumpPublishedPortVersionRow struct {
+	Port         int32 `json:"port"`
+	TokenVersion int32 `json:"token_version"`
+}
+
+// Rotate one port's credential: advance only this port's generation, leaving
+// every other published port's tokens valid. Returns the new version for the
+// vmd push + the freshly minted replacement token.
+func (q *Queries) BumpPublishedPortVersion(ctx context.Context, arg BumpPublishedPortVersionParams) (BumpPublishedPortVersionRow, error) {
+	row := q.db.QueryRow(ctx, bumpPublishedPortVersion, arg.SandboxID, arg.Port)
+	var i BumpPublishedPortVersionRow
+	err := row.Scan(&i.Port, &i.TokenVersion)
+	return i, err
 }
 
 const claimAutoDeleteSandboxes = `-- name: ClaimAutoDeleteSandboxes :many
@@ -508,7 +510,7 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 const createSandbox = `-- name: CreateSandbox :one
 INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, preview_access)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access, preview_token_version
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access
 `
 
 type CreateSandboxParams struct {
@@ -589,7 +591,6 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.PreviewAccess,
-		&i.PreviewTokenVersion,
 	)
 	return i, err
 }
@@ -604,7 +605,7 @@ WITH tpl AS (
 )
 INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, preview_access)
 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, $21 FROM tpl
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access, preview_token_version
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access
 `
 
 type CreateSandboxFromTemplateParams struct {
@@ -686,7 +687,6 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.PreviewAccess,
-		&i.PreviewTokenVersion,
 	)
 	return i, err
 }
@@ -827,8 +827,30 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 	return snapshot_id, err
 }
 
+const getPublishedPort = `-- name: GetPublishedPort :one
+SELECT port, token_version FROM sandbox_published_port
+WHERE sandbox_id = $1 AND port = $2
+`
+
+type GetPublishedPortParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
+}
+
+type GetPublishedPortRow struct {
+	Port         int32 `json:"port"`
+	TokenVersion int32 `json:"token_version"`
+}
+
+func (q *Queries) GetPublishedPort(ctx context.Context, arg GetPublishedPortParams) (GetPublishedPortRow, error) {
+	row := q.db.QueryRow(ctx, getPublishedPort, arg.SandboxID, arg.Port)
+	var i GetPublishedPortRow
+	err := row.Scan(&i.Port, &i.TokenVersion)
+	return i, err
+}
+
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access, preview_token_version FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -866,7 +888,6 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.PreviewAccess,
-		&i.PreviewTokenVersion,
 	)
 	return i, err
 }
@@ -934,6 +955,39 @@ func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 	return items, nil
 }
 
+const listPublishedPorts = `-- name: ListPublishedPorts :many
+SELECT port, token_version FROM sandbox_published_port
+WHERE sandbox_id = $1
+ORDER BY port
+`
+
+type ListPublishedPortsRow struct {
+	Port         int32 `json:"port"`
+	TokenVersion int32 `json:"token_version"`
+}
+
+// The published-port set for a sandbox, ascending. Backs both the API list
+// response and the full set pushed to vmd after any publish/unpublish/rotate.
+func (q *Queries) ListPublishedPorts(ctx context.Context, sandboxID uuid.UUID) ([]ListPublishedPortsRow, error) {
+	rows, err := q.db.Query(ctx, listPublishedPorts, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPublishedPortsRow{}
+	for rows.Next() {
+		var i ListPublishedPortsRow
+		if err := rows.Scan(&i.Port, &i.TokenVersion); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRecentlyDestroyedSandboxIDsByHost = `-- name: ListRecentlyDestroyedSandboxIDsByHost :many
 SELECT id
 FROM sandbox
@@ -971,7 +1025,7 @@ func (q *Queries) ListRecentlyDestroyedSandboxIDsByHost(ctx context.Context, arg
 }
 
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.preview_access, s.preview_token_version, snap.path AS snapshot_path
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.preview_access, snap.path AS snapshot_path
 FROM sandbox s
 LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL
@@ -1019,7 +1073,6 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 			&i.Sandbox.AutoDeleteSeconds,
 			&i.Sandbox.AutoDeleteAt,
 			&i.Sandbox.PreviewAccess,
-			&i.Sandbox.PreviewTokenVersion,
 			&i.SnapshotPath,
 		); err != nil {
 			return nil, err
@@ -1033,7 +1086,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access, preview_token_version FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, preview_access FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
@@ -1116,7 +1169,6 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 			&i.AutoDeleteSeconds,
 			&i.AutoDeleteAt,
 			&i.PreviewAccess,
-			&i.PreviewTokenVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -1194,6 +1246,33 @@ func (q *Queries) MarkSandboxFailedInTeam(ctx context.Context, arg MarkSandboxFa
 	return err
 }
 
+const publishPort = `-- name: PublishPort :one
+INSERT INTO sandbox_published_port (sandbox_id, port)
+VALUES ($1, $2)
+ON CONFLICT (sandbox_id, port) DO UPDATE SET updated_at = now()
+RETURNING port, token_version
+`
+
+type PublishPortParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
+}
+
+type PublishPortRow struct {
+	Port         int32 `json:"port"`
+	TokenVersion int32 `json:"token_version"`
+}
+
+// Idempotent publish: first publish starts at version 1; re-publishing an
+// existing port is a no-op that returns the current version (it must NOT
+// reset the version, or a republish would silently revoke live tokens).
+func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (PublishPortRow, error) {
+	row := q.db.QueryRow(ctx, publishPort, arg.SandboxID, arg.Port)
+	var i PublishPortRow
+	err := row.Scan(&i.Port, &i.TokenVersion)
+	return i, err
+}
+
 const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
 UPDATE sandbox
 SET status = 'paused',
@@ -1231,6 +1310,24 @@ func (q *Queries) SandboxExists(ctx context.Context, arg SandboxExistsParams) (b
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const unpublishPort = `-- name: UnpublishPort :execrows
+DELETE FROM sandbox_published_port
+WHERE sandbox_id = $1 AND port = $2
+`
+
+type UnpublishPortParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
+}
+
+func (q *Queries) UnpublishPort(ctx context.Context, arg UnpublishPortParams) (int64, error) {
+	result, err := q.db.Exec(ctx, unpublishPort, arg.SandboxID, arg.Port)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateSandboxAutoDelete = `-- name: UpdateSandboxAutoDelete :execrows

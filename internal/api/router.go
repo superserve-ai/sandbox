@@ -41,10 +41,14 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
-		// Preview URL auth: mint is a read (like the access_token on GET),
-		// rotate mutates the token generation and is a write.
-		api.POST("/sandboxes/:sandbox_id/preview-token", h.MintSandboxPreviewToken)
-		api.POST("/sandboxes/:sandbox_id/preview-token/rotate", h.RotateSandboxPreviewToken)
+		// Preview URL auth: deny-by-default published ports, each with its own
+		// token lifecycle. Listing is a read; publish/unpublish and mint/rotate
+		// are writes (a token is a live data-plane credential).
+		api.GET("/sandboxes/:sandbox_id/preview-ports", h.ListSandboxPreviewPorts)
+		api.POST("/sandboxes/:sandbox_id/preview-ports", h.PublishSandboxPreviewPort)
+		api.DELETE("/sandboxes/:sandbox_id/preview-ports/:port", h.UnpublishSandboxPreviewPort)
+		api.POST("/sandboxes/:sandbox_id/preview-ports/:port/token", h.MintSandboxPreviewToken)
+		api.POST("/sandboxes/:sandbox_id/preview-ports/:port/token/rotate", h.RotateSandboxPreviewToken)
 		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
 		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 

@@ -18,8 +18,12 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Test harness — numeric preview ports (not the boxd label)
+// Test harness — numeric preview ports (not the boxd label). Requests target
+// port 3000 (see request()); publish 3000 to make it routable, publish some
+// other port (or nothing) to exercise the deny-by-default 404.
 // ---------------------------------------------------------------------------
+
+const previewReqPort = 3000
 
 type previewTestEnv struct {
 	t          *testing.T
@@ -42,7 +46,9 @@ type previewCapturedRequest struct {
 	received  bool
 }
 
-func newPreviewTestEnv(t *testing.T, access string, tokenVersion int64) *previewTestEnv {
+// newPreviewTestEnv wires a proxy whose single sandbox has the given preview
+// policy and published-port set (port → token version).
+func newPreviewTestEnv(t *testing.T, access string, ports map[int]int64) *previewTestEnv {
 	t.Helper()
 
 	env := &previewTestEnv{
@@ -71,11 +77,11 @@ func newPreviewTestEnv(t *testing.T, access string, tokenVersion int64) *preview
 	upURL, _ := url.Parse(env.upstream.URL)
 	env.resolver = &stubResolver{
 		info: InstanceInfo{
-			VMIP:                upURL.Hostname(),
-			Status:              "running",
-			StartedAt:           time.Now().UnixNano(),
-			PreviewAccess:       access,
-			PreviewTokenVersion: tokenVersion,
+			VMIP:          upURL.Hostname(),
+			Status:        "running",
+			StartedAt:     time.Now().UnixNano(),
+			PreviewAccess: access,
+			PreviewPorts:  ports,
 		},
 	}
 
@@ -99,10 +105,16 @@ func newPreviewTestEnv(t *testing.T, access string, tokenVersion int64) *preview
 	return env
 }
 
+// publishedPort is a convenience for the common "port 3000 at version v" set.
+func publishedPort(v int64) map[int]int64 { return map[int]int64{previewReqPort: v} }
+
 func (e *previewTestEnv) token(claims auth.PreviewClaims) string {
 	e.t.Helper()
 	if claims.SandboxID == "" {
 		claims.SandboxID = e.sandboxID
+	}
+	if claims.Port == 0 {
+		claims.Port = previewReqPort
 	}
 	tok, err := auth.ComputePreviewToken(e.seedKey, claims)
 	if err != nil {
@@ -135,7 +147,7 @@ func (e *previewTestEnv) captured() previewCapturedRequest {
 
 func TestPreview_PublicNoCredentialNeeded(t *testing.T) {
 	for _, access := range []string{"", auth.PreviewAccessPublic} {
-		env := newPreviewTestEnv(t, access, 0)
+		env := newPreviewTestEnv(t, access, nil)
 		w := env.serve(env.request(http.MethodGet, "http://unused/index.html"))
 		if w.Code != http.StatusOK {
 			t.Fatalf("access=%q: status = %d, want 200; body: %s", access, w.Code, w.Body.String())
@@ -147,7 +159,7 @@ func TestPreview_PublicNoCredentialNeeded(t *testing.T) {
 }
 
 func TestPreview_PublicStrayCredentialStripped(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPublic, 0)
+	env := newPreviewTestEnv(t, auth.PreviewAccessPublic, nil)
 	req := env.request(http.MethodGet, "http://unused/p?keep=1&"+previewQueryParam+"=old-token")
 	req.Header.Set(previewTokenHeader, "old-token")
 	req.AddCookie(&http.Cookie{Name: previewCookieName, Value: "old-token"})
@@ -176,11 +188,60 @@ func TestPreview_PublicStrayCredentialStripped(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Private sandboxes — deny paths
+// Deny-by-default: unpublished ports are not routable
 // ---------------------------------------------------------------------------
 
-func TestPreview_PrivateNoCredential401(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+func TestPreview_PrivateUnpublishedPort404(t *testing.T) {
+	// Port 3000 is requested but only 3001 is published → 404, and a valid
+	// token for 3000 does NOT change that (nothing is published for it).
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, map[int]int64{3001: 1})
+	req := env.request(http.MethodGet, "http://unused/")
+	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Port: 3000, Version: 1}))
+
+	w := env.serve(req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for an unpublished port", w.Code)
+	}
+	if env.captured().received {
+		t.Error("request for an unpublished port reached the app")
+	}
+}
+
+func TestPreview_PrivateNothingPublishedDeniesEverything(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, nil)
+	if w := env.serve(env.request(http.MethodGet, "http://unused/")); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 when nothing is published", w.Code)
+	}
+}
+
+func TestPreview_UnpublishedPortNotEvenValidTokenLeaksStatus(t *testing.T) {
+	// 404 for an unpublished port must not depend on running/paused state.
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, map[int]int64{3001: 1})
+	env.resolver.info.Status = "paused"
+	w := env.serve(env.request(http.MethodGet, "http://unused/"))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+	if strings.Contains(strings.ToLower(w.Body.String()), "paused") {
+		t.Errorf("404 body leaks sandbox status: %q", w.Body.String())
+	}
+}
+
+func TestPreview_UnknownPolicyValueFailsClosed(t *testing.T) {
+	// A policy value this proxy doesn't know must behave like private
+	// (deny-by-default), never public.
+	env := newPreviewTestEnv(t, "team-only", nil)
+	if w := env.serve(env.request(http.MethodGet, "http://unused/")); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown policy value", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Published-port auth — deny paths
+// ---------------------------------------------------------------------------
+
+func TestPreview_PublishedNoCredential401(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	w := env.serve(env.request(http.MethodGet, "http://unused/"))
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
@@ -190,35 +251,32 @@ func TestPreview_PrivateNoCredential401(t *testing.T) {
 	}
 }
 
-func TestPreview_PrivatePausedDoesNotLeakStatus(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+func TestPreview_PublishedPausedDoesNotLeakStatus(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	env.resolver.info.Status = "paused"
 
-	// Unauthenticated: 401, and the body must not mention the paused state.
 	w := env.serve(env.request(http.MethodGet, "http://unused/"))
 	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", w.Code)
+		t.Fatalf("unauthenticated status = %d, want 401", w.Code)
 	}
 	if strings.Contains(strings.ToLower(w.Body.String()), "paused") {
 		t.Errorf("401 body leaks sandbox status: %q", w.Body.String())
 	}
 
-	// Authenticated: the usual 503 with the real status.
 	req := env.request(http.MethodGet, "http://unused/")
 	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Version: 1}))
-	w = env.serve(req)
-	if w.Code != http.StatusServiceUnavailable {
+	if w := env.serve(req); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("authenticated status = %d, want 503", w.Code)
 	}
 }
 
-func TestPreview_PrivateBadTokens401(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 2)
+func TestPreview_PublishedBadTokens401(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(2))
 	cases := map[string]string{
 		"garbage":       "not-a-token",
 		"stale version": env.token(auth.PreviewClaims{Version: 1}),
 		"wrong sandbox": env.token(auth.PreviewClaims{SandboxID: "sbx-other", Version: 2}),
-		"wrong port":    env.token(auth.PreviewClaims{Version: 2, Port: 4000}),
+		"wrong port":    env.token(auth.PreviewClaims{Port: 4000, Version: 2}),
 		"expired":       env.token(auth.PreviewClaims{Version: 2, ExpiresAt: time.Now().Add(-time.Minute).Unix()}),
 		"boxd token":    auth.ComputeAccessToken(env.seedKey, env.sandboxID),
 	}
@@ -234,35 +292,8 @@ func TestPreview_PrivateBadTokens401(t *testing.T) {
 	}
 }
 
-func TestPreview_UnknownPolicyValueFailsClosed(t *testing.T) {
-	// A policy value this proxy doesn't know (a future control plane, or a
-	// corrupted record) must never be interpreted as public.
-	env := newPreviewTestEnv(t, "team-only", 1)
-	if w := env.serve(env.request(http.MethodGet, "http://unused/")); w.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 for unknown policy value", w.Code)
-	}
-	// A valid token still gets through — most-restrictive-known enforcement,
-	// not a hard brick.
-	req := env.request(http.MethodGet, "http://unused/")
-	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Version: 1}))
-	if w := env.serve(req); w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 with a valid token", w.Code)
-	}
-}
-
-func TestPreview_PrivateZeroVersionFailsClosed(t *testing.T) {
-	// Record says private but the version never got plumbed (0): every token
-	// is rejected — misconfiguration must deny, not allow.
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 0)
-	req := env.request(http.MethodGet, "http://unused/")
-	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Version: 1}))
-	if w := env.serve(req); w.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", w.Code)
-	}
-}
-
-func TestPreview_PrivateNoSeedFailsClosed(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+func TestPreview_PublishedNoSeedFailsClosed(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	tok := env.token(auth.PreviewClaims{Version: 1})
 	env.handler.seedKey = nil
 
@@ -274,11 +305,11 @@ func TestPreview_PrivateNoSeedFailsClosed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Private sandboxes — allow paths
+// Published-port auth — allow paths
 // ---------------------------------------------------------------------------
 
-func TestPreview_PrivateHeaderToken(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+func TestPreview_PublishedHeaderToken(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	req := env.request(http.MethodGet, "http://unused/api/data?x=1")
 	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Version: 1}))
 
@@ -298,17 +329,8 @@ func TestPreview_PrivateHeaderToken(t *testing.T) {
 	}
 }
 
-func TestPreview_PrivatePortScopedTokenOnItsPort(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
-	req := env.request(http.MethodGet, "http://unused/")
-	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Version: 1, Port: 3000}))
-	if w := env.serve(req); w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-}
-
-func TestPreview_PrivateCookieToken(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+func TestPreview_PublishedCookieToken(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	req := env.request(http.MethodGet, "http://unused/")
 	req.AddCookie(&http.Cookie{Name: previewCookieName, Value: env.token(auth.PreviewClaims{Version: 1})})
 	req.AddCookie(&http.Cookie{Name: "app_session", Value: "keep-me"})
@@ -326,9 +348,8 @@ func TestPreview_PrivateCookieToken(t *testing.T) {
 	}
 }
 
-func TestPreview_PrivateOptionsPreflightPassesThrough(t *testing.T) {
-	// CORS preflights carry no credentials by spec; the app answers them.
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+func TestPreview_PublishedOptionsPreflightPassesThrough(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	w := env.serve(env.request(http.MethodOptions, "http://unused/api"))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -338,12 +359,20 @@ func TestPreview_PrivateOptionsPreflightPassesThrough(t *testing.T) {
 	}
 }
 
+func TestPreview_UnpublishedOptionsIs404(t *testing.T) {
+	// A preflight for an unpublished port is denied like any other request.
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, map[int]int64{3001: 1})
+	if w := env.serve(env.request(http.MethodOptions, "http://unused/api")); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Query-param bootstrap → cookie
 // ---------------------------------------------------------------------------
 
 func TestPreview_QueryBootstrapRedirectsAndSetsCookie(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	tok := env.token(auth.PreviewClaims{Version: 1})
 	req := env.request(http.MethodGet, "http://unused/dash?a=1&"+previewQueryParam+"="+url.QueryEscape(tok)+"&b=2")
 
@@ -386,7 +415,6 @@ func TestPreview_QueryBootstrapRedirectsAndSetsCookie(t *testing.T) {
 		t.Error("bootstrap redirect missing Cache-Control: no-store")
 	}
 
-	// The cookie from the redirect authenticates the follow-up request.
 	follow := env.request(http.MethodGet, "http://unused"+loc.String())
 	follow.AddCookie(&http.Cookie{Name: previewCookieName, Value: tok})
 	if w := env.serve(follow); w.Code != http.StatusOK {
@@ -395,7 +423,7 @@ func TestPreview_QueryBootstrapRedirectsAndSetsCookie(t *testing.T) {
 }
 
 func TestPreview_QueryInvalidToken401NoCookie(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	req := env.request(http.MethodGet, "http://unused/?"+previewQueryParam+"=bogus")
 	w := env.serve(req)
 	if w.Code != http.StatusUnauthorized {
@@ -407,7 +435,7 @@ func TestPreview_QueryInvalidToken401NoCookie(t *testing.T) {
 }
 
 func TestPreview_QueryTokenOnPostForwardsWithoutRedirect(t *testing.T) {
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	tok := env.token(auth.PreviewClaims{Version: 1})
 	req := env.request(http.MethodPost, "http://unused/submit?"+previewQueryParam+"="+url.QueryEscape(tok))
 
@@ -425,9 +453,7 @@ func TestPreview_QueryTokenOnPostForwardsWithoutRedirect(t *testing.T) {
 }
 
 func TestPreview_QueryTokenOnUpgradeForwardsWithoutRedirect(t *testing.T) {
-	// Browser WebSocket clients can't follow redirects; a ws URL carrying the
-	// token must be accepted directly (param stripped upstream).
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 1)
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
 	tok := env.token(auth.PreviewClaims{Version: 1})
 	req := env.request(http.MethodGet, "http://unused/hmr?"+previewQueryParam+"="+url.QueryEscape(tok))
 	req.Header.Set("Upgrade", "websocket")
@@ -447,9 +473,7 @@ func TestPreview_QueryTokenOnUpgradeForwardsWithoutRedirect(t *testing.T) {
 }
 
 func TestPreview_StaleCookieFreshQueryParamStillBootstraps(t *testing.T) {
-	// After a rotation, a browser holding the old cookie but opening a fresh
-	// signed link must not be locked out by the stale cookie.
-	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, 2)
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(2))
 	fresh := env.token(auth.PreviewClaims{Version: 2})
 	stale := env.token(auth.PreviewClaims{Version: 2, ExpiresAt: time.Now().Add(-time.Minute).Unix()})
 

@@ -56,10 +56,10 @@ func (c *instrumentedVMDClient) ResumeInstance(ctx context.Context, instanceID, 
 	return c.next.ResumeInstance(ctx, instanceID, snapshotPath, memPath)
 }
 
-func (c *instrumentedVMDClient) RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewTokenVersion int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error) {
+func (c *instrumentedVMDClient) RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error) {
 	started := time.Now()
 	defer func() { c.record(ctx, "CreateVM", started, err) }()
-	return c.next.RestoreSnapshot(ctx, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID, previewAccess, previewTokenVersion, envVars)
+	return c.next.RestoreSnapshot(ctx, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID, previewAccess, previewPorts, envVars)
 }
 
 func (c *instrumentedVMDClient) InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error {
@@ -94,8 +94,8 @@ func (c *instrumentedVMDClient) UpdateSandboxNetwork(ctx context.Context, instan
 	return c.next.UpdateSandboxNetwork(ctx, instanceID, allowedCIDRs, deniedCIDRs, allowedDomains)
 }
 
-func (c *instrumentedVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewTokenVersion int64) error {
-	return c.next.UpdateSandboxPreviewPolicy(ctx, instanceID, previewAccess, previewTokenVersion)
+func (c *instrumentedVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]int64) error {
+	return c.next.UpdateSandboxPreviewPolicy(ctx, instanceID, previewAccess, previewPorts)
 }
 
 func (c *instrumentedVMDClient) InvalidateSecret(ctx context.Context, secretID string) error {

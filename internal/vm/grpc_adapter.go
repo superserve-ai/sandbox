@@ -121,11 +121,12 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	if pa := req.GetPreviewAccess(); pa != "" && pa != "public" && pa != "private" {
 		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, \"public\" or \"private\", got %q", pa)
 	}
-	if req.GetPreviewAccess() == "private" && req.GetPreviewTokenVersion() <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "private preview_access requires preview_token_version > 0")
+	previewPorts, err := previewPortsFromProto(req.GetPreviewPorts())
+	if err != nil {
+		return nil, err
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), req.GetPreviewTokenVersion())
+	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts)
 	if err != nil {
 		return nil, err
 	}
@@ -354,10 +355,11 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
 }
 
-// UpdateSandboxPreviewPolicy replaces the preview-access policy on the
-// instance record. Valid in any VM state — the record, not the VM, is what
-// the edge proxy reads. NotFound (no record on this host) is surfaced to the
-// caller, which treats it as "the policy will apply on the next restore".
+// UpdateSandboxPreviewPolicy replaces the preview-access policy and the full
+// published-port set on the instance record. Valid in any VM state — the
+// record, not the VM, is what the edge proxy reads. NotFound (no record on
+// this host) is surfaced to the caller, which treats it as "the policy will
+// apply on the next restore".
 func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(ctx context.Context, req *vmdpb.UpdateSandboxPreviewPolicyRequest) (*vmdpb.UpdateSandboxPreviewPolicyResponse, error) {
 	vmID := req.GetVmId()
 	if vmID == "" {
@@ -367,13 +369,39 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(ctx context.Context, req *vmdpb
 	if access != "public" && access != "private" {
 		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be \"public\" or \"private\", got %q", access)
 	}
-	if req.GetPreviewTokenVersion() <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "preview_token_version must be > 0")
+	previewPorts, err := previewPortsFromProto(req.GetPreviewPorts())
+	if err != nil {
+		return nil, err
 	}
-	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, req.GetPreviewTokenVersion()); err != nil {
+	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, previewPorts); err != nil {
 		return nil, err
 	}
 	return &vmdpb.UpdateSandboxPreviewPolicyResponse{VmId: vmID}, nil
+}
+
+// previewPortsFromProto validates and converts the repeated PreviewPort into
+// the int-keyed map the manager stores. Rejects out-of-range ports, non-
+// positive versions, and duplicate ports so a malformed record can't reach
+// the proxy's deny-by-default lookup.
+func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]int64, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[int32]int64, len(in))
+	for _, p := range in {
+		port := p.GetPort()
+		if port < 1 || port > 65535 {
+			return nil, status.Errorf(codes.InvalidArgument, "preview port out of range: %d", port)
+		}
+		if p.GetTokenVersion() <= 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "preview port %d has a non-positive token_version", port)
+		}
+		if _, dup := out[port]; dup {
+			return nil, status.Errorf(codes.InvalidArgument, "duplicate preview port: %d", port)
+		}
+		out[port] = p.GetTokenVersion()
+	}
+	return out, nil
 }
 
 // InvalidateSecret forwards the invalidate call to the local secretsproxy daemon.

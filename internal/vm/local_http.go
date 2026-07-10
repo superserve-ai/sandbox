@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,8 +86,9 @@ type instanceResponse struct {
 	OwnerID   string `json:"owner_id,omitempty"`
 	// Preview-access policy for the edge proxy's numeric-port gate.
 	// Omitted (→ zero values) for sandboxes that predate the feature = public.
-	PreviewAccess       string `json:"preview_access,omitempty"`
-	PreviewTokenVersion int64  `json:"preview_token_version,omitempty"`
+	// preview_ports keys are strings because JSON object keys must be.
+	PreviewAccess string           `json:"preview_access,omitempty"`
+	PreviewPorts  map[string]int64 `json:"preview_ports,omitempty"`
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -116,8 +118,8 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		TeamID:    info.TeamID,
 		OwnerID:   info.OwnerID,
 
-		PreviewAccess:       info.PreviewAccess,
-		PreviewTokenVersion: info.PreviewTokenVersion,
+		PreviewAccess: info.PreviewAccess,
+		PreviewPorts:  previewPortsToJSON(info.PreviewPorts),
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
 	}
@@ -158,6 +160,20 @@ func (s *LocalHTTPServer) handleVerifySnapshot(w http.ResponseWriter, r *http.Re
 	if err := json.NewEncoder(w).Encode(verifySnapshotResponse{MemPath: memPath}); err != nil {
 		s.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to encode verify response")
 	}
+}
+
+// previewPortsToJSON renders the int-keyed published-port map with string keys
+// for the /instances JSON body (JSON object keys must be strings). Nil in →
+// nil out, so an unset/public sandbox omits the field entirely.
+func previewPortsToJSON(in map[int32]int64) map[string]int64 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(in))
+	for port, version := range in {
+		out[strconv.Itoa(int(port))] = version
+	}
+	return out
 }
 
 // splitHostPort extracts the port from a host:port string.

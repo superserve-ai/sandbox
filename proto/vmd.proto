@@ -345,11 +345,18 @@ message RestoreSnapshotRequest {
   string team_id = 10;
   string owner_id = 11;
   // Preview-access policy carried onto the instance record so the edge proxy
-  // can gate numeric-port traffic without a database. "private" requires a
-  // preview token; empty (older control planes) means public. The version is
-  // the token generation preview tokens must match; must be > 0 when private.
+  // can gate numeric-port traffic without a database. "private" is
+  // deny-by-default (only published ports route); empty (older control planes)
+  // means public. preview_ports is the published-port allowlist, each with its
+  // own token generation; empty on a private sandbox denies every port.
   string preview_access = 12;
-  int64 preview_token_version = 13;
+  repeated PreviewPort preview_ports = 13;
+}
+
+// PreviewPort is one published preview port and its current token generation.
+message PreviewPort {
+  int32 port = 1;
+  int64 token_version = 2;
 }
 
 message RestoreSnapshotResponse {
@@ -526,8 +533,8 @@ message UpdateSandboxNetworkResponse {
 
 message UpdateSandboxPreviewPolicyRequest {
   string vm_id = 1;
-  string preview_access = 2;        // "public" | "private"
-  int64 preview_token_version = 3;  // current token generation; must be > 0
+  string preview_access = 2;              // "public" | "private"
+  repeated PreviewPort preview_ports = 3; // full published-port set (replace)
 }
 
 message UpdateSandboxPreviewPolicyResponse {

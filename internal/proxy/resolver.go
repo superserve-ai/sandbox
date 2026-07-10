@@ -21,18 +21,19 @@ var ErrInstanceNotFound = errors.New("proxy: instance not found")
 type InstanceInfo struct {
 	VMIP      string
 	Status    string
-	StartedAt int64 // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	StartedAt int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
 	TeamID    string // owning team, for usage attribution
 	OwnerID   string // creating user, for usage attribution; empty when unknown
 
-	// PreviewAccess gates numeric-port (preview URL) traffic: "private"
-	// requires a preview token; anything else — including empty, for
-	// sandboxes that predate the field — is public.
+	// PreviewAccess gates numeric-port (preview URL) traffic: "private" means
+	// deny-by-default (only published ports route, each token-gated); anything
+	// else — including empty, for sandboxes that predate the field — is public
+	// (every port routable, no auth).
 	PreviewAccess string
-	// PreviewTokenVersion is the token generation preview tokens must match.
-	// Zero on a private sandbox means the version was never plumbed; the
-	// proxy fails closed and rejects every token.
-	PreviewTokenVersion int64
+	// PreviewPorts maps each published port to its current token version.
+	// Only consulted when PreviewAccess is "private": a port absent from this
+	// map is not routable (404). Nil on a private sandbox denies every port.
+	PreviewPorts map[int]int64
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -56,7 +57,7 @@ const (
 	defaultVMDAddr   = "http://127.0.0.1:9090"
 	defaultCacheTTL  = 500 * time.Millisecond // VMD is on localhost, latency is negligible
 	negativeCacheTTL = 1 * time.Second        // cache "not found" slightly longer to absorb spam
-	maxCacheSize     = 10_000                  // cap against random instance ID amplification
+	maxCacheSize     = 10_000                 // cap against random instance ID amplification
 
 	// vmdRequestTimeout bounds a single resolve call. A steady-state lookup is a
 	// localhost map read (sub-ms), but a miss right after a VMD restart triggers
@@ -129,13 +130,13 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP                string `json:"vm_ip"`
-	Status              string `json:"status"`
-	StartedAt           int64  `json:"started_at"`
-	TeamID              string `json:"team_id"`
-	OwnerID             string `json:"owner_id"`
-	PreviewAccess       string `json:"preview_access"`
-	PreviewTokenVersion int64  `json:"preview_token_version"`
+	VMIP          string           `json:"vm_ip"`
+	Status        string           `json:"status"`
+	StartedAt     int64            `json:"started_at"`
+	TeamID        string           `json:"team_id"`
+	OwnerID       string           `json:"owner_id"`
+	PreviewAccess string           `json:"preview_access"`
+	PreviewPorts  map[string]int64 `json:"preview_ports"` // port (string key for JSON) → token version
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, error) {
@@ -165,16 +166,35 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInf
 	}
 
 	info := InstanceInfo{
-		VMIP:                raw.VMIP,
-		Status:              raw.Status,
-		StartedAt:           raw.StartedAt,
-		TeamID:              raw.TeamID,
-		OwnerID:             raw.OwnerID,
-		PreviewAccess:       raw.PreviewAccess,
-		PreviewTokenVersion: raw.PreviewTokenVersion,
+		VMIP:          raw.VMIP,
+		Status:        raw.Status,
+		StartedAt:     raw.StartedAt,
+		TeamID:        raw.TeamID,
+		OwnerID:       raw.OwnerID,
+		PreviewAccess: raw.PreviewAccess,
+		PreviewPorts:  decodePreviewPorts(raw.PreviewPorts),
 	}
 	r.store(instanceID, info, nil, r.ttl)
 	return info, nil
+}
+
+// decodePreviewPorts converts the wire form (JSON object keys are strings)
+// into the int-keyed map the enforcement path uses. A malformed port key or a
+// non-positive version is dropped rather than trusted — a port that can't be
+// parsed can't be published, so it falls through to the deny-by-default 404.
+func decodePreviewPorts(raw map[string]int64) map[int]int64 {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[int]int64, len(raw))
+	for k, v := range raw {
+		port, err := strconv.Atoi(k)
+		if err != nil || port < 1 || port > 65535 || v <= 0 {
+			continue
+		}
+		out[port] = v
+	}
+	return out
 }
 
 func (r *VMDResolver) store(instanceID string, info InstanceInfo, err error, ttl time.Duration) {
