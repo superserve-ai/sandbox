@@ -652,11 +652,13 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 			return bc, fmt.Errorf("ensure user %s: %w", name, err)
 		}
 		if step.User.Sudo {
+			// Quote the whole sudoers line (not just the name) and match it with
+			// grep -xF: the name stays literal for both the shell and grep.
+			sudoersLine := shellquote.Single(name + " ALL=(ALL:ALL) NOPASSWD: ALL")
 			sudo := fmt.Sprintf(
 				"usermod -aG sudo %s || true; passwd -d %s || true; "+
-					"grep -q '^%s ALL=(ALL:ALL) NOPASSWD: ALL' /etc/sudoers || "+
-					"echo '%s ALL=(ALL:ALL) NOPASSWD: ALL' >>/etc/sudoers",
-				shellquote.Single(name), shellquote.Single(name), name, name,
+					"grep -qxF %s /etc/sudoers || echo %s >>/etc/sudoers",
+				shellquote.Single(name), shellquote.Single(name), sudoersLine, sudoersLine,
 			)
 			if err := runShellCmd(ctx, vmIP, sudo, root); err != nil {
 				return bc, fmt.Errorf("grant sudo to %s: %w", name, err)

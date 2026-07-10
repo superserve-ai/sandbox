@@ -2408,16 +2408,18 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	setupCmds := fcSetupCmds(templateDir, basePath, perVMRootfs)
 
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	// Re-check validity here, not just launcherReady: a pin that went bad since the
+	// Re-check the pin here, not just launcherReady: a pin unmounted since the
 	// last revalidation tick would otherwise bake a dead nsenter --mount into
-	// start.sh and hard-fail. On failure, fall back to legacy and drop the pin.
+	// start.sh and hard-fail. pinIsMounted is one statfs — no fork on the hot
+	// path, no transient exec failure under burst load. On failure fall back to
+	// legacy for THIS launch only; launcherReady stays with the sampler, so one
+	// blip can't knock the whole fleet onto the O(fleet) legacy path for a tick.
 	launcherPath := ""
 	if m.launcherReady.Load() {
-		if pin := m.launcherNSPath(); launcherNSValid(ctx, pin) {
+		if pin := m.launcherNSPath(); pinIsMounted(pin) {
 			launcherPath = pin
 		} else {
-			m.launcherReady.Store(false)
-			m.log.Error().Str("path", pin).Msg("launcher pin invalid at launch — using legacy path")
+			m.log.Warn().Str("path", pin).Msg("launcher pin not mounted at launch — using legacy path for this launch")
 		}
 	}
 	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)

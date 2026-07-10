@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -77,6 +78,23 @@ func launcherNSValid(ctx context.Context, pinPath string) bool {
 	return !strings.Contains(string(out), " /run/netns")
 }
 
+// nsfsMagic is NSFS_MAGIC from linux/magic.h — the statfs f_type of a namespace
+// bind mount.
+const nsfsMagic = 0x6e736673
+
+// pinIsMounted reports whether pinPath still has the mount-namespace pin
+// bind-mounted over it (an unmounted pin statfs's as the underlying tmpfs, a
+// deleted one errors). One syscall, no fork — cheap and non-flaky enough for the
+// per-launch hot path, unlike launcherNSValid's nsenter exec, which stays the
+// deep check for boot and the sampler.
+func pinIsMounted(pinPath string) bool {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(pinPath, &st); err != nil {
+		return false
+	}
+	return st.Type == nsfsMagic
+}
+
 // buildLauncherNamespace creates a fresh mount namespace, prunes /run/netns from
 // it, and persists it at pinPath. `unshare --mount=<file>` self-persists by
 // binding the process's own /proc/self/ns/mnt (binding another process's mount
@@ -110,6 +128,12 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 // boot) is reused; a pre-existing NON-private mount is refused — never
 // make-private a mount we didn't create.
 func ensurePrivateMount(ctx context.Context, dir string) error {
+	// Resolve symlinks first: mountinfo records the resolved path (/var/run/… →
+	// /run/…), so comparing an unresolved dir would never match our prior bind
+	// and stack a fresh one every boot.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	// Read propagation from /proc/self/mountinfo, not the `mountpoint` binary: it
 	// isn't preflighted, so on a minimal image its absence would read as "not a
 	// mount point" and stack a fresh bind on every restart.

@@ -487,11 +487,15 @@ func main() {
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
 	if launchViaLauncherNS {
-		// Build the pruned launcher mount namespace before any VM launches (see
-		// fcStartScript). Non-fatal: on failure, launches fall back to legacy.
-		if err := mgr.EnsureLauncherNamespace(ctx); err != nil {
-			log.Error().Err(err).Msg("launcher namespace unavailable — using legacy launch path")
-		}
+		// Build the pruned launcher mount namespace in the background: the prune is
+		// O(fleet) (up to launcherBuildTimeout), and launches fall back to legacy
+		// until the pin is ready, so boot and the warm pool aren't held behind it.
+		go func() {
+			defer sentrylog.Recover("launcher namespace build")
+			if err := mgr.EnsureLauncherNamespace(ctx); err != nil {
+				log.Error().Err(err).Msg("launcher namespace unavailable — using legacy launch path")
+			}
+		}()
 		// Periodically log the host mount-table size + revalidate the pin.
 		mgr.StartMountCountSampler(ctx, time.Minute)
 	}

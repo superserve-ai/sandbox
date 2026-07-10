@@ -27,6 +27,9 @@ func TestBuildLauncherNamespace_Integration(t *testing.T) {
 	if !launcherNSValid(ctx, pin) {
 		t.Fatal("launcherNSValid = false after a successful build")
 	}
+	if !pinIsMounted(pin) {
+		t.Fatal("pinIsMounted = false after a successful build")
+	}
 	// A rebuild over an existing pin must also succeed (stale-pin path).
 	if err := buildLauncherNamespace(ctx, pin); err != nil {
 		t.Fatalf("rebuild over existing pin: %v", err)
@@ -113,6 +116,24 @@ func TestFCStartScript_NoShellInjection(t *testing.T) {
 	if _, err := os.Stat(marker); err == nil {
 		_ = os.Remove(marker)
 		t.Fatal("SHELL INJECTION: embedded command substitution executed")
+	}
+}
+
+func TestPinIsMounted_NotAPin(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("statfs nsfs check (linux only)")
+	}
+	// Absent path and a plain file both fail the nsfs-magic check.
+	if pinIsMounted("/no/such/pin") {
+		t.Error("pinIsMounted(absent) = true, want false")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "pin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if pinIsMounted(f.Name()) {
+		t.Error("pinIsMounted(regular file) = true, want false")
 	}
 }
 
