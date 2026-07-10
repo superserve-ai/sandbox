@@ -281,16 +281,22 @@ func TestFreshenFirstPassOverlay(t *testing.T) {
 		t.Errorf("missing overlay: got %v, want nil", err)
 	}
 
-	// Existing overlay → removed, nil.
+	// Existing overlay (and its presence side-car) → both removed, nil.
 	f := filepath.Join(dir, "mem.diff")
 	if err := os.WriteFile(f, []byte("stale"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(presenceSidecarPath(f), []byte("stale bits"), 0o600); err != nil {
+		t.Fatalf("write side-car: %v", err)
 	}
 	if err := freshenFirstPassOverlay(f); err != nil {
 		t.Errorf("existing overlay: got %v, want nil", err)
 	}
 	if _, err := os.Stat(f); !os.IsNotExist(err) {
 		t.Errorf("overlay not removed: %v", err)
+	}
+	if _, err := os.Stat(presenceSidecarPath(f)); !os.IsNotExist(err) {
+		t.Errorf("presence side-car not removed: %v", err)
 	}
 
 	// Un-removable overlay (non-empty dir stands in for any remove failure) → error,
@@ -310,8 +316,9 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	snap := filepath.Join(root, vmID, "vmstate.snap")
 	mem := filepath.Join(root, vmID, "mem.diff")
 	overlay := snap + ".overlay"
-	base := layeredBaseSidecarPath(mem) // mem.diff.base
-	for _, p := range []string{snap, mem, overlay, base} {
+	base := layeredBaseSidecarPath(mem)  // mem.diff.base
+	presence := presenceSidecarPath(mem) // mem.diff.presence
+	for _, p := range []string{snap, mem, overlay, base, presence} {
 		writeFile(t, p)
 	}
 
@@ -320,11 +327,25 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 	// A leftover sidecar would make a later restore mis-handle a non-layered
-	// mem file as a layered overlay — the fork-bug class both removals prevent.
-	for _, p := range []string{overlay, base} {
+	// mem file as a layered overlay — and a stale .presence next to a future
+	// same-size overlay passes Firecracker's geometry checks and silently
+	// mis-layers pages. All must go with the files they describe.
+	for _, p := range []string{overlay, base, presence} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("sidecar still exists: %s (%v)", p, err)
 		}
+	}
+}
+
+func TestOverlayPresenceMissing(t *testing.T) {
+	dir := t.TempDir()
+	mem := filepath.Join(dir, "mem.diff")
+	if !overlayPresenceMissing(mem) {
+		t.Error("no side-car on disk: want missing=true")
+	}
+	writeFile(t, presenceSidecarPath(mem))
+	if overlayPresenceMissing(mem) {
+		t.Error("side-car exists: want missing=false")
 	}
 }
 

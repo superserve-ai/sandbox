@@ -186,6 +186,14 @@ type ManagerConfig struct {
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
 
+	// RequirePresenceSidecar refuses a layered UFFD restore whose overlay has no
+	// .presence side-car next to it. Without the side-car, Firecracker falls back
+	// to inferring page presence from the overlay's extent map — only sound if
+	// the file was never copied by a tool that rewrites sparse extents. Enable on
+	// hosts that restore transferred artifacts, where a missing side-car more
+	// likely means "dropped in transit" than "legacy snapshot". Default false.
+	RequirePresenceSidecar bool
+
 	// LaunchViaLauncherNS routes the Firecracker launch through a long-lived,
 	// pruned "launcher" mount namespace (pinned at LauncherNSPath); see
 	// fcStartScript for the mechanism. Keeps per-VM launch cost independent of
@@ -740,6 +748,19 @@ func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeMemPath stri
 // standalone (which would read the base's pages as zero holes).
 func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
 
+// presenceSidecarPath is where Firecracker persists the overlay's page-presence
+// bitmap. It pairs with the mem file: transfers must copy the two together and
+// deletion must remove both — a stale bitmap next to a future same-size overlay
+// passes every restore-side check and silently mis-layers pages.
+func presenceSidecarPath(memPath string) string { return memPath + ".presence" }
+
+// overlayPresenceMissing reports whether the overlay has no readable presence
+// side-car, in which case Firecracker would fall back to extent scanning.
+func overlayPresenceMissing(memPath string) bool {
+	_, err := os.Stat(presenceSidecarPath(memPath))
+	return err != nil
+}
+
 // freshenFirstPassOverlay removes any leftover overlay so a first layered pass starts
 // from a clean file (its dirty set is the whole overlay, so a stale one would leave
 // non-dirtied stale pages that override the base on restore). A missing overlay is the
@@ -747,6 +768,12 @@ func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
 // caller falls back to a Full snapshot rather than diff onto stale data.
 func freshenFirstPassOverlay(overlayPath string) error {
 	if err := os.Remove(overlayPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// The presence side-car pairs with the overlay just removed. Firecracker
+	// rewrites it on the upcoming save, so this mainly keeps the fallback-to-Full
+	// path from leaving a bitmap that describes a file that no longer exists.
+	if err := os.Remove(presenceSidecarPath(overlayPath)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -1150,9 +1177,14 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		}
 	}
 	if memPath != "" {
-		sidecar := layeredBaseSidecarPath(memPath)
-		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
-			m.log.Warn().Err(err).Str("path", sidecar).Msg("remove layered base side-car")
+		// The .presence bitmap must go with the mem file for the same reason as
+		// .base: VMD reuses mem paths, and a stale bitmap next to a future
+		// same-size overlay passes Firecracker's geometry checks and silently
+		// resolves pages against the wrong layer.
+		for _, sidecar := range []string{layeredBaseSidecarPath(memPath), presenceSidecarPath(memPath)} {
+			if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+				m.log.Warn().Err(err).Str("path", sidecar).Msg("remove mem side-car")
+			}
 		}
 	}
 
@@ -1424,6 +1456,20 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		case hasSidecar:
 			// The outer overlayNeedsLayered guard already required resume-UFFD to reach
 			// here, so canLayered holds — serve the overlay over its recorded base.
+			// Without a presence side-car Firecracker infers presence from the
+			// overlay's extent map, which transfers can silently rewrite: refuse when
+			// this host requires the side-car (transferred-artifact hosts), warn
+			// otherwise (pre-side-car local snapshots restore fine from extents).
+			if overlayPresenceMissing(memPath) {
+				if m.cfg.RequirePresenceSidecar {
+					restoreErr = fmt.Errorf(
+						"layered overlay %q has no presence side-car and this host requires one; re-copy the overlay and side-car as a pair",
+						memPath)
+					break
+				}
+				log.Warn().Str("path", presenceSidecarPath(memPath)).
+					Msg("layered overlay has no presence side-car; Firecracker will infer presence from extents")
+			}
 			basePath = sidecarBase
 			armLayered = m.cfg.IncrementalSnapshotEnabled
 			inst.mu.Lock()
