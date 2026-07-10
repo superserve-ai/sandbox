@@ -126,7 +126,7 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, err
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts)
+	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +373,7 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(ctx context.Context, req *vmdpb
 	if err != nil {
 		return nil, err
 	}
-	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, previewPorts); err != nil {
+	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, previewPorts, req.GetPolicyRevision()); err != nil {
 		return nil, err
 	}
 	return &vmdpb.UpdateSandboxPreviewPolicyResponse{VmId: vmID}, nil

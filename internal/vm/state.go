@@ -56,6 +56,10 @@ type VMRecord struct {
 	// Absent in records that predate the feature → zero values → public.
 	PreviewAccess string          `json:"preview_access,omitempty"`
 	PreviewPorts  map[int32]int64 `json:"preview_ports,omitempty"`
+	// Persisted so the monotonic revision survives a vmd restart — otherwise a
+	// reattach would reset it to 0 and then accept a stale push that reopens a
+	// port.
+	PreviewPolicyRevision int64 `json:"preview_policy_revision,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -212,8 +216,9 @@ func toRecord(inst *VMInstance) VMRecord {
 		TeamID:       inst.TeamID,
 		OwnerID:      inst.OwnerID,
 
-		PreviewAccess: inst.PreviewAccess,
-		PreviewPorts:  inst.PreviewPorts,
+		PreviewAccess:         inst.PreviewAccess,
+		PreviewPorts:          inst.PreviewPorts,
+		PreviewPolicyRevision: inst.PreviewPolicyRevision,
 	}
 }
 
@@ -239,8 +244,9 @@ func toInstance(rec VMRecord) *VMInstance {
 		TeamID:       rec.TeamID,
 		OwnerID:      rec.OwnerID,
 
-		PreviewAccess: rec.PreviewAccess,
-		PreviewPorts:  rec.PreviewPorts,
+		PreviewAccess:         rec.PreviewAccess,
+		PreviewPorts:          rec.PreviewPorts,
+		PreviewPolicyRevision: rec.PreviewPolicyRevision,
 
 		Config: VMConfig{
 			VCPU:      rec.VCPU,

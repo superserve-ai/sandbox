@@ -1612,8 +1612,12 @@ type RestoreSnapshotRequest struct {
 	// own token generation; empty on a private sandbox denies every port.
 	PreviewAccess string         `protobuf:"bytes,12,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"`
 	PreviewPorts  []*PreviewPort `protobuf:"bytes,13,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Monotonic generation of this preview policy. vmd records it and rejects
+	// any later UpdateSandboxPreviewPolicy carrying a revision <= the stored
+	// one, so a reordered/stale full-snapshot push can't regress enforcement.
+	PreviewPolicyRevision int64 `protobuf:"varint,14,opt,name=preview_policy_revision,json=previewPolicyRevision,proto3" json:"preview_policy_revision,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *RestoreSnapshotRequest) Reset() {
@@ -1728,6 +1732,13 @@ func (x *RestoreSnapshotRequest) GetPreviewPorts() []*PreviewPort {
 		return x.PreviewPorts
 	}
 	return nil
+}
+
+func (x *RestoreSnapshotRequest) GetPreviewPolicyRevision() int64 {
+	if x != nil {
+		return x.PreviewPolicyRevision
+	}
+	return 0
 }
 
 // PreviewPort is one published preview port and its current token generation.
@@ -3037,12 +3048,13 @@ func (x *UpdateSandboxNetworkResponse) GetVmId() string {
 }
 
 type UpdateSandboxPreviewPolicyRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
-	PreviewAccess string                 `protobuf:"bytes,2,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"` // "public" | "private"
-	PreviewPorts  []*PreviewPort         `protobuf:"bytes,3,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`    // full published-port set (replace)
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	PreviewAccess  string                 `protobuf:"bytes,2,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"`     // "public" | "private"
+	PreviewPorts   []*PreviewPort         `protobuf:"bytes,3,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`        // full published-port set (replace)
+	PolicyRevision int64                  `protobuf:"varint,4,opt,name=policy_revision,json=policyRevision,proto3" json:"policy_revision,omitempty"` // monotonic; vmd rejects <= current
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *UpdateSandboxPreviewPolicyRequest) Reset() {
@@ -3094,6 +3106,13 @@ func (x *UpdateSandboxPreviewPolicyRequest) GetPreviewPorts() []*PreviewPort {
 		return x.PreviewPorts
 	}
 	return nil
+}
+
+func (x *UpdateSandboxPreviewPolicyRequest) GetPolicyRevision() int64 {
+	if x != nil {
+		return x.PolicyRevision
+	}
+	return 0
 }
 
 type UpdateSandboxPreviewPolicyResponse struct {
@@ -3502,7 +3521,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\x88\x05\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xc0\x05\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -3516,7 +3535,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	" \x01(\tR\x06teamId\x12\x19\n" +
 	"\bowner_id\x18\v \x01(\tR\aownerId\x12%\n" +
 	"\x0epreview_access\x18\f \x01(\tR\rpreviewAccess\x12C\n" +
-	"\rpreview_ports\x18\r \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\x1a:\n" +
+	"\rpreview_ports\x18\r \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\x126\n" +
+	"\x17preview_policy_revision\x18\x0e \x01(\x03R\x15previewPolicyRevision\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"F\n" +
@@ -3614,11 +3634,12 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12E\n" +
 	"\x06egress\x18\x02 \x01(\v2-.superserve.vmd.v1.SandboxNetworkEgressConfigR\x06egress\"3\n" +
 	"\x1cUpdateSandboxNetworkResponse\x12\x13\n" +
-	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"\xa4\x01\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"\xcd\x01\n" +
 	"!UpdateSandboxPreviewPolicyRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12%\n" +
 	"\x0epreview_access\x18\x02 \x01(\tR\rpreviewAccess\x12C\n" +
-	"\rpreview_ports\x18\x03 \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\"9\n" +
+	"\rpreview_ports\x18\x03 \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\x12'\n" +
+	"\x0fpolicy_revision\x18\x04 \x01(\x03R\x0epolicyRevision\"9\n" +
 	"\"UpdateSandboxPreviewPolicyResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"6\n" +
 	"\x17InvalidateSecretRequest\x12\x1b\n" +

@@ -26,7 +26,7 @@ type Client interface {
 	// token version. For sandboxes with secrets the caller passes envVars=nil
 	// here and uses InjectSandboxEnv below once the source IP is known and a
 	// JWT is minted.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]int64, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -58,8 +58,9 @@ type Client interface {
 	// the record is what the edge proxy reads). previewPorts maps published
 	// port → token version. gRPC NotFound means the host has no record; callers
 	// treat that as "applies on the next restore" since restores carry the
-	// policy.
-	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]int64) error
+	// policy. policyRevision orders concurrent pushes: vmd ignores a revision
+	// <= the one it already holds.
+	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]int64, policyRevision int64) error
 
 	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the
 	// cached cleartext for secretID. Used by the control plane to push

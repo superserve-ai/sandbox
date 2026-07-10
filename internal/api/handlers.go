@@ -21,8 +21,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
@@ -567,10 +565,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			// Carry the row's preview policy AND published-port set: the
-			// stateless restore builds a fresh instance record, and omitting
-			// either would silently reopen a private sandbox's ports (empty
-			// set → everything 404s → fail closed, not open).
+			// Carry the row's preview policy, published-port set, AND policy
+			// revision: the stateless restore builds a fresh instance record,
+			// and omitting them would silently reopen a private sandbox's ports
+			// (empty set → everything 404s → fail closed) or reset the revision
+			// so a later stale push could be accepted. The revision seeds the
+			// fresh record at the DB's current generation.
 			previewPorts, ppErr := h.loadPreviewPorts(c.Request.Context(), sandboxID)
 			if ppErr != nil {
 				log.Error().Err(ppErr).Str("sandbox_id", sandboxID.String()).Msg("load published ports for resume failed")
@@ -578,7 +578,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				respondError(c, ErrInternal)
 				return false
 			}
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), sandbox.PreviewAccess, previewPorts, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), sandbox.PreviewAccess, previewPorts, sandbox.PreviewPolicyRevision, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -1822,7 +1822,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, req.EnvVars)
+	// A brand-new sandbox has no published ports and starts at policy revision
+	// 0 (the DB column default); the first publish bumps it.
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -2536,49 +2538,44 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// applyPreviewAccessPatch toggles the preview-URL policy. Order matters: the
-// host's instance record (what the edge proxy enforces) is updated first,
-// the DB row second — so a success response never means "recorded but not
-// enforced". A DB failure after the vmd push is a hard 500, not a warning:
+// applyPreviewAccessPatch toggles the preview-URL policy. The toggle, the
+// policy-revision bump, and the read of the published-port set are one
+// serialized transaction; the resulting revision-tagged policy is then pushed
+// so the edge proxy enforces it immediately. A push failure is a hard 500 —
 // silently drifting a security policy is worse than asking the caller to
-// retry. NotFound from vmd is fine — no record on the host means the next
-// restore seeds the policy from the row this handler is about to write.
+// retry, and vmd's revision check makes the retry converge. NotFound from vmd
+// is fine: no record on the host means the next restore seeds the policy from
+// the DB.
 func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID, access string) bool {
-	vmd, err := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("resolve VMD for preview-access patch failed")
-		respondError(c, ErrInternal)
-		return false
-	}
-
-	previewPorts, err := h.loadPreviewPorts(c.Request.Context(), sandbox.ID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("load published ports for preview-access patch failed")
-		respondError(c, ErrInternal)
-		return false
-	}
-
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), access, previewPorts)
-	if err != nil && status.Code(err) != codes.NotFound {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD UpdateSandboxPreviewPolicy failed")
-		respondError(c, ErrInternal)
-		return false
-	}
-
-	rows, err := h.DB.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
-		ID:            sandbox.ID,
-		PreviewAccess: access,
-		TeamID:        teamID,
+	// The sandbox struct carries the new access into the push.
+	sandbox.PreviewAccess = access
+	var rows int64
+	rev, previewPorts, err := h.applyPreviewMutation(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
+		var e error
+		rows, e = q.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
+			ID:            sandbox.ID,
+			PreviewAccess: access,
+			TeamID:        teamID,
+		})
+		return e
 	})
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB UpdateSandboxPreviewAccess failed (host record already updated)")
+		if err == ErrSandboxNotFound {
+			respondError(c, ErrSandboxNotFound)
+			return false
+		}
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("preview-access mutation failed")
 		respondError(c, ErrInternal)
 		return false
 	}
 	if rows == 0 {
 		respondError(c, ErrSandboxNotFound)
+		return false
+	}
+
+	if err := h.pushPreviewPolicy(c.Request.Context(), sandbox, previewPorts, rev); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("VMD UpdateSandboxPreviewPolicy failed")
+		respondError(c, ErrInternal)
 		return false
 	}
 

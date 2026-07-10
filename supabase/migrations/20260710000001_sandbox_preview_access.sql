@@ -15,7 +15,13 @@
 -- /instances endpoint. The DB rows are the intent; the vmd record is the
 -- enforcement copy.
 ALTER TABLE sandbox
-    ADD COLUMN IF NOT EXISTS preview_access text NOT NULL DEFAULT 'public';
+    ADD COLUMN IF NOT EXISTS preview_access text NOT NULL DEFAULT 'public',
+    -- Monotonic per-sandbox generation of the whole preview policy (access +
+    -- published-port set). Bumped inside the same transaction as every preview
+    -- mutation; carried to vmd on each push. vmd rejects any update whose
+    -- revision is <= the one it already holds, so concurrent or reordered
+    -- full-snapshot pushes can never reopen a port or revive a rotated token.
+    ADD COLUMN IF NOT EXISTS preview_policy_revision bigint NOT NULL DEFAULT 0;
 
 ALTER TABLE sandbox
     DROP CONSTRAINT IF EXISTS sandbox_preview_access_valid;

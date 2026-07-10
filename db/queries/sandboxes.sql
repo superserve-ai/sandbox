@@ -371,6 +371,18 @@ UPDATE sandbox
 SET preview_access = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
+-- name: BumpPreviewPolicyRevision :one
+-- Advance the sandbox's preview-policy generation and take a row-level write
+-- lock in the process. Run FIRST inside a preview-mutation transaction so
+-- concurrent mutations on the same sandbox serialize here: the (revision,
+-- published-set) pair each transaction then reads is internally consistent,
+-- and the returned revision orders the vmd pushes. Returns 0 rows if the
+-- sandbox is gone.
+UPDATE sandbox
+SET preview_policy_revision = preview_policy_revision + 1, updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+RETURNING preview_policy_revision;
+
 -- name: ListPublishedPorts :many
 -- The published-port set for a sandbox, ascending. Backs both the API list
 -- response and the full set pushed to vmd after any publish/unpublish/rotate.

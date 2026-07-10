@@ -104,9 +104,12 @@ type VMInstance struct {
 	// proxy: "private" is deny-by-default (only published ports route); empty
 	// means public (sandboxes that predate the field). PreviewPorts is the
 	// published-port allowlist keyed by port → token generation. Carried like
-	// TeamID so the proxy needs no database.
-	PreviewAccess string
-	PreviewPorts  map[int32]int64
+	// TeamID so the proxy needs no database. PreviewPolicyRevision is the
+	// monotonic generation of (access + ports); a preview-policy update with a
+	// revision <= this one is a stale/reordered push and is ignored.
+	PreviewAccess         string
+	PreviewPorts          map[int32]int64
+	PreviewPolicyRevision int64
 
 	// BaseMemPath is the immutable base (template) memory file for a layered
 	// snapshot. Set at create-from-template; non-empty ⇒ this VM's pauses write a
@@ -1211,9 +1214,9 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]int64,
+	previewAccess string, previewPorts map[int32]int64, previewPolicyRevision int64,
 ) (*VMInstance, error) {
-	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, "")
+	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, "")
 }
 
 // restoreVMSnapshot is the implementation. recordToPath is empty for normal
@@ -1222,7 +1225,7 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]int64, recordToPath string,
+	previewAccess string, previewPorts map[int32]int64, previewPolicyRevision int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -1268,8 +1271,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		TeamID:       teamID,
 		OwnerID:      ownerID,
 
-		PreviewAccess: previewAccess,
-		PreviewPorts:  previewPorts,
+		PreviewAccess:         previewAccess,
+		PreviewPorts:          previewPorts,
+		PreviewPolicyRevision: previewPolicyRevision,
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -1986,14 +1990,29 @@ func clonePreviewPorts(in map[int32]int64) map[int32]int64 {
 // this host has no record of the sandbox; the caller treats that as "will
 // apply on the next restore", since restores carry the policy from the
 // control-plane database.
-func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]int64) error {
+//
+// revision orders concurrent full-snapshot pushes. A revision <= the one
+// already recorded is a stale or reordered push and is IGNORED (returns nil):
+// the record already reflects an equal-or-newer policy, so applying the older
+// snapshot would reopen a just-unpublished port or revive a just-rotated
+// token. Ignoring is a success, not an error — the caller wanted enforcement
+// at least as current as its revision, and that is already true.
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]int64, revision int64) error {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return err
 	}
 	inst.mu.Lock()
+	if revision <= inst.PreviewPolicyRevision {
+		current := inst.PreviewPolicyRevision
+		inst.mu.Unlock()
+		m.log.Debug().Str("vm_id", vmID).Int64("incoming", revision).Int64("current", current).
+			Msg("ignoring stale preview-policy update")
+		return nil
+	}
 	inst.PreviewAccess = previewAccess
 	inst.PreviewPorts = clonePreviewPorts(previewPorts)
+	inst.PreviewPolicyRevision = revision
 	inst.mu.Unlock()
 	m.persistState(inst)
 	return nil
@@ -2220,7 +2239,7 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		return nil
 	}
 
-	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", "", nil, outputPath)
+	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", "", nil, 0, outputPath)
 	if err != nil {
 		return fmt.Errorf("restore for recording: %w", err)
 	}

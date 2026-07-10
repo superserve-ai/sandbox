@@ -351,6 +351,10 @@ message RestoreSnapshotRequest {
   // own token generation; empty on a private sandbox denies every port.
   string preview_access = 12;
   repeated PreviewPort preview_ports = 13;
+  // Monotonic generation of this preview policy. vmd records it and rejects
+  // any later UpdateSandboxPreviewPolicy carrying a revision <= the stored
+  // one, so a reordered/stale full-snapshot push can't regress enforcement.
+  int64 preview_policy_revision = 14;
 }
 
 // PreviewPort is one published preview port and its current token generation.
@@ -535,6 +539,7 @@ message UpdateSandboxPreviewPolicyRequest {
   string vm_id = 1;
   string preview_access = 2;              // "public" | "private"
   repeated PreviewPort preview_ports = 3; // full published-port set (replace)
+  int64 policy_revision = 4;              // monotonic; vmd rejects <= current
 }
 
 message UpdateSandboxPreviewPolicyResponse {

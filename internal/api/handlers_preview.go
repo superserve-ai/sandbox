@@ -44,36 +44,92 @@ const (
 
 // loadPreviewPorts returns a sandbox's published ports as port → token
 // version, the shape carried to vmd and enforced at the proxy. Nil when
-// nothing is published.
+// nothing is published. Used by the read path (list) and by the resume path
+// that seeds a restored record.
 func (h *Handlers) loadPreviewPorts(ctx context.Context, sandboxID uuid.UUID) (map[int32]int64, error) {
 	rows, err := h.DB.ListPublishedPorts(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}
+	return portsFromRows(rows), nil
+}
+
+func portsFromRows(rows []db.ListPublishedPortsRow) map[int32]int64 {
 	if len(rows) == 0 {
-		return nil, nil
+		return nil
 	}
 	out := make(map[int32]int64, len(rows))
 	for _, r := range rows {
 		out[r.Port] = int64(r.TokenVersion)
 	}
-	return out, nil
+	return out
 }
 
-// pushPreviewPolicy sends the sandbox's current preview_access + full
-// published-port set to its host's vmd, so the edge proxy enforces the change
-// now rather than at the next restore. gRPC NotFound (no record on the host —
-// e.g. a paused sandbox) is not an error: the next restore seeds the policy
-// from the DB. Any other failure is returned so the caller can 500 rather than
-// report a security change that was not applied.
-func (h *Handlers) pushPreviewPolicy(ctx context.Context, sandbox db.Sandbox, ports map[int32]int64) error {
+// applyPreviewMutation runs a preview-policy change atomically. In a single
+// transaction it bumps the sandbox's policy revision — a row-level write lock
+// that serializes concurrent preview mutations on the same sandbox — then runs
+// the caller's mutation and reads back the resulting published-port set. The
+// returned (revision, ports) pair is therefore a consistent snapshot, and the
+// monotonically increasing revision lets vmd reject any push that arrives out
+// of order. Returns ErrSandboxNotFound when the sandbox row is gone; a mutation
+// that itself returns pgx.ErrNoRows (e.g. rotating an unpublished port) rolls
+// the whole transaction back, so the revision bump has no effect.
+func (h *Handlers) applyPreviewMutation(ctx context.Context, sandboxID, teamID uuid.UUID, mutate func(q *db.Queries) error) (int64, map[int32]int64, error) {
+	run := func(q *db.Queries) (int64, map[int32]int64, error) {
+		rev, err := q.BumpPreviewPolicyRevision(ctx, db.BumpPreviewPolicyRevisionParams{ID: sandboxID, TeamID: teamID})
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return 0, nil, ErrSandboxNotFound
+			}
+			return 0, nil, err
+		}
+		if err := mutate(q); err != nil {
+			return 0, nil, err
+		}
+		rows, err := q.ListPublishedPorts(ctx, sandboxID)
+		if err != nil {
+			return 0, nil, err
+		}
+		return rev, portsFromRows(rows), nil
+	}
+
+	// No pool (DBTX-mocked unit tests): run directly. Real serialization comes
+	// from the transaction + row lock, which the mock doesn't model, but unit
+	// tests exercise one request at a time.
+	if h.Pool == nil {
+		return run(h.DB)
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback(ctx)
+	rev, ports, err := run(h.DB.WithTx(tx))
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, nil, err
+	}
+	return rev, ports, nil
+}
+
+// pushPreviewPolicy sends the sandbox's preview_access + full published-port
+// set, tagged with the policy revision, to its host's vmd so the edge proxy
+// enforces the change now rather than at the next restore. vmd ignores a
+// revision <= the one it already holds, making the push order-independent.
+// gRPC NotFound (no record on the host — e.g. a paused sandbox) is not an
+// error: the next restore seeds the policy from the DB. Any other failure is
+// returned so the caller can 500 rather than report a change that was not
+// applied.
+func (h *Handlers) pushPreviewPolicy(ctx context.Context, sandbox db.Sandbox, ports map[int32]int64, revision int64) error {
 	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
 	if err != nil {
 		return fmt.Errorf("resolve vmd: %w", err)
 	}
 	vmdCtx, cancel := context.WithTimeout(ctx, vmdTimeout)
 	defer cancel()
-	if err := vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), sandbox.PreviewAccess, ports); err != nil && status.Code(err) != codes.NotFound {
+	if err := vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), sandbox.PreviewAccess, ports, revision); err != nil && status.Code(err) != codes.NotFound {
 		return err
 	}
 	return nil
@@ -169,14 +225,16 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 		return
 	}
 
-	row, err := h.DB.PublishPort(c.Request.Context(), db.PublishPortParams{SandboxID: sandboxID, Port: body.Port})
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Int32("port", body.Port).Msg("DB PublishPort failed")
-		respondError(c, ErrInternal)
+	var row db.PublishPortRow
+	rev, ports, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
+		var e error
+		row, e = q.PublishPort(c.Request.Context(), db.PublishPortParams{SandboxID: sandboxID, Port: body.Port})
+		return e
+	})
+	if !h.handlePreviewMutationResult(c, sandboxID, "PublishPort", err) {
 		return
 	}
-
-	if !h.syncPreviewPortsToHost(c, sandbox) {
+	if !h.pushAfterMutation(c, sandbox, ports, rev) {
 		return
 	}
 
@@ -191,17 +249,17 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 // DELETE /sandboxes/:sandbox_id/preview-ports/:port. After this the port is no
 // longer routable (deny-by-default) and its outstanding tokens are useless.
 //
-// Unpublish is a revocation, so it must be retry-safe: the host's enforcement
-// copy is updated BEFORE the DB row is removed, and the operation is
-// idempotent. Ordering rationale:
-//   - Host push fails → 500 with nothing changed (DB still says published,
-//     host still routes it — consistent; retry redoes both).
-//   - Push succeeds, DB delete fails → the host is stricter than the DB
-//     (port 404s even though the row exists) — fail closed; retry repairs.
-//   - Row already absent (a retry, or a never-published port) → the intended
-//     allowlist is pushed anyway, repairing any stale host state, and the
-//     response is 204. A repeat DELETE can never strand a routable port the
-//     DB no longer knows about.
+// Unpublish is a revocation, so it is idempotent and retry-safe. The DB
+// deletion and the policy-revision bump are one transaction; the resulting
+// allowlist is then pushed to the host tagged with the new revision:
+//   - Host push fails → 500. The DB is ahead of the host, but a retry
+//     re-bumps the revision and re-pushes, and vmd applies it because the
+//     revision is higher. Enforcement converges.
+//   - A repeat DELETE (row already gone, or never published) still bumps and
+//     re-pushes the current allowlist, so a stale host copy is always
+//     repaired and the response is 204 — never 404 without re-syncing.
+//   - Concurrency can't reopen the port: a stale lower-revision push from a
+//     racing publish/rotate is ignored by vmd.
 func (h *Handlers) UnpublishSandboxPreviewPort(c *gin.Context) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -223,44 +281,52 @@ func (h *Handlers) UnpublishSandboxPreviewPort(c *gin.Context) {
 		return
 	}
 
-	// Compute the intended post-unpublish allowlist from the DB's current set.
-	current, err := h.loadPreviewPorts(c.Request.Context(), sandboxID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("load published ports for unpublish failed")
-		respondError(c, ErrInternal)
+	var deleted int64
+	rev, ports, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
+		var e error
+		deleted, e = q.UnpublishPort(c.Request.Context(), db.UnpublishPortParams{SandboxID: sandboxID, Port: port})
+		return e
+	})
+	if !h.handlePreviewMutationResult(c, sandboxID, "UnpublishPort", err) {
 		return
 	}
-	_, wasPublished := current[port]
-	intended := make(map[int32]int64, len(current))
-	for p, v := range current {
-		if p != port {
-			intended[p] = v
-		}
-	}
-
-	// Enforcement first: the port must stop routing before the DB forgets it
-	// was ever published.
-	if err := h.pushPreviewPolicy(c.Request.Context(), sandbox, intended); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Int32("port", port).Msg("push preview policy for unpublish failed — nothing changed; retry")
-		respondError(c, ErrInternal)
+	if !h.pushAfterMutation(c, sandbox, ports, rev) {
 		return
 	}
 
-	// Then intent: remove the row. Zero rows is fine — that's the idempotent
-	// retry/repair path, and the push above already corrected the host.
-	if _, err := h.DB.UnpublishPort(c.Request.Context(), db.UnpublishPortParams{SandboxID: sandboxID, Port: port}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Int32("port", port).Msg("DB UnpublishPort failed (host already stopped routing the port — retry to finish)")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	if wasPublished {
+	if deleted > 0 {
 		detail, _ := json.Marshal(map[string]any{"port": port})
 		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_port_unpublished", "success", &sandbox.Name, nil, detail)
 		h.capture(c, "sandbox_preview_port_unpublished", map[string]any{"sandbox_id": sandboxID.String(), "port": port})
 	}
 
 	c.Status(http.StatusNoContent)
+}
+
+// handlePreviewMutationResult maps applyPreviewMutation's error to a response.
+// Returns true when the caller may proceed (no error).
+func (h *Handlers) handlePreviewMutationResult(c *gin.Context, sandboxID uuid.UUID, op string, err error) bool {
+	if err == nil {
+		return true
+	}
+	if err == ErrSandboxNotFound {
+		respondError(c, ErrSandboxNotFound)
+		return false
+	}
+	log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Str("op", op).Msg("preview mutation failed")
+	respondError(c, ErrInternal)
+	return false
+}
+
+// pushAfterMutation pushes the post-mutation allowlist to the host, writing the
+// 500 itself on failure. Returns false when it has already responded.
+func (h *Handlers) pushAfterMutation(c *gin.Context, sandbox db.Sandbox, ports map[int32]int64, revision int64) bool {
+	if err := h.pushPreviewPolicy(c.Request.Context(), sandbox, ports, revision); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("push preview policy to host failed — retry to converge enforcement")
+		respondError(c, ErrInternal)
+		return false
+	}
+	return true
 }
 
 type previewTokenResponse struct {
@@ -368,21 +434,27 @@ func (h *Handlers) RotateSandboxPreviewToken(c *gin.Context) {
 		return
 	}
 
-	bumped, err := h.DB.BumpPublishedPortVersion(c.Request.Context(), db.BumpPublishedPortVersionParams{SandboxID: sandboxID, Port: port})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondErrorMsg(c, "not_found", "Preview port not published", http.StatusNotFound)
-			return
-		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Int32("port", port).Msg("DB BumpPublishedPortVersion failed")
-		respondError(c, ErrInternal)
+	// The version bump and the revision bump are one transaction; rotating an
+	// unpublished port returns pgx.ErrNoRows, which rolls the whole thing back
+	// (no revision side effect) and maps to 404.
+	var bumped db.BumpPublishedPortVersionRow
+	rev, ports, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
+		var e error
+		bumped, e = q.BumpPublishedPortVersion(c.Request.Context(), db.BumpPublishedPortVersionParams{SandboxID: sandboxID, Port: port})
+		return e
+	})
+	if err == pgx.ErrNoRows {
+		respondErrorMsg(c, "not_found", "Preview port not published", http.StatusNotFound)
+		return
+	}
+	if !h.handlePreviewMutationResult(c, sandboxID, "BumpPublishedPortVersion", err) {
 		return
 	}
 
 	// Push the new generation so the proxy stops accepting old tokens now, not
 	// at the next restore. A hard failure is a 500: the rotation is not
-	// complete until the host has the new version.
-	if !h.syncPreviewPortsToHost(c, sandbox) {
+	// complete until the host has the new version (retry converges).
+	if !h.pushAfterMutation(c, sandbox, ports, rev) {
 		return
 	}
 
@@ -397,24 +469,6 @@ func (h *Handlers) RotateSandboxPreviewToken(c *gin.Context) {
 	h.capture(c, "sandbox_preview_token_rotated", map[string]any{"sandbox_id": sandboxID.String(), "port": port})
 
 	c.JSON(http.StatusOK, resp)
-}
-
-// syncPreviewPortsToHost loads the sandbox's current published set and pushes
-// it (with the sandbox's policy) to the host's vmd, writing the 500 response
-// itself on failure. Returns false when it has already responded.
-func (h *Handlers) syncPreviewPortsToHost(c *gin.Context, sandbox db.Sandbox) bool {
-	ports, err := h.loadPreviewPorts(c.Request.Context(), sandbox.ID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("load published ports for host sync failed")
-		respondError(c, ErrInternal)
-		return false
-	}
-	if err := h.pushPreviewPolicy(c.Request.Context(), sandbox, ports); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("push preview policy to host failed")
-		respondError(c, ErrInternal)
-		return false
-	}
-	return true
 }
 
 // getTeamSandbox loads a team-scoped sandbox row, writing the 404/500

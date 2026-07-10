@@ -33,7 +33,7 @@ type stubVMD struct {
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
 	deleteSnapsFn    func(ctx context.Context, id string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
-	updatePreviewFn  func(ctx context.Context, id, previewAccess string, previewPorts map[int32]int64) error
+	updatePreviewFn  func(ctx context.Context, id, previewAccess string, previewPorts map[int32]int64, policyRevision int64) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
 }
@@ -57,7 +57,7 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ string, _ map[int32]int64, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ string, _ map[int32]int64, _ int64, _ map[string]string) (string, uint32, uint32, error) {
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -93,9 +93,9 @@ func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, 
 	}
 	return nil
 }
-func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, previewAccess string, previewPorts map[int32]int64) error {
+func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, previewAccess string, previewPorts map[int32]int64, policyRevision int64) error {
 	if s.updatePreviewFn != nil {
-		return s.updatePreviewFn(ctx, id, previewAccess, previewPorts)
+		return s.updatePreviewFn(ctx, id, previewAccess, previewPorts, policyRevision)
 	}
 	return nil
 }

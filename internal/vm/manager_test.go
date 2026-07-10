@@ -797,3 +797,45 @@ func TestWaitForPIDExit_DeadProcessReturnsPromptly(t *testing.T) {
 		t.Errorf("returned after %v; expected a prompt return once the process exited", elapsed)
 	}
 }
+
+// TestUpdateSandboxPreviewPolicy_MonotonicRevision verifies the guard that
+// closes the DB↔vmd push race: an update whose revision is <= the recorded one
+// is a stale/reordered push and must be ignored, so a racing snapshot can't
+// reopen a just-unpublished port or revive a just-rotated token version.
+func TestUpdateSandboxPreviewPolicy_MonotonicRevision(t *testing.T) {
+	const id = "vm-preview-rev"
+	m := &Manager{vms: map[string]*VMInstance{}, log: zerolog.Nop()}
+	m.vms[id] = &VMInstance{
+		ID:                    id,
+		PreviewAccess:         "private",
+		PreviewPorts:          map[int32]int64{3000: 1},
+		PreviewPolicyRevision: 5,
+	}
+
+	inst := m.vms[id] // read the record directly; the proxy-facing InstanceInfo
+	// deliberately omits the revision (CP↔vmd internal).
+
+	// Lower revision: ignored.
+	if err := m.UpdateSandboxPreviewPolicy(id, "private", map[int32]int64{3000: 1, 4000: 1}, 4); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inst.PreviewPolicyRevision != 5 || len(inst.PreviewPorts) != 1 {
+		t.Errorf("stale (lower) update was applied: rev=%d ports=%v", inst.PreviewPolicyRevision, inst.PreviewPorts)
+	}
+
+	// Equal revision: ignored (a re-delivered push must not regress).
+	if err := m.UpdateSandboxPreviewPolicy(id, "public", nil, 5); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inst.PreviewAccess != "private" || inst.PreviewPolicyRevision != 5 {
+		t.Errorf("equal-revision update was applied: access=%q rev=%d", inst.PreviewAccess, inst.PreviewPolicyRevision)
+	}
+
+	// Higher revision: applied, and fully replaces the port set.
+	if err := m.UpdateSandboxPreviewPolicy(id, "private", map[int32]int64{8080: 3}, 6); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inst.PreviewPolicyRevision != 6 || len(inst.PreviewPorts) != 1 || inst.PreviewPorts[8080] != 3 {
+		t.Errorf("newer update not applied cleanly: rev=%d ports=%v", inst.PreviewPolicyRevision, inst.PreviewPorts)
+	}
+}

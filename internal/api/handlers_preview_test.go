@@ -65,13 +65,10 @@ type previewHandlerEnv struct {
 	getPortVersion   int32      // GetPublishedPort → this version; 0 => ErrNoRows
 	publishToVersion int32      // PublishPort RETURNING token_version
 	bumpToVersion    int32      // BumpPublishedPortVersion RETURNING token_version
+	bumpNoRow        bool       // BumpPublishedPortVersion → ErrNoRows (unpublished)
 	unpublishRows    int64      // rows affected by UnpublishPort
-	listPorts        [][2]int32 // ListPublishedPorts rows
-
-	// onUnpublishExec fires when the UnpublishPort DELETE executes — lets
-	// tests observe whether/when the row removal happened relative to the
-	// host push.
-	onUnpublishExec func()
+	policyRevision   int64      // BumpPreviewPolicyRevision → this revision
+	listPorts        [][2]int32 // ListPublishedPorts rows (post-mutation state)
 }
 
 func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
@@ -84,6 +81,7 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 		publishToVersion: 1,
 		bumpToVersion:    2,
 		unpublishRows:    1,
+		policyRevision:   5,
 		listPorts:        [][2]int32{{3000, 1}},
 	}
 	env.sb = db.Sandbox{
@@ -107,7 +105,15 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
+			case strings.Contains(sql, "preview_policy_revision = preview_policy_revision + 1"):
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = env.policyRevision
+					return nil
+				}}
 			case strings.Contains(sql, "token_version = token_version + 1"):
+				if env.bumpNoRow {
+					return errorRow(pgx.ErrNoRows)
+				}
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*int32) = portFromArgs(args)
 					*dest[1].(*int32) = env.bumpToVersion
@@ -142,9 +148,6 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 			if strings.Contains(sql, "DELETE FROM sandbox_published_port") {
-				if env.onUnpublishExec != nil {
-					env.onUnpublishExec()
-				}
 				return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", env.unpublishRows)), nil
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
@@ -196,7 +199,7 @@ func TestPublishPort_PushesFullSetToHost(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
 	var pushedAccess string
 	var pushed map[int32]int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _ string, access string, ports map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _ string, access string, ports map[int32]int64, _ int64) error {
 		pushedAccess, pushed = access, ports
 		return nil
 	}
@@ -225,7 +228,7 @@ func TestPublishPort_InvalidPort400(t *testing.T) {
 
 func TestPublishPort_VMDHardErrorIs500(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
 		return grpcUnavailable("vmd down")
 	}
 	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusInternalServerError {
@@ -235,7 +238,7 @@ func TestPublishPort_VMDHardErrorIs500(t *testing.T) {
 
 func TestPublishPort_VMDNotFoundIsOK(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
 		return grpcNotFound("no record on host")
 	}
 	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusOK {
@@ -243,69 +246,58 @@ func TestPublishPort_VMDNotFoundIsOK(t *testing.T) {
 	}
 }
 
-func TestUnpublishPort_PushesIntendedSetBeforeDelete(t *testing.T) {
-	// Enforcement-before-intent ordering: the host must stop routing the port
-	// before the DB row disappears, and the pushed set is the CURRENT set
-	// minus the port (not a post-delete read-back).
+func TestUnpublishPort_PushesResultingSetWithRevision(t *testing.T) {
+	// The pushed set is the post-mutation published set (read inside the same
+	// transaction as the delete + revision bump), tagged with the bumped
+	// revision so vmd can order it against concurrent pushes.
 	env := newPreviewHandlerEnv(t)
-	env.listPorts = [][2]int32{{3000, 1}, {8080, 2}} // DB state at push time
+	env.policyRevision = 9
+	env.listPorts = [][2]int32{{8080, 2}} // state after 3000 is removed
 
-	seq := 0
-	pushSeq, deleteSeq := 0, 0
 	var pushed map[int32]int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
-		seq++
-		pushSeq, pushed = seq, ports
+	var pushedRev int64
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, rev int64) error {
+		pushed, pushedRev = ports, rev
 		return nil
-	}
-	env.onUnpublishExec = func() {
-		seq++
-		deleteSeq = seq
 	}
 
 	w := env.do(http.MethodDelete, env.base()+"/3000", "")
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
 	}
-	if pushSeq == 0 || deleteSeq == 0 || pushSeq > deleteSeq {
-		t.Errorf("ordering: push seq=%d, delete seq=%d — host push must precede DB delete", pushSeq, deleteSeq)
-	}
 	if _, still := pushed[3000]; still || pushed[8080] != 2 {
-		t.Errorf("pushed set = %v, want {8080:2} (3000 removed, 8080 untouched)", pushed)
+		t.Errorf("pushed set = %v, want {8080:2}", pushed)
+	}
+	if pushedRev != 9 {
+		t.Errorf("pushed revision = %d, want 9 (the bumped policy revision)", pushedRev)
 	}
 }
 
-func TestUnpublishPort_HostPushFailureChangesNothing(t *testing.T) {
-	// A failed host push must 500 WITHOUT deleting the DB row — otherwise the
-	// DB says "not published" while the host keeps routing, and a retry would
-	// have nothing to act on.
+func TestUnpublishPort_HostPushFailureIs500(t *testing.T) {
+	// A failed host push is a 500: the DB change committed but the host didn't
+	// get it. That is recoverable — a retry re-bumps the revision and re-pushes,
+	// and vmd accepts the higher revision — so this is not split-brain.
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
 		return grpcUnavailable("vmd down")
 	}
-	deleted := false
-	env.onUnpublishExec = func() { deleted = true }
-
-	w := env.do(http.MethodDelete, env.base()+"/3000", "")
-	if w.Code != http.StatusInternalServerError {
+	if w := env.do(http.MethodDelete, env.base()+"/3000", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 when host push fails", w.Code)
-	}
-	if deleted {
-		t.Error("DB row deleted despite host push failure — unpublish must stay retryable")
 	}
 }
 
 func TestUnpublishPort_IdempotentRetryRepairsHost(t *testing.T) {
 	// The reviewer's scenario: DB row already gone but the host still routes
-	// the port (stale enforcement copy). A repeat DELETE must re-push the
-	// corrected allowlist and succeed — never 404 without touching the host.
+	// the port (stale enforcement copy). A repeat DELETE must re-bump, re-push
+	// the corrected allowlist, and succeed — never 404 without touching the
+	// host.
 	env := newPreviewHandlerEnv(t)
 	env.listPorts = [][2]int32{{8080, 2}} // 3000 already absent from the DB
 	env.unpublishRows = 0                 // delete affects no rows
 
 	var pushed map[int32]int64
 	called := false
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, _ int64) error {
 		called, pushed = true, ports
 		return nil
 	}
@@ -324,10 +316,10 @@ func TestUnpublishPort_IdempotentRetryRepairsHost(t *testing.T) {
 
 func TestUnpublishPort_LastPortPushesEmptySet(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.listPorts = [][2]int32{{3000, 1}} // only port
+	env.listPorts = nil // post-delete state: nothing left published
 	var pushed map[int32]int64
 	called := false
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, _ int64) error {
 		called, pushed = true, ports
 		return nil
 	}
@@ -417,7 +409,7 @@ func TestRotateToken_BumpsOnlyThisPort(t *testing.T) {
 	env.listPorts = [][2]int32{{3000, 2}, {8080, 1}} // 8080 untouched
 
 	var pushed map[int32]int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, _ int64) error {
 		pushed = ports
 		return nil
 	}
@@ -439,9 +431,17 @@ func TestRotateToken_BumpsOnlyThisPort(t *testing.T) {
 	}
 }
 
+func TestRotateToken_UnpublishedPort404(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.bumpNoRow = true // BumpPublishedPortVersion → ErrNoRows
+	if w := env.do(http.MethodPost, env.base()+"/3000/token/rotate", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for an unpublished port", w.Code)
+	}
+}
+
 func TestRotateToken_VMDHardErrorIs500(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
 		return grpcUnavailable("vmd down")
 	}
 	if w := env.do(http.MethodPost, env.base()+"/3000/token/rotate", ""); w.Code != http.StatusInternalServerError {
@@ -458,7 +458,7 @@ func TestPatchSandbox_PreviewAccessPushesPublishedSet(t *testing.T) {
 	env.listPorts = [][2]int32{{3000, 1}}
 	var pushedAccess string
 	var pushed map[int32]int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _, access string, ports map[int32]int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _, access string, ports map[int32]int64, _ int64) error {
 		pushedAccess, pushed = access, ports
 		return nil
 	}
