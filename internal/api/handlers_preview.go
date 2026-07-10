@@ -190,6 +190,18 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 // UnpublishSandboxPreviewPort handles
 // DELETE /sandboxes/:sandbox_id/preview-ports/:port. After this the port is no
 // longer routable (deny-by-default) and its outstanding tokens are useless.
+//
+// Unpublish is a revocation, so it must be retry-safe: the host's enforcement
+// copy is updated BEFORE the DB row is removed, and the operation is
+// idempotent. Ordering rationale:
+//   - Host push fails → 500 with nothing changed (DB still says published,
+//     host still routes it — consistent; retry redoes both).
+//   - Push succeeds, DB delete fails → the host is stricter than the DB
+//     (port 404s even though the row exists) — fail closed; retry repairs.
+//   - Row already absent (a retry, or a never-published port) → the intended
+//     allowlist is pushed anyway, repairing any stale host state, and the
+//     response is 204. A repeat DELETE can never strand a routable port the
+//     DB no longer knows about.
 func (h *Handlers) UnpublishSandboxPreviewPort(c *gin.Context) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -211,24 +223,42 @@ func (h *Handlers) UnpublishSandboxPreviewPort(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.DB.UnpublishPort(c.Request.Context(), db.UnpublishPortParams{SandboxID: sandboxID, Port: port})
+	// Compute the intended post-unpublish allowlist from the DB's current set.
+	current, err := h.loadPreviewPorts(c.Request.Context(), sandboxID)
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Int32("port", port).Msg("DB UnpublishPort failed")
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("load published ports for unpublish failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	if rows == 0 {
-		respondErrorMsg(c, "not_found", "Preview port not published", http.StatusNotFound)
+	_, wasPublished := current[port]
+	intended := make(map[int32]int64, len(current))
+	for p, v := range current {
+		if p != port {
+			intended[p] = v
+		}
+	}
+
+	// Enforcement first: the port must stop routing before the DB forgets it
+	// was ever published.
+	if err := h.pushPreviewPolicy(c.Request.Context(), sandbox, intended); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Int32("port", port).Msg("push preview policy for unpublish failed — nothing changed; retry")
+		respondError(c, ErrInternal)
 		return
 	}
 
-	if !h.syncPreviewPortsToHost(c, sandbox) {
+	// Then intent: remove the row. Zero rows is fine — that's the idempotent
+	// retry/repair path, and the push above already corrected the host.
+	if _, err := h.DB.UnpublishPort(c.Request.Context(), db.UnpublishPortParams{SandboxID: sandboxID, Port: port}); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Int32("port", port).Msg("DB UnpublishPort failed (host already stopped routing the port — retry to finish)")
+		respondError(c, ErrInternal)
 		return
 	}
 
-	detail, _ := json.Marshal(map[string]any{"port": port})
-	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_port_unpublished", "success", &sandbox.Name, nil, detail)
-	h.capture(c, "sandbox_preview_port_unpublished", map[string]any{"sandbox_id": sandboxID.String(), "port": port})
+	if wasPublished {
+		detail, _ := json.Marshal(map[string]any{"port": port})
+		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_port_unpublished", "success", &sandbox.Name, nil, detail)
+		h.capture(c, "sandbox_preview_port_unpublished", map[string]any{"sandbox_id": sandboxID.String(), "port": port})
+	}
 
 	c.Status(http.StatusNoContent)
 }

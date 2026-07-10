@@ -649,11 +649,18 @@ paths:
         Removes a port from the published set. On a `private` sandbox it is
         immediately no longer routable (404 at the edge) and its outstanding
         tokens stop working.
+
+        This is a revocation, so it is **idempotent and retry-safe**: the
+        host's enforcement copy is updated before the record is removed, a
+        `500` means nothing changed and the call should be retried, and
+        repeating the DELETE (including for a port that is not currently
+        published) re-synchronizes enforcement and returns `204`. `404` is
+        returned only when the sandbox itself does not exist.
       security:
         - apiKey: []
       responses:
         "204":
-          description: Port unpublished
+          description: Port unpublished (or already unpublished)
         "404":
           $ref: "#/components/responses/NotFound"
         "401":

@@ -67,6 +67,11 @@ type previewHandlerEnv struct {
 	bumpToVersion    int32      // BumpPublishedPortVersion RETURNING token_version
 	unpublishRows    int64      // rows affected by UnpublishPort
 	listPorts        [][2]int32 // ListPublishedPorts rows
+
+	// onUnpublishExec fires when the UnpublishPort DELETE executes — lets
+	// tests observe whether/when the row removal happened relative to the
+	// host push.
+	onUnpublishExec func()
 }
 
 func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
@@ -137,6 +142,9 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 			if strings.Contains(sql, "DELETE FROM sandbox_published_port") {
+				if env.onUnpublishExec != nil {
+					env.onUnpublishExec()
+				}
 				return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", env.unpublishRows)), nil
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
@@ -235,17 +243,88 @@ func TestPublishPort_VMDNotFoundIsOK(t *testing.T) {
 	}
 }
 
-func TestUnpublishPort_NotPublished404(t *testing.T) {
+func TestUnpublishPort_PushesIntendedSetBeforeDelete(t *testing.T) {
+	// Enforcement-before-intent ordering: the host must stop routing the port
+	// before the DB row disappears, and the pushed set is the CURRENT set
+	// minus the port (not a post-delete read-back).
 	env := newPreviewHandlerEnv(t)
-	env.unpublishRows = 0
-	if w := env.do(http.MethodDelete, env.base()+"/3000", ""); w.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", w.Code)
+	env.listPorts = [][2]int32{{3000, 1}, {8080, 2}} // DB state at push time
+
+	seq := 0
+	pushSeq, deleteSeq := 0, 0
+	var pushed map[int32]int64
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
+		seq++
+		pushSeq, pushed = seq, ports
+		return nil
+	}
+	env.onUnpublishExec = func() {
+		seq++
+		deleteSeq = seq
+	}
+
+	w := env.do(http.MethodDelete, env.base()+"/3000", "")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	if pushSeq == 0 || deleteSeq == 0 || pushSeq > deleteSeq {
+		t.Errorf("ordering: push seq=%d, delete seq=%d — host push must precede DB delete", pushSeq, deleteSeq)
+	}
+	if _, still := pushed[3000]; still || pushed[8080] != 2 {
+		t.Errorf("pushed set = %v, want {8080:2} (3000 removed, 8080 untouched)", pushed)
 	}
 }
 
-func TestUnpublishPort_Success(t *testing.T) {
+func TestUnpublishPort_HostPushFailureChangesNothing(t *testing.T) {
+	// A failed host push must 500 WITHOUT deleting the DB row — otherwise the
+	// DB says "not published" while the host keeps routing, and a retry would
+	// have nothing to act on.
 	env := newPreviewHandlerEnv(t)
-	env.listPorts = nil // nothing left published after delete
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64) error {
+		return grpcUnavailable("vmd down")
+	}
+	deleted := false
+	env.onUnpublishExec = func() { deleted = true }
+
+	w := env.do(http.MethodDelete, env.base()+"/3000", "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when host push fails", w.Code)
+	}
+	if deleted {
+		t.Error("DB row deleted despite host push failure — unpublish must stay retryable")
+	}
+}
+
+func TestUnpublishPort_IdempotentRetryRepairsHost(t *testing.T) {
+	// The reviewer's scenario: DB row already gone but the host still routes
+	// the port (stale enforcement copy). A repeat DELETE must re-push the
+	// corrected allowlist and succeed — never 404 without touching the host.
+	env := newPreviewHandlerEnv(t)
+	env.listPorts = [][2]int32{{8080, 2}} // 3000 already absent from the DB
+	env.unpublishRows = 0                 // delete affects no rows
+
+	var pushed map[int32]int64
+	called := false
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
+		called, pushed = true, ports
+		return nil
+	}
+
+	w := env.do(http.MethodDelete, env.base()+"/3000", "")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (idempotent); body: %s", w.Code, w.Body.String())
+	}
+	if !called {
+		t.Fatal("host never received the corrected allowlist on retry")
+	}
+	if _, still := pushed[3000]; still || pushed[8080] != 2 {
+		t.Errorf("pushed set = %v, want {8080:2}", pushed)
+	}
+}
+
+func TestUnpublishPort_LastPortPushesEmptySet(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.listPorts = [][2]int32{{3000, 1}} // only port
 	var pushed map[int32]int64
 	called := false
 	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64) error {
