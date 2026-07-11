@@ -1319,6 +1319,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		vmID = uuid.New().String()
 	}
 
+	// Presence gate for layered overlays (same predicate the layered backend
+	// selection uses below). Needs only memPath, so it runs before ANY state
+	// changes: no provisional instance published (a refusal must not leave a
+	// phantom StatusError record for retries to trip over as inPlace), no
+	// existing same-ID VM stopped, no disk/network/Firecracker setup.
+	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
+		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
+		}
+	}
+
 	// Load a paused VM the background reattach hasn't reached yet, so the inPlace
 	// path below reuses its slot instead of allocating a fresh one. No-op for a
 	// new VM (not in BoltDB).
@@ -1354,15 +1365,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.setStatus(vmID, StatusError)
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"snapshot %q is overlay-mode but no base_path was provided to restore", snapshotPath)
-		}
-	}
-
-	// Presence gate for layered overlays (same predicate the layered backend
-	// selection uses below), before any disk, network, or Firecracker setup.
-	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
-		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
-			m.setStatus(vmID, StatusError)
-			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
 
