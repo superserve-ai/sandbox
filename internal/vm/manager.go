@@ -1319,11 +1319,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		vmID = uuid.New().String()
 	}
 
-	// Presence gate for layered overlays (same predicate the layered backend
-	// selection uses below). Needs only memPath, so it runs before ANY state
+	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
 	// phantom StatusError record for retries to trip over as inPlace), no
 	// existing same-ID VM stopped, no disk/network/Firecracker setup.
+	//
+	// Side-car == overlay-mode marker. Fail clean if BasePath is missing
+	// rather than fall through and risk opening an unrelated rootfs.
+	if resourceLimits.BasePath == "" && snapshotPath != "" {
+		if _, err := os.Stat(snapshotPath + ".overlay"); err == nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q is overlay-mode but no base_path was provided to restore", snapshotPath)
+		}
+	}
+	// Presence gate for layered overlays (same predicate the layered backend
+	// selection uses below).
 	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
 		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
@@ -1357,16 +1367,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
-
-	// Side-car == overlay-mode marker. Fail clean if BasePath is missing
-	// rather than fall through and risk opening an unrelated rootfs.
-	if resourceLimits.BasePath == "" && snapshotPath != "" {
-		if _, err := os.Stat(snapshotPath + ".overlay"); err == nil {
-			m.setStatus(vmID, StatusError)
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"snapshot %q is overlay-mode but no base_path was provided to restore", snapshotPath)
-		}
-	}
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
