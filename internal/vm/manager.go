@@ -663,8 +663,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		usable := true
 		if instMemFile == instBaseMem {
 			if rerr := freshenFirstPassOverlay(overlayPath); rerr != nil {
-				// rerr's PathError names the exact file — the overlay or its
-				// presence side-car; freshenFirstPassOverlay removes both.
 				log.Warn().Err(rerr).Str("path", overlayPath).Msg("pause: stale overlay/side-car removal failed; falling back to Full")
 				usable = false
 			}
@@ -688,13 +686,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				// failing loud instead of loading corrupt memory. The overlay file
 				// itself is left in place: handleVMError keeps a still-running VM, which
 				// may still have it mmap'd. (True crash-atomicity is out of scope.)
-				//
-				// The presence side-car goes too: it describes the pre-failure overlay,
-				// and an orphan next to a partial one is one out-of-band re-copy of
-				// mem.diff away from being re-paired with bytes it doesn't describe
-				// (geometry alone would pass). If Firecracker is still mid-dump it may
-				// rewrite the side-car after this remove — that bitmap then matches the
-				// completed dump, and with .base gone the restore is refused anyway.
+				// The presence side-car goes too — it describes the pre-failure
+				// overlay. Racing a still-running Firecracker is benign: a side-car it
+				// rewrites after this remove matches the completed dump, and with
+				// .base gone the restore is refused regardless.
 				_ = os.Remove(layeredBaseSidecarPath(memPath))
 				_ = os.Remove(presenceSidecarPath(memPath))
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
@@ -1363,9 +1358,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	// Presence gate for layered overlays (same predicate the layered backend
-	// selection uses below). Deterministic from a stat, so refuse here — before
-	// disk, network, and Firecracker setup — mirroring ResumeVM; this is the
-	// entry point transferred artifacts actually arrive through.
+	// selection uses below), before any disk, network, or Firecracker setup.
 	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
 		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
 			m.setStatus(vmID, StatusError)
@@ -1510,7 +1503,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		case hasSidecar:
 			// The outer overlayNeedsLayered guard already required resume-UFFD to reach
 			// here, so canLayered holds — serve the overlay over its recorded base.
-			// The presence gate already ran in the precondition block above.
 			basePath = sidecarBase
 			armLayered = m.cfg.IncrementalSnapshotEnabled
 			inst.mu.Lock()
@@ -1572,12 +1564,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				snapshotPath, restoreErr)
 		}
 		if errors.Is(restoreErr, ErrPresenceSidecarMissing) {
-			// Same contract as above: deterministic artifact state, retrying cannot
-			// succeed until the side-car is re-copied next to the overlay. The gate
-			// runs in the precondition block before any side effects, so nothing in
-			// this function produces the sentinel today — this mapping guards any
-			// future gate call that funnels through restoreErr from silently
-			// downgrading the refusal to a retryable error.
+			// Permanent until the side-car is re-copied next to the overlay. Nothing
+			// sets restoreErr to this sentinel today (the gate runs in the
+			// precondition block), but without this mapping a future gate call that
+			// funnels through restoreErr would downgrade the refusal to retryable.
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", restoreErr)
 		}
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
