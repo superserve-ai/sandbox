@@ -198,6 +198,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		active[id] = true
 	}
 
+	// Presence convergence rides the reconcile tick: give every quiesced legacy
+	// overlay its side-car, then persist the converged marker. No-op (one
+	// atomic load) once the host has converged.
+	r.mgr.sweepPresenceSidecars(active)
+
 	// Source C: DB sandbox rows for this host (optional), with their
 	// linked snapshot path joined in so Drift 4 can stat the snapshot
 	// without a per-row lookup. A short per-query deadline keeps a slow

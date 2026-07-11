@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/presence"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/shellquote"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
@@ -186,13 +187,18 @@ type ManagerConfig struct {
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
 
-	// RequirePresenceSidecar refuses a layered UFFD restore whose overlay has no
-	// .presence side-car next to it. Without the side-car, Firecracker falls back
-	// to inferring page presence from the overlay's extent map — only sound if
-	// the file was never copied by a tool that rewrites sparse extents. Enable on
-	// hosts that restore transferred artifacts, where a missing side-car more
-	// likely means "dropped in transit" than "legacy snapshot". Default false.
-	RequirePresenceSidecar bool
+	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
+	// overlay has no .presence side-car next to it. Without the side-car,
+	// Firecracker falls back to inferring page presence from the overlay's
+	// extent map — only sound if the file was never copied by a tool that
+	// rewrites sparse extents.
+	//
+	// Modes: "auto" (default) enforces once the host's convergence sweep has
+	// given every layered overlay a side-car — enforcement engages only when
+	// it provably affects nothing that exists; "always" enforces immediately
+	// (fresh migration-target hosts, which start converged by construction);
+	// "never" is the break-glass off switch.
+	RequirePresenceSidecar string
 
 	// LaunchViaLauncherNS routes the Firecracker launch through a long-lived,
 	// pruned "launcher" mount namespace (pinned at LauncherNSPath); see
@@ -227,6 +233,12 @@ type Manager struct {
 	// the launcher path.
 	launcherBuilt atomic.Bool
 
+	// presenceConverged mirrors the on-disk converged marker: every layered
+	// overlay on this host has a presence side-car, so strict enforcement can
+	// engage (in "auto" mode) without affecting anything that exists. Set at
+	// startup from the marker file and by the convergence sweep when it wins.
+	presenceConverged atomic.Bool
+
 	mu  sync.RWMutex
 	vms map[string]*VMInstance
 
@@ -260,13 +272,15 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 			return nil, fmt.Errorf("mkdir template magic dir: %w", err)
 		}
 	}
-	return &Manager{
+	m := &Manager{
 		cfg:        cfg,
 		netMgr:     netMgr,
 		log:        log.With().Str("component", "vm_manager").Logger(),
 		vms:        make(map[string]*VMInstance),
 		restoreSem: make(chan struct{}, maxRestores),
-	}, nil
+	}
+	m.loadPresenceConverged()
+	return m, nil
 }
 
 // SetStateStore attaches a BoltDB state store for durable persistence.
@@ -753,11 +767,11 @@ func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeMemPath stri
 // standalone (which would read the base's pages as zero holes).
 func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
 
-// presenceSidecarPath is where Firecracker persists the overlay's page-presence
-// bitmap. It pairs with the mem file: transfers must copy the two together and
-// deletion must remove both — a stale bitmap next to a future same-size overlay
-// passes every restore-side check and silently mis-layers pages.
-func presenceSidecarPath(memPath string) string { return memPath + ".presence" }
+// presenceSidecarPath aliases the shared format package: the side-car pairs
+// with the mem file (transfers copy both, deletion removes both — a stale
+// bitmap next to a future same-size overlay passes every restore-side check
+// and silently mis-layers pages).
+func presenceSidecarPath(memPath string) string { return presence.SidecarPath(memPath) }
 
 // ErrPresenceSidecarMissing marks a layered restore refused because the overlay
 // has no presence side-car on a host that requires one (RequirePresenceSidecar).
@@ -779,7 +793,7 @@ func (m *Manager) gateOverlayPresence(memPath string, log zerolog.Logger) error 
 	if _, err := os.Stat(presenceSidecarPath(memPath)); !os.IsNotExist(err) {
 		return nil
 	}
-	if m.cfg.RequirePresenceSidecar {
+	if m.presenceStrict() {
 		return fmt.Errorf(
 			"layered overlay %q has no presence side-car and this host requires one; "+
 				"re-copy the overlay and side-car as a pair: %w",

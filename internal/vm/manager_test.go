@@ -353,7 +353,7 @@ func TestGateOverlayPresence(t *testing.T) {
 	// Missing side-car, gate on → refused, carrying the sentinel both restore
 	// entry points map to FailedPrecondition. Without the sentinel the fresh
 	// path would surface this deterministic refusal as a retryable error.
-	m = &Manager{cfg: ManagerConfig{RequirePresenceSidecar: true}}
+	m = &Manager{cfg: ManagerConfig{RequirePresenceSidecar: "always"}}
 	err := m.gateOverlayPresence(mem, nop)
 	if !errors.Is(err, ErrPresenceSidecarMissing) {
 		t.Errorf("gate on: got %v, want ErrPresenceSidecarMissing", err)
