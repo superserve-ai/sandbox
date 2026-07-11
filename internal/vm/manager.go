@@ -1362,6 +1362,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	}
 
+	// Presence gate for layered overlays (same predicate the layered backend
+	// selection uses below). Deterministic from a stat, so refuse here — before
+	// disk, network, and Firecracker setup — mirroring ResumeVM; this is the
+	// entry point transferred artifacts actually arrive through.
+	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
+		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+			m.setStatus(vmID, StatusError)
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
+		}
+	}
+
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
@@ -1499,10 +1510,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		case hasSidecar:
 			// The outer overlayNeedsLayered guard already required resume-UFFD to reach
 			// here, so canLayered holds — serve the overlay over its recorded base.
-			if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
-				restoreErr = gerr
-				break
-			}
+			// The presence gate already ran in the precondition block above.
 			basePath = sidecarBase
 			armLayered = m.cfg.IncrementalSnapshotEnabled
 			inst.mu.Lock()
@@ -1565,9 +1573,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		if errors.Is(restoreErr, ErrPresenceSidecarMissing) {
 			// Same contract as above: deterministic artifact state, retrying cannot
-			// succeed until the side-car is re-copied next to the overlay. ResumeVM
-			// classifies this identically — the two entry points must agree or the
-			// same refusal looks permanent on one path and retryable on the other.
+			// succeed until the side-car is re-copied next to the overlay. The gate
+			// runs in the precondition block before any side effects, so nothing in
+			// this function produces the sentinel today — this mapping guards any
+			// future gate call that funnels through restoreErr from silently
+			// downgrading the refusal to a retryable error.
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", restoreErr)
 		}
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)

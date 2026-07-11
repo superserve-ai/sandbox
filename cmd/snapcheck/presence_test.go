@@ -175,4 +175,14 @@ func TestPresenceAwareCatchesWhatBytesCannot(t *testing.T) {
 	if len(res.contentDiff) != 1 || res.contentDiff[0] != 1 {
 		t.Fatalf("content diff: got %+v, want page 1", res.contentDiff)
 	}
+
+	// A sub-page truncation must fail geometry, never report identical: the
+	// ceiling page count would still match, and a truncated final page absent
+	// in both bitmaps would be skipped by the compare loop entirely.
+	if err := os.Truncate(dst, int64(4*ps-100)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := comparePresenceAware(src, dst, ps); err == nil {
+		t.Error("truncated overlay: want geometry error, got nil")
+	}
 }

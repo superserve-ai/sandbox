@@ -133,8 +133,12 @@ func comparePresenceAware(pathA, pathB string, pageSize int) (presenceResult, er
 		if err != nil {
 			return presenceResult{}, err
 		}
-		if got := (uint64(st.Size()) + uint64(pageSize) - 1) / uint64(pageSize); got != pa.npages {
-			return presenceResult{}, fmt.Errorf("%s: %d pages on disk, side-car says %d", f.Name(), got, pa.npages)
+		// Exact size, not a page-count ceiling: an overlay truncated by less
+		// than one page would round up to the right count, and if that final
+		// page is absent in both bitmaps the compare loop never touches it —
+		// "identical" for an artifact the restore would reject as short.
+		if want := pa.npages * uint64(pageSize); uint64(st.Size()) != want {
+			return presenceResult{}, fmt.Errorf("%s: %d bytes on disk, side-car geometry needs %d", f.Name(), st.Size(), want)
 		}
 	}
 
