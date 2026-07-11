@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc64"
 	"io"
 	"os"
 )
@@ -26,34 +27,16 @@ const (
 	presenceUnderivable = 0x55
 )
 
-// crc64Table implements CRC-64 with the Jones polynomial (reflected, zero
-// init and xorout) — the variant the snapshotting side writes. Verified
-// against it by TestCRC64MatchesSnapshotter's known-answer values.
-var crc64Table = func() [256]uint64 {
-	// The Jones polynomial 0xad93d23594c935a9 in the bit-reversed form a
-	// reflected table-driven implementation needs.
-	const poly = 0x95ac9329ac4bc9b5
-	var t [256]uint64
-	for i := range t {
-		crc := uint64(i)
-		for j := 0; j < 8; j++ {
-			if crc&1 == 1 {
-				crc = (crc >> 1) ^ poly
-			} else {
-				crc >>= 1
-			}
-		}
-		t[i] = crc
-	}
-	return t
-}()
+// crc64Table is the Jones polynomial (0xad93d23594c935a9) in the bit-reversed
+// form stdlib's reflected implementation expects.
+var crc64Table = crc64.MakeTable(0x95ac9329ac4bc9b5)
 
+// crc64Sum computes the zero-init/zero-xorout CRC-64 variant the snapshotting
+// side writes. stdlib bakes in all-ones init and xorout; seeding Update with ^0
+// cancels both inversions. Pinned to the snapshotter's implementation by
+// TestCRC64MatchesSnapshotter's known-answer values.
 func crc64Sum(data []byte) uint64 {
-	var crc uint64
-	for _, b := range data {
-		crc = crc64Table[byte(crc)^b] ^ (crc >> 8)
-	}
-	return crc
+	return ^crc64.Update(^uint64(0), crc64Table, data)
 }
 
 type presenceBitmap struct {
@@ -126,10 +109,11 @@ func comparePresenceAware(pathA, pathB string, pageSize int) (presenceResult, er
 	if err != nil {
 		return presenceResult{}, err
 	}
-	for _, p := range []presenceBitmap{pa, pb} {
-		if p.pageSize != uint64(pageSize) {
-			return presenceResult{}, fmt.Errorf("side-car page size %d does not match -page-size %d", p.pageSize, pageSize)
-		}
+	if pa.pageSize != uint64(pageSize) {
+		return presenceResult{}, fmt.Errorf("%s.presence: page size %d does not match -page-size %d", pathA, pa.pageSize, pageSize)
+	}
+	if pb.pageSize != uint64(pageSize) {
+		return presenceResult{}, fmt.Errorf("%s.presence: page size %d does not match -page-size %d", pathB, pb.pageSize, pageSize)
 	}
 	if pa.npages != pb.npages {
 		return presenceResult{}, fmt.Errorf("side-cars disagree on page count: %d vs %d", pa.npages, pb.npages)

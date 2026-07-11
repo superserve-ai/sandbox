@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -337,18 +338,6 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	}
 }
 
-func TestOverlayPresenceMissing(t *testing.T) {
-	dir := t.TempDir()
-	mem := filepath.Join(dir, "mem.diff")
-	if !overlayPresenceMissing(mem) {
-		t.Error("no side-car on disk: want missing=true")
-	}
-	writeFile(t, presenceSidecarPath(mem))
-	if overlayPresenceMissing(mem) {
-		t.Error("side-car exists: want missing=false")
-	}
-}
-
 func TestGateOverlayPresence(t *testing.T) {
 	dir := t.TempDir()
 	mem := filepath.Join(dir, "mem.diff")
@@ -356,20 +345,22 @@ func TestGateOverlayPresence(t *testing.T) {
 
 	// Missing side-car, gate off → allowed (warn-only compat for pre-side-car
 	// local snapshots).
-	m := &Manager{log: nop}
+	m := &Manager{}
 	if err := m.gateOverlayPresence(mem, nop); err != nil {
 		t.Errorf("gate off: got %v, want nil", err)
 	}
 
-	// Missing side-car, gate on → refused. This must hold on every layered
-	// restore entry point (fresh restore AND resume) or a transferred overlay
-	// that lost its side-car silently falls back to extent scanning.
-	m = &Manager{cfg: ManagerConfig{RequirePresenceSidecar: true}, log: nop}
-	if err := m.gateOverlayPresence(mem, nop); err == nil {
-		t.Error("gate on: want error, got nil")
+	// Missing side-car, gate on → refused, carrying the sentinel both restore
+	// entry points map to FailedPrecondition. Without the sentinel the fresh
+	// path would surface this deterministic refusal as a retryable error.
+	m = &Manager{cfg: ManagerConfig{RequirePresenceSidecar: true}}
+	err := m.gateOverlayPresence(mem, nop)
+	if !errors.Is(err, ErrPresenceSidecarMissing) {
+		t.Errorf("gate on: got %v, want ErrPresenceSidecarMissing", err)
 	}
 
-	// Side-car present → allowed regardless of the gate.
+	// Side-car present → allowed regardless of the gate. Only confirmed
+	// absence gates; other stat outcomes defer to Firecracker's own read.
 	writeFile(t, presenceSidecarPath(mem))
 	if err := m.gateOverlayPresence(mem, nop); err != nil {
 		t.Errorf("side-car present: got %v, want nil", err)

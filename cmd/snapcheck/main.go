@@ -43,17 +43,8 @@ func main() {
 		}
 		fmt.Printf("pages: %d  presence-differing: %d  content-differing: %d\n",
 			res.totalPages, len(res.presenceDiff), len(res.contentDiff))
-		report := func(label string, pages []int) {
-			for i, p := range pages {
-				if i >= *maxReport {
-					fmt.Printf("  ... %d more\n", len(pages)-*maxReport)
-					break
-				}
-				fmt.Printf("  %s page %d  offset 0x%x\n", label, p, int64(p)*int64(*pageSize))
-			}
-		}
-		report("presence", res.presenceDiff)
-		report("content", res.contentDiff)
+		reportPages("presence ", res.presenceDiff, *pageSize, *maxReport)
+		reportPages("content ", res.contentDiff, *pageSize, *maxReport)
 		if len(res.presenceDiff) > 0 || len(res.contentDiff) > 0 {
 			os.Exit(1)
 		}
@@ -68,17 +59,24 @@ func main() {
 	}
 
 	fmt.Printf("pages: %d  differing: %d\n", res.totalPages, len(res.diffPages))
-	for i, p := range res.diffPages {
-		if i >= *maxReport {
-			fmt.Printf("  ... %d more\n", len(res.diffPages)-*maxReport)
-			break
-		}
-		fmt.Printf("  page %d  offset 0x%x\n", p, int64(p)*int64(*pageSize))
-	}
+	reportPages("", res.diffPages, *pageSize, *maxReport)
 	if len(res.diffPages) > 0 {
 		os.Exit(1)
 	}
 	fmt.Println("identical")
+}
+
+// reportPages prints up to maxReport page indices with their byte offsets.
+// prefix distinguishes the diff kind in presence mode ("presence ", "content ")
+// and is empty for the raw byte compare.
+func reportPages(prefix string, pages []int, pageSize, maxReport int) {
+	for i, p := range pages {
+		if i >= maxReport {
+			fmt.Printf("  ... %d more\n", len(pages)-maxReport)
+			break
+		}
+		fmt.Printf("  %spage %d  offset 0x%x\n", prefix, p, int64(p)*int64(pageSize))
+	}
 }
 
 type compareResult struct {

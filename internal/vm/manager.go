@@ -663,7 +663,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		usable := true
 		if instMemFile == instBaseMem {
 			if rerr := freshenFirstPassOverlay(overlayPath); rerr != nil {
-				log.Warn().Err(rerr).Str("path", overlayPath).Msg("pause: stale overlay removal failed; falling back to Full")
+				// rerr's PathError names the exact file — the overlay or its
+				// presence side-car; freshenFirstPassOverlay removes both.
+				log.Warn().Err(rerr).Str("path", overlayPath).Msg("pause: stale overlay/side-car removal failed; falling back to Full")
 				usable = false
 			}
 		}
@@ -686,7 +688,15 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				// failing loud instead of loading corrupt memory. The overlay file
 				// itself is left in place: handleVMError keeps a still-running VM, which
 				// may still have it mmap'd. (True crash-atomicity is out of scope.)
+				//
+				// The presence side-car goes too: it describes the pre-failure overlay,
+				// and an orphan next to a partial one is one out-of-band re-copy of
+				// mem.diff away from being re-paired with bytes it doesn't describe
+				// (geometry alone would pass). If Firecracker is still mid-dump it may
+				// rewrite the side-car after this remove — that bitmap then matches the
+				// completed dump, and with .base gone the restore is refused anyway.
 				_ = os.Remove(layeredBaseSidecarPath(memPath))
+				_ = os.Remove(presenceSidecarPath(memPath))
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 			}
 		} else {
@@ -754,27 +764,31 @@ func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
 // passes every restore-side check and silently mis-layers pages.
 func presenceSidecarPath(memPath string) string { return memPath + ".presence" }
 
-// overlayPresenceMissing reports whether the overlay has no readable presence
-// side-car, in which case Firecracker would fall back to extent scanning.
-func overlayPresenceMissing(memPath string) bool {
-	_, err := os.Stat(presenceSidecarPath(memPath))
-	return err != nil
-}
+// ErrPresenceSidecarMissing marks a layered restore refused because the overlay
+// has no presence side-car on a host that requires one (RequirePresenceSidecar).
+// Deterministic and permanent until the artifact pair is re-copied, so callers
+// must map it to FailedPrecondition — surfacing it as a generic (retryable)
+// error turns one bad transfer into an indefinite boot/teardown retry loop.
+var ErrPresenceSidecarMissing = errors.New("overlay presence side-car missing")
 
 // gateOverlayPresence enforces RequirePresenceSidecar before a layered restore
 // of memPath. Without the side-car Firecracker infers presence from the
 // overlay's extent map, which transfers can silently rewrite: refuse when this
 // host requires the side-car (transferred-artifact hosts), warn otherwise
-// (pre-side-car local snapshots restore fine from extents). Every layered
-// restore entry point must call this — fresh restores and resumes alike.
+// (pre-side-car local snapshots restore fine from extents). Only confirmed
+// absence gates; a side-car that exists but can't be stat'ed or parsed is left
+// to Firecracker's own read, which fails loudly with the real error. Every
+// layered restore entry point must call this — fresh restores and resumes
+// alike — and it needs only memPath, so call it before any side effects.
 func (m *Manager) gateOverlayPresence(memPath string, log zerolog.Logger) error {
-	if !overlayPresenceMissing(memPath) {
+	if _, err := os.Stat(presenceSidecarPath(memPath)); !os.IsNotExist(err) {
 		return nil
 	}
 	if m.cfg.RequirePresenceSidecar {
 		return fmt.Errorf(
-			"layered overlay %q has no presence side-car and this host requires one; re-copy the overlay and side-car as a pair",
-			memPath)
+			"layered overlay %q has no presence side-car and this host requires one; "+
+				"re-copy the overlay and side-car as a pair: %w",
+			memPath, ErrPresenceSidecarMissing)
 	}
 	log.Warn().Str("path", presenceSidecarPath(memPath)).
 		Msg("layered overlay has no presence side-car; Firecracker will infer presence from extents")
@@ -881,6 +895,15 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
 	}
+	// Presence gate for layered overlays. Deterministic from a stat, so it
+	// belongs here with the other precondition checks — a post-boot refusal
+	// would start and tear down a Firecracker unit and network slot on every
+	// auto-resume retry of a sandbox whose side-car was lost in transfer.
+	if isOverlayMemFile(memPath) {
+		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
+		}
+	}
 
 	rundirKey := vmID
 	if inst.RunDirID != "" {
@@ -936,10 +959,6 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 			m.stopUnitDuringRestoreError(vmID)
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
-		}
-		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
-			m.stopUnitDuringRestoreError(vmID)
-			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
 	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
@@ -1543,6 +1562,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
 				snapshotPath, restoreErr)
+		}
+		if errors.Is(restoreErr, ErrPresenceSidecarMissing) {
+			// Same contract as above: deterministic artifact state, retrying cannot
+			// succeed until the side-car is re-copied next to the overlay. ResumeVM
+			// classifies this identically — the two entry points must agree or the
+			// same refusal looks permanent on one path and retryable on the other.
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", restoreErr)
 		}
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}

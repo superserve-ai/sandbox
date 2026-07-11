@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -107,7 +108,7 @@ func TestPresenceAwareCatchesWhatBytesCannot(t *testing.T) {
 		}
 		// Page 1: real data. Page 2: written zeros on the source, elided to a
 		// hole on the copy — identical bytes when read either way.
-		if _, err := f.WriteAt(bytesRepeat(0xAA, ps), ps); err != nil {
+		if _, err := f.WriteAt(bytes.Repeat([]byte{0xAA}, ps), ps); err != nil {
 			t.Fatal(err)
 		}
 		if !holePage2 {
@@ -161,7 +162,7 @@ func TestPresenceAwareCatchesWhatBytesCannot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt(bytesRepeat(0xBB, ps), ps); err != nil {
+	if _, err := f.WriteAt(bytes.Repeat([]byte{0xBB}, ps), ps); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
@@ -174,12 +175,4 @@ func TestPresenceAwareCatchesWhatBytesCannot(t *testing.T) {
 	if len(res.contentDiff) != 1 || res.contentDiff[0] != 1 {
 		t.Fatalf("content diff: got %+v, want page 1", res.contentDiff)
 	}
-}
-
-func bytesRepeat(b byte, n int) []byte {
-	s := make([]byte, n)
-	for i := range s {
-		s[i] = b
-	}
-	return s
 }
