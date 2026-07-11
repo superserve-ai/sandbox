@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/presence"
 )
 
 // TestPlanRestore pins the restore-decision behavior across the four input
@@ -287,7 +288,7 @@ func TestFreshenFirstPassOverlay(t *testing.T) {
 	if err := os.WriteFile(f, []byte("stale"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := os.WriteFile(presenceSidecarPath(f), []byte("stale bits"), 0o600); err != nil {
+	if err := os.WriteFile(presence.SidecarPath(f), []byte("stale bits"), 0o600); err != nil {
 		t.Fatalf("write side-car: %v", err)
 	}
 	if err := freshenFirstPassOverlay(f); err != nil {
@@ -296,7 +297,7 @@ func TestFreshenFirstPassOverlay(t *testing.T) {
 	if _, err := os.Stat(f); !os.IsNotExist(err) {
 		t.Errorf("overlay not removed: %v", err)
 	}
-	if _, err := os.Stat(presenceSidecarPath(f)); !os.IsNotExist(err) {
+	if _, err := os.Stat(presence.SidecarPath(f)); !os.IsNotExist(err) {
 		t.Errorf("presence side-car not removed: %v", err)
 	}
 
@@ -317,8 +318,8 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	snap := filepath.Join(root, vmID, "vmstate.snap")
 	mem := filepath.Join(root, vmID, "mem.diff")
 	overlay := snap + ".overlay"
-	base := layeredBaseSidecarPath(mem)  // mem.diff.base
-	presence := presenceSidecarPath(mem) // mem.diff.presence
+	base := layeredBaseSidecarPath(mem)   // mem.diff.base
+	presence := presence.SidecarPath(mem) // mem.diff.presence
 	for _, p := range []string{snap, mem, overlay, base, presence} {
 		writeFile(t, p)
 	}
@@ -361,7 +362,7 @@ func TestGateOverlayPresence(t *testing.T) {
 
 	// Side-car present → allowed regardless of the gate. Only confirmed
 	// absence gates; other stat outcomes defer to Firecracker's own read.
-	writeFile(t, presenceSidecarPath(mem))
+	writeFile(t, presence.SidecarPath(mem))
 	if err := m.gateOverlayPresence(mem, nop); err != nil {
 		t.Errorf("side-car present: got %v, want nil", err)
 	}

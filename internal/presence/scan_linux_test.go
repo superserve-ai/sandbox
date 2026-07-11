@@ -6,33 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-)
 
-// writeSparseOverlay lays out a file the way a diff dump does: written
-// extents for provided pages (zeros included), holes for the rest.
-func writeSparseOverlay(t *testing.T, path string, pageSize, npages int, dataPages map[int]byte) {
-	t.Helper()
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if err := f.Truncate(int64(npages * pageSize)); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, pageSize)
-	for pg, b := range dataPages {
-		for i := range buf {
-			buf[i] = b
-		}
-		if _, err := f.WriteAt(buf, int64(pg*pageSize)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := f.Sync(); err != nil {
-		t.Fatal(err)
-	}
-}
+	"github.com/superserve-ai/sandbox/internal/presence/presencetest"
+)
 
 func TestScanAndGenerate(t *testing.T) {
 	ps := os.Getpagesize()
@@ -41,7 +17,7 @@ func TestScanAndGenerate(t *testing.T) {
 
 	// Pages 1 (real data) and 2 (written zeros — still a provided page!)
 	// present; 0 and 3 are holes.
-	writeSparseOverlay(t, mem, ps, 4, map[int]byte{1: 0xAA, 2: 0x00})
+	presencetest.WriteSparseOverlay(t, mem, ps, 4, map[int]byte{1: 0xAA, 2: 0x00})
 
 	p, err := Scan(mem, ps)
 	if err != nil {
@@ -54,9 +30,16 @@ func TestScanAndGenerate(t *testing.T) {
 		t.Errorf("scan bits wrong: %+v", p.Bits)
 	}
 
-	// Generate = scan + atomic write; the side-car must decode to the same bits.
-	if err := Generate(mem); err != nil {
-		t.Fatalf("generate: %v", err)
+	// Scan + WriteIfAbsent is the sweep's generation path; the side-car must
+	// decode to the same bits, and a second write must refuse to replace it.
+	if err := WriteIfAbsent(mem, p.PageSize, p.NPages, p.Bits); err != nil {
+		t.Fatalf("write-if-absent: %v", err)
+	}
+	if err := WriteIfAbsent(mem, p.PageSize, p.NPages, p.Bits); err != ErrSidecarExists {
+		t.Fatalf("second write-if-absent: got %v, want ErrSidecarExists", err)
+	}
+	if _, err := os.Stat(SidecarPath(mem) + ".tmp"); !os.IsNotExist(err) {
+		t.Error("refused write left a temp file behind")
 	}
 	rd, err := Read(mem)
 	if err != nil {
@@ -76,7 +59,7 @@ func TestScanAllHoles(t *testing.T) {
 	ps := os.Getpagesize()
 	dir := t.TempDir()
 	mem := filepath.Join(dir, "mem.diff")
-	writeSparseOverlay(t, mem, ps, 8, nil)
+	presencetest.WriteSparseOverlay(t, mem, ps, 8, nil)
 
 	p, err := Scan(mem, ps)
 	if err != nil {

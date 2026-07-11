@@ -5,21 +5,31 @@ package presence
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// Scan derives a presence bitmap from memPath's allocated extents
-// via SEEK_DATA/SEEK_HOLE: a written extent is a page the overlay provides, a
+// ErrSidecarExists reports that WriteIfAbsent found a side-car already in
+// place. For the convergence sweep this means the authoritative writer
+// (Firecracker, at snapshot save) got there first — the sweep's scanned
+// bitmap is the stale one and must be discarded, never the reverse.
+var ErrSidecarExists = errors.New("presence side-car already exists")
+
+// Scan derives a presence bitmap from memPath's allocated extents via
+// SEEK_DATA/SEEK_HOLE: a written extent is a page the overlay provides, a
 // hole falls through to the base. This is the same inference Firecracker's
 // legacy restore fallback performs, so it is sound under the same conditions
 // only: the file's extents must be the ones its dump wrote — i.e. the overlay
 // has never been transferred — and the filesystem's allocation unit must not
 // exceed the page size (a coarser unit over-reports clean pages as present,
 // which a restore would serve as zeros instead of base content).
+//
+// Any unexpected seek error aborts the scan — including ENXIO from SEEK_HOLE,
+// which on Linux can only mean the file shrank mid-scan (an implicit hole
+// exists at EOF otherwise): a concurrent rewrite whose bitmap must not be
+// trusted.
 func Scan(memPath string, pageSize int) (Bitmap, error) {
 	f, err := os.Open(memPath)
 	if err != nil {
@@ -36,9 +46,10 @@ func Scan(memPath string, pageSize int) (Bitmap, error) {
 			memPath, sys.Blksize, pageSize)
 	}
 	size := st.Size()
-	npages := uint64((size + int64(pageSize) - 1) / int64(pageSize))
+	ps := uint64(pageSize)
+	npages := (uint64(size) + ps - 1) / ps
 	p := Bitmap{
-		PageSize: uint64(pageSize),
+		PageSize: ps,
 		NPages:   npages,
 		Bits:     make([]uint64, (npages+63)/64),
 	}
@@ -53,13 +64,10 @@ func Scan(memPath string, pageSize int) (Bitmap, error) {
 		}
 		hole, err := unix.Seek(int(f.Fd()), data, unix.SEEK_HOLE)
 		if err != nil {
-			if errors.Is(err, unix.ENXIO) || errors.Is(err, io.EOF) {
-				hole = size
-			} else {
-				return Bitmap{}, fmt.Errorf("seek hole %s: %w", memPath, err)
-			}
+			return Bitmap{}, fmt.Errorf("seek hole %s: %w", memPath, err)
 		}
-		for pg := uint64(data) / uint64(pageSize); pg < (uint64(hole)+uint64(pageSize)-1)/uint64(pageSize) && pg < npages; pg++ {
+		end := min((uint64(hole)+ps-1)/ps, npages)
+		for pg := uint64(data) / ps; pg < end; pg++ {
 			p.Bits[pg>>6] |= 1 << (pg & 63)
 		}
 		off = hole
@@ -67,18 +75,25 @@ func Scan(memPath string, pageSize int) (Bitmap, error) {
 	return p, nil
 }
 
-// Generate builds `<memPath>.presence` from the overlay's own
-// extents and writes it atomically. ONLY sound for a quiesced overlay that
-// has never left the host it was dumped on — generating from a transferred
-// file's extents would launder exactly the corruption the side-car exists to
-// prevent, which is why the convergence sweep runs pre-marker only and never
-// touches an overlay that already has a side-car (including the torn-save
-// and un-layerable sentinels, whose loud refusal must be preserved).
-func Generate(memPath string) error {
-	pageSize := os.Getpagesize()
-	p, err := Scan(memPath, pageSize)
+// WriteIfAbsent writes `<memPath>.presence` like Write, but refuses to
+// replace an existing side-car: the rename uses RENAME_NOREPLACE, so if the
+// authoritative writer (Firecracker, during a concurrent pause) created one
+// between the caller's scan and this write, the stale scanned bitmap loses
+// and ErrSidecarExists is returned. The reverse interleaving is benign —
+// Firecracker's own writer truncates the destination in place, so a side-car
+// this function placed is simply overwritten by the authoritative one.
+func WriteIfAbsent(memPath string, pageSize, npages uint64, bits []uint64) error {
+	dst := SidecarPath(memPath)
+	tmp, err := writeSidecarTemp(dst, pageSize, npages, bits)
 	if err != nil {
 		return err
 	}
-	return Write(memPath, p.PageSize, p.NPages, p.Bits)
+	if err := unix.Renameat2(unix.AT_FDCWD, tmp, unix.AT_FDCWD, dst, unix.RENAME_NOREPLACE); err != nil {
+		os.Remove(tmp)
+		if errors.Is(err, unix.EEXIST) {
+			return ErrSidecarExists
+		}
+		return fmt.Errorf("rename %s: %w", dst, err)
+	}
+	return syncDir(dst)
 }

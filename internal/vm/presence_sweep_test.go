@@ -10,38 +10,19 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/presence"
+	"github.com/superserve-ai/sandbox/internal/presence/presencetest"
 )
 
 // sweepFixture writes a snapshot dir with a sparse mem.diff (page 1 data,
 // page 2 written zeros, 0/3 holes) and returns the mem path.
 func sweepFixture(t *testing.T, root, vmID string) string {
 	t.Helper()
-	ps := os.Getpagesize()
 	dir := filepath.Join(root, vmID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	mem := filepath.Join(dir, "mem.diff")
-	f, err := os.Create(mem)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(int64(4 * ps)); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, ps)
-	for i := range buf {
-		buf[i] = 0xAA
-	}
-	if _, err := f.WriteAt(buf, int64(ps)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteAt(make([]byte, ps), int64(2*ps)); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
+	presencetest.WriteSparseOverlay(t, mem, os.Getpagesize(), 4, map[int]byte{1: 0xAA, 2: 0x00})
 	return mem
 }
 
@@ -153,5 +134,51 @@ func TestPresenceStrictModes(t *testing.T) {
 		if got := m.presenceStrict(); got != c.want {
 			t.Errorf("mode=%q converged=%v: strict=%v, want %v", c.mode, c.converged, got, c.want)
 		}
+	}
+}
+
+func TestSweepAlwaysModeNeverGenerates(t *testing.T) {
+	root := t.TempDir()
+	m := &Manager{
+		cfg: ManagerConfig{SnapshotDir: root, RequirePresenceSidecar: "always"},
+		log: zerolog.Nop(),
+		vms: map[string]*VMInstance{},
+	}
+	// An "always" host declares its artifacts may be transferred: extent
+	// inference is never sound there, so the sweep must not touch this
+	// side-car-less overlay even pre-convergence.
+	mem := sweepFixture(t, root, "vm-x")
+	m.sweepPresenceSidecars(nil)
+	if _, err := os.Stat(presence.SidecarPath(mem)); !os.IsNotExist(err) {
+		t.Error("always-mode sweep generated a side-car from possibly-transferred extents")
+	}
+	if !m.presenceStrict() {
+		t.Error("always mode must be strict regardless of marker")
+	}
+}
+
+func TestSweepRederivesMarkerBothDirections(t *testing.T) {
+	root := t.TempDir()
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}, log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+
+	// Empty dir converges (fresh-host case).
+	m.sweepPresenceSidecars(nil)
+	if !m.presenceConverged.Load() {
+		t.Fatal("empty host did not converge")
+	}
+
+	// Marker removed (ops action, or hidden by a late mount): the next tick
+	// must un-converge — dropping strictness, the safe direction — and resume
+	// healing rather than trusting the stale in-memory latch.
+	if err := os.Remove(m.presenceConvergedMarkerPath()); err != nil {
+		t.Fatal(err)
+	}
+	mem := sweepFixture(t, root, "vm-late")
+	m.sweepPresenceSidecars(nil)
+	if _, err := presence.Read(mem); err != nil {
+		t.Fatalf("late overlay not healed after marker removal: %v", err)
+	}
+	if !m.presenceConverged.Load() {
+		t.Fatal("host did not re-converge after healing")
 	}
 }

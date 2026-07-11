@@ -113,43 +113,62 @@ func Read(memPath string) (Bitmap, error) {
 	return p, nil
 }
 
-// Write atomically writes `<memPath>.presence`: encode to a
-// temp file, fsync, rename over the destination, fsync the directory. Unlike
-// the Firecracker-side writer (whose seccomp allowlist has no rename), a torn
-// write here can never leave a partial side-car — the reader sees the old
-// file or the new one.
-func Write(memPath string, pageSize, npages uint64, bits []uint64) error {
+// writeSidecarTemp writes the encoded side-car to `<dst>.tmp`, fsynced, and
+// returns the temp path. The caller renames it into place (plainly or with
+// RENAME_NOREPLACE) and fsyncs the directory, removing the temp on failure.
+func writeSidecarTemp(dst string, pageSize, npages uint64, bits []uint64) (tmp string, err error) {
 	if uint64(len(bits)) != (npages+63)/64 {
-		return fmt.Errorf("presence bitmap has %d words, want %d for %d pages", len(bits), (npages+63)/64, npages)
+		return "", fmt.Errorf("presence bitmap has %d words, want %d for %d pages", len(bits), (npages+63)/64, npages)
 	}
-	dst := SidecarPath(memPath)
-	tmp := dst + ".tmp"
+	tmp = dst + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+	if _, err = f.Write(Encode(pageSize, npages, bits)); err != nil {
+		return "", err
+	}
+	if err = f.Sync(); err != nil {
+		return "", err
+	}
+	if err = f.Close(); err != nil {
+		return "", err
+	}
+	return tmp, nil
+}
+
+// syncDir fsyncs the directory containing path, making a just-renamed dirent
+// durable.
+func syncDir(path string) error {
+	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(Encode(pageSize, npages, bits)); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+	defer dir.Close()
+	return dir.Sync()
+}
+
+// Write atomically writes `<memPath>.presence`: encode to a temp file, fsync,
+// rename over the destination, fsync the directory. Unlike the
+// Firecracker-side writer (whose seccomp allowlist has no rename), a torn
+// write here can never leave a partial side-car — the reader sees the old
+// file or the new one. Replaces an existing side-car; writers that must NOT
+// replace one (the convergence sweep) use WriteIfAbsent.
+func Write(memPath string, pageSize, npages uint64, bits []uint64) error {
+	dst := SidecarPath(memPath)
+	tmp, err := writeSidecarTemp(dst, pageSize, npages, bits)
+	if err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(dst))
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	return syncDir(dst)
 }

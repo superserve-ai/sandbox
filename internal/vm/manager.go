@@ -705,7 +705,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				// rewrites after this remove matches the completed dump, and with
 				// .base gone the restore is refused regardless.
 				_ = os.Remove(layeredBaseSidecarPath(memPath))
-				_ = os.Remove(presenceSidecarPath(memPath))
+				_ = os.Remove(presence.SidecarPath(memPath))
 				return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 			}
 		} else {
@@ -767,12 +767,6 @@ func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeMemPath stri
 // standalone (which would read the base's pages as zero holes).
 func layeredBaseSidecarPath(memPath string) string { return memPath + ".base" }
 
-// presenceSidecarPath aliases the shared format package: the side-car pairs
-// with the mem file (transfers copy both, deletion removes both — a stale
-// bitmap next to a future same-size overlay passes every restore-side check
-// and silently mis-layers pages).
-func presenceSidecarPath(memPath string) string { return presence.SidecarPath(memPath) }
-
 // ErrPresenceSidecarMissing marks a layered restore refused because the overlay
 // has no presence side-car on a host that requires one (RequirePresenceSidecar).
 // Deterministic and permanent until the artifact pair is re-copied, so callers
@@ -790,7 +784,7 @@ var ErrPresenceSidecarMissing = errors.New("overlay presence side-car missing")
 // layered restore entry point must call this — fresh restores and resumes
 // alike — and it needs only memPath, so call it before any side effects.
 func (m *Manager) gateOverlayPresence(memPath string, log zerolog.Logger) error {
-	if _, err := os.Stat(presenceSidecarPath(memPath)); !os.IsNotExist(err) {
+	if _, err := os.Stat(presence.SidecarPath(memPath)); !os.IsNotExist(err) {
 		return nil
 	}
 	if m.presenceStrict() {
@@ -799,7 +793,7 @@ func (m *Manager) gateOverlayPresence(memPath string, log zerolog.Logger) error 
 				"re-copy the overlay and side-car as a pair: %w",
 			memPath, ErrPresenceSidecarMissing)
 	}
-	log.Warn().Str("path", presenceSidecarPath(memPath)).
+	log.Warn().Str("path", presence.SidecarPath(memPath)).
 		Msg("layered overlay has no presence side-car; Firecracker will infer presence from extents")
 	return nil
 }
@@ -816,7 +810,7 @@ func freshenFirstPassOverlay(overlayPath string) error {
 	// The presence side-car pairs with the overlay just removed. Firecracker
 	// rewrites it on the upcoming save, so this mainly keeps the fallback-to-Full
 	// path from leaving a bitmap that describes a file that no longer exists.
-	if err := os.Remove(presenceSidecarPath(overlayPath)); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(presence.SidecarPath(overlayPath)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -1233,7 +1227,7 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		// .base: VMD reuses mem paths, and a stale bitmap next to a future
 		// same-size overlay passes Firecracker's geometry checks and silently
 		// resolves pages against the wrong layer.
-		for _, sidecar := range []string{layeredBaseSidecarPath(memPath), presenceSidecarPath(memPath)} {
+		for _, sidecar := range []string{layeredBaseSidecarPath(memPath), presence.SidecarPath(memPath)} {
 			if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
 				m.log.Warn().Err(err).Str("path", sidecar).Msg("remove mem side-car")
 			}
