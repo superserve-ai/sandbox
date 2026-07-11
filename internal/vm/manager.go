@@ -761,6 +761,26 @@ func overlayPresenceMissing(memPath string) bool {
 	return err != nil
 }
 
+// gateOverlayPresence enforces RequirePresenceSidecar before a layered restore
+// of memPath. Without the side-car Firecracker infers presence from the
+// overlay's extent map, which transfers can silently rewrite: refuse when this
+// host requires the side-car (transferred-artifact hosts), warn otherwise
+// (pre-side-car local snapshots restore fine from extents). Every layered
+// restore entry point must call this — fresh restores and resumes alike.
+func (m *Manager) gateOverlayPresence(memPath string, log zerolog.Logger) error {
+	if !overlayPresenceMissing(memPath) {
+		return nil
+	}
+	if m.cfg.RequirePresenceSidecar {
+		return fmt.Errorf(
+			"layered overlay %q has no presence side-car and this host requires one; re-copy the overlay and side-car as a pair",
+			memPath)
+	}
+	log.Warn().Str("path", presenceSidecarPath(memPath)).
+		Msg("layered overlay has no presence side-car; Firecracker will infer presence from extents")
+	return nil
+}
+
 // freshenFirstPassOverlay removes any leftover overlay so a first layered pass starts
 // from a clean file (its dirty set is the whole overlay, so a stale one would leave
 // non-dirtied stale pages that override the base on restore). A missing overlay is the
@@ -916,6 +936,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 			m.stopUnitDuringRestoreError(vmID)
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
+		}
+		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+			m.stopUnitDuringRestoreError(vmID)
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
 	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
@@ -1456,19 +1480,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		case hasSidecar:
 			// The outer overlayNeedsLayered guard already required resume-UFFD to reach
 			// here, so canLayered holds — serve the overlay over its recorded base.
-			// Without a presence side-car Firecracker infers presence from the
-			// overlay's extent map, which transfers can silently rewrite: refuse when
-			// this host requires the side-car (transferred-artifact hosts), warn
-			// otherwise (pre-side-car local snapshots restore fine from extents).
-			if overlayPresenceMissing(memPath) {
-				if m.cfg.RequirePresenceSidecar {
-					restoreErr = fmt.Errorf(
-						"layered overlay %q has no presence side-car and this host requires one; re-copy the overlay and side-car as a pair",
-						memPath)
-					break
-				}
-				log.Warn().Str("path", presenceSidecarPath(memPath)).
-					Msg("layered overlay has no presence side-car; Firecracker will infer presence from extents")
+			if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+				restoreErr = gerr
+				break
 			}
 			basePath = sidecarBase
 			armLayered = m.cfg.IncrementalSnapshotEnabled

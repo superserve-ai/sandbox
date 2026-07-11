@@ -349,6 +349,33 @@ func TestOverlayPresenceMissing(t *testing.T) {
 	}
 }
 
+func TestGateOverlayPresence(t *testing.T) {
+	dir := t.TempDir()
+	mem := filepath.Join(dir, "mem.diff")
+	nop := zerolog.Nop()
+
+	// Missing side-car, gate off → allowed (warn-only compat for pre-side-car
+	// local snapshots).
+	m := &Manager{log: nop}
+	if err := m.gateOverlayPresence(mem, nop); err != nil {
+		t.Errorf("gate off: got %v, want nil", err)
+	}
+
+	// Missing side-car, gate on → refused. This must hold on every layered
+	// restore entry point (fresh restore AND resume) or a transferred overlay
+	// that lost its side-car silently falls back to extent scanning.
+	m = &Manager{cfg: ManagerConfig{RequirePresenceSidecar: true}, log: nop}
+	if err := m.gateOverlayPresence(mem, nop); err == nil {
+		t.Error("gate on: want error, got nil")
+	}
+
+	// Side-car present → allowed regardless of the gate.
+	writeFile(t, presenceSidecarPath(mem))
+	if err := m.gateOverlayPresence(mem, nop); err != nil {
+		t.Errorf("side-car present: got %v, want nil", err)
+	}
+}
+
 func TestDeleteSnapshotFiles_PathEqualSnapshotRoot_Rejected(t *testing.T) {
 	root := t.TempDir()
 	mgr := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
