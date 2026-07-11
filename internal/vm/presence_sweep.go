@@ -89,12 +89,17 @@ func (m *Manager) writePresenceConvergedMarker() error {
 // process (their overlays may be mid-write; they'll get side-cars from their
 // own next pause instead).
 //
-// Generation here is sound because a pre-convergence side-car-less overlay on
-// an auto/never host is a legacy local artifact: it was dumped on this host
-// and never transferred, so its extent map still encodes presence faithfully —
-// the same trust the warn-and-scan restore fallback already extends to it at
-// restore time. The sweep performs that inference once, at rest, instead of
-// on every restore forever. Three guards keep the inference honest:
+// Generation is sound only for overlays this host provably dumped itself —
+// their extent maps still encode presence faithfully, the same trust the
+// warn-and-scan restore fallback extends at restore time. Provenance is
+// checked structurally, not by time: only VMs known to this host as paused
+// (in memory or in BoltDB) are eligible. An overlay with no local record may
+// be a freshly transferred artifact whose extents a copy already mangled —
+// generating from those would launder exactly the corruption the side-car
+// exists to prevent, so unknown-provenance overlays are never generated and
+// never block convergence (they are the reconciler's orphans to reap; a
+// later adoption is gated loudly at restore). Guards keeping the inference
+// honest:
 //
 //   - "always" hosts never generate: that mode declares the host's artifacts
 //     may be transferred, so extent inference is never sound there.
@@ -130,7 +135,7 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 		log.Warn().Err(err).Msg("overlay glob failed; retrying next pass")
 		return
 	}
-	var generated, busy, failed, deferred int
+	var generated, busy, failed, deferred, unknown int
 	for _, mem := range overlays {
 		if _, err := os.Stat(presence.SidecarPath(mem)); err == nil || !os.IsNotExist(err) {
 			// Present (including the torn-save / un-layerable sentinels, whose
@@ -142,7 +147,11 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 			continue
 		}
 		vmID := filepath.Base(filepath.Dir(mem))
-		if activeUnits[vmID] || !m.instanceQuiescedForSweep(vmID) {
+		switch m.sweepEligibilityOf(vmID, activeUnits) {
+		case sweepUnknownProvenance:
+			unknown++
+			continue
+		case sweepBusy:
 			busy++
 			continue
 		}
@@ -155,7 +164,7 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 		// Re-check after the (possibly long) scan: if the VM woke up meanwhile,
 		// the scanned bitmap may describe a mid-rewrite file. WriteIfAbsent is
 		// the backstop for the window this check can't close.
-		if activeUnits[vmID] || !m.instanceQuiescedForSweep(vmID) {
+		if m.sweepEligibilityOf(vmID, activeUnits) != sweepEligible {
 			busy++
 			continue
 		}
@@ -172,8 +181,15 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 	}
 	if remaining := busy + failed + deferred; remaining > 0 {
 		log.Info().Int("generated", generated).Int("busy", busy).Int("failed", failed).
-			Int("deferred", deferred).Msg("presence convergence in progress")
+			Int("deferred", deferred).Int("unknown_provenance", unknown).
+			Msg("presence convergence in progress")
 		return
+	}
+	if unknown > 0 {
+		// Converging around them is deliberate: they are refused at restore
+		// until healed explicitly, the loud-safe direction.
+		log.Info().Int("unknown_provenance", unknown).
+			Msg("orphan overlays without local provenance left un-swept")
 	}
 	if err := m.writePresenceConvergedMarker(); err != nil {
 		log.Warn().Err(err).Msg("converged marker write failed; retrying next pass")
@@ -184,18 +200,48 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 		Msg("presence side-cars converged; strict enforcement active in auto mode")
 }
 
-// instanceQuiescedForSweep reports whether vmID's overlay is safe to scan: the
-// manager either doesn't know the VM (an orphaned snapshot dir — no process,
-// quiescent by definition) or knows it as fully paused. Any transitional or
-// running state defers to a later pass.
-func (m *Manager) instanceQuiescedForSweep(vmID string) bool {
+// sweepEligibility classifies an overlay for the convergence sweep.
+type sweepEligibility int
+
+const (
+	// sweepEligible: the VM is provably local — a paused instance in memory,
+	// or a paused BoltDB record the background reattach hasn't loaded yet —
+	// so its overlay's extents were written by this host's own dumps.
+	sweepEligible sweepEligibility = iota
+	// sweepBusy: known VM in a non-paused state (or live unit); a later pass
+	// retries after it quiesces.
+	sweepBusy
+	// sweepUnknownProvenance: no record of this VM ever running here. The
+	// overlay may be a freshly transferred artifact; never generate from it.
+	sweepUnknownProvenance
+)
+
+func (m *Manager) sweepEligibilityOf(vmID string, activeUnits map[string]bool) sweepEligibility {
+	if activeUnits[vmID] {
+		return sweepBusy
+	}
 	m.mu.RLock()
 	inst, ok := m.vms[vmID]
 	m.mu.RUnlock()
-	if !ok {
-		return true
+	if ok {
+		inst.mu.Lock()
+		defer inst.mu.Unlock()
+		if inst.Status == StatusPaused {
+			return sweepEligible
+		}
+		return sweepBusy
 	}
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
-	return inst.Status == StatusPaused
+	// Not in memory: consult BoltDB directly so the first tick can't race the
+	// background reattach into misreading a local paused VM as an orphan —
+	// skipping it there wouldn't block convergence, and the VM would be
+	// stranded behind the strict gate once the marker lands.
+	if m.state != nil {
+		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
+			if rec.Status == StatusPaused {
+				return sweepEligible
+			}
+			return sweepBusy
+		}
+	}
+	return sweepUnknownProvenance
 }

@@ -34,12 +34,15 @@ func TestSweepConvergesAndFreezes(t *testing.T) {
 		vms: map[string]*VMInstance{},
 	}
 
-	memA := sweepFixture(t, root, "vm-a") // orphan dir: quiescent, sweepable
+	m.vms["vm-a"] = &VMInstance{ID: "vm-a", Status: StatusPaused}
+	memA := sweepFixture(t, root, "vm-a") // known-paused: provably local, sweepable
+	m.vms["vm-b"] = &VMInstance{ID: "vm-b", Status: StatusPaused}
 	memB := sweepFixture(t, root, "vm-b") // active unit: must be deferred
 	m.vms["vm-c"] = &VMInstance{ID: "vm-c", Status: StatusRunning}
 	memC := sweepFixture(t, root, "vm-c") // running instance: deferred
+	memO := sweepFixture(t, root, "vm-o") // orphan: unknown provenance, never swept
 
-	// Pass 1: only vm-a is quiescent → generated; host not converged.
+	// Pass 1: only vm-a is local+quiescent → generated; host not converged.
 	m.sweepPresenceSidecars(map[string]bool{"vm-b": true})
 	if _, err := presence.Read(memA); err != nil {
 		t.Fatalf("vm-a side-car not generated: %v", err)
@@ -50,6 +53,9 @@ func TestSweepConvergesAndFreezes(t *testing.T) {
 	if _, err := os.Stat(presence.SidecarPath(memC)); !os.IsNotExist(err) {
 		t.Error("vm-c swept while transitional")
 	}
+	if _, err := os.Stat(presence.SidecarPath(memO)); !os.IsNotExist(err) {
+		t.Error("orphan overlay swept: unknown provenance must never be generated from")
+	}
 	if m.presenceConverged.Load() {
 		t.Fatal("converged with stragglers outstanding")
 	}
@@ -57,14 +63,18 @@ func TestSweepConvergesAndFreezes(t *testing.T) {
 		t.Fatal("auto mode strict before convergence")
 	}
 
-	// Pass 2: vm-b quiesced (unit gone), vm-c now paused → all generated,
-	// marker written, auto mode turns strict.
+	// Pass 2: vm-b quiesced (unit gone), vm-c now paused → all local overlays
+	// generated; the orphan neither gets a side-car nor blocks the marker —
+	// converging around it is deliberate (it is refused at restore instead).
 	m.vms["vm-c"].Status = StatusPaused
 	m.sweepPresenceSidecars(nil)
 	for _, mem := range []string{memB, memC} {
 		if _, err := presence.Read(mem); err != nil {
 			t.Fatalf("side-car missing after pass 2 for %s: %v", mem, err)
 		}
+	}
+	if _, err := os.Stat(presence.SidecarPath(memO)); !os.IsNotExist(err) {
+		t.Error("orphan overlay swept on pass 2")
 	}
 	if !m.presenceConverged.Load() {
 		t.Fatal("not converged after all side-cars generated")
@@ -173,6 +183,7 @@ func TestSweepRederivesMarkerBothDirections(t *testing.T) {
 	if err := os.Remove(m.presenceConvergedMarkerPath()); err != nil {
 		t.Fatal(err)
 	}
+	m.vms["vm-late"] = &VMInstance{ID: "vm-late", Status: StatusPaused}
 	mem := sweepFixture(t, root, "vm-late")
 	m.sweepPresenceSidecars(nil)
 	if _, err := presence.Read(mem); err != nil {
@@ -180,5 +191,35 @@ func TestSweepRederivesMarkerBothDirections(t *testing.T) {
 	}
 	if !m.presenceConverged.Load() {
 		t.Fatal("host did not re-converge after healing")
+	}
+}
+
+func TestSweepBoltDBProvenanceBeatsReattachRace(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	m := &Manager{
+		cfg:   ManagerConfig{SnapshotDir: root},
+		log:   zerolog.Nop(),
+		vms:   map[string]*VMInstance{},
+		state: store,
+	}
+
+	// A paused VM persisted in BoltDB but not yet reattached into memory (the
+	// first tick racing the background reattach) is still provably local —
+	// it must be swept, not misread as an orphan and stranded behind the gate.
+	if err := store.Put(VMRecord{ID: "vm-bolt", Status: StatusPaused}); err != nil {
+		t.Fatal(err)
+	}
+	mem := sweepFixture(t, root, "vm-bolt")
+	m.sweepPresenceSidecars(nil)
+	if _, err := presence.Read(mem); err != nil {
+		t.Fatalf("BoltDB-known paused overlay not swept: %v", err)
+	}
+	if !m.presenceConverged.Load() {
+		t.Fatal("host did not converge")
 	}
 }
