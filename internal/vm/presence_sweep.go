@@ -127,34 +127,53 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 	m.presenceConverged.Store(false)
 	log := m.log.With().Str("component", "presence_sweep").Logger()
 
+	if m.state == nil {
+		// Only the reconciler calls the sweep, and it requires a state store;
+		// without one there is no provenance and nothing may be generated.
+		return
+	}
 	// A missing SnapshotDir (volume not mounted yet) must not converge an
-	// empty view of the world; Glob would return nil, nil for it.
+	// empty view of the world.
 	if _, err := os.Stat(m.cfg.SnapshotDir); err != nil {
 		log.Warn().Err(err).Msg("snapshot dir unavailable; skipping pass")
 		return
 	}
-	overlays, err := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, "*", "mem.diff"))
+	// Enumerate from BoltDB, not the filesystem: paused records are the only
+	// overlays the sweep may generate for (provenance), and PauseVM accepts a
+	// caller-supplied snapshot dir, so overlays need not sit at the default
+	// <SnapshotDir>/<vmID>/mem.diff shape a glob would find. The record's
+	// MemFilePath is authoritative wherever the overlay lives.
+	recs, err := m.state.All()
 	if err != nil {
-		log.Warn().Err(err).Msg("overlay glob failed; retrying next pass")
+		log.Warn().Err(err).Msg("state store list failed; deferring pass")
 		return
 	}
-	var generated, busy, failed, deferred, unknown int
-	for _, mem := range overlays {
+	var generated, busy, failed, deferred int
+	swept := make(map[string]bool, len(recs))
+	for _, rec := range recs {
+		if rec.Status != StatusPaused || !isOverlayMemFile(rec.MemFilePath) {
+			continue
+		}
+		mem := rec.MemFilePath
+		if swept[mem] {
+			continue
+		}
+		swept[mem] = true
 		if _, err := os.Stat(presence.SidecarPath(mem)); err == nil || !os.IsNotExist(err) {
 			// Present (including the torn-save / un-layerable sentinels, whose
 			// loud refusal must be preserved) or unreadable — not ours to touch.
+			continue
+		}
+		if _, err := os.Stat(mem); os.IsNotExist(err) {
+			// Stale record: the overlay is gone, so there is nothing to heal
+			// and nothing a restore could load — don't block convergence on it.
 			continue
 		}
 		if generated >= sweepGenerateBudget {
 			deferred++
 			continue
 		}
-		vmID := filepath.Base(filepath.Dir(mem))
-		switch m.sweepEligibilityOf(vmID, activeUnits) {
-		case sweepUnknownProvenance:
-			unknown++
-			continue
-		case sweepBusy:
+		if m.instanceBusyForSweep(rec.ID, activeUnits) {
 			busy++
 			continue
 		}
@@ -167,7 +186,7 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 		// Re-check after the (possibly long) scan: if the VM woke up meanwhile,
 		// the scanned bitmap may describe a mid-rewrite file. WriteIfAbsent is
 		// the backstop for the window this check can't close.
-		if m.sweepEligibilityOf(vmID, activeUnits) != sweepEligible {
+		if m.instanceBusyForSweep(rec.ID, activeUnits) {
 			busy++
 			continue
 		}
@@ -184,15 +203,8 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 	}
 	if remaining := busy + failed + deferred; remaining > 0 {
 		log.Info().Int("generated", generated).Int("busy", busy).Int("failed", failed).
-			Int("deferred", deferred).Int("unknown_provenance", unknown).
-			Msg("presence convergence in progress")
+			Int("deferred", deferred).Msg("presence convergence in progress")
 		return
-	}
-	if unknown > 0 {
-		// Converging around them is deliberate: they are refused at restore
-		// until healed explicitly, the loud-safe direction.
-		log.Info().Int("unknown_provenance", unknown).
-			Msg("orphan overlays without local provenance left un-swept")
 	}
 	if err := m.writePresenceConvergedMarker(); err != nil {
 		log.Warn().Err(err).Msg("converged marker write failed; retrying next pass")
@@ -203,60 +215,23 @@ func (m *Manager) sweepPresenceSidecars(activeUnits map[string]bool) {
 		Msg("presence side-cars converged; strict enforcement active in auto mode")
 }
 
-// sweepEligibility classifies an overlay for the convergence sweep.
-type sweepEligibility int
-
-const (
-	// sweepEligible: the VM is provably local — a paused instance in memory,
-	// or a paused BoltDB record the background reattach hasn't loaded yet —
-	// so its overlay's extents were written by this host's own dumps.
-	sweepEligible sweepEligibility = iota
-	// sweepBusy: known VM in a non-paused state (or live unit); a later pass
-	// retries after it quiesces.
-	sweepBusy
-	// sweepUnknownProvenance: no record of this VM ever running here. The
-	// overlay may be a freshly transferred artifact; never generate from it.
-	sweepUnknownProvenance
-)
-
-func (m *Manager) sweepEligibilityOf(vmID string, activeUnits map[string]bool) sweepEligibility {
+// instanceBusyForSweep reports whether vmID's overlay may be mid-write: a live
+// Firecracker unit, or an in-memory instance in any non-paused state. The
+// BoltDB record already established provenance and paused-ness at enumeration;
+// this catches the VM having woken up since (memory is fresher than the store).
+func (m *Manager) instanceBusyForSweep(vmID string, activeUnits map[string]bool) bool {
 	if activeUnits[vmID] {
-		return sweepBusy
+		return true
 	}
 	m.mu.RLock()
 	inst, ok := m.vms[vmID]
 	m.mu.RUnlock()
-	if ok {
-		inst.mu.Lock()
-		defer inst.mu.Unlock()
-		if inst.Status == StatusPaused {
-			return sweepEligible
-		}
-		return sweepBusy
+	if !ok {
+		return false
 	}
-	// Not in memory: consult BoltDB directly so the first tick can't race the
-	// background reattach into misreading a local paused VM as an orphan —
-	// skipping it there wouldn't block convergence, and the VM would be
-	// stranded behind the strict gate once the marker lands.
-	if m.state != nil {
-		rec, err := m.state.Get(vmID)
-		if err != nil {
-			// Can't classify: a read/unmarshal failure is not "no record". Treat
-			// as busy so the pass retries and the marker is withheld — converging
-			// past an unreadable record could strand a local paused VM behind
-			// the strict gate.
-			m.log.Warn().Err(err).Str("vm_id", vmID).
-				Msg("presence sweep: state store read failed; deferring overlay")
-			return sweepBusy
-		}
-		if rec != nil {
-			if rec.Status == StatusPaused {
-				return sweepEligible
-			}
-			return sweepBusy
-		}
-	}
-	return sweepUnknownProvenance
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return inst.Status != StatusPaused
 }
 
 // verifyPresenceRefreshed guards a misordered deploy. A diff save through a
