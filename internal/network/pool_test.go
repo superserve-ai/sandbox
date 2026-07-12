@@ -185,11 +185,29 @@ func TestPoolReturn_TearsDownWhenTapResetFails(t *testing.T) {
 
 	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
 
-	// The slot must never become claimable; cleanup (not recycle) runs instead.
+	// Let verifyAndRecycle run: it clears the namespace, fails the tap reset, and
+	// tears down instead of recycling.
+	time.Sleep(200 * time.Millisecond)
+
 	select {
 	case slot := <-p.recycled:
 		t.Fatalf("slot idx %d was recycled despite tap reset failure", slot.idx)
-	case <-time.After(200 * time.Millisecond):
+	default:
+	}
+
+	// Reading the released slot under m.mu synchronizes with verifyAndRecycle's
+	// teardown so the test doesn't race its goroutine on the stub globals.
+	m.mu.Lock()
+	_, stillOwned := m.slotOwner[1]
+	freed := false
+	for _, idx := range m.freeSlots {
+		if idx == 1 {
+			freed = true
+		}
+	}
+	m.mu.Unlock()
+	if stillOwned || !freed {
+		t.Errorf("slot 1 not released after tap reset failure (owned=%v freed=%v)", stillOwned, freed)
 	}
 }
 
