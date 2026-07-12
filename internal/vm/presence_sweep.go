@@ -3,6 +3,9 @@ package vm
 import (
 	"os"
 	"path/filepath"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/presence"
 )
@@ -244,4 +247,35 @@ func (m *Manager) sweepEligibilityOf(vmID string, activeUnits map[string]bool) s
 		}
 	}
 	return sweepUnknownProvenance
+}
+
+// verifyPresenceRefreshed guards a misordered deploy. A diff save through a
+// Firecracker that predates the presence side-car rewrites the overlay but
+// not the side-car, leaving a stale bitmap a NEWER Firecracker would later
+// trust — silent wrong-layer page resolution under live traffic. A side-car
+// whose mtime didn't advance past the save start wasn't written by this
+// save: remove it and warn, converting the misorder into loud strict-mode
+// refusals (or a sound extent scan pre-convergence) instead of corruption.
+// No-op on correctly ordered deployments — the side-car-aware Firecracker
+// rewrites the file on every save.
+func (m *Manager) verifyPresenceRefreshed(memPath string, saveStart time.Time, log zerolog.Logger) {
+	sc := presence.SidecarPath(memPath)
+	st, err := os.Stat(sc)
+	if os.IsNotExist(err) {
+		log.Warn().Str("path", sc).
+			Msg("presence side-car absent after diff save — Firecracker predates the side-car format; fix deploy ordering")
+		return
+	}
+	if err != nil {
+		log.Warn().Err(err).Str("path", sc).Msg("presence side-car stat failed after diff save")
+		return
+	}
+	if st.ModTime().Before(saveStart) {
+		if rmErr := os.Remove(sc); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Warn().Err(rmErr).Str("path", sc).Msg("stale presence side-car removal failed")
+			return
+		}
+		log.Warn().Str("path", sc).
+			Msg("presence side-car not refreshed by this diff save — removed stale bitmap; Firecracker predates the side-car format, fix deploy ordering")
+	}
 }

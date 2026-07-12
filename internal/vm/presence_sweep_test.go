@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -221,5 +222,39 @@ func TestSweepBoltDBProvenanceBeatsReattachRace(t *testing.T) {
 	}
 	if !m.presenceConverged.Load() {
 		t.Fatal("host did not converge")
+	}
+}
+
+func TestVerifyPresenceRefreshed(t *testing.T) {
+	root := t.TempDir()
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}, log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	nop := zerolog.Nop()
+	mem := sweepFixture(t, root, "vm-r")
+	sc := presence.SidecarPath(mem)
+
+	// Fresh side-car (written during the save) is kept.
+	if err := presence.Write(mem, 4096, 4, []uint64{0b0110}); err != nil {
+		t.Fatal(err)
+	}
+	m.verifyPresenceRefreshed(mem, time.Now().Add(-time.Minute), nop)
+	if _, err := os.Stat(sc); err != nil {
+		t.Fatalf("fresh side-car removed: %v", err)
+	}
+
+	// Stale side-car (predates the save — the old-Firecracker misorder) is
+	// removed so a newer Firecracker can never trust it.
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(sc, old, old); err != nil {
+		t.Fatal(err)
+	}
+	m.verifyPresenceRefreshed(mem, time.Now(), nop)
+	if _, err := os.Stat(sc); !os.IsNotExist(err) {
+		t.Error("stale side-car not removed")
+	}
+
+	// Missing side-car: warn-only, nothing created.
+	m.verifyPresenceRefreshed(mem, time.Now(), nop)
+	if _, err := os.Stat(sc); !os.IsNotExist(err) {
+		t.Error("guard created a side-car")
 	}
 }
