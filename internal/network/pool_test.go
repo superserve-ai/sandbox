@@ -211,6 +211,38 @@ func TestPoolReturn_TearsDownWhenTapResetFails(t *testing.T) {
 	}
 }
 
+// TestTeardownVM_ReclaimsSlotWithoutRecycling: a forced teardown of a suspect
+// slot reclaims its index to freeSlots and never hands it to the pool, so a
+// failed create's slot can't be immediately re-claimed with the same bad tap.
+func TestTeardownVM_ReclaimsSlotWithoutRecycling(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	m.pool = p
+	m.devices["vm-t"] = &VMNetInfo{Namespace: "ns-7", HostIP: "10.11.0.7"}
+	m.assignSlotLocked(7, "vm-t")
+
+	m.TeardownVM("vm-t")
+
+	if _, tracked := m.devices["vm-t"]; tracked {
+		t.Error("vm-t still tracked after TeardownVM")
+	}
+	freed := false
+	for _, idx := range m.freeSlots {
+		if idx == 7 {
+			freed = true
+		}
+	}
+	if !freed {
+		t.Errorf("slot 7 not reclaimed to freeSlots = %v", m.freeSlots)
+	}
+	select {
+	case slot := <-p.recycled:
+		t.Fatalf("slot %+v was recycled; TeardownVM must never recycle", slot)
+	default:
+	}
+}
+
 // TestPoolReturn_WaitsForNamespaceToClearBeforeRecycling pins the actual bug
 // fix: a slot whose namespace still has an attached process (the old VM's
 // Firecracker mid-death) must NOT be claimable yet, even though Return()

@@ -457,7 +457,17 @@ func (m *Manager) GetVMNetInfo(vmID string) *VMNetInfo {
 	return &cp
 }
 
-func (m *Manager) CleanupVM(vmID string) {
+// CleanupVM releases a VM's network slot, recycling it into the pool when one
+// is configured.
+func (m *Manager) CleanupVM(vmID string) { m.cleanupVM(vmID, true) }
+
+// TeardownVM releases a VM's network slot with a full teardown, never recycling
+// it. Used when the slot is suspect — e.g. a create that failed to attach tap0 —
+// so its index is rebuilt from scratch (fresh tap) before reuse instead of being
+// handed straight to the next claim, which could inherit the same bad tap.
+func (m *Manager) TeardownVM(vmID string) { m.cleanupVM(vmID, false) }
+
+func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	m.mu.Lock()
 	info, ok := m.devices[vmID]
 	if ok {
@@ -487,13 +497,14 @@ func (m *Manager) CleanupVM(vmID string) {
 	// in-ns handle couldn't be rebound) — pooling would let the next
 	// Claim silently lose per-VM egress filtering. Return transfers ownership
 	// from this VM back to the pool.
-	if m.pool != nil && info.Firewall != nil {
+	if recycle && m.pool != nil && info.Firewall != nil {
 		_ = info.Firewall.ReplaceUserRules(nil, nil)
 		m.pool.Return(&preallocSlot{idx: idx, info: info, vethName: vethName})
 		return
 	}
 
-	// No pool — full teardown. Release the index only if this VM still owns it.
+	// Full teardown (no pool, or a forced teardown of a suspect slot). Release
+	// the index only if this VM still owns it.
 	m.releaseIfOwned(idx, vmID)
 
 	if info.Firewall != nil {

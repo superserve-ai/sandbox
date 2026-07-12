@@ -1476,7 +1476,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		log.Warn().Err(restoreErr).Int("attempt", attempt).
 			Msg("restore failed with tap0 busy — retrying with a fresh slot")
 		m.stopUnitDuringRestoreError(vmID)
-		m.netMgr.CleanupVM(vmID)
+		// Full teardown, not recycle: a fast recycle could return this same busy
+		// slot to the pool and the next attempt could re-claim it.
+		m.netMgr.TeardownVM(vmID)
 		inst.mu.Lock()
 		inst.DirtyTracked = false
 		inst.mu.Unlock()
@@ -1487,7 +1489,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
+			// A tap-busy slot is suspect — tear it down rather than recycle it,
+			// so it isn't handed to another create with the same bad tap.
+			if isTapDeviceBusy(restoreErr) {
+				m.netMgr.TeardownVM(vmID)
+			} else {
+				m.netMgr.CleanupVM(vmID)
+			}
 		}
 		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
