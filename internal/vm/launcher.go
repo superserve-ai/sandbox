@@ -239,6 +239,36 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 	}()
 }
 
+// StartNetnsLeakSampler periodically logs the host network-namespace count
+// against the live-VM and pool-held counts so leaked namespaces are observable
+// and alertable: netns_leak_estimate ≈ netns_total - live_vms - pool_held. One
+// /run/netns readdir per tick.
+func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
+	go func() {
+		defer sentrylog.Recover("netns-leak sampler")
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				netnsTotal, poolHeld := m.netMgr.NetnsStats()
+				m.mu.RLock()
+				liveVMs := len(m.vms)
+				m.mu.RUnlock()
+				leak := netnsTotal - liveVMs - poolHeld
+				if leak < 0 {
+					leak = 0
+				}
+				m.log.Info().Int("netns_total", netnsTotal).Int("live_vms", liveVMs).
+					Int("pool_held", poolHeld).Int("netns_leak_estimate", leak).
+					Msg("netns leak gauge")
+			}
+		}
+	}()
+}
+
 // revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to
 // legacy if the pin went bad, and re-enable only the pin THIS boot built
 // (launcherBuilt) — a previous-boot pin left mounted after a failed rebuild may

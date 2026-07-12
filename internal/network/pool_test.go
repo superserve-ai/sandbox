@@ -1,6 +1,8 @@
 package network
 
 import (
+	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +19,16 @@ func stubPidsInNs(t *testing.T, fn func(ns string) ([]int, bool)) {
 	old := pidsInNsFunc
 	pidsInNsFunc = fn
 	t.Cleanup(func() { pidsInNsFunc = old })
+}
+
+// stubResetTap overrides resetTapFunc for the duration of the test and restores
+// it on cleanup, so the recycle path's tap0 rebuild is driven without a real
+// netns/tap device.
+func stubResetTap(t *testing.T, fn func(m *Manager, ctx context.Context, ns string) error) {
+	t.Helper()
+	old := resetTapFunc
+	resetTapFunc = fn
+	t.Cleanup(func() { resetTapFunc = old })
 }
 
 func newTestPool(t *testing.T, m *Manager) *Pool {
@@ -120,6 +132,64 @@ func TestPoolReturn_RecyclesOnceNamespaceIsClear(t *testing.T) {
 	m.mu.Unlock()
 	if owner != poolOwner {
 		t.Errorf("slotOwner[1] = %q, want poolOwner", owner)
+	}
+}
+
+// TestPoolReturn_ResetsTapBeforeRecycling: with the reset enabled, a cleared
+// namespace has its tap0 rebuilt before the slot is made claimable.
+func TestPoolReturn_ResetsTapBeforeRecycling(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+
+	var resetNS atomic.Value
+	stubResetTap(t, func(_ *Manager, _ context.Context, ns string) error {
+		resetNS.Store(ns)
+		return nil
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	select {
+	case slot := <-p.recycled:
+		if slot.idx != 1 {
+			t.Errorf("recycled slot idx = %d, want 1", slot.idx)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slot never appeared in recycled — reset-then-recycle did not complete")
+	}
+	if got, _ := resetNS.Load().(string); got != "ns-1" {
+		t.Errorf("resetTap called with ns %q, want ns-1", got)
+	}
+}
+
+// TestPoolReturn_TearsDownWhenTapResetFails: if tap0 can't be rebuilt, the slot
+// is torn down instead of recycled — never handed to the next VM.
+func TestPoolReturn_TearsDownWhenTapResetFails(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error {
+		return errors.New("tap busy")
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	// The slot must never become claimable; cleanup (not recycle) runs instead.
+	select {
+	case slot := <-p.recycled:
+		t.Fatalf("slot idx %d was recycled despite tap reset failure", slot.idx)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 

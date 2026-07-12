@@ -538,44 +538,39 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	}
 	removeUnitDropIn(vmID)
 
-	// Fallback: cold-booted VMs (template build VMs from startFirecrackerColdBoot
-	// and the default-template cold boot) aren't systemd-managed — they run as
-	// plain child processes of vmd. stopUnit is a no-op for them, so we have
-	// to SIGKILL by PID or Firecracker keeps holding its TAP fd, causing the
-	// network pool to hand out a "reusable" slot whose tap0 is still in use.
-	// Next VM that claims the slot fails with EBUSY ("Open tap device failed:
-	// Resource busy"). See internal/network/manager.go:344 for the pool
-	// return path that assumes the previous owner is dead.
+	// Recover the PID, socket, and namespace to tear down. A tracked VM has them
+	// in memory; an untracked one (paused or post-restart, absent from m.vms) has
+	// them only in the record. Without the record fallback a cold-boot VM's
+	// Firecracker is never killed (stopUnit is a no-op for it) and its slot is
+	// never reclaimed (ns is ""). Mirrors the reconciler's orphan teardown.
+	var pid int
+	var sockPath, ns string
 	if instErr == nil {
 		inst.mu.RLock()
-		pid := inst.PID
-		sockPath := inst.SocketPath
+		pid = inst.PID
+		sockPath = inst.SocketPath
+		ns = inst.Namespace
 		inst.mu.RUnlock()
-		if pid > 0 {
-			if proc, err := os.FindProcess(pid); err == nil {
-				// SIGKILL is safe here: we're tearing down, no graceful shutdown
-				// is expected. For systemd-managed VMs this is a no-op because
-				// stopUnit already killed the process.
-				_ = proc.Signal(syscall.SIGKILL)
-				// Give the kernel a moment to actually release fds before we
-				// hand the namespace + TAP back to the pool. 100ms is enough
-				// in practice — Linux process teardown is fast once all fds
-				// are dropped.
-				waitForPIDExit(pid, 500*time.Millisecond)
-			}
-		}
-		if sockPath != "" {
-			_ = os.Remove(sockPath)
+	} else if m.state != nil {
+		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
+			pid = rec.PID
+			sockPath = rec.SocketPath
+			ns = rec.Namespace
 		}
 	}
 
-	// Reclaim the network slot even if the VM isn't tracked in the devices
-	// map (e.g. a paused VM reattached without network state) — pass the
-	// known namespace so the slot isn't leaked.
-	ns := ""
-	if instErr == nil {
-		ns = inst.Namespace
+	if pid > 0 {
+		if proc, err := os.FindProcess(pid); err == nil {
+			// No-op for systemd VMs (stopUnit already killed them); the real kill
+			// for cold-boot VMs. Best-effort by record PID, as the reconciler does.
+			_ = proc.Signal(syscall.SIGKILL)
+			waitForPIDExit(pid, 500*time.Millisecond)
+		}
 	}
+	if sockPath != "" {
+		_ = os.Remove(sockPath)
+	}
+
 	m.netMgr.CleanupVMOrNamespace(vmID, ns)
 
 	// Fall back to vmID when the instance is absent (RunDirID == vmID anyway).
@@ -1318,143 +1313,175 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	tDiskReady := time.Now()
 
-	var tapDevice, macAddr, hostIP, nsName string
-
-	if inPlace {
-		existingNet := m.netMgr.GetVMNetInfo(vmID)
-		if existingNet != nil {
-			tapDevice = existingNet.TAPDevice
-			macAddr = existingNet.MACAddress
-			hostIP = existingNet.HostIP
-			nsName = existingNet.Namespace
-		}
-	}
-
-	if tapDevice == "" {
-		netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, netCfg)
-		if netErr != nil {
-			cleanupAfterRestoreFailure()
-			m.setStatus(vmID, StatusError)
-			return nil, fmt.Errorf("setup network: %w", netErr)
-		}
-		tapDevice = netInfo.TAPDevice
-		macAddr = netInfo.MACAddress
-		hostIP = netInfo.HostIP
-		nsName = netInfo.Namespace
-	}
-	tNetReady := time.Now()
-
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
-
-	// Publish all the network/disk/socket fields before starting
-	// Firecracker so the in-memory view is consistent for concurrent
-	// readers. Lock once for the batch.
-	inst.mu.Lock()
-	inst.DiskPath = diskPath
-	inst.IP = hostIP
-	inst.TAPDevice = tapDevice
-	inst.MACAddress = macAddr
-	inst.Namespace = nsName
-	inst.SocketPath = socketPath
-	inst.mu.Unlock()
 
 	// inPlace resume always uses the File backend; UffdEnabled=false is the
 	// ops circuit breaker that forces fresh restores onto File too.
 	useUffd := !inPlace && m.cfg.UffdEnabled
 
-	pid, startErr := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
-	if startErr != nil {
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
-		m.setStatus(vmID, StatusError)
-		return nil, fmt.Errorf("start firecracker: %w", startErr)
-	}
-	inst.mu.Lock()
-	inst.PID = pid
-	inst.mu.Unlock()
-	tFcReady := time.Now()
+	// Loop-carried across restore attempts (see the retry at the end of the loop).
+	var (
+		tapDevice, macAddr, hostIP, nsName string
+		pid                                int
+		tNetReady, tFcReady                time.Time
+		restoreErr                         error
+	)
 
-	log.Info().
-		Int64("entry_to_sem_ms", tSemAcquired.Sub(tEntry).Milliseconds()).
-		Int64("sem_to_disk_ms", tDiskReady.Sub(tSemAcquired).Milliseconds()).
-		Int64("disk_to_net_ms", tNetReady.Sub(tDiskReady).Milliseconds()).
-		Int64("net_to_fc_ms", tFcReady.Sub(tNetReady).Milliseconds()).
-		Int64("entry_to_fc_ready_ms", tFcReady.Sub(tEntry).Milliseconds()).
-		Msg("restoring snapshot")
-
-	var restoreErr error
-	// A diff overlay (mem.diff, or any file with a base sidecar) must be served by
-	// the UFFD layered backend. Catch it before backend selection so that with UFFD
-	// disabled / inPlace / resume-UFFD off it fails loud instead of falling to the
-	// File backend, which would load the sparse overlay as a full image (the base's
-	// pages read as zero holes).
-	sidecarBase, hasSidecar := readLayeredBase(memPath)
-	overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
-	switch {
-	case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
-		restoreErr = fmt.Errorf(
-			"layered overlay %q requires UFFD layered restore (uffd + resume-uffd); refusing File-backend restore",
-			memPath)
-	case useUffd:
-		// Skip prefetch trace when recording so the captured order reflects
-		// guest-driven access, not pages pulled in by the prefetcher.
-		// Firecracker enforces this same invariant on its side (record_to set
-		// ⇒ no prefetch regardless of access_log_path); this branch is the
-		// stat-avoidance optimisation that keeps us from probing the disk for
-		// a file we already know we won't pass through.
-		accessLogPath := ""
-		if recordToPath == "" && m.cfg.UffdPrefetchEnabled {
-			candidate := filepath.Join(filepath.Dir(memPath), accessLogFilename)
-			if _, err := os.Stat(candidate); err == nil {
-				accessLogPath = candidate
+	// A fresh restore that fails with a still-held tap0 (see isTapDeviceBusy) is
+	// retried on a different slot; the failed slot is released back to the pool.
+	// inPlace resumes reuse a specific VM's own slot and never retry.
+	const maxRestoreAttempts = 3
+	for attempt := 1; ; attempt++ {
+		tapDevice, macAddr, hostIP, nsName = "", "", "", ""
+		if inPlace {
+			existingNet := m.netMgr.GetVMNetInfo(vmID)
+			if existingNet != nil {
+				tapDevice = existingNet.TAPDevice
+				macAddr = existingNet.MACAddress
+				hostIP = existingNet.HostIP
+				nsName = existingNet.Namespace
 			}
 		}
-		// Decide the layered base for this UFFD restore. An overlay (mem.diff) needs
-		// its base reconstructed from the sidecar (else refuse — loading it
-		// standalone reads the base as zero holes); a template create instead arms
-		// tracking and records the template as the base. Layered needs resume-UFFD.
-		isTemplate := m.isTemplateMemPath(memPath)
-		canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
-		basePath := ""
-		armLayered := false
+
+		if tapDevice == "" {
+			netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, netCfg)
+			if netErr != nil {
+				cleanupAfterRestoreFailure()
+				m.setStatus(vmID, StatusError)
+				return nil, fmt.Errorf("setup network: %w", netErr)
+			}
+			tapDevice = netInfo.TAPDevice
+			macAddr = netInfo.MACAddress
+			hostIP = netInfo.HostIP
+			nsName = netInfo.Namespace
+		}
+		tNetReady = time.Now()
+
+		// Publish all the network/disk/socket fields before starting Firecracker
+		// so the in-memory view is consistent for concurrent readers.
+		inst.mu.Lock()
+		inst.DiskPath = diskPath
+		inst.IP = hostIP
+		inst.TAPDevice = tapDevice
+		inst.MACAddress = macAddr
+		inst.Namespace = nsName
+		inst.SocketPath = socketPath
+		inst.mu.Unlock()
+
+		var startErr error
+		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
+		if startErr != nil {
+			if !inPlace {
+				m.netMgr.CleanupVM(vmID)
+			}
+			cleanupAfterRestoreFailure()
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("start firecracker: %w", startErr)
+		}
+		inst.mu.Lock()
+		inst.PID = pid
+		inst.mu.Unlock()
+		tFcReady = time.Now()
+
+		log.Info().
+			Int64("entry_to_sem_ms", tSemAcquired.Sub(tEntry).Milliseconds()).
+			Int64("sem_to_disk_ms", tDiskReady.Sub(tSemAcquired).Milliseconds()).
+			Int64("disk_to_net_ms", tNetReady.Sub(tDiskReady).Milliseconds()).
+			Int64("net_to_fc_ms", tFcReady.Sub(tNetReady).Milliseconds()).
+			Int64("entry_to_fc_ready_ms", tFcReady.Sub(tEntry).Milliseconds()).
+			Int("attempt", attempt).
+			Msg("restoring snapshot")
+
+		restoreErr = nil
+		// A diff overlay (mem.diff, or any file with a base sidecar) must be served by
+		// the UFFD layered backend. Catch it before backend selection so that with UFFD
+		// disabled / inPlace / resume-UFFD off it fails loud instead of falling to the
+		// File backend, which would load the sparse overlay as a full image (the base's
+		// pages read as zero holes).
+		sidecarBase, hasSidecar := readLayeredBase(memPath)
+		overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
 		switch {
-		case hasSidecar:
-			// The outer overlayNeedsLayered guard already required resume-UFFD to reach
-			// here, so canLayered holds — serve the overlay over its recorded base.
-			basePath = sidecarBase
-			armLayered = m.cfg.IncrementalSnapshotEnabled
-			inst.mu.Lock()
-			inst.BaseMemPath = sidecarBase
-			inst.DirtyTracked = armLayered
-			inst.mu.Unlock()
-		case isOverlayMemFile(memPath):
-			restoreErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
-		case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
-			armLayered = true
-			inst.mu.Lock()
-			inst.BaseMemPath = memPath // template mem file = the layered base
-			inst.DirtyTracked = true
-			inst.mu.Unlock()
+		case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
+			restoreErr = fmt.Errorf(
+				"layered overlay %q requires UFFD layered restore (uffd + resume-uffd); refusing File-backend restore",
+				memPath)
+		case useUffd:
+			// Skip prefetch trace when recording so the captured order reflects
+			// guest-driven access, not pages pulled in by the prefetcher.
+			// Firecracker enforces this same invariant on its side (record_to set
+			// ⇒ no prefetch regardless of access_log_path); this branch is the
+			// stat-avoidance optimisation that keeps us from probing the disk for
+			// a file we already know we won't pass through.
+			accessLogPath := ""
+			if recordToPath == "" && m.cfg.UffdPrefetchEnabled {
+				candidate := filepath.Join(filepath.Dir(memPath), accessLogFilename)
+				if _, err := os.Stat(candidate); err == nil {
+					accessLogPath = candidate
+				}
+			}
+			// Decide the layered base for this UFFD restore. An overlay (mem.diff) needs
+			// its base reconstructed from the sidecar (else refuse — loading it
+			// standalone reads the base as zero holes); a template create instead arms
+			// tracking and records the template as the base. Layered needs resume-UFFD.
+			isTemplate := m.isTemplateMemPath(memPath)
+			canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
+			basePath := ""
+			armLayered := false
+			switch {
+			case hasSidecar:
+				// The outer overlayNeedsLayered guard already required resume-UFFD to reach
+				// here, so canLayered holds — serve the overlay over its recorded base.
+				basePath = sidecarBase
+				armLayered = m.cfg.IncrementalSnapshotEnabled
+				inst.mu.Lock()
+				inst.BaseMemPath = sidecarBase
+				inst.DirtyTracked = armLayered
+				inst.mu.Unlock()
+			case isOverlayMemFile(memPath):
+				restoreErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
+			case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
+				armLayered = true
+				inst.mu.Lock()
+				inst.BaseMemPath = memPath // template mem file = the layered base
+				inst.DirtyTracked = true
+				inst.mu.Unlock()
+			}
+			if restoreErr == nil {
+				restoreErr = RestoreSnapshotUffdInternalWithOverrides(
+					socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+					m.cfg.HandlerDeathAbortEnabled,
+				)
+			}
+		case inPlace:
+			restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
+		default:
+			// UFFD disabled but fresh restore — File backend with network overrides.
+			restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
 		}
+		log.Info().
+			Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).
+			Bool("ok", restoreErr == nil).
+			Int("attempt", attempt).
+			Msg("snapshot loaded")
+
 		if restoreErr == nil {
-			restoreErr = RestoreSnapshotUffdInternalWithOverrides(
-				socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-				m.cfg.HandlerDeathAbortEnabled,
-			)
+			break
 		}
-	case inPlace:
-		restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
-	default:
-		// UFFD disabled but fresh restore — File backend with network overrides.
-		restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
+		// Retriable only for a fresh-restore tap0 busy. The overlay and inst are
+		// kept for the next attempt; terminal cleanup lives below the loop.
+		if inPlace || attempt >= maxRestoreAttempts || !isTapDeviceBusy(restoreErr) {
+			break
+		}
+		log.Warn().Err(restoreErr).Int("attempt", attempt).
+			Msg("restore failed with tap0 busy — retrying with a fresh slot")
+		m.stopUnitDuringRestoreError(vmID)
+		m.netMgr.CleanupVM(vmID)
+		inst.mu.Lock()
+		inst.DirtyTracked = false
+		inst.mu.Unlock()
 	}
-	log.Info().
-		Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).
-		Bool("ok", restoreErr == nil).
-		Msg("snapshot loaded")
+
 	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before other
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
@@ -1513,6 +1540,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
 		Msg("VM restored from snapshot")
 	return inst, nil
+}
+
+// isTapDeviceBusy reports whether err is Firecracker's tap0-attach EBUSY —
+// "Open tap device failed: ... Device or resource busy" — surfaced through the
+// snapshot-load error. It marks a restore failure as retriable on a fresh slot.
+func isTapDeviceBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "Open tap device failed") ||
+		(strings.Contains(s, "tap0") && strings.Contains(s, "resource busy"))
 }
 
 // ---------------------------------------------------------------------------

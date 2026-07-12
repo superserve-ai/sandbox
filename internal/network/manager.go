@@ -79,12 +79,12 @@ type Manager struct {
 	hostInterface string
 	log           zerolog.Logger
 
-	mu        sync.Mutex
-	devices   map[string]*VMNetInfo
-	freeSlots []int // recycled slot indices, guaranteed absent from slotOwner
-	nextSlot   int  // next new slot (used when freeSlots is empty)
-	maxSlot    int  // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
-	slotPinned bool // WithExactSlot: allocate exactly maxSlot or fail, never advance
+	mu         sync.Mutex
+	devices    map[string]*VMNetInfo
+	freeSlots  []int // recycled slot indices, guaranteed absent from slotOwner
+	nextSlot   int   // next new slot (used when freeSlots is empty)
+	maxSlot    int   // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
+	slotPinned bool  // WithExactSlot: allocate exactly maxSlot or fail, never advance
 
 	// slotOwner is the single source of truth for slot allocation AND identity:
 	// slotOwner[idx] == the current owner of slot index idx, one of
@@ -423,6 +423,29 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	return info, vethName, nil
 }
 
+// resetTap deletes and recreates tap0 in nsName so a recycled slot's TAP is
+// unattached by construction, rather than relying on the namespace being
+// process-free (which doesn't guarantee the previous owner's fd is released).
+// Returns an error if the tap can't be rebuilt, so the caller can decline to
+// recycle. nftables rules match tap0 by name, so reusing the name keeps them
+// valid. Mirrors setupSlot's tap block.
+func (m *Manager) resetTap(ctx context.Context, nsName string) error {
+	_ = nsRun(ctx, nsName, "ip", "link", "del", TAPName)
+	if err := nsRun(ctx, nsName, "ip", "tuntap", "add", "dev", TAPName, "mode", "tap"); err != nil {
+		return fmt.Errorf("recreate TAP: %w", err)
+	}
+	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "up"); err != nil {
+		return fmt.Errorf("bring up TAP: %w", err)
+	}
+	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "mtu", ifaceMTU); err != nil {
+		return fmt.Errorf("set TAP MTU: %w", err)
+	}
+	if err := nsRun(ctx, nsName, "ip", "addr", "add", tapCIDR, "dev", TAPName); err != nil {
+		return fmt.Errorf("assign TAP IP: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) GetVMNetInfo(vmID string) *VMNetInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -526,6 +549,13 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	// teardownOwner forever (no other path releases that sentinel).
 	defer m.releaseIfOwned(idx, teardownOwner)
 
+	// Kill any process still in the namespace before removing it — `ip netns del`
+	// only unlinks the name, so a namespace with a live holder lingers (keeping
+	// its tap0) until that process exits. Mirrors SweepOrphanNamespaces.
+	if killed := killProcessesInNs(fallbackNamespace); killed > 0 {
+		m.log.Info().Str("namespace", fallbackNamespace).Int("killed", killed).
+			Msg("cleanup: killed lingering processes before namespace teardown")
+	}
 	// Tear down both sides even if the netns is already gone: `ip netns del`
 	// only removes the in-namespace side, so the host-side veth-N can outlive it.
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
@@ -999,6 +1029,24 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 	defer cancel()
 	_ = run(ctx, "ip", "link", "del", vethName)
 	_ = run(ctx, "ip", "netns", "del", nsName)
+}
+
+// NetnsStats reports how many ns-N network namespaces exist on the host and how
+// many the pool is holding ready (fresh + recycled). Callers subtract the live
+// VM count too: netnsTotal - poolHeld - liveVMs approximates leaked namespaces
+// (teardown that failed to remove a netns), which is the signal to alert on.
+func (m *Manager) NetnsStats() (netnsTotal, poolHeld int) {
+	if entries, err := os.ReadDir(netnsDir); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "ns-") {
+				netnsTotal++
+			}
+		}
+	}
+	if m.pool != nil {
+		poolHeld = len(m.pool.fresh) + len(m.pool.recycled)
+	}
+	return netnsTotal, poolHeld
 }
 
 func run(ctx context.Context, name string, args ...string) error {

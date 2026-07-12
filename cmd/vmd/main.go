@@ -498,6 +498,7 @@ func main() {
 		}()
 		// Periodically log the host mount-table size + revalidate the pin.
 		mgr.StartMountCountSampler(ctx, time.Minute)
+		mgr.StartNetnsLeakSampler(ctx, time.Minute)
 	}
 
 	// ---- Pre-allocate network slots ----
@@ -507,8 +508,9 @@ func main() {
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize:     netPoolFresh,
-		RecycleSize: netPoolRecycle,
+		NewSize:           netPoolFresh,
+		RecycleSize:       netPoolRecycle,
+		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 
