@@ -258,3 +258,29 @@ func TestVerifyPresenceRefreshed(t *testing.T) {
 		t.Error("guard created a side-car")
 	}
 }
+
+func TestSweepStateStoreErrorBlocksConvergence(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A closed store errors on every read — standing in for any BoltDB
+	// read/unmarshal failure. "Can't classify" must not read as "orphan":
+	// converging past it could strand a local paused VM behind the gate.
+	store.Close()
+	m := &Manager{
+		cfg:   ManagerConfig{SnapshotDir: root},
+		log:   zerolog.Nop(),
+		vms:   map[string]*VMInstance{},
+		state: store,
+	}
+	mem := sweepFixture(t, root, "vm-err")
+	m.sweepPresenceSidecars(nil)
+	if _, err := os.Stat(presence.SidecarPath(mem)); !os.IsNotExist(err) {
+		t.Error("side-car generated despite unreadable provenance")
+	}
+	if m.presenceConverged.Load() {
+		t.Error("converged past an unreadable state record")
+	}
+}

@@ -239,7 +239,17 @@ func (m *Manager) sweepEligibilityOf(vmID string, activeUnits map[string]bool) s
 	// skipping it there wouldn't block convergence, and the VM would be
 	// stranded behind the strict gate once the marker lands.
 	if m.state != nil {
-		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
+		rec, err := m.state.Get(vmID)
+		if err != nil {
+			// Can't classify: a read/unmarshal failure is not "no record". Treat
+			// as busy so the pass retries and the marker is withheld — converging
+			// past an unreadable record could strand a local paused VM behind
+			// the strict gate.
+			m.log.Warn().Err(err).Str("vm_id", vmID).
+				Msg("presence sweep: state store read failed; deferring overlay")
+			return sweepBusy
+		}
+		if rec != nil {
 			if rec.Status == StatusPaused {
 				return sweepEligible
 			}
