@@ -23,10 +23,12 @@ const launcherPruneScript = `mount --make-rprivate / || exit 1
 umount -l /run/netns 2>/dev/null || true
 for m in $(grep ' /run/netns/' /proc/self/mounts | awk '{print $2}'); do umount -l "$m" 2>/dev/null || true; done`
 
-// launcherBuildTimeout bounds the boot-time launcher build. It must exceed the
-// O(fleet) prune, so it's far larger than the 5s single-exec bound used
-// elsewhere; on timeout the build errors and launches fall back to legacy.
-const launcherBuildTimeout = 90 * time.Second
+// launcherBuildTimeout reaps a genuinely wedged mount syscall — it does not
+// pace the build, which runs async with legacy-path fallback until done, so a
+// slow build costs nothing. The prune is O(host mount table), so the bound
+// must stay comfortably ahead of fleet growth: a bound the prune catches up
+// to silently strands the host on the legacy launch path.
+const launcherBuildTimeout = 10 * time.Minute
 
 // EnsureLauncherNamespace builds and pins the pruned launcher mount namespace at
 // m.launcherNSPath(). No-op when launcher mode is disabled. The pin snapshots the
