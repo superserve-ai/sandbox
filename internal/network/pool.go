@@ -66,9 +66,7 @@ var pidsInNsFunc = pidsInNs
 
 // resetTapFunc is a seam over Manager.resetTap so tests can drive the
 // recycle-vs-teardown decision without building a real netns + tap device.
-var resetTapFunc = func(m *Manager, ctx context.Context, ns string) error {
-	return m.resetTap(ctx, ns)
-}
+var resetTapFunc = (*Manager).resetTap
 
 const (
 	// defaultVerifyPollInterval trades a small amount of slot-reuse latency
@@ -239,6 +237,15 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 			p.cleanup(slot)
 			return
 		}
+	}
+
+	// A full recycle pool means this slot is headed for teardown anyway — skip
+	// the tap rebuild rather than pay it for a slot about to be destroyed
+	// (mass deletes overflow the pool by design). Racy but safe: the send
+	// below still has a default arm.
+	if p.resetTapOnRecycle && len(p.recycled) == cap(p.recycled) {
+		p.cleanup(slot)
+		return
 	}
 
 	// Process-free doesn't prove tap0's fd is released, so rebuild the tap

@@ -168,6 +168,46 @@ func TestPoolReturn_ResetsTapBeforeRecycling(t *testing.T) {
 	}
 }
 
+// TestPoolReturn_SkipsTapResetWhenRecycleFull: a slot that would overflow the
+// recycle pool is torn down without paying the tap rebuild first.
+func TestPoolReturn_SkipsTapResetWhenRecycleFull(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error {
+		t.Error("resetTap ran for a slot the full recycle pool was about to discard")
+		return nil
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	for i := 0; i < cap(p.recycled); i++ {
+		p.recycled <- &preallocSlot{idx: 100 + i, info: &VMNetInfo{Namespace: "ns-x"}}
+	}
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	// Synchronize with the verify goroutine via the slot release under m.mu.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		_, owned := m.slotOwner[1]
+		m.mu.Unlock()
+		if !owned || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	m.mu.Lock()
+	_, stillOwned := m.slotOwner[1]
+	m.mu.Unlock()
+	if stillOwned {
+		t.Error("slot 1 never released — overflow cleanup did not run")
+	}
+}
+
 // TestPoolReturn_TearsDownWhenTapResetFails: if tap0 can't be rebuilt, the slot
 // is torn down instead of recycled — never handed to the next VM.
 func TestPoolReturn_TearsDownWhenTapResetFails(t *testing.T) {

@@ -364,21 +364,11 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", fmt.Errorf("assign veth IP: %w", err)
 	}
 
-	if err := nsRun(ctx, nsName, "ip", "tuntap", "add", "dev", TAPName, "mode", "tap"); err != nil {
+	// One tap-construction path for fresh and recycled slots, so their tap
+	// config can't diverge (the leading delete is a no-op on a fresh namespace).
+	if err := m.resetTap(ctx, nsName); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("create TAP: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "up"); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("bring up TAP: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "mtu", ifaceMTU); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("set TAP MTU: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "addr", "add", tapCIDR, "dev", TAPName); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("assign TAP IP: %w", err)
+		return nil, "", err
 	}
 
 	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
@@ -423,16 +413,17 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	return info, vethName, nil
 }
 
-// resetTap deletes and recreates tap0 in nsName so a recycled slot's TAP is
-// unattached by construction, rather than relying on the namespace being
-// process-free (which doesn't guarantee the previous owner's fd is released).
-// Returns an error if the tap can't be rebuilt, so the caller can decline to
-// recycle. nftables rules match tap0 by name, so reusing the name keeps them
-// valid. Mirrors setupSlot's tap block.
+// resetTap deletes and recreates tap0 in nsName, leaving a TAP that is
+// unattached by construction — a recycled slot can't rely on the namespace
+// being process-free (that doesn't guarantee the previous owner's fd is
+// released). Returns an error if the tap can't be rebuilt, so the caller can
+// decline to recycle. nftables rules match tap0 by name, so reusing the name
+// keeps them valid. Also the tap-construction path for setupSlot (the delete
+// is a no-op on a fresh namespace), keeping fresh and recycled taps identical.
 func (m *Manager) resetTap(ctx context.Context, nsName string) error {
 	_ = nsRun(ctx, nsName, "ip", "link", "del", TAPName)
 	if err := nsRun(ctx, nsName, "ip", "tuntap", "add", "dev", TAPName, "mode", "tap"); err != nil {
-		return fmt.Errorf("recreate TAP: %w", err)
+		return fmt.Errorf("create TAP: %w", err)
 	}
 	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "up"); err != nil {
 		return fmt.Errorf("bring up TAP: %w", err)
@@ -503,14 +494,35 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 		return
 	}
 
-	// Full teardown (no pool, or a forced teardown of a suspect slot). Release
-	// the index only if this VM still owns it.
-	m.releaseIfOwned(idx, vmID)
-
+	// Full teardown (no pool, or a forced teardown of a suspect slot).
 	if info.Firewall != nil {
 		if err := info.Firewall.Close(); err != nil {
 			m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error closing namespace firewall")
 		}
+	}
+
+	// Park the index as teardownOwner for the duration of the kernel teardown —
+	// releasing it first would let a concurrent claim pop the idx, see the netns
+	// still present, and discard it for good. Skip when this VM no longer owns
+	// the index: the slot has moved on and tearing down would hit the new tenant.
+	m.mu.Lock()
+	if m.slotOwner[idx] != vmID {
+		m.mu.Unlock()
+		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+			Msg("teardown skipped — slot no longer owned by this VM")
+		return
+	}
+	m.slotOwner[idx] = teardownOwner
+	m.mu.Unlock()
+	defer m.releaseIfOwned(idx, teardownOwner)
+
+	// Kill any process still in the namespace before removing it — `ip netns
+	// del` only unlinks the name, so a live holder (e.g. the still-attached tap
+	// owner on the teardown-not-recycle path) would keep the namespace and its
+	// tap alive but anonymous: unfindable by pidsInNs, the sweep, or the gauge.
+	if killed := killProcessesInNs(info.Namespace); killed > 0 {
+		m.log.Info().Str("namespace", info.Namespace).Int("killed", killed).
+			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 
 	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
@@ -1042,22 +1054,26 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 	_ = run(ctx, "ip", "netns", "del", nsName)
 }
 
-// NetnsStats reports how many ns-N network namespaces exist on the host and how
-// many the pool is holding ready (fresh + recycled). Callers subtract the live
-// VM count too: netnsTotal - poolHeld - liveVMs approximates leaked namespaces
-// (teardown that failed to remove a netns), which is the signal to alert on.
-func (m *Manager) NetnsStats() (netnsTotal, poolHeld int) {
+// NetnsStats reports how many ns-N network namespaces exist on the host and
+// how many slot indices are currently owned (live VMs, pool-held slots, build
+// reservations, record reservations, in-flight teardowns — slotOwner is the
+// allocator's single source of truth). netnsTotal - ownedSlots approximates
+// leaked namespaces; sustained growth is the signal to alert on, and a
+// negative value flags an accounting inconsistency rather than health.
+func (m *Manager) NetnsStats() (netnsTotal, ownedSlots int) {
 	if entries, err := os.ReadDir(netnsDir); err == nil {
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "ns-") {
+			// Same strict ns-<int> parse the sweeper uses, so the gauge and the
+			// sweep agree on what counts as a managed namespace.
+			if _, ok := slotFromNamespace(e.Name()); ok {
 				netnsTotal++
 			}
 		}
 	}
-	if m.pool != nil {
-		poolHeld = len(m.pool.fresh) + len(m.pool.recycled)
-	}
-	return netnsTotal, poolHeld
+	m.mu.Lock()
+	ownedSlots = len(m.slotOwner)
+	m.mu.Unlock()
+	return netnsTotal, ownedSlots
 }
 
 func run(ctx context.Context, name string, args ...string) error {

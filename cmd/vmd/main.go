@@ -498,7 +498,6 @@ func main() {
 		}()
 		// Periodically log the host mount-table size + revalidate the pin.
 		mgr.StartMountCountSampler(ctx, time.Minute)
-		mgr.StartNetnsLeakSampler(ctx, time.Minute)
 	}
 
 	// ---- Pre-allocate network slots ----
@@ -513,6 +512,10 @@ func main() {
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+
+	// Leak gauge for network namespaces — independent of the launcher path, and
+	// started after StartPool so its first read observes an initialized pool.
+	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively

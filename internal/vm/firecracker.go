@@ -47,6 +47,26 @@ func isLayeredInvalidErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), layeredInvalidMarker)
 }
 
+// Firecracker's tap-attach failure when a previous owner still holds the
+// device (TUNSETIFF EBUSY). Both substrings must match: the tap-open prefix
+// alone wraps every tap errno (EPERM, ENODEV, ...), which retrying on a
+// different slot can't fix. Named so a fork message change is updated here,
+// not missed at runtime.
+const (
+	tapOpenMarker = "Open tap device failed"
+	tapBusyMarker = "resource busy"
+)
+
+// isTapDeviceBusyErr reports whether err is the still-held-tap attach failure —
+// the one restore error worth retrying on a different network slot.
+func isTapDeviceBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, tapOpenMarker) && strings.Contains(s, tapBusyMarker)
+}
+
 // ---------------------------------------------------------------------------
 // Firecracker config (our internal type, not a Firecracker API type)
 // ---------------------------------------------------------------------------

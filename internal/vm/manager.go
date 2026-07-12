@@ -390,18 +390,47 @@ func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
 // ---------------------------------------------------------------------------
 
 // waitForPIDExit polls until the process at pid is gone (kill(pid, 0)
-// returns ESRCH) or the deadline expires. Best-effort: returns silently
-// either way. Used after SIGKILL to ensure the kernel has actually
-// reaped the process and released its fds before we reuse its resources.
-func waitForPIDExit(pid int, timeout time.Duration) {
+// returns ESRCH) or the deadline expires. Returns true when the process is
+// gone. Used after SIGKILL to ensure the kernel has actually reaped the
+// process and released its fds before we reuse its resources.
+func waitForPIDExit(pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		// syscall.Kill(pid, 0) returns ESRCH when the process is gone.
 		if err := syscall.Kill(pid, 0); err != nil {
-			return
+			return true
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	return false
+}
+
+// sigkillPID SIGKILLs pid and waits up to wait for the kernel to reap it, so
+// its fds (including a tap device) are released before the caller reuses the
+// process's resources. The single kill path for orphan Firecrackers.
+func sigkillPID(pid int, wait time.Duration) {
+	if pid <= 0 {
+		return
+	}
+	if proc, err := os.FindProcess(pid); err == nil {
+		_ = proc.Signal(syscall.SIGKILL)
+		if wait > 0 {
+			waitForPIDExit(pid, wait)
+		}
+	}
+}
+
+// pidIsVMFirecracker reports whether pid's command line names vmID. Record
+// PIDs can be stale (a paused record keeps the PID of a Firecracker that died
+// at pause), and after PID-space reuse a stale PID may belong to an unrelated
+// live process — so record-sourced kills must verify identity first. The
+// per-VM rundir path on the command line embeds vmID.
+func pidIsVMFirecracker(pid int, vmID string) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(b), vmID)
 }
 
 // coldBootFromRootfs is the parameterized form: boot a VM from a specific
@@ -542,7 +571,9 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// in memory; an untracked one (paused or post-restart, absent from m.vms) has
 	// them only in the record. Without the record fallback a cold-boot VM's
 	// Firecracker is never killed (stopUnit is a no-op for it) and its slot is
-	// never reclaimed (ns is ""). Mirrors the reconciler's orphan teardown.
+	// never reclaimed (ns is ""). A record PID is killed only after verifying it
+	// still names this VM — a paused record keeps its dead Firecracker's PID, and
+	// after PID reuse that number can be an unrelated live process.
 	var pid int
 	var sockPath, ns string
 	if instErr == nil {
@@ -553,20 +584,17 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		inst.mu.RUnlock()
 	} else if m.state != nil {
 		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
-			pid = rec.PID
+			if pidIsVMFirecracker(rec.PID, vmID) {
+				pid = rec.PID
+			}
 			sockPath = rec.SocketPath
 			ns = rec.Namespace
 		}
 	}
 
-	if pid > 0 {
-		if proc, err := os.FindProcess(pid); err == nil {
-			// No-op for systemd VMs (stopUnit already killed them); the real kill
-			// for cold-boot VMs. Best-effort by record PID, as the reconciler does.
-			_ = proc.Signal(syscall.SIGKILL)
-			waitForPIDExit(pid, 500*time.Millisecond)
-		}
-	}
+	// No-op for systemd VMs (stopUnit already killed them); the real kill for
+	// cold-boot VMs and verified record orphans.
+	sigkillPID(pid, 500*time.Millisecond)
 	if sockPath != "" {
 		_ = os.Remove(sockPath)
 	}
@@ -1320,20 +1348,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// ops circuit breaker that forces fresh restores onto File too.
 	useUffd := !inPlace && m.cfg.UffdEnabled
 
-	// Loop-carried across restore attempts (see the retry at the end of the loop).
+	// Loop-carried across restore attempts: only what the post-loop code reads.
 	var (
-		tapDevice, macAddr, hostIP, nsName string
-		pid                                int
-		tNetReady, tFcReady                time.Time
-		restoreErr                         error
+		hostIP     string
+		pid        int
+		restoreErr error
 	)
 
-	// A fresh restore that fails with a still-held tap0 (see isTapDeviceBusy) is
-	// retried on a different slot; the failed slot is released back to the pool.
-	// inPlace resumes reuse a specific VM's own slot and never retry.
+	// A fresh restore that fails with a still-held tap0 (isTapDeviceBusyErr) is
+	// retried on a different slot; the failed slot is torn down. inPlace resumes
+	// reuse a specific VM's own slot and never retry.
 	const maxRestoreAttempts = 3
 	for attempt := 1; ; attempt++ {
-		tapDevice, macAddr, hostIP, nsName = "", "", "", ""
+		tAttemptStart := time.Now()
+		var tapDevice, macAddr, nsName string
+		hostIP = ""
 		if inPlace {
 			existingNet := m.netMgr.GetVMNetInfo(vmID)
 			if existingNet != nil {
@@ -1356,7 +1385,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			hostIP = netInfo.HostIP
 			nsName = netInfo.Namespace
 		}
-		tNetReady = time.Now()
+		tNetReady := time.Now()
 
 		// Publish all the network/disk/socket fields before starting Firecracker
 		// so the in-memory view is consistent for concurrent readers.
@@ -1382,18 +1411,27 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Lock()
 		inst.PID = pid
 		inst.mu.Unlock()
-		tFcReady = time.Now()
+		tFcReady := time.Now()
 
+		// Attempts after the first measure from the attempt start, so a retry's
+		// disk_to_net_ms doesn't absorb the whole failed previous attempt.
+		netBase := tDiskReady
+		if attempt > 1 {
+			netBase = tAttemptStart
+		}
 		log.Info().
 			Int64("entry_to_sem_ms", tSemAcquired.Sub(tEntry).Milliseconds()).
 			Int64("sem_to_disk_ms", tDiskReady.Sub(tSemAcquired).Milliseconds()).
-			Int64("disk_to_net_ms", tNetReady.Sub(tDiskReady).Milliseconds()).
+			Int64("disk_to_net_ms", tNetReady.Sub(netBase).Milliseconds()).
 			Int64("net_to_fc_ms", tFcReady.Sub(tNetReady).Milliseconds()).
 			Int64("entry_to_fc_ready_ms", tFcReady.Sub(tEntry).Milliseconds()).
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
 
-		restoreErr = nil
+		// attemptErr is this attempt's result alone; it lands in restoreErr after
+		// the load log so a stale prior-attempt error can never leak into the
+		// UFFD branch's attemptErr==nil gate below.
+		var attemptErr error
 		// A diff overlay (mem.diff, or any file with a base sidecar) must be served by
 		// the UFFD layered backend. Catch it before backend selection so that with UFFD
 		// disabled / inPlace / resume-UFFD off it fails loud instead of falling to the
@@ -1403,7 +1441,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
 		switch {
 		case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
-			restoreErr = fmt.Errorf(
+			attemptErr = fmt.Errorf(
 				"layered overlay %q requires UFFD layered restore (uffd + resume-uffd); refusing File-backend restore",
 				memPath)
 		case useUffd:
@@ -1439,7 +1477,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.DirtyTracked = armLayered
 				inst.mu.Unlock()
 			case isOverlayMemFile(memPath):
-				restoreErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
+				attemptErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
 			case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
 				armLayered = true
 				inst.mu.Lock()
@@ -1447,35 +1485,47 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.DirtyTracked = true
 				inst.mu.Unlock()
 			}
-			if restoreErr == nil {
-				restoreErr = RestoreSnapshotUffdInternalWithOverrides(
+			if attemptErr == nil {
+				attemptErr = RestoreSnapshotUffdInternalWithOverrides(
 					socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
 					m.cfg.HandlerDeathAbortEnabled,
 				)
 			}
 		case inPlace:
-			restoreErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
+			attemptErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
 		default:
 			// UFFD disabled but fresh restore — File backend with network overrides.
-			restoreErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
+			attemptErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
 		}
 		log.Info().
 			Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).
-			Bool("ok", restoreErr == nil).
+			Bool("ok", attemptErr == nil).
 			Int("attempt", attempt).
 			Msg("snapshot loaded")
+		restoreErr = attemptErr
 
 		if restoreErr == nil {
 			break
 		}
 		// Retriable only for a fresh-restore tap0 busy. The overlay and inst are
 		// kept for the next attempt; terminal cleanup lives below the loop.
-		if inPlace || attempt >= maxRestoreAttempts || !isTapDeviceBusy(restoreErr) {
+		if inPlace || attempt >= maxRestoreAttempts || !isTapDeviceBusyErr(restoreErr) {
+			break
+		}
+		m.stopUnitDuringRestoreError(vmID)
+		// systemctl start is a no-op on an active unit, so a retry against a
+		// surviving Firecracker can't boot a new one — verify the unit is gone
+		// before reusing its name, and give up if it isn't.
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		survivor := m.unitMainPID(checkCtx, vmID)
+		checkCancel()
+		if survivor > 0 && !waitForPIDExit(survivor, 2*time.Second) {
+			log.Warn().Int("pid", survivor).Int("attempt", attempt).
+				Msg("unit still alive after stop — not retrying restore")
 			break
 		}
 		log.Warn().Err(restoreErr).Int("attempt", attempt).
 			Msg("restore failed with tap0 busy — retrying with a fresh slot")
-		m.stopUnitDuringRestoreError(vmID)
 		// Full teardown, not recycle: a fast recycle could return this same busy
 		// slot to the pool and the next attempt could re-claim it.
 		m.netMgr.TeardownVM(vmID)
@@ -1491,7 +1541,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if !inPlace {
 			// A tap-busy slot is suspect — tear it down rather than recycle it,
 			// so it isn't handed to another create with the same bad tap.
-			if isTapDeviceBusy(restoreErr) {
+			if isTapDeviceBusyErr(restoreErr) {
 				m.netMgr.TeardownVM(vmID)
 			} else {
 				m.netMgr.CleanupVM(vmID)
@@ -1538,6 +1588,22 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	tBoxdReady := time.Now()
 
+	// A concurrent DestroyVM may have completed while we were restoring (its
+	// network cleanup no-ops during the retry window, and removeVM deletes the
+	// record). Persisting would resurrect the destroyed VM as an untracked
+	// zombie, so tear down instead.
+	m.mu.RLock()
+	_, stillTracked := m.vms[vmID]
+	m.mu.RUnlock()
+	if !stillTracked {
+		m.stopUnitDuringRestoreError(vmID)
+		if !inPlace {
+			m.netMgr.CleanupVM(vmID)
+		}
+		cleanupAfterRestoreFailure()
+		return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
+	}
+
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
 	tPersisted := time.Now()
@@ -1548,18 +1614,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
 		Msg("VM restored from snapshot")
 	return inst, nil
-}
-
-// isTapDeviceBusy reports whether err is Firecracker's tap0-attach EBUSY —
-// "Open tap device failed: ... Device or resource busy" — surfaced through the
-// snapshot-load error. It marks a restore failure as retriable on a fresh slot.
-func isTapDeviceBusy(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "Open tap device failed") ||
-		(strings.Contains(s, "tap0") && strings.Contains(s, "resource busy"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1688,13 +1742,13 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		if unitDefinitelyDead(ctx, systemdUnitName(rec.ID)) {
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
 			// Cold-booted VMs (old build path) ran with Setsid and no unit, so
-			// they survive vmd restarts as orphans holding TAP fds — SIGKILL by PID.
-			if rec.PID > 0 {
-				if proc, err := os.FindProcess(rec.PID); err == nil {
-					if killErr := proc.Signal(syscall.SIGKILL); killErr == nil {
-						log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
-					}
-				}
+			// they survive vmd restarts as orphans holding TAP fds — SIGKILL by
+			// PID, but only after verifying the PID still names this VM (a stale
+			// record PID may have been reused by an unrelated process). The wait
+			// lets the kernel release the tap fd before the netns teardown below.
+			if pidIsVMFirecracker(rec.PID, rec.ID) {
+				sigkillPID(rec.PID, 500*time.Millisecond)
+				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
 			m.state.Delete(rec.ID)
 			// Free this record's namespace/slot directly instead of a broad
@@ -2238,12 +2292,7 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 	// asynchronously and often still 0 this early), SIGKILL, and wait for exit.
 	killCtx, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
-	if pid := m.unitMainPID(killCtx, vmID); pid > 0 {
-		if proc, err := os.FindProcess(pid); err == nil {
-			_ = proc.Signal(syscall.SIGKILL)
-			waitForPIDExit(pid, 500*time.Millisecond)
-		}
-	}
+	sigkillPID(m.unitMainPID(killCtx, vmID), 500*time.Millisecond)
 
 	removeUnitDropIn(vmID)
 }

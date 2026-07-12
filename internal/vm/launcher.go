@@ -217,12 +217,11 @@ func unescapeMountinfo(s string) string {
 	return b.String()
 }
 
-// StartMountCountSampler periodically logs the host mount-table size so the
-// O(1)-launch invariant — mount count should stay roughly flat, not grow with
-// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
-func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+// startSampler runs fn on a ticker until ctx is done. Shared scaffold for the
+// periodic host gauges below.
+func (m *Manager) startSampler(ctx context.Context, name string, every time.Duration, fn func()) {
 	go func() {
-		defer sentrylog.Recover("mount-count sampler")
+		defer sentrylog.Recover(name)
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
@@ -230,43 +229,38 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				total, nsfs := hostMountCounts()
-				m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
-					Msg("host mount table")
-				m.revalidateLauncher(ctx)
+				fn()
 			}
 		}
 	}()
 }
 
+// StartMountCountSampler periodically logs the host mount-table size so the
+// O(1)-launch invariant — mount count should stay roughly flat, not grow with
+// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
+func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+	m.startSampler(ctx, "mount-count sampler", every, func() {
+		total, nsfs := hostMountCounts()
+		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Msg("host mount table")
+		m.revalidateLauncher(ctx)
+	})
+}
+
 // StartNetnsLeakSampler periodically logs the host network-namespace count
-// against the live-VM and pool-held counts so leaked namespaces are observable
-// and alertable: netns_leak_estimate ≈ netns_total - live_vms - pool_held. One
-// /run/netns readdir per tick.
+// against the slot allocator's owned-index count so leaked namespaces are
+// observable and alertable: netns_leak_estimate = netns_total - owned_slots.
+// The owned set covers every legitimate holder (live VMs, pool-held slots,
+// build and record reservations, in-flight teardowns), so a sustained positive
+// estimate means teardown is leaking; a negative one is logged as-is since it
+// flags an accounting inconsistency. One /run/netns readdir per tick.
 func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
-	go func() {
-		defer sentrylog.Recover("netns-leak sampler")
-		t := time.NewTicker(every)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				netnsTotal, poolHeld := m.netMgr.NetnsStats()
-				m.mu.RLock()
-				liveVMs := len(m.vms)
-				m.mu.RUnlock()
-				leak := netnsTotal - liveVMs - poolHeld
-				if leak < 0 {
-					leak = 0
-				}
-				m.log.Info().Int("netns_total", netnsTotal).Int("live_vms", liveVMs).
-					Int("pool_held", poolHeld).Int("netns_leak_estimate", leak).
-					Msg("netns leak gauge")
-			}
-		}
-	}()
+	m.startSampler(ctx, "netns-leak sampler", every, func() {
+		netnsTotal, ownedSlots := m.netMgr.NetnsStats()
+		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
+			Int("netns_leak_estimate", netnsTotal-ownedSlots).
+			Msg("netns leak gauge")
+	})
 }
 
 // revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to
