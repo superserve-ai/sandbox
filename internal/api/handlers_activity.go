@@ -100,7 +100,7 @@ func (h *Handlers) ListActivity(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	if !h.requireTeamSandboxRead(c, teamID) {
+	if !h.requireTeamSettingsRead(c, teamID) {
 		return
 	}
 

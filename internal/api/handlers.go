@@ -1450,7 +1450,9 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	} else if canWrite {
 		resp = h.sandboxToResponseWithToken(sandbox)
 	}
-	resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
+	if !isConsoleImpersonation(c) {
+		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
+	}
 	c.JSON(http.StatusOK, resp)
 }
 
