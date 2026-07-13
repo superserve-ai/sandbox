@@ -652,11 +652,15 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	// Retried pause (response lost mid-RPC): re-snapshotting a stopped VM
 	// dials a dead socket and ends with the record deleted. Return the
-	// recorded artifacts instead.
+	// recorded artifacts instead — after confirming they still exist, like
+	// ResumeVM does before acting on a record.
 	inst.mu.RLock()
 	if inst.Status == StatusPaused && inst.SnapshotPath != "" && inst.MemFilePath != "" {
 		snapshotPath, memPath = inst.SnapshotPath, inst.MemFilePath
 		inst.mu.RUnlock()
+		if !fileExists(snapshotPath) || !fileExists(memPath) {
+			return "", "", status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
+		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
 		return snapshotPath, memPath, nil
 	}
@@ -771,18 +775,20 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 	}
 
-	// Stop the Firecracker process — snapshot is already on disk. The stop
-	// must actually take: a unit left running pins the guest's RAM for as
-	// long as the sandbox sleeps. Detached ctx: the request budget may be
-	// spent after a slow snapshot. Fail the pause rather than report
-	// success with the VM still alive.
+	// Stop the Firecracker process — snapshot is already on disk. Detached
+	// ctx: the request budget may be spent after a slow snapshot. A stop
+	// that still fails must NOT fail the pause: the artifacts are valid and
+	// the record must reach Paused — a retry against a Running record would
+	// re-diff an already-consumed dirty bitmap and destroy the overlay. The
+	// straggler unit is replaced at the next launch and reclaimed by the
+	// reconciler meanwhile.
 	unit := systemdUnitName(vmID)
 	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer stopCancel()
 	if err := stopUnit(stopCtx, unit); err != nil {
 		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
 		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
-			return "", "", fmt.Errorf("stop unit after snapshot: %w", serr)
+			log.Error().Err(serr).Msg("unit still running after pause; reconciler will reclaim it")
 		}
 	}
 
@@ -922,6 +928,15 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 	if snapshotPath == "" || memPath == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
+	}
+
+	// Retried resume (response lost mid-RPC): the VM may already be up from
+	// the prior attempt. Relaunching would kill it and roll the guest back
+	// to the snapshot, so return the live instance — same guard as the
+	// stateless restore path.
+	if existing := m.retriedLaunchTarget(ctx, vmID, snapshotPath, memPath); existing != nil {
+		log.Info().Msg("resume: VM already running and healthy, returning it")
+		return existing, nil
 	}
 
 	// Verify the snapshot files actually exist on disk. DB can claim
@@ -1405,20 +1420,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// Retried restore (response lost mid-RPC): re-restoring a VM the prior
 	// attempt brought up would roll the guest back to the snapshot. Healthy
 	// boxd proves the prior restore completed — return that VM instead.
-	m.mu.RLock()
-	existing := m.vms[vmID]
-	m.mu.RUnlock()
-	if existing != nil {
-		existing.mu.RLock()
-		running, ip := existing.Status == StatusRunning, existing.IP
-		// Only a request for the SAME artifacts is a retry; a different
-		// snapshot for this vmID must replace the VM as before.
-		sameArtifacts := existing.SnapshotPath == snapshotPath && existing.MemFilePath == memPath
-		existing.mu.RUnlock()
-		if running && sameArtifacts && ip != "" && probeBoxdHealth(ctx, ip, 3*time.Second) == nil {
-			log.Info().Msg("restore: VM already running and healthy, returning it")
-			return existing, nil
-		}
+	if existing := m.retriedLaunchTarget(ctx, vmID, snapshotPath, memPath); existing != nil {
+		log.Info().Msg("restore: VM already running and healthy, returning it")
+		return existing, nil
 	}
 
 	m.mu.Lock()
@@ -1647,8 +1651,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			break
 		}
 		m.stopUnitDuringRestoreError(vmID)
-		// systemctl start is a no-op on an active unit, so retry only when the
-		// unit is affirmatively dead — an inconclusive answer reads as alive.
+		// Retry only when the unit is affirmatively dead — an inconclusive
+		// answer reads as alive. Launches restart the unit these days, so a
+		// live leftover would be replaced; kept conservative because "not
+		// confirmed dead" here means systemctl itself is struggling, and
+		// relaxing this gate deserves its own change.
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
 		checkCancel()
@@ -2669,22 +2676,25 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	tStartUnitDone := time.Now()
 
 	err := waitForSocket(socketPath, 5*time.Second)
-	if err != nil {
-		status := unitFailureSummary(ctx, systemdUnitName(vmID))
+	if err != nil && unitJobPending(ctx, systemdUnitName(vmID)) {
 		// A restart that replaced a live stale unit may still be inside its
 		// stop phase (TimeoutStopSec 10s) with the start queued behind it —
-		// give that one bounded extension instead of killing a launch
-		// systemd is about to complete.
-		if unitTransitioning(status) {
-			err = waitForSocket(socketPath, 12*time.Second)
+		// give that one bounded extension, capped by the caller's remaining
+		// budget, instead of killing a launch systemd is about to complete.
+		extra := 12 * time.Second
+		if dl, ok := ctx.Deadline(); ok {
+			extra = min(extra, time.Until(dl))
 		}
-		if err != nil {
-			status = unitFailureSummary(ctx, systemdUnitName(vmID))
-			m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
-				Msg("firecracker socket missing after launch")
-			_ = stopUnit(ctx, systemdUnitName(vmID))
-			return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
+		if extra > 0 {
+			err = waitForSocket(socketPath, extra)
 		}
+	}
+	if err != nil {
+		status := unitFailureSummary(ctx, systemdUnitName(vmID))
+		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
+			Msg("firecracker socket missing after launch")
+		_ = stopUnit(ctx, systemdUnitName(vmID))
+		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
 	}
 	tSocketReady := time.Now()
 
@@ -2801,5 +2811,38 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 	return waitForHTTPHealth(ctx, vmIP, timeout)
 }
 
-// probeBoxdHealth is the retried-restore liveness probe; swappable in tests.
+// probeBoxdHealth is the retried-launch liveness probe; swappable in tests.
 var probeBoxdHealth = waitForHTTPHealth
+
+// retriedLaunchTarget returns the tracked instance for vmID when a resume or
+// restore request is a retry of one that already completed: instance Running,
+// requesting the SAME artifacts (a different snapshot must replace the VM as
+// before), and boxd answering. The probe runs on a detached ctx so a
+// nearly-spent retry deadline can't false-negative a healthy VM into being
+// replaced. The post-probe identity recheck drops a VM destroyed during the
+// probe (same threat the restore path's persist-then-verify recheck names).
+func (m *Manager) retriedLaunchTarget(ctx context.Context, vmID, snapshotPath, memPath string) *VMInstance {
+	m.mu.RLock()
+	existing := m.vms[vmID]
+	m.mu.RUnlock()
+	if existing == nil {
+		return nil
+	}
+	existing.mu.RLock()
+	running, ip := existing.Status == StatusRunning, existing.IP
+	sameArtifacts := existing.SnapshotPath == snapshotPath && existing.MemFilePath == memPath
+	existing.mu.RUnlock()
+	if !running || !sameArtifacts || ip == "" {
+		return nil
+	}
+	if probeBoxdHealth(context.WithoutCancel(ctx), ip, 3*time.Second) != nil {
+		return nil
+	}
+	m.mu.RLock()
+	still := m.vms[vmID] == existing
+	m.mu.RUnlock()
+	if !still {
+		return nil
+	}
+	return existing
+}

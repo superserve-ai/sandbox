@@ -348,6 +348,36 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Drift 5: systemd unit active, DB says paused. An interrupted pause
+	// stop (or a vmd crash between snapshot and stop) leaves the old
+	// firecracker running, pinning the guest's RAM for as long as the
+	// sandbox sleeps. A resume replaces it at launch; a sandbox that stays
+	// paused needs this reclaim. The record stays — the snapshot is valid.
+	if dbSandboxes != nil {
+		for id := range active {
+			sb, known := dbSandboxes[id]
+			if !known || sb.Sandbox.Status != db.SandboxStatusPaused {
+				r.clearDrift("pausedunit:" + id)
+				continue
+			}
+			if !r.gracePeriodElapsed("pausedunit:"+id, now) {
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				r.writeAudit(ctx, id, "budget_exhausted", "paused_unit_stop suppressed by rate limit", "systemd_active_db_paused")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
+				Msg("live unit for paused sandbox — stopping")
+			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop paused sandbox's unit")
+				continue
+			}
+			r.writeAudit(ctx, id, "paused_unit_stop", "unit still running for paused sandbox", "systemd_active_db_paused")
+			r.clearDrift("pausedunit:" + id)
+		}
+	}
+
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {

@@ -925,3 +925,24 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 		t.Fatal("a restore for different artifacts must not return the old VM")
 	}
 }
+
+func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
+	orig := probeBoxdHealth
+	probeBoxdHealth = func(ctx context.Context, vmIP string, timeout time.Duration) error { return nil }
+	defer func() { probeBoxdHealth = orig }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	if err != nil {
+		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing running instance, not a relaunch")
+	}
+}
