@@ -27,7 +27,7 @@ var boxdHTTPClient = &http.Client{
 
 // waitForHTTPHealth polls boxd's /health endpoint until it responds or timeout.
 //
-// The probe interval ramps 1ms → 50ms (doubling): readiness in the tens of
+// The probe interval ramps 1ms → 10ms (doubling): readiness in the tens of
 // milliseconds would otherwise be quantized to the poll interval, so the
 // early probes must be dense; the cap keeps the steady-state cost of a slow
 // boot negligible. Probes ride the host↔guest veth, so each costs well
@@ -37,7 +37,7 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 
-	const maxProbeInterval = 50 * time.Millisecond
+	const maxProbeInterval = 10 * time.Millisecond
 	interval := time.Millisecond
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
