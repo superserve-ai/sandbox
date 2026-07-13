@@ -421,10 +421,9 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 // keeps them valid. Also the tap-construction path for setupSlot (the delete
 // is a no-op on a fresh namespace), keeping fresh and recycled taps identical.
 //
-// The rebuild runs as a single exec: per-command `ip netns exec` invocations
-// fork twice each and serialize on the kernel's netlink lock, which under a
-// mass delete's concurrent resets was enough to blow the caller's deadline.
-// All interpolants are package constants.
+// One exec for the whole rebuild: per-command `ip netns exec` invocations fork
+// twice each and serialize on the kernel's netlink lock under concurrent
+// resets. All interpolants are package constants.
 func (m *Manager) resetTap(ctx context.Context, nsName string) error {
 	script := fmt.Sprintf(
 		"ip link del %[1]s 2>/dev/null; ip tuntap add dev %[1]s mode tap && ip link set %[1]s up && ip link set %[1]s mtu %[2]s && ip addr add %[3]s dev %[1]s",

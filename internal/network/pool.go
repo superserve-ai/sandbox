@@ -48,9 +48,8 @@ type Pool struct {
 
 	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
 	resetTapOnRecycle bool
-	// resetSem bounds concurrent tap rebuilds: a mass delete returns hundreds
-	// of slots at once, and unbounded rebuilds contend on the kernel's netlink
-	// lock until every one blows its deadline.
+	// resetSem bounds concurrent tap rebuilds so a mass delete's returns can't
+	// fork-storm the kernel's netlink lock.
 	resetSem chan struct{}
 }
 
@@ -83,9 +82,9 @@ const (
 	// TimeoutStopSec=10 (systemd's own worst case for a unit that ignores
 	// SIGTERM) plus margin for kernel teardown under host I/O contention.
 	defaultVerifyMaxWait = 20 * time.Second
-	// resetTapConcurrency caps in-flight tap rebuilds (see Pool.resetSem).
-	// Rebuilds are short once uncontended, so a small window drains a mass
-	// delete's backlog quickly without a fork storm.
+	// resetTapConcurrency caps in-flight tap rebuilds (see Pool.resetSem);
+	// rebuilds are short once uncontended, so a small window drains a backlog
+	// quickly.
 	resetTapConcurrency = 8
 )
 
