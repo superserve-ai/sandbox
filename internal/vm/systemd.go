@@ -14,14 +14,17 @@ func systemdUnitName(vmID string) string {
 	return "firecracker@" + vmID + ".service"
 }
 
-// startUnit starts a systemd unit. Idempotent — starting an already-running
-// unit is a no-op. Returns after the start job is queued; readiness is
-// signalled by the unit's own side effect (e.g., API socket appearing).
-func startUnit(ctx context.Context, unit string) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "start", "--no-block", unit)
+// restartUnit (re)starts a systemd unit. For an inactive unit this is
+// exactly `start`; an already-active unit — a stale firecracker left by an
+// interrupted stop — is replaced rather than silently no-op'd, which would
+// strand the launch waiting on a socket the old process never re-binds.
+// Returns after the job is queued; readiness is signalled by the unit's own
+// side effect (e.g., API socket appearing).
+func restartUnit(ctx context.Context, unit string) error {
+	cmd := exec.CommandContext(ctx, "systemctl", "restart", "--no-block", unit)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl start %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("systemctl restart %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }

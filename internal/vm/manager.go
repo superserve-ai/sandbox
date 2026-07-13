@@ -772,9 +772,20 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 	}
 
-	// Stop the Firecracker process — snapshot is already on disk.
-	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
-		log.Warn().Err(err).Msg("systemctl stop failed during pause")
+	// Stop the Firecracker process — snapshot is already on disk. The stop
+	// must actually take: a unit left running pins the guest's RAM for as
+	// long as the sandbox sleeps. Detached ctx — the request budget may be
+	// nearly spent after a slow snapshot. Fail the pause (sandbox stays
+	// active, which is the truth) rather than report success with the VM
+	// still alive.
+	unit := systemdUnitName(vmID)
+	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer stopCancel()
+	if err := stopUnit(stopCtx, unit); err != nil {
+		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
+		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
+			return "", "", fmt.Errorf("stop unit after snapshot: %w", serr)
+		}
 	}
 
 	inst.mu.Lock()
@@ -2652,13 +2663,15 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	}
 
 	tStartUnit := time.Now()
-	if err := startUnit(ctx, systemdUnitName(vmID)); err != nil {
+	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
 		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
 	tStartUnitDone := time.Now()
 
 	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
 		status := unitFailureSummary(ctx, systemdUnitName(vmID))
+		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
+			Msg("firecracker socket missing after launch")
 		_ = stopUnit(ctx, systemdUnitName(vmID))
 		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
 	}
