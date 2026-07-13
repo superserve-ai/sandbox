@@ -650,10 +650,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
-	// Retried pause (response lost to a daemon restart or connection reset):
-	// re-snapshotting a stopped VM would dial the dead firecracker socket and
-	// end with handleVMError deleting the record. Return the recorded
-	// artifacts instead.
+	// Retried pause (response lost mid-RPC): re-snapshotting a stopped VM
+	// dials a dead socket and ends with the record deleted. Return the
+	// recorded artifacts instead.
 	inst.mu.RLock()
 	if inst.Status == StatusPaused && inst.SnapshotPath != "" && inst.MemFilePath != "" {
 		snapshotPath, memPath = inst.SnapshotPath, inst.MemFilePath
@@ -774,10 +773,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	// Stop the Firecracker process — snapshot is already on disk. The stop
 	// must actually take: a unit left running pins the guest's RAM for as
-	// long as the sandbox sleeps. Detached ctx — the request budget may be
-	// nearly spent after a slow snapshot. Fail the pause (sandbox stays
-	// active, which is the truth) rather than report success with the VM
-	// still alive.
+	// long as the sandbox sleeps. Detached ctx: the request budget may be
+	// spent after a slow snapshot. Fail the pause rather than report
+	// success with the VM still alive.
 	unit := systemdUnitName(vmID)
 	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer stopCancel()
@@ -1404,10 +1402,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// new VM (not in BoltDB).
 	m.lazyReattach(vmID)
 
-	// Retried restore (response lost to a daemon restart or connection
-	// reset): stopping and re-restoring a VM the previous attempt already
-	// brought up would roll the guest back to the snapshot. A healthy boxd
-	// is the proof the prior restore completed — return that VM instead.
+	// Retried restore (response lost mid-RPC): re-restoring a VM the prior
+	// attempt brought up would roll the guest back to the snapshot. Healthy
+	// boxd proves the prior restore completed — return that VM instead.
 	m.mu.RLock()
 	existing := m.vms[vmID]
 	m.mu.RUnlock()
