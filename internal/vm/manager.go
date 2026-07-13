@@ -1652,10 +1652,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		m.stopUnitDuringRestoreError(vmID)
 		// Retry only when the unit is affirmatively dead — an inconclusive
-		// answer reads as alive. Launches restart the unit these days, so a
-		// live leftover would be replaced; kept conservative because "not
-		// confirmed dead" here means systemctl itself is struggling, and
-		// relaxing this gate deserves its own change.
+		// answer reads as alive. Launches would replace a live leftover,
+		// but "not confirmed dead" means systemctl itself is struggling;
+		// kept conservative.
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
 		checkCancel()
@@ -2820,12 +2819,11 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 var probeBoxdHealth = waitForHTTPHealth
 
 // retriedLaunchTarget returns the tracked instance for vmID when a resume or
-// restore request is a retry of one that already completed: instance Running,
-// requesting the SAME artifacts (a different snapshot must replace the VM as
-// before), and boxd answering. The probe runs on a detached ctx so a
-// nearly-spent retry deadline can't false-negative a healthy VM into being
-// replaced. The post-probe identity recheck drops a VM destroyed during the
-// probe (same threat the restore path's persist-then-verify recheck names).
+// restore request is a retry of one that already completed: Running, SAME
+// artifacts (a different snapshot must replace the VM as before), and boxd
+// answering. Detached probe ctx — a spent retry deadline must not
+// false-negative a healthy VM into replacement; post-probe identity recheck
+// drops a VM destroyed during the probe.
 func (m *Manager) retriedLaunchTarget(ctx context.Context, vmID, snapshotPath, memPath string) *VMInstance {
 	m.mu.RLock()
 	existing := m.vms[vmID]
