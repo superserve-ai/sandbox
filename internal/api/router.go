@@ -79,6 +79,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 
 		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)
 
+		api.GET("/billing/summary", h.GetBillingSummary)
 		api.GET("/billing/pricing", h.GetBillingPricing)
 
 		// RBAC Phase 2b customer-facing team management.
