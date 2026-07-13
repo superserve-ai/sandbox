@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/presence"
 )
 
 // TestPlanRestore pins the restore-decision behavior across the four input
@@ -281,16 +283,22 @@ func TestFreshenFirstPassOverlay(t *testing.T) {
 		t.Errorf("missing overlay: got %v, want nil", err)
 	}
 
-	// Existing overlay → removed, nil.
+	// Existing overlay (and its presence side-car) → both removed, nil.
 	f := filepath.Join(dir, "mem.diff")
 	if err := os.WriteFile(f, []byte("stale"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(presence.SidecarPath(f), []byte("stale bits"), 0o600); err != nil {
+		t.Fatalf("write side-car: %v", err)
 	}
 	if err := freshenFirstPassOverlay(f); err != nil {
 		t.Errorf("existing overlay: got %v, want nil", err)
 	}
 	if _, err := os.Stat(f); !os.IsNotExist(err) {
 		t.Errorf("overlay not removed: %v", err)
+	}
+	if _, err := os.Stat(presence.SidecarPath(f)); !os.IsNotExist(err) {
+		t.Errorf("presence side-car not removed: %v", err)
 	}
 
 	// Un-removable overlay (non-empty dir stands in for any remove failure) → error,
@@ -310,8 +318,9 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	snap := filepath.Join(root, vmID, "vmstate.snap")
 	mem := filepath.Join(root, vmID, "mem.diff")
 	overlay := snap + ".overlay"
-	base := layeredBaseSidecarPath(mem) // mem.diff.base
-	for _, p := range []string{snap, mem, overlay, base} {
+	base := layeredBaseSidecarPath(mem)   // mem.diff.base
+	presence := presence.SidecarPath(mem) // mem.diff.presence
+	for _, p := range []string{snap, mem, overlay, base, presence} {
 		writeFile(t, p)
 	}
 
@@ -320,11 +329,42 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 	// A leftover sidecar would make a later restore mis-handle a non-layered
-	// mem file as a layered overlay — the fork-bug class both removals prevent.
-	for _, p := range []string{overlay, base} {
+	// mem file as a layered overlay — and a stale .presence next to a future
+	// same-size overlay passes Firecracker's geometry checks and silently
+	// mis-layers pages. All must go with the files they describe.
+	for _, p := range []string{overlay, base, presence} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("sidecar still exists: %s (%v)", p, err)
 		}
+	}
+}
+
+func TestGateOverlayPresence(t *testing.T) {
+	dir := t.TempDir()
+	mem := filepath.Join(dir, "mem.diff")
+	nop := zerolog.Nop()
+
+	// Missing side-car, gate off → allowed (warn-only compat for pre-side-car
+	// local snapshots).
+	m := &Manager{}
+	if err := m.gateOverlayPresence(mem, nop); err != nil {
+		t.Errorf("gate off: got %v, want nil", err)
+	}
+
+	// Missing side-car, gate on → refused, carrying the sentinel both restore
+	// entry points map to FailedPrecondition. Without the sentinel the fresh
+	// path would surface this deterministic refusal as a retryable error.
+	m = &Manager{cfg: ManagerConfig{RequirePresenceSidecar: "always"}}
+	err := m.gateOverlayPresence(mem, nop)
+	if !errors.Is(err, ErrPresenceSidecarMissing) {
+		t.Errorf("gate on: got %v, want ErrPresenceSidecarMissing", err)
+	}
+
+	// Side-car present → allowed regardless of the gate. Only confirmed
+	// absence gates; other stat outcomes defer to Firecracker's own read.
+	writeFile(t, presence.SidecarPath(mem))
+	if err := m.gateOverlayPresence(mem, nop); err != nil {
+		t.Errorf("side-car present: got %v, want nil", err)
 	}
 }
 

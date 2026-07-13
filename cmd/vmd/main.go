@@ -361,6 +361,21 @@ func main() {
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
+	// Tri-state: "auto" (default) lets vmd enforce only after its convergence
+	// sweep proves every layered overlay has a presence side-car; "always"
+	// forces enforcement (fresh migration-target hosts); "never" is the
+	// break-glass off switch. Legacy true/false map to always/never.
+	requirePresenceSidecar := envOrDefault("VMD_REQUIRE_PRESENCE_SIDECAR", "auto")
+	switch requirePresenceSidecar {
+	case "true":
+		requirePresenceSidecar = "always"
+	case "false":
+		requirePresenceSidecar = "never"
+	case "auto", "always", "never":
+	default:
+		log.Warn().Str("value", requirePresenceSidecar).Msg("unknown VMD_REQUIRE_PRESENCE_SIDECAR; using auto")
+		requirePresenceSidecar = "auto"
+	}
 	launchViaLauncherNS := envOrDefault("VMD_LAUNCH_VIA_LAUNCHER_NS", "false") == "true"
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
@@ -381,6 +396,7 @@ func main() {
 		VerifySnapshotEnabled:      verifySnapshotEnabled,
 		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
 		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
+		RequirePresenceSidecar:     requirePresenceSidecar,
 		LaunchViaLauncherNS:        launchViaLauncherNS,
 		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
 	}, netMgr, log)
