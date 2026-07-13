@@ -48,6 +48,10 @@ type Pool struct {
 
 	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
 	resetTapOnRecycle bool
+	// resetSem bounds concurrent tap rebuilds: a mass delete returns hundreds
+	// of slots at once, and unbounded rebuilds contend on the kernel's netlink
+	// lock until every one blows its deadline.
+	resetSem chan struct{}
 }
 
 // preallocSlot holds a fully configured network namespace ready to be
@@ -79,6 +83,10 @@ const (
 	// TimeoutStopSec=10 (systemd's own worst case for a unit that ignores
 	// SIGTERM) plus margin for kernel teardown under host I/O contention.
 	defaultVerifyMaxWait = 20 * time.Second
+	// resetTapConcurrency caps in-flight tap rebuilds (see Pool.resetSem).
+	// Rebuilds are short once uncontended, so a small window drains a mass
+	// delete's backlog quickly without a fork storm.
+	resetTapConcurrency = 8
 )
 
 // StartPool creates the network slot pool and fills it in the background, so
@@ -103,6 +111,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		recycled:          make(chan *preallocSlot, recycleSize),
 		stopCh:            make(chan struct{}),
 		resetTapOnRecycle: cfg.ResetTapOnRecycle,
+		resetSem:          make(chan struct{}, resetTapConcurrency),
 	}
 	m.pool = p
 
@@ -248,11 +257,20 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 	}
 
 	// Process-free doesn't prove tap0's fd is released, so rebuild the tap
-	// before recycling; if it can't be rebuilt, tear down instead.
+	// before recycling; if it can't be rebuilt, tear down instead. The
+	// semaphore is acquired before the deadline starts, so queueing behind a
+	// mass delete's backlog doesn't eat into a rebuild's own budget.
 	if p.resetTapOnRecycle {
+		select {
+		case p.resetSem <- struct{}{}:
+		case <-p.stopCh:
+			p.cleanup(slot)
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := resetTapFunc(p.mgr, ctx, ns)
 		cancel()
+		<-p.resetSem
 		if err != nil {
 			p.log.Error().Err(err).Str("namespace", ns).Int("slot", slot.idx).
 				Msg("pool: tap reset failed on recycle — tearing down instead of recycling")

@@ -420,19 +420,17 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 // decline to recycle. nftables rules match tap0 by name, so reusing the name
 // keeps them valid. Also the tap-construction path for setupSlot (the delete
 // is a no-op on a fresh namespace), keeping fresh and recycled taps identical.
+//
+// The rebuild runs as a single exec: per-command `ip netns exec` invocations
+// fork twice each and serialize on the kernel's netlink lock, which under a
+// mass delete's concurrent resets was enough to blow the caller's deadline.
+// All interpolants are package constants.
 func (m *Manager) resetTap(ctx context.Context, nsName string) error {
-	_ = nsRun(ctx, nsName, "ip", "link", "del", TAPName)
-	if err := nsRun(ctx, nsName, "ip", "tuntap", "add", "dev", TAPName, "mode", "tap"); err != nil {
-		return fmt.Errorf("create TAP: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "up"); err != nil {
-		return fmt.Errorf("bring up TAP: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "mtu", ifaceMTU); err != nil {
-		return fmt.Errorf("set TAP MTU: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "addr", "add", tapCIDR, "dev", TAPName); err != nil {
-		return fmt.Errorf("assign TAP IP: %w", err)
+	script := fmt.Sprintf(
+		"ip link del %[1]s 2>/dev/null; ip tuntap add dev %[1]s mode tap && ip link set %[1]s up && ip link set %[1]s mtu %[2]s && ip addr add %[3]s dev %[1]s",
+		TAPName, ifaceMTU, tapCIDR)
+	if err := nsRun(ctx, nsName, "sh", "-c", script); err != nil {
+		return fmt.Errorf("reset TAP: %w", err)
 	}
 	return nil
 }
