@@ -1414,8 +1414,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if existing != nil {
 		existing.mu.RLock()
 		running, ip := existing.Status == StatusRunning, existing.IP
+		// Only a request for the SAME artifacts is a retry; a different
+		// snapshot for this vmID must replace the VM as before.
+		sameArtifacts := existing.SnapshotPath == snapshotPath && existing.MemFilePath == memPath
 		existing.mu.RUnlock()
-		if running && ip != "" && probeBoxdHealth(ctx, ip, 3*time.Second) == nil {
+		if running && sameArtifacts && ip != "" && probeBoxdHealth(ctx, ip, 3*time.Second) == nil {
 			log.Info().Msg("restore: VM already running and healthy, returning it")
 			return existing, nil
 		}
@@ -2668,12 +2671,23 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	}
 	tStartUnitDone := time.Now()
 
-	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+	err := waitForSocket(socketPath, 5*time.Second)
+	if err != nil {
 		status := unitFailureSummary(ctx, systemdUnitName(vmID))
-		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
-			Msg("firecracker socket missing after launch")
-		_ = stopUnit(ctx, systemdUnitName(vmID))
-		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
+		// A restart that replaced a live stale unit may still be inside its
+		// stop phase (TimeoutStopSec 10s) with the start queued behind it —
+		// give that one bounded extension instead of killing a launch
+		// systemd is about to complete.
+		if unitTransitioning(status) {
+			err = waitForSocket(socketPath, 12*time.Second)
+		}
+		if err != nil {
+			status = unitFailureSummary(ctx, systemdUnitName(vmID))
+			m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
+				Msg("firecracker socket missing after launch")
+			_ = stopUnit(ctx, systemdUnitName(vmID))
+			return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
+		}
 	}
 	tSocketReady := time.Now()
 

@@ -861,12 +861,6 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	probeBoxdHealth = func(ctx context.Context, vmIP string, timeout time.Duration) error { return nil }
 	defer func() { probeBoxdHealth = orig }()
 
-	existing := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5"}
-	mgr := &Manager{
-		log:        zerolog.Nop(),
-		vms:        map[string]*VMInstance{"vm-1": existing},
-		restoreSem: make(chan struct{}, 1),
-	}
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
 	memPath := filepath.Join(dir, "mem.snap")
@@ -874,6 +868,15 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
 	}
 
 	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
@@ -888,5 +891,37 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	mgr.mu.RUnlock()
 	if still != existing {
 		t.Fatal("existing instance must remain tracked untouched")
+	}
+}
+
+func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
+	orig := probeBoxdHealth
+	probeBoxdHealth = func(ctx context.Context, vmIP string, timeout time.Duration) error { return nil }
+	defer func() { probeBoxdHealth = orig }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The live VM was restored from other artifacts: the request must NOT
+	// short-circuit to it, even with boxd healthy.
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: filepath.Join(dir, "old-vmstate.snap"),
+		MemFilePath:  filepath.Join(dir, "old-mem.snap"),
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	inst, _ := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	if inst == existing {
+		t.Fatal("a restore for different artifacts must not return the old VM")
 	}
 }

@@ -46,6 +46,13 @@ func unitFailureSummary(ctx context.Context, unit string) string {
 	return s
 }
 
+// unitTransitioning reports whether a Result/SubState summary describes a
+// unit mid stop or start — e.g. a restart that replaced a live stale unit
+// and is still tearing the old process down (TimeoutStopSec allows 10s).
+func unitTransitioning(summary string) bool {
+	return strings.Contains(summary, "stop") || strings.Contains(summary, "start")
+}
+
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
 // unit is a no-op.
 func stopUnit(ctx context.Context, unit string) error {
