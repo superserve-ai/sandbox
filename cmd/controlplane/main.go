@@ -619,10 +619,9 @@ func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error
 }
 
 func (c *grpcVMDClient) StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(vmdclient.BuildLogEvent) error) error {
-	// The unary retry interceptor doesn't cover streams, so ride out a
-	// daemon restart here — but only while no event has been delivered:
-	// vmd replays buffered history on a fresh stream, so retrying after
-	// delivery would duplicate events to the caller.
+	// The unary retry interceptor doesn't cover streams. Retry the open
+	// only while nothing was delivered — a fresh stream replays history,
+	// which would duplicate events.
 	deadline := time.Now().Add(retryUnavailableWindow)
 	backoff := 250 * time.Millisecond
 	for {
@@ -674,14 +673,10 @@ func (c *grpcVMDClient) streamBuildLogsOnce(ctx context.Context, buildVMID strin
 
 // retryUnavailableUnaryInterceptor retries codes.Unavailable — the daemon
 // is down or still starting — with deterministic backoff until the window
-// or the caller's context expires. Unavailable almost always means the
-// request never executed (connection refused, or the daemon's startup gate
-// rejecting before the handler). A connection severed mid-call also
-// surfaces as Unavailable though, so every retried RPC must stay safe to
-// re-execute — do not add a non-idempotent RPC relying on this retry.
+// or the caller's context expires. A connection severed mid-call also
+// surfaces as Unavailable, so every retried RPC must stay idempotent.
 // gRPC's built-in retryPolicy can't cover a daemon restart: attempts are
-// hard-capped at 5 with jittered backoff, so its worst-case envelope is a
-// few seconds.
+// hard-capped at 5, so its worst-case envelope is a few seconds.
 func retryUnavailableUnaryInterceptor(window time.Duration) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		deadline := time.Now().Add(window)
@@ -692,25 +687,21 @@ func retryUnavailableUnaryInterceptor(window time.Duration) grpc.UnaryClientInte
 			err := invoker(ctx, method, req, reply, cc, opts...)
 			if err == nil || grpcstatus.Code(err) != grpccodes.Unavailable || !time.Now().Before(deadline) {
 				if err != nil && attempts > 1 {
-					// The only signal that the retry window is too small
-					// for however long the daemon is staying unreachable.
 					log.Warn().Err(err).Str("method", method).Int("attempts", attempts).
 						Msg("VMD RPC still failing after retry window")
 				}
 				return err
 			}
-			// The channel's own reconnect backoff spaces dials out to
-			// multi-second gaps that can overshoot this window even when
-			// the daemon recovers inside it; reset it so re-dials follow
-			// this loop's cadence instead. Nil cc only in tests.
+			// The channel's own reconnect backoff spaces dials out past
+			// this window; reset it so re-dials follow this loop's
+			// cadence. Nil cc only in tests.
 			if cc != nil {
 				cc.ResetConnectBackoff()
 			}
 			select {
 			case <-ctx.Done():
-				// Return the Unavailable seen before cancellation rather
-				// than ctx.Err(), so the dead-host interceptor above still
-				// observes it and evicts the cached client.
+				// Stale Unavailable, not ctx.Err(): the dead-host
+				// interceptor above keys off it.
 				return err
 			case <-time.After(min(backoff, time.Until(deadline))):
 			}
