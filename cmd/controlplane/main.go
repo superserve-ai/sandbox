@@ -634,7 +634,9 @@ func (c *grpcVMDClient) StreamBuildLogs(ctx context.Context, buildVMID string, o
 		}
 		select {
 		case <-ctx.Done():
-			return err
+			// Same as the unary interceptor: a caller giving up must not
+			// read as a dead host.
+			return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), err)
 		case <-time.After(min(backoff, time.Until(deadline))):
 		}
 		backoff = min(backoff*2, 2*time.Second)
@@ -656,6 +658,7 @@ func (c *grpcVMDClient) streamBuildLogsOnce(ctx context.Context, buildVMID strin
 			}
 			return delivered, fmt.Errorf("recv build log: %w", err)
 		}
+		delivered = true
 		if cbErr := onEvent(vmdclient.BuildLogEvent{
 			TimestampUnixNanos: pbEv.GetTimestampUnixNanos(),
 			Stream:             pbEv.GetStream(),
@@ -700,9 +703,9 @@ func retryUnavailableUnaryInterceptor(window time.Duration) grpc.UnaryClientInte
 			}
 			select {
 			case <-ctx.Done():
-				// Stale Unavailable, not ctx.Err(): the dead-host
-				// interceptor above keys off it.
-				return err
+				// The caller gave up, not the host: don't surface
+				// Unavailable (the dead-host interceptor keys off it).
+				return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), err)
 			case <-time.After(min(backoff, time.Until(deadline))):
 			}
 			backoff = min(backoff*2, 2*time.Second)
