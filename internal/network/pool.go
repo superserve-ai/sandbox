@@ -21,8 +21,7 @@ type PoolConfig struct {
 	// Default: 100.
 	RecycleSize int
 	// ResetTapOnRecycle recreates a returned slot's tap0 before it is made
-	// claimable again (see verifyAndRecycle). Off by default so it can be
-	// enabled per cell during rollout.
+	// claimable again (see verifyAndRecycle). Off by default.
 	ResetTapOnRecycle bool
 }
 

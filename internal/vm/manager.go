@@ -420,17 +420,22 @@ func sigkillPID(pid int, wait time.Duration) {
 	}
 }
 
-// pidIsVMFirecracker reports whether pid's command line names vmID. Record
-// PIDs can be stale (a paused record keeps the PID of a Firecracker that died
-// at pause), and after PID-space reuse a stale PID may belong to an unrelated
-// live process — so record-sourced kills must verify identity first. The
-// per-VM rundir path on the command line embeds vmID.
+// pidIsVMFirecracker reports whether pid is this VM's Firecracker. A stored PID
+// can be stale (a paused VM keeps the PID of a Firecracker that died at pause),
+// and after PID-space reuse it may belong to an unrelated live process — so any
+// kill fed by stored state must verify identity first. Substring matching is
+// not identity (a tail/cp on the VM's rundir path would pass it); this requires
+// the exact `--id <vmID>` argv token and the firecracker binary, the same
+// predicate killOrphanFirecracker uses.
 func pidIsVMFirecracker(pid int, vmID string) bool {
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if pid <= 0 || vmID == "" {
+		return false
+	}
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(b), vmID)
+	return firecrackerCmdlineMatches(cmdline, vmID)
 }
 
 // coldBootFromRootfs is the parameterized form: boot a VM from a specific
@@ -571,9 +576,7 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// in memory; an untracked one (paused or post-restart, absent from m.vms) has
 	// them only in the record. Without the record fallback a cold-boot VM's
 	// Firecracker is never killed (stopUnit is a no-op for it) and its slot is
-	// never reclaimed (ns is ""). A record PID is killed only after verifying it
-	// still names this VM — a paused record keeps its dead Firecracker's PID, and
-	// after PID reuse that number can be an unrelated live process.
+	// never reclaimed (ns is "").
 	var pid int
 	var sockPath, ns string
 	if instErr == nil {
@@ -584,17 +587,19 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		inst.mu.RUnlock()
 	} else if m.state != nil {
 		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
-			if pidIsVMFirecracker(rec.PID, vmID) {
-				pid = rec.PID
-			}
+			pid = rec.PID
 			sockPath = rec.SocketPath
 			ns = rec.Namespace
 		}
 	}
 
 	// No-op for systemd VMs (stopUnit already killed them); the real kill for
-	// cold-boot VMs and verified record orphans.
-	sigkillPID(pid, 500*time.Millisecond)
+	// cold-boot VMs and record orphans. Identity-gated regardless of source: a
+	// paused VM's PID is stale whether it came from memory or the record, and
+	// after PID reuse an unverified kill hits an unrelated process.
+	if pidIsVMFirecracker(pid, vmID) {
+		sigkillPID(pid, 500*time.Millisecond)
+	}
 	if sockPath != "" {
 		_ = os.Remove(sockPath)
 	}
@@ -1514,14 +1519,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		m.stopUnitDuringRestoreError(vmID)
 		// systemctl start is a no-op on an active unit, so a retry against a
-		// surviving Firecracker can't boot a new one — verify the unit is gone
-		// before reusing its name, and give up if it isn't.
+		// surviving Firecracker can't boot a new one — retry only when the unit
+		// is affirmatively dead. An inconclusive answer (systemctl error or
+		// timeout under the same host contention that causes tap-busy) must
+		// read as alive, not as permission to retry.
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		survivor := m.unitMainPID(checkCtx, vmID)
+		dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
 		checkCancel()
-		if survivor > 0 && !waitForPIDExit(survivor, 2*time.Second) {
-			log.Warn().Int("pid", survivor).Int("attempt", attempt).
-				Msg("unit still alive after stop — not retrying restore")
+		if !dead {
+			log.Warn().Int("attempt", attempt).
+				Msg("unit not confirmed dead after stop — not retrying restore")
 			break
 		}
 		log.Warn().Err(restoreErr).Int("attempt", attempt).
@@ -1588,14 +1595,19 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	tBoxdReady := time.Now()
 
-	// A concurrent DestroyVM may have completed while we were restoring (its
-	// network cleanup no-ops during the retry window, and removeVM deletes the
-	// record). Persisting would resurrect the destroyed VM as an untracked
-	// zombie, so tear down instead.
+	m.setStatus(vmID, StatusRunning)
+	m.persistState(inst)
+	// Persist-then-verify: a concurrent DestroyVM may have completed while we
+	// were restoring (its network cleanup no-ops during the retry window, and
+	// removeVM deletes the record — possibly between our persist and here, or
+	// our persist may have resurrected an already-deleted record). Checking
+	// AFTER the write leaves no window: a destroy that raced us either erased
+	// the record itself or is caught now, and we erase it and tear down.
 	m.mu.RLock()
 	_, stillTracked := m.vms[vmID]
 	m.mu.RUnlock()
 	if !stillTracked {
+		m.deleteState(vmID)
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
@@ -1603,9 +1615,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		cleanupAfterRestoreFailure()
 		return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 	}
-
-	m.setStatus(vmID, StatusRunning)
-	m.persistState(inst)
 	tPersisted := time.Now()
 
 	log.Info().

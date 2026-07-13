@@ -97,7 +97,6 @@ func killOrphanFirecracker(buildVMID string) int {
 		return 0
 	}
 	killed := 0
-	marker := []byte("--id\x00" + buildVMID + "\x00")
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -110,13 +109,7 @@ func killOrphanFirecracker(buildVMID string) int {
 		if err != nil {
 			continue
 		}
-		if !bytes.Contains(cmdline, marker) {
-			continue
-		}
-		// Only kill firecracker — don't touch other processes that happen
-		// to mention the build id in their args.
-		if !bytes.HasPrefix(cmdline, []byte("firecracker")) &&
-			!bytes.Contains(cmdline, []byte("/firecracker\x00")) {
+		if !firecrackerCmdlineMatches(cmdline, buildVMID) {
 			continue
 		}
 		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
@@ -124,4 +117,16 @@ func killOrphanFirecracker(buildVMID string) int {
 		}
 	}
 	return killed
+}
+
+// firecrackerCmdlineMatches is the identity predicate over a /proc/<pid>/cmdline:
+// the NUL-delimited `--id <vmID>` argv token plus the firecracker binary name.
+// Only firecracker matches — never another process that happens to mention the
+// id in its args.
+func firecrackerCmdlineMatches(cmdline []byte, vmID string) bool {
+	if !bytes.Contains(cmdline, []byte("--id\x00"+vmID+"\x00")) {
+		return false
+	}
+	return bytes.HasPrefix(cmdline, []byte("firecracker")) ||
+		bytes.Contains(cmdline, []byte("/firecracker\x00"))
 }

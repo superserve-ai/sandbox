@@ -477,10 +477,11 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	}
 	vethName := fmt.Sprintf("veth-%d", idx)
 
-	// Remove per-sandbox egress proxy rules.
-	if m.egressProxy != nil {
-		m.egressProxy.RemoveRules(info.HostIP)
-	}
+	// Ownership gates every slot-keyed side effect below: the egress rules
+	// (keyed by the slot-derived HostIP), the firewall, and the kernel state
+	// belong to whoever owns the index now, so a stale cleanup for a moved-on
+	// slot must touch none of them — stripping the egress rules alone would
+	// silently remove the new tenant's filtering.
 
 	// Recycle the slot into the pool — namespace, veth, TAP, and base
 	// nftables stay configured; the next Claim re-adds vmID-specific
@@ -489,32 +490,41 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	// Claim silently lose per-VM egress filtering. Return transfers ownership
 	// from this VM back to the pool.
 	if recycle && m.pool != nil && info.Firewall != nil {
+		m.mu.Lock()
+		owned := m.slotOwner[idx] == vmID
+		m.mu.Unlock()
+		if !owned {
+			m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+				Msg("cleanup skipped — slot no longer owned by this VM")
+			return
+		}
+		if m.egressProxy != nil {
+			m.egressProxy.RemoveRules(info.HostIP)
+		}
 		_ = info.Firewall.ReplaceUserRules(nil, nil)
 		m.pool.Return(&preallocSlot{idx: idx, info: info, vethName: vethName})
 		return
 	}
 
-	// Full teardown (no pool, or a forced teardown of a suspect slot).
+	// Full teardown (no pool, or a forced teardown of a suspect slot). Park the
+	// index as teardownOwner for the duration — releasing it first would let a
+	// concurrent claim pop the idx, see the netns still present, and discard it
+	// for good.
+	if !m.claimTeardown(idx, vmID) {
+		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+			Msg("teardown skipped — slot no longer owned by this VM")
+		return
+	}
+	defer m.releaseIfOwned(idx, teardownOwner)
+
+	if m.egressProxy != nil {
+		m.egressProxy.RemoveRules(info.HostIP)
+	}
 	if info.Firewall != nil {
 		if err := info.Firewall.Close(); err != nil {
 			m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error closing namespace firewall")
 		}
 	}
-
-	// Park the index as teardownOwner for the duration of the kernel teardown —
-	// releasing it first would let a concurrent claim pop the idx, see the netns
-	// still present, and discard it for good. Skip when this VM no longer owns
-	// the index: the slot has moved on and tearing down would hit the new tenant.
-	m.mu.Lock()
-	if m.slotOwner[idx] != vmID {
-		m.mu.Unlock()
-		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
-			Msg("teardown skipped — slot no longer owned by this VM")
-		return
-	}
-	m.slotOwner[idx] = teardownOwner
-	m.mu.Unlock()
-	defer m.releaseIfOwned(idx, teardownOwner)
 
 	// Kill any process still in the namespace before removing it — `ip netns
 	// del` only unlinks the name, so a live holder (e.g. the still-attached tap
@@ -558,16 +568,10 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 		return
 	}
 	// Only tear down if this vmID still owns the index, so a stale cleanup racing
-	// the pool's reuse of the slot can't destroy a new tenant's ns/veth. Claim the
-	// teardown atomically (vmID → teardownOwner) so claimSlotIndex can't grab idx
-	// while cleanupFull runs below.
-	m.mu.Lock()
-	if m.slotOwner[idx] != vmID {
-		m.mu.Unlock()
+	// the pool's reuse of the slot can't destroy a new tenant's ns/veth.
+	if !m.claimTeardown(idx, vmID) {
 		return
 	}
-	m.slotOwner[idx] = teardownOwner
-	m.mu.Unlock()
 	// Release even if cleanupFull panics — otherwise the index stays stuck as
 	// teardownOwner forever (no other path releases that sentinel).
 	defer m.releaseIfOwned(idx, teardownOwner)
@@ -835,19 +839,28 @@ func (m *Manager) ClaimFreshSlot(owner string) (int, error) {
 // reserved index. Owns the namespace naming so callers never reconstruct
 // "ns-<idx>"; a no-op if owner no longer owns idx (already reclaimed/reused).
 func (m *Manager) ReleaseSlot(owner string, idx int) {
-	// Claim the teardown atomically (owner → teardownOwner) so claimSlotIndex
-	// can't grab idx while cleanupFull runs below.
-	m.mu.Lock()
-	if m.slotOwner[idx] != owner {
-		m.mu.Unlock()
+	if !m.claimTeardown(idx, owner) {
 		return
 	}
-	m.slotOwner[idx] = teardownOwner
-	m.mu.Unlock()
 	// Release even if cleanupFull panics — otherwise idx stays stuck as
 	// teardownOwner forever (no other path releases that sentinel).
 	defer m.releaseIfOwned(idx, teardownOwner)
 	m.cleanupFull(fmt.Sprintf("ns-%d", idx), fmt.Sprintf("veth-%d", idx))
+}
+
+// claimTeardown atomically transfers idx from owner to the teardown sentinel so
+// claimSlotIndex can't grab it mid-teardown. False when owner no longer holds
+// idx — the slot moved on and its state belongs to the new tenant, so the
+// caller must touch none of it. Pair with `defer m.releaseIfOwned(idx,
+// teardownOwner)`.
+func (m *Manager) claimTeardown(idx int, owner string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.slotOwner[idx] != owner {
+		return false
+	}
+	m.slotOwner[idx] = teardownOwner
+	return true
 }
 
 // claimSlotIndex picks a slot idx that is unowned and not present in the kernel,
@@ -904,15 +917,15 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "ns-") {
-			continue
-		}
 		if keep[name] {
 			continue
 		}
 
-		var idx int
-		if _, err := fmt.Sscanf(name, "ns-%d", &idx); err != nil {
+		// Strict ns-<int> parse (same as the gauge): a Sscanf-style parse would
+		// accept trailing garbage ("ns-5abc" → 5) and tear down veth-5 — the
+		// host side of whatever legitimately owns slot 5.
+		idx, ok := slotFromNamespace(name)
+		if !ok {
 			continue
 		}
 		if killed := killProcessesInNs(name); killed > 0 {
@@ -929,8 +942,11 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 	// before ns deletion, or when a crash left the host side orphaned).
 	if veths, err := listHostVeths(); err == nil {
 		for _, veth := range veths {
-			var idx int
-			if _, err := fmt.Sscanf(veth, "veth-%d", &idx); err != nil {
+			// Same strict parse: reject veth-<int><junk> rather than mapping it
+			// onto another slot's keep entry.
+			idxStr, isVeth := strings.CutPrefix(veth, "veth-")
+			idx, err := strconv.Atoi(idxStr)
+			if !isVeth || err != nil || idx < 0 {
 				continue
 			}
 			if keep[fmt.Sprintf("ns-%d", idx)] {
@@ -1054,26 +1070,32 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 	_ = run(ctx, "ip", "netns", "del", nsName)
 }
 
-// NetnsStats reports how many ns-N network namespaces exist on the host and
-// how many slot indices are currently owned (live VMs, pool-held slots, build
-// reservations, record reservations, in-flight teardowns — slotOwner is the
-// allocator's single source of truth). netnsTotal - ownedSlots approximates
-// leaked namespaces; sustained growth is the signal to alert on, and a
-// negative value flags an accounting inconsistency rather than health.
-func (m *Manager) NetnsStats() (netnsTotal, ownedSlots int) {
+// NetnsStats reports how many ns-N network namespaces exist on the host, how
+// many slot indices are currently owned (live VMs, pool-held slots, build and
+// record reservations, in-flight teardowns — slotOwner is the allocator's
+// single source of truth), and how many namespaces are orphaned: present in
+// the kernel with no owner. Orphaned is the leak signal — measured per
+// namespace, it is immune to owners with no backing namespace (record slots
+// reserved at startup for VMs whose netns a reboot destroyed).
+func (m *Manager) NetnsStats() (netnsTotal, ownedSlots, orphaned int) {
+	var indices []int
 	if entries, err := os.ReadDir(netnsDir); err == nil {
 		for _, e := range entries {
-			// Same strict ns-<int> parse the sweeper uses, so the gauge and the
-			// sweep agree on what counts as a managed namespace.
-			if _, ok := slotFromNamespace(e.Name()); ok {
+			if idx, ok := slotFromNamespace(e.Name()); ok {
 				netnsTotal++
+				indices = append(indices, idx)
 			}
 		}
 	}
 	m.mu.Lock()
 	ownedSlots = len(m.slotOwner)
+	for _, idx := range indices {
+		if _, ok := m.slotOwner[idx]; !ok {
+			orphaned++
+		}
+	}
 	m.mu.Unlock()
-	return netnsTotal, ownedSlots
+	return netnsTotal, ownedSlots, orphaned
 }
 
 func run(ctx context.Context, name string, args ...string) error {

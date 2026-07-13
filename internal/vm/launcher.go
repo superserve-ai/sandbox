@@ -247,18 +247,16 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 	})
 }
 
-// StartNetnsLeakSampler periodically logs the host network-namespace count
-// against the slot allocator's owned-index count so leaked namespaces are
-// observable and alertable: netns_leak_estimate = netns_total - owned_slots.
-// The owned set covers every legitimate holder (live VMs, pool-held slots,
-// build and record reservations, in-flight teardowns), so a sustained positive
-// estimate means teardown is leaking; a negative one is logged as-is since it
-// flags an accounting inconsistency. One /run/netns readdir per tick.
+// StartNetnsLeakSampler periodically logs the host's network-namespace counts.
+// netns_orphaned — namespaces present in the kernel with no owning slot — is
+// the leak signal: sustained growth means teardown is leaking. Owned covers
+// every legitimate holder (live VMs, pool-held slots, build and record
+// reservations, in-flight teardowns). One /run/netns readdir per tick.
 func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
 	m.startSampler(ctx, "netns-leak sampler", every, func() {
-		netnsTotal, ownedSlots := m.netMgr.NetnsStats()
+		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
 		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
-			Int("netns_leak_estimate", netnsTotal-ownedSlots).
+			Int("netns_orphaned", orphaned).
 			Msg("netns leak gauge")
 	})
 }
