@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/shellquote"
 )
 
 // ---------------------------------------------------------------------------
@@ -423,11 +425,11 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 //
 // One exec for the whole rebuild: per-command `ip netns exec` invocations fork
 // twice each and serialize on the kernel's netlink lock under concurrent
-// resets. All interpolants are package constants.
+// resets. Interpolants are shell-quoted package constants.
 func (m *Manager) resetTap(ctx context.Context, nsName string) error {
 	script := fmt.Sprintf(
 		"ip link del %[1]s 2>/dev/null; ip tuntap add dev %[1]s mode tap && ip link set %[1]s up && ip link set %[1]s mtu %[2]s && ip addr add %[3]s dev %[1]s",
-		TAPName, ifaceMTU, tapCIDR)
+		shellquote.Single(TAPName), shellquote.Single(ifaceMTU), shellquote.Single(tapCIDR))
 	if err := nsRun(ctx, nsName, "sh", "-c", script); err != nil {
 		return fmt.Errorf("reset TAP: %w", err)
 	}
@@ -1097,8 +1099,21 @@ func run(ctx context.Context, name string, args ...string) error {
 	// process kill would orphan them to finish after the caller moved on.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			// Group already gone: report "done" so a command that finished
+			// just as the deadline fired isn't turned into a spurious failure.
+			return os.ErrProcessDone
+		}
+		return err
 	}
+	// Bound the post-kill wait for output pipes: a descendant that detached
+	// into its own group survives the group kill and would otherwise hold
+	// stdout open indefinitely.
+	cmd.WaitDelay = time.Second
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s %v: %s: %w", name, args, string(out), err)
 	}

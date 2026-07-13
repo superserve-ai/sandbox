@@ -215,6 +215,31 @@ func TestPoolReturn_BoundsConcurrentTapResets(t *testing.T) {
 	}
 }
 
+// TestPoolReturn_ReleasesResetTokenOnPanic: a panicking rebuild must release
+// its semaphore token — Return's goroutine recovers panics, so a leaked token
+// would permanently shrink the reset window.
+func TestPoolReturn_ReleasesResetTokenOnPanic(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error { panic("rebuild blew up") })
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(p.resetSem) != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := len(p.resetSem); got != 0 {
+		t.Errorf("resetSem holds %d token(s) after a panicking rebuild, want 0", got)
+	}
+}
+
 // TestPoolReturn_SkipsTapResetWhenRecycleFull: a slot that would overflow the
 // recycle pool is torn down without paying the tap rebuild first.
 func TestPoolReturn_SkipsTapResetWhenRecycleFull(t *testing.T) {
