@@ -477,11 +477,8 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	}
 	vethName := fmt.Sprintf("veth-%d", idx)
 
-	// Ownership gates every slot-keyed side effect below: the egress rules
-	// (keyed by the slot-derived HostIP), the firewall, and the kernel state
-	// belong to whoever owns the index now, so a stale cleanup for a moved-on
-	// slot must touch none of them — stripping the egress rules alone would
-	// silently remove the new tenant's filtering.
+	// Ownership gates every slot-keyed side effect below (egress rules, firewall,
+	// kernel state): they belong to whoever owns the index now.
 
 	// Recycle the slot into the pool — namespace, veth, TAP, and base
 	// nftables stay configured; the next Claim re-adds vmID-specific
@@ -921,9 +918,8 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 			continue
 		}
 
-		// Strict ns-<int> parse (same as the gauge): a Sscanf-style parse would
-		// accept trailing garbage ("ns-5abc" → 5) and tear down veth-5 — the
-		// host side of whatever legitimately owns slot 5.
+		// Strict ns-<int> parse: trailing garbage must not map a foreign
+		// namespace onto another slot's veth.
 		idx, ok := slotFromNamespace(name)
 		if !ok {
 			continue
@@ -942,8 +938,7 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 	// before ns deletion, or when a crash left the host side orphaned).
 	if veths, err := listHostVeths(); err == nil {
 		for _, veth := range veths {
-			// Same strict parse: reject veth-<int><junk> rather than mapping it
-			// onto another slot's keep entry.
+			// Same strict parse as the ns loop.
 			idxStr, isVeth := strings.CutPrefix(veth, "veth-")
 			idx, err := strconv.Atoi(idxStr)
 			if !isVeth || err != nil || idx < 0 {
@@ -1070,13 +1065,10 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 	_ = run(ctx, "ip", "netns", "del", nsName)
 }
 
-// NetnsStats reports how many ns-N network namespaces exist on the host, how
-// many slot indices are currently owned (live VMs, pool-held slots, build and
-// record reservations, in-flight teardowns — slotOwner is the allocator's
-// single source of truth), and how many namespaces are orphaned: present in
-// the kernel with no owner. Orphaned is the leak signal — measured per
-// namespace, it is immune to owners with no backing namespace (record slots
-// reserved at startup for VMs whose netns a reboot destroyed).
+// NetnsStats reports the ns-N namespaces on the host, the owned slot indices
+// (slotOwner covers every legitimate holder), and orphaned — namespaces with
+// no owner, the leak signal. Measured per namespace so owners without a
+// backing namespace (e.g. record reservations after a reboot) don't distort it.
 func (m *Manager) NetnsStats() (netnsTotal, ownedSlots, orphaned int) {
 	var indices []int
 	if entries, err := os.ReadDir(netnsDir); err == nil {

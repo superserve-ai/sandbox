@@ -420,13 +420,11 @@ func sigkillPID(pid int, wait time.Duration) {
 	}
 }
 
-// pidIsVMFirecracker reports whether pid is this VM's Firecracker. A stored PID
-// can be stale (a paused VM keeps the PID of a Firecracker that died at pause),
-// and after PID-space reuse it may belong to an unrelated live process — so any
-// kill fed by stored state must verify identity first. Substring matching is
-// not identity (a tail/cp on the VM's rundir path would pass it); this requires
-// the exact `--id <vmID>` argv token and the firecracker binary, the same
-// predicate killOrphanFirecracker uses.
+// pidIsVMFirecracker reports whether pid is this VM's Firecracker. A stored
+// PID can be stale (paused VMs keep the PID of a process that died at pause)
+// and reused by an unrelated process, so kills fed by stored state verify
+// identity first — the exact `--id <vmID>` argv token plus the firecracker
+// binary, not a substring match.
 func pidIsVMFirecracker(pid int, vmID string) bool {
 	if pid <= 0 || vmID == "" {
 		return false
@@ -594,9 +592,8 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	}
 
 	// No-op for systemd VMs (stopUnit already killed them); the real kill for
-	// cold-boot VMs and record orphans. Identity-gated regardless of source: a
-	// paused VM's PID is stale whether it came from memory or the record, and
-	// after PID reuse an unverified kill hits an unrelated process.
+	// cold-boot VMs and record orphans. Identity-gated regardless of source —
+	// a paused VM's PID is stale whether it came from memory or the record.
 	if pidIsVMFirecracker(pid, vmID) {
 		sigkillPID(pid, 500*time.Millisecond)
 	}
@@ -1518,11 +1515,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			break
 		}
 		m.stopUnitDuringRestoreError(vmID)
-		// systemctl start is a no-op on an active unit, so a retry against a
-		// surviving Firecracker can't boot a new one — retry only when the unit
-		// is affirmatively dead. An inconclusive answer (systemctl error or
-		// timeout under the same host contention that causes tap-busy) must
-		// read as alive, not as permission to retry.
+		// systemctl start is a no-op on an active unit, so retry only when the
+		// unit is affirmatively dead — an inconclusive answer reads as alive.
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
 		checkCancel()
@@ -1597,12 +1591,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
-	// Persist-then-verify: a concurrent DestroyVM may have completed while we
-	// were restoring (its network cleanup no-ops during the retry window, and
-	// removeVM deletes the record — possibly between our persist and here, or
-	// our persist may have resurrected an already-deleted record). Checking
-	// AFTER the write leaves no window: a destroy that raced us either erased
-	// the record itself or is caught now, and we erase it and tear down.
+	// Persist-then-verify: checking AFTER the write leaves no window — a
+	// concurrent DestroyVM either erased the record itself or is caught here,
+	// and we erase our write and tear down instead of resurrecting it.
 	m.mu.RLock()
 	_, stillTracked := m.vms[vmID]
 	m.mu.RUnlock()

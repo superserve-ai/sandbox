@@ -248,10 +248,8 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 }
 
 // StartNetnsLeakSampler periodically logs the host's network-namespace counts.
-// netns_orphaned — namespaces present in the kernel with no owning slot — is
-// the leak signal: sustained growth means teardown is leaking. Owned covers
-// every legitimate holder (live VMs, pool-held slots, build and record
-// reservations, in-flight teardowns). One /run/netns readdir per tick.
+// netns_orphaned (namespaces with no owning slot) is the leak signal: sustained
+// growth means teardown is leaking. One /run/netns readdir per tick.
 func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
 	m.startSampler(ctx, "netns-leak sampler", every, func() {
 		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
