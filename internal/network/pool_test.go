@@ -231,10 +231,9 @@ func TestPoolReturn_ReleasesResetTokenOnPanic(t *testing.T) {
 
 	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
 
-	deadline := time.Now().Add(2 * time.Second)
-	for len(p.resetSem) != 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Wait for the verify goroutine (it holds a wg slot through the panic
+	// recovery) so the assertion — and the test's stub cleanup — can't race it.
+	p.wg.Wait()
 	if got := len(p.resetSem); got != 0 {
 		t.Errorf("resetSem holds %d token(s) after a panicking rebuild, want 0", got)
 	}
