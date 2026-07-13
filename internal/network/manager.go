@@ -1093,6 +1093,13 @@ func run(ctx context.Context, name string, args ...string) error {
 		ctx = context.Background()
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
+	// Run in its own process group and cancel the whole group, so a timeout
+	// also kills any children the command spawned (resetTap's shell) — a lone
+	// process kill would orphan them to finish after the caller moved on.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s %v: %s: %w", name, args, string(out), err)
 	}
