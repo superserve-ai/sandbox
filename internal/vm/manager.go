@@ -2669,12 +2669,13 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
 
-	// Replacing a live stale unit spends the stop phase (TimeoutStopSec 10s)
-	// before the fresh process can even fork, so it needs a bigger socket
-	// budget. Decided up front: with Type=simple the restart job clears at
-	// fork, before the socket exists, so no at-timeout probe can tell a
-	// just-replaced unit from a stalled fresh one.
-	replacingLive := isUnitActive(ctx, systemdUnitName(vmID))
+	// Replacing a live (or still winding down) stale unit spends the stop
+	// phase (TimeoutStopSec 10s) before the fresh process can even fork, so
+	// it needs a bigger socket budget. Decided up front: with Type=simple
+	// the restart job clears at fork, before the socket exists, so no
+	// at-timeout probe can tell a just-replaced unit from a stalled fresh
+	// one.
+	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
 
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {

@@ -348,15 +348,23 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Drift 5: systemd unit active, DB says paused. An interrupted pause
-	// stop (or a vmd crash between snapshot and stop) leaves the old
+	// Drift 5: systemd unit active for a paused sandbox (DB row when
+	// available, BoltDB record on the DB-down fallback). An interrupted
+	// pause stop (or a vmd crash between snapshot and stop) leaves the old
 	// firecracker running, pinning the guest's RAM for as long as the
 	// sandbox sleeps. A resume replaces it at launch; a sandbox that stays
 	// paused needs this reclaim. The record stays — the snapshot is valid.
-	if dbSandboxes != nil {
+	{
 		for id := range active {
-			sb, known := dbSandboxes[id]
-			if !known || sb.Sandbox.Status != db.SandboxStatusPaused {
+			paused := false
+			if dbSandboxes != nil {
+				sb, known := dbSandboxes[id]
+				paused = known && sb.Sandbox.Status == db.SandboxStatusPaused
+			} else {
+				rec, ok := bolted[id]
+				paused = ok && rec.Status == StatusPaused
+			}
+			if !paused {
 				r.clearDrift("pausedunit:" + id)
 				continue
 			}

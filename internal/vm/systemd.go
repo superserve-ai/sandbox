@@ -57,6 +57,21 @@ func stopUnit(ctx context.Context, unit string) error {
 	return nil
 }
 
+// unitLingering reports whether the unit has a live or winding-down process
+// (active, activating, or deactivating) — i.e. a restart must wait out a
+// stop phase before the fresh process can bind its socket.
+func unitLingering(ctx context.Context, unit string) bool {
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", unit).Output()
+	if err != nil {
+		return false
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "active", "activating", "deactivating":
+		return true
+	}
+	return false
+}
+
 // isUnitActive checks if a systemd unit is currently active (running).
 func isUnitActive(ctx context.Context, unit string) bool {
 	cmd := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit)
