@@ -650,6 +650,19 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
+	// Retried pause (response lost to a daemon restart or connection reset):
+	// re-snapshotting a stopped VM would dial the dead firecracker socket and
+	// end with handleVMError deleting the record. Return the recorded
+	// artifacts instead.
+	inst.mu.RLock()
+	if inst.Status == StatusPaused && inst.SnapshotPath != "" && inst.MemFilePath != "" {
+		snapshotPath, memPath = inst.SnapshotPath, inst.MemFilePath
+		inst.mu.RUnlock()
+		log.Info().Msg("pause: VM already paused, returning existing snapshot")
+		return snapshotPath, memPath, nil
+	}
+	inst.mu.RUnlock()
+
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
 	}
@@ -1379,6 +1392,23 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// path below reuses its slot instead of allocating a fresh one. No-op for a
 	// new VM (not in BoltDB).
 	m.lazyReattach(vmID)
+
+	// Retried restore (response lost to a daemon restart or connection
+	// reset): stopping and re-restoring a VM the previous attempt already
+	// brought up would roll the guest back to the snapshot. A healthy boxd
+	// is the proof the prior restore completed — return that VM instead.
+	m.mu.RLock()
+	existing := m.vms[vmID]
+	m.mu.RUnlock()
+	if existing != nil {
+		existing.mu.RLock()
+		running, ip := existing.Status == StatusRunning, existing.IP
+		existing.mu.RUnlock()
+		if running && ip != "" && probeBoxdHealth(ctx, ip, 3*time.Second) == nil {
+			log.Info().Msg("restore: VM already running and healthy, returning it")
+			return existing, nil
+		}
+	}
 
 	m.mu.Lock()
 	_, inPlace := m.vms[vmID]
@@ -2746,3 +2776,6 @@ func waitForSocketPolling(path string, timeout time.Duration) error {
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {
 	return waitForHTTPHealth(ctx, vmIP, timeout)
 }
+
+// probeBoxdHealth is the retried-restore liveness probe; swappable in tests.
+var probeBoxdHealth = waitForHTTPHealth

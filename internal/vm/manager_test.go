@@ -837,3 +837,56 @@ func TestWaitForPIDExit_DeadProcessReturnsPromptly(t *testing.T) {
 		t.Errorf("returned after %v; expected a prompt return once the process exited", elapsed)
 	}
 }
+
+func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+
+	snap, mem, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	if err != nil {
+		t.Fatalf("retried pause of a paused VM should succeed, got %v", err)
+	}
+	if snap != inst.SnapshotPath || mem != inst.MemFilePath {
+		t.Fatalf("got (%q, %q), want the recorded snapshot artifacts", snap, mem)
+	}
+}
+
+func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
+	orig := probeBoxdHealth
+	probeBoxdHealth = func(ctx context.Context, vmIP string, timeout time.Duration) error { return nil }
+	defer func() { probeBoxdHealth = orig }()
+
+	existing := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5"}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	if err != nil {
+		t.Fatalf("retried restore of a healthy running VM should succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing running instance, not a re-restore")
+	}
+	mgr.mu.RLock()
+	still := mgr.vms["vm-1"]
+	mgr.mu.RUnlock()
+	if still != existing {
+		t.Fatal("existing instance must remain tracked untouched")
+	}
+}
