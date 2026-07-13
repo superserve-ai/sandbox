@@ -39,21 +39,12 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
-// vmdRetryServiceConfig retries on UNAVAILABLE only — gRPC guarantees
-// such requests never reached the server, so create RPCs can't
-// double-execute. Other codes lack this guarantee.
-const vmdRetryServiceConfig = `{
-  "methodConfig": [{
-    "name": [{"service": "superserve.vmd.v1.VMDaemon"}],
-    "retryPolicy": {
-      "maxAttempts": 5,
-      "initialBackoff": "0.2s",
-      "maxBackoff": "2s",
-      "backoffMultiplier": 2.0,
-      "retryableStatusCodes": ["UNAVAILABLE"]
-    }
-  }]
-}`
+// retryUnavailableWindow bounds how long a unary RPC keeps retrying
+// codes.Unavailable. Sized to outlast a vmd deploy restart — several
+// seconds of connection-refused while the process swaps, plus the
+// startup gate that answers Unavailable until the daemon is serving —
+// with margin.
+const retryUnavailableWindow = 15 * time.Second
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -157,7 +148,7 @@ func run() error {
 	// Connect to VMD via gRPC.
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultServiceConfig(vmdRetryServiceConfig),
+		grpc.WithUnaryInterceptor(retryUnavailableUnaryInterceptor(retryUnavailableWindow)),
 	)
 	if err != nil {
 		return fmt.Errorf("dial VMD gRPC: %w", err)
@@ -211,11 +202,13 @@ func run() error {
 	// Interceptors below fire onDead on codes.Unavailable so the registry
 	// drops stale cached clients.
 	dialVMD := func(hostID, addr string, onDead func()) (vmdclient.Client, error) {
-		// Retry runs inside the invoker; the dead-host interceptor sees the post-retry outcome only.
+		// deadHost is chained outside retry, so it sees the post-retry outcome only.
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultServiceConfig(vmdRetryServiceConfig),
-			grpc.WithUnaryInterceptor(deadHostUnaryInterceptor(onDead)),
+			grpc.WithChainUnaryInterceptor(
+				deadHostUnaryInterceptor(onDead),
+				retryUnavailableUnaryInterceptor(retryUnavailableWindow),
+			),
 			grpc.WithStreamInterceptor(deadHostStreamInterceptor(onDead)),
 		)
 		if err != nil {
@@ -649,6 +642,32 @@ func (c *grpcVMDClient) StreamBuildLogs(ctx context.Context, buildVMID string, o
 		}
 		if pbEv.GetFinished() {
 			return nil
+		}
+	}
+}
+
+// retryUnavailableUnaryInterceptor retries codes.Unavailable — the daemon
+// is down or still starting — with deterministic backoff until the window
+// or the caller's context expires. Unavailable guarantees the request never
+// executed on the server, so retries can't double-execute. gRPC's built-in
+// retryPolicy can't cover a daemon restart: attempts are hard-capped at 5
+// and each backoff is randomized in [0, backoff], so its worst-case
+// envelope is a few seconds.
+func retryUnavailableUnaryInterceptor(window time.Duration) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		deadline := time.Now().Add(window)
+		backoff := 250 * time.Millisecond
+		for {
+			err := invoker(ctx, method, req, reply, cc, opts...)
+			if err == nil || grpcstatus.Code(err) != grpccodes.Unavailable || !time.Now().Before(deadline) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, 2*time.Second)
 		}
 	}
 }
