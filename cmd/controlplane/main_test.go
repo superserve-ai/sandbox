@@ -68,7 +68,7 @@ func TestRetryUnavailableStopsOnContextCancel(t *testing.T) {
 	calls := 0
 	invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 		calls++
-		cancel() // cancel while the interceptor is in its backoff sleep
+		cancel() // ctx is already cancelled when the backoff select runs
 		return grpcstatus.Error(grpccodes.Unavailable, "connection refused")
 	}
 	err := retryUnavailableUnaryInterceptor(5*time.Second)(ctx, "m", nil, nil, nil, invoker)
