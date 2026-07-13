@@ -2669,26 +2669,30 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
 
+	// Replacing a live stale unit spends the stop phase (TimeoutStopSec 10s)
+	// before the fresh process can even fork, so it needs a bigger socket
+	// budget. Decided up front: with Type=simple the restart job clears at
+	// fork, before the socket exists, so no at-timeout probe can tell a
+	// just-replaced unit from a stalled fresh one.
+	replacingLive := isUnitActive(ctx, systemdUnitName(vmID))
+
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
 		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
 	tStartUnitDone := time.Now()
 
-	err := waitForSocket(socketPath, 5*time.Second)
-	if err != nil && unitJobPending(ctx, systemdUnitName(vmID)) {
-		// A restart that replaced a live stale unit may still be inside its
-		// stop phase (TimeoutStopSec 10s) with the start queued behind it —
-		// give that one bounded extension, capped by the caller's remaining
-		// budget, instead of killing a launch systemd is about to complete.
+	socketWait := 5 * time.Second
+	if replacingLive {
 		extra := 12 * time.Second
 		if dl, ok := ctx.Deadline(); ok {
 			extra = min(extra, time.Until(dl))
 		}
 		if extra > 0 {
-			err = waitForSocket(socketPath, extra)
+			socketWait += extra
 		}
 	}
+	err := waitForSocket(socketPath, socketWait)
 	if err != nil {
 		status := unitFailureSummary(ctx, systemdUnitName(vmID))
 		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).

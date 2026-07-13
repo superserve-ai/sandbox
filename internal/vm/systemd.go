@@ -46,20 +46,6 @@ func unitFailureSummary(ctx context.Context, unit string) string {
 	return s
 }
 
-// unitJobPending reports whether systemd has a queued or running job for the
-// unit — e.g. a restart that replaced a live stale unit and is still tearing
-// the old process down (TimeoutStopSec allows 10s) with the start queued
-// behind it. Settled states (running, dead, failed, start-limit-hit) have no
-// job, so this cannot false-positive on a unit that will never produce a
-// socket.
-func unitJobPending(ctx context.Context, unit string) bool {
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=Job", "--value", unit).Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) != ""
-}
-
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
 // unit is a no-op.
 func stopUnit(ctx context.Context, unit string) error {
