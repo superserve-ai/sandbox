@@ -839,11 +839,19 @@ func TestWaitForPIDExit_DeadProcessReturnsPromptly(t *testing.T) {
 }
 
 func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	inst := &VMInstance{
 		ID:           "vm-1",
 		Status:       StatusPaused,
-		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
-		MemFilePath:  "/snapshots/vm-1/mem.snap",
+		SnapshotPath: snapPath,
+		MemFilePath:  memPath,
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
 
@@ -851,8 +859,24 @@ func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retried pause of a paused VM should succeed, got %v", err)
 	}
-	if snap != inst.SnapshotPath || mem != inst.MemFilePath {
+	if snap != snapPath || mem != memPath {
 		t.Fatalf("got (%q, %q), want the recorded snapshot artifacts", snap, mem)
+	}
+}
+
+func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
+	dir := t.TempDir()
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		SnapshotPath: filepath.Join(dir, "gone-vmstate.snap"),
+		MemFilePath:  filepath.Join(dir, "gone-mem.snap"),
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+
+	_, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for dangling artifacts, got %v", err)
 	}
 }
 
