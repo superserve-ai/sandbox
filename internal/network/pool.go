@@ -266,6 +266,15 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 			p.cleanup(slot)
 			return
 		}
+		// Recheck capacity after queueing: a mass return can fill the pool
+		// while this slot waited on the semaphore, and a slot headed for
+		// teardown shouldn't pay for a rebuild. Racy but safe, like the
+		// pre-check.
+		if len(p.recycled) == cap(p.recycled) {
+			<-p.resetSem
+			p.cleanup(slot)
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := resetTapFunc(p.mgr, ctx, ns)
 		cancel()
