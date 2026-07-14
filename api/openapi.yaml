@@ -175,6 +175,238 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/billing/usage:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getTeamBillingUsage
+      tags: [Billing]
+      summary: Get team billing usage
+      description: |
+        Returns billing usage for the specified team and billing period.
+        Customer callers may only access their own team and must hold
+        `billing:read`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: period_start
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: period_end
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Team billing usage for the requested period
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamBillingUsageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/billing/periods:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: listTeamBillingPeriods
+      tags: [Billing]
+      summary: List team billing periods
+      description: |
+        Lists persisted billing periods for the specified team. Customer
+        callers may only access their own team and must hold `billing:read`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Billing periods for the team
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [periods]
+                properties:
+                  periods:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TeamBillingPeriodResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/billing/periods/{period_id}/export-preview:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: period_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Billing period identifier in `period_start,period_end` RFC3339 form.
+    get:
+      operationId: getTeamBillingExportPreview
+      tags: [Billing]
+      summary: Preview team billing export payload
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Stripe export preview for the billing period
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingExportPreviewResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stripe/webhook:
+    post:
+      operationId: handleStripeWebhook
+      tags: [Billing]
+      summary: Receive Stripe webhooks
+      description: |
+        Stripe webhook receiver. Requests are authenticated with the Stripe
+        signature header instead of an API key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Webhook received
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stripe/checkout-session:
+    post:
+      operationId: createStripeCheckoutSession
+      tags: [Billing]
+      summary: Create a Stripe Checkout session
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [success_url, cancel_url]
+              properties:
+                success_url:
+                  type: string
+                  format: uri
+                cancel_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stripe/customer-portal-session:
+    post:
+      operationId: createStripeCustomerPortalSession
+      tags: [Billing]
+      summary: Create a Stripe customer portal session
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [return_url]
+              properties:
+                return_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Customer portal session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /teams/{team_id}/management:
     parameters:
       - name: team_id
@@ -2177,18 +2409,183 @@ components:
         `sb-<region>-<uuid>` (e.g. `sb-use-1b4e28ba-…`). Treat as an opaque
         string; the tagged form routes the request to the sandbox's home
         region. Endpoints accept both forms interchangeably.
+
+    BillingSessionResponse:
+      type: object
+      required: [url]
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+          format: uri
+
+    BillingExportPreviewResponse:
+      type: object
+      required: [mode, period_id, team_id, status, items, attempts]
+      properties:
+        mode:
+          type: string
+          enum: [shadow, live]
+        period_id:
+          type: string
+        team_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        stripe_customer_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingExportPreviewItem"
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingExportAttemptRecord"
+
+    TeamBillingPeriodResponse:
+      type: object
+      required: [period_id, period_start, period_end, status]
+      properties:
+        period_id:
+          type: string
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        status:
+          type: string
+        blocked_reason:
+          type: string
+        approved_at:
+          type: string
+          format: date-time
+        exported_at:
+          type: string
+          format: date-time
+        finalized_at:
+          type: string
+          format: date-time
+        cancel_at_period_end:
+          type: boolean
+        stripe_customer_id:
+          type: string
+        stripe_subscription_id:
+          type: string
+        stripe_subscription_status:
+          type: string
+        stripe_invoice_status:
+          type: string
+        current_period_start:
+          type: string
+          format: date-time
+        current_period_end:
+          type: string
+          format: date-time
+
+    TeamBillingUsageResponse:
+      type: object
+      required:
+        - period_id
+        - team_id
+        - status
+        - period_start
+        - period_end
+        - vcpu_seconds
+        - memory_mib_seconds
+        - storage_mib_seconds
+        - cpu_vcpu_hours
+        - memory_gib_hours
+        - storage_gib_hours
+        - resources
+        - updated_at
+      properties:
+        period_id:
+          type: string
+        team_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        vcpu_seconds:
+          type: number
+          format: double
+        memory_mib_seconds:
+          type: number
+          format: double
+        storage_mib_seconds:
+          type: number
+          format: double
+        cpu_vcpu_hours:
+          type: number
+          format: double
+        memory_gib_hours:
+          type: number
+          format: double
+        storage_gib_hours:
+          type: number
+          format: double
+        resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingUsageResource"
+        resources_by_key:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/BillingUsageResource"
+        exported_at:
+          type: string
+          format: date-time
+        finalized_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
     BillingSummaryResponse:
       type: object
       required:
+        - mode
+        - billing_mode
+        - permissions
+        - checkout_available
+        - portal_available
+        - payment_setup_required
         - current_charges_usd
         - credits_applied_usd
         - credits_remaining_usd
         - expected_invoice_amount_usd
         - cost_breakdown_usd
+        - resources
         - billing_period
         - pricing_tier
         - calculated_at
       properties:
+        mode:
+          type: string
+          enum: [shadow, live]
+        billing_mode:
+          type: string
+          enum: [shadow, live]
+        permissions:
+          $ref: "#/components/schemas/BillingSummaryPermissions"
+        checkout_available:
+          type: boolean
+        portal_available:
+          type: boolean
+        payment_setup_required:
+          type: boolean
         current_charges_usd:
           type: number
           format: double
@@ -2209,48 +2606,209 @@ components:
           format: double
           description: Expected invoice amount after credits.
         cost_breakdown_usd:
+          $ref: "#/components/schemas/BillingSummaryCostBreakdown"
+        resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingSummaryResource"
+        resources_by_key:
           type: object
-          required: [compute, memory, storage]
-          properties:
-            compute:
-              type: number
-              format: double
-              description: vCPU charges for the current period.
-            memory:
-              type: number
-              format: double
-              description: memory charges for the current period.
-            storage:
-              type: number
-              format: double
-              description: storage charges for the current period.
+          additionalProperties:
+            $ref: "#/components/schemas/BillingSummaryResource"
         billing_period:
-          type: object
-          required: [start, end]
-          properties:
-            start:
-              type: string
-              format: date-time
-            end:
-              type: string
-              format: date-time
+          $ref: "#/components/schemas/BillingSummaryPeriod"
         pricing_tier:
-          type: object
-          required: [plan_key, plan_name, currency]
-          properties:
-            plan_key:
-              type: string
-              example: payg
-            plan_name:
-              type: string
-              example: Pay-as-you-go
-            currency:
-              type: string
-              example: USD
+          $ref: "#/components/schemas/BillingSummaryPricingTier"
         calculated_at:
           type: string
           format: date-time
           description: Timestamp when this live billing summary was calculated.
+
+    BillingSummaryPermissions:
+      type: object
+      required: [can_view, can_manage]
+      properties:
+        can_view:
+          type: boolean
+        can_manage:
+          type: boolean
+
+    BillingSummaryCostBreakdown:
+      type: object
+      required: [compute, memory, storage]
+      properties:
+        compute:
+          type: number
+          format: double
+          description: vCPU charges for the current period.
+        memory:
+          type: number
+          format: double
+          description: memory charges for the current period.
+        storage:
+          type: number
+          format: double
+          description: storage charges for the current period.
+
+    BillingSummaryResource:
+      type: object
+      required:
+        - resource_key
+        - resource
+        - display_name
+        - sort_order
+        - unit
+        - display_unit
+        - usage
+        - tracked
+        - billable
+        - charge_usd
+      properties:
+        resource_key:
+          type: string
+        resource:
+          type: string
+        display_name:
+          type: string
+        sort_order:
+          type: integer
+        unit:
+          type: string
+        display_unit:
+          type: string
+        usage:
+          type: number
+          format: double
+        tracked:
+          type: boolean
+        billable:
+          type: boolean
+        charge_usd:
+          type: number
+          format: double
+
+    BillingUsageResource:
+      type: object
+      required:
+        - resource_key
+        - resource
+        - display_name
+        - sort_order
+        - unit
+        - display_unit
+        - usage
+        - tracked
+        - billable
+      properties:
+        resource_key:
+          type: string
+        resource:
+          type: string
+        display_name:
+          type: string
+        sort_order:
+          type: integer
+        unit:
+          type: string
+        display_unit:
+          type: string
+        usage:
+          type: number
+          format: double
+        tracked:
+          type: boolean
+        billable:
+          type: boolean
+
+    BillingSummaryPeriod:
+      type: object
+      required: [start, end]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+
+    BillingSummaryPricingTier:
+      type: object
+      required: [plan_key, plan_name, currency]
+      properties:
+        plan_key:
+          type: string
+          example: payg
+        plan_name:
+          type: string
+          example: Pay-as-you-go
+        currency:
+          type: string
+          example: USD
+
+    BillingExportPreviewItem:
+      type: object
+      required:
+        - resource_type
+        - resource_key
+        - display_name
+        - sort_order
+        - display_unit
+        - stripe_event_name
+        - stripe_meter_event_identifier
+        - value
+      properties:
+        resource_type:
+          type: string
+          enum: [cpu, memory, storage]
+        resource_key:
+          type: string
+        display_name:
+          type: string
+        sort_order:
+          type: integer
+        display_unit:
+          type: string
+        stripe_event_name:
+          type: string
+        stripe_meter_event_identifier:
+          type: string
+        value:
+          type: number
+          format: double
+
+    BillingExportAttemptRecord:
+      type: object
+      required:
+        [id, resource_type, stripe_meter_event_identifier, stripe_event_name, value, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        resource_type:
+          type: string
+          enum: [cpu, memory, storage]
+        stripe_meter_event_identifier:
+          type: string
+        stripe_event_name:
+          type: string
+        value:
+          type: number
+          format: double
+        status:
+          type: string
+          enum: [pending, sent, accepted, failed, skipped_shadow]
+          description: >
+            Export attempt lifecycle. `sent` means Stripe returned a
+            2xx response. `accepted` is kept for legacy rows and is
+            treated the same as `sent` when reading historical data.
+        error:
+          type: string
+        sent_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
 
     CreateSandboxRequest:
       type: object
@@ -3508,16 +4066,41 @@ components:
 
     BillingPricingRate:
       type: object
-      required: [resource, unit, price_usd, price_usd_hourly, effective_from]
+      required:
+        [
+          resource_key,
+          resource,
+          display_name,
+          sort_order,
+          unit,
+          display_unit,
+          price_usd,
+          price_usd_hourly,
+          effective_from,
+          tracked,
+          billable,
+        ]
       properties:
+        resource_key:
+          type: string
+          description: Stable billing resource key.
         resource:
           type: string
           enum: [memory_gib, storage_gib, vcpu]
           description: Metered resource name.
+        display_name:
+          type: string
+          description: Human-readable resource name.
+        sort_order:
+          type: integer
+          description: Display ordering for billing surfaces.
         unit:
           type: string
           enum: [second]
           description: Billing unit for `price_usd`.
+        display_unit:
+          type: string
+          description: Human-readable unit for billing surfaces.
         price_usd:
           type: number
           format: double
@@ -3531,6 +4114,12 @@ components:
         effective_from:
           type: string
           format: date-time
+        tracked:
+          type: boolean
+          description: Whether the resource is tracked in usage reporting.
+        billable:
+          type: boolean
+          description: Whether the resource contributes to billing totals.
 
     TeamMember:
       type: object
