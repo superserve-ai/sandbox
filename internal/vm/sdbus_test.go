@@ -1,7 +1,9 @@
 package vm
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
@@ -39,6 +41,16 @@ func TestSdbusAnswer(t *testing.T) {
 		if _, ok := sdbusAnswer(terr); ok {
 			t.Fatalf("%v must be transport-shaped, not an answer", terr)
 		}
+	}
+}
+
+func TestSdbusCondemns(t *testing.T) {
+	// Caller cancellation must not condemn the shared connection.
+	if sdbusCondemns(context.Canceled) || sdbusCondemns(fmt.Errorf("call: %w", context.DeadlineExceeded)) {
+		t.Fatal("caller ctx expiry is the call's result, not a dead bus")
+	}
+	if !sdbusCondemns(io.EOF) || !sdbusCondemns(dbus.ErrClosed) {
+		t.Fatal("real transport death must condemn the connection")
 	}
 }
 

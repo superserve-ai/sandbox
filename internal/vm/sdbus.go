@@ -157,10 +157,22 @@ func sdbusDo(fn func(*sddbus.Conn) error) (err error, handled bool) {
 	if merr, answered := sdbusAnswer(err); answered {
 		return merr, true
 	}
-	// Transport-shaped failure: drop the corpse so a later call redials,
-	// and let the exec path handle this call with today's semantics.
-	sdbusDrop(conn)
+	// Transport-shaped failure: drop the corpse so a later call redials —
+	// unless it's the CALLER's cancellation, which is this call's result,
+	// not evidence the shared bus is dead. Either way the exec path
+	// handles this call with today's semantics.
+	if sdbusCondemns(err) {
+		sdbusDrop(conn)
+	}
 	return nil, false
+}
+
+// sdbusCondemns reports whether a non-answer error condemns the shared
+// connection. Caller ctx expiry doesn't: the library surfaces it without
+// the connection being unhealthy, and dropping would tear the bus down
+// under every other in-flight operation.
+func sdbusCondemns(err error) bool {
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 // sdbusAnswer reports whether systemd answered the call: nil, or a D-Bus
