@@ -14,10 +14,10 @@ package vm
 //     ends, so a per-request context would kill it seconds after birth.
 //   - No caller ever blocks on connection state. Acquisition is a
 //     non-blocking check; if there is no healthy connection, one background
-//     dial is kicked off (single-flight, bounded by its own timer since
-//     dial+auth I/O ignores context deadlines) and the caller falls back to
-//     exec immediately. A wedged PID1 can therefore never stall helpers
-//     behind a mutex.
+//     dial is kicked off (single-flight, held until it truly returns) and
+//     the caller falls back to exec immediately. A wedged PID1 can
+//     therefore never stall helpers behind a mutex, and never costs more
+//     than one blocked dial goroutine.
 //   - Connected() is checked on every acquisition: the library's Conn is
 //     two sockets, and the signal socket can die alone, which would
 //     otherwise strand every job-completion wait while method calls keep
@@ -49,10 +49,6 @@ func SetSystemdDBusEnabled(v bool) {
 		sdbusAcquire()
 	}
 }
-
-// sdbusDialTimeout bounds a background dial attempt; an attempt that
-// overruns is abandoned (and closed if it ever completes).
-const sdbusDialTimeout = 5 * time.Second
 
 // sdbusRedialCooldown is the minimum gap between dial attempts, so a host
 // where systemd is unreachable doesn't burn a dial per helper call.
@@ -86,42 +82,23 @@ func sdbusAcquire() *sddbus.Conn {
 }
 
 // sdbusDial runs one background dial. The connection context is detached —
-// its lifetime is the daemon's, not any request's. The dial itself is
-// bounded by a timer, not a context deadline: the library's dial+auth I/O
-// ignores deadlines, and a deadline on the connection context would close
-// the connection when it fired.
+// its lifetime is the daemon's, not any request's (a deadline on it would
+// close the connection when it fired). The attempt stays marked in flight
+// until it truly returns: the library's dial+auth I/O has no deadline, so
+// abandoning a hung attempt and retrying would leak a goroutine per retry;
+// held single-flight, a wedged PID1 costs at most one blocked goroutine
+// while every caller keeps exec-falling-back.
 func sdbusDial() {
-	type result struct{ conn *sddbus.Conn }
-	ch := make(chan result, 1)
-	go func() {
-		conn, err := sddbus.NewSystemdConnectionContext(context.Background())
-		if err != nil {
-			ch <- result{nil}
-			return
-		}
-		ch <- result{conn}
-	}()
-
-	var conn *sddbus.Conn
-	select {
-	case r := <-ch:
-		conn = r.conn
-	case <-time.After(sdbusDialTimeout):
-		// Abandoned: if the dial ever completes, close the orphan.
-		go func() {
-			if r := <-ch; r.conn != nil {
-				r.conn.Close()
-			}
-		}()
-	}
+	conn, err := sddbus.NewSystemdConnectionContext(context.Background())
 
 	sdbus.mu.Lock()
 	sdbus.dialing = false
-	if conn != nil {
+	sdbus.lastDial = time.Now() // cooldown runs from completion, not start
+	if err == nil {
 		if sdbus.conn == nil {
 			sdbus.conn = conn
 		} else {
-			// Lost a race with another successful dial.
+			// Lost a race with a connection cached by someone else.
 			defer conn.Close()
 		}
 	}
