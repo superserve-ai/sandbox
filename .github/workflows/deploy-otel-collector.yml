@@ -23,6 +23,7 @@ on:
 
 jobs:
   deploy-staging:
+    if: github.event_name == 'push' || github.event.inputs.environment == 'staging'
     runs-on: ubuntu-latest
     environment: staging
     permissions:

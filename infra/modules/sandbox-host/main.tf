@@ -3,13 +3,14 @@ terraform {
 }
 
 resource "google_compute_instance" "this" {
-  project        = var.project_id
-  name           = var.instance_name
-  zone           = var.zone
-  machine_type   = var.machine_type
-  can_ip_forward = var.can_ip_forward
-  tags           = var.tags
-  labels         = var.labels
+  project                   = var.project_id
+  name                      = var.instance_name
+  zone                      = var.zone
+  machine_type              = var.machine_type
+  can_ip_forward            = var.can_ip_forward
+  allow_stopping_for_update = var.allow_stopping_for_update
+  tags                      = var.tags
+  labels                    = var.labels
 
   boot_disk {
     auto_delete = true

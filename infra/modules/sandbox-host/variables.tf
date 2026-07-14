@@ -79,6 +79,12 @@ variable "metadata" {
   default     = {}
 }
 
+variable "allow_stopping_for_update" {
+  description = "Whether Terraform may stop the instance to apply in-place updates."
+  type        = bool
+  default     = false
+}
+
 variable "can_ip_forward" {
   type    = bool
   default = false

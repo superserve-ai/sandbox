@@ -217,7 +217,7 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "clamp_min(sum(rate(sandbox_transition_total{environment=\"${environment}\",result=\"success\"}[30m])) or vector(0), 0) / clamp_min(sum(rate(sandbox_transition_total{environment=\"${environment}\"}[30m])), 1e-9)"
+                  "prometheusQuery": "(sum(rate(sandbox_transition_total{environment=\"${environment}\",result=\"success\"}[30m])) or vector(0)) / clamp_min(sum(rate(sandbox_transition_total{environment=\"${environment}\"}[30m])), 1e-9)"
                 },
                 "plotType": "LINE",
                 "targetAxis": "Y1",
