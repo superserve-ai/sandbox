@@ -348,7 +348,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Drift 6: systemd unit active, DB says paused — an interrupted pause
+	// Drift 7: systemd unit active, DB says paused — an interrupted pause
 	// stop left the old firecracker pinning guest RAM; stop it. DB rows
 	// only: a mid-resume sandbox reads 'resuming' there, clearing the
 	// drift, while its BoltDB record stays Paused until the resume
