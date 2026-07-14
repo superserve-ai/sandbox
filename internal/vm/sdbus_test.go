@@ -1,8 +1,8 @@
 package vm
 
 import (
-	"context"
 	"errors"
+	"io"
 	"testing"
 
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
@@ -12,7 +12,7 @@ import (
 func TestSdbusDo_FlagOff_NotHandled(t *testing.T) {
 	SetSystemdDBusEnabled(false)
 	called := false
-	err, handled := sdbusDo(context.Background(), func(*sddbus.Conn) error {
+	err, handled := sdbusDo(func(*sddbus.Conn) error {
 		called = true
 		return nil
 	})
@@ -29,13 +29,30 @@ func TestSdbusAnswer(t *testing.T) {
 	if err, ok := sdbusAnswer(methodErr); !ok || err == nil {
 		t.Fatal("a D-Bus method error is an answer and must surface")
 	}
-	if _, ok := sdbusAnswer(errors.New("write unix @->/run/systemd/private: broken pipe")); ok {
-		t.Fatal("a transport error is not an answer (must fall back to exec)")
+	// Transport-shaped errors must NOT count as answers — they route the
+	// call to the exec fallback.
+	for _, terr := range []error{
+		dbus.ErrClosed,
+		io.EOF, // what an in-flight call sees when the transport dies
+		errors.New("read unix @->/run/systemd/private: use of closed network connection"),
+	} {
+		if _, ok := sdbusAnswer(terr); ok {
+			t.Fatalf("%v must be transport-shaped, not an answer", terr)
+		}
 	}
-	if sdbusClosed(methodErr) {
-		t.Fatal("a method error is not a closed connection")
+}
+
+func TestSdbusNotLoaded(t *testing.T) {
+	if !sdbusNotLoaded(dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit"}) {
+		t.Fatal("NoSuchUnit is the definitive not-loaded answer")
 	}
-	if !sdbusClosed(dbus.ErrClosed) {
-		t.Fatal("ErrClosed must trigger the redial path")
+	if !sdbusNotLoaded(dbus.Error{Name: "org.freedesktop.DBus.Error.UnknownObject"}) {
+		t.Fatal("UnknownObject (unloaded template instance) is not-loaded")
+	}
+	if sdbusNotLoaded(dbus.Error{Name: "org.freedesktop.DBus.Error.AccessDenied"}) {
+		t.Fatal("other method errors are not the not-loaded answer")
+	}
+	if sdbusNotLoaded(io.EOF) {
+		t.Fatal("transport errors are not the not-loaded answer")
 	}
 }

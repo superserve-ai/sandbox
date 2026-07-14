@@ -1,18 +1,36 @@
 package vm
 
 // One persistent connection to systemd's private socket replaces per-call
-// systemctl forks. Under a concurrent launch burst the forks are the
+// systemctl forks. Under a large concurrent launch burst the forks are the
 // dominant cost: each pays fork+exec plus a D-Bus connect/handshake that
-// grows with the number of loaded units, and 100 simultaneous spawns
+// grows with the number of loaded units, and the simultaneous spawns
 // compete with PID1 and the starting units for the scheduler. Every helper
 // falls back to exec'ing systemctl when the connection is unavailable, so
 // the worst case is exactly the exec-only behavior.
+//
+// Design rules, each load-bearing:
+//   - The connection is dialed with its own lifetime context, never a
+//     caller's: the library closes the connection when the dialing context
+//     ends, so a per-request context would kill it seconds after birth.
+//   - No caller ever blocks on connection state. Acquisition is a
+//     non-blocking check; if there is no healthy connection, one background
+//     dial is kicked off (single-flight, bounded by its own timer since
+//     dial+auth I/O ignores context deadlines) and the caller falls back to
+//     exec immediately. A wedged PID1 can therefore never stall helpers
+//     behind a mutex.
+//   - Connected() is checked on every acquisition: the library's Conn is
+//     two sockets, and the signal socket can die alone, which would
+//     otherwise strand every job-completion wait while method calls keep
+//     succeeding.
 
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
@@ -23,33 +41,96 @@ import (
 var systemdDBusEnabled atomic.Bool
 
 // SetSystemdDBusEnabled turns the persistent systemd D-Bus path on or off.
-func SetSystemdDBusEnabled(v bool) { systemdDBusEnabled.Store(v) }
-
-// sdbus holds the shared connection. nil until first use and after a
-// transport failure; redialed lazily. The private socket requires root and
-// bypasses dbus-daemon entirely.
-var sdbus struct {
-	mu   sync.Mutex
-	conn *sddbus.Conn
+// Enabling kicks off the background dial so the first helper call after
+// startup doesn't need the exec fallback.
+func SetSystemdDBusEnabled(v bool) {
+	systemdDBusEnabled.Store(v)
+	if v {
+		sdbusAcquire()
+	}
 }
 
-func sdbusGet(ctx context.Context) (*sddbus.Conn, error) {
+// sdbusDialTimeout bounds a background dial attempt; an attempt that
+// overruns is abandoned (and closed if it ever completes).
+const sdbusDialTimeout = 5 * time.Second
+
+// sdbusRedialCooldown is the minimum gap between dial attempts, so a host
+// where systemd is unreachable doesn't burn a dial per helper call.
+const sdbusRedialCooldown = 3 * time.Second
+
+var sdbus struct {
+	mu       sync.Mutex
+	conn     *sddbus.Conn
+	dialing  bool
+	lastDial time.Time
+}
+
+// sdbusAcquire returns a healthy connection or nil, without ever blocking
+// on dial or I/O. A nil return means: use the exec fallback for this call.
+func sdbusAcquire() *sddbus.Conn {
 	sdbus.mu.Lock()
 	defer sdbus.mu.Unlock()
 	if sdbus.conn != nil {
-		return sdbus.conn, nil
+		if sdbus.conn.Connected() {
+			return sdbus.conn
+		}
+		sdbus.conn.Close()
+		sdbus.conn = nil
 	}
-	conn, err := sddbus.NewSystemdConnectionContext(ctx)
-	if err != nil {
-		return nil, err
+	if !sdbus.dialing && time.Since(sdbus.lastDial) >= sdbusRedialCooldown {
+		sdbus.dialing = true
+		sdbus.lastDial = time.Now()
+		go sdbusDial()
 	}
-	sdbus.conn = conn
-	return conn, nil
+	return nil
 }
 
-// sdbusDrop closes and forgets a connection after a transport failure so
-// the next call redials — a systemd daemon-reexec kills the socket and the
-// library never reconnects on its own. Only drops the current connection.
+// sdbusDial runs one background dial. The connection context is detached —
+// its lifetime is the daemon's, not any request's. The dial itself is
+// bounded by a timer, not a context deadline: the library's dial+auth I/O
+// ignores deadlines, and a deadline on the connection context would close
+// the connection when it fired.
+func sdbusDial() {
+	type result struct{ conn *sddbus.Conn }
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := sddbus.NewSystemdConnectionContext(context.Background())
+		if err != nil {
+			ch <- result{nil}
+			return
+		}
+		ch <- result{conn}
+	}()
+
+	var conn *sddbus.Conn
+	select {
+	case r := <-ch:
+		conn = r.conn
+	case <-time.After(sdbusDialTimeout):
+		// Abandoned: if the dial ever completes, close the orphan.
+		go func() {
+			if r := <-ch; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+	}
+
+	sdbus.mu.Lock()
+	sdbus.dialing = false
+	if conn != nil {
+		if sdbus.conn == nil {
+			sdbus.conn = conn
+		} else {
+			// Lost a race with another successful dial.
+			defer conn.Close()
+		}
+	}
+	sdbus.mu.Unlock()
+}
+
+// sdbusDrop closes and forgets a connection after a transport failure so a
+// later acquisition redials — a systemd daemon-reexec kills the socket and
+// the library never reconnects on its own. Only drops the current one.
 func sdbusDrop(c *sddbus.Conn) {
 	sdbus.mu.Lock()
 	if sdbus.conn == c {
@@ -60,47 +141,38 @@ func sdbusDrop(c *sddbus.Conn) {
 }
 
 // sdbusDo runs fn against the shared connection. handled=false means the
-// D-Bus path could not produce an answer (flag off, dial failed, connection
-// closed twice) and the caller must fall back to exec'ing systemctl.
+// D-Bus path could not produce an answer (flag off, no healthy connection,
+// transport failure) and the caller must fall back to exec'ing systemctl.
 // handled=true means systemd answered: err is nil or a real method error
-// (e.g. NoSuchUnit) that the fallback would hit too.
-func sdbusDo(ctx context.Context, fn func(*sddbus.Conn) error) (err error, handled bool) {
+// (e.g. NoSuchUnit) that exec'd systemctl would hit identically.
+func sdbusDo(fn func(*sddbus.Conn) error) (err error, handled bool) {
 	if !systemdDBusEnabled.Load() {
 		return nil, false
 	}
-	conn, derr := sdbusGet(ctx)
-	if derr != nil {
+	conn := sdbusAcquire()
+	if conn == nil {
 		return nil, false
 	}
 	err = fn(conn)
-	if sdbusClosed(err) {
-		sdbusDrop(conn)
-		if conn, derr = sdbusGet(ctx); derr != nil {
-			return nil, false
-		}
-		err = fn(conn)
-		if sdbusClosed(err) {
-			sdbusDrop(conn)
-			return nil, false
-		}
-	}
 	if merr, answered := sdbusAnswer(err); answered {
 		return merr, true
 	}
-	// Transport-shaped failure (net error, ctx expiry mid-call): let the
-	// exec path try; it either succeeds or fails with today's semantics.
+	// Transport-shaped failure: drop the corpse so a later call redials,
+	// and let the exec path handle this call with today's semantics.
+	sdbusDrop(conn)
 	return nil, false
 }
 
-// sdbusClosed reports a dead connection — the one error worth a redial.
-func sdbusClosed(err error) bool { return errors.Is(err, dbus.ErrClosed) }
-
 // sdbusAnswer reports whether systemd answered the call: nil, or a D-Bus
 // method error (NoSuchUnit, start-limit, ...) that exec'd systemctl would
-// hit identically. Anything else is transport-shaped → not answered.
+// hit identically. Anything else — ErrClosed, raw socket EOF/reset from a
+// call in flight at transport death, ctx expiry — is transport-shaped.
 func sdbusAnswer(err error) (error, bool) {
 	if err == nil {
 		return nil, true
+	}
+	if errors.Is(err, dbus.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return nil, false
 	}
 	var de dbus.Error
 	if errors.As(err, &de) {
@@ -109,11 +181,31 @@ func sdbusAnswer(err error) (error, bool) {
 	return nil, false
 }
 
+// sdbusNotLoaded reports the method errors meaning "systemd has no such
+// unit loaded" — for template instances that is the normal state of every
+// stopped/dead VM, and it is a definitive answer (not active, no PID), not
+// a reason to fall back to exec.
+func sdbusNotLoaded(err error) bool {
+	var de dbus.Error
+	if !errors.As(err, &de) {
+		return false
+	}
+	switch de.Name {
+	case "org.freedesktop.systemd1.NoSuchUnit",
+		"org.freedesktop.DBus.Error.UnknownObject",
+		"org.freedesktop.DBus.Error.UnknownInterface":
+		return true
+	}
+	return false
+}
+
 // sdbusUnitProperty reads one property of a unit (iface "" = the generic
-// Unit interface, "Service" = the service-specific one).
-func sdbusUnitProperty(ctx context.Context, unit, iface, name string) (any, error, bool) {
-	var val any
-	err, handled := sdbusDo(ctx, func(c *sddbus.Conn) error {
+// Unit interface, "Service" = the service-specific one). The ctx bounds
+// only this method call, never the connection. notLoaded=true is the
+// definitive "unit does not exist" answer — for template instances that is
+// the normal state of every stopped VM, not a fallback case.
+func sdbusUnitProperty(ctx context.Context, unit, iface, name string) (val any, notLoaded, handled bool) {
+	err, ok := sdbusDo(func(c *sddbus.Conn) error {
 		var p *sddbus.Property
 		var e error
 		if iface == "Service" {
@@ -127,5 +219,14 @@ func sdbusUnitProperty(ctx context.Context, unit, iface, name string) (any, erro
 		val = p.Value.Value()
 		return nil
 	})
-	return val, err, handled
+	if !ok {
+		return nil, false, false
+	}
+	if err != nil {
+		if sdbusNotLoaded(err) {
+			return nil, true, true
+		}
+		return nil, false, false
+	}
+	return val, false, true
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
 )
@@ -23,7 +24,7 @@ func startUnit(ctx context.Context, unit string) error {
 	// mode "replace" + nil result channel == `systemctl start --no-block`:
 	// the call returns at job-enqueue. nil also skips the library's
 	// job-tracking lock, so concurrent launches pipeline on the socket.
-	if err, ok := sdbusDo(ctx, func(c *sddbus.Conn) error {
+	if err, ok := sdbusDo(func(c *sddbus.Conn) error {
 		_, e := c.StartUnitContext(ctx, unit, "replace", nil)
 		return e
 	}); ok {
@@ -40,13 +41,65 @@ func startUnit(ctx context.Context, unit string) error {
 	return nil
 }
 
+// stopJobWaitCap bounds the wait for a stop job's completion signal. Above
+// the unit's TimeoutStopSec (10s) + kill margin: past this the signal is
+// considered lost (dead signal socket), not the job slow.
+const stopJobWaitCap = 15 * time.Second
+
+// stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
+// unit is a no-op. Blocks until the stop job completes.
+func stopUnit(ctx context.Context, unit string) error {
+	// Buffered channel: the library's dispatcher does one blocking send;
+	// buffer 1 keeps an abandoned wait from wedging every job on the
+	// connection.
+	ch := make(chan string, 1)
+	err, enqueued := sdbusDo(func(c *sddbus.Conn) error {
+		_, e := c.StopUnitContext(ctx, unit, "replace", ch)
+		return e
+	})
+	if enqueued {
+		if err != nil {
+			if sdbusNotLoaded(err) {
+				return nil // not loaded == already stopped
+			}
+			return fmt.Errorf("stop unit %s: %w", unit, err)
+		}
+		// systemd accepted the job — from here we only report the outcome,
+		// never re-drive the stop via exec (that would double-execute).
+		timer := time.NewTimer(stopJobWaitCap)
+		defer timer.Stop()
+		select {
+		case res := <-ch:
+			if res != "done" && res != "skipped" {
+				return fmt.Errorf("stop unit %s: job result %q", unit, res)
+			}
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("stop unit %s: %w", unit, ctx.Err())
+		case <-timer.C:
+			// Completion signal lost (e.g. signal socket died mid-wait).
+			return fmt.Errorf("stop unit %s: no job completion within %s", unit, stopJobWaitCap)
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, "systemctl", "stop", unit)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl stop %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // unitFailureSummary returns a one-line summary of a unit's
 // Result/SubState for embedding in error messages. Best-effort —
 // returns "unknown" on any error.
 func unitFailureSummary(ctx context.Context, unit string) string {
 	// Result lives on the Service interface, SubState on Unit.
-	if res, err, ok := sdbusUnitProperty(ctx, unit, "Service", "Result"); ok && err == nil {
-		if sub, serr, sok := sdbusUnitProperty(ctx, unit, "", "SubState"); sok && serr == nil {
+	if res, notLoaded, ok := sdbusUnitProperty(ctx, unit, "Service", "Result"); ok {
+		if notLoaded {
+			return "not-loaded"
+		}
+		if sub, _, sok := sdbusUnitProperty(ctx, unit, "", "SubState"); sok {
 			r, _ := res.(string)
 			s, _ := sub.(string)
 			if r != "" || s != "" {
@@ -67,55 +120,28 @@ func unitFailureSummary(ctx context.Context, unit string) string {
 	return s
 }
 
-// stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
-// unit is a no-op. Blocks until the stop job completes.
-func stopUnit(ctx context.Context, unit string) error {
-	if err, ok := sdbusDo(ctx, func(c *sddbus.Conn) error {
-		// Buffered channel: the library's job dispatcher does one blocking
-		// send; buffer 1 keeps an abandoned wait (ctx expiry) from wedging
-		// every job on the connection.
-		ch := make(chan string, 1)
-		if _, e := c.StopUnitContext(ctx, unit, "replace", ch); e != nil {
-			return e
-		}
-		select {
-		case res := <-ch:
-			if res != "done" && res != "skipped" {
-				return fmt.Errorf("stop job result %q", res)
-			}
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}); ok {
-		if err != nil {
-			return fmt.Errorf("stop unit %s: %w", unit, err)
-		}
-		return nil
+// unitActiveState answers whether the unit counts as active, matching
+// `systemctl is-active` (which accepts both "active" and "reloading").
+// handled=false → no D-Bus answer, use the exec path.
+func unitActiveState(ctx context.Context, unit string) (activeNow, handled bool) {
+	val, notLoaded, ok := sdbusUnitProperty(ctx, unit, "", "ActiveState")
+	if !ok {
+		return false, false
 	}
-	cmd := exec.CommandContext(ctx, "systemctl", "stop", unit)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("systemctl stop %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
-	}
-	return nil
-}
-
-// unitActiveState returns the unit's ActiveState over D-Bus.
-// handled=false → answer unavailable, use the exec path.
-func unitActiveState(ctx context.Context, unit string) (state string, handled bool) {
-	val, err, ok := sdbusUnitProperty(ctx, unit, "", "ActiveState")
-	if !ok || err != nil {
-		return "", false
+	if notLoaded {
+		return false, true // not loaded == not active, definitively
 	}
 	s, _ := val.(string)
-	return s, s != ""
+	if s == "" {
+		return false, false
+	}
+	return s == "active" || s == "reloading", true
 }
 
 // isUnitActive checks if a systemd unit is currently active (running).
 func isUnitActive(ctx context.Context, unit string) bool {
-	if state, ok := unitActiveState(ctx, unit); ok {
-		return state == "active"
+	if active, ok := unitActiveState(ctx, unit); ok {
+		return active
 	}
 	cmd := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit)
 	return cmd.Run() == nil
@@ -129,8 +155,8 @@ func unitDefinitelyDead(ctx context.Context, unit string) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	if state, ok := unitActiveState(ctx, unit); ok {
-		return state != "active"
+	if active, ok := unitActiveState(ctx, unit); ok {
+		return !active
 	}
 	err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run()
 	if err == nil {
@@ -147,7 +173,7 @@ func unitDefinitelyDead(ctx context.Context, unit string) bool {
 // firecracker@ units. Used during startup reattach.
 func listActiveFirecrackerUnits(ctx context.Context) ([]string, error) {
 	var units []sddbus.UnitStatus
-	if err, ok := sdbusDo(ctx, func(c *sddbus.Conn) error {
+	if err, ok := sdbusDo(func(c *sddbus.Conn) error {
 		var e error
 		units, e = c.ListUnitsByPatternsContext(ctx, []string{"active"}, []string{"firecracker@*.service"})
 		return e
