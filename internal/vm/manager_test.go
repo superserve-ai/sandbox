@@ -993,6 +993,20 @@ func TestVMOpLock_SerializesSameID_TryLockSkips(t *testing.T) {
 	if _, err := m.lockVMOp(cancelled, "vm-1"); err == nil {
 		t.Fatal("cancelled context must not acquire a held lock")
 	}
+	// Free lock + already-cancelled ctx: even if the random select picks
+	// the send case, the post-acquire recheck must release and return err,
+	// not leave the lock held.
+	freeCancel, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if u, err := m.lockVMOp(freeCancel, "vm-free"); err == nil {
+		u()
+		t.Fatal("cancelled ctx must not acquire even a free lock")
+	}
+	if u, ok := m.tryLockVMOp("vm-free"); !ok {
+		t.Fatal("a cancelled acquire must not leave the lock held")
+	} else {
+		u()
+	}
 	unlock()
 	// Released — now acquirable.
 	if u, ok := m.tryLockVMOp("vm-1"); !ok {

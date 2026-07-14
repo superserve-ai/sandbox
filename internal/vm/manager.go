@@ -304,6 +304,13 @@ func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
 	ch := m.vmOpCh(vmID)
 	select {
 	case ch <- struct{}{}:
+		// select picks a ready case at random, so an already-cancelled
+		// caller can win the send even though ctx is done. Re-check and
+		// release rather than run abandoned work.
+		if err := ctx.Err(); err != nil {
+			<-ch
+			return nil, err
+		}
 		return func() { <-ch }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1483,6 +1490,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	defer unlockOp()
 
+	// Retried restore (response lost mid-RPC): re-restoring a VM the prior
+	// attempt brought up would roll the guest back to the snapshot. A live
+	// unit proves the prior restore completed — return that VM instead.
+	// Checked BEFORE restoreSem so a no-op retry never consumes a scarce
+	// restore slot (or fails on the semaphore when all slots are busy).
+	// lazyReattach loads a paused VM the background reattach hasn't reached.
+	m.lazyReattach(vmID)
+	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+		log.Info().Msg("restore: VM already running and healthy, returning it")
+		return existing, nil
+	}
+
 	// Bound concurrent restores so a burst of sandbox creates doesn't
 	// saturate host file I/O, netns setup, tmpfs, and Firecracker boots.
 	// Fail fast with ctx.Err() if the caller's deadline fires while we
@@ -1514,19 +1533,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
-	}
-
-	// Load a paused VM the background reattach hasn't reached yet, so the inPlace
-	// path below reuses its slot instead of allocating a fresh one. No-op for a
-	// new VM (not in BoltDB).
-	m.lazyReattach(vmID)
-
-	// Retried restore (response lost mid-RPC): re-restoring a VM the prior
-	// attempt brought up would roll the guest back to the snapshot. A live
-	// unit proves the prior restore completed — return that VM instead.
-	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
-		log.Info().Msg("restore: VM already running and healthy, returning it")
-		return existing, nil
 	}
 
 	m.mu.Lock()
