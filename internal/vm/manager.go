@@ -260,35 +260,51 @@ type Manager struct {
 	// vmOpLocks serializes lifecycle operations (restore, resume, pause) for
 	// a single vmID, so a retry or a concurrent actor can't stomp an
 	// in-flight launch (kill a still-booting VM, re-diff a consumed dirty
-	// bitmap). Keyed by vmID → *sync.Mutex. Entries are never deleted:
-	// vmIDs are unique UUIDs so they don't collide, and deleting on destroy
-	// would let a same-vmID retry acquire a fresh mutex and lose mutual
-	// exclusion. DestroyVM deliberately does NOT take these locks — it must
-	// interrupt a wedged op (a hung firecracker socket call holds the lock
-	// until destroy SIGKILLs the process), so blocking it would turn a
-	// recoverable wedge into a permanent hang.
+	// bitmap). Keyed by vmID → chan struct{}{} used as a capacity-1
+	// semaphore, so acquisition can honor the caller's context. Entries are
+	// never deleted: vmIDs are unique UUIDs so they don't collide, and
+	// deleting on destroy would let a same-vmID retry acquire a fresh lock
+	// and lose mutual exclusion. DestroyVM deliberately does NOT take these
+	// locks — it must interrupt a wedged op (a hung firecracker socket call
+	// holds the lock until destroy SIGKILLs the process), so blocking it
+	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
 }
 
-// lockVMOp blocks until it holds vmID's lifecycle lock; the returned func
-// releases it. Never called from a read/reattach path (the mutex is not
-// reentrant) or from DestroyVM (see vmOpLocks).
-func (m *Manager) lockVMOp(vmID string) func() {
-	mu, _ := m.vmOpLocks.LoadOrStore(vmID, &sync.Mutex{})
-	l := mu.(*sync.Mutex)
-	l.Lock()
-	return l.Unlock
+// vmOpCh returns vmID's capacity-1 lock channel, creating it once.
+func (m *Manager) vmOpCh(vmID string) chan struct{} {
+	if v, ok := m.vmOpLocks.Load(vmID); ok {
+		return v.(chan struct{})
+	}
+	v, _ := m.vmOpLocks.LoadOrStore(vmID, make(chan struct{}, 1))
+	return v.(chan struct{})
+}
+
+// lockVMOp acquires vmID's lifecycle lock, honoring ctx while it waits — a
+// caller whose deadline expires in the queue behind another op returns
+// ctx.Err() instead of running abandoned pause/restore work. The returned
+// func releases it. Never called from a read/reattach path (not reentrant)
+// or from DestroyVM (see vmOpLocks).
+func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
+	ch := m.vmOpCh(vmID)
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // tryLockVMOp acquires vmID's lifecycle lock without blocking. ok=false
 // means an operation is in flight for this vmID and the caller must not act.
 func (m *Manager) tryLockVMOp(vmID string) (unlock func(), ok bool) {
-	mu, _ := m.vmOpLocks.LoadOrStore(vmID, &sync.Mutex{})
-	l := mu.(*sync.Mutex)
-	if !l.TryLock() {
+	ch := m.vmOpCh(vmID)
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, true
+	default:
 		return nil, false
 	}
-	return l.Unlock, true
 }
 
 // NewManager creates a new VM manager.
@@ -678,7 +694,10 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
 	// waits, then hits the already-paused guard.
-	unlockOp := m.lockVMOp(vmID)
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return "", "", err
+	}
 	defer unlockOp()
 
 	inst, err := m.getInstance(vmID)
@@ -960,7 +979,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
 	// waits, then is recognized as a retry rather than relaunching.
-	unlockOp := m.lockVMOp(vmID)
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
 	defer unlockOp()
 
 	inst, err := m.getInstance(vmID)
@@ -1173,7 +1195,10 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): the throwaway
 	// firecracker must not race a concurrent resume onto the same unit.
-	unlockOp := m.lockVMOp(vmID)
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return "", err
+	}
 	defer unlockOp()
 
 	inst, err := m.getInstance(vmID)
@@ -1435,9 +1460,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
 	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
 	// it — instead of racing into the inPlace block and stopping it. Taken
-	// BEFORE restoreSem so a retry storm for one vmID blocks on the mutex
+	// BEFORE restoreSem so a retry storm for one vmID blocks on the lock
 	// without holding scarce restore slots, which would starve other VMs.
-	unlockOp := m.lockVMOp(vmID)
+	unlockOp, lerr := m.lockVMOp(ctx, vmID)
+	if lerr != nil {
+		return nil, lerr
+	}
 	defer unlockOp()
 
 	// Bound concurrent restores so a burst of sandbox creates doesn't

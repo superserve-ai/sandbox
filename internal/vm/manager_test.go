@@ -971,7 +971,10 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 func TestVMOpLock_SerializesSameID_TryLockSkips(t *testing.T) {
 	m := &Manager{log: zerolog.Nop()}
 
-	unlock := m.lockVMOp("vm-1")
+	unlock, err := m.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	// A different vmID is independent — must acquire freely.
 	if u2, ok := m.tryLockVMOp("vm-2"); !ok {
 		t.Fatal("different vmID must not contend")
@@ -982,6 +985,13 @@ func TestVMOpLock_SerializesSameID_TryLockSkips(t *testing.T) {
 	// reconciler skip a unit a launch is mid-flight on).
 	if _, ok := m.tryLockVMOp("vm-1"); ok {
 		t.Fatal("held vmID must fail TryLock")
+	}
+	// A queued acquire whose context is already cancelled returns ctx.Err()
+	// instead of waiting for the lock — no abandoned pause/restore work.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.lockVMOp(cancelled, "vm-1"); err == nil {
+		t.Fatal("cancelled context must not acquire a held lock")
 	}
 	unlock()
 	// Released — now acquirable.
