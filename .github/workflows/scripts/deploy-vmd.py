@@ -239,7 +239,13 @@ def main() -> int:
                 fi
             done
 
-            sudo systemctl restart {service}
+            # Stop before starting the socket unit: on the first deploy of
+            # socket activation the old direct-bound vmd still holds the
+            # ports, and a plain restart can bind the socket unit before the
+            # old process has released them. Idempotent in steady state.
+            sudo systemctl stop {service}
+            sudo systemctl start superserve-vmd.socket
+            sudo systemctl start {service}
             sleep 3
             sudo systemctl is-active --quiet {service} || (
                 echo "ERROR: {service} failed to become active after restart" >&2

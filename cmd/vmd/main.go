@@ -31,6 +31,10 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
+// localHTTPPort is the loopback resolver server's port; must match the
+// socket unit's second ListenStream.
+const localHTTPPort = 9090
+
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
 	FirecrackerBin     string
@@ -453,18 +457,44 @@ func main() {
 	notReady := func() error {
 		return status.Error(codes.Unavailable, "vmd is starting up (reattaching VMs), retry shortly")
 	}
-	// Inherit the gRPC listener from systemd when socket-activated: the
-	// socket unit owns the fd across vmd restarts, so connections arriving
+	// Inherit listeners from systemd when socket-activated: the socket
+	// unit owns the fds across vmd restarts, so connections arriving
 	// mid-deploy queue in the kernel accept backlog instead of being
-	// refused. Without a socket unit (dev, tests, hosts not yet migrated)
-	// bind directly, exactly as before.
-	var lis net.Listener
-	if inherited, aerr := activation.Listeners(); aerr == nil && len(inherited) > 0 {
-		if len(inherited) > 1 {
-			log.Fatal().Int("count", len(inherited)).Msg("unexpected listener count from systemd")
+	// refused. Matched by port — fd order follows the unit file, but port
+	// matching survives reordering, and nil entries (non-listener fds)
+	// must be skipped. Without a socket unit (dev, tests, hosts not yet
+	// migrated) both servers bind directly, exactly as before.
+	var lis, localLis net.Listener
+	if inherited, aerr := activation.Listeners(); aerr == nil {
+		for _, l := range inherited {
+			if l == nil {
+				continue
+			}
+			ta, ok := l.Addr().(*net.TCPAddr)
+			if !ok {
+				_ = l.Close()
+				continue
+			}
+			switch ta.Port {
+			case cfg.GRPCPort:
+				lis = l
+			case localHTTPPort:
+				if !ta.IP.IsLoopback() {
+					log.Fatal().Str("addr", ta.String()).Msg("inherited resolver listener must be loopback-only")
+				}
+				localLis = l
+			default:
+				log.Warn().Str("addr", ta.String()).Msg("inherited listener matches no known port — closing")
+				_ = l.Close()
+			}
 		}
-		lis = inherited[0]
-		log.Info().Msg("gRPC listener inherited from systemd socket unit")
+		if len(inherited) > 0 && lis == nil {
+			log.Warn().Int("grpc_port", cfg.GRPCPort).
+				Msg("socket unit passed listeners but none matches GRPC_PORT — binding directly; check the unit's ListenStream")
+		}
+	}
+	if lis != nil {
+		log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
 	} else {
 		var lerr error
 		lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
@@ -636,7 +666,10 @@ func main() {
 	// instanceID → vmIP before forwarding data-plane traffic.
 	localHTTP := vm.NewLocalHTTPServer(mgr, log)
 	lc.start("local http server", func() error {
-		return localHTTP.ListenAndServe(ctx, "localhost:9090")
+		if localLis != nil {
+			return localHTTP.Serve(ctx, localLis)
+		}
+		return localHTTP.ListenAndServe(ctx, fmt.Sprintf("localhost:%d", localHTTPPort))
 	})
 	lc.addCloser("local http server", func(shutdownCtx context.Context) error {
 		return localHTTP.Shutdown(shutdownCtx)
