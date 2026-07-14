@@ -378,6 +378,12 @@ func main() {
 	}
 	launchViaLauncherNS := envOrDefault("VMD_LAUNCH_VIA_LAUNCHER_NS", "false") == "true"
 
+	// Persistent systemd D-Bus connection for unit operations (vs forking
+	// systemctl per call). Falls back to systemctl per call when unavailable.
+	systemdDBus := envOrDefault("VMD_SYSTEMD_DBUS", "false") == "true"
+	vm.SetSystemdDBusEnabled(systemdDBus)
+	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
+
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:             cfg.FirecrackerBin,
 		JailerBin:                  cfg.JailerBin,

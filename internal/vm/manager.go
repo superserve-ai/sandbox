@@ -2651,6 +2651,11 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 // unitMainPID returns the systemd MainPID for a VM's unit, or 0 when it can't
 // be resolved or the unit has no running process.
 func (m *Manager) unitMainPID(ctx context.Context, vmID string) int {
+	if val, err, ok := sdbusUnitProperty(ctx, systemdUnitName(vmID), "Service", "MainPID"); ok && err == nil {
+		if pid, isU32 := val.(uint32); isU32 {
+			return int(pid)
+		}
+	}
 	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID)).Output()
 	if err != nil {
 		return 0
