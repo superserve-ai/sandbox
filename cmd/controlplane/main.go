@@ -39,21 +39,12 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
-// vmdRetryServiceConfig retries on UNAVAILABLE only — gRPC guarantees
-// such requests never reached the server, so create RPCs can't
-// double-execute. Other codes lack this guarantee.
-const vmdRetryServiceConfig = `{
-  "methodConfig": [{
-    "name": [{"service": "superserve.vmd.v1.VMDaemon"}],
-    "retryPolicy": {
-      "maxAttempts": 5,
-      "initialBackoff": "0.2s",
-      "maxBackoff": "2s",
-      "backoffMultiplier": 2.0,
-      "retryableStatusCodes": ["UNAVAILABLE"]
-    }
-  }]
-}`
+// retryUnavailableWindow bounds how long a unary RPC keeps retrying
+// codes.Unavailable. Sized to outlast a vmd deploy restart — several
+// seconds of connection-refused while the process swaps, plus the
+// startup gate that answers Unavailable until the daemon is serving —
+// with margin.
+const retryUnavailableWindow = 15 * time.Second
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -157,7 +148,7 @@ func run() error {
 	// Connect to VMD via gRPC.
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultServiceConfig(vmdRetryServiceConfig),
+		grpc.WithUnaryInterceptor(retryUnavailableUnaryInterceptor(retryUnavailableWindow)),
 	)
 	if err != nil {
 		return fmt.Errorf("dial VMD gRPC: %w", err)
@@ -211,11 +202,13 @@ func run() error {
 	// Interceptors below fire onDead on codes.Unavailable so the registry
 	// drops stale cached clients.
 	dialVMD := func(hostID, addr string, onDead func()) (vmdclient.Client, error) {
-		// Retry runs inside the invoker; the dead-host interceptor sees the post-retry outcome only.
+		// deadHost is chained outside retry, so it sees the post-retry outcome only.
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultServiceConfig(vmdRetryServiceConfig),
-			grpc.WithUnaryInterceptor(deadHostUnaryInterceptor(onDead)),
+			grpc.WithChainUnaryInterceptor(
+				deadHostUnaryInterceptor(onDead),
+				retryUnavailableUnaryInterceptor(retryUnavailableWindow),
+			),
 			grpc.WithStreamInterceptor(deadHostStreamInterceptor(onDead)),
 		)
 		if err != nil {
@@ -627,18 +620,46 @@ func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error
 }
 
 func (c *grpcVMDClient) StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(vmdclient.BuildLogEvent) error) error {
+	// The unary retry interceptor doesn't cover streams. Retry the open
+	// only while nothing was delivered — a fresh stream replays history,
+	// which would duplicate events.
+	deadline := time.Now().Add(retryUnavailableWindow)
+	backoff := 250 * time.Millisecond
+	for {
+		delivered, err := c.streamBuildLogsOnce(ctx, buildVMID, onEvent)
+		if err == nil || delivered || grpcstatus.Code(err) != grpccodes.Unavailable || !time.Now().Before(deadline) {
+			return err
+		}
+		if c.conn != nil {
+			c.conn.ResetConnectBackoff()
+		}
+		select {
+		case <-ctx.Done():
+			// Same as the unary interceptor: a caller giving up must not
+			// read as a dead host.
+			return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), err)
+		case <-time.After(min(backoff, time.Until(deadline))):
+		}
+		backoff = min(backoff*2, 2*time.Second)
+	}
+}
+
+// streamBuildLogsOnce opens one log stream and pumps it to onEvent.
+// delivered reports whether any event reached the callback.
+func (c *grpcVMDClient) streamBuildLogsOnce(ctx context.Context, buildVMID string, onEvent func(vmdclient.BuildLogEvent) error) (delivered bool, _ error) {
 	stream, err := c.client.StreamBuildLogs(ctx, &vmdpb.StreamBuildLogsRequest{BuildVmId: buildVMID})
 	if err != nil {
-		return fmt.Errorf("gRPC StreamBuildLogs: %w", err)
+		return false, fmt.Errorf("gRPC StreamBuildLogs: %w", err)
 	}
 	for {
 		pbEv, err := stream.Recv()
 		if err != nil {
 			if err == io.EOF {
-				return nil
+				return delivered, nil
 			}
-			return fmt.Errorf("recv build log: %w", err)
+			return delivered, fmt.Errorf("recv build log: %w", err)
 		}
+		delivered = true
 		if cbErr := onEvent(vmdclient.BuildLogEvent{
 			TimestampUnixNanos: pbEv.GetTimestampUnixNanos(),
 			Stream:             pbEv.GetStream(),
@@ -646,10 +667,49 @@ func (c *grpcVMDClient) StreamBuildLogs(ctx context.Context, buildVMID string, o
 			Finished:           pbEv.GetFinished(),
 			Status:             pbEv.GetStatus(),
 		}); cbErr != nil {
-			return cbErr
+			return true, cbErr
 		}
 		if pbEv.GetFinished() {
-			return nil
+			return true, nil
+		}
+	}
+}
+
+// retryUnavailableUnaryInterceptor retries codes.Unavailable — the daemon
+// is down or still starting — with deterministic backoff until the window
+// or the caller's context expires. A connection severed mid-call also
+// surfaces as Unavailable, so every retried RPC must stay idempotent.
+// gRPC's built-in retryPolicy can't cover a daemon restart: attempts are
+// hard-capped at 5, so its worst-case envelope is a few seconds.
+func retryUnavailableUnaryInterceptor(window time.Duration) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		deadline := time.Now().Add(window)
+		backoff := 250 * time.Millisecond
+		attempts := 0
+		for {
+			attempts++
+			err := invoker(ctx, method, req, reply, cc, opts...)
+			if err == nil || grpcstatus.Code(err) != grpccodes.Unavailable || !time.Now().Before(deadline) {
+				if err != nil && attempts > 1 {
+					log.Warn().Err(err).Str("method", method).Int("attempts", attempts).
+						Msg("VMD RPC still failing after retry window")
+				}
+				return err
+			}
+			// The channel's own reconnect backoff spaces dials out past
+			// this window; reset it so re-dials follow this loop's
+			// cadence. Nil cc only in tests.
+			if cc != nil {
+				cc.ResetConnectBackoff()
+			}
+			select {
+			case <-ctx.Done():
+				// The caller gave up, not the host: don't surface
+				// Unavailable (the dead-host interceptor keys off it).
+				return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), err)
+			case <-time.After(min(backoff, time.Until(deadline))):
+			}
+			backoff = min(backoff*2, 2*time.Second)
 		}
 	}
 }
