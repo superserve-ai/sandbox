@@ -1,0 +1,15 @@
+[Unit]
+Description=Superserve vmd gRPC listener
+
+# systemd owns this socket, so it survives vmd restarts: connections
+# arriving mid-deploy queue in the kernel accept backlog instead of being
+# refused, and the freshly started vmd (which serves before reattach)
+# accepts them within a second.
+
+[Socket]
+ListenStream=50051
+Accept=no
+ReusePort=yes
+
+[Install]
+WantedBy=sockets.target

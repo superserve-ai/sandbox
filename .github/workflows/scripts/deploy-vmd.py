@@ -61,6 +61,7 @@ BUNDLE_FILES = [
     "bin/template-builder",
     "bin/secretsproxy",
     "deploy/superserve-vmd.service",
+    "deploy/superserve-vmd.socket",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
@@ -152,10 +153,12 @@ def main() -> int:
 
             # Install systemd units.
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd.socket /etc/systemd/system/superserve-vmd.socket
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
             sudo systemctl daemon-reload
+            sudo systemctl enable --quiet superserve-vmd.socket
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 

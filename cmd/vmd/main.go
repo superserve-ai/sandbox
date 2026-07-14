@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -452,9 +453,24 @@ func main() {
 	notReady := func() error {
 		return status.Error(codes.Unavailable, "vmd is starting up (reattaching VMs), retry shortly")
 	}
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
-	if err != nil {
-		log.Fatal().Err(err).Int("port", cfg.GRPCPort).Msg("failed to listen")
+	// Inherit the gRPC listener from systemd when socket-activated: the
+	// socket unit owns the fd across vmd restarts, so connections arriving
+	// mid-deploy queue in the kernel accept backlog instead of being
+	// refused. Without a socket unit (dev, tests, hosts not yet migrated)
+	// bind directly, exactly as before.
+	var lis net.Listener
+	if inherited, aerr := activation.Listeners(); aerr == nil && len(inherited) > 0 {
+		if len(inherited) > 1 {
+			log.Fatal().Int("count", len(inherited)).Msg("unexpected listener count from systemd")
+		}
+		lis = inherited[0]
+		log.Info().Msg("gRPC listener inherited from systemd socket unit")
+	} else {
+		var lerr error
+		lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
+		if lerr != nil {
+			log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
+		}
 	}
 	// Set explicitly, else gRPC clients self-cap at 100 streams/conn
 	// (defaultMaxStreamsClient) because the server advertises no limit by default.
