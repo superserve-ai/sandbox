@@ -833,26 +833,26 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	}
 
 	// Stop the Firecracker process — snapshot is already on disk. A stop
-	// that still fails must NOT fail the pause: the artifacts are valid and
-	// the record must reach Paused — a retry against a Running record would
-	// re-diff an already-consumed dirty bitmap and destroy the overlay. The
-	// straggler unit is replaced at the next launch and reclaimed by the
-	// reconciler meanwhile.
+	// that fails must NOT fail the pause: the artifacts are valid and the
+	// record must reach Paused (a retry against a Running record would
+	// re-diff an already-consumed dirty bitmap and destroy the overlay).
+	//
+	// Bound the WHOLE stop path (both attempts + dead-check) to the caller's
+	// deadline: the control plane caps the pause RPC at ~30s and reverts the
+	// DB row to active on timeout, so a stop that finishes after that would
+	// leave DB-active-but-VM-stopped drift. If the stop can't finish in the
+	// remaining budget the straggler unit is reclaimed by the reconciler —
+	// self-healing, unlike the drift. This is why the path shares the
+	// caller's budget rather than taking fresh detached ones.
 	unit := systemdUnitName(vmID)
-	if err := stopUnitWithBudget(ctx, unit); err != nil {
+	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
+	if err := stopUnit(stopCtx, unit); err != nil {
 		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
-		// Fresh budget for the retry — sharing the first attempt's would
-		// leave the retry (and the dead-check) no time under host I/O
-		// contention, exactly when the retry is needed.
-		if serr := stopUnitWithBudget(ctx, unit); serr != nil {
-			deadCtx, deadCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-			dead := unitDefinitelyDead(deadCtx, unit)
-			deadCancel()
-			if !dead {
-				log.Error().Err(serr).Msg("unit still running after pause; reconciler will reclaim it")
-			}
+		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
+			log.Error().Err(serr).Msg("unit still running after pause; reconciler will reclaim it")
 		}
 	}
+	stopCancel()
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
