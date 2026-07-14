@@ -676,9 +676,8 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 
 // PauseVM snapshots the VM state and then stops the process.
 func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
-	// Serialize with any other launch/pause for this vmID (see lockVMOp): a
-	// duplicate pause must wait and then hit the already-paused guard, not
-	// re-diff a dirty bitmap the first pass already consumed.
+	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
+	// waits, then hits the already-paused guard.
 	unlockOp := m.lockVMOp(vmID)
 	defer unlockOp()
 
@@ -959,9 +958,8 @@ func fileExists(path string) bool {
 func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
-	// Serialize with any other launch/pause for this vmID (see lockVMOp): a
-	// duplicate resume must wait and then be recognized as a retry, not
-	// relaunch over a VM the first attempt is still booting.
+	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
+	// waits, then is recognized as a retry rather than relaunching.
 	unlockOp := m.lockVMOp(vmID)
 	defer unlockOp()
 
@@ -1173,9 +1171,8 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
-	// Serialize with launch/pause for this vmID (see lockVMOp): the
-	// throwaway firecracker this starts must not race a concurrent resume
-	// onto the same unit.
+	// Serialize same-vmID lifecycle ops (see lockVMOp): the throwaway
+	// firecracker must not race a concurrent resume onto the same unit.
 	unlockOp := m.lockVMOp(vmID)
 	defer unlockOp()
 
@@ -1447,10 +1444,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		vmID = uuid.New().String()
 	}
 
-	// Serialize with any other launch/pause for this vmID, so a retry lands
-	// AFTER an in-flight attempt finishes (and is then recognized as a retry
-	// by retriedLaunchTarget below) instead of racing into the inPlace block
-	// and stopping a still-booting VM.
+	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
+	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
+	// it — instead of racing into the inPlace block and stopping it.
 	unlockOp := m.lockVMOp(vmID)
 	defer unlockOp()
 
@@ -2882,19 +2878,14 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 // restore request is a retry of one that already completed: Running with the
 // SAME artifacts (a different snapshot must replace the VM as before).
 //
-// Called only while holding vmID's lifecycle lock, which is what makes
-// Status trustworthy: no concurrent restore/resume/pause can be mid-flight,
-// so a Running instance is a finished prior attempt, not a still-booting or
-// about-to-be-paused one. That's why there is no boxd probe — an earlier
-// version used one as a stand-in for "the prior attempt finished", but it
-// couldn't tell a slow-booting boxd (up to the 30s warmup) from a dead one,
-// and a false negative relaunches over the live VM, rolling the guest back.
-// boxd readiness is the caller's concern; returning the Running VM is always
-// safer than relaunching it. DestroyVM bypasses the lock, so the final
-// recheck drops an instance a concurrent destroy removed.
+// Called while holding vmID's lifecycle lock, so Status is trustworthy: no
+// concurrent op is mid-flight, and a Running instance is a finished prior
+// attempt. Hence no boxd probe — it couldn't tell a slow-booting boxd (30s
+// warmup) from a dead one, and a false negative relaunches over the live
+// VM, rolling the guest back. DestroyVM bypasses the lock, so the recheck
+// drops an instance a concurrent destroy removed.
 //
-// A deliberate reset-to-snapshot flow (none exists today) must NOT reuse
-// these RPCs as-is — it would need an explicit signal to bypass this guard.
+// A reset-to-snapshot flow (none today) must not reuse these RPCs as-is.
 func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMInstance {
 	m.mu.RLock()
 	existing := m.vms[vmID]
