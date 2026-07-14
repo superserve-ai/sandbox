@@ -1452,13 +1452,15 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 
 	body := mustJSON(t, w)
+	if got := body["mode"].(string); got != "shadow" {
+		t.Fatalf("mode = %q, want shadow", got)
+	}
 	breakdown, ok := body["cost_breakdown_usd"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
 	}
 	closedCompute := 2 * seconds * 0.000014
 	closedMemory := 2 * seconds * 0.0000045
-	closedStorage := 10 * seconds * 0.00000003
 	minOpenSeconds := requestStarted.Sub(openStart).Seconds()
 	maxOpenSeconds := requestFinished.Sub(openStart).Seconds()
 	if minOpenSeconds < 0 {
@@ -1472,14 +1474,60 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	storage := breakdown["storage"].(float64)
 	assertFloatBetween(t, compute, closedCompute+minOpenSeconds*0.000014, closedCompute+maxOpenSeconds*0.000014)
 	assertFloatBetween(t, memory, closedMemory+0.5*minOpenSeconds*0.0000045, closedMemory+0.5*maxOpenSeconds*0.0000045)
-	assertFloatBetween(t, storage, closedStorage+5*minOpenSeconds*0.00000003, closedStorage+5*maxOpenSeconds*0.00000003)
+	assertFloatNear(t, storage, 0)
 
 	currentCharges := body["current_charges_usd"].(float64)
 	creditsApplied := math.Min(currentCharges, 0.1)
-	assertFloatNear(t, currentCharges, compute+memory+storage)
+	assertFloatNear(t, currentCharges, compute+memory)
 	assertFloatNear(t, body["credits_applied_usd"].(float64), creditsApplied)
 	assertFloatNear(t, body["credits_remaining_usd"].(float64), 0.1-creditsApplied)
 	assertFloatNear(t, body["expected_invoice_amount_usd"].(float64), currentCharges-creditsApplied)
+
+	resources, ok := body["resources"].([]interface{})
+	if !ok || len(resources) != 3 {
+		t.Fatalf("resources = %v, want 3 entries", body["resources"])
+	}
+	storageResource := resources[2].(map[string]interface{})
+	if storageResource["resource"] != "storage_gib" || storageResource["billable"].(bool) {
+		t.Fatalf("storage resource should be tracked-only in shadow mode: %+v", storageResource)
+	}
+	if got := body["payment_setup_required"].(bool); got {
+		t.Fatal("payment_setup_required should be false in shadow mode")
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable live billing mode: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+		ON CONFLICT (team_id) DO UPDATE
+		SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+		    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+		    stripe_subscription_status = EXCLUDED.stripe_subscription_status
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete billing account: %v", err)
+	}
+
+	liveRouter := newBillingRouter(t, &fakeStripeClient{})
+	live := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if live.Code != http.StatusOK {
+		t.Fatalf("live billing summary: expected 200, got %d: %s", live.Code, live.Body.String())
+	}
+	liveBody := mustJSON(t, live)
+	if got := liveBody["payment_setup_required"].(bool); !got {
+		t.Fatal("payment_setup_required should be true before subscription is established")
+	}
+	if got := liveBody["checkout_available"].(bool); !got {
+		t.Fatal("checkout_available should be true before subscription is established")
+	}
+	if got := liveBody["portal_available"].(bool); got {
+		t.Fatal("portal_available should be false before subscription is established")
+	}
 
 	period, ok := body["billing_period"].(map[string]interface{})
 	if !ok {
@@ -1677,9 +1725,12 @@ func TestIntegration_GetBillingPricingUsesNewestEffectiveRate(t *testing.T) {
 	}
 	rates := billingRatesByResource(t, body)
 	assertFloatNear(t, rates["vcpu"].PriceUSD, 0.000022)
+	if got := rates["storage_gib"].Billable; got {
+		t.Fatal("storage_gib pricing should be tracked-only in public pricing")
+	}
 }
 
-func TestIntegration_GetBillingPricingMissingRequiredRateReturns503(t *testing.T) {
+func TestIntegration_GetBillingPricingMissingRequiredComputeRateReturns503(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
 	planKey := "missing-rate-plan-" + uuid.New().String()
@@ -1693,9 +1744,7 @@ func TestIntegration_GetBillingPricingMissingRequiredRateReturns503(t *testing.T
 	}
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
-		VALUES
-			($1, 'vcpu', 'second', 0.000011, $2),
-			($1, 'memory_gib', 'second', 0.0000045, $2)
+		VALUES ($1, 'vcpu', 'second', 0.000011, $2)
 	`, planKey, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("insert incomplete pricing rates: %v", err)
 	}
@@ -1775,6 +1824,8 @@ type billingPricingTestResponse struct {
 		Unit           string  `json:"unit"`
 		PriceUSD       float64 `json:"price_usd"`
 		PriceUSDHourly float64 `json:"price_usd_hourly"`
+		Tracked        bool    `json:"tracked"`
+		Billable       bool    `json:"billable"`
 	} `json:"rates"`
 }
 
@@ -1821,6 +1872,9 @@ func assertPaygPricingResponse(t *testing.T, body billingPricingTestResponse) {
 		assertFloatNear(t, got.PriceUSD, want.price)
 		assertFloatNear(t, got.PriceUSDHourly, want.hourlyRate)
 	}
+	if got := rates["storage_gib"].Billable; got {
+		t.Fatal("storage_gib should be tracked-only in public pricing")
+	}
 }
 
 func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[string]struct {
@@ -1828,6 +1882,8 @@ func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[s
 	Unit           string
 	PriceUSD       float64
 	PriceUSDHourly float64
+	Tracked        bool
+	Billable       bool
 } {
 	t.Helper()
 	rates := make(map[string]struct {
@@ -1835,6 +1891,8 @@ func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[s
 		Unit           string
 		PriceUSD       float64
 		PriceUSDHourly float64
+		Tracked        bool
+		Billable       bool
 	}, len(body.Rates))
 	for _, rate := range body.Rates {
 		if _, exists := rates[rate.Resource]; exists {
@@ -1845,11 +1903,15 @@ func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[s
 			Unit           string
 			PriceUSD       float64
 			PriceUSDHourly float64
+			Tracked        bool
+			Billable       bool
 		}{
 			Resource:       rate.Resource,
 			Unit:           rate.Unit,
 			PriceUSD:       rate.PriceUSD,
 			PriceUSDHourly: rate.PriceUSDHourly,
+			Tracked:        rate.Tracked,
+			Billable:       rate.Billable,
 		}
 	}
 	return rates
@@ -3512,6 +3574,7 @@ func setupBillingFinalizationScenarioAt(
 		0,
 		0,
 		0,
+		false,
 	)
 
 	return billingFinalizationScenario{
@@ -3955,6 +4018,13 @@ func TestIntegration_BillingPeriodFinalizationUsesPeriodPricingAndUsageUnits(t *
 	`, teamID, planAKey, periodStart.Add(-time.Hour), planBKey, currentPlanAt); err != nil {
 		t.Fatalf("assign pricing plans: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_storage_billing_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable storage billing: %v", err)
+	}
 
 	result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, periodStart, periodEnd)
 	if err != nil {
@@ -3972,6 +4042,7 @@ func TestIntegration_BillingPeriodFinalizationUsesPeriodPricingAndUsageUnits(t *
 		0.000004,
 		0.00000002,
 		0,
+		true,
 	)
 	wantCurrent := math.Round(want.CurrentChargesUSD*1e6) / 1e6
 	assertFloatNear(t, result.Charges.CurrentChargesUSD, wantCurrent)
@@ -4078,6 +4149,75 @@ func TestIntegration_BillingPeriodFinalizationRoundsFinancialValuesAtMicroBounda
 	assertFloatNear(t, numericFloat64(t, result.Period.CreditsAppliedUsd), 0.123456)
 	assertFloatNear(t, numericFloat64(t, result.Period.NetInvoiceAmountUsd), 0.000001)
 	assertFloatNear(t, numericFloat64(t, result.Period.GrossChargesUsd)-numericFloat64(t, result.Period.CreditsAppliedUsd), numericFloat64(t, result.Period.NetInvoiceAmountUsd))
+}
+
+func TestIntegration_BillingPeriodFinalizationUsesExportedStorageMode(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	planKey := "storage-mode-finalization-" + uuid.New().String()
+	periodStart := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+	rateEffectiveFrom := periodStart.Add(-time.Hour)
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, rateEffectiveFrom); err != nil {
+		t.Fatalf("insert storage-mode pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, rateEffectiveFrom); err != nil {
+		t.Fatalf("assign storage-mode pricing plan: %v", err)
+	}
+
+	scenario := setupBillingFinalizationScenarioAt(t, ctx, teamID, periodStart, periodEnd, 120, nil)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_billing_usage
+		SET memory_mib_seconds = 0,
+		    storage_mib_seconds = 4096
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, scenario.periodStart, scenario.periodEnd); err != nil {
+		t.Fatalf("seed storage usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_usage_export (
+			team_id, period_start, period_end, resource_type,
+			stripe_customer_id, stripe_meter_event_identifier, stripe_event_name,
+			value, status
+		)
+		VALUES ($1, $2, $3, 'storage', NULL, 'team-storage-mode', 'storage_gib_hours', 4.000000, 'sent')
+	`, teamID, scenario.periodStart, scenario.periodEnd); err != nil {
+		t.Fatalf("seed storage export attempt: %v", err)
+	}
+
+	result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+	if err != nil {
+		t.Fatalf("finalize billing period: %v", err)
+	}
+	want := billing.CalculateSummaryCharges(
+		120,
+		0,
+		4,
+		0.000011,
+		0.0000045,
+		0.00000003,
+		0,
+		true,
+	)
+	wantCurrent := math.Round(want.CurrentChargesUSD*1e6) / 1e6
+	wantStorage := math.Round(want.Breakdown.StorageUSD*1e6) / 1e6
+	assertFloatNear(t, result.Charges.CurrentChargesUSD, wantCurrent)
+	assertFloatNear(t, result.Charges.Breakdown.StorageUSD, wantStorage)
+	if got := numericFloat64(t, result.Period.GrossChargesUsd); math.Abs(got-wantCurrent) > 1e-9 {
+		t.Fatalf("gross charges = %v, want %v", got, wantCurrent)
+	}
 }
 
 func TestIntegration_BillingPeriodFinalizationCreditEligibilityUsesPeriodEnd(t *testing.T) {
@@ -4257,6 +4397,11 @@ func TestIntegration_BillingEndpointsRespectTenantUsageDashboardFlag(t *testing.
 		if errBody["code"] != "not_found" {
 			t.Fatalf("%s: error code = %v, want not_found", path, errBody["code"])
 		}
+	}
+
+	w := do(r, "GET", "/teams/"+teamID.String()+"/billing/usage", apiKey, "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("/teams/%s/billing/usage: expected 404, got %d: %s", teamID, w.Code, w.Body.String())
 	}
 }
 

@@ -79,6 +79,7 @@ type Handlers struct {
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
 	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
+	Stripe    StripeBillingClient
 	Now       func() time.Time  // when set, returns the current UTC time for testable handlers
 
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
@@ -170,6 +171,7 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 		VMD:    vmd,
 		DB:     queries,
 		Config: cfg,
+		Now:    time.Now,
 	}
 }
 

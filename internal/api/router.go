@@ -86,6 +86,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 
 		api.GET("/billing/summary", h.GetBillingSummary)
 		api.GET("/billing/pricing", h.GetBillingPricing)
+		api.GET("/teams/:team_id/billing/usage", h.GetTeamBillingUsage)
+		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
+		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
+		api.POST("/stripe/checkout-session", h.CreateStripeCheckoutSession)
+		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
 
 		// RBAC Phase 2b customer-facing team management.
 		api.GET("/teams/:team_id/management", h.GetTeamManagement)
@@ -100,6 +105,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.GET("/health", h.Health)
 	// Public pricing is intentionally unauthenticated so the marketing site can render current PAYG rates from the same source as billing.
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
+	r.POST("/stripe/webhook", h.HandleStripeWebhook)
 
 	// Internal endpoints — authenticated via a shared token (not per-team
 	// API keys). Called by infrastructure components (VMD heartbeat) and
@@ -117,6 +123,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
 		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
 		internal.GET("/billing", h.ListPlatformBilling)
+		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
+		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
+		internal.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetPlatformTeamBillingExportPreview)
+		internal.POST("/teams/:team_id/billing/periods/:period_id/approve", h.ApproveTeamBillingPeriod)
+		internal.POST("/teams/:team_id/billing/periods/:period_id/export", h.ExportTeamBillingPeriod)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

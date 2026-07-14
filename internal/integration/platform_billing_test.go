@@ -70,8 +70,7 @@ func TestPlatformBillingPaginationTotalsAndPartialFailures(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd)
 		VALUES
-			($1, 'vcpu', 'second', 0.00001),
-			($1, 'memory_gib', 'second', 0.00001)
+			($1, 'vcpu', 'second', 0.00001)
 	`, planKey); err != nil {
 		t.Fatalf("seed incomplete pricing rates: %v", err)
 	}
@@ -183,6 +182,13 @@ func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *te
 	`, sandboxID, teamID, start, end); err != nil {
 		t.Fatalf("seed storage billing usage: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_storage_billing_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable storage billing: %v", err)
+	}
 
 	var grantID uuid.UUID
 	if err := testPool.QueryRow(ctx, `
@@ -257,6 +263,13 @@ func seedPlatformBillingRatesForTest(t *testing.T, ctx context.Context, teamID u
 		VALUES ($1, $2, $3)
 	`, teamID, planKey, effectiveFrom); err != nil {
 		t.Fatalf("assign platform billing pricing plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_storage_billing_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable storage billing: %v", err)
 	}
 }
 
@@ -376,6 +389,7 @@ func TestPlatformBillingUsesHalfOpenMonthBoundaryForUsage(t *testing.T) {
 		0.0000045,
 		0.00000003,
 		0.060000,
+		true,
 	)
 	assertFloatNear(t, row.Summary["current_charges_usd"].(float64), want.CurrentChargesUSD)
 	assertFloatNear(t, row.Summary["credits_applied_usd"].(float64), want.CreditsAppliedUSD)
@@ -500,6 +514,7 @@ func TestPlatformBillingUsesExactMonthBoundaryAtRollover(t *testing.T) {
 		0.0000045,
 		0.00000003,
 		0.020000,
+		true,
 	)
 	assertFloatNear(t, row.Summary["current_charges_usd"].(float64), want.CurrentChargesUSD)
 	assertFloatNear(t, row.Summary["credits_applied_usd"].(float64), want.CreditsAppliedUSD)

@@ -234,6 +234,35 @@ WHERE team_id = sqlc.arg(team_id)
   AND hour_start < sqlc.arg(period_end)
 ORDER BY hour_start ASC;
 
+-- name: GetTeamBillingUsageRollup :one
+SELECT *
+FROM team_billing_usage
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end);
+
+-- name: ListTeamBillingPeriods :many
+SELECT *
+FROM team_billing_period
+WHERE team_id = sqlc.arg(team_id)
+ORDER BY period_start DESC
+LIMIT sqlc.arg(limit_count);
+
+-- name: GetTeamBillingPeriod :one
+SELECT *
+FROM team_billing_period
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end);
+
+-- name: GetTeamBillingPeriodForUpdate :one
+SELECT *
+FROM team_billing_period
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end)
+FOR UPDATE;
+
 -- name: UpsertTeamBillingPeriod :one
 INSERT INTO team_billing_period (team_id, period_start, period_end, status)
 VALUES (
@@ -363,6 +392,134 @@ SET resolved_at = now(),
     resolved_by = sqlc.arg(resolved_by)
 WHERE billing_period_anomaly.id = sqlc.arg(id)
   AND billing_period_anomaly.resolved_at IS NULL
+RETURNING *;
+
+-- name: GetTeamBillingAccount :one
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+FROM team_billing_account
+WHERE team_id = sqlc.arg(team_id);
+
+-- name: GetTeamBillingAccountByStripeCustomerID :one
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+FROM team_billing_account
+WHERE stripe_customer_id = sqlc.arg(stripe_customer_id);
+
+-- name: UpsertTeamBillingAccountCustomer :one
+INSERT INTO team_billing_account (team_id, stripe_customer_id)
+VALUES (sqlc.arg(team_id), sqlc.arg(stripe_customer_id))
+ON CONFLICT (team_id) DO UPDATE
+SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+    updated_at = now()
+RETURNING *;
+
+-- name: UpsertTeamBillingAccountSubscription :one
+INSERT INTO team_billing_account (
+    team_id,
+    stripe_customer_id,
+    stripe_subscription_id,
+    stripe_subscription_status,
+    stripe_invoice_status,
+    current_period_start,
+    current_period_end,
+    cancel_at_period_end
+)
+VALUES (
+    sqlc.arg(team_id),
+    sqlc.narg(stripe_customer_id),
+    sqlc.narg(stripe_subscription_id),
+    sqlc.narg(stripe_subscription_status),
+    sqlc.narg(stripe_invoice_status),
+    sqlc.narg(current_period_start),
+    sqlc.narg(current_period_end),
+    COALESCE(sqlc.narg(cancel_at_period_end), false)
+)
+ON CONFLICT (team_id) DO UPDATE
+SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_account.stripe_customer_id),
+    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, team_billing_account.stripe_subscription_id),
+    stripe_subscription_status = COALESCE(EXCLUDED.stripe_subscription_status, team_billing_account.stripe_subscription_status),
+    stripe_invoice_status = COALESCE(EXCLUDED.stripe_invoice_status, team_billing_account.stripe_invoice_status),
+    current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
+    current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
+    cancel_at_period_end = COALESCE(sqlc.narg(cancel_at_period_end), team_billing_account.cancel_at_period_end),
+    updated_at = now()
+RETURNING *;
+
+-- name: CreateBillingUsageExport :one
+INSERT INTO billing_usage_export (
+    team_id,
+    period_start,
+    period_end,
+    resource_type,
+    stripe_customer_id,
+    stripe_meter_event_identifier,
+    stripe_event_name,
+    value,
+    status,
+    error,
+    sent_at
+)
+VALUES (
+    sqlc.arg(team_id),
+    sqlc.arg(period_start),
+    sqlc.arg(period_end),
+    sqlc.arg(resource_type),
+    sqlc.narg(stripe_customer_id),
+    sqlc.arg(stripe_meter_event_identifier),
+    sqlc.arg(stripe_event_name),
+    sqlc.arg(value),
+    sqlc.arg(status),
+    sqlc.narg(error),
+    sqlc.narg(sent_at)
+)
+RETURNING *;
+
+-- name: UpdateBillingUsageExportStatus :one
+UPDATE billing_usage_export
+SET status = sqlc.arg(status),
+    error = sqlc.narg(error),
+    sent_at = COALESCE(sqlc.narg(sent_at), billing_usage_export.sent_at),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+RETURNING *;
+
+-- name: ListBillingUsageExportsForPeriod :many
+SELECT *
+FROM billing_usage_export
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end)
+ORDER BY created_at ASC;
+
+-- name: CreateStripeWebhookEvent :one
+INSERT INTO stripe_webhook_event (event_id, event_type, payload)
+VALUES (sqlc.arg(event_id), sqlc.arg(event_type), sqlc.arg(payload))
+ON CONFLICT (event_id) DO NOTHING
+RETURNING *;
+
+-- name: GetStripeWebhookEvent :one
+SELECT *
+FROM stripe_webhook_event
+WHERE event_id = sqlc.arg(event_id);
+
+-- name: GetStripeWebhookEventForUpdate :one
+SELECT *
+FROM stripe_webhook_event
+WHERE event_id = sqlc.arg(event_id)
+FOR UPDATE;
+
+-- name: MarkStripeWebhookEventProcessed :one
+UPDATE stripe_webhook_event
+SET processed_at = now(),
+    last_error = NULL,
+    updated_at = now()
+WHERE event_id = sqlc.arg(event_id)
+RETURNING *;
+
+-- name: MarkStripeWebhookEventFailed :one
+UPDATE stripe_webhook_event
+SET last_error = sqlc.arg(last_error),
+    updated_at = now()
+WHERE event_id = sqlc.arg(event_id)
 RETURNING *;
 
 -- name: IsFeatureEnabledForTeam :one
