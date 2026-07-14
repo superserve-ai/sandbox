@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2686,21 +2687,32 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 	m.log.Debug().Str("vm_id", vmID).Int("pid", pid).Msg("resolved systemd MainPID")
 }
 
-// waitForSocket blocks until the given socket path appears or the timeout
-// elapses. Falls back to polling if inotify setup fails.
+// waitForSocket blocks until the socket at path ACCEPTS connections or the
+// timeout elapses. File existence alone is not readiness: the file appears
+// at bind(), and a connect() in the bind()→listen() gap is refused.
 func waitForSocket(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if err := waitForSocketFile(path, deadline); err != nil {
+		return err
+	}
+	return waitForSocketConnectable(path, deadline)
+}
+
+// waitForSocketFile waits for the socket file to exist — inotify with a
+// polling fallback.
+func waitForSocketFile(path string, deadline time.Time) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return waitForSocketPolling(path, timeout)
+		return waitForSocketFilePolling(path, deadline)
 	}
 	defer watcher.Close()
 
 	if err := watcher.Add(filepath.Dir(path)); err != nil {
-		return waitForSocketPolling(path, timeout)
+		return waitForSocketFilePolling(path, deadline)
 	}
 
 	// Recheck after the watch is active: the socket could have appeared
@@ -2710,37 +2722,57 @@ func waitForSocket(path string, timeout time.Duration) error {
 	}
 
 	name := filepath.Base(path)
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 
 	for {
 		select {
 		case ev, ok := <-watcher.Events:
 			if !ok {
-				return waitForSocketPolling(path, timeout)
+				return waitForSocketFilePolling(path, deadline)
 			}
 			if (ev.Op&fsnotify.Create) != 0 && filepath.Base(ev.Name) == name {
 				return nil
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok || err != nil {
-				return waitForSocketPolling(path, timeout)
+				return waitForSocketFilePolling(path, deadline)
 			}
-		case <-deadline.C:
-			return fmt.Errorf("socket %s did not appear within %s", path, timeout)
+		case <-timer.C:
+			return fmt.Errorf("socket %s did not appear within deadline", path)
 		}
 	}
 }
 
-func waitForSocketPolling(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+func waitForSocketFilePolling(path string, deadline time.Time) error {
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return nil
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return fmt.Errorf("socket %s did not appear within %s", path, timeout)
+	return fmt.Errorf("socket %s did not appear within deadline", path)
+}
+
+// waitForSocketConnectable dials until the socket accepts a connection.
+// The bind()→listen() gap is normally sub-microsecond but scheduler
+// pressure under a launch burst stretches it to milliseconds, and an
+// immediate API call used to fail hard there. Fast path: one successful
+// connect+close (tens of µs).
+func waitForSocketConnectable(path string, deadline time.Time) error {
+	interval := time.Millisecond
+	for {
+		c, err := net.Dial("unix", path)
+		if err == nil {
+			c.Close()
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("socket %s not accepting connections: %w", path, err)
+		}
+		time.Sleep(interval)
+		interval = min(interval*2, 10*time.Millisecond)
+	}
 }
 
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {

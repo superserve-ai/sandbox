@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	httptransport "github.com/go-openapi/runtime/client"
@@ -99,17 +100,36 @@ type FirecrackerConfig struct {
 func newFCClient(socketPath string) *fcclient.Firecracker {
 	transport := httptransport.New(fcclient.DefaultHost, fcclient.DefaultBasePath, fcclient.DefaultSchemes)
 	transport.Transport = &http.Transport{
-		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-			addr, err := net.ResolveUnixAddr("unix", socketPath)
-			if err != nil {
-				return nil, err
-			}
-			return net.DialUnix("unix", nil, addr)
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialUnixRetryRefused(ctx, socketPath)
 		},
 	}
 	c := fcclient.NewHTTPClient(strfmt.NewFormats())
 	c.SetTransport(transport)
 	return c
+}
+
+// dialUnixRetryRefused dials the API socket, retrying briefly on a refused
+// connection: the socket file exists from bind() but refuses until
+// listen(), and scheduler pressure under a launch burst can stretch that
+// gap to milliseconds. The bound stays tight so a dead firecracker still
+// fails fast; the fast path is a single dial.
+func dialUnixRetryRefused(ctx context.Context, socketPath string) (net.Conn, error) {
+	addr, err := net.ResolveUnixAddr("unix", socketPath)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(100 * time.Millisecond)
+	interval := time.Millisecond
+	for {
+		conn, dErr := net.DialUnix("unix", nil, addr)
+		if dErr == nil || !errors.Is(dErr, syscall.ECONNREFUSED) ||
+			!time.Now().Before(deadline) || ctx.Err() != nil {
+			return conn, dErr
+		}
+		time.Sleep(interval)
+		interval = min(interval*2, 10*time.Millisecond)
+	}
 }
 
 func strPtr(s string) *string { return &s }

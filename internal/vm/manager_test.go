@@ -3,9 +3,11 @@ package vm
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -690,14 +692,32 @@ func TestInspectRecordedTrace_CountsLines(t *testing.T) {
 	}
 }
 
-func TestWaitForSocket_AlreadyPresent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sock")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
+// bindOnlySocket creates a unix socket file via bind() WITHOUT listen() —
+// the exact state a connect() gets ECONNREFUSED from. Returns the fd so the
+// test can listen() later.
+func bindOnlySocket(t *testing.T, path string) int {
+	t.Helper()
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	return fd
+}
+
+func TestWaitForSocket_AlreadyListening(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
 	if err := waitForSocket(path, time.Second); err != nil {
-		t.Errorf("waitForSocket on existing file: %v", err)
+		t.Errorf("waitForSocket on listening socket: %v", err)
 	}
 }
 
@@ -705,9 +725,15 @@ func TestWaitForSocket_AppearsAfterStart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sock")
 
+	var l net.Listener
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		_ = os.WriteFile(path, nil, 0o644)
+		l, _ = net.Listen("unix", path)
+	}()
+	defer func() {
+		if l != nil {
+			l.Close()
+		}
 	}()
 
 	start := time.Now()
@@ -729,16 +755,52 @@ func TestWaitForSocket_TimesOut(t *testing.T) {
 	}
 }
 
-func TestWaitForSocketPolling_AppearsAfterStart(t *testing.T) {
+func TestWaitForSocket_BindListenGap(t *testing.T) {
+	// The socket FILE exists (bind done) but refuses connections until
+	// listen() — waitForSocket must wait out the gap, not return early.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sock")
+	fd := bindOnlySocket(t, path)
+
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		_ = os.WriteFile(path, nil, 0o644)
+		_ = syscall.Listen(fd, 8)
 	}()
-	if err := waitForSocketPolling(path, time.Second); err != nil {
-		t.Errorf("waitForSocketPolling: %v", err)
+
+	if err := waitForSocket(path, time.Second); err != nil {
+		t.Errorf("waitForSocket across the bind→listen gap: %v", err)
 	}
+}
+
+func TestWaitForSocket_NeverListens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sock")
+	bindOnlySocket(t, path) // file exists, never listens
+
+	err := waitForSocket(path, 60*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error for a socket that never accepts")
+	}
+	if !strings.Contains(err.Error(), "not accepting connections") {
+		t.Errorf("error should name the refused state, got: %v", err)
+	}
+}
+
+func TestDialUnixRetryRefused_BindListenGap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sock")
+	fd := bindOnlySocket(t, path)
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = syscall.Listen(fd, 8)
+	}()
+
+	conn, err := dialUnixRetryRefused(context.Background(), path)
+	if err != nil {
+		t.Fatalf("dial across the bind→listen gap: %v", err)
+	}
+	conn.Close()
 }
 
 func TestShouldWriteDiff(t *testing.T) {
