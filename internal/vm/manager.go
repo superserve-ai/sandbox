@@ -2743,20 +2743,22 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	socketWait := 5 * time.Second
 	if replacingLive {
-		extra := 12 * time.Second
-		if dl, ok := ctx.Deadline(); ok {
-			extra = min(extra, time.Until(dl))
-		}
-		if extra > 0 {
-			socketWait += extra
-		}
+		socketWait = 17 * time.Second // 5s + the stop-phase margin
+	}
+	// waitForSocket ignores ctx, so cap the TOTAL wait at the caller's
+	// remaining deadline — otherwise it overruns, the ctx expires, and the
+	// stopUnit cleanup below runs on a dead context and leaves the unit up.
+	if dl, ok := ctx.Deadline(); ok {
+		socketWait = min(socketWait, time.Until(dl))
 	}
 	err := waitForSocket(socketPath, socketWait)
 	if err != nil {
 		status := unitFailureSummary(ctx, systemdUnitName(vmID))
 		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
 			Msg("firecracker socket missing after launch")
-		_ = stopUnit(ctx, systemdUnitName(vmID))
+		// Detached budget: the caller's ctx may be at its deadline here, and
+		// this stop must run or the just-launched unit leaks.
+		_ = stopUnitWithBudget(ctx, systemdUnitName(vmID))
 		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
 	}
 	tSocketReady := time.Now()

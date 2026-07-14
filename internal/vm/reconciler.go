@@ -363,17 +363,19 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed("pausedunit:"+id, now) {
 				continue
 			}
-			if !r.consumeAutoFailBudget(id) {
-				r.writeAudit(ctx, id, "budget_exhausted", "paused_unit_stop suppressed by rate limit", "systemd_active_db_paused")
-				continue
-			}
-			// Skip (not block) if a launch/pause is in flight for this
-			// vmID: the DB snapshot is from the top of the pass, and a
-			// resume could have claimed and relaunched this exact unit
-			// since. TryLock keeps the single-threaded pass moving; a
-			// genuinely stale unit is reclaimed next tick.
+			// Take the lock BEFORE spending budget: if a launch/pause is in
+			// flight for this vmID (DB snapshot is from the top of the pass;
+			// a resume may have claimed and relaunched this unit since),
+			// TryLock fails and we skip — without burning an auto-fail slot
+			// on a stop we won't perform. A genuinely stale unit is
+			// reclaimed next tick.
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "systemd_active_db_paused")
 				continue
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
@@ -384,7 +386,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop paused sandbox's unit")
 				continue
 			}
-			r.writeAudit(ctx, id, "paused_unit_stop", "unit still running for paused sandbox", "systemd_active_db_paused")
+			// Reuse the orphan_stop action (both stop a unit that shouldn't
+			// run); the drift_kind column carries the paused-specific detail.
+			r.writeAudit(ctx, id, "orphan_stop", "unit still running for paused sandbox", "systemd_active_db_paused")
 			r.clearDrift("pausedunit:" + id)
 		}
 	}
