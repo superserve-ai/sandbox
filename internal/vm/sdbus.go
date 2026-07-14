@@ -34,6 +34,7 @@ import (
 
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
+	zlog "github.com/rs/zerolog/log"
 )
 
 // systemdDBusEnabled gates the D-Bus path; set once at startup from
@@ -90,6 +91,14 @@ func sdbusAcquire() *sddbus.Conn {
 // while every caller keeps exec-falling-back.
 func sdbusDial() {
 	conn, err := sddbus.NewSystemdConnectionContext(context.Background())
+
+	// The dial outcome is the only signal of which transport the helpers
+	// are using — surfaced for the flag rollout.
+	if err != nil {
+		zlog.Warn().Err(err).Msg("systemd dbus dial failed; helpers exec systemctl")
+	} else {
+		zlog.Info().Msg("systemd dbus connected")
+	}
 
 	sdbus.mu.Lock()
 	sdbus.dialing = false
