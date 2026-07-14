@@ -2821,7 +2821,9 @@ var probeBoxdHealth = waitForHTTPHealth
 // retriedLaunchTarget returns the tracked instance for vmID when a resume or
 // restore request is a retry of one that already completed: Running, SAME
 // artifacts (a different snapshot must replace the VM as before), and boxd
-// answering. Detached probe ctx — a spent retry deadline must not
+// answering. A deliberate reset-to-snapshot flow (none exists today) must
+// NOT reuse these RPCs as-is — it would need an explicit signal to bypass
+// this guard. Detached probe ctx — a spent retry deadline must not
 // false-negative a healthy VM into replacement; post-probe identity recheck
 // drops a VM destroyed during the probe.
 func (m *Manager) retriedLaunchTarget(ctx context.Context, vmID, snapshotPath, memPath string) *VMInstance {
