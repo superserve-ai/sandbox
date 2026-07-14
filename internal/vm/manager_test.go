@@ -1028,3 +1028,22 @@ func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
 		t.Fatal("a dead-unit Running record must not be returned as a retry target")
 	}
 }
+
+func TestInstanceRunning(t *testing.T) {
+	m := &Manager{
+		log: zerolog.Nop(),
+		vms: map[string]*VMInstance{
+			"run":   {ID: "run", Status: StatusRunning},
+			"pause": {ID: "pause", Status: StatusPaused},
+		},
+	}
+	if !m.instanceRunning("run") {
+		t.Fatal("running instance must report running")
+	}
+	if m.instanceRunning("pause") {
+		t.Fatal("paused instance must not report running (a genuine stale-unit target)")
+	}
+	if m.instanceRunning("absent") {
+		t.Fatal("absent instance must not report running")
+	}
+}

@@ -271,6 +271,21 @@ type Manager struct {
 	vmOpLocks sync.Map
 }
 
+// instanceRunning reports whether vmID's tracked instance is Running — the
+// authoritative signal that a resume/restore completed, used by the
+// reconciler to avoid stopping a just-relaunched unit.
+func (m *Manager) instanceRunning(vmID string) bool {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.Status == StatusRunning
+}
+
 // vmOpCh returns vmID's capacity-1 lock channel, creating it once.
 func (m *Manager) vmOpCh(vmID string) chan struct{} {
 	if v, ok := m.vmOpLocks.Load(vmID); ok {
@@ -1507,8 +1522,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.lazyReattach(vmID)
 
 	// Retried restore (response lost mid-RPC): re-restoring a VM the prior
-	// attempt brought up would roll the guest back to the snapshot. Healthy
-	// boxd proves the prior restore completed — return that VM instead.
+	// attempt brought up would roll the guest back to the snapshot. A live
+	// unit proves the prior restore completed — return that VM instead.
 	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
@@ -2778,8 +2793,11 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// waitForSocket ignores ctx, so cap the TOTAL wait at the caller's
 	// remaining deadline — otherwise it overruns, the ctx expires, and the
 	// stopUnit cleanup below runs on a dead context and leaves the unit up.
+	// Floor it so a launch reached late in the deadline still gets a real
+	// chance: a ~0 cap would reap a healthy VM whose socket is milliseconds
+	// away. A small overrun of a near-spent deadline is the lesser evil.
 	if dl, ok := ctx.Deadline(); ok {
-		socketWait = min(socketWait, time.Until(dl))
+		socketWait = max(2*time.Second, min(socketWait, time.Until(dl)))
 	}
 	err := waitForSocket(socketPath, socketWait)
 	if err != nil {

@@ -373,6 +373,17 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !ok {
 				continue
 			}
+			// Re-check liveness under the lock against the AUTHORITATIVE
+			// in-memory record, not the top-of-pass DB snapshot: a resume
+			// can complete mid-pass (relaunch the unit, set Running, release
+			// the lock) so tryLock succeeds while the snapshot still says
+			// paused. Stopping then would kill the freshly-resumed VM. A
+			// genuine stale unit has a Paused/absent record, not Running.
+			if r.mgr.instanceRunning(id) {
+				unlockOp()
+				r.clearDrift("pausedunit:" + id)
+				continue
+			}
 			if !r.consumeAutoFailBudget(id) {
 				unlockOp()
 				r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "systemd_active_db_paused")

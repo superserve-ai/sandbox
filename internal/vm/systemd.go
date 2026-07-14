@@ -59,7 +59,8 @@ func stopUnit(ctx context.Context, unit string) error {
 }
 
 // stopUnitBudget covers `systemctl stop` blocking up to TimeoutStopSec plus
-// margin for host I/O contention. Each stop attempt gets its own.
+// margin for host I/O contention. The pause path caps its whole stop phase
+// at this OR the caller's remaining deadline, whichever is shorter.
 const stopUnitBudget = 15 * time.Second
 
 // stopUnitWithBudget stops a unit on a detached context with its own budget,
