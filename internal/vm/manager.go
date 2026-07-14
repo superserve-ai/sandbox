@@ -1428,6 +1428,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
 
+	if vmID == "" {
+		vmID = uuid.New().String()
+	}
+
+	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
+	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
+	// it — instead of racing into the inPlace block and stopping it. Taken
+	// BEFORE restoreSem so a retry storm for one vmID blocks on the mutex
+	// without holding scarce restore slots, which would starve other VMs.
+	unlockOp := m.lockVMOp(vmID)
+	defer unlockOp()
+
 	// Bound concurrent restores so a burst of sandbox creates doesn't
 	// saturate host file I/O, netns setup, tmpfs, and Firecracker boots.
 	// Fail fast with ctx.Err() if the caller's deadline fires while we
@@ -1439,16 +1451,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
-
-	if vmID == "" {
-		vmID = uuid.New().String()
-	}
-
-	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
-	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
-	// it — instead of racing into the inPlace block and stopping it.
-	unlockOp := m.lockVMOp(vmID)
-	defer unlockOp()
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -2888,6 +2890,14 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 // drops an instance a concurrent destroy removed.
 //
 // A reset-to-snapshot flow (none today) must not reuse these RPCs as-is.
+// vmUnitDead reports a VM's systemd unit as definitively not-active;
+// swappable in tests. Inconclusive answers read as alive (not dead).
+var vmUnitDead = func(vmID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
+}
+
 func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMInstance {
 	m.mu.RLock()
 	existing := m.vms[vmID]
@@ -2900,6 +2910,15 @@ func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMIns
 	sameArtifacts := existing.SnapshotPath == snapshotPath && existing.MemFilePath == memPath
 	existing.mu.RUnlock()
 	if !running || !sameArtifacts {
+		return nil
+	}
+	// Process-level liveness, not boxd readiness: a record can read Running
+	// while the firecracker died (crash while vmd was down, then a
+	// cleanupStale=false reattach loads it). A slow-booting VM's unit is
+	// still active, so this catches a corpse without false-negativing a
+	// warming one — the trap the removed boxd probe fell into. Inconclusive
+	// (systemctl slow) reads as alive: never relaunch on doubt.
+	if vmUnitDead(vmID) {
 		return nil
 	}
 	m.mu.RLock()
