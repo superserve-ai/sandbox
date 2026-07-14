@@ -348,7 +348,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Drift 5: systemd unit active, DB says paused — an interrupted pause
+	// Drift 6: systemd unit active, DB says paused — an interrupted pause
 	// stop left the old firecracker pinning guest RAM; stop it. DB rows
 	// only: a mid-resume sandbox reads 'resuming' there, clearing the
 	// drift, while its BoltDB record stays Paused until the resume
@@ -367,9 +367,20 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				r.writeAudit(ctx, id, "budget_exhausted", "paused_unit_stop suppressed by rate limit", "systemd_active_db_paused")
 				continue
 			}
+			// Skip (not block) if a launch/pause is in flight for this
+			// vmID: the DB snapshot is from the top of the pass, and a
+			// resume could have claimed and relaunched this exact unit
+			// since. TryLock keeps the single-threaded pass moving; a
+			// genuinely stale unit is reclaimed next tick.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
 			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
 				Msg("live unit for paused sandbox — stopping")
-			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+			err := stopUnit(ctx, systemdUnitName(id))
+			unlockOp()
+			if err != nil {
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop paused sandbox's unit")
 				continue
 			}

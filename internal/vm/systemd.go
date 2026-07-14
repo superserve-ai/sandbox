@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // systemdUnitName returns the systemd unit name for a sandbox.
@@ -55,6 +56,19 @@ func stopUnit(ctx context.Context, unit string) error {
 		return fmt.Errorf("systemctl stop %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// stopUnitBudget covers `systemctl stop` blocking up to TimeoutStopSec plus
+// margin for host I/O contention. Each stop attempt gets its own.
+const stopUnitBudget = 15 * time.Second
+
+// stopUnitWithBudget stops a unit on a detached context with its own budget,
+// so the caller's possibly-spent deadline can't starve a stop that must
+// happen (e.g. after a pause's snapshot already landed).
+func stopUnitWithBudget(ctx context.Context, unit string) error {
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopUnitBudget)
+	defer cancel()
+	return stopUnit(c, unit)
 }
 
 // unitLingering reports whether the unit has a live or winding-down process

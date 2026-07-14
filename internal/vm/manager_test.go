@@ -881,9 +881,6 @@ func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
 }
 
 func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := probeBoxdHealth
-	probeBoxdHealth = func(ctx context.Context, vmIP string, timeout time.Duration) error { return nil }
-	defer func() { probeBoxdHealth = orig }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
@@ -919,9 +916,6 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 }
 
 func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
-	orig := probeBoxdHealth
-	probeBoxdHealth = func(ctx context.Context, vmIP string, timeout time.Duration) error { return nil }
-	defer func() { probeBoxdHealth = orig }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
@@ -951,9 +945,6 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 }
 
 func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := probeBoxdHealth
-	probeBoxdHealth = func(ctx context.Context, vmIP string, timeout time.Duration) error { return nil }
-	defer func() { probeBoxdHealth = orig }()
 
 	existing := &VMInstance{
 		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
@@ -968,5 +959,29 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	if inst != existing {
 		t.Fatal("expected the existing running instance, not a relaunch")
+	}
+}
+
+func TestVMOpLock_SerializesSameID_TryLockSkips(t *testing.T) {
+	m := &Manager{log: zerolog.Nop()}
+
+	unlock := m.lockVMOp("vm-1")
+	// A different vmID is independent — must acquire freely.
+	if u2, ok := m.tryLockVMOp("vm-2"); !ok {
+		t.Fatal("different vmID must not contend")
+	} else {
+		u2()
+	}
+	// The held vmID must not be re-acquirable (this is what makes the
+	// reconciler skip a unit a launch is mid-flight on).
+	if _, ok := m.tryLockVMOp("vm-1"); ok {
+		t.Fatal("held vmID must fail TryLock")
+	}
+	unlock()
+	// Released — now acquirable.
+	if u, ok := m.tryLockVMOp("vm-1"); !ok {
+		t.Fatal("released vmID must be acquirable")
+	} else {
+		u()
 	}
 }
