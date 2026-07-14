@@ -2005,14 +2005,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // Sandbox Pause
 // ---------------------------------------------------------------------------
 
-// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A pause
-// that timed out or hit a transient error may have actually COMPLETED on the
-// host (the RPC deadline fired after vmd persisted paused), so reverting the
-// DB row to active on that error would drift DB-active against a paused VM.
-// PauseVM is idempotent — the retry blocks on vmd's per-sandbox lock until any
-// in-flight pause finishes, then its already-paused guard returns the recorded
-// snapshot, converging the DB to paused instead of a false revert. NotFound is
-// terminal (the VM is genuinely gone) and returns immediately.
+// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
+// timed-out pause may have actually completed on the host, so reverting the
+// row to active would drift it against a paused VM; PauseVM is idempotent, so
+// the retry returns the recorded snapshot and the row converges to paused.
+// NotFound is terminal — the VM is genuinely gone.
 func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (snapshotPath, memPath string, err error) {
 	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
 	snapshotPath, memPath, err = vmd.PauseInstance(ctx, id, "")
