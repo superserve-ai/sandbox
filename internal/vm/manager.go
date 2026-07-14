@@ -2692,27 +2692,41 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 // at bind(), and a connect() in the bind()→listen() gap is refused.
 func waitForSocket(path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	if err := waitForSocketFile(path, deadline); err != nil {
+	if err := waitForSocketFile(path, deadline, timeout); err != nil {
 		return err
 	}
-	return waitForSocketConnectable(path, deadline)
+	// The connect phase gets its own bounded window from file-appearance:
+	// capped at 1s so a process that bound and then died fails fast (its
+	// socket refuses just like the gap does), floored at 250ms so a socket
+	// appearing at the edge of the file budget still gets a real chance to
+	// reach listen() — a bounded overrun of the nominal timeout.
+	connWindow := min(time.Until(deadline), time.Second)
+	connWindow = max(connWindow, 250*time.Millisecond)
+	return waitForSocketConnectable(path, time.Now().Add(connWindow))
+}
+
+// WaitForAPISocket is the exported readiness wait for a firecracker API
+// socket: file existence AND accepting connections. For use by every
+// spawn site, in and out of this package.
+func WaitForAPISocket(path string, timeout time.Duration) error {
+	return waitForSocket(path, timeout)
 }
 
 // waitForSocketFile waits for the socket file to exist — inotify with a
-// polling fallback.
-func waitForSocketFile(path string, deadline time.Time) error {
+// polling fallback. timeout is only for the error message.
+func waitForSocketFile(path string, deadline time.Time, timeout time.Duration) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return waitForSocketFilePolling(path, deadline)
+		return waitForSocketFilePolling(path, deadline, timeout)
 	}
 	defer watcher.Close()
 
 	if err := watcher.Add(filepath.Dir(path)); err != nil {
-		return waitForSocketFilePolling(path, deadline)
+		return waitForSocketFilePolling(path, deadline, timeout)
 	}
 
 	// Recheck after the watch is active: the socket could have appeared
@@ -2729,36 +2743,39 @@ func waitForSocketFile(path string, deadline time.Time) error {
 		select {
 		case ev, ok := <-watcher.Events:
 			if !ok {
-				return waitForSocketFilePolling(path, deadline)
+				return waitForSocketFilePolling(path, deadline, timeout)
 			}
 			if (ev.Op&fsnotify.Create) != 0 && filepath.Base(ev.Name) == name {
 				return nil
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok || err != nil {
-				return waitForSocketFilePolling(path, deadline)
+				return waitForSocketFilePolling(path, deadline, timeout)
 			}
 		case <-timer.C:
-			return fmt.Errorf("socket %s did not appear within deadline", path)
+			return fmt.Errorf("socket %s did not appear within %s", path, timeout)
 		}
 	}
 }
 
-func waitForSocketFilePolling(path string, deadline time.Time) error {
+func waitForSocketFilePolling(path string, deadline time.Time, timeout time.Duration) error {
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return nil
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return fmt.Errorf("socket %s did not appear within deadline", path)
+	return fmt.Errorf("socket %s did not appear within %s", path, timeout)
 }
 
 // waitForSocketConnectable dials until the socket accepts a connection.
 // The bind()→listen() gap is normally sub-microsecond but scheduler
 // pressure under a launch burst stretches it to milliseconds, and an
-// immediate API call used to fail hard there. Fast path: one successful
-// connect+close (tens of µs).
+// immediate API call used to fail hard there. ONLY a refused connection
+// (the gap, or a dead process's lingering socket) is worth waiting out;
+// any other error — ENOENT from a teardown race, ENOTSOCK, EACCES — is
+// surfaced immediately. Fast path: one successful connect+close (tens
+// of µs).
 func waitForSocketConnectable(path string, deadline time.Time) error {
 	interval := time.Millisecond
 	for {
@@ -2766,6 +2783,9 @@ func waitForSocketConnectable(path string, deadline time.Time) error {
 		if err == nil {
 			c.Close()
 			return nil
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			return fmt.Errorf("socket %s: %w", path, err)
 		}
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("socket %s not accepting connections: %w", path, err)
