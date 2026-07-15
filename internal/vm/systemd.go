@@ -36,6 +36,10 @@ func restartUnit(ctx context.Context, unit string) error {
 		}
 		return nil
 	}
+	// At-least-once: a reply lost mid-call reads as unhandled and re-drives
+	// here, possibly replace-restarting the job the lost call already
+	// enqueued. Accepted — the ambiguity is irreducible without job
+	// tracking, and the replace converges to one fresh process.
 	cmd := exec.CommandContext(ctx, "systemctl", "restart", "--no-block", unit)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
