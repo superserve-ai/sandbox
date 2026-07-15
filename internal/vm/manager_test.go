@@ -837,3 +837,227 @@ func TestWaitForPIDExit_DeadProcessReturnsPromptly(t *testing.T) {
 		t.Errorf("returned after %v; expected a prompt return once the process exited", elapsed)
 	}
 }
+
+func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		SnapshotPath: snapPath,
+		MemFilePath:  memPath,
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+
+	snap, mem, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	if err != nil {
+		t.Fatalf("retried pause of a paused VM should succeed, got %v", err)
+	}
+	if snap != snapPath || mem != memPath {
+		t.Fatalf("got (%q, %q), want the recorded snapshot artifacts", snap, mem)
+	}
+}
+
+func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
+	dir := t.TempDir()
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		SnapshotPath: filepath.Join(dir, "gone-vmstate.snap"),
+		MemFilePath:  filepath.Join(dir, "gone-mem.snap"),
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+
+	_, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for dangling artifacts, got %v", err)
+	}
+}
+
+func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	if err != nil {
+		t.Fatalf("retried restore of a healthy running VM should succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing running instance, not a re-restore")
+	}
+	mgr.mu.RLock()
+	still := mgr.vms["vm-1"]
+	mgr.mu.RUnlock()
+	if still != existing {
+		t.Fatal("existing instance must remain tracked untouched")
+	}
+}
+
+func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The live VM was restored from other artifacts: the request must NOT
+	// short-circuit to it, even with boxd healthy.
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: filepath.Join(dir, "old-vmstate.snap"),
+		MemFilePath:  filepath.Join(dir, "old-mem.snap"),
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	inst, _ := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	if inst == existing {
+		t.Fatal("a restore for different artifacts must not return the old VM")
+	}
+}
+
+func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	if err != nil {
+		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing running instance, not a relaunch")
+	}
+}
+
+func TestVMOpLock_SerializesSameID_TryLockSkips(t *testing.T) {
+	m := &Manager{log: zerolog.Nop()}
+
+	unlock, err := m.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A different vmID is independent — must acquire freely.
+	if u2, ok := m.tryLockVMOp("vm-2"); !ok {
+		t.Fatal("different vmID must not contend")
+	} else {
+		u2()
+	}
+	// The held vmID must not be re-acquirable (this is what makes the
+	// reconciler skip a unit a launch is mid-flight on).
+	if _, ok := m.tryLockVMOp("vm-1"); ok {
+		t.Fatal("held vmID must fail TryLock")
+	}
+	// A queued acquire whose context is already cancelled returns ctx.Err()
+	// instead of waiting for the lock — no abandoned pause/restore work.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.lockVMOp(cancelled, "vm-1"); err == nil {
+		t.Fatal("cancelled context must not acquire a held lock")
+	}
+	// Free lock + already-cancelled ctx: even if the random select picks
+	// the send case, the post-acquire recheck must release and return err,
+	// not leave the lock held.
+	freeCancel, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if u, err := m.lockVMOp(freeCancel, "vm-free"); err == nil {
+		u()
+		t.Fatal("cancelled ctx must not acquire even a free lock")
+	}
+	if u, ok := m.tryLockVMOp("vm-free"); !ok {
+		t.Fatal("a cancelled acquire must not leave the lock held")
+	} else {
+		u()
+	}
+	unlock()
+	// Released — now acquirable.
+	if u, ok := m.tryLockVMOp("vm-1"); !ok {
+		t.Fatal("released vmID must be acquirable")
+	} else {
+		u()
+	}
+}
+
+func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
+	// A record can read Running while the firecracker process is gone. The
+	// retry guard must not hand back that corpse — it must fall through to
+	// a fresh restore.
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return true } // unit definitively dead
+	defer func() { vmUnitDead = orig }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	if got := m.retriedLaunchTarget("vm-1", snapPath, memPath); got != nil {
+		t.Fatal("a dead-unit Running record must not be returned as a retry target")
+	}
+}
+
+func TestInstanceRunning(t *testing.T) {
+	m := &Manager{
+		log: zerolog.Nop(),
+		vms: map[string]*VMInstance{
+			"run":   {ID: "run", Status: StatusRunning},
+			"pause": {ID: "pause", Status: StatusPaused},
+		},
+	}
+	if !m.instanceRunning("run") {
+		t.Fatal("running instance must report running")
+	}
+	if m.instanceRunning("pause") {
+		t.Fatal("paused instance must not report running (a genuine stale-unit target)")
+	}
+	if m.instanceRunning("absent") {
+		t.Fatal("absent instance must not report running")
+	}
+}

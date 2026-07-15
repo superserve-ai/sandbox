@@ -2393,3 +2393,40 @@ func TestListSandboxFiles_PathTraversalRejected(t *testing.T) {
 		t.Error("ListDir should not be called for a traversal path")
 	}
 }
+
+func TestPauseWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
+	calls := 0
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, id, dir string) (string, string, error) {
+		calls++
+		if calls == 1 {
+			return "", "", context.DeadlineExceeded
+		}
+		return "/snap/vmstate.snap", "/snap/mem.snap", nil
+	}}
+	snap, mem, err := pauseWithRetry(context.Background(), vmd, "vm-1")
+	if err != nil {
+		t.Fatalf("retry should recover a transient failure, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 1 retry (2 calls), got %d", calls)
+	}
+	if snap == "" || mem == "" {
+		t.Fatalf("expected snapshot artifacts, got (%q,%q)", snap, mem)
+	}
+}
+
+func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
+	calls := 0
+	notFound := status.Error(codes.NotFound, "no such vm")
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, id, dir string) (string, string, error) {
+		calls++
+		return "", "", notFound
+	}}
+	_, _, err := pauseWithRetry(context.Background(), vmd, "vm-1")
+	if !isVMDNotFound(err) {
+		t.Fatalf("expected NotFound to surface, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("NotFound must not be retried, got %d calls", calls)
+	}
+}
