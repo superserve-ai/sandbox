@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -256,6 +257,77 @@ type Manager struct {
 	// until process exit so late pollers can read terminal outcomes.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
+
+	// vmOpLocks serializes lifecycle operations (restore, resume, pause) for
+	// a single vmID, so a retry or a concurrent actor can't stomp an
+	// in-flight launch (kill a still-booting VM, re-diff a consumed dirty
+	// bitmap). Keyed by vmID → chan struct{}{} used as a capacity-1
+	// semaphore, so acquisition can honor the caller's context. Entries are
+	// never deleted: vmIDs are unique UUIDs so they don't collide, and
+	// deleting on destroy would let a same-vmID retry acquire a fresh lock
+	// and lose mutual exclusion. DestroyVM deliberately does NOT take these
+	// locks — it must interrupt a wedged op (a hung firecracker socket call
+	// holds the lock until destroy SIGKILLs the process), so blocking it
+	// would turn a recoverable wedge into a permanent hang.
+	vmOpLocks sync.Map
+}
+
+// instanceRunning reports whether vmID's tracked instance is Running — the
+// authoritative signal that a resume/restore completed, used by the
+// reconciler to avoid stopping a just-relaunched unit.
+func (m *Manager) instanceRunning(vmID string) bool {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.Status == StatusRunning
+}
+
+// vmOpCh returns vmID's capacity-1 lock channel, creating it once.
+func (m *Manager) vmOpCh(vmID string) chan struct{} {
+	if v, ok := m.vmOpLocks.Load(vmID); ok {
+		return v.(chan struct{})
+	}
+	v, _ := m.vmOpLocks.LoadOrStore(vmID, make(chan struct{}, 1))
+	return v.(chan struct{})
+}
+
+// lockVMOp acquires vmID's lifecycle lock, honoring ctx while it waits — a
+// caller whose deadline expires in the queue behind another op returns
+// ctx.Err() instead of running abandoned pause/restore work. The returned
+// func releases it. Never called from a read/reattach path (not reentrant)
+// or from DestroyVM (see vmOpLocks).
+func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
+	ch := m.vmOpCh(vmID)
+	select {
+	case ch <- struct{}{}:
+		// select picks a ready case at random, so an already-cancelled
+		// caller can win the send even though ctx is done. Re-check and
+		// release rather than run abandoned work.
+		if err := ctx.Err(); err != nil {
+			<-ch
+			return nil, err
+		}
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// tryLockVMOp acquires vmID's lifecycle lock without blocking. ok=false
+// means an operation is in flight for this vmID and the caller must not act.
+func (m *Manager) tryLockVMOp(vmID string) (unlock func(), ok bool) {
+	ch := m.vmOpCh(vmID)
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, true
+	default:
+		return nil, false
+	}
 }
 
 // NewManager creates a new VM manager.
@@ -643,12 +715,36 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 
 // PauseVM snapshots the VM state and then stops the process.
 func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
+	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
+	// waits, then hits the already-paused guard.
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return "", "", err
+	}
+	defer unlockOp()
+
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return "", "", err
 	}
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
+
+	// Retried pause (response lost mid-RPC): re-snapshotting a stopped VM
+	// dials a dead socket and ends with the record deleted. Return the
+	// recorded artifacts instead — after confirming they still exist, like
+	// ResumeVM does before acting on a record.
+	inst.mu.RLock()
+	if inst.Status == StatusPaused && inst.SnapshotPath != "" && inst.MemFilePath != "" {
+		snapshotPath, memPath = inst.SnapshotPath, inst.MemFilePath
+		inst.mu.RUnlock()
+		if !fileExists(snapshotPath) || !fileExists(memPath) {
+			return "", "", status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
+		}
+		log.Info().Msg("pause: VM already paused, returning existing snapshot")
+		return snapshotPath, memPath, nil
+	}
+	inst.mu.RUnlock()
 
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
@@ -759,10 +855,26 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 	}
 
-	// Stop the Firecracker process — snapshot is already on disk.
-	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
-		log.Warn().Err(err).Msg("systemctl stop failed during pause")
+	// Stop the Firecracker process — snapshot is already on disk. A stop
+	// that fails must NOT fail the pause: the artifacts are valid and the
+	// record must reach Paused (a retry against a Running record would
+	// re-diff an already-consumed dirty bitmap and destroy the overlay).
+	//
+	// Bound the stop path (both attempts + dead-check) to the caller's
+	// deadline so the handler can't run long past the ~30s pause RPC cap
+	// (stopUnit's expiry settle may probe ≤2s past it — bounded, and it only
+	// affects the log below, never what gets persisted). A timed-out pause
+	// converges anyway: the control plane retries pause to paused rather than
+	// reverting, and a straggler unit is reclaimed by the reconciler.
+	unit := systemdUnitName(vmID)
+	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
+	if err := stopUnit(stopCtx, unit); err != nil {
+		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
+		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
+			log.Error().Err(serr).Msg("unit still running after pause; reconciler will reclaim it")
+		}
 	}
+	stopCancel()
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
@@ -887,6 +999,14 @@ func fileExists(path string) bool {
 func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
+	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
+	// waits, then is recognized as a retry rather than relaunching.
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockOp()
+
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return nil, err
@@ -900,6 +1020,15 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 	if snapshotPath == "" || memPath == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
+	}
+
+	// Retried resume (response lost mid-RPC): the VM may already be up from
+	// the prior attempt. Relaunching would kill it and roll the guest back
+	// to the snapshot, so return the live instance — same guard as the
+	// stateless restore path.
+	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+		log.Info().Msg("resume: VM already running and healthy, returning it")
+		return existing, nil
 	}
 
 	// Verify the snapshot files actually exist on disk. DB can claim
@@ -1086,6 +1215,14 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 
+	// Serialize same-vmID lifecycle ops (see lockVMOp): the throwaway
+	// firecracker must not race a concurrent resume onto the same unit.
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return "", err
+	}
+	defer unlockOp()
+
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return "", err
@@ -1141,7 +1278,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
-	defer func() { _ = stopUnit(context.Background(), systemdUnitName(vmID)) }()
+	defer func() { _ = stopUnitWithBudget(context.Background(), systemdUnitName(vmID)) }()
 
 	if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
 		return "", err
@@ -1338,6 +1475,33 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
 
+	if vmID == "" {
+		vmID = uuid.New().String()
+	}
+
+	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
+	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
+	// it — instead of racing into the inPlace block and stopping it. Taken
+	// BEFORE restoreSem so a retry storm for one vmID blocks on the lock
+	// without holding scarce restore slots, which would starve other VMs.
+	unlockOp, lerr := m.lockVMOp(ctx, vmID)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlockOp()
+
+	// Retried restore (response lost mid-RPC): re-restoring a VM the prior
+	// attempt brought up would roll the guest back to the snapshot. A live
+	// unit proves the prior restore completed — return that VM instead.
+	// Checked BEFORE restoreSem so a no-op retry never consumes a scarce
+	// restore slot (or fails on the semaphore when all slots are busy).
+	// lazyReattach loads a paused VM the background reattach hasn't reached.
+	m.lazyReattach(vmID)
+	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+		log.Info().Msg("restore: VM already running and healthy, returning it")
+		return existing, nil
+	}
+
 	// Bound concurrent restores so a burst of sandbox creates doesn't
 	// saturate host file I/O, netns setup, tmpfs, and Firecracker boots.
 	// Fail fast with ctx.Err() if the caller's deadline fires while we
@@ -1349,10 +1513,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
-
-	if vmID == "" {
-		vmID = uuid.New().String()
-	}
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -1374,11 +1534,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
-
-	// Load a paused VM the background reattach hasn't reached yet, so the inPlace
-	// path below reuses its slot instead of allocating a fresh one. No-op for a
-	// new VM (not in BoltDB).
-	m.lazyReattach(vmID)
 
 	m.mu.Lock()
 	_, inPlace := m.vms[vmID]
@@ -1606,8 +1761,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			break
 		}
 		m.stopUnitDuringRestoreError(vmID)
-		// systemctl start is a no-op on an active unit, so retry only when the
-		// unit is affirmatively dead — an inconclusive answer reads as alive.
+		// Retry only when the unit is affirmatively dead — an inconclusive
+		// answer reads as alive. Launches would replace a live leftover,
+		// but "not confirmed dead" means systemctl itself is struggling;
+		// kept conservative.
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
 		checkCancel()
@@ -2426,15 +2583,24 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		warmup = time.Duration(m.cfg.UffdRecordMaxSeconds) * time.Second
 	}
 
+	// Bounded, not Background: an unbounded destroy could pin the shared
+	// systemd job lock behind a wedged PID1 and queue every stop on the host.
+	// The clock starts at the destroy, not before the warmup sleep.
+	destroyRecordingVM := func() error {
+		dctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		return m.DestroyVM(dctx, inst.ID, true)
+	}
+
 	if recordWarmup(ctx, warmup) == warmupCancelled {
-		if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
+		if err := destroyRecordingVM(); err != nil {
 			m.log.Warn().Err(err).Str("template_vm", vmID).
 				Msg("destroy after cancelled recording warmup failed; reconciler will clean up")
 		}
 		return ctx.Err()
 	}
 
-	if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
+	if err := destroyRecordingVM(); err != nil {
 		return fmt.Errorf("destroy recording VM: %w", err)
 	}
 
@@ -2621,15 +2787,41 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
 
+	// Replacing a live (or still winding down) stale unit spends the stop
+	// phase (TimeoutStopSec 10s) before the fresh process can even fork, so
+	// it needs a bigger socket budget. Decided up front: with Type=simple
+	// the restart job clears at fork, before the socket exists, so no
+	// at-timeout probe can tell a just-replaced unit from a stalled fresh
+	// one.
+	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
+
 	tStartUnit := time.Now()
-	if err := startUnit(ctx, systemdUnitName(vmID)); err != nil {
+	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
 		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
 	tStartUnitDone := time.Now()
 
-	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+	socketWait := 5 * time.Second
+	if replacingLive {
+		socketWait = 17 * time.Second // 5s + the stop-phase margin
+	}
+	// waitForSocket ignores ctx, so cap the TOTAL wait at the caller's
+	// remaining deadline — otherwise it overruns, the ctx expires, and the
+	// stopUnit cleanup below runs on a dead context and leaves the unit up.
+	// Floor it so a launch reached late in the deadline still gets a real
+	// chance: a ~0 cap would reap a healthy VM whose socket is milliseconds
+	// away. A small overrun of a near-spent deadline is the lesser evil.
+	if dl, ok := ctx.Deadline(); ok {
+		socketWait = max(2*time.Second, min(socketWait, time.Until(dl)))
+	}
+	err := waitForSocket(socketPath, socketWait)
+	if err != nil {
 		status := unitFailureSummary(ctx, systemdUnitName(vmID))
-		_ = stopUnit(ctx, systemdUnitName(vmID))
+		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
+			Msg("firecracker socket missing after launch")
+		// Detached budget: the caller's ctx may be at its deadline here, and
+		// this stop must run or the just-launched unit leaks.
+		_ = stopUnitWithBudget(ctx, systemdUnitName(vmID))
 		return 0, fmt.Errorf("wait for socket (unit %s): %w", status, err)
 	}
 	tSocketReady := time.Now()
@@ -2651,6 +2843,14 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 // unitMainPID returns the systemd MainPID for a VM's unit, or 0 when it can't
 // be resolved or the unit has no running process.
 func (m *Manager) unitMainPID(ctx context.Context, vmID string) int {
+	if val, notLoaded, ok := sdbusUnitProperty(ctx, systemdUnitName(vmID), "Service", "MainPID"); ok {
+		if notLoaded {
+			return 0 // unit gone == no process, definitively
+		}
+		if pid, isU32 := val.(uint32); isU32 {
+			return int(pid)
+		}
+	}
 	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID)).Output()
 	if err != nil {
 		return 0
@@ -2686,21 +2886,46 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 	m.log.Debug().Str("vm_id", vmID).Int("pid", pid).Msg("resolved systemd MainPID")
 }
 
-// waitForSocket blocks until the given socket path appears or the timeout
-// elapses. Falls back to polling if inotify setup fails.
+// waitForSocket blocks until the socket at path ACCEPTS connections or the
+// timeout elapses. File existence alone is not readiness: the file appears
+// at bind(), and a connect() in the bind()→listen() gap is refused.
 func waitForSocket(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if err := waitForSocketFile(path, deadline, timeout); err != nil {
+		return err
+	}
+	// The connect phase gets its own bounded window from file-appearance:
+	// capped at 1s so a process that bound and then died fails fast (its
+	// socket refuses just like the gap does), floored at 250ms so a socket
+	// appearing at the edge of the file budget still gets a real chance to
+	// reach listen() — a bounded overrun of the nominal timeout.
+	connWindow := min(time.Until(deadline), time.Second)
+	connWindow = max(connWindow, 250*time.Millisecond)
+	return waitForSocketConnectable(path, time.Now().Add(connWindow))
+}
+
+// WaitForAPISocket is the exported readiness wait for a firecracker API
+// socket: file existence AND accepting connections. For use by every
+// spawn site, in and out of this package.
+func WaitForAPISocket(path string, timeout time.Duration) error {
+	return waitForSocket(path, timeout)
+}
+
+// waitForSocketFile waits for the socket file to exist — inotify with a
+// polling fallback. timeout is only for the error message.
+func waitForSocketFile(path string, deadline time.Time, timeout time.Duration) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return waitForSocketPolling(path, timeout)
+		return waitForSocketFilePolling(path, deadline, timeout)
 	}
 	defer watcher.Close()
 
 	if err := watcher.Add(filepath.Dir(path)); err != nil {
-		return waitForSocketPolling(path, timeout)
+		return waitForSocketFilePolling(path, deadline, timeout)
 	}
 
 	// Recheck after the watch is active: the socket could have appeared
@@ -2710,30 +2935,29 @@ func waitForSocket(path string, timeout time.Duration) error {
 	}
 
 	name := filepath.Base(path)
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 
 	for {
 		select {
 		case ev, ok := <-watcher.Events:
 			if !ok {
-				return waitForSocketPolling(path, timeout)
+				return waitForSocketFilePolling(path, deadline, timeout)
 			}
 			if (ev.Op&fsnotify.Create) != 0 && filepath.Base(ev.Name) == name {
 				return nil
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok || err != nil {
-				return waitForSocketPolling(path, timeout)
+				return waitForSocketFilePolling(path, deadline, timeout)
 			}
-		case <-deadline.C:
+		case <-timer.C:
 			return fmt.Errorf("socket %s did not appear within %s", path, timeout)
 		}
 	}
 }
 
-func waitForSocketPolling(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+func waitForSocketFilePolling(path string, deadline time.Time, timeout time.Duration) error {
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return nil
@@ -2743,6 +2967,85 @@ func waitForSocketPolling(path string, timeout time.Duration) error {
 	return fmt.Errorf("socket %s did not appear within %s", path, timeout)
 }
 
+// waitForSocketConnectable dials until the socket accepts a connection.
+// The bind()→listen() gap is normally sub-microsecond but scheduler
+// pressure under a launch burst stretches it to milliseconds, and an
+// immediate API call used to fail hard there. ONLY a refused connection
+// (the gap, or a dead process's lingering socket) is worth waiting out;
+// any other error — ENOENT from a teardown race, ENOTSOCK, EACCES — is
+// surfaced immediately. Fast path: one successful connect+close (tens
+// of µs).
+func waitForSocketConnectable(path string, deadline time.Time) error {
+	interval := time.Millisecond
+	for {
+		c, err := net.Dial("unix", path)
+		if err == nil {
+			c.Close()
+			return nil
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			return fmt.Errorf("socket %s: %w", path, err)
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("socket %s not accepting connections: %w", path, err)
+		}
+		time.Sleep(interval)
+		interval = min(interval*2, 10*time.Millisecond)
+	}
+}
+
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {
 	return waitForHTTPHealth(ctx, vmIP, timeout)
+}
+
+// retriedLaunchTarget returns the tracked instance for vmID when a resume or
+// restore request is a retry of one that already completed: Running with the
+// SAME artifacts (a different snapshot must replace the VM as before).
+//
+// Called while holding vmID's lifecycle lock, so Status is trustworthy: no
+// concurrent op is mid-flight, and a Running instance is a finished prior
+// attempt. Hence no boxd probe — it couldn't tell a slow-booting boxd (30s
+// warmup) from a dead one, and a false negative relaunches over the live
+// VM, rolling the guest back. DestroyVM bypasses the lock, so the recheck
+// drops an instance a concurrent destroy removed.
+//
+// A reset-to-snapshot flow (none today) must not reuse these RPCs as-is.
+// vmUnitDead reports a VM's systemd unit as definitively not-active;
+// swappable in tests. Inconclusive answers read as alive (not dead).
+var vmUnitDead = func(vmID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
+}
+
+func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMInstance {
+	m.mu.RLock()
+	existing := m.vms[vmID]
+	m.mu.RUnlock()
+	if existing == nil {
+		return nil
+	}
+	existing.mu.RLock()
+	running := existing.Status == StatusRunning
+	sameArtifacts := existing.SnapshotPath == snapshotPath && existing.MemFilePath == memPath
+	existing.mu.RUnlock()
+	if !running || !sameArtifacts {
+		return nil
+	}
+	// Process-level liveness, not boxd readiness: a record can read Running
+	// while the firecracker died (crash while vmd was down, then a
+	// cleanupStale=false reattach loads it). A slow-booting VM's unit is
+	// still active, so this catches a corpse without false-negativing a
+	// warming one — the trap the removed boxd probe fell into. Inconclusive
+	// (systemctl slow) reads as alive: never relaunch on doubt.
+	if vmUnitDead(vmID) {
+		return nil
+	}
+	m.mu.RLock()
+	still := m.vms[vmID] == existing
+	m.mu.RUnlock()
+	if !still {
+		return nil
+	}
+	return existing
 }
