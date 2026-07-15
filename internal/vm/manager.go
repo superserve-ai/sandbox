@@ -2585,18 +2585,22 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 
 	// Bounded, not Background: an unbounded destroy could pin the shared
 	// systemd job lock behind a wedged PID1 and queue every stop on the host.
-	dctx, dcancel := context.WithTimeout(context.Background(), time.Minute)
-	defer dcancel()
+	// The clock starts at the destroy, not before the warmup sleep.
+	destroyRecordingVM := func() error {
+		dctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		return m.DestroyVM(dctx, inst.ID, true)
+	}
 
 	if recordWarmup(ctx, warmup) == warmupCancelled {
-		if err := m.DestroyVM(dctx, inst.ID, true); err != nil {
+		if err := destroyRecordingVM(); err != nil {
 			m.log.Warn().Err(err).Str("template_vm", vmID).
 				Msg("destroy after cancelled recording warmup failed; reconciler will clean up")
 		}
 		return ctx.Err()
 	}
 
-	if err := m.DestroyVM(dctx, inst.ID, true); err != nil {
+	if err := destroyRecordingVM(); err != nil {
 		return fmt.Errorf("destroy recording VM: %w", err)
 	}
 
