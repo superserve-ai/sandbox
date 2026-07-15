@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // systemdUnitName returns the systemd unit name for a sandbox.
@@ -14,14 +15,17 @@ func systemdUnitName(vmID string) string {
 	return "firecracker@" + vmID + ".service"
 }
 
-// startUnit starts a systemd unit. Idempotent — starting an already-running
-// unit is a no-op. Returns after the start job is queued; readiness is
-// signalled by the unit's own side effect (e.g., API socket appearing).
-func startUnit(ctx context.Context, unit string) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "start", "--no-block", unit)
+// restartUnit (re)starts a systemd unit. For an inactive unit this is
+// exactly `start`; an already-active unit — a stale firecracker left by an
+// interrupted stop — is replaced rather than silently no-op'd, which would
+// strand the launch waiting on a socket the old process never re-binds.
+// Returns after the job is queued; readiness is signalled by the unit's own
+// side effect (e.g., API socket appearing).
+func restartUnit(ctx context.Context, unit string) error {
+	cmd := exec.CommandContext(ctx, "systemctl", "restart", "--no-block", unit)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl start %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("systemctl restart %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
@@ -52,6 +56,35 @@ func stopUnit(ctx context.Context, unit string) error {
 		return fmt.Errorf("systemctl stop %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// stopUnitBudget covers `systemctl stop` blocking up to TimeoutStopSec plus
+// margin for host I/O contention. The pause path caps its whole stop phase
+// at this OR the caller's remaining deadline, whichever is shorter.
+const stopUnitBudget = 15 * time.Second
+
+// stopUnitWithBudget stops a unit on a detached context with its own budget,
+// so the caller's possibly-spent deadline can't starve a stop that must
+// happen (e.g. after a pause's snapshot already landed).
+func stopUnitWithBudget(ctx context.Context, unit string) error {
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopUnitBudget)
+	defer cancel()
+	return stopUnit(c, unit)
+}
+
+// unitLingering reports whether the unit has a live or winding-down process
+// (active, activating, or deactivating) — i.e. a restart must wait out a
+// stop phase before the fresh process can bind its socket.
+func unitLingering(ctx context.Context, unit string) bool {
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", unit).Output()
+	if err != nil {
+		return false
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "active", "activating", "deactivating":
+		return true
+	}
+	return false
 }
 
 // isUnitActive checks if a systemd unit is currently active (running).

@@ -348,6 +348,62 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Drift 7: systemd unit active, DB says paused — an interrupted pause
+	// stop left the old firecracker pinning guest RAM; stop it. DB rows
+	// only: a mid-resume sandbox reads 'resuming' there, clearing the
+	// drift, while its BoltDB record stays Paused until the resume
+	// persists — keying off records could kill a just-launched resume.
+	if dbSandboxes != nil {
+		for id := range active {
+			sb, known := dbSandboxes[id]
+			if !known || sb.Sandbox.Status != db.SandboxStatusPaused {
+				r.clearDrift("pausedunit:" + id)
+				continue
+			}
+			if !r.gracePeriodElapsed("pausedunit:"+id, now) {
+				continue
+			}
+			// Take the lock BEFORE spending budget: if a launch/pause is in
+			// flight for this vmID (DB snapshot is from the top of the pass;
+			// a resume may have claimed and relaunched this unit since),
+			// TryLock fails and we skip — without burning an auto-fail slot
+			// on a stop we won't perform. A genuinely stale unit is
+			// reclaimed next tick.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			// Re-check liveness under the lock against the AUTHORITATIVE
+			// in-memory record, not the top-of-pass DB snapshot: a resume
+			// can complete mid-pass (relaunch the unit, set Running, release
+			// the lock) so tryLock succeeds while the snapshot still says
+			// paused. Stopping then would kill the freshly-resumed VM. A
+			// genuine stale unit has a Paused/absent record, not Running.
+			if r.mgr.instanceRunning(id) {
+				unlockOp()
+				r.clearDrift("pausedunit:" + id)
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "systemd_active_db_paused")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
+				Msg("live unit for paused sandbox — stopping")
+			err := stopUnit(ctx, systemdUnitName(id))
+			unlockOp()
+			if err != nil {
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop paused sandbox's unit")
+				continue
+			}
+			// Reuse the orphan_stop action (both stop a unit that shouldn't
+			// run); the drift_kind column carries the paused-specific detail.
+			r.writeAudit(ctx, id, "orphan_stop", "unit still running for paused sandbox", "systemd_active_db_paused")
+			r.clearDrift("pausedunit:" + id)
+		}
+	}
+
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {
