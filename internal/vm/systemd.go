@@ -67,6 +67,9 @@ func stopUnit(ctx context.Context, unit string) error {
 	// buffer 1 keeps an abandoned wait from wedging every job on the
 	// connection. Non-nil ch also serializes concurrent stops on the
 	// library's job lock — enqueue round trip only, not the stop itself.
+	// Concurrent stops of the SAME unit merge into one systemd job, whose
+	// single registered channel goes to the last caller; an earlier caller
+	// waits out its budget and converges via settleExpiredStopWait.
 	ch := make(chan string, 1)
 	err, enqueued := sdbusDo(func(c *sddbus.Conn) error {
 		ectx, cancel := context.WithTimeout(ctx, stopEnqueueCap)
