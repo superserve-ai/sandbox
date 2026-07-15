@@ -54,13 +54,8 @@ const stopJobWaitCap = 15 * time.Second
 func stopUnit(ctx context.Context, unit string) error {
 	// Buffered channel: the library's dispatcher does one blocking send;
 	// buffer 1 keeps an abandoned wait from wedging every job on the
-	// connection.
-	//
-	// A non-nil channel makes the library hold its job lock across the
-	// ENQUEUE round trip (ms-scale on the private socket), so concurrent
-	// stops serialize there — accepted: the completion wait below happens
-	// outside that lock, so stops never serialize on each other's 10s stop
-	// phase, and the enqueue is still far cheaper than a systemctl fork.
+	// connection. Non-nil ch also serializes concurrent stops on the
+	// library's job lock — enqueue round trip only, not the stop itself.
 	ch := make(chan string, 1)
 	err, enqueued := sdbusDo(func(c *sddbus.Conn) error {
 		_, e := c.StopUnitContext(ctx, unit, "replace", ch)
@@ -103,8 +98,8 @@ func stopUnit(ctx context.Context, unit string) error {
 // Result/SubState for embedding in error messages. Best-effort —
 // returns "unknown" on any error.
 func unitFailureSummary(ctx context.Context, unit string) string {
-	// Result lives on the Service interface, SubState on Unit — two reads
-	// by necessity, not atomic; a torn pair is fine for a log-only string.
+	// Result lives on the Service interface, SubState on Unit — two reads,
+	// not atomic; fine for a log-only string.
 	if res, notLoaded, ok := sdbusUnitProperty(ctx, unit, "Service", "Result"); ok {
 		if notLoaded {
 			return "not-loaded"
@@ -188,10 +183,8 @@ func unitLingering(ctx context.Context, unit string) bool {
 }
 
 // isUnitActive checks if a systemd unit is currently active (running).
-// Inconclusive checks (ctx already spent by the D-Bus attempt, transport
-// failure) report ACTIVE: its caller treats "not active" as license to
-// declare the VM dead and drop it, so only a definitive answer may say no.
-// unitDefinitelyDead already implements exactly those guards.
+// Inconclusive (ctx spent, transport failure) reports active — the caller
+// treats "not active" as a dead VM, so only a definitive answer may say no.
 func isUnitActive(ctx context.Context, unit string) bool {
 	return !unitDefinitelyDead(ctx, unit)
 }
