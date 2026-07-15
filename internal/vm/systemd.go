@@ -44,10 +44,17 @@ func restartUnit(ctx context.Context, unit string) error {
 	return nil
 }
 
-// stopJobWaitCap bounds the wait for a stop job's completion signal. Above
-// the unit's TimeoutStopSec (10s) + kill margin: past this the signal is
-// considered lost (dead signal socket), not the job slow.
-const stopJobWaitCap = 15 * time.Second
+// stopJobWaitCap bounds the wait for a stop job's completion signal when the
+// caller's ctx allows more. A legitimate stop can take two full TimeoutStopSec
+// windows (SIGTERM phase, then a second window after SIGKILL) plus ExecStopPost,
+// so this sits above that worst case. Distinct from stopUnitBudget below, which
+// is the pause path's deliberately tighter policy.
+const stopJobWaitCap = 35 * time.Second
+
+// stopEnqueueCap bounds the StopUnit enqueue round trip. The library holds its
+// job lock across this call, so one slow enqueue against a wedged PID1 would
+// otherwise queue every other stop on the host behind it indefinitely.
+const stopEnqueueCap = 5 * time.Second
 
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
 // unit is a no-op. Blocks until the stop job completes.
@@ -58,7 +65,9 @@ func stopUnit(ctx context.Context, unit string) error {
 	// library's job lock — enqueue round trip only, not the stop itself.
 	ch := make(chan string, 1)
 	err, enqueued := sdbusDo(func(c *sddbus.Conn) error {
-		_, e := c.StopUnitContext(ctx, unit, "replace", ch)
+		ectx, cancel := context.WithTimeout(ctx, stopEnqueueCap)
+		defer cancel()
+		_, e := c.StopUnitContext(ectx, unit, "replace", ch)
 		return e
 	})
 	if enqueued {
@@ -74,15 +83,13 @@ func stopUnit(ctx context.Context, unit string) error {
 		defer timer.Stop()
 		select {
 		case res := <-ch:
-			if res != "done" && res != "skipped" {
-				return fmt.Errorf("stop unit %s: job result %q", unit, res)
-			}
-			return nil
+			return stopJobResult(unit, res)
 		case <-ctx.Done():
-			return fmt.Errorf("stop unit %s: %w", unit, ctx.Err())
+			return settleExpiredStopWait(ctx, unit, ch,
+				fmt.Errorf("stop unit %s: %w", unit, ctx.Err()))
 		case <-timer.C:
-			// Completion signal lost (e.g. signal socket died mid-wait).
-			return fmt.Errorf("stop unit %s: no job completion within %s", unit, stopJobWaitCap)
+			return settleExpiredStopWait(ctx, unit, ch,
+				fmt.Errorf("stop unit %s: no job completion within %s", unit, stopJobWaitCap))
 		}
 	}
 
@@ -92,6 +99,32 @@ func stopUnit(ctx context.Context, unit string) error {
 		return fmt.Errorf("systemctl stop %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+func stopJobResult(unit, res string) error {
+	if res != "done" && res != "skipped" {
+		return fmt.Errorf("stop unit %s: job result %q", unit, res)
+	}
+	return nil
+}
+
+// settleExpiredStopWait decides the outcome of a stop whose wait expired. The
+// result may have landed together with the deadline (select picks randomly
+// among ready cases), and a completed job's signal may have been lost with the
+// connection — check both on a fresh, detached deadline before reporting
+// failure, so a stop that actually finished never reads as failed.
+func settleExpiredStopWait(ctx context.Context, unit string, ch <-chan string, waitErr error) error {
+	select {
+	case res := <-ch:
+		return stopJobResult(unit, res)
+	default:
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	if unitDefinitelyDead(cctx, unit) {
+		return nil
+	}
+	return waitErr
 }
 
 // unitFailureSummary returns a one-line summary of a unit's
@@ -165,17 +198,22 @@ func unitLingering(ctx context.Context, unit string) bool {
 		if notLoaded {
 			return false
 		}
-		switch s, _ := val.(string); s {
-		case "active", "activating", "deactivating":
-			return true
+		// Unexpected value shape falls through to exec, like unitActiveState.
+		if s, isStr := val.(string); isStr && s != "" {
+			return lingeringState(s)
 		}
-		return false
 	}
 	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", unit).Output()
 	if err != nil {
 		return false
 	}
-	switch strings.TrimSpace(string(out)) {
+	return lingeringState(strings.TrimSpace(string(out)))
+}
+
+// lingeringState reports whether an ActiveState means a live or winding-down
+// process (a restart must wait out a stop phase before the socket can rebind).
+func lingeringState(s string) bool {
+	switch s {
 	case "active", "activating", "deactivating":
 		return true
 	}

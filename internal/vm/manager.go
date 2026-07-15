@@ -1278,7 +1278,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
-	defer func() { _ = stopUnit(context.Background(), systemdUnitName(vmID)) }()
+	defer func() { _ = stopUnitWithBudget(context.Background(), systemdUnitName(vmID)) }()
 
 	if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
 		return "", err
@@ -2583,15 +2583,20 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		warmup = time.Duration(m.cfg.UffdRecordMaxSeconds) * time.Second
 	}
 
+	// Bounded, not Background: an unbounded destroy could pin the shared
+	// systemd job lock behind a wedged PID1 and queue every stop on the host.
+	dctx, dcancel := context.WithTimeout(context.Background(), time.Minute)
+	defer dcancel()
+
 	if recordWarmup(ctx, warmup) == warmupCancelled {
-		if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
+		if err := m.DestroyVM(dctx, inst.ID, true); err != nil {
 			m.log.Warn().Err(err).Str("template_vm", vmID).
 				Msg("destroy after cancelled recording warmup failed; reconciler will clean up")
 		}
 		return ctx.Err()
 	}
 
-	if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
+	if err := m.DestroyVM(dctx, inst.ID, true); err != nil {
 		return fmt.Errorf("destroy recording VM: %w", err)
 	}
 
