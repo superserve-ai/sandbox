@@ -477,10 +477,22 @@ func main() {
 			}
 			switch ta.Port {
 			case cfg.GRPCPort:
+				// A bare ListenStream=<port> can pass separate v4/v6 fds; keep
+				// the first, close dups so the fd isn't leaked.
+				if lis != nil {
+					log.Warn().Str("addr", ta.String()).Msg("duplicate inherited gRPC listener — closing")
+					_ = l.Close()
+					continue
+				}
 				lis = l
 			case localHTTPPort:
 				if !ta.IP.IsLoopback() {
 					log.Fatal().Str("addr", ta.String()).Msg("inherited resolver listener must be loopback-only")
+				}
+				if localLis != nil {
+					log.Warn().Str("addr", ta.String()).Msg("duplicate inherited resolver listener — closing")
+					_ = l.Close()
+					continue
 				}
 				localLis = l
 			default:
@@ -488,9 +500,11 @@ func main() {
 				_ = l.Close()
 			}
 		}
+		// systemd already owns the port; a direct bind would EADDRINUSE or
+		// serve a port nothing dials. Fail loudly rather than split-brain.
 		if len(inherited) > 0 && lis == nil {
-			log.Warn().Int("grpc_port", cfg.GRPCPort).
-				Msg("socket unit passed listeners but none matches GRPC_PORT — binding directly; check the unit's ListenStream")
+			log.Fatal().Int("grpc_port", cfg.GRPCPort).
+				Msg("socket unit passed listeners but none matches GRPC_PORT — check the unit's ListenStream against GRPC_PORT")
 		}
 	}
 	if lis != nil {

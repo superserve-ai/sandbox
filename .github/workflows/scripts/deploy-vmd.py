@@ -151,7 +151,16 @@ def main() -> int:
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
 
-            # Install systemd units.
+            # Install systemd units. A running socket unit keeps its
+            # originally-bound fds across daemon-reload + start (start is a
+            # no-op when active), so a changed ListenStream/socket option
+            # only takes effect if the socket is rebound — flagged here,
+            # acted on in the restart block below.
+            if sudo cmp -s {extract_dir}/deploy/superserve-vmd.socket /etc/systemd/system/superserve-vmd.socket; then
+                SOCKET_CHANGED=0
+            else
+                SOCKET_CHANGED=1
+            fi
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd.service /etc/systemd/system/superserve-vmd.service
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd.socket /etc/systemd/system/superserve-vmd.socket
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
@@ -244,7 +253,15 @@ def main() -> int:
             # ports, and a plain restart can bind the socket unit before the
             # old process has released them. Idempotent in steady state.
             sudo systemctl stop {service}
-            sudo systemctl start superserve-vmd.socket
+            if [ "$SOCKET_CHANGED" = 1 ]; then
+                # Socket unit changed: rebind so the new ListenStream/options
+                # apply. Brief refused window, but only on the rare deploy that
+                # edits the socket file. Steady state keeps the socket up so
+                # connections backlog across the vmd swap instead of refusing.
+                sudo systemctl restart superserve-vmd.socket
+            else
+                sudo systemctl start superserve-vmd.socket
+            fi
             sudo systemctl start {service}
             sleep 3
             sudo systemctl is-active --quiet {service} || (
