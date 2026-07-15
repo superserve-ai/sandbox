@@ -3,9 +3,11 @@ package vm
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -690,24 +692,62 @@ func TestInspectRecordedTrace_CountsLines(t *testing.T) {
 	}
 }
 
-func TestWaitForSocket_AlreadyPresent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sock")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
+// shortSockPath returns a socket path safely under sun_path's ~108-byte
+// cap — t.TempDir embeds long test names that can blow it.
+func shortSockPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "fcs")
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "s")
+}
+
+// bindOnlySocket creates a unix socket file via bind() WITHOUT listen() —
+// the exact state a connect() gets ECONNREFUSED from. Returns the fd so the
+// test can listen() later.
+func bindOnlySocket(t *testing.T, path string) int {
+	t.Helper()
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	return fd
+}
+
+func TestWaitForSocket_AlreadyListening(t *testing.T) {
+	path := shortSockPath(t)
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
 	if err := waitForSocket(path, time.Second); err != nil {
-		t.Errorf("waitForSocket on existing file: %v", err)
+		t.Errorf("waitForSocket on listening socket: %v", err)
 	}
 }
 
 func TestWaitForSocket_AppearsAfterStart(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sock")
+	path := shortSockPath(t)
 
+	lch := make(chan net.Listener, 1)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		_ = os.WriteFile(path, nil, 0o644)
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			t.Error(err)
+		}
+		lch <- l
+	}()
+	defer func() {
+		if l := <-lch; l != nil {
+			l.Close()
+		}
 	}()
 
 	start := time.Now()
@@ -727,17 +767,59 @@ func TestWaitForSocket_TimesOut(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected timeout error, got nil")
 	}
+	if !strings.Contains(err.Error(), "did not appear within 50ms") {
+		t.Errorf("error should state the budget, got: %v", err)
+	}
 }
 
-func TestWaitForSocketPolling_AppearsAfterStart(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sock")
+func TestWaitForSocket_BindListenGap(t *testing.T) {
+	// The socket FILE exists (bind done) but refuses connections until
+	// listen() — waitForSocket must wait out the gap, not return early.
+	path := shortSockPath(t)
+	fd := bindOnlySocket(t, path)
+
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		_ = os.WriteFile(path, nil, 0o644)
+		_ = syscall.Listen(fd, 8)
 	}()
-	if err := waitForSocketPolling(path, time.Second); err != nil {
-		t.Errorf("waitForSocketPolling: %v", err)
+
+	if err := waitForSocket(path, time.Second); err != nil {
+		t.Errorf("waitForSocket across the bind→listen gap: %v", err)
+	}
+}
+
+func TestWaitForSocket_NeverListens_FailsWithinCap(t *testing.T) {
+	// A bound-but-dead socket refuses forever; the connect phase must give
+	// up at its 1s cap, not spin the caller's full budget.
+	path := shortSockPath(t)
+	bindOnlySocket(t, path) // file exists, never listens
+
+	start := time.Now()
+	err := waitForSocket(path, 10*time.Second)
+	if err == nil {
+		t.Fatal("expected an error for a socket that never accepts")
+	}
+	if !strings.Contains(err.Error(), "not accepting connections") {
+		t.Errorf("error should name the refused state, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("gave up after %s; the connect phase is capped at 1s", elapsed)
+	}
+}
+
+func TestWaitForSocketConnectable_NonRefusedFailsFast(t *testing.T) {
+	// Anything but ECONNREFUSED (here: ENOENT from a teardown race) must
+	// surface immediately, not spin until the deadline.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gone")
+
+	start := time.Now()
+	err := waitForSocketConnectable(path, time.Now().Add(5*time.Second))
+	if err == nil {
+		t.Fatal("expected an error for a missing socket")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("non-refused error took %s to surface; must fail fast", elapsed)
 	}
 }
 

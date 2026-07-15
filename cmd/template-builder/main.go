@@ -415,7 +415,7 @@ func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.Fire
 	}
 	pid := cmd.Process.Pid
 
-	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+	if err := vm.WaitForAPISocket(socketPath, 5*time.Second); err != nil {
 		_ = cmd.Process.Kill()
 		return 0, fmt.Errorf("wait for socket: %w", err)
 	}
@@ -432,17 +432,6 @@ func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.Fire
 
 	go func() { _ = cmd.Wait() }()
 	return pid, nil
-}
-
-func waitForSocket(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return fmt.Errorf("socket %s not ready after %s", path, timeout)
 }
 
 func killProcess(pid int) {
