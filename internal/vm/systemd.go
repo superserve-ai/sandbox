@@ -118,8 +118,10 @@ func stopJobResult(unit, res string) error {
 // settleExpiredStopWait decides the outcome of a stop whose wait expired. The
 // result may have landed together with the deadline (select picks randomly
 // among ready cases), and a completed job's signal may have been lost with the
-// connection — check both on a fresh, detached deadline before reporting
-// failure, so a stop that actually finished never reads as failed.
+// connection — check both before reporting failure, so a stop that actually
+// finished never reads as failed. The probe is detached and bounded: at most
+// 2s past a spent caller deadline, buying one truthful answer; it changes only
+// the reported outcome, never any persisted state.
 func settleExpiredStopWait(ctx context.Context, unit string, ch <-chan string, waitErr error) error {
 	select {
 	case res := <-ch:

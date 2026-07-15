@@ -860,13 +860,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// record must reach Paused (a retry against a Running record would
 	// re-diff an already-consumed dirty bitmap and destroy the overlay).
 	//
-	// Bound the WHOLE stop path (both attempts + dead-check) to the caller's
-	// deadline: the control plane caps the pause RPC at ~30s and reverts the
-	// DB row to active on timeout, so a stop that finishes after that would
-	// leave DB-active-but-VM-stopped drift. If the stop can't finish in the
-	// remaining budget the straggler unit is reclaimed by the reconciler —
-	// self-healing, unlike the drift. This is why the path shares the
-	// caller's budget rather than taking fresh detached ones.
+	// Bound the stop path (both attempts + dead-check) to the caller's
+	// deadline so the handler can't run long past the ~30s pause RPC cap
+	// (stopUnit's expiry settle may probe ≤2s past it — bounded, and it only
+	// affects the log below, never what gets persisted). A timed-out pause
+	// converges anyway: the control plane retries pause to paused rather than
+	// reverting, and a straggler unit is reclaimed by the reconciler.
 	unit := systemdUnitName(vmID)
 	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
 	if err := stopUnit(stopCtx, unit); err != nil {
