@@ -1576,8 +1576,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	tSemAcquired := time.Now()
 	// Cold/hot segmentation tags for the phase log, sampled once (not per
 	// attempt): concurrency, template-cache age, and host CPU/mem pressure.
+	// warmthPath is the file that actually drives fault-in — for a layered
+	// overlay it's the recorded template base (memPath is then a per-VM diff),
+	// else memPath itself — so layered restores segment by the base they use.
 	inflight := len(m.restoreSem)
-	tplAgeSecs := m.templateRestoreAge(memPath)
+	warmthPath := memPath
+	if base, ok := readLayeredBase(memPath); ok {
+		warmthPath = base
+	}
+	tplAgeSecs := m.templateRestoreAge(warmthPath)
 	cpuPSI := psiSomeAvg10("/proc/pressure/cpu")
 	memPSI := psiSomeAvg10("/proc/pressure/memory")
 
@@ -1919,9 +1926,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	// boxd is up → the guest has booted, so this template's working set is now
 	// in page cache: read eagerly at load (File) or faulted in during boot
-	// (UFFD). Stamp it here (not at the load) so the next restore's
+	// (UFFD). Stamp warmthPath (the layered base for an overlay restore, else
+	// memPath) here (not at the load) so the next restore's
 	// secs_since_template_restore reflects real warmth for either backend.
-	m.markTemplateRestored(memPath)
+	m.markTemplateRestored(warmthPath)
 
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
