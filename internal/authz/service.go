@@ -110,10 +110,11 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 	}
 
 	epoch := s.teamEpoch(teamID)
+	observed := epoch.Load()
 	key := teamPermCacheKey{userID: userID, teamID: teamID, permission: permission}
 	if v, ok := s.teamPermCache.Load(key); ok {
 		e := v.(*teamPermCacheEntry)
-		if e.epoch == epoch.Load() && time.Now().Before(e.expiry) {
+		if e.epoch == observed && time.Now().Before(e.expiry) {
 			return true, nil
 		}
 		// Stale epoch or expired — drop it. CompareAndDelete so a concurrent
@@ -121,11 +122,11 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 		s.teamPermCache.CompareAndDelete(key, v)
 	}
 
-	sfKey := userID.String() + "|" + teamID.String() + "|" + permission
+	// The epoch is in the singleflight key: a request that observes a newer epoch
+	// (post-revocation) will not coalesce onto an in-flight pre-revocation query,
+	// so it can't be handed that query's stale grant — it starts its own.
+	sfKey := fmt.Sprintf("%s|%s|%s|%d", userID, teamID, permission, observed)
 	result, err, _ := s.teamPermGroup.Do(sfKey, func() (interface{}, error) {
-		// Capture the epoch inside the query so all coalesced waiters cache under
-		// the epoch it observed; a later revocation bump makes the store stale on read.
-		observed := epoch.Load()
 		// Detach: coalesced waiters may outlive the triggering caller, and a fresh
 		// deadline keeps a slow check from hanging.
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)

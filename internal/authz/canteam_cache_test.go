@@ -155,6 +155,37 @@ func TestCanTeamStoreAfterInvalidateDoesNotResurrectGrant(t *testing.T) {
 	}
 }
 
+func TestCanTeamLateJoinerAfterInvalidateStartsFreshQuery(t *testing.T) {
+	gate := &gateStore{result: true, entered: make(chan struct{}), release: make(chan struct{})}
+	s := New(gate)
+	user, team := uuid.New(), uuid.New()
+
+	aResult := make(chan bool, 1)
+	go func() {
+		ok, _ := s.CanTeam(context.Background(), user, team, "settings:write")
+		aResult <- ok
+	}()
+	<-gate.entered // A's pre-revocation query is in flight
+
+	s.InvalidateTeam(team) // role revoked, epoch bumped
+
+	// B arrives after the revocation. It must NOT coalesce onto A's in-flight
+	// query (different epoch in the singleflight key); it starts its own query
+	// against the post-revocation state.
+	fresh := &countingStore{result: false}
+	s.store = fresh
+	bOK, _ := s.CanTeam(context.Background(), user, team, "settings:write")
+	if bOK {
+		t.Fatal("post-revocation request was served A's stale grant via singleflight")
+	}
+	if n := fresh.calls.Load(); n != 1 {
+		t.Fatalf("expected B to run its own query, got %d", n)
+	}
+
+	close(gate.release)
+	<-aResult // A drains (its pre-revocation grant is acceptable)
+}
+
 func TestCanTeamSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	store := &countingStore{result: true, delay: 30 * time.Millisecond}
 	s := New(store)
