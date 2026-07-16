@@ -173,8 +173,8 @@ func (h *Handlers) withRBACMutation(ctx context.Context, teamID uuid.UUID, fn fu
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	// Drop cached permission grants for this team so a role or membership change
-	// takes effect immediately rather than after the cache TTL.
+	// Drop this instance's cached grants for the team; other instances converge
+	// within the cache TTL (see teamPermCacheTTL for the revocation contract).
 	if svc := h.authzService(); svc != nil {
 		svc.InvalidateTeam(teamID)
 	}

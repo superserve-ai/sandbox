@@ -77,8 +77,12 @@ type teamPermResult struct {
 	epoch   uint64
 }
 
-// teamPermCacheTTL backstops epoch invalidation: a grant is served at most this
-// long even without an explicit invalidation.
+// teamPermCacheTTL is the revocation contract: a role or membership change takes
+// effect within this window, everywhere. The cache is per-process and instances
+// don't coordinate, so InvalidateTeam can only tighten the instance that handled
+// the change — other instances converge at TTL expiry. Same accepted window as
+// the API-key cache. If a permission ever requires immediate cross-instance
+// revocation, replace this cache with a DB-backed per-team generation.
 const teamPermCacheTTL = 30 * time.Second
 
 // teamEpoch returns the per-team epoch counter, creating it on first use.
@@ -150,10 +154,11 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 	return res.allowed, nil
 }
 
-// InvalidateTeam makes a team's cached grants stale immediately after a role or
-// membership change. Bumping the epoch is the correctness mechanism — in-flight
-// misses stored under the old epoch fail the read check; the Range only reclaims
-// memory.
+// InvalidateTeam makes a team's cached grants stale on THIS instance after a
+// role or membership change. Bumping the epoch is the correctness mechanism —
+// in-flight misses stored under the old epoch fail the read check; the Range
+// only reclaims memory. Other instances converge within teamPermCacheTTL (the
+// cross-instance contract lives on that constant).
 func (s *Service) InvalidateTeam(teamID uuid.UUID) {
 	if s == nil {
 		return
