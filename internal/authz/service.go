@@ -45,18 +45,11 @@ type AuditEvent struct {
 type Service struct {
 	store db.DBTX
 
-	// teamPermCache caches positive team-permission results, keyed by
-	// teamPermCacheKey, value *teamPermCacheEntry. Only grants are cached, so a
-	// denied check always re-queries (denied probes can't grow the map).
-	// teamPermGroup coalesces concurrent identical misses so a burst of creates
-	// from one caller issues a single DB query instead of one per request.
-	//
-	// teamPermGen is a per-team epoch (teamID -> *atomic.Uint64). Each cached
-	// entry records the epoch its query observed; InvalidateTeam bumps the epoch,
-	// so any entry cached under an older epoch is ignored on read. This closes the
-	// store-after-invalidate race: a miss whose query overlapped a revocation
-	// carries the pre-bump epoch, so its store is stale on arrival rather than
-	// resurrecting the grant for a TTL. Zero values are ready to use.
+	// teamPermCache caches positive results (teamPermCacheKey -> *teamPermCacheEntry);
+	// denials always re-query so probes can't grow the map. teamPermGroup coalesces
+	// concurrent identical misses. teamPermGen is a per-team epoch (teamID ->
+	// *atomic.Uint64) that InvalidateTeam bumps to make stale entries fail the
+	// read-side check. Zero values are ready to use.
 	teamPermCache sync.Map
 	teamPermGroup singleflight.Group
 	teamPermGen   sync.Map
@@ -77,17 +70,15 @@ type teamPermCacheEntry struct {
 	epoch  uint64
 }
 
-// teamPermResult is the singleflight payload: the grant plus the team epoch
-// observed at query time, so every coalesced waiter caches under the same epoch.
+// teamPermResult is the singleflight payload: grant plus the epoch observed at
+// query time, so all coalesced waiters cache under the same epoch.
 type teamPermResult struct {
 	allowed bool
 	epoch   uint64
 }
 
-// teamPermCacheTTL backstops the epoch invalidation: a grant is served at most
-// this long even absent an explicit invalidation. Role changes are rare and
-// admin-initiated, and InvalidateTeam makes revocation immediate, so this is
-// only a safety net on the create hot path.
+// teamPermCacheTTL backstops epoch invalidation: a grant is served at most this
+// long even without an explicit invalidation.
 const teamPermCacheTTL = 30 * time.Second
 
 // teamEpoch returns the per-team epoch counter, creating it on first use.
@@ -132,12 +123,11 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 
 	sfKey := userID.String() + "|" + teamID.String() + "|" + permission
 	result, err, _ := s.teamPermGroup.Do(sfKey, func() (interface{}, error) {
-		// Capture the epoch before the query so every coalesced waiter caches
-		// under the epoch this query observed; a revocation that bumps the epoch
-		// after this point makes the resulting store stale on read.
+		// Capture the epoch inside the query so all coalesced waiters cache under
+		// the epoch it observed; a later revocation bump makes the store stale on read.
 		observed := epoch.Load()
-		// Detach: coalesced waiters may outlive the caller that triggered the
-		// query, and a fresh deadline keeps a slow check from hanging.
+		// Detach: coalesced waiters may outlive the triggering caller, and a fresh
+		// deadline keeps a slow check from hanging.
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		allowed, err := s.canTeamQuery(qctx, userID, teamID, permission)
@@ -159,14 +149,10 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 	return res.allowed, nil
 }
 
-// InvalidateTeam makes cached grants for a team stale immediately, across every
-// user and permission. Called after a role or membership change so revocation
-// takes effect at once instead of after the cache TTL.
-//
-// Bumping the epoch first is what closes the store-after-invalidate race: any
-// in-flight miss that observed the old epoch will store under it and be ignored
-// on read. The subsequent Range only reclaims memory for already-stored entries;
-// correctness rests on the epoch, not the delete.
+// InvalidateTeam makes a team's cached grants stale immediately after a role or
+// membership change. Bumping the epoch is the correctness mechanism — in-flight
+// misses stored under the old epoch fail the read check; the Range only reclaims
+// memory.
 func (s *Service) InvalidateTeam(teamID uuid.UUID) {
 	if s == nil {
 		return
