@@ -159,7 +159,7 @@ func (h *Handlers) authzService() *authz.Service {
 		return nil
 	}
 	h.authzOnce.Do(func() {
-		h.authzSvc = authz.New(h.Pool)
+		h.authzSvc = authz.NewCached(h.Pool, authz.TeamPermCacheTTLFromEnv())
 	})
 	return h.authzSvc
 }

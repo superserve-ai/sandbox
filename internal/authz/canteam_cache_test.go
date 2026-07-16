@@ -14,11 +14,14 @@ import (
 
 // countingStore is a fake db.DBTX that records how many QueryRow calls reach it
 // and Scans a fixed bool result. A per-call delay lets the test force concurrent
-// misses so singleflight coalescing is observable.
+// misses so singleflight coalescing is observable. lastCtxErr records the
+// context state the query ran under, to distinguish caller-context (uncached)
+// from detached-context (cached) paths.
 type countingStore struct {
-	result bool
-	delay  time.Duration
-	calls  atomic.Int64
+	result     bool
+	delay      time.Duration
+	calls      atomic.Int64
+	lastCtxErr atomic.Value // error or nil sentinel
 }
 
 func (s *countingStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
@@ -27,8 +30,11 @@ func (s *countingStore) Exec(context.Context, string, ...interface{}) (pgconn.Co
 func (s *countingStore) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
 	return nil, nil
 }
-func (s *countingStore) QueryRow(context.Context, string, ...interface{}) pgx.Row {
+func (s *countingStore) QueryRow(ctx context.Context, _ string, _ ...interface{}) pgx.Row {
 	s.calls.Add(1)
+	if err := ctx.Err(); err != nil {
+		s.lastCtxErr.Store(err)
+	}
 	if s.delay > 0 {
 		time.Sleep(s.delay)
 	}
@@ -46,9 +52,19 @@ func (r scanRow) Scan(dest ...any) error {
 	return nil
 }
 
+func newCachedForTest(store *countingStore) *Service {
+	return NewCached(store, defaultTeamPermCacheTTL)
+}
+
+func (s *Service) cacheLen() int {
+	s.cache.mu.Lock()
+	defer s.cache.mu.Unlock()
+	return len(s.cache.m)
+}
+
 func TestCanTeamCachesGrants(t *testing.T) {
 	store := &countingStore{result: true}
-	s := New(store)
+	s := newCachedForTest(store)
 	user, team := uuid.New(), uuid.New()
 
 	for i := 0; i < 5; i++ {
@@ -64,7 +80,7 @@ func TestCanTeamCachesGrants(t *testing.T) {
 
 func TestCanTeamDoesNotCacheDenials(t *testing.T) {
 	store := &countingStore{result: false}
-	s := New(store)
+	s := newCachedForTest(store)
 	user, team := uuid.New(), uuid.New()
 
 	for i := 0; i < 3; i++ {
@@ -79,9 +95,31 @@ func TestCanTeamDoesNotCacheDenials(t *testing.T) {
 	}
 }
 
-func TestCanTeamInvalidateTeamForcesRequery(t *testing.T) {
+// Plain New() instances (the per-transaction shape) must not cache and must run
+// the query under the caller's context, so a client disconnect cancels a check
+// that runs while the tx holds the per-team advisory lock.
+func TestCanTeamUncachedInstanceQueriesEveryCallWithCallerContext(t *testing.T) {
 	store := &countingStore{result: true}
 	s := New(store)
+	user, team := uuid.New(), uuid.New()
+
+	_, _ = s.CanTeam(context.Background(), user, team, "settings:write")
+	_, _ = s.CanTeam(context.Background(), user, team, "settings:write")
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("uncached instance must query every call, got %d queries", n)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = s.CanTeam(ctx, user, team, "settings:write")
+	if err, _ := store.lastCtxErr.Load().(error); err == nil {
+		t.Fatal("uncached query must run under the caller's context (cancellation not visible)")
+	}
+}
+
+func TestCanTeamInvalidateTeamForcesRequery(t *testing.T) {
+	store := &countingStore{result: true}
+	s := newCachedForTest(store)
 	user, team := uuid.New(), uuid.New()
 	other := uuid.New()
 
@@ -126,7 +164,7 @@ func (s *gateStore) QueryRow(context.Context, string, ...interface{}) pgx.Row {
 
 func TestCanTeamStoreAfterInvalidateDoesNotResurrectGrant(t *testing.T) {
 	store := &gateStore{result: true, entered: make(chan struct{}), release: make(chan struct{})}
-	s := New(store)
+	s := NewCached(store, defaultTeamPermCacheTTL)
 	user, team := uuid.New(), uuid.New()
 
 	done := make(chan bool, 1)
@@ -135,15 +173,15 @@ func TestCanTeamStoreAfterInvalidateDoesNotResurrectGrant(t *testing.T) {
 		done <- ok
 	}()
 
-	<-store.entered           // query is in flight, reading the (still valid) grant
-	s.InvalidateTeam(team)    // role revoked + committed → epoch bumped mid-query
-	close(store.release)      // query now returns the stale true and stores it
+	<-store.entered        // query is in flight, reading the (still valid) grant
+	s.InvalidateTeam(team) // role revoked + committed → generation bumped mid-query
+	close(store.release)   // query returns the stale true; the store must discard it
 	if !<-done {
 		t.Fatal("in-flight query should still return its observed grant")
 	}
 
-	// The store landed after invalidation. A subsequent check must NOT be served
-	// from cache — it must re-query, because the stored entry is a stale epoch.
+	// The stale result must not have been cached: a subsequent check re-queries
+	// and sees the revoked state.
 	countingBacking := &countingStore{result: false}
 	s.store = countingBacking
 	ok, _ := s.CanTeam(context.Background(), user, team, "settings:write")
@@ -153,11 +191,14 @@ func TestCanTeamStoreAfterInvalidateDoesNotResurrectGrant(t *testing.T) {
 	if n := countingBacking.calls.Load(); n != 1 {
 		t.Fatalf("expected a re-query after invalidation, got %d queries", n)
 	}
+	if s.cacheLen() != 0 {
+		t.Fatalf("stale-generation result must be discarded, cache holds %d entries", s.cacheLen())
+	}
 }
 
 func TestCanTeamLateJoinerAfterInvalidateStartsFreshQuery(t *testing.T) {
 	gate := &gateStore{result: true, entered: make(chan struct{}), release: make(chan struct{})}
-	s := New(gate)
+	s := NewCached(gate, defaultTeamPermCacheTTL)
 	user, team := uuid.New(), uuid.New()
 
 	aResult := make(chan bool, 1)
@@ -167,11 +208,11 @@ func TestCanTeamLateJoinerAfterInvalidateStartsFreshQuery(t *testing.T) {
 	}()
 	<-gate.entered // A's pre-revocation query is in flight
 
-	s.InvalidateTeam(team) // role revoked, epoch bumped
+	s.InvalidateTeam(team) // role revoked, generation bumped
 
 	// B arrives after the revocation. It must NOT coalesce onto A's in-flight
-	// query (different epoch in the singleflight key); it starts its own query
-	// against the post-revocation state.
+	// query (different generation in the singleflight key); it starts its own
+	// query against the post-revocation state.
 	fresh := &countingStore{result: false}
 	s.store = fresh
 	bOK, _ := s.CanTeam(context.Background(), user, team, "settings:write")
@@ -188,28 +229,22 @@ func TestCanTeamLateJoinerAfterInvalidateStartsFreshQuery(t *testing.T) {
 
 func TestCanTeamCacheStaysBounded(t *testing.T) {
 	store := &countingStore{result: true}
-	s := New(store)
+	s := newCachedForTest(store)
 	team := uuid.New()
 
-	// Insert well past the cap with distinct users; the overflow store sweeps
-	// (nothing expired) and then clears, so the map never exceeds the cap.
+	// Insert well past the cap with distinct users; the overflow sweep finds
+	// nothing expired and resets, so the map never exceeds the cap.
 	for i := 0; i < teamPermCacheMaxEntries+50; i++ {
 		_, _ = s.CanTeam(context.Background(), uuid.New(), team, "settings:write")
 	}
-	if n := s.teamPermCount.Load(); n > teamPermCacheMaxEntries {
+	if n := s.cacheLen(); n > teamPermCacheMaxEntries {
 		t.Fatalf("cache grew past the cap: %d > %d", n, teamPermCacheMaxEntries)
-	}
-	// The counter must agree with the map's real size.
-	var real int64
-	s.teamPermCache.Range(func(_, _ any) bool { real++; return true })
-	if real != s.teamPermCount.Load() {
-		t.Fatalf("size counter drifted: counter=%d map=%d", s.teamPermCount.Load(), real)
 	}
 }
 
 func TestCanTeamSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	store := &countingStore{result: true, delay: 30 * time.Millisecond}
-	s := New(store)
+	s := newCachedForTest(store)
 	user, team := uuid.New(), uuid.New()
 
 	var wg sync.WaitGroup
