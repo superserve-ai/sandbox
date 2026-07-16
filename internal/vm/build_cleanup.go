@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 )
 
@@ -112,7 +111,7 @@ func killOrphanFirecracker(buildVMID string) int {
 		if !firecrackerCmdlineMatches(cmdline, buildVMID) {
 			continue
 		}
-		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+		if matched, err := killExactVMFirecrackerPID(pid, buildVMID, 500*time.Millisecond); err == nil && matched {
 			killed++
 		}
 	}
@@ -124,9 +123,14 @@ func killOrphanFirecracker(buildVMID string) int {
 // Only firecracker matches — never another process that happens to mention the
 // id in its args.
 func firecrackerCmdlineMatches(cmdline []byte, vmID string) bool {
-	if !bytes.Contains(cmdline, []byte("--id\x00"+vmID+"\x00")) {
+	args := bytes.Split(cmdline, []byte{0})
+	if len(args) == 0 || filepath.Base(string(args[0])) != "firecracker" {
 		return false
 	}
-	return bytes.HasPrefix(cmdline, []byte("firecracker")) ||
-		bytes.Contains(cmdline, []byte("/firecracker\x00"))
+	for i := 1; i+1 < len(args); i++ {
+		if string(args[i]) == "--id" && string(args[i+1]) == vmID {
+			return true
+		}
+	}
+	return false
 }

@@ -21,6 +21,20 @@ WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
+-- name: LockActiveTeamSecretIDs :many
+-- Fork creation revalidates every inherited/replacement secret in the same
+-- transaction as its binding inserts. Deterministic lock order prevents two
+-- overlapping secret sets from acquiring row locks in conflicting orders.
+SELECT id FROM secret
+WHERE team_id = sqlc.arg(team_id)
+  AND deleted_at IS NULL
+  AND id = ANY(sqlc.arg(secret_ids)::uuid[])
+ORDER BY id
+-- SoftDeleteSecret updates only non-key columns, so KEY SHARE would not
+-- conflict with it. SHARE holds every active identity stable until the fork
+-- row and all of its bindings commit.
+FOR SHARE;
+
 -- name: ListSecretsForTeam :many
 SELECT * FROM secret
 WHERE team_id = $1 AND deleted_at IS NULL
@@ -60,8 +74,21 @@ RETURNING *;
 SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 
 -- name: AddSandboxSecret :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4);
+WITH inserted AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  VALUES ($1, $2, $3, $4)
+  RETURNING sandbox_id, env_key
+)
+UPDATE sandbox s
+SET secret_env_keys = (
+  SELECT jsonb_agg(keys.env_key ORDER BY keys.env_key)
+  FROM (
+    SELECT jsonb_array_elements_text(s.secret_env_keys) AS env_key
+    UNION
+    SELECT env_key FROM inserted
+  ) keys
+), updated_at = now()
+WHERE s.id = (SELECT sandbox_id FROM inserted);
 
 -- name: ClaimSandboxSecretProxyToken :one
 -- Persist a proxy token minted on the fly for a legacy (NULL-token) binding.
@@ -75,9 +102,23 @@ RETURNING proxy_token;
 -- name: AddSandboxSecrets :exec
 -- Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
 -- the secret_ids, env_keys, and proxy_tokens arrays are paired by position.
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
-FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i);
+WITH inserted AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT @sandbox_id::uuid, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
+  FROM generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
+  RETURNING sandbox_id, env_key
+)
+UPDATE sandbox s
+SET secret_env_keys = (
+  SELECT jsonb_agg(keys.env_key ORDER BY keys.env_key)
+  FROM (
+    SELECT jsonb_array_elements_text(s.secret_env_keys) AS env_key
+    UNION
+    SELECT env_key FROM inserted
+  ) keys
+), updated_at = now()
+WHERE s.id = @sandbox_id::uuid
+  AND EXISTS (SELECT 1 FROM inserted);
 
 -- name: DeleteSandboxSecretBinding :one
 -- Remove one binding by env_key; returns the secret_id and proxy token for re-mint.
@@ -99,6 +140,16 @@ WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL;
 -- env_key → secret_name map for the sandbox detail response. Includes
 -- bindings to soft-deleted secrets so the UI can show "(revoked)".
 SELECT ss.env_key, s.name AS secret_name, (s.deleted_at IS NOT NULL)::bool AS secret_revoked
+FROM sandbox_secret ss
+JOIN secret s ON s.id = ss.secret_id
+WHERE ss.sandbox_id = $1
+ORDER BY ss.env_key;
+
+-- name: ListSandboxSecretBindingIdentities :many
+-- Stable, non-secret identity captured by a saved snapshot. Soft-deleted
+-- secrets remain visible so a fork can fail explicitly (or accept a complete
+-- replacement set) instead of silently dropping a revoked binding.
+SELECT ss.env_key, s.id AS secret_id, s.name AS secret_name
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1

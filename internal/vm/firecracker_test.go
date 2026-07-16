@@ -2,6 +2,7 @@ package vm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/vm/fc/client/operations"
 )
 
 // TestCreateSnapshot_FlattenFieldInJSONBody asserts that the Go-side enum
@@ -160,5 +163,17 @@ func TestIsLayeredInvalidErr(t *testing.T) {
 	}
 	if isLayeredInvalidErr(nil) {
 		t.Error("isLayeredInvalidErr(nil) = true, want false")
+	}
+}
+
+func TestWrapSnapshotLoadErrorMarksOnlyFirecrackerRejections(t *testing.T) {
+	rejected := wrapSnapshotLoadError("load snapshot", operations.NewLoadSnapshotBadRequest())
+	if !errors.Is(rejected, ErrSnapshotLoadRejected) {
+		t.Fatalf("Firecracker 400 was not marked as an artifact rejection: %v", rejected)
+	}
+
+	transport := wrapSnapshotLoadError("load snapshot", fmt.Errorf("dial unix: connection refused"))
+	if errors.Is(transport, ErrSnapshotLoadRejected) {
+		t.Fatalf("transport failure was misclassified as an artifact rejection: %v", transport)
 	}
 }

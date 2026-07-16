@@ -2,6 +2,15 @@
 SELECT sandbox_id FROM sandbox_revocation
 WHERE expires_at > NOW();
 
+-- name: UpsertSandboxRevocation :exec
+-- Failed-create compensation can race a delete retry. Preserve whichever
+-- caller supplies the longer token lifetime so an older retry cannot shorten
+-- an already-persisted revocation.
+INSERT INTO sandbox_revocation (sandbox_id, expires_at)
+VALUES (sqlc.arg(sandbox_id), sqlc.arg(expires_at))
+ON CONFLICT (sandbox_id) DO UPDATE
+SET expires_at = GREATEST(sandbox_revocation.expires_at, EXCLUDED.expires_at);
+
 -- name: DeleteExpiredSandboxRevocations :execrows
 DELETE FROM sandbox_revocation
 WHERE expires_at < NOW();

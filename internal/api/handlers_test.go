@@ -22,6 +22,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -34,6 +35,7 @@ type stubVMD struct {
 	deleteSnapsFn    func(ctx context.Context, id string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
+	revokeSandboxFn  func(ctx context.Context, id string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
 }
 
@@ -92,8 +94,13 @@ func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, 
 	}
 	return nil
 }
-func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error       { return nil }
-func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error          { return nil }
+func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) RevokeSandbox(ctx context.Context, id string) error {
+	if s.revokeSandboxFn != nil {
+		return s.revokeSandboxFn(ctx, id)
+	}
+	return nil
+}
 func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) InjectSandboxEnv(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error {
 	if s.injectEnvFn != nil {
@@ -187,6 +194,12 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[21].(*int32) = s.DiskMib
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
+		if len(dest) > 24 {
+			*dest[24].(*pgtype.UUID) = s.SourceSnapshotID
+			*dest[25].(*pgtype.UUID) = s.SnapshotOperationID
+			*dest[26].(*pgtype.Timestamptz) = s.SnapshotOperationStartedAt
+			*dest[27].(*[]byte) = s.SecretEnvKeys
+		}
 		return nil
 	}}
 }
@@ -303,6 +316,10 @@ func deleteRequest(sandboxID string) *http.Request {
 	return httptest.NewRequest(http.MethodDelete, "/sandboxes/"+sandboxID, nil)
 }
 
+func patchRequest(sandboxID, body string) *http.Request {
+	return httptest.NewRequest(http.MethodPatch, "/sandboxes/"+sandboxID, strings.NewReader(body))
+}
+
 func parseJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	var body map[string]any
@@ -360,6 +377,51 @@ func TestDeleteSandbox_Success(t *testing.T) {
 	}
 	if !destroyCalled {
 		t.Error("VMD.DestroyInstance was not called")
+	}
+}
+
+func TestPatchSandbox_SnapshotOperationRejectsCapturedPolicyChanges(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	operationID := uuid.New()
+	sb := db.Sandbox{
+		ID:                  sandboxID,
+		TeamID:              teamID,
+		Status:              db.SandboxStatusActive,
+		SnapshotOperationID: pgtype.UUID{Bytes: operationID, Valid: true},
+	}
+
+	for name, body := range map[string]string{
+		"network":     `{"network":{"allow_out":["192.0.2.0/24"]}}`,
+		"timeout":     `{"timeout_seconds":600}`,
+		"auto_delete": `{"auto_delete_seconds":3600}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var networkCalled bool
+			mock := &mockDBTX{queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) }}
+			h := &Handlers{
+				VMD: &stubVMD{updateNetworkFn: func(context.Context, string, []string, []string, []string) error {
+					networkCalled = true
+					return nil
+				}},
+				DB: db.New(mock),
+			}
+			r := gin.New()
+			r.Use(func(c *gin.Context) {
+				c.Set("team_id", teamID.String())
+				c.Next()
+			})
+			r.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, patchRequest(sandboxID.String(), body))
+
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+			}
+			if networkCalled {
+				t.Error("network policy must not be pushed while snapshot capture is in progress")
+			}
+		})
 	}
 }
 
@@ -747,6 +809,79 @@ func TestDeleteSandbox_Resuming_Returns409(t *testing.T) {
 	}
 	if destroyCalled {
 		t.Error("must NOT tear down a sandbox it couldn't claim")
+	}
+}
+
+func TestDeleteSandbox_SavedSnapshots_ReturnsDependencyConflict(t *testing.T) {
+	recorder := useSavedSnapshotOutcomeRecorder(t)
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotIDs := []uuid.UUID{uuid.New(), uuid.New()}
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+
+	var destroyCalled bool
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
+		destroyCalled = true
+		return nil
+	}}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return notFoundRow() // guarded claim rejected by saved snapshots
+			case strings.Contains(sql, "saved_snapshot_count"):
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = int64(len(snapshotIDs))
+					return nil
+				}}
+			default:
+				return sandboxRow(sb) // initial read and post-claim re-read
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "kind = 'saved'") {
+				rows := make([]func(...any) error, 0, len(snapshotIDs))
+				for _, id := range snapshotIDs {
+					id := id
+					rows = append(rows, func(dest ...any) error {
+						*dest[0].(*uuid.UUID) = id
+						return nil
+					})
+				}
+				return &scanRows{rows: rows}, nil
+			}
+			return &scanRows{}, nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	errorBody, _ := body["error"].(map[string]any)
+	if got := errorBody["code"]; got != "sandbox_has_snapshots" {
+		t.Fatalf("error code = %v, want sandbox_has_snapshots", got)
+	}
+	dependencies, _ := errorBody["dependencies"].(map[string]any)
+	if got := dependencies["sandbox_count"]; got != float64(0) {
+		t.Errorf("sandbox_count = %v, want 0", got)
+	}
+	if got := dependencies["snapshot_count"]; got != float64(len(snapshotIDs)) {
+		t.Errorf("snapshot_count = %v, want %d", got, len(snapshotIDs))
+	}
+	if ids, _ := dependencies["snapshot_ids"].([]any); len(ids) != len(snapshotIDs) {
+		t.Errorf("snapshot_ids length = %d, want %d", len(ids), len(snapshotIDs))
+	}
+	if destroyCalled {
+		t.Error("must not tear down a source sandbox while saved snapshots pin it")
+	}
+	if len(recorder.outcomes) != 1 || recorder.outcomes[0].Operation != telemetry.SavedSnapshotOperationDelete ||
+		recorder.outcomes[0].Outcome != telemetry.SavedSnapshotOutcomeDependencyBlocked {
+		t.Fatalf("dependency-block telemetry = %+v", recorder.outcomes)
 	}
 }
 

@@ -41,6 +41,10 @@
 //   - Artifact files on hosts (template rootfs/snapshots, sandbox snapshots)
 //     are copied via GCS by the runbook; plan/validate print the directory
 //     list that step consumes.
+//   - V1 saved snapshots and sandboxes forked from them are host-local and
+//     cannot be replicated by this tool. Every phase refuses a team with any
+//     saved-snapshot rows, lineage, in-flight capture, dependent template, or
+//     non-zero saved-snapshot storage accounting.
 //   - proxy_audit, net_flow, audit_logs, and reconciler_log stay in the
 //     source cell: they are append-only audit history (audit_logs even
 //     blocks deletes with a trigger) and are host/cell-scoped.

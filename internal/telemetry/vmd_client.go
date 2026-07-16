@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -48,6 +49,64 @@ func (c *instrumentedVMDClient) PauseInstance(ctx context.Context, instanceID, s
 	started := time.Now()
 	defer func() { c.record(ctx, "PauseVM", started, err) }()
 	return c.next.PauseInstance(ctx, instanceID, snapshotDir)
+}
+
+func (c *instrumentedVMDClient) savedSnapshots() (vmdclient.SavedSnapshotClient, error) {
+	next, ok := c.next.(vmdclient.SavedSnapshotClient)
+	if !ok {
+		return nil, fmt.Errorf("VMD client does not support immutable saved snapshots")
+	}
+	return next, nil
+}
+
+func (c *instrumentedVMDClient) CheckSavedSnapshotSupport(ctx context.Context) (err error) {
+	started := time.Now()
+	defer func() { c.record(ctx, "GetCapabilities", started, err) }()
+	next, err := c.savedSnapshots()
+	if err != nil {
+		return err
+	}
+	return next.CheckSavedSnapshotSupport(ctx)
+}
+
+func (c *instrumentedVMDClient) CreateSavedSnapshot(ctx context.Context, sourceInstanceID, snapshotID string) (artifacts vmdclient.SavedSnapshotArtifacts, err error) {
+	started := time.Now()
+	defer func() { c.record(ctx, "CreateSavedSnapshot", started, err) }()
+	next, err := c.savedSnapshots()
+	if err != nil {
+		return artifacts, err
+	}
+	return next.CreateSavedSnapshot(ctx, sourceInstanceID, snapshotID)
+}
+
+func (c *instrumentedVMDClient) RestoreSavedSnapshot(ctx context.Context, instanceID, manifestPath, manifestDigest, teamID, ownerID string, network vmdclient.SavedSnapshotNetwork, clearEnvKeys []string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error) {
+	started := time.Now()
+	defer func() { c.record(ctx, "RestoreSavedSnapshot", started, err) }()
+	next, err := c.savedSnapshots()
+	if err != nil {
+		return "", 0, 0, err
+	}
+	return next.RestoreSavedSnapshot(ctx, instanceID, manifestPath, manifestDigest, teamID, ownerID, network, clearEnvKeys)
+}
+
+func (c *instrumentedVMDClient) DeleteSavedSnapshot(ctx context.Context, sourceInstanceID, snapshotID string) (err error) {
+	started := time.Now()
+	defer func() { c.record(ctx, "DeleteSavedSnapshot", started, err) }()
+	next, err := c.savedSnapshots()
+	if err != nil {
+		return err
+	}
+	return next.DeleteSavedSnapshot(ctx, sourceInstanceID, snapshotID)
+}
+
+func (c *instrumentedVMDClient) MeasureSandboxWritableLayer(ctx context.Context, instanceID string) (logicalBytes, exclusiveBytes int64, err error) {
+	started := time.Now()
+	defer func() { c.record(ctx, "GetWritableLayerUsage", started, err) }()
+	next, err := c.savedSnapshots()
+	if err != nil {
+		return 0, 0, err
+	}
+	return next.MeasureSandboxWritableLayer(ctx, instanceID)
 }
 
 func (c *instrumentedVMDClient) ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error) {

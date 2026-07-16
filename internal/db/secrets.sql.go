@@ -14,8 +14,21 @@ import (
 )
 
 const addSandboxSecret = `-- name: AddSandboxSecret :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4)
+WITH inserted AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  VALUES ($1, $2, $3, $4)
+  RETURNING sandbox_id, env_key
+)
+UPDATE sandbox s
+SET secret_env_keys = (
+  SELECT jsonb_agg(keys.env_key ORDER BY keys.env_key)
+  FROM (
+    SELECT jsonb_array_elements_text(s.secret_env_keys) AS env_key
+    UNION
+    SELECT env_key FROM inserted
+  ) keys
+), updated_at = now()
+WHERE s.id = (SELECT sandbox_id FROM inserted)
 `
 
 type AddSandboxSecretParams struct {
@@ -36,9 +49,23 @@ func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretPara
 }
 
 const addSandboxSecrets = `-- name: AddSandboxSecrets :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-SELECT $1::uuid, ($2::uuid[])[i], ($3::text[])[i], ($4::text[])[i]
-FROM generate_subscripts($2::uuid[], 1) AS g(i)
+WITH inserted AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT $1::uuid, ($2::uuid[])[i], ($3::text[])[i], ($4::text[])[i]
+  FROM generate_subscripts($2::uuid[], 1) AS g(i)
+  RETURNING sandbox_id, env_key
+)
+UPDATE sandbox s
+SET secret_env_keys = (
+  SELECT jsonb_agg(keys.env_key ORDER BY keys.env_key)
+  FROM (
+    SELECT jsonb_array_elements_text(s.secret_env_keys) AS env_key
+    UNION
+    SELECT env_key FROM inserted
+  ) keys
+), updated_at = now()
+WHERE s.id = $1::uuid
+  AND EXISTS (SELECT 1 FROM inserted)
 `
 
 type AddSandboxSecretsParams struct {
@@ -448,6 +475,43 @@ func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEv
 	return items, nil
 }
 
+const listSandboxSecretBindingIdentities = `-- name: ListSandboxSecretBindingIdentities :many
+SELECT ss.env_key, s.id AS secret_id, s.name AS secret_name
+FROM sandbox_secret ss
+JOIN secret s ON s.id = ss.secret_id
+WHERE ss.sandbox_id = $1
+ORDER BY ss.env_key
+`
+
+type ListSandboxSecretBindingIdentitiesRow struct {
+	EnvKey     string    `json:"env_key"`
+	SecretID   uuid.UUID `json:"secret_id"`
+	SecretName string    `json:"secret_name"`
+}
+
+// Stable, non-secret identity captured by a saved snapshot. Soft-deleted
+// secrets remain visible so a fork can fail explicitly (or accept a complete
+// replacement set) instead of silently dropping a revoked binding.
+func (q *Queries) ListSandboxSecretBindingIdentities(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretBindingIdentitiesRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxSecretBindingIdentities, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxSecretBindingIdentitiesRow{}
+	for rows.Next() {
+		var i ListSandboxSecretBindingIdentitiesRow
+		if err := rows.Scan(&i.EnvKey, &i.SecretID, &i.SecretName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxSecretBindingMeta = `-- name: ListSandboxSecretBindingMeta :many
 SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
        s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
@@ -712,6 +776,46 @@ func (q *Queries) ListSecretsForTeam(ctx context.Context, teamID uuid.UUID) ([]S
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockActiveTeamSecretIDs = `-- name: LockActiveTeamSecretIDs :many
+SELECT id FROM secret
+WHERE team_id = $1
+  AND deleted_at IS NULL
+  AND id = ANY($2::uuid[])
+ORDER BY id
+FOR SHARE
+`
+
+type LockActiveTeamSecretIDsParams struct {
+	TeamID    uuid.UUID   `json:"team_id"`
+	SecretIds []uuid.UUID `json:"secret_ids"`
+}
+
+// Fork creation revalidates every inherited/replacement secret in the same
+// transaction as its binding inserts. Deterministic lock order prevents two
+// overlapping secret sets from acquiring row locks in conflicting orders.
+// SoftDeleteSecret updates only non-key columns, so KEY SHARE would not
+// conflict with it. SHARE holds every active identity stable until the fork
+// row and all of its bindings commit.
+func (q *Queries) LockActiveTeamSecretIDs(ctx context.Context, arg LockActiveTeamSecretIDsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockActiveTeamSecretIDs, arg.TeamID, arg.SecretIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

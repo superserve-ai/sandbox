@@ -136,8 +136,8 @@ WHERE deleted_at IS NULL
        OR name LIKE sqlc.narg('name_prefix')::text || '%');
 
 -- name: SoftDeleteTemplateIfUnused :one
--- Soft-deletes a template only if no live sandbox references it AND no
--- build is in flight. Blocking on builds prevents the vmd-side artifact
+-- Soft-deletes a template only if no live sandbox or saved snapshot pins it
+-- and no build is in flight. Blocking on builds prevents the vmd-side artifact
 -- cleanup from racing with template-builder still writing to the same dirs.
 WITH locked AS (
   SELECT t.id AS tpl_id FROM template t
@@ -148,6 +148,10 @@ counted AS (
   SELECT
     (SELECT COUNT(*)::bigint FROM sandbox
      WHERE template_id = $1 AND destroyed_at IS NULL) AS live_count,
+    (SELECT COUNT(*)::bigint FROM snapshot
+     WHERE template_id = $1
+       AND kind = 'saved'
+       AND deleted_at IS NULL) AS snapshot_count,
     (SELECT COUNT(*)::bigint FROM template_build
      WHERE template_id = $1
        AND status IN ('pending', 'building', 'snapshotting')) AS inflight_build_count
@@ -157,12 +161,14 @@ deleted AS (
   SET deleted_at = now(), updated_at = now()
   WHERE t.id IN (SELECT tpl_id FROM locked)
     AND (SELECT live_count FROM counted) = 0
+    AND (SELECT snapshot_count FROM counted) = 0
     AND (SELECT inflight_build_count FROM counted) = 0
   RETURNING t.id
 )
 SELECT
   EXISTS(SELECT 1 FROM locked)  AS found,
   (SELECT live_count FROM counted) AS live_count,
+  (SELECT snapshot_count FROM counted) AS snapshot_count,
   (SELECT inflight_build_count FROM counted) AS inflight_build_count,
   EXISTS(SELECT 1 FROM deleted) AS deleted;
 

@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -91,13 +93,124 @@ func TestRetryUnavailableStopsOnContextCancel(t *testing.T) {
 // embedded nil interface.
 type fakeVMDClient struct {
 	vmdpb.VMDaemonClient
-	opens   int
-	opensFn func(call int) (vmdpb.VMDaemon_StreamBuildLogsClient, error)
+	opens            int
+	opensFn          func(call int) (vmdpb.VMDaemon_StreamBuildLogsClient, error)
+	capabilitiesFn   func() (*vmdpb.GetCapabilitiesResponse, error)
+	createSnapshotFn func() (*vmdpb.CreateSnapshotResponse, error)
+}
+
+func (f *fakeVMDClient) GetCapabilities(context.Context, *vmdpb.GetCapabilitiesRequest, ...grpc.CallOption) (*vmdpb.GetCapabilitiesResponse, error) {
+	return f.capabilitiesFn()
+}
+
+func (f *fakeVMDClient) CreateSnapshot(context.Context, *vmdpb.CreateSnapshotRequest, ...grpc.CallOption) (*vmdpb.CreateSnapshotResponse, error) {
+	return f.createSnapshotFn()
 }
 
 func (f *fakeVMDClient) StreamBuildLogs(ctx context.Context, req *vmdpb.StreamBuildLogsRequest, opts ...grpc.CallOption) (vmdpb.VMDaemon_StreamBuildLogsClient, error) {
 	f.opens++
 	return f.opensFn(f.opens)
+}
+
+func TestGRPCVMDClientSavedSnapshotCapabilityFailsClosedOnOldVMD(t *testing.T) {
+	fake := &fakeVMDClient{capabilitiesFn: func() (*vmdpb.GetCapabilitiesResponse, error) {
+		return nil, grpcstatus.Error(grpccodes.Unimplemented, "unknown method GetCapabilities")
+	}}
+	err := (&grpcVMDClient{client: fake}).CheckSavedSnapshotSupport(context.Background())
+	if grpcstatus.Code(err) != grpccodes.Unimplemented {
+		t.Fatalf("capability error code = %s, want Unimplemented: %v", grpcstatus.Code(err), err)
+	}
+}
+
+func TestGRPCVMDClientSavedSnapshotCapabilityRequiresAdvertisement(t *testing.T) {
+	fake := &fakeVMDClient{capabilitiesFn: func() (*vmdpb.GetCapabilitiesResponse, error) {
+		return &vmdpb.GetCapabilitiesResponse{}, nil
+	}}
+	err := (&grpcVMDClient{client: fake}).CheckSavedSnapshotSupport(context.Background())
+	if grpcstatus.Code(err) != grpccodes.Unimplemented {
+		t.Fatalf("capability error code = %s, want Unimplemented: %v", grpcstatus.Code(err), err)
+	}
+}
+
+func TestGRPCVMDClientMissingSavedSnapshotArtifactsAreRetryable(t *testing.T) {
+	fake := &fakeVMDClient{createSnapshotFn: func() (*vmdpb.CreateSnapshotResponse, error) {
+		return &vmdpb.CreateSnapshotResponse{}, nil
+	}}
+	_, err := (&grpcVMDClient{client: fake}).CreateSavedSnapshot(context.Background(), "source", "snapshot")
+	if grpcstatus.Code(err) != grpccodes.Unavailable {
+		t.Fatalf("missing artifact error code = %s, want Unavailable: %v", grpcstatus.Code(err), err)
+	}
+}
+
+func TestGRPCVMDClientSanitizesSavedSnapshotErrorsFromOlderVMD(t *testing.T) {
+	const hostPath = "/var/lib/superserve/private/snapshots/source/snapshot/manifest.json"
+	st, err := grpcstatus.New(grpccodes.DataLoss, "read "+hostPath+": input/output error").WithDetails(&errdetails.ErrorInfo{
+		Reason: vmdclient.SavedSnapshotSourceResumeFailureReason,
+		Domain: "vmd.superserve.ai",
+		Metadata: map[string]string{
+			"artifact_path": hostPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach VMD error details: %v", err)
+	}
+	fake := &fakeVMDClient{createSnapshotFn: func() (*vmdpb.CreateSnapshotResponse, error) {
+		return nil, st.Err()
+	}}
+
+	_, err = (&grpcVMDClient{client: fake}).CreateSavedSnapshot(context.Background(), "source", "snapshot")
+	if grpcstatus.Code(err) != grpccodes.DataLoss {
+		t.Fatalf("code = %s, want DataLoss (%v)", grpcstatus.Code(err), err)
+	}
+	if !vmdclient.GRPCErrorHasReason(err, vmdclient.SavedSnapshotSourceResumeFailureReason) {
+		t.Fatalf("stable error reason was not preserved: %v", err)
+	}
+	if strings.Contains(err.Error(), hostPath) || strings.Contains(err.Error(), "artifact_path") {
+		t.Fatalf("control-plane boundary exposed host artifact path: %v", err)
+	}
+}
+
+func TestGRPCVMDClientRejectsInvalidSavedSnapshotMetadata(t *testing.T) {
+	validResponse := func() *vmdpb.CreateSnapshotResponse {
+		return &vmdpb.CreateSnapshotResponse{
+			Artifacts: &vmdpb.SavedSnapshotArtifacts{
+				SchemaVersion:  1,
+				ManifestPath:   "/snapshots/saved/manifest.json",
+				ManifestDigest: strings.Repeat("a", 64),
+				SnapshotPath:   "/snapshots/saved/vmstate.snap",
+				MemFilePath:    "/snapshots/saved/mem.snap",
+				DiskFullPath:   "/snapshots/saved/rootfs.ext4",
+			},
+			ResourceLimits: &vmdpb.ResourceLimits{VcpuCount: 2, MemoryMib: 2048, DiskSizeMib: 8192},
+			SourceState:    "running",
+		}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*vmdpb.CreateSnapshotResponse)
+	}{
+		{name: "logical", mutate: func(resp *vmdpb.CreateSnapshotResponse) { resp.LogicalSizeBytes = -1 }},
+		{name: "exclusive", mutate: func(resp *vmdpb.CreateSnapshotResponse) { resp.ExclusiveSizeBytes = -1 }},
+		{name: "source logical", mutate: func(resp *vmdpb.CreateSnapshotResponse) { resp.SourceLogicalSizeBytes = -1 }},
+		{name: "source exclusive", mutate: func(resp *vmdpb.CreateSnapshotResponse) { resp.SourceExclusiveSizeBytes = -1 }},
+		{name: "uppercase manifest digest", mutate: func(resp *vmdpb.CreateSnapshotResponse) {
+			resp.Artifacts.ManifestDigest = strings.Repeat("A", 64)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := validResponse()
+			tt.mutate(resp)
+			fake := &fakeVMDClient{createSnapshotFn: func() (*vmdpb.CreateSnapshotResponse, error) {
+				return resp, nil
+			}}
+			_, err := (&grpcVMDClient{client: fake}).CreateSavedSnapshot(context.Background(), "source", "snapshot")
+			if grpcstatus.Code(err) != grpccodes.Unavailable {
+				t.Fatalf("invalid metadata error code = %s, want Unavailable: %v", grpcstatus.Code(err), err)
+			}
+		})
+	}
 }
 
 // fakeLogStream serves the given events, then errAfter (or io.EOF).

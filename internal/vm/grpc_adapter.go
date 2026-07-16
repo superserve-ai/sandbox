@@ -2,13 +2,18 @@ package vm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -31,6 +36,11 @@ func (a *GRPCAdapter) WithSecretsBroker(socketPath, sandboxProxyURL string) *GRP
 	a.secrets = NewSecretsBrokerClient(socketPath)
 	a.sandboxProxyURL = sandboxProxyURL
 	return a
+}
+
+func (a *GRPCAdapter) GetCapabilities(context.Context, *vmdpb.GetCapabilitiesRequest) (*vmdpb.GetCapabilitiesResponse, error) {
+	enabled := a != nil && a.mgr != nil && a.mgr.savedSnapshotsSupported()
+	return &vmdpb.GetCapabilitiesResponse{SavedSnapshotsV1: enabled}, nil
 }
 
 func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest) (*vmdpb.DestroyVMResponse, error) {
@@ -81,6 +91,61 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 }
 
 func (a *GRPCAdapter) CreateSnapshot(ctx context.Context, req *vmdpb.CreateSnapshotRequest) (*vmdpb.CreateSnapshotResponse, error) {
+	if req.GetSnapshotId() != "" {
+		saved, err := a.mgr.CreateSavedSnapshot(ctx, req.GetVmId(), req.GetSnapshotId())
+		if err != nil {
+			if errors.Is(err, ErrSavedSnapshotSourceResume) {
+				st := status.New(codes.Internal, "saved snapshot source failed to resume after capture")
+				withDetails, detailErr := st.WithDetails(&errdetails.ErrorInfo{
+					Reason: vmdclient.SavedSnapshotSourceResumeFailureReason,
+					Domain: "vmd.superserve.ai",
+				})
+				if detailErr == nil {
+					return nil, withDetails.Err()
+				}
+				return nil, st.Err()
+			}
+			if errors.Is(err, context.Canceled) {
+				return nil, vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationCapture, err)
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationCapture, err)
+			}
+			if status.Code(err) == codes.Unknown {
+				err = status.Error(codes.Unavailable, "saved snapshot host capture failed")
+			}
+			return nil, vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationCapture, err)
+		}
+		return &vmdpb.CreateSnapshotResponse{
+			VmId:          req.GetVmId(),
+			SnapshotId:    saved.SnapshotID,
+			SnapshotPath:  saved.Artifacts.SnapshotPath,
+			MemFilePath:   saved.Artifacts.MemFilePath,
+			CreatedAtUnix: saved.CreatedAt.Unix(),
+			Artifacts: &vmdpb.SavedSnapshotArtifacts{
+				SchemaVersion:   saved.SchemaVersion,
+				ManifestPath:    saved.Artifacts.ManifestPath,
+				SnapshotPath:    saved.Artifacts.SnapshotPath,
+				MemFilePath:     saved.Artifacts.MemFilePath,
+				MemoryBasePath:  saved.Artifacts.MemoryBasePath,
+				DiskBasePath:    saved.Artifacts.DiskBasePath,
+				DiskDeltaPath:   saved.Artifacts.DiskDeltaPath,
+				DiskOverlayPath: saved.Artifacts.DiskOverlayPath,
+				DiskFullPath:    saved.Artifacts.DiskFullPath,
+				ManifestDigest:  saved.ManifestDigest,
+			},
+			ResourceLimits: &vmdpb.ResourceLimits{
+				VcpuCount:   saved.Resources.VCPU,
+				MemoryMib:   saved.Resources.MemoryMiB,
+				DiskSizeMib: saved.Resources.DiskSizeMiB,
+			},
+			LogicalSizeBytes:         saved.LogicalSizeBytes,
+			ExclusiveSizeBytes:       saved.ExclusiveSizeBytes,
+			SourceLogicalSizeBytes:   saved.SourceLogicalSizeBytes,
+			SourceExclusiveSizeBytes: saved.SourceExclusiveSizeBytes,
+			SourceState:              saved.SourceState,
+		}, nil
+	}
 	snapshotPath, memPath, err := a.mgr.CreateVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotDir())
 	if err != nil {
 		return nil, err
@@ -90,6 +155,92 @@ func (a *GRPCAdapter) CreateSnapshot(ctx context.Context, req *vmdpb.CreateSnaps
 		SnapshotPath:  snapshotPath,
 		MemFilePath:   memPath,
 		CreatedAtUnix: time.Now().Unix(),
+	}, nil
+}
+
+func (a *GRPCAdapter) RestoreSavedSnapshot(ctx context.Context, req *vmdpb.RestoreSavedSnapshotRequest) (*vmdpb.RestoreSavedSnapshotResponse, error) {
+	if len(req.GetExpectedManifestDigest()) != sha256.Size*2 {
+		return nil, status.Error(codes.InvalidArgument, "expected_manifest_digest must be a SHA-256 hex digest")
+	}
+	if _, err := hex.DecodeString(req.GetExpectedManifestDigest()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "expected_manifest_digest must be a SHA-256 hex digest")
+	}
+	clear := make(map[string]string, len(req.GetClearEnvKeys()))
+	for _, key := range req.GetClearEnvKeys() {
+		if key == "" {
+			return nil, status.Error(codes.InvalidArgument, "clear_env_keys cannot contain an empty key")
+		}
+		clear[key] = ""
+	}
+	var netCfg *network.Config
+	if nc := req.GetNetworkConfig(); nc != nil {
+		netCfg = &network.Config{
+			HostInterface: nc.GetHostInterface(),
+			SubnetCIDR:    nc.GetSubnetCidr(),
+			GatewayIP:     nc.GetGatewayIp(),
+			EnableNAT:     nc.GetEnableNat(),
+		}
+	}
+	var egress *network.EgressRules
+	if sandboxNetwork := req.GetSandboxNetwork(); sandboxNetwork != nil && sandboxNetwork.GetEgress() != nil {
+		rules := sandboxNetwork.GetEgress()
+		egress = &network.EgressRules{
+			AllowedCIDRs:   rules.GetAllowedCidrs(),
+			DeniedCIDRs:    rules.GetDeniedCidrs(),
+			AllowedDomains: rules.GetAllowedDomains(),
+			SandboxID:      req.GetVmId(),
+		}
+	}
+	inst, saved, err := a.mgr.RestoreSavedSnapshot(ctx, req.GetVmId(), req.GetManifestPath(), req.GetExpectedManifestDigest(), netCfg, egress, req.GetTeamId(), req.GetOwnerId())
+	if err != nil {
+		return nil, vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationRestore, err)
+	}
+
+	// boxd /init is additive, so overwrite captured source-specific secret
+	// token defaults with empty values before exposing the child. Fresh child
+	// values and HTTPS_PROXY are injected afterward through InjectSandboxEnv.
+	if len(clear) > 0 {
+		if err := postBoxdInit(ctx, inst.IP, clear, vmHostname(inst.ID)); err != nil {
+			// Do not leave a reachable child with captured boxd defaults after
+			// the security scrub failed. Control-plane cleanup remains idempotent.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = a.mgr.DestroyVM(cleanupCtx, inst.ID, true)
+			cancel()
+			return nil, vmdclient.SanitizeSavedSnapshotError(
+				vmdclient.SavedSnapshotOperationRestore,
+				status.Errorf(codes.Internal, "clear captured env defaults: %v", err),
+			)
+		}
+	}
+
+	return &vmdpb.RestoreSavedSnapshotResponse{
+		VmId:       inst.ID,
+		SocketPath: inst.SocketPath,
+		IpAddress:  inst.IP,
+		Pid:        uint32(inst.PID),
+		ResourceLimits: &vmdpb.ResourceLimits{
+			VcpuCount:   saved.Resources.VCPU,
+			MemoryMib:   saved.Resources.MemoryMiB,
+			DiskSizeMib: saved.Resources.DiskSizeMiB,
+		},
+	}, nil
+}
+
+func (a *GRPCAdapter) DeleteSavedSnapshot(ctx context.Context, req *vmdpb.DeleteSavedSnapshotRequest) (*vmdpb.DeleteSavedSnapshotResponse, error) {
+	if err := a.mgr.DeleteSavedSnapshot(ctx, req.GetSourceVmId(), req.GetSnapshotId()); err != nil {
+		return nil, vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationDelete, err)
+	}
+	return &vmdpb.DeleteSavedSnapshotResponse{Deleted: true}, nil
+}
+
+func (a *GRPCAdapter) GetWritableLayerUsage(_ context.Context, req *vmdpb.GetWritableLayerUsageRequest) (*vmdpb.GetWritableLayerUsageResponse, error) {
+	logical, exclusive, err := a.mgr.SandboxWritableLayerUsage(req.GetVmId())
+	if err != nil {
+		return nil, vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationWritableLayerMeasurement, err)
+	}
+	return &vmdpb.GetWritableLayerUsageResponse{
+		LogicalSizeBytes:   logical,
+		ExclusiveSizeBytes: exclusive,
 	}, nil
 }
 
@@ -319,8 +470,15 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 	// This RPC reads netMgr state directly (below), which the background startup
 	// reattach may not have restored yet. Resolve the VM through getInstance first
 	// so it's reattached on demand (or NotFound if it's genuinely gone).
-	if _, err := a.mgr.getInstance(vmID); err != nil {
+	inst, err := a.mgr.getInstance(vmID)
+	if err != nil {
 		return nil, err
+	}
+	rules := &network.EgressRules{
+		AllowedCIDRs:   append([]string(nil), egress.GetAllowedCidrs()...),
+		DeniedCIDRs:    append([]string(nil), egress.GetDeniedCidrs()...),
+		AllowedDomains: append([]string(nil), egress.GetAllowedDomains()...),
+		SandboxID:      vmID,
 	}
 
 	// Update nftables rules (non-TCP traffic).
@@ -332,14 +490,14 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 	if a.mgr.egressProxy != nil {
 		netInfo := a.mgr.netMgr.GetVMNetInfo(vmID)
 		if netInfo != nil {
-			a.mgr.egressProxy.SetRules(netInfo.HostIP, &network.EgressRules{
-				AllowedCIDRs:   egress.GetAllowedCidrs(),
-				DeniedCIDRs:    egress.GetDeniedCidrs(),
-				AllowedDomains: egress.GetAllowedDomains(),
-				SandboxID:      vmID,
-			})
+			a.mgr.egressProxy.SetRules(netInfo.HostIP, rules)
 		}
 	}
+
+	inst.mu.Lock()
+	inst.Config.EgressPolicy = rules
+	inst.mu.Unlock()
+	a.mgr.persistState(inst)
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
 }

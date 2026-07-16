@@ -75,6 +75,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
 		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
+		sentrylog.RunSafe("snapshot-fork-teardown", func() { h.reapDestroyedSnapshotForkPins(ctx, cfg.BatchSize, parallelism) })
 		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
 		// Auto-delete runs after the DB-only sweeps (interval/revocation/
 		// snapshot) so a slow host during its batch teardown can't delay them.
@@ -201,6 +202,25 @@ func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context) {
 	}
 }
 
+// reapDestroyedSnapshotForkPins retries exact-host teardown for soft-deleted
+// forks whose parent snapshot remains pinned. It is the crash/outage backstop
+// for the immediate delete path; clearing the pin is performed only inside the
+// shared teardown helper after VMD proves the VM is gone.
+func (h *Handlers) reapDestroyedSnapshotForkPins(ctx context.Context, batchSize int32, parallelism int) {
+	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
+	pending, err := h.DB.ListDestroyedSnapshotForksPendingPinRelease(queryCtx, batchSize)
+	queryCancel()
+	if err != nil {
+		log.Warn().Err(err).Msg("reaper: list destroyed snapshot forks pending teardown")
+		return
+	}
+	dispatchBounded(ctx, pending, parallelism, func(sbx db.ListDestroyedSnapshotForksPendingPinReleaseRow) {
+		tctx, cancel := context.WithTimeout(ctx, autoDeleteTeardownTimeout)
+		defer cancel()
+		h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.TeamID, sbx.HostID, sbx.BasePath, sbx.TemplateID, sbx.SourceSnapshotID)
+	})
+}
+
 // reapAutoDeleteOnce deletes paused sandboxes whose auto-delete deadline has
 // passed. ClaimAutoDeleteSandboxes soft-deletes the rows (revocation written,
 // intervals closed) in one guarded statement, so everything after the claim is
@@ -247,7 +267,7 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 
 	tctx, cancel := context.WithTimeout(ctx, autoDeleteTeardownTimeout)
 	defer cancel()
-	h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, sbx.BasePath, sbx.TemplateID)
+	h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.TeamID, sbx.HostID, sbx.BasePath, sbx.TemplateID, sbx.SourceSnapshotID)
 
 	l.Info().Msg("reaper: sandbox auto-deleted after paused window elapsed")
 	h.logSandboxActivity(tctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)
@@ -301,9 +321,12 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		return
 	}
 
+	// Reconcile shadow usage while VMD is still paused, but give FinalizePause
+	// a fresh deadline so telemetry can never roll back lifecycle correctness.
+	h.recordSandboxWritableLayerUsage(ctx, vmd, sbx.ID, sbx.TeamID)
+
 	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
 	defer postCancel()
-
 	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sbx.ID,
 		TeamID:    sbx.TeamID,
@@ -317,7 +340,6 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
 	}
-
 	l.Info().Msg("reaper: sandbox paused due to timeout")
 	RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	// Interval was already closed at the top of pauseExpired; FinalizePause

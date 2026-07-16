@@ -5,7 +5,28 @@ package vmdclient
 
 import (
 	"context"
+
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/status"
 )
+
+const SavedSnapshotSourceResumeFailureReason = "SAVED_SNAPSHOT_SOURCE_RESUME_FAILED"
+
+// GRPCErrorHasReason reads a stable ErrorInfo reason through wrapped gRPC
+// errors. Status codes alone cannot distinguish a corrupt snapshot from the
+// operationally different case where capture failed to return its source VM
+// to running.
+func GRPCErrorHasReason(err error, reason string) bool {
+	if err == nil {
+		return false
+	}
+	for _, detail := range status.Convert(err).Details() {
+		if info, ok := detail.(*errdetails.ErrorInfo); ok && info.GetReason() == reason {
+			return true
+		}
+	}
+	return false
+}
 
 // Client defines the subset of the VM daemon gRPC interface used by the
 // control plane. Implementations: grpcVMDClient in cmd/controlplane,
@@ -84,6 +105,71 @@ type Client interface {
 	// ctx is cancelled. Returns nil on clean close, an error on transport
 	// failure or gRPC NotFound (which callers surface as SSE 404).
 	StreamBuildLogs(ctx context.Context, buildVMID string, onEvent func(BuildLogEvent) error) error
+}
+
+// SavedSnapshotClient is the optional immutable-snapshot extension exposed by
+// VMDs that support sandbox_snapshots_v1. Keeping it separate from Client lets
+// the control plane roll out first: existing daemons continue serving the
+// pause/resume lifecycle, while feature-enabled requests fail closed until the
+// selected host advertises these methods.
+type SavedSnapshotClient interface {
+	// CheckSavedSnapshotSupport performs an explicit capability handshake with
+	// the remote VMD. Callers must invoke it before any saved-snapshot operation:
+	// an interface assertion only proves the local adapter is new enough, not
+	// that the daemon on the other side of its gRPC connection is compatible.
+	CheckSavedSnapshotSupport(ctx context.Context) error
+
+	// CreateSavedSnapshot captures sourceInstanceID into an immutable,
+	// committed artifact directory identified by snapshotID. The source may be
+	// active or paused and must be left in its original state.
+	CreateSavedSnapshot(ctx context.Context, sourceInstanceID, snapshotID string) (SavedSnapshotArtifacts, error)
+
+	// RestoreSavedSnapshot creates a new VM and writable disk overlay from a
+	// committed saved-snapshot manifest. Resource shape comes from the manifest
+	// and cannot be overridden.
+	RestoreSavedSnapshot(ctx context.Context, instanceID, manifestPath, manifestDigest, teamID, ownerID string, network SavedSnapshotNetwork, clearEnvKeys []string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+
+	// DeleteSavedSnapshot removes one immutable saved-snapshot directory.
+	// Dependency safety is enforced in the database before this host call;
+	// VMD validates path ownership and treats an absent directory as success.
+	DeleteSavedSnapshot(ctx context.Context, sourceInstanceID, snapshotID string) error
+
+	// MeasureSandboxWritableLayer returns filesystem-authoritative shadow usage
+	// for the sandbox-owned persisted disk/memory generation. Shared reflink
+	// extents are excluded.
+	MeasureSandboxWritableLayer(ctx context.Context, instanceID string) (logicalBytes, exclusiveBytes int64, err error)
+}
+
+// SavedSnapshotArtifacts is the host-private capture result persisted by the
+// control plane. None of its path fields are exposed in public API responses.
+type SavedSnapshotArtifacts struct {
+	SchemaVersion            uint32
+	ManifestPath             string
+	ManifestDigest           string
+	SnapshotPath             string
+	MemPath                  string
+	MemoryBasePath           string
+	DiskBasePath             string
+	DiskDeltaPath            string
+	DiskOverlayPath          string
+	DiskFullPath             string
+	VCPU                     uint32
+	MemoryMiB                uint32
+	DiskMiB                  uint32
+	LogicalSizeBytes         int64
+	ExclusiveSizeBytes       int64
+	SourceLogicalSizeBytes   int64
+	SourceExclusiveSizeBytes int64
+	SourceState              string
+}
+
+// SavedSnapshotNetwork is the effective egress policy for a fork. Empty
+// slices mean the platform's default policy; callers must intentionally pass
+// either the captured policy or an explicit replacement.
+type SavedSnapshotNetwork struct {
+	AllowedCIDRs   []string
+	DeniedCIDRs    []string
+	AllowedDomains []string
 }
 
 // BuildTemplateInput mirrors vmdpb.BuildTemplateRequest at the client layer

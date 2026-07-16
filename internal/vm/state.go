@@ -6,6 +6,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/superserve-ai/sandbox/internal/network"
 )
 
 // State provides durable local persistence for VM instance metadata.
@@ -42,12 +44,18 @@ type VMRecord struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	VCPU        uint32            `json:"vcpu"`
 	MemoryMiB   uint32            `json:"memory_mib"`
+	DiskSizeMiB uint32            `json:"disk_size_mib,omitempty"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
 	// persisted — it's only relevant at create-from-template; a resumed
 	// sandbox reuses its existing overlay file in place.
 	BasePath string `json:"base_path,omitempty"`
+	// EgressPolicy is the effective sandbox policy installed before boot. It
+	// must survive a VMD restart: nftables keeps CIDR rules in the namespace,
+	// but the in-process domain proxy otherwise comes back with an allow-all
+	// default until the control plane happens to issue another update.
+	EgressPolicy *network.EgressRules `json:"egress_policy,omitempty"`
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
@@ -184,6 +192,11 @@ func (s *StateStore) IDs() (map[string]struct{}, error) {
 func toRecord(inst *VMInstance) VMRecord {
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
+	var egressPolicy *network.EgressRules
+	if inst.Config.EgressPolicy != nil {
+		copy := cloneEgressRules(inst.Config.EgressPolicy)
+		egressPolicy = &copy
+	}
 	return VMRecord{
 		ID:           inst.ID,
 		PID:          inst.PID,
@@ -203,7 +216,9 @@ func toRecord(inst *VMInstance) VMRecord {
 		Metadata:     inst.Metadata,
 		VCPU:         inst.Config.VCPU,
 		MemoryMiB:    inst.Config.MemoryMiB,
+		DiskSizeMiB:  inst.Config.DiskSizeMiB,
 		BasePath:     inst.Config.BasePath,
+		EgressPolicy: egressPolicy,
 		TeamID:       inst.TeamID,
 		OwnerID:      inst.OwnerID,
 	}
@@ -211,6 +226,11 @@ func toRecord(inst *VMInstance) VMRecord {
 
 // toInstance converts a VMRecord back to a VMInstance.
 func toInstance(rec VMRecord) *VMInstance {
+	var egressPolicy *network.EgressRules
+	if rec.EgressPolicy != nil {
+		copy := cloneEgressRules(rec.EgressPolicy)
+		egressPolicy = &copy
+	}
 	return &VMInstance{
 		ID:           rec.ID,
 		PID:          rec.PID,
@@ -231,9 +251,23 @@ func toInstance(rec VMRecord) *VMInstance {
 		TeamID:       rec.TeamID,
 		OwnerID:      rec.OwnerID,
 		Config: VMConfig{
-			VCPU:      rec.VCPU,
-			MemoryMiB: rec.MemoryMiB,
-			BasePath:  rec.BasePath,
+			VCPU:         rec.VCPU,
+			MemoryMiB:    rec.MemoryMiB,
+			DiskSizeMiB:  rec.DiskSizeMiB,
+			BasePath:     rec.BasePath,
+			EgressPolicy: egressPolicy,
 		},
+	}
+}
+
+func cloneEgressRules(in *network.EgressRules) network.EgressRules {
+	if in == nil {
+		return network.EgressRules{}
+	}
+	return network.EgressRules{
+		AllowedCIDRs:   append([]string(nil), in.AllowedCIDRs...),
+		DeniedCIDRs:    append([]string(nil), in.DeniedCIDRs...),
+		AllowedDomains: append([]string(nil), in.AllowedDomains...),
+		SandboxID:      in.SandboxID,
 	}
 }

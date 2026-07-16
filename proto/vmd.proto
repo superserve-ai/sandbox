@@ -6,6 +6,11 @@ option go_package = "github.com/superserve-ai/sandbox/proto/vmdpb";
 
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 service VMDaemon {
+  // GetCapabilities reports optional data-plane features. Control planes must
+  // check the corresponding bit before using an optional RPC or overloaded
+  // request shape so a rolling deploy fails closed against an older VMD.
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+
   // DestroyVM terminates a running microVM and cleans up all associated resources.
   rpc DestroyVM(DestroyVMRequest) returns (DestroyVMResponse);
 
@@ -15,8 +20,24 @@ service VMDaemon {
   // ResumeVM restores a paused VM from its snapshot, optionally into a pre-warmed slot.
   rpc ResumeVM(ResumeVMRequest) returns (ResumeVMResponse);
 
-  // CreateSnapshot captures a point-in-time snapshot of a running VM.
+  // CreateSnapshot captures a point-in-time snapshot. A non-empty snapshot_id
+  // selects immutable saved-snapshot semantics for a running or paused VM;
+  // otherwise the legacy caller-selected-directory behavior is retained.
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+
+  // RestoreSavedSnapshot boots a new VM from an immutable saved-snapshot
+  // manifest. VMD resolves and validates every artifact locally and always
+  // creates a fresh writable disk layer for the new VM.
+  rpc RestoreSavedSnapshot(RestoreSavedSnapshotRequest) returns (RestoreSavedSnapshotResponse);
+
+  // DeleteSavedSnapshot removes one committed saved-snapshot artifact
+  // directory. The control plane must first prove the snapshot is a leaf.
+  // Path construction is local to VMD and the operation is idempotent.
+  rpc DeleteSavedSnapshot(DeleteSavedSnapshotRequest) returns (DeleteSavedSnapshotResponse);
+
+  // GetWritableLayerUsage measures the sandbox-owned persisted disk/memory
+  // generation with CoW-shared extents excluded. It is shadow accounting only.
+  rpc GetWritableLayerUsage(GetWritableLayerUsageRequest) returns (GetWritableLayerUsageResponse);
 
   // RestoreSnapshot boots a VM from a previously captured snapshot and
   // returns its source IP. The caller must follow with InjectSandboxEnv to
@@ -101,6 +122,17 @@ service VMDaemon {
   // events as they arrive. Closes when the build reaches a terminal
   // status. Used by the control plane to drive /builds/:id/logs SSE.
   rpc StreamBuildLogs(StreamBuildLogsRequest) returns (stream BuildLogEvent);
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  // Supports immutable saved-snapshot capture, restore, and delete semantics.
+  bool saved_snapshots_v1 = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +331,11 @@ message ResumeVMResponse {
 
 message CreateSnapshotRequest {
   string vm_id = 1;
+  // Legacy caller-selected output directory. Ignored when snapshot_id is set.
   string snapshot_dir = 2;
+  // Stable control-plane id for an immutable reusable snapshot. Retrying the
+  // same source VM + snapshot id returns the already-committed manifest.
+  string snapshot_id = 3;
 }
 
 message CreateSnapshotResponse {
@@ -307,6 +343,95 @@ message CreateSnapshotResponse {
   string snapshot_path = 2;
   string mem_file_path = 3;
   int64 created_at_unix = 4;
+  SavedSnapshotArtifacts artifacts = 5;
+  ResourceLimits resource_limits = 6;
+  // Apparent bytes required to reconstruct the state, including referenced
+  // immutable template/base files and deduplicating identical inodes.
+  int64 logical_size_bytes = 7;
+  // Allocated filesystem blocks owned by this saved snapshot. Shared base
+  // files are excluded, so fan-out does not multiply this value.
+  int64 exclusive_size_bytes = 8;
+  // Source lifecycle state restored before this RPC returned: "running" or
+  // "paused".
+  string source_state = 9;
+  string snapshot_id = 10;
+  // Source-owned unshared extents that became retained by this immutable
+  // branch. Shadow accounting transfers them into the source writable layer;
+  // they are not charged again as snapshot-exclusive reflink bytes.
+  int64 source_exclusive_size_bytes = 11;
+  int64 source_logical_size_bytes = 12;
+}
+
+// SavedSnapshotArtifacts identifies a committed local artifact set. These
+// paths are control-plane metadata only and must never be returned publicly.
+message SavedSnapshotArtifacts {
+  uint32 schema_version = 1;
+  string manifest_path = 2;
+  string snapshot_path = 3;
+  string mem_file_path = 4;
+  // Present only when mem_file_path is an immutable diff over another
+  // immutable memory image.
+  string memory_base_path = 5;
+  // Immutable disk base referenced by an overlay-mode snapshot.
+  string disk_base_path = 6;
+  // Firecracker block-delta artifact emitted for a running source.
+  string disk_delta_path = 7;
+  // Immutable sparse disk overlay copied from a paused source when no block
+  // delta can be emitted without changing its lifecycle state.
+  string disk_overlay_path = 8;
+  // Immutable complete rootfs for legacy non-overlay sources.
+  string disk_full_path = 9;
+  // sha256 of the exact committed manifest bytes, hex encoded.
+  string manifest_digest = 10;
+}
+
+// ---------------------------------------------------------------------------
+// RestoreSavedSnapshot / DeleteSavedSnapshot
+// ---------------------------------------------------------------------------
+
+message RestoreSavedSnapshotRequest {
+  string vm_id = 1;
+  string manifest_path = 2;
+  NetworkConfig network_config = 3;
+  string team_id = 4;
+  string owner_id = 5;
+  // Captured boxd defaults to overwrite with empty values before this RPC
+  // returns. Used for source-specific secret proxy-token variables; existing
+  // in-memory process environments are inherently part of the snapshot.
+  repeated string clear_env_keys = 6;
+  // Effective inherited or explicitly replaced egress policy. VMD installs
+  // it after allocating the child network and before starting Firecracker, so
+  // restored processes never observe a transient allow-all gap.
+  SandboxNetworkConfig sandbox_network = 7;
+  // SHA-256 of the committed manifest recorded by the control plane. VMD
+  // rejects a different manifest before allocating any child resources.
+  string expected_manifest_digest = 8;
+}
+
+message RestoreSavedSnapshotResponse {
+  string vm_id = 1;
+  string socket_path = 2;
+  string ip_address = 3;
+  uint32 pid = 4;
+  ResourceLimits resource_limits = 5;
+}
+
+message DeleteSavedSnapshotRequest {
+  string source_vm_id = 1;
+  string snapshot_id = 2;
+}
+
+message DeleteSavedSnapshotResponse {
+  bool deleted = 1;
+}
+
+message GetWritableLayerUsageRequest {
+  string vm_id = 1;
+}
+
+message GetWritableLayerUsageResponse {
+  int64 logical_size_bytes = 1;
+  int64 exclusive_size_bytes = 2;
 }
 
 // ---------------------------------------------------------------------------

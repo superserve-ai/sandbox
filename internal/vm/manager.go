@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,6 +133,14 @@ type VMConfig struct {
 	// DeltaDir hydrates a fresh per-VM overlay from <dir>/rootfs.delta on
 	// restore. Empty for in-place resume of an already-populated overlay.
 	DeltaDir string
+	// EgressPolicy, when non-nil, is installed after the network slot is
+	// allocated but before Firecracker starts. Saved-snapshot forks use this
+	// to preserve a restrictive source policy without an allow-all race.
+	EgressPolicy *network.EgressRules
+	// savedSnapshotRestore marks a restore that must always materialize a fresh
+	// child-owned disk. It is deliberately package-private and non-persistent:
+	// every retry reconstructs it from the immutable saved manifest.
+	savedSnapshotRestore bool
 }
 
 // ManagerConfig holds paths and settings for the VM manager.
@@ -225,6 +234,14 @@ type Manager struct {
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
 
+	// savedSnapshotCapability is established by one real reflink probe across
+	// RunDir and SnapshotDir. The feature requires mandatory CoW branching, so
+	// configuration flags alone are not sufficient evidence that this host can
+	// safely advertise saved snapshots.
+	savedSnapshotCapabilityOnce  sync.Once
+	savedSnapshotCapability      bool
+	savedSnapshotCapabilityProbe func(context.Context) error // test seam; nil uses the host probe
+
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by
 	// revalidateLauncher.
@@ -258,17 +275,17 @@ type Manager struct {
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
 
-	// vmOpLocks serializes lifecycle operations (restore, resume, pause) for
+	// vmOpLocks serializes lifecycle operations (restore, resume, pause, and
+	// the destructive phase of destroy) for
 	// a single vmID, so a retry or a concurrent actor can't stomp an
 	// in-flight launch (kill a still-booting VM, re-diff a consumed dirty
 	// bitmap). Keyed by vmID → chan struct{}{} used as a capacity-1
 	// semaphore, so acquisition can honor the caller's context. Entries are
 	// never deleted: vmIDs are unique UUIDs so they don't collide, and
 	// deleting on destroy would let a same-vmID retry acquire a fresh lock
-	// and lose mutual exclusion. DestroyVM deliberately does NOT take these
-	// locks — it must interrupt a wedged op (a hung firecracker socket call
-	// holds the lock until destroy SIGKILLs the process), so blocking it
-	// would turn a recoverable wedge into a permanent hang.
+	// and lose mutual exclusion. DestroyVM first stops the exact process
+	// without the lock to interrupt a wedged socket operation, then acquires
+	// this lock and reconfirms process death before releasing resources.
 	vmOpLocks sync.Map
 }
 
@@ -405,18 +422,29 @@ const (
 	restoreCreateOverlay restoreDiskAction = iota // overlay clone of a template
 	restoreReuseOverlay                           // existing per-VM overlay (resume)
 	restoreLegacyResolve                          // legacy non-overlay path
+	restoreCloneOverlay                           // fresh clone of an immutable saved overlay
+	restoreCopyRootfs                             // fresh copy of an immutable saved legacy rootfs
 )
 
 // restorePlan is planRestore's output — pure decision, no I/O.
 type restorePlan struct {
 	action   restoreDiskAction
 	deltaDir string
+	source   string
 }
 
 // planRestore picks the disk action + delta_dir for a restore. createOverlay
 // requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
 // we'd be cloning over an existing per-VM file, so fall back to reuse.
 func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
+	return planRestoreWithSource(basePath, deltaDir, "", inPlace)
+}
+
+// planRestoreWithSource extends planRestore for saved snapshots. sourcePath is
+// an immutable saved disk artifact: with a base it is a sparse overlay to clone;
+// without a base it is a complete legacy rootfs to copy. Normal restores pass
+// an empty sourcePath and retain the existing behavior.
+func planRestoreWithSource(basePath, deltaDir, sourcePath string, inPlace bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
 	if inPlace {
 		// fc's delta-apply truncates the overlay; force empty to stop a
@@ -424,6 +452,14 @@ func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
 		p.deltaDir = ""
 	}
 	switch {
+	case sourcePath != "" && basePath != "" && !inPlace:
+		p.action = restoreCloneOverlay
+		p.source = sourcePath
+		p.deltaDir = ""
+	case sourcePath != "" && basePath == "" && !inPlace:
+		p.action = restoreCopyRootfs
+		p.source = sourcePath
+		p.deltaDir = ""
 	case basePath != "" && deltaDir != "" && !inPlace:
 		p.action = restoreCreateOverlay
 	case basePath != "":
@@ -651,51 +687,41 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		return status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
 
-	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
-	// that: unit stop and rundir removal are derivable from vmID and must run, or
-	// destroying a paused sandbox leaks its rundir. Process/socket teardown needs
-	// the instance, so it's gated below. Destroy is idempotent.
-	inst, instErr := m.getInstance(vmID)
+	// Interrupt first, before waiting on the lifecycle lock. A wedged
+	// Firecracker socket call may hold that lock and only process death can make
+	// it return. No disk/network/state is released at this stage.
+	initial, initialErr := m.getInstance(vmID)
+	if initialErr != nil {
+		initial = nil
+	}
+	if _, err := m.stopVMProcessAndConfirm(ctx, vmID, initial); err != nil {
+		return status.Errorf(codes.Unavailable, "confirm VM teardown: %v", err)
+	}
 
-	// Stop the systemd unit if one exists — this is the path for sandbox
-	// VMs launched via startFirecrackerViaSystemd.
-	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
-		log.Warn().Err(err).Msg("systemctl stop failed (unit may not exist — trying PID-based kill)")
+	// Once the interrupted operation has unwound, own the lifecycle boundary.
+	// It may have started or persisted a replacement process after the first
+	// stop, so re-resolve and positively confirm death again under the lock.
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return err
+	}
+	defer unlockOp()
+
+	inst, instErr := m.getInstance(vmID)
+	tracked := inst
+	if instErr != nil {
+		tracked = nil
+	}
+	identity, err := m.stopVMProcessAndConfirm(ctx, vmID, tracked)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "reconfirm VM teardown under lifecycle lock: %v", err)
 	}
 	removeUnitDropIn(vmID)
-
-	// Recover the PID, socket, and namespace to tear down. A tracked VM has them
-	// in memory; an untracked one (paused or post-restart, absent from m.vms) has
-	// them only in the record. Without the record fallback a cold-boot VM's
-	// Firecracker is never killed (stopUnit is a no-op for it) and its slot is
-	// never reclaimed (ns is "").
-	var pid int
-	var sockPath, ns string
-	if instErr == nil {
-		inst.mu.RLock()
-		pid = inst.PID
-		sockPath = inst.SocketPath
-		ns = inst.Namespace
-		inst.mu.RUnlock()
-	} else if m.state != nil {
-		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
-			pid = rec.PID
-			sockPath = rec.SocketPath
-			ns = rec.Namespace
-		}
+	if identity.socketPath != "" {
+		_ = os.Remove(identity.socketPath)
 	}
 
-	// No-op for systemd VMs (stopUnit already killed them); the real kill for
-	// cold-boot VMs and record orphans. Identity-gated regardless of source —
-	// a paused VM's PID is stale whether it came from memory or the record.
-	if pidIsVMFirecracker(pid, vmID) {
-		sigkillPID(pid, 500*time.Millisecond)
-	}
-	if sockPath != "" {
-		_ = os.Remove(sockPath)
-	}
-
-	m.netMgr.CleanupVMOrNamespace(vmID, ns)
+	m.netMgr.CleanupVMOrNamespace(vmID, identity.namespace)
 
 	// Fall back to vmID when the instance is absent (RunDirID == vmID anyway).
 	rundirKey := vmID
@@ -707,6 +733,125 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 
 	log.Info().Msg("VM destroyed")
 	return nil
+}
+
+type stoppedVMProcessIdentity struct {
+	socketPath string
+	namespace  string
+}
+
+// stopVMProcessAndConfirm is the destructive safety boundary shared by normal
+// deletion and failed saved-snapshot source recovery. It stops only the exact
+// Firecracker process; callers decide whether to retain or remove the VM's
+// disk, network namespace, in-memory entry, and Bolt record.
+func (m *Manager) stopVMProcessAndConfirm(ctx context.Context, vmID string, inst *VMInstance) (stoppedVMProcessIdentity, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	log := m.log.With().Str("vm_id", vmID).Logger()
+	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	if err := stopUnit(stopCtx, systemdUnitName(vmID)); err != nil {
+		log.Warn().Err(err).Msg("systemctl stop failed (unit may not exist — trying PID-based kill)")
+	}
+	stopCancel()
+
+	var identity stoppedVMProcessIdentity
+	var pid int
+	if inst != nil {
+		inst.mu.RLock()
+		pid = inst.PID
+		identity.socketPath = inst.SocketPath
+		identity.namespace = inst.Namespace
+		inst.mu.RUnlock()
+	} else if m.state != nil {
+		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
+			pid = rec.PID
+			identity.socketPath = rec.SocketPath
+			identity.namespace = rec.Namespace
+		} else if err != nil {
+			return identity, fmt.Errorf("read VM state for teardown: %w", err)
+		}
+	}
+
+	if _, killErr := killExactVMFirecrackerPID(pid, vmID, 500*time.Millisecond); killErr != nil {
+		return identity, fmt.Errorf("stop tracked VM process: %w", killErr)
+	}
+	orphanPIDs, scanErr := vmFirecrackerPIDs(vmID)
+	if scanErr != nil {
+		return identity, fmt.Errorf("inspect VM processes: %w", scanErr)
+	}
+	for _, orphanPID := range orphanPIDs {
+		if _, killErr := killExactVMFirecrackerPID(orphanPID, vmID, 500*time.Millisecond); killErr != nil {
+			return identity, fmt.Errorf("stop scanned VM process: %w", killErr)
+		}
+	}
+
+	confirmCtx, confirmCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer confirmCancel()
+	if err := unitConfirmedInactive(confirmCtx, systemdUnitName(vmID)); err != nil {
+		return identity, fmt.Errorf("confirm VM unit teardown: %w", err)
+	}
+	remaining, scanErr := vmFirecrackerPIDs(vmID)
+	if scanErr != nil {
+		return identity, fmt.Errorf("confirm VM process teardown: %w", scanErr)
+	}
+	if len(remaining) > 0 {
+		return identity, fmt.Errorf("VM process teardown is incomplete for %s", vmID)
+	}
+	return identity, nil
+}
+
+// confirmSavedRestoreProcessStopped is the fail-closed teardown boundary for a
+// saved-snapshot restore that started (or may have started) Firecracker. A
+// failed confirmation deliberately retains the provisional VM, network, disk,
+// and Bolt record so the caller's compensation or the reconciler can retry
+// exact teardown; releasing any of them beneath an unproven process would turn
+// a retryable host failure into an orphan or cross-sandbox resource race.
+func (m *Manager) confirmSavedRestoreProcessStopped(vmID string, inst *VMInstance) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	_, err := m.stopVMProcessAndConfirm(ctx, vmID, inst)
+	cancel()
+	if err == nil {
+		return nil
+	}
+
+	if inst != nil {
+		inst.mu.Lock()
+		inst.Status = StatusError
+		inst.DirtyTracked = false
+		inst.mu.Unlock()
+		m.persistState(inst)
+	}
+	return err
+}
+
+// vmFirecrackerPIDs returns every /proc process whose exact argv identifies it
+// as Firecracker for vmID. Any unreadable numeric proc entry is inconclusive:
+// destroy must fail closed rather than release an artifact beneath a hidden
+// reader. Entries that disappear between directory scan and read are ignored.
+func vmFirecrackerPIDs(vmID string) ([]int, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("read /proc: %w", err)
+	}
+	var pids []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read process %d identity: %w", pid, err)
+		}
+		if firecrackerCmdlineMatches(cmdline, vmID) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,11 +1681,43 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	m.mu.Lock()
-	_, inPlace := m.vms[vmID]
-	if inPlace {
-		delete(m.vms, vmID)
+	priorTarget, targetExists := m.vms[vmID]
+	// A saved snapshot always creates a new child-owned disk. A prior failed
+	// attempt may still have an Error/Creating record after a daemon crash, but
+	// treating that as an in-place resume would reuse its partial target disk.
+	inPlace := targetExists && !resourceLimits.savedSnapshotRestore
+	if targetExists {
+		if resourceLimits.savedSnapshotRestore {
+			m.mu.Unlock()
+			if stopErr := m.confirmSavedRestoreProcessStopped(vmID, priorTarget); stopErr != nil {
+				return nil, status.Errorf(codes.Unavailable,
+					"prior saved snapshot restore process teardown is inconclusive: %v", stopErr)
+			}
+			removeUnitDropIn(vmID)
+			m.mu.Lock()
+		} else {
+			delete(m.vms, vmID)
+			m.mu.Unlock()
+			_ = stopUnit(ctx, systemdUnitName(vmID))
+			m.mu.Lock()
+		}
+	}
+	if resourceLimits.savedSnapshotRestore {
+		// Only forget a retained provisional target after exact process death was
+		// proven above. The per-VM operation lock excludes another restore; the
+		// pointer check avoids deleting a concurrently replaced entry.
+		if targetExists {
+			if current, ok := m.vms[vmID]; ok && current == priorTarget {
+				delete(m.vms, vmID)
+			}
+		}
 		m.mu.Unlock()
-		_ = stopUnit(ctx, systemdUnitName(vmID))
+		if targetExists && m.netMgr != nil {
+			m.netMgr.CleanupVM(vmID)
+		}
+		// Also handles an unrecorded partial disk left by a daemon/process crash.
+		m.cleanupRunDir(vmID)
+		m.deleteState(vmID)
 		m.mu.Lock()
 	}
 
@@ -1558,7 +1735,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.vms[vmID] = inst
 	m.mu.Unlock()
 
-	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
+	plan := planRestoreWithSource(resourceLimits.BasePath, resourceLimits.DeltaDir, resourceLimits.RootfsPath, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
 	cleanupAfterRestoreFailure := func() {
@@ -1567,6 +1744,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		} else {
 			m.cleanupRunDir(vmID)
 		}
+	}
+	failRestoreTarget := func() {
+		if resourceLimits.savedSnapshotRestore {
+			// A retry must be planned as another fresh clone/copy, never as an
+			// in-place resume of a failed provisional child.
+			m.removeVM(vmID)
+			return
+		}
+		m.setStatus(vmID, StatusError)
 	}
 	var diskPath string
 	var diskErr error
@@ -1582,9 +1768,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	case restoreLegacyResolve:
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+	case restoreCloneOverlay:
+		diskPath, diskErr = m.cloneSavedOverlay(ctx, vmID, plan.source)
+	case restoreCopyRootfs:
+		if resourceLimits.savedSnapshotRestore {
+			diskPath, diskErr = m.copySavedRootfs(ctx, vmID, plan.source)
+		} else {
+			diskPath, diskErr = m.copyRootfs(ctx, vmID, plan.source)
+		}
 	}
 	if diskErr != nil {
-		m.setStatus(vmID, StatusError)
+		cleanupAfterRestoreFailure()
+		failRestoreTarget()
 		return nil, diskErr
 	}
 	tDiskReady := time.Now()
@@ -1625,13 +1820,29 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, netCfg)
 			if netErr != nil {
 				cleanupAfterRestoreFailure()
-				m.setStatus(vmID, StatusError)
+				failRestoreTarget()
 				return nil, fmt.Errorf("setup network: %w", netErr)
 			}
 			tapDevice = netInfo.TAPDevice
 			macAddr = netInfo.MACAddress
 			hostIP = netInfo.HostIP
 			nsName = netInfo.Namespace
+		}
+		if resourceLimits.EgressPolicy != nil {
+			policy := resourceLimits.EgressPolicy
+			if err := m.netMgr.UpdateFirewallRules(vmID, policy.AllowedCIDRs, policy.DeniedCIDRs); err != nil {
+				if !inPlace {
+					m.netMgr.CleanupVM(vmID)
+				}
+				cleanupAfterRestoreFailure()
+				failRestoreTarget()
+				return nil, fmt.Errorf("install pre-restore egress firewall: %w", err)
+			}
+			if m.egressProxy != nil {
+				applied := *policy
+				applied.SandboxID = vmID
+				m.egressProxy.SetRules(hostIP, &applied)
+			}
 		}
 		tNetReady := time.Now()
 
@@ -1649,11 +1860,19 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		var startErr error
 		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
 		if startErr != nil {
+			if resourceLimits.savedSnapshotRestore {
+				if stopErr := m.confirmSavedRestoreProcessStopped(vmID, inst); stopErr != nil {
+					return nil, status.Errorf(codes.Unavailable,
+						"saved snapshot restore start failed and process teardown is inconclusive (start error: %v): %v",
+						startErr, stopErr)
+				}
+				removeUnitDropIn(vmID)
+			}
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
 			}
 			cleanupAfterRestoreFailure()
-			m.setStatus(vmID, StatusError)
+			failRestoreTarget()
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
 		inst.mu.Lock()
@@ -1726,10 +1945,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.mu.Unlock()
 			case isOverlayMemFile(memPath):
 				attemptErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
-			case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
+			case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" &&
+				(isTemplate || resourceLimits.savedSnapshotRestore):
 				armLayered = true
 				inst.mu.Lock()
-				inst.BaseMemPath = memPath // template mem file = the layered base
+				// A saved standalone memory image is immutable just like a
+				// template image. Treat it as the base so the child appends its
+				// next dirty set into one bounded overlay instead of taking a
+				// second full snapshot.
+				inst.BaseMemPath = memPath
 				inst.DirtyTracked = true
 				inst.mu.Unlock()
 			}
@@ -1760,18 +1984,27 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if inPlace || attempt >= maxRestoreAttempts || !isTapDeviceBusyErr(restoreErr) {
 			break
 		}
-		m.stopUnitDuringRestoreError(vmID)
-		// Retry only when the unit is affirmatively dead — an inconclusive
-		// answer reads as alive. Launches would replace a live leftover,
-		// but "not confirmed dead" means systemctl itself is struggling;
-		// kept conservative.
-		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
-		checkCancel()
-		if !dead {
-			log.Warn().Int("attempt", attempt).
-				Msg("unit not confirmed dead after stop — not retrying restore")
-			break
+		if resourceLimits.savedSnapshotRestore {
+			if stopErr := m.confirmSavedRestoreProcessStopped(vmID, inst); stopErr != nil {
+				return nil, status.Errorf(codes.Unavailable,
+					"saved snapshot load retry process teardown is inconclusive (load error: %v): %v",
+					restoreErr, stopErr)
+			}
+			removeUnitDropIn(vmID)
+		} else {
+			m.stopUnitDuringRestoreError(vmID)
+			// Retry only when the unit is affirmatively dead — an inconclusive
+			// answer reads as alive. Launches would replace a live leftover,
+			// but "not confirmed dead" means systemctl itself is struggling;
+			// kept conservative.
+			checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
+			checkCancel()
+			if !dead {
+				log.Warn().Int("attempt", attempt).
+					Msg("unit not confirmed dead after stop — not retrying restore")
+				break
+			}
 		}
 		log.Warn().Err(restoreErr).Int("attempt", attempt).
 			Msg("restore failed with tap0 busy — retrying with a fresh slot")
@@ -1786,7 +2019,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before other
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
-		m.stopUnitDuringRestoreError(vmID)
+		if resourceLimits.savedSnapshotRestore {
+			if stopErr := m.confirmSavedRestoreProcessStopped(vmID, inst); stopErr != nil {
+				return nil, status.Errorf(codes.Unavailable,
+					"saved snapshot load failed and process teardown is inconclusive (load error: %v): %v",
+					restoreErr, stopErr)
+			}
+			removeUnitDropIn(vmID)
+		} else {
+			m.stopUnitDuringRestoreError(vmID)
+		}
 		if !inPlace {
 			// A tap-busy slot is suspect — tear it down rather than recycle it,
 			// so it isn't handed to another create with the same bad tap.
@@ -1797,7 +2039,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			}
 		}
 		cleanupAfterRestoreFailure()
-		m.setStatus(vmID, StatusError)
+		failRestoreTarget()
 		// armLayered may have set DirtyTracked=true on inst before the restore call;
 		// clear it on failure so a lingering instance can't later take a Diff against a
 		// baseline that never loaded. (The VM is StatusError + unit stopped, so this is
@@ -1834,12 +2076,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
 	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
-		m.stopUnitDuringRestoreError(vmID)
+		if resourceLimits.savedSnapshotRestore {
+			if stopErr := m.confirmSavedRestoreProcessStopped(vmID, inst); stopErr != nil {
+				return nil, status.Errorf(codes.Unavailable,
+					"saved snapshot boxd readiness failed and process teardown is inconclusive (readiness error: %v): %v",
+					err, stopErr)
+			}
+			removeUnitDropIn(vmID)
+		} else {
+			m.stopUnitDuringRestoreError(vmID)
+		}
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
 		cleanupAfterRestoreFailure()
-		m.setStatus(vmID, StatusError)
+		failRestoreTarget()
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
@@ -1853,8 +2104,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	_, stillTracked := m.vms[vmID]
 	m.mu.RUnlock()
 	if !stillTracked {
+		if resourceLimits.savedSnapshotRestore {
+			if stopErr := m.confirmSavedRestoreProcessStopped(vmID, inst); stopErr != nil {
+				return nil, status.Errorf(codes.Unavailable,
+					"saved snapshot restore lost its lifecycle record and process teardown is inconclusive: %v",
+					stopErr)
+			}
+			removeUnitDropIn(vmID)
+		} else {
+			m.stopUnitDuringRestoreError(vmID)
+		}
 		m.deleteState(vmID)
-		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
 		}
@@ -2001,8 +2261,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			// PID, but only after verifying the PID still names this VM (a stale
 			// record PID may have been reused by an unrelated process). The wait
 			// lets the kernel release the tap fd before the netns teardown below.
-			if pidIsVMFirecracker(rec.PID, rec.ID) {
-				sigkillPID(rec.PID, 500*time.Millisecond)
+			if matched, killErr := killExactVMFirecrackerPID(rec.PID, rec.ID, 500*time.Millisecond); killErr != nil {
+				log.Error().Err(killErr).Int("pid", rec.PID).Msg("refusing stale-record cleanup without safe process teardown")
+				return nil, false
+			} else if matched {
 				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
 			m.state.Delete(rec.ID)
@@ -2046,7 +2308,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// idempotent, so a rare double restore (background pass and a request both
 	// reaching here) is harmless.
 	if inst.Namespace != "" && inst.IP != "" {
-		if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
+		if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress, inst.Config.EgressPolicy); err != nil {
 			log.Error().Err(err).Msg("reattach: restore network state failed")
 		}
 	}
@@ -2441,12 +2703,67 @@ func (m *Manager) copyRootfs(ctx context.Context, dirName, srcRootfs string) (st
 	}
 
 	diskPath := filepath.Join(vmDir, "rootfs.ext4")
-	cmd := exec.CommandContext(ctx, "cp", "--reflink=auto", srcRootfs, diskPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("copy rootfs: %s: %w", string(out), err)
+	if err := copyWritableDisk(ctx, "copy rootfs", srcRootfs, diskPath, "--reflink=auto"); err != nil {
+		return "", err
 	}
 
 	return diskPath, nil
+}
+
+// copySavedRootfs creates the fork's writable branch without duplicating the
+// immutable saved full-disk layer. Saved snapshots are feature-gated and fail
+// closed on hosts/filesystems that cannot provide reflink semantics.
+func (m *Manager) copySavedRootfs(ctx context.Context, dirName, srcRootfs string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	diskPath := filepath.Join(vmDir, "rootfs.ext4")
+	if err := copyWritableDisk(ctx, "clone saved rootfs", srcRootfs, diskPath, "--reflink=always", "--sparse=always"); err != nil {
+		return "", err
+	}
+	return diskPath, nil
+}
+
+// cloneSavedOverlay gives a fork a private writable overlay cloned from an
+// immutable saved overlay. Reflink is required so unchanged blocks stay
+// physically shared; this feature fails closed instead of duplicating bytes.
+func (m *Manager) cloneSavedOverlay(ctx context.Context, dirName, source string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	dst := filepath.Join(vmDir, "overlay.ext4")
+	if err := copyWritableDisk(ctx, "clone saved overlay", source, dst, "--reflink=always", "--sparse=always"); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+// copyWritableDisk publishes the child disk only after cp and chmod both
+// succeed. A cancellation, ENOSPC, or process crash can leave the staging file
+// behind, but never a partially written destination that a retry could reuse.
+func copyWritableDisk(ctx context.Context, operation, source, destination string, cpOptions ...string) error {
+	staging := destination + ".restore-tmp"
+	for _, path := range []string{staging, destination} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("%s: remove stale target %q: %w", operation, path, err)
+		}
+	}
+	defer os.Remove(staging) // best-effort cleanup after every error path
+
+	args := append(append([]string(nil), cpOptions...), source, staging)
+	cmd := exec.CommandContext(ctx, "cp", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %s: %w", operation, string(out), err)
+	}
+	if err := os.Chmod(staging, 0o600); err != nil {
+		return fmt.Errorf("%s: make staged disk writable: %w", operation, err)
+	}
+	if err := os.Rename(staging, destination); err != nil {
+		return fmt.Errorf("%s: publish staged disk: %w", operation, err)
+	}
+	return nil
 }
 
 // createOverlay creates a sparse per-VM overlay file pre-sized to the base

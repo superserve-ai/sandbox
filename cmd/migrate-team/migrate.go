@@ -42,6 +42,87 @@ type config struct {
 	pathsOut        string
 }
 
+// savedSnapshotMigrationState is every database-visible sign that a team has
+// host-local saved-snapshot artifacts or dependencies. Deleted snapshot rows
+// remain relevant: their lineage FKs are history, not proof that every host
+// artifact and dependency can be reconstructed in another cell.
+type savedSnapshotMigrationState struct {
+	snapshotRows       int64
+	forkedSandboxes    int64
+	captureOperations  int64
+	templateDependents int64
+	storageBytes       int64
+}
+
+func (s savedSnapshotMigrationState) empty() bool {
+	return s.snapshotRows == 0 &&
+		s.forkedSandboxes == 0 &&
+		s.captureOperations == 0 &&
+		s.templateDependents == 0 &&
+		s.storageBytes == 0
+}
+
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// rejectSavedSnapshotMigration refuses every migrate-team phase when the
+// source contains saved-snapshot state. Saved snapshots are pinned to one VMD
+// host in V1; copying their rows without their manifests and sparse extents
+// would create a destination that validates in SQL but cannot restore them.
+func rejectSavedSnapshotMigration(ctx context.Context, src rowQuerier, teamID uuid.UUID, phase string) error {
+	var state savedSnapshotMigrationState
+	err := src.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM snapshot
+			 WHERE team_id = $1 AND kind = 'saved'),
+			(SELECT count(*) FROM sandbox
+			 WHERE team_id = $1 AND source_snapshot_id IS NOT NULL),
+			(SELECT count(*) FROM sandbox
+			 WHERE team_id = $1 AND snapshot_operation_id IS NOT NULL),
+			(SELECT count(*)
+			 FROM snapshot sn
+			 JOIN template t ON t.id = sn.template_id
+			 WHERE t.team_id = $1
+			   AND sn.team_id <> $1
+			   AND sn.kind = 'saved'),
+			COALESCE((SELECT snapshot_storage_bytes FROM team WHERE id = $1), 0)`,
+		teamID).Scan(
+		&state.snapshotRows,
+		&state.forkedSandboxes,
+		&state.captureOperations,
+		&state.templateDependents,
+		&state.storageBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("check saved-snapshot migration state: %w", err)
+	}
+	if state.empty() {
+		return nil
+	}
+
+	var found []string
+	if state.snapshotRows > 0 {
+		found = append(found, fmt.Sprintf("saved snapshot rows=%d (including deleted history)", state.snapshotRows))
+	}
+	if state.forkedSandboxes > 0 {
+		found = append(found, fmt.Sprintf("sandboxes forked from saved snapshots=%d", state.forkedSandboxes))
+	}
+	if state.captureOperations > 0 {
+		found = append(found, fmt.Sprintf("snapshot capture operations=%d", state.captureOperations))
+	}
+	if state.templateDependents > 0 {
+		found = append(found, fmt.Sprintf("other teams' saved snapshots pinning this team's templates=%d", state.templateDependents))
+	}
+	if state.storageBytes > 0 {
+		found = append(found, fmt.Sprintf("snapshot storage bytes=%d", state.storageBytes))
+	}
+
+	return fmt.Errorf(
+		"refusing %s: migrate-team cannot replicate V1 host-local saved snapshots (%s); use a snapshot-aware migration path",
+		phase, strings.Join(found, ", "))
+}
+
 // dbIdentity fingerprints the database a pool is connected to by cluster
 // identity plus database name — never by connection endpoint. The same
 // database reached through a pooler and directly must collapse to ONE
@@ -105,6 +186,13 @@ func run(ctx context.Context, cfg config) error {
 			return fmt.Errorf("team %s not found in source", cfg.teamID)
 		}
 		return fmt.Errorf("look up team: %w", err)
+	}
+	// This check precedes every phase dispatch. In particular, plan cannot
+	// emit an incomplete --paths-out file, copy cannot write unrestorable DB
+	// rows into the destination, and purge cannot destroy the only artifact
+	// lineage that still names the source hosts.
+	if err := rejectSavedSnapshotMigration(ctx, src, cfg.teamID, cfg.phase); err != nil {
+		return err
 	}
 	log.Info().Str("phase", cfg.phase).Str("team", teamName).Str("team_id", cfg.teamID.String()).Msg("migrate-team")
 

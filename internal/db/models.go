@@ -61,6 +61,136 @@ func (ns NullSandboxStatus) Value() (driver.Value, error) {
 	return string(ns.SandboxStatus), nil
 }
 
+type SnapshotKind string
+
+const (
+	SnapshotKindRuntimeCheckpoint SnapshotKind = "runtime_checkpoint"
+	SnapshotKindSaved             SnapshotKind = "saved"
+)
+
+func (e *SnapshotKind) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = SnapshotKind(s)
+	case string:
+		*e = SnapshotKind(s)
+	default:
+		return fmt.Errorf("unsupported scan type for SnapshotKind: %T", src)
+	}
+	return nil
+}
+
+type NullSnapshotKind struct {
+	SnapshotKind SnapshotKind `json:"snapshot_kind"`
+	Valid        bool         `json:"valid"` // Valid is true if SnapshotKind is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullSnapshotKind) Scan(value interface{}) error {
+	if value == nil {
+		ns.SnapshotKind, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.SnapshotKind.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullSnapshotKind) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.SnapshotKind), nil
+}
+
+type SnapshotStatus string
+
+const (
+	SnapshotStatusCreating    SnapshotStatus = "creating"
+	SnapshotStatusReady       SnapshotStatus = "ready"
+	SnapshotStatusUnavailable SnapshotStatus = "unavailable"
+	SnapshotStatusFailed      SnapshotStatus = "failed"
+	SnapshotStatusDeleting    SnapshotStatus = "deleting"
+)
+
+func (e *SnapshotStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = SnapshotStatus(s)
+	case string:
+		*e = SnapshotStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for SnapshotStatus: %T", src)
+	}
+	return nil
+}
+
+type NullSnapshotStatus struct {
+	SnapshotStatus SnapshotStatus `json:"snapshot_status"`
+	Valid          bool           `json:"valid"` // Valid is true if SnapshotStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullSnapshotStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.SnapshotStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.SnapshotStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullSnapshotStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.SnapshotStatus), nil
+}
+
+type SnapshotStorageLayerKind string
+
+const (
+	SnapshotStorageLayerKindSavedSnapshot     SnapshotStorageLayerKind = "saved_snapshot"
+	SnapshotStorageLayerKindSandboxGeneration SnapshotStorageLayerKind = "sandbox_generation"
+	SnapshotStorageLayerKindSandboxWritable   SnapshotStorageLayerKind = "sandbox_writable"
+)
+
+func (e *SnapshotStorageLayerKind) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = SnapshotStorageLayerKind(s)
+	case string:
+		*e = SnapshotStorageLayerKind(s)
+	default:
+		return fmt.Errorf("unsupported scan type for SnapshotStorageLayerKind: %T", src)
+	}
+	return nil
+}
+
+type NullSnapshotStorageLayerKind struct {
+	SnapshotStorageLayerKind SnapshotStorageLayerKind `json:"snapshot_storage_layer_kind"`
+	Valid                    bool                     `json:"valid"` // Valid is true if SnapshotStorageLayerKind is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullSnapshotStorageLayerKind) Scan(value interface{}) error {
+	if value == nil {
+		ns.SnapshotStorageLayerKind, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.SnapshotStorageLayerKind.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullSnapshotStorageLayerKind) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.SnapshotStorageLayerKind), nil
+}
+
 type TemplateBuildStatus string
 
 const (
@@ -426,15 +556,19 @@ type Sandbox struct {
 	// Auto-pause timeout in seconds, evaluated against the current active session (re-armed on each resume). NULL = no timeout. Settable at create and via PATCH. The reaper pauses the sandbox on expiry; it does not delete it.
 	TimeoutSeconds *int32 `json:"timeout_seconds"`
 	// User-supplied flat string→string tags attached at creation. Immutable. Filterable on list endpoints via jsonb @> containment. Always non-null; an absent value is the empty object {}, never NULL.
-	Metadata          []byte             `json:"metadata"`
-	TemplateID        pgtype.UUID        `json:"template_id"`
-	SnapshotPath      *string            `json:"snapshot_path"`
-	MemPath           *string            `json:"mem_path"`
-	BasePath          *string            `json:"base_path"`
-	DeltaPath         *string            `json:"delta_path"`
-	DiskMib           int32              `json:"disk_mib"`
-	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
-	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	Metadata                   []byte             `json:"metadata"`
+	TemplateID                 pgtype.UUID        `json:"template_id"`
+	SnapshotPath               *string            `json:"snapshot_path"`
+	MemPath                    *string            `json:"mem_path"`
+	BasePath                   *string            `json:"base_path"`
+	DeltaPath                  *string            `json:"delta_path"`
+	DiskMib                    int32              `json:"disk_mib"`
+	AutoDeleteSeconds          *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt               pgtype.Timestamptz `json:"auto_delete_at"`
+	SourceSnapshotID           pgtype.UUID        `json:"source_snapshot_id"`
+	SnapshotOperationID        pgtype.UUID        `json:"snapshot_operation_id"`
+	SnapshotOperationStartedAt pgtype.Timestamptz `json:"snapshot_operation_started_at"`
+	SecretEnvKeys              []byte             `json:"secret_env_keys"`
 }
 
 type SandboxActiveInterval struct {
@@ -499,32 +633,91 @@ type Secret struct {
 }
 
 type Snapshot struct {
-	ID        uuid.UUID `json:"id"`
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	TeamID    uuid.UUID `json:"team_id"`
-	Path      string    `json:"path"`
-	SizeBytes int64     `json:"size_bytes"`
-	Trigger   string    `json:"trigger"`
-	CreatedAt time.Time `json:"created_at"`
-	MemPath   *string   `json:"mem_path"`
+	ID                   uuid.UUID          `json:"id"`
+	SandboxID            uuid.UUID          `json:"sandbox_id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	Path                 string             `json:"path"`
+	SizeBytes            int64              `json:"size_bytes"`
+	Trigger              string             `json:"trigger"`
+	CreatedAt            time.Time          `json:"created_at"`
+	MemPath              *string            `json:"mem_path"`
+	Kind                 SnapshotKind       `json:"kind"`
+	Status               SnapshotStatus     `json:"status"`
+	Name                 *string            `json:"name"`
+	IdempotencyKey       *string            `json:"idempotency_key"`
+	ParentSnapshotID     pgtype.UUID        `json:"parent_snapshot_id"`
+	SourceStatus         NullSandboxStatus  `json:"source_status"`
+	TemplateID           pgtype.UUID        `json:"template_id"`
+	TemplateSnapshotPath *string            `json:"template_snapshot_path"`
+	TemplateMemPath      *string            `json:"template_mem_path"`
+	BasePath             *string            `json:"base_path"`
+	DeltaPath            *string            `json:"delta_path"`
+	HostID               *string            `json:"host_id"`
+	VcpuCount            *int32             `json:"vcpu_count"`
+	MemoryMib            *int32             `json:"memory_mib"`
+	DiskMib              *int32             `json:"disk_mib"`
+	ManifestPath         *string            `json:"manifest_path"`
+	ManifestDigest       *string            `json:"manifest_digest"`
+	ArtifactMetadata     []byte             `json:"artifact_metadata"`
+	LogicalSizeBytes     int64              `json:"logical_size_bytes"`
+	ExclusiveSizeBytes   int64              `json:"exclusive_size_bytes"`
+	NetworkConfig        []byte             `json:"network_config"`
+	TimeoutSeconds       *int32             `json:"timeout_seconds"`
+	AutoDeleteSeconds    *int32             `json:"auto_delete_seconds"`
+	SecretBindings       []byte             `json:"secret_bindings"`
+	SecretEnvKeys        []byte             `json:"secret_env_keys"`
+	FailureReason        *string            `json:"failure_reason"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	FinalizedAt          pgtype.Timestamptz `json:"finalized_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type SnapshotStorageLayer struct {
+	ID                         int64                    `json:"id"`
+	TeamID                     uuid.UUID                `json:"team_id"`
+	Kind                       SnapshotStorageLayerKind `json:"kind"`
+	OwnerSnapshotID            pgtype.UUID              `json:"owner_snapshot_id"`
+	OwnerSandboxID             pgtype.UUID              `json:"owner_sandbox_id"`
+	RetainedLogicalSizeBytes   int64                    `json:"retained_logical_size_bytes"`
+	CurrentLogicalSizeBytes    int64                    `json:"current_logical_size_bytes"`
+	RetainedExclusiveSizeBytes int64                    `json:"retained_exclusive_size_bytes"`
+	CurrentExclusiveSizeBytes  int64                    `json:"current_exclusive_size_bytes"`
+	ShadowOnly                 bool                     `json:"shadow_only"`
+	CreatedAt                  time.Time                `json:"created_at"`
+	UpdatedAt                  time.Time                `json:"updated_at"`
+	EndedAt                    pgtype.Timestamptz       `json:"ended_at"`
+}
+
+type SnapshotStorageReference struct {
+	ID         int64              `json:"id"`
+	LayerID    int64              `json:"layer_id"`
+	TeamID     uuid.UUID          `json:"team_id"`
+	SnapshotID pgtype.UUID        `json:"snapshot_id"`
+	SandboxID  pgtype.UUID        `json:"sandbox_id"`
+	CreatedAt  time.Time          `json:"created_at"`
+	ReleasedAt pgtype.Timestamptz `json:"released_at"`
 }
 
 type Team struct {
-	ID                    uuid.UUID `json:"id"`
-	Name                  string    `json:"name"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
-	BuildConcurrency      int32     `json:"build_concurrency"`
-	MaxTemplateVcpu       *int32    `json:"max_template_vcpu"`
-	MaxTemplateMemoryMib  *int32    `json:"max_template_memory_mib"`
-	MaxTemplateDiskMib    *int32    `json:"max_template_disk_mib"`
-	MaxTemplates          *int32    `json:"max_templates"`
-	MaxSandboxes          int32     `json:"max_sandboxes"`
-	ActiveSandboxCount    int32     `json:"active_sandbox_count"`
-	CredentialStoreKind   string    `json:"credential_store_kind"`
-	CredentialStoreConfig []byte    `json:"credential_store_config"`
-	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
-	HomeRegion            string    `json:"home_region"`
+	ID                        uuid.UUID `json:"id"`
+	Name                      string    `json:"name"`
+	CreatedAt                 time.Time `json:"created_at"`
+	UpdatedAt                 time.Time `json:"updated_at"`
+	BuildConcurrency          int32     `json:"build_concurrency"`
+	MaxTemplateVcpu           *int32    `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib      *int32    `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib        *int32    `json:"max_template_disk_mib"`
+	MaxTemplates              *int32    `json:"max_templates"`
+	MaxSandboxes              int32     `json:"max_sandboxes"`
+	ActiveSandboxCount        int32     `json:"active_sandbox_count"`
+	CredentialStoreKind       string    `json:"credential_store_kind"`
+	CredentialStoreConfig     []byte    `json:"credential_store_config"`
+	UnmatchedHostPolicy       string    `json:"unmatched_host_policy"`
+	HomeRegion                string    `json:"home_region"`
+	MaxSnapshots              int32     `json:"max_snapshots"`
+	MaxSnapshotsPerSandbox    int32     `json:"max_snapshots_per_sandbox"`
+	SnapshotStorageQuotaBytes *int64    `json:"snapshot_storage_quota_bytes"`
+	SnapshotStorageBytes      int64     `json:"snapshot_storage_bytes"`
 }
 
 type TeamBillingPeriod struct {

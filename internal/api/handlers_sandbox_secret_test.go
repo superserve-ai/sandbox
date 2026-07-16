@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/secrets"
@@ -269,6 +270,26 @@ func TestAttachSandboxSecret_BadStatus_Conflict(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
 	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Encryptor: noopEncryptor{}, Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupSecretRouter(h, teamID.String()).ServeHTTP(w, attachReq(sandboxID.String(), `{"env_key":"ANTHROPIC_API_KEY","secret_name":"anthropic-prod"}`))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAttachSandboxSecret_SnapshotOperation_Conflict(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	operationID := uuid.New()
+	sb := db.Sandbox{
+		ID:                  sandboxID,
+		TeamID:              teamID,
+		Status:              db.SandboxStatusActive,
+		SnapshotOperationID: pgtype.UUID{Bytes: operationID, Valid: true},
+	}
+	mock := &mockDBTX{queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) }}
 	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Encryptor: noopEncryptor{}, Signer: newTestSigner(t, "v1")}
 	w := httptest.NewRecorder()
 	setupSecretRouter(h, teamID.String()).ServeHTTP(w, attachReq(sandboxID.String(), `{"env_key":"ANTHROPIC_API_KEY","secret_name":"anthropic-prod"}`))
@@ -565,6 +586,26 @@ func TestDetachSandboxSecret_BadStatus_Conflict(t *testing.T) {
 		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
 	}
 	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Encryptor: noopEncryptor{}, Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupSecretRouter(h, teamID.String()).ServeHTTP(w, detachReq(sandboxID.String(), "ANTHROPIC_API_KEY"))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDetachSandboxSecret_SnapshotOperation_Conflict(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	operationID := uuid.New()
+	sb := db.Sandbox{
+		ID:                  sandboxID,
+		TeamID:              teamID,
+		Status:              db.SandboxStatusPaused,
+		SnapshotOperationID: pgtype.UUID{Bytes: operationID, Valid: true},
+	}
+	mock := &mockDBTX{queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) }}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupSecretRouter(h, teamID.String()).ServeHTTP(w, detachReq(sandboxID.String(), "ANTHROPIC_API_KEY"))
 

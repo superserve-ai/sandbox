@@ -37,6 +37,7 @@ type OTelRecorder struct {
 	sandboxDuration          metric.Float64Histogram
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
+	savedSnapshotOutcomes    metric.Int64Counter
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
@@ -107,6 +108,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds"); err != nil {
+		return nil, err
+	}
+	if r.savedSnapshotOutcomes, err = meter.Int64Counter("saved_snapshot_outcome_total"); err != nil {
 		return nil, err
 	}
 	if r.hostVCPU, err = meter.Int64Gauge("host_capacity_used_vcpu"); err != nil {
@@ -183,6 +187,18 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	}
 }
 
+func (r *OTelRecorder) RecordSavedSnapshotOutcome(ctx context.Context, o SavedSnapshotOutcome) {
+	if r == nil {
+		return
+	}
+	r.savedSnapshotOutcomes.Add(ctx, 1, metric.WithAttributes(r.attrs(
+		attribute.String("operation", safeSavedSnapshotOperation(o.Operation)),
+		attribute.String("outcome", safeSavedSnapshotOutcome(o.Outcome)),
+		attribute.String("region", safeRegion(o.Region)),
+		attribute.String("host_id", safeHostID(o.HostID)),
+	)...))
+}
+
 func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {
 	if r == nil {
 		return
@@ -245,12 +261,33 @@ func safeOperation(v string) string {
 
 func safeMethod(v string) string {
 	switch v {
-	case "CreateVM", "PauseVM", "ResumeVM", "DeleteVM", "BuildTemplate", "GetBuildStatus", "CancelBuild":
+	case "CreateVM", "PauseVM", "ResumeVM", "DeleteVM", "BuildTemplate", "GetBuildStatus", "CancelBuild",
+		"GetCapabilities", "CreateSavedSnapshot", "RestoreSavedSnapshot", "DeleteSavedSnapshot", "GetWritableLayerUsage":
 		return v
 	case "RestoreSnapshot":
 		return "CreateVM"
 	default:
 		return "unknown"
+	}
+}
+
+func safeSavedSnapshotOperation(v string) string {
+	switch v {
+	case SavedSnapshotOperationCapture, SavedSnapshotOperationRestore, SavedSnapshotOperationDelete, SavedSnapshotOperationCleanup:
+		return v
+	default:
+		return "unknown"
+	}
+}
+
+func safeSavedSnapshotOutcome(v string) string {
+	switch v {
+	case SavedSnapshotOutcomeSuccess, SavedSnapshotOutcomeError, SavedSnapshotOutcomeRetry,
+		SavedSnapshotOutcomeQueued, SavedSnapshotOutcomeDependencyBlocked,
+		SavedSnapshotOutcomeArtifactCorrupt, SavedSnapshotOutcomeUnavailable:
+		return v
+	default:
+		return SavedSnapshotOutcomeError
 	}
 }
 
