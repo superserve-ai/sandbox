@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -55,13 +54,10 @@ func New(store db.DBTX) *Service {
 }
 
 // NewCached returns a Service that caches positive team-permission results for
-// ttl. ttl <= 0 disables caching.
-func NewCached(store db.DBTX, ttl time.Duration) *Service {
-	if ttl <= 0 {
-		return New(store)
-	}
+// teamPermCacheTTL. Use for one process-lifetime singleton only.
+func NewCached(store db.DBTX) *Service {
 	return &Service{store: store, cache: &teamPermCache{
-		ttl: ttl,
+		ttl: teamPermCacheTTL,
 		m:   make(map[teamPermCacheKey]teamPermCacheEntry),
 		gen: make(map[uuid.UUID]uint64),
 	}}
@@ -100,31 +96,15 @@ type teamPermResult struct {
 	start   time.Time
 }
 
-// defaultTeamPermCacheTTL is the revocation contract: a role or membership
-// change takes effect within this window, everywhere. The cache is per-process
-// and instances don't coordinate, so InvalidateTeam can only tighten the
-// instance that handled the change — other instances, and RBAC writes that
-// bypass the API entirely (team-migration tooling, support SQL, the DB-trigger
-// cascade on membership rows), converge at TTL expiry. Same accepted window as
-// the API-key cache. If a permission ever requires immediate cross-instance
+// teamPermCacheTTL is the revocation contract: a role or membership change
+// takes effect within this window, everywhere. The cache is per-process and
+// instances don't coordinate, so InvalidateTeam can only tighten the instance
+// that handled the change — other instances, and RBAC writes that bypass the
+// API entirely (team-migration tooling, support SQL, the DB-trigger cascade on
+// membership rows), converge at TTL expiry. Same accepted window as the
+// API-key cache. If a permission ever requires immediate cross-instance
 // revocation, replace this cache with a DB-backed per-team generation.
-const defaultTeamPermCacheTTL = 10 * time.Second
-
-// TeamPermCacheTTLFromEnv reads TEAM_PERM_CACHE_TTL (a Go duration, e.g.
-// "10s"). Unset or unparsable values fall back to the default; a non-positive
-// duration disables caching. Mirrors API_KEY_CACHE_TTL so ops can tune or
-// disable both halves of the revocation window without a deploy.
-func TeamPermCacheTTLFromEnv() time.Duration {
-	raw := os.Getenv("TEAM_PERM_CACHE_TTL")
-	if raw == "" {
-		return defaultTeamPermCacheTTL
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		return defaultTeamPermCacheTTL
-	}
-	return d
-}
+const teamPermCacheTTL = 10 * time.Second
 
 // teamPermCacheMaxEntries bounds the map so churned user/team/permission
 // triples can't grow process memory; a backstop, not an expected operating

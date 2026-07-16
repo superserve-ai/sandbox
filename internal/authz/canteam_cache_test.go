@@ -53,7 +53,7 @@ func (r scanRow) Scan(dest ...any) error {
 }
 
 func newCachedForTest(store *countingStore) *Service {
-	return NewCached(store, defaultTeamPermCacheTTL)
+	return NewCached(store)
 }
 
 func (s *Service) cacheLen() int {
@@ -164,7 +164,7 @@ func (s *gateStore) QueryRow(context.Context, string, ...interface{}) pgx.Row {
 
 func TestCanTeamStoreAfterInvalidateDoesNotResurrectGrant(t *testing.T) {
 	store := &gateStore{result: true, entered: make(chan struct{}), release: make(chan struct{})}
-	s := NewCached(store, defaultTeamPermCacheTTL)
+	s := NewCached(store)
 	user, team := uuid.New(), uuid.New()
 
 	done := make(chan bool, 1)
@@ -198,7 +198,7 @@ func TestCanTeamStoreAfterInvalidateDoesNotResurrectGrant(t *testing.T) {
 
 func TestCanTeamLateJoinerAfterInvalidateStartsFreshQuery(t *testing.T) {
 	gate := &gateStore{result: true, entered: make(chan struct{}), release: make(chan struct{})}
-	s := NewCached(gate, defaultTeamPermCacheTTL)
+	s := NewCached(gate)
 	user, team := uuid.New(), uuid.New()
 
 	aResult := make(chan bool, 1)
