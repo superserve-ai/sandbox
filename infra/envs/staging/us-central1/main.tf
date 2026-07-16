@@ -164,9 +164,6 @@ module "api" {
     INTERNAL_API_TOKEN = {
       secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
     }
-    SENTRY_DSN = {
-      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn-${local.resource_suffix}")
-    }
   }
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels

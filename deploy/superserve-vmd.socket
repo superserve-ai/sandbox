@@ -1,0 +1,21 @@
+[Unit]
+Description=Superserve vmd listeners
+
+# systemd owns these sockets, so they survive vmd restarts: connections
+# arriving mid-deploy queue in the kernel accept backlog instead of being
+# refused, and the freshly started vmd (which serves before reattach)
+# accepts them within a second. Covers both the control-plane gRPC port
+# and the loopback resolver the edge proxy queries per request.
+#
+# Stopping THIS unit stops vmd too (the service Requires= it).
+# Rolling back to a vmd build without listener inheritance requires
+# `systemctl disable --now superserve-vmd.socket` first — an old build
+# binds the ports directly and cannot coexist with this unit.
+
+[Socket]
+ListenStream=50051
+ListenStream=127.0.0.1:9090
+Accept=no
+
+[Install]
+WantedBy=sockets.target

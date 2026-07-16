@@ -22,7 +22,17 @@ processors:
   memory_limiter:
     check_interval: 1s
     limit_mib: 256
-    spike_limit_mib: 64
+    spike_limit_mib: 65
+  resourcedetection/gcp:
+    detectors: [gcp]
+    timeout: 10s
+    override: false
+
+  resource/gmp_location:
+    attributes:
+      - key: location
+        value: ${env:GCP_ZONE}
+        action: upsert
   attributes/drop_internal_high_cardinality:
     actions:
       - key: sandbox_id
@@ -66,5 +76,5 @@ service:
   pipelines:
     metrics:
       receivers: [otlp, prometheus/self]
-      processors: [memory_limiter, attributes/drop_internal_high_cardinality, batch]
+      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/drop_internal_high_cardinality, batch]
       exporters: [googlemanagedprometheus]

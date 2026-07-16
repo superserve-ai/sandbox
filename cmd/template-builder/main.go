@@ -23,6 +23,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/shellquote"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
@@ -361,7 +362,7 @@ func fsyncBuildArtifacts(snapDir string, paths ...string) error {
 func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID string) (*network.Manager, *network.VMNetInfo, func(), error) {
 	log := newLogger("network")
 	mgr, err := network.NewManager(ctx, hostIface, log,
-		network.WithStartSlot(slotIndex),
+		network.WithExactSlot(slotIndex),
 		network.WithHTTPProxyPort(0), // no egress proxy for builds
 	)
 	if err != nil {
@@ -414,7 +415,7 @@ func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.Fire
 	}
 	pid := cmd.Process.Pid
 
-	if err := waitForSocket(socketPath, 5*time.Second); err != nil {
+	if err := vm.WaitForAPISocket(socketPath, 5*time.Second); err != nil {
 		_ = cmd.Process.Kill()
 		return 0, fmt.Errorf("wait for socket: %w", err)
 	}
@@ -431,17 +432,6 @@ func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.Fire
 
 	go func() { _ = cmd.Wait() }()
 	return pid, nil
-}
-
-func waitForSocket(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return fmt.Errorf("socket %s not ready after %s", path, timeout)
 }
 
 func killProcess(pid int) {
@@ -630,7 +620,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 			ownUser = "root"
 		}
 		mkdir := fmt.Sprintf("mkdir -p %s && chown -R %s:%s %s",
-			shellQuote(target), shellQuote(ownUser), shellQuote(ownUser), shellQuote(target))
+			shellquote.Single(target), shellquote.Single(ownUser), shellquote.Single(ownUser), shellquote.Single(target))
 		root := bc
 		root.user = "root" // ensure mkdir + chown run as root
 		if err := runShellCmd(ctx, vmIP, mkdir, root); err != nil {
@@ -646,16 +636,18 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		root := bc
 		root.user = "root"
 		check := fmt.Sprintf("id -u %s >/dev/null 2>&1 || adduser --disabled-password --gecos \"\" %s",
-			shellQuote(name), shellQuote(name))
+			shellquote.Single(name), shellquote.Single(name))
 		if err := runShellCmd(ctx, vmIP, check, root); err != nil {
 			return bc, fmt.Errorf("ensure user %s: %w", name, err)
 		}
 		if step.User.Sudo {
+			// Quote the whole sudoers line (not just the name) and match it with
+			// grep -xF: the name stays literal for both the shell and grep.
+			sudoersLine := shellquote.Single(name + " ALL=(ALL:ALL) NOPASSWD: ALL")
 			sudo := fmt.Sprintf(
 				"usermod -aG sudo %s || true; passwd -d %s || true; "+
-					"grep -q '^%s ALL=(ALL:ALL) NOPASSWD: ALL' /etc/sudoers || "+
-					"echo '%s ALL=(ALL:ALL) NOPASSWD: ALL' >>/etc/sudoers",
-				shellQuote(name), shellQuote(name), name, name,
+					"grep -qxF %s /etc/sudoers || echo %s >>/etc/sudoers",
+				shellquote.Single(name), shellquote.Single(name), sudoersLine, sudoersLine,
 			)
 			if err := runShellCmd(ctx, vmIP, sudo, root); err != nil {
 				return bc, fmt.Errorf("grant sudo to %s: %w", name, err)
@@ -905,8 +897,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

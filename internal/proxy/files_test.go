@@ -107,7 +107,7 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 		},
 	}
 
-	env.handler = NewHandler(env.domain, env.resolver, zerolog.Nop())
+	env.handler = NewHandler([]string{env.domain}, env.resolver, zerolog.Nop())
 	env.handler.WithAuth(seedKey).WithTerminal([]string{"*"}).WithFiles()
 
 	upHost := upURL.Host

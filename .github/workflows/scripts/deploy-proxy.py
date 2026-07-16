@@ -14,6 +14,8 @@ Env vars:
   VMD_INSTALL_DIR            required — bin install dir on the host
   SHA                        required — commit SHA (only first 8 chars used)
   PROXY_DOMAIN               required — host suffix the proxy serves (e.g. sandbox.superserve.ai)
+  PROXY_DOMAINS              optional — comma-separated host suffixes; overrides
+                             PROXY_DOMAIN on the proxy when set (DNS transitions)
   SANDBOX_ACCESS_TOKEN_SEED  optional — hex, >=32 bytes (>=64 hex chars)
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
@@ -42,6 +44,16 @@ def main() -> int:
     if not re.fullmatch(r"[A-Za-z0-9.\-]+", proxy_domain):
         print("ERROR: PROXY_DOMAIN contains disallowed characters", file=sys.stderr)
         return 1
+    # Optional multi-domain set for DNS/hostname transitions; the proxy
+    # prefers PROXY_DOMAINS over PROXY_DOMAIN when both are present.
+    # Validated per-entry (not as one blob) so a space-separated list
+    # fails loudly here instead of deploying a domain string that can
+    # never match a Host — the proxy only splits on commas.
+    proxy_domains = os.environ.get("PROXY_DOMAINS", "")
+    for entry in filter(None, (s.strip() for s in proxy_domains.split(","))):
+        if not re.fullmatch(r"[A-Za-z0-9.\-]+", entry):
+            print("ERROR: PROXY_DOMAINS contains an invalid domain", file=sys.stderr)
+            return 1
     access_seed = os.environ.get("SANDBOX_ACCESS_TOKEN_SEED", "")
     if access_seed and not re.fullmatch(r"[0-9a-fA-F]{64,}", access_seed):
         print("ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)", file=sys.stderr)
@@ -125,6 +137,7 @@ def main() -> int:
             sudo mkdir -p /etc/sandbox
             sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
             PROXY_DOMAIN={proxy_domain}
+            PROXY_DOMAINS={proxy_domains}
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}

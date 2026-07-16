@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/shellquote"
 )
 
 // ---------------------------------------------------------------------------
@@ -79,10 +81,12 @@ type Manager struct {
 	hostInterface string
 	log           zerolog.Logger
 
-	mu        sync.Mutex
-	devices   map[string]*VMNetInfo
-	freeSlots []int // recycled slot indices, guaranteed absent from slotOwner
-	nextSlot  int   // next new slot (used when freeSlots is empty)
+	mu         sync.Mutex
+	devices    map[string]*VMNetInfo
+	freeSlots  []int // recycled slot indices, guaranteed absent from slotOwner
+	nextSlot   int   // next new slot (used when freeSlots is empty)
+	maxSlot    int   // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
+	slotPinned bool  // WithExactSlot: allocate exactly maxSlot or fail, never advance
 
 	// slotOwner is the single source of truth for slot allocation AND identity:
 	// slotOwner[idx] == the current owner of slot index idx, one of
@@ -151,11 +155,13 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 // ManagerOption configures optional Manager behavior.
 type ManagerOption func(*Manager)
 
-// WithStartSlot sets the starting slot index for network allocation.
-// Use to avoid collision when multiple processes manage VMs on the
-// same host (e.g. vmd uses 1-100, template-builder uses 200+).
-func WithStartSlot(idx int) ManagerOption {
-	return func(m *Manager) { m.nextSlot = idx }
+// WithExactSlot pins the Manager to exactly slot idx: it claims that one index
+// or fails with ErrNoSlots, never advancing to idx+1. A template-builder
+// subprocess uses this to build precisely the slot vmd reserved for it via
+// ReserveSlot; if that slot is somehow unavailable the build fails cleanly
+// instead of silently running on an index vmd never reserved.
+func WithExactSlot(idx int) ManagerOption {
+	return func(m *Manager) { m.nextSlot = idx; m.maxSlot = idx; m.slotPinned = true }
 }
 
 // WithHTTPProxyPort sets the HTTP proxy port for egress REDIRECT rules.
@@ -360,21 +366,11 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", fmt.Errorf("assign veth IP: %w", err)
 	}
 
-	if err := nsRun(ctx, nsName, "ip", "tuntap", "add", "dev", TAPName, "mode", "tap"); err != nil {
+	// One tap-construction path for fresh and recycled slots, so their tap
+	// config can't diverge (the leading delete is a no-op on a fresh namespace).
+	if err := m.resetTap(ctx, nsName); err != nil {
 		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("create TAP: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "up"); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("bring up TAP: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", TAPName, "mtu", ifaceMTU); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("set TAP MTU: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "addr", "add", tapCIDR, "dev", TAPName); err != nil {
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("assign TAP IP: %w", err)
+		return nil, "", err
 	}
 
 	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
@@ -419,6 +415,27 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	return info, vethName, nil
 }
 
+// resetTap deletes and recreates tap0 in nsName, leaving a TAP that is
+// unattached by construction — a recycled slot can't rely on the namespace
+// being process-free (that doesn't guarantee the previous owner's fd is
+// released). Returns an error if the tap can't be rebuilt, so the caller can
+// decline to recycle. nftables rules match tap0 by name, so reusing the name
+// keeps them valid. Also the tap-construction path for setupSlot (the delete
+// is a no-op on a fresh namespace), keeping fresh and recycled taps identical.
+//
+// One exec for the whole rebuild: per-command `ip netns exec` invocations fork
+// twice each and serialize on the kernel's netlink lock under concurrent
+// resets. Interpolants are shell-quoted package constants.
+func (m *Manager) resetTap(ctx context.Context, nsName string) error {
+	script := fmt.Sprintf(
+		"ip link del %[1]s 2>/dev/null; ip tuntap add dev %[1]s mode tap && ip link set %[1]s up && ip link set %[1]s mtu %[2]s && ip addr add %[3]s dev %[1]s",
+		shellquote.Single(TAPName), shellquote.Single(ifaceMTU), shellquote.Single(tapCIDR))
+	if err := nsRun(ctx, nsName, "sh", "-c", script); err != nil {
+		return fmt.Errorf("reset TAP: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) GetVMNetInfo(vmID string) *VMNetInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -430,7 +447,17 @@ func (m *Manager) GetVMNetInfo(vmID string) *VMNetInfo {
 	return &cp
 }
 
-func (m *Manager) CleanupVM(vmID string) {
+// CleanupVM releases a VM's network slot, recycling it into the pool when one
+// is configured.
+func (m *Manager) CleanupVM(vmID string) { m.cleanupVM(vmID, true) }
+
+// TeardownVM releases a VM's network slot with a full teardown, never recycling
+// it. Used when the slot is suspect — e.g. a create that failed to attach tap0 —
+// so its index is rebuilt from scratch (fresh tap) before reuse instead of being
+// handed straight to the next claim, which could inherit the same bad tap.
+func (m *Manager) TeardownVM(vmID string) { m.cleanupVM(vmID, false) }
+
+func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	m.mu.Lock()
 	info, ok := m.devices[vmID]
 	if ok {
@@ -449,10 +476,8 @@ func (m *Manager) CleanupVM(vmID string) {
 	}
 	vethName := fmt.Sprintf("veth-%d", idx)
 
-	// Remove per-sandbox egress proxy rules.
-	if m.egressProxy != nil {
-		m.egressProxy.RemoveRules(info.HostIP)
-	}
+	// Ownership gates every slot-keyed side effect below (egress rules, firewall,
+	// kernel state): they belong to whoever owns the index now.
 
 	// Recycle the slot into the pool — namespace, veth, TAP, and base
 	// nftables stay configured; the next Claim re-adds vmID-specific
@@ -460,19 +485,50 @@ func (m *Manager) CleanupVM(vmID string) {
 	// in-ns handle couldn't be rebound) — pooling would let the next
 	// Claim silently lose per-VM egress filtering. Return transfers ownership
 	// from this VM back to the pool.
-	if m.pool != nil && info.Firewall != nil {
+	if recycle && m.pool != nil && info.Firewall != nil {
+		m.mu.Lock()
+		owned := m.slotOwner[idx] == vmID
+		m.mu.Unlock()
+		if !owned {
+			m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+				Msg("cleanup skipped — slot no longer owned by this VM")
+			return
+		}
+		if m.egressProxy != nil {
+			m.egressProxy.RemoveRules(info.HostIP)
+		}
 		_ = info.Firewall.ReplaceUserRules(nil, nil)
 		m.pool.Return(&preallocSlot{idx: idx, info: info, vethName: vethName})
 		return
 	}
 
-	// No pool — full teardown. Release the index only if this VM still owns it.
-	m.releaseIfOwned(idx, vmID)
+	// Full teardown (no pool, or a forced teardown of a suspect slot). Park the
+	// index as teardownOwner for the duration — releasing it first would let a
+	// concurrent claim pop the idx, see the netns still present, and discard it
+	// for good.
+	if !m.claimTeardown(idx, vmID) {
+		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+			Msg("teardown skipped — slot no longer owned by this VM")
+		return
+	}
+	defer m.releaseIfOwned(idx, teardownOwner)
 
+	if m.egressProxy != nil {
+		m.egressProxy.RemoveRules(info.HostIP)
+	}
 	if info.Firewall != nil {
 		if err := info.Firewall.Close(); err != nil {
 			m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error closing namespace firewall")
 		}
+	}
+
+	// Kill any process still in the namespace before removing it — `ip netns
+	// del` only unlinks the name, so a live holder (e.g. the still-attached tap
+	// owner on the teardown-not-recycle path) would keep the namespace and its
+	// tap alive but anonymous: unfindable by pidsInNs, the sweep, or the gauge.
+	if killed := killProcessesInNs(info.Namespace); killed > 0 {
+		m.log.Info().Str("namespace", info.Namespace).Int("killed", killed).
+			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 
 	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
@@ -508,20 +564,21 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 		return
 	}
 	// Only tear down if this vmID still owns the index, so a stale cleanup racing
-	// the pool's reuse of the slot can't destroy a new tenant's ns/veth. Claim the
-	// teardown atomically (vmID → teardownOwner) so claimSlotIndex can't grab idx
-	// while cleanupFull runs below.
-	m.mu.Lock()
-	if m.slotOwner[idx] != vmID {
-		m.mu.Unlock()
+	// the pool's reuse of the slot can't destroy a new tenant's ns/veth.
+	if !m.claimTeardown(idx, vmID) {
 		return
 	}
-	m.slotOwner[idx] = teardownOwner
-	m.mu.Unlock()
 	// Release even if cleanupFull panics — otherwise the index stays stuck as
 	// teardownOwner forever (no other path releases that sentinel).
 	defer m.releaseIfOwned(idx, teardownOwner)
 
+	// Kill any process still in the namespace before removing it — `ip netns del`
+	// only unlinks the name, so a namespace with a live holder lingers (keeping
+	// its tap0) until that process exits. Mirrors SweepOrphanNamespaces.
+	if killed := killProcessesInNs(fallbackNamespace); killed > 0 {
+		m.log.Info().Str("namespace", fallbackNamespace).Int("killed", killed).
+			Msg("cleanup: killed lingering processes before namespace teardown")
+	}
 	// Tear down both sides even if the netns is already gone: `ip netns del`
 	// only removes the in-namespace side, so the host-side veth-N can outlive it.
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
@@ -759,6 +816,49 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	return true
 }
 
+// ClaimFreshSlot claims a fresh, unused slot index under owner without building
+// any kernel network state. The caller — a template-builder subprocess —
+// creates ns-<idx>/veth-<idx> itself; the reservation is what stops vmd's
+// sandbox allocator from handing the same index to a VM, so builds and
+// sandboxes draw from one authoritative allocator instead of racing disjoint
+// ranges. Distinct from ReserveSlotsAbove, which pins already-known indices
+// via reserveSlotLocked (bypassing the owned/nsExists checks). Pair every
+// ClaimFreshSlot with a ReleaseSlot.
+func (m *Manager) ClaimFreshSlot(owner string) (int, error) {
+	return m.claimSlotIndex(owner)
+}
+
+// ReleaseSlot frees a slot claimed via ClaimFreshSlot and tears down any ns/veth
+// the caller built at idx. It releases strictly by (owner, idx) — never routing
+// through the tracked-VM path — so a caller-supplied build ID that collides with
+// a live sandbox's VM ID can't tear down that sandbox's namespace or leak the
+// reserved index. Owns the namespace naming so callers never reconstruct
+// "ns-<idx>"; a no-op if owner no longer owns idx (already reclaimed/reused).
+func (m *Manager) ReleaseSlot(owner string, idx int) {
+	if !m.claimTeardown(idx, owner) {
+		return
+	}
+	// Release even if cleanupFull panics — otherwise idx stays stuck as
+	// teardownOwner forever (no other path releases that sentinel).
+	defer m.releaseIfOwned(idx, teardownOwner)
+	m.cleanupFull(fmt.Sprintf("ns-%d", idx), fmt.Sprintf("veth-%d", idx))
+}
+
+// claimTeardown atomically transfers idx from owner to the teardown sentinel so
+// claimSlotIndex can't grab it mid-teardown. False when owner no longer holds
+// idx — the slot moved on and its state belongs to the new tenant, so the
+// caller must touch none of it. Pair with `defer m.releaseIfOwned(idx,
+// teardownOwner)`.
+func (m *Manager) claimTeardown(idx int, owner string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.slotOwner[idx] != owner {
+		return false
+	}
+	m.slotOwner[idx] = teardownOwner
+	return true
+}
+
 // claimSlotIndex picks a slot idx that is unowned and not present in the kernel,
 // assigns it to owner, and returns it. owner is poolOwner for pool pre-allocation
 // or the vmID for an on-demand SetupVM.
@@ -768,11 +868,18 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 
 	for {
 		var idx int
-		if len(m.freeSlots) > 0 {
+		// A pinned Manager (WithExactSlot) must claim exactly maxSlot or fail —
+		// so it never draws from freeSlots (which could hand back a different
+		// index); it only takes the pinned nextSlot path below.
+		if !m.slotPinned && len(m.freeSlots) > 0 {
 			idx = m.freeSlots[len(m.freeSlots)-1]
 			m.freeSlots = m.freeSlots[:len(m.freeSlots)-1]
 		} else {
-			if m.nextSlot > MaxSlots {
+			ceiling := MaxSlots
+			if m.slotPinned {
+				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
+			}
+			if m.nextSlot > ceiling {
 				return 0, ErrNoSlots
 			}
 			idx = m.nextSlot
@@ -806,15 +913,14 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "ns-") {
-			continue
-		}
 		if keep[name] {
 			continue
 		}
 
-		var idx int
-		if _, err := fmt.Sscanf(name, "ns-%d", &idx); err != nil {
+		// Strict ns-<int> parse: trailing garbage must not map a foreign
+		// namespace onto another slot's veth.
+		idx, ok := slotFromNamespace(name)
+		if !ok {
 			continue
 		}
 		if killed := killProcessesInNs(name); killed > 0 {
@@ -831,8 +937,10 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 	// before ns deletion, or when a crash left the host side orphaned).
 	if veths, err := listHostVeths(); err == nil {
 		for _, veth := range veths {
-			var idx int
-			if _, err := fmt.Sscanf(veth, "veth-%d", &idx); err != nil {
+			// Same strict parse as the ns loop.
+			idxStr, isVeth := strings.CutPrefix(veth, "veth-")
+			idx, err := strconv.Atoi(idxStr)
+			if !isVeth || err != nil || idx < 0 {
 				continue
 			}
 			if keep[fmt.Sprintf("ns-%d", idx)] {
@@ -850,19 +958,38 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 }
 
 // killProcessesInNs SIGKILLs every process whose net namespace matches
-// /run/netns/<name>. Returns the number of pids signalled.
+// /run/netns/<name>. Returns the number of pids signalled. Best-effort: a
+// failed /proc scan (see pidsInNs) just means nothing gets killed this pass.
 func killProcessesInNs(name string) int {
+	pids, _ := pidsInNs(name)
+	killed := 0
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			killed++
+		}
+	}
+	return killed
+}
+
+// pidsInNs returns the PIDs whose net namespace matches /run/netns/<name>,
+// found by comparing /proc/<pid>/ns/net's inode against the namespace file's.
+// ok is false only when the /proc scan itself failed (e.g. transient
+// resource pressure) — a genuine "don't know" that callers must not treat as
+// "clear" the way an actually-empty scan is; conflating the two would let a
+// still-occupied namespace be recycled, reintroducing the exact race this
+// guards against. A namespace file that no longer exists can't have
+// anything attached to it, so that case is a confident (nil, true).
+func pidsInNs(name string) (pids []int, ok bool) {
 	nsPath := netnsDir + "/" + name
 	nsStat, err := os.Stat(nsPath)
 	if err != nil {
-		return 0
+		return nil, true
 	}
 	nsIno := nsStat.Sys().(*syscall.Stat_t).Ino
 	procs, err := os.ReadDir("/proc")
 	if err != nil {
-		return 0
+		return nil, false
 	}
-	killed := 0
 	for _, e := range procs {
 		if !e.IsDir() {
 			continue
@@ -878,11 +1005,9 @@ func killProcessesInNs(name string) int {
 		if procNsStat.Sys().(*syscall.Stat_t).Ino != nsIno {
 			continue
 		}
-		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
-			killed++
-		}
+		pids = append(pids, pid)
 	}
-	return killed
+	return pids, true
 }
 
 // listHostVeths returns all veth-N interfaces visible in the host namespace.
@@ -939,11 +1064,56 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 	_ = run(ctx, "ip", "netns", "del", nsName)
 }
 
+// NetnsStats reports the ns-N namespaces on the host, the owned slot indices
+// (slotOwner covers every legitimate holder), and orphaned — namespaces with
+// no owner, the leak signal. Measured per namespace so owners without a
+// backing namespace (e.g. record reservations after a reboot) don't distort it.
+func (m *Manager) NetnsStats() (netnsTotal, ownedSlots, orphaned int) {
+	var indices []int
+	if entries, err := os.ReadDir(netnsDir); err == nil {
+		for _, e := range entries {
+			if idx, ok := slotFromNamespace(e.Name()); ok {
+				netnsTotal++
+				indices = append(indices, idx)
+			}
+		}
+	}
+	m.mu.Lock()
+	ownedSlots = len(m.slotOwner)
+	for _, idx := range indices {
+		if _, ok := m.slotOwner[idx]; !ok {
+			orphaned++
+		}
+	}
+	m.mu.Unlock()
+	return netnsTotal, ownedSlots, orphaned
+}
+
 func run(ctx context.Context, name string, args ...string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
+	// Run in its own process group and cancel the whole group, so a timeout
+	// also kills any children the command spawned (resetTap's shell) — a lone
+	// process kill would orphan them to finish after the caller moved on.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			// Group already gone: report "done" so a command that finished
+			// just as the deadline fired isn't turned into a spurious failure.
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	// Bound the post-kill wait for output pipes: a descendant that detached
+	// into its own group survives the group kill and would otherwise hold
+	// stdout open indefinitely.
+	cmd.WaitDelay = time.Second
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s %v: %s: %w", name, args, string(out), err)
 	}

@@ -535,7 +535,7 @@ func TestServeTerminal_AllowedOriginAccepted(t *testing.T) {
 		},
 	}
 
-	h := NewHandler(domain, resolver, zerolog.Nop())
+	h := NewHandler([]string{domain}, resolver, zerolog.Nop())
 	h.WithAuth(seedKey).WithTerminal([]string{"http://127.0.0.1:*"}).WithFiles()
 
 	upHost := upURL.Host

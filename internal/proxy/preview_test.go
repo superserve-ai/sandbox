@@ -85,7 +85,7 @@ func newPreviewTestEnv(t *testing.T, access string, ports map[int]int64) *previe
 		},
 	}
 
-	env.handler = NewHandler(env.domain, env.resolver, zerolog.Nop())
+	env.handler = NewHandler([]string{env.domain}, env.resolver, zerolog.Nop())
 	env.handler.WithAuth(env.seedKey)
 
 	upHost := upURL.Host

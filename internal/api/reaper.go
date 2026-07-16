@@ -291,12 +291,10 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		return
 	}
 
-	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sbx.ID.String(), "")
-	vmdCancel()
+	snapshotPath, memPath, err := pauseWithRetry(ctx, vmd, sbx.ID.String())
 	if err != nil {
-		// VM never stopped — safe to revert DB to active so the reaper
-		// retries on the next tick.
+		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
+		// didn't pause, so revert to active and let the next tick retry.
 		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
 		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, err, l)

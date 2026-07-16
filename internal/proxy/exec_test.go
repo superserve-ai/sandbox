@@ -55,7 +55,7 @@ func newExecTestEnv(t *testing.T) *filesTestEnv {
 		},
 	}
 
-	env.handler = NewHandler(env.domain, env.resolver, zerolog.Nop())
+	env.handler = NewHandler([]string{env.domain}, env.resolver, zerolog.Nop())
 	env.handler.WithAuth(seedKey).WithExec()
 
 	// Redirect transport at the per-sandbox cache so the boxd-internal
@@ -181,7 +181,7 @@ func TestExec_NotEnabled_404(t *testing.T) {
 	domain := "sandbox.test"
 	sandboxID := "sbx-" + strings.Repeat("z", 8)
 
-	h := NewHandler(domain, &stubResolver{info: InstanceInfo{VMIP: "127.0.0.1", Status: "running"}}, zerolog.Nop())
+	h := NewHandler([]string{domain}, &stubResolver{info: InstanceInfo{VMIP: "127.0.0.1", Status: "running"}}, zerolog.Nop())
 	h.WithAuth(seedKey) // WithExec deliberately not called
 
 	req := httptest.NewRequest(http.MethodPost, "http://unused/exec", strings.NewReader(`{"command":"echo"}`))
@@ -201,7 +201,7 @@ func TestExec_WithoutWithAuth_Panics(t *testing.T) {
 			t.Error("expected panic when WithExec called before WithAuth")
 		}
 	}()
-	h := NewHandler("sandbox.test", &stubResolver{}, zerolog.Nop())
+	h := NewHandler([]string{"sandbox.test"}, &stubResolver{}, zerolog.Nop())
 	h.WithExec()
 }
 

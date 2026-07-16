@@ -2,7 +2,10 @@ package proxy
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/rs/zerolog"
 )
 
 const testDomain = "sandbox.superserve.ai"
@@ -148,7 +151,7 @@ func TestParseHost(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.host, func(t *testing.T) {
-			port, instanceID, err := ParseHost(tt.host, testDomain)
+			port, instanceID, err := ParseHost(tt.host, []string{testDomain})
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error, got port=%d instanceID=%q", port, instanceID)
@@ -163,6 +166,161 @@ func TestParseHost(t *testing.T) {
 			}
 			if instanceID != tt.wantInstanceID {
 				t.Errorf("instanceID: got %q, want %q", instanceID, tt.wantInstanceID)
+			}
+		})
+	}
+}
+
+// With several configured domains — during a DNS transition the legacy
+// hostname and the region-prefixed hostname must both route — every entry
+// gets the same suffix check a single domain got.
+func TestParseHost_MultiDomain(t *testing.T) {
+	domains := []string{testDomain, "usw-sandbox.superserve.ai"}
+
+	tests := []struct {
+		host           string
+		wantPort       int
+		wantInstanceID string
+		wantErr        bool
+	}{
+		// Each configured domain routes.
+		{
+			host:           "boxd-abc123." + testDomain,
+			wantPort:       boxdPort,
+			wantInstanceID: "abc123",
+		},
+		{
+			host:           "boxd-abc123.usw-sandbox.superserve.ai",
+			wantPort:       boxdPort,
+			wantInstanceID: "abc123",
+		},
+		// TCP ports in Host are stripped on every domain.
+		{
+			host:           "boxd-abc123.usw-sandbox.superserve.ai:443",
+			wantPort:       boxdPort,
+			wantInstanceID: "abc123",
+		},
+		{
+			host:           "3000-mybox.usw-sandbox.superserve.ai:8443",
+			wantPort:       3000,
+			wantInstanceID: "mybox",
+		},
+
+		// Unconfigured domains are rejected, including near-misses.
+		{
+			host:    "boxd-abc123.euw-sandbox.superserve.ai",
+			wantErr: true,
+		},
+		{
+			host:    "boxd-abc.usw-sandbox.superserve.ai.attacker.com",
+			wantErr: true,
+		},
+
+		// Matching stays case-sensitive, exactly like the single-domain
+		// check it generalizes.
+		{
+			host:    "boxd-abc123.USW-SANDBOX.SUPERSERVE.AI",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			port, instanceID, err := ParseHost(tt.host, domains)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got port=%d instanceID=%q", port, instanceID)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if port != tt.wantPort {
+				t.Errorf("port: got %d, want %d", port, tt.wantPort)
+			}
+			if instanceID != tt.wantInstanceID {
+				t.Errorf("instanceID: got %q, want %q", instanceID, tt.wantInstanceID)
+			}
+		})
+	}
+}
+
+// ServesHost backs the LB health-check gate, so it must accept exactly the
+// hosts ParseHost would route and reject everything else.
+func TestServesHost(t *testing.T) {
+	domains := []string{testDomain, "usw-sandbox.superserve.ai"}
+	h := NewHandler(domains, &stubResolver{}, zerolog.Nop())
+
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"boxd-abc123." + testDomain, true},
+		{"boxd-abc123.usw-sandbox.superserve.ai", true},
+		{"boxd-abc123.usw-sandbox.superserve.ai:443", true},
+		{testDomain, false}, // bare domain: shared-host form, not a subdomain
+		{"boxd-abc123.euw-sandbox.superserve.ai", false},
+		{"boxd-abc123." + testDomain + ".attacker.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			if got := h.ServesHost(tt.host); got != tt.want {
+				t.Errorf("ServesHost(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+// Shared-host header routing works on any configured domain, not just the first.
+func TestParseRequest_MultiDomainSharedHost(t *testing.T) {
+	const sandboxID = "b150ee22-4956-4f5b-926a-f921ed8c37d6"
+	domains := []string{testDomain, "usw-sandbox.superserve.ai"}
+
+	headers := http.Header{}
+	headers.Set(headerSandboxID, sandboxID)
+
+	port, gotID, err := ParseRequest("usw-sandbox.superserve.ai:443", headers, domains)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if port != boxdPort {
+		t.Errorf("port: got %d, want %d", port, boxdPort)
+	}
+	if gotID != sandboxID {
+		t.Errorf("instanceID: got %q, want %q", gotID, sandboxID)
+	}
+}
+
+// ServeHTTP accepts sandbox hosts on every configured domain and rejects the
+// rest before any resolver lookup: 404 means the host parsed and reached the
+// resolver; 400 means the domain check refused it.
+func TestHandler_MultiDomainHostCheck(t *testing.T) {
+	domains := []string{testDomain, "usw-sandbox.superserve.ai"}
+	h := NewHandler(domains, &stubResolver{err: ErrInstanceNotFound}, zerolog.Nop())
+
+	tests := []struct {
+		host       string
+		wantStatus int
+	}{
+		{"3000-mybox." + testDomain, http.StatusNotFound},
+		{"3000-mybox.usw-sandbox.superserve.ai", http.StatusNotFound},
+		{"3000-mybox.usw-sandbox.superserve.ai:443", http.StatusNotFound},
+		{"3000-mybox.euw-sandbox.superserve.ai", http.StatusBadRequest},
+		{"3000-mybox.attacker.com", http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://unused/", nil)
+			req.Host = tt.host
+			w := httptest.NewRecorder()
+
+			h.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("status: got %d, want %d; body: %s", w.Code, tt.wantStatus, w.Body.String())
 			}
 		})
 	}
@@ -245,7 +403,7 @@ func TestParseRequest(t *testing.T) {
 			if tt.headerID != "" {
 				headers.Set(headerSandboxID, tt.headerID)
 			}
-			port, instanceID, err := ParseRequest(tt.host, headers, testDomain)
+			port, instanceID, err := ParseRequest(tt.host, headers, []string{testDomain})
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error, got port=%d instanceID=%q", port, instanceID)
@@ -273,7 +431,7 @@ func TestParseRequest_HeaderRoutingRequiresSharedHost(t *testing.T) {
 	headers := http.Header{}
 	headers.Set(headerSandboxID, attackerID)
 
-	_, gotID, err := ParseRequest("boxd-"+targetID+"."+testDomain, headers, testDomain)
+	_, gotID, err := ParseRequest("boxd-"+targetID+"."+testDomain, headers, []string{testDomain})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -38,19 +39,23 @@ func main() {
 	addr := envOrDefault("PROXY_ADDR", ":5007")
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
 	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
-	domain := envOrDefault("PROXY_DOMAIN", "sandbox.superserve.ai")
+	domains := proxyDomains()
+	if legacy := os.Getenv("PROXY_DOMAIN"); legacy != "" && !slices.Contains(domains, legacy) {
+		log.Warn().Str("proxy_domain", legacy).Strs("effective_domains", domains).
+			Msg("PROXY_DOMAIN is set but not in the effective domain list — PROXY_DOMAINS overrides it and this host will stop serving it")
+	}
 
 	log.Info().
 		Str("addr", addr).
 		Str("vmd_addr", vmdAddr).
-		Str("domain", domain).
+		Strs("domains", domains).
 		Msg("starting edge proxy")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
-	proxyHandler := proxy.NewHandler(domain, resolver, log)
+	proxyHandler := proxy.NewHandler(domains, resolver, log)
 	proxyHandler.StartSweeper(ctx)
 
 	// Product-usage analytics for exec/files — no-op when POSTHOG_KEY is unset.
@@ -101,14 +106,9 @@ func main() {
 
 	// Health check for the GCP LB. Only responds on non-sandbox hosts
 	// so the boxd-label lockdown isn't bypassed.
-	domainSuffix := "." + domain
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if i := strings.IndexByte(host, ':'); i >= 0 {
-			host = host[:i]
-		}
-		if strings.HasSuffix(host, domainSuffix) {
+		if proxyHandler.ServesHost(r.Host) {
 			proxyHandler.ServeHTTP(w, r)
 			return
 		}
@@ -146,6 +146,18 @@ func main() {
 	_ = redirectSrv.Shutdown(shutCtx)
 
 	log.Info().Msg("proxy stopped")
+}
+
+// proxyDomains resolves the set of sandbox domains the proxy accepts.
+// PROXY_DOMAINS (comma-separated) takes precedence so one deploy can serve
+// both the legacy hostname and the region-prefixed hostname during a DNS
+// transition; otherwise the single-value PROXY_DOMAIN keeps existing
+// deploys unchanged.
+func proxyDomains() []string {
+	if domains := splitCSV(os.Getenv("PROXY_DOMAINS")); len(domains) > 0 {
+		return domains
+	}
+	return []string{envOrDefault("PROXY_DOMAIN", "sandbox.superserve.ai")}
 }
 
 func envOrDefault(key, fallback string) string {

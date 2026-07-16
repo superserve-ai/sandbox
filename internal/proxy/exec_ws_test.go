@@ -305,7 +305,7 @@ func TestServeExecWS_ForeignOriginAccepted(t *testing.T) {
 		},
 	}
 
-	h := NewHandler(domain, resolver, zerolog.Nop())
+	h := NewHandler([]string{domain}, resolver, zerolog.Nop())
 	// Deliberately restrict the terminal allowlist to a console origin —
 	// exec/ws must ignore it and accept a different (customer) origin.
 	h.WithAuth(seedKey).WithExec().WithTerminal([]string{"https://console.example.com"})
