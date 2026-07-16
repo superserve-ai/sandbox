@@ -1579,7 +1579,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// warmthPath is the file that actually drives fault-in — for a layered
 	// overlay it's the recorded template base (memPath is then a per-VM diff),
 	// else memPath itself — so layered restores segment by the base they use.
-	inflight := len(m.restoreSem)
+	//
+	// inflight = other restores in flight (we already hold a slot, so subtract
+	// it); an uncontended restore reads 0. len >= 1 here, so no underflow.
+	inflight := len(m.restoreSem) - 1
 	warmthPath := memPath
 	if base, ok := readLayeredBase(memPath); ok {
 		warmthPath = base
