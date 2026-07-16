@@ -36,6 +36,20 @@ func writeSavedTestFile(t *testing.T, path string, data []byte) {
 	}
 }
 
+func requireSavedSnapshotTestReflink(t *testing.T, sourceDir, destinationDir string) {
+	t.Helper()
+	source := filepath.Join(sourceDir, ".saved-snapshot-test-reflink-source")
+	destination := filepath.Join(destinationDir, ".saved-snapshot-test-reflink-destination")
+	writeSavedTestFile(t, source, bytes.Repeat([]byte{0x5a}, 4096))
+	t.Cleanup(func() {
+		_ = os.Remove(source)
+		_ = os.Remove(destination)
+	})
+	if err := reflinkImmutableFileContext(context.Background(), source, destination); err != nil {
+		t.Skipf("test filesystem has no cross-directory reflink support: %v", err)
+	}
+}
+
 func savedTestManager(snapshotDir, runDir string, inst *VMInstance) *Manager {
 	return &Manager{
 		cfg: ManagerConfig{
@@ -51,6 +65,7 @@ func TestCreateSavedSnapshotPausedFullIsImmutableAndIdempotent(t *testing.T) {
 	installInactiveSystemctl(t)
 	snapshotRoot := t.TempDir()
 	runRoot := t.TempDir()
+	requireSavedSnapshotTestReflink(t, runRoot, snapshotRoot)
 	vmID := "11111111-1111-1111-1111-111111111111"
 	snapshotID := "snap-111"
 	runtimeDir := filepath.Join(snapshotRoot, vmID)
@@ -212,6 +227,7 @@ func TestCreateSavedSnapshotPausedLayeredCopiesSidecarsAndPlansFreshClone(t *tes
 	installInactiveSystemctl(t)
 	snapshotRoot := t.TempDir()
 	runRoot := t.TempDir()
+	requireSavedSnapshotTestReflink(t, runRoot, snapshotRoot)
 	vmID := "22222222-2222-2222-2222-222222222222"
 	snapshotID := "snap-layered"
 	runtimeDir := filepath.Join(snapshotRoot, vmID)
