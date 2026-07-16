@@ -83,7 +83,7 @@ type teamPermResult struct {
 // the change — other instances converge at TTL expiry. Same accepted window as
 // the API-key cache. If a permission ever requires immediate cross-instance
 // revocation, replace this cache with a DB-backed per-team generation.
-const teamPermCacheTTL = 30 * time.Second
+const teamPermCacheTTL = 10 * time.Second
 
 // teamEpoch returns the per-team epoch counter, creating it on first use.
 func (s *Service) teamEpoch(teamID uuid.UUID) *atomic.Uint64 {

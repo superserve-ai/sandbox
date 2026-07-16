@@ -18,7 +18,7 @@ import (
 // bad keys cannot grow the map. The key's own expires_at is stored and
 // checked on every hit, so expiry is exact even inside the TTL window.
 const (
-	defaultAPIKeyCacheTTL = 30 * time.Second
+	defaultAPIKeyCacheTTL = 10 * time.Second
 	// apiKeyCacheMaxEntries bounds the map. Only valid keys enter the
 	// cache, so this is effectively "number of live keys used within one
 	// TTL" — the cap is a backstop, not an expected operating point.
