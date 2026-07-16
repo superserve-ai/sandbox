@@ -150,6 +150,7 @@ module "api" {
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
     VMD_GRPC_ADDRESS            = "10.0.0.2:50051"
+    SYSTEM_TEAM_ID              = "a79a37c6-8622-4caa-b0e8-008ab8e4b78e"
   }
   secrets = {
     SANDBOX_ACCESS_TOKEN_SEED = {

@@ -1,0 +1,52 @@
+name: Terraform Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: terraform-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  terraform-fmt:
+    name: Terraform Fmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive infra/
+
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Validate Terraform roots
+        run: scripts/terraform-validate.sh
+
+  terraform-plan-summary:
+    name: Terraform Plan Summary
+    runs-on: ubuntu-latest
+    needs: [terraform-fmt, terraform-validate]
+    permissions:
+      contents: read
+    steps:
+      - name: Report plan workflow status
+        run: |
+          echo "Terraform plan runs in the path-filtered Terraform Plans workflow."
+          echo "Docs-only and Go-only PRs still complete this required check."

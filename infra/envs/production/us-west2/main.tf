@@ -37,7 +37,23 @@ locals {
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
+module "artifact_storage" {
+  source = "../../../modules/artifact-storage"
 
+  project_id  = local.project_id
+  environment = local.environment
+  region      = local.region
+
+  artifact_registry = {
+    superserve = {
+      repository_id = "superserve-${local.resource_suffix}"
+      format        = "DOCKER"
+      description   = "Superserve control plane images for ${local.region}"
+    }
+  }
+
+  labels = local.common_labels
+}
 module "network" {
   source = "../../../modules/network"
 
@@ -79,6 +95,7 @@ data "google_service_account" "api_runner" {
   account_id = "superserve-api-runner"
 }
 
+
 data "google_service_account" "github_actions" {
   project    = local.project_id
   account_id = "superserve-github-actions"
@@ -118,6 +135,7 @@ module "api" {
     SANDBOX_ID_REGION = "usw"
     SUPABASE_URL      = var.supabase_url
     VMD_GRPC_ADDRESS  = "10.1.0.2:50051"
+    SYSTEM_TEAM_ID    = "258e290e-d30d-4d2a-b751-07da118248c0"
   }
 
   secrets = {

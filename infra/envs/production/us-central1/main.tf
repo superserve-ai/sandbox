@@ -120,7 +120,17 @@ module "iam" {
   }
   labels = local.common_labels
 }
+resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
+  for_each = toset([
+    "posthog-project-key",
+    "slack-quota-alert-webhook",
+  ])
 
+  project   = local.project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.api_service_account_email}"
+}
 module "api" {
   source = "../../../modules/api"
 
@@ -132,15 +142,24 @@ module "api" {
   image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   env = {
-    API_PORT          = "8080"
-    EDGE_PROXY_DOMAIN = "usc-sandbox.superserve.ai"
-    SUPABASE_URL      = var.supabase_url
-    VMD_GRPC_ADDRESS  = "10.0.0.3:50051"
+    API_PORT               = "8080"
+    EDGE_PROXY_DOMAIN      = "usc-sandbox.superserve.ai"
+    SUPABASE_URL           = var.supabase_url
+    SENTRY_DSN             = "https://4497bf1fc61a2388b355489982086ac7@o4511499764760576.ingest.us.sentry.io/4511499780620288"
+    SECRETS_SIGNING_KEY_ID = "v1"
+    VMD_GRPC_ADDRESS       = "10.0.0.3:50051"
+    SYSTEM_TEAM_ID         = "258e290e-d30d-4d2a-b751-07da118248c0"
+    ALLOW_EPHEMERAL_SEED   = "0"
+    API_PORT               = "8080"
+    DB_MAX_CONNS           = "12"
+    EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
+    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
 
   secrets = {
     DATABASE_URL = {
-      secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
+      secret  = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
+      version = "5"
     }
     INTERNAL_API_TOKEN = {
       secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
@@ -150,6 +169,12 @@ module "api" {
     }
     SECRETS_SIGNING_KEY = {
       secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
+    }
+    SLACK_QUOTA_ALERT_WEBHOOK = {
+      secret = "slack-quota-alert-webhook"
+    }
+    POSTHOG_KEY = {
+      secret = "posthog-project-key"
     }
   }
   cpu_limit         = "2"
