@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -40,11 +43,35 @@ type AuditEvent struct {
 // Service evaluates RBAC permissions against the database.
 type Service struct {
 	store db.DBTX
+
+	// teamPermCache caches positive team-permission results, keyed by
+	// teamPermCacheKey, value *teamPermCacheEntry. Only grants are cached, so a
+	// denied check always re-queries (revocation of a grant takes effect within
+	// one TTL; denied probes can't grow the map). teamPermGroup coalesces
+	// concurrent identical misses so a burst of creates from one caller issues a
+	// single DB query instead of one per request. Zero values are ready to use.
+	teamPermCache sync.Map
+	teamPermGroup singleflight.Group
 }
 
 func New(store db.DBTX) *Service {
 	return &Service{store: store}
 }
+
+type teamPermCacheKey struct {
+	userID     uuid.UUID
+	teamID     uuid.UUID
+	permission string
+}
+
+type teamPermCacheEntry struct {
+	expiry time.Time
+}
+
+// teamPermCacheTTL bounds how long a cached grant is served after a revocation.
+// Matches the API-key cache's revocation window; role changes are rare and
+// admin-initiated, so this staleness is acceptable on the create hot path.
+const teamPermCacheTTL = 30 * time.Second
 
 // Can checks either team-scoped or platform-scoped access depending on teamID.
 // Team permissions require a non-nil teamID. Platform permissions must use the
@@ -65,6 +92,37 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 		return false, ErrScopeMismatch
 	}
 
+	key := teamPermCacheKey{userID: userID, teamID: teamID, permission: permission}
+	if v, ok := s.teamPermCache.Load(key); ok {
+		e := v.(*teamPermCacheEntry)
+		if time.Now().Before(e.expiry) {
+			return true, nil
+		}
+		// CompareAndDelete so a concurrent fresh Store isn't clobbered.
+		s.teamPermCache.CompareAndDelete(key, v)
+	}
+
+	sfKey := userID.String() + "|" + teamID.String() + "|" + permission
+	result, err, _ := s.teamPermGroup.Do(sfKey, func() (interface{}, error) {
+		// Detach: coalesced waiters may outlive the caller that triggered the
+		// query, and a fresh deadline keeps a slow check from hanging.
+		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		return s.canTeamQuery(qctx, userID, teamID, permission)
+	})
+	if err != nil {
+		return false, err
+	}
+	allowed := result.(bool)
+	if allowed {
+		s.teamPermCache.Store(key, &teamPermCacheEntry{expiry: time.Now().Add(teamPermCacheTTL)})
+	}
+	return allowed, nil
+}
+
+// canTeamQuery runs the permission JOIN. Kept free of caching/HTTP side effects
+// so it can sit safely under singleflight.Group.
+func (s *Service) canTeamQuery(ctx context.Context, userID, teamID uuid.UUID, permission string) (bool, error) {
 	var ok bool
 	err := s.store.QueryRow(ctx, `
 		SELECT EXISTS (
