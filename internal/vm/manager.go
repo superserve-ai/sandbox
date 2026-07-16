@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -252,6 +253,11 @@ type Manager struct {
 	// channel; capacity = effective MaxConcurrentRestores.
 	restoreSem chan struct{}
 
+	// tplLastRestore: last restore time per template mem file, for the
+	// secs_since_template_restore phase tag (a page-cache warmth proxy).
+	tplMu          sync.Mutex
+	tplLastRestore map[string]time.Time
+
 	// builds tracks in-flight and completed template builds. Keyed by
 	// build VM id (which is also "build-" + templateID). Entries survive
 	// until process exit so late pollers can read terminal outcomes.
@@ -345,11 +351,12 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		}
 	}
 	m := &Manager{
-		cfg:        cfg,
-		netMgr:     netMgr,
-		log:        log.With().Str("component", "vm_manager").Logger(),
-		vms:        make(map[string]*VMInstance),
-		restoreSem: make(chan struct{}, maxRestores),
+		cfg:            cfg,
+		netMgr:         netMgr,
+		log:            log.With().Str("component", "vm_manager").Logger(),
+		vms:            make(map[string]*VMInstance),
+		restoreSem:     make(chan struct{}, maxRestores),
+		tplLastRestore: make(map[string]time.Time),
 	}
 	m.loadPresenceConverged()
 	return m, nil
@@ -1465,6 +1472,50 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
 }
 
+// templateRestoreAge returns seconds since this host last restored the given
+// template mem file and records now, or -1 on first sighting. Only template
+// mem paths are tracked — per-VM resume snapshots are keyed by vmID and would
+// grow the map unbounded, so they short-circuit to -1. Best-effort.
+func (m *Manager) templateRestoreAge(memPath string) int64 {
+	if !m.isTemplateMemPath(memPath) {
+		return -1
+	}
+	key := filepath.Clean(memPath)
+	now := time.Now()
+	m.tplMu.Lock()
+	prev, seen := m.tplLastRestore[key]
+	m.tplLastRestore[key] = now
+	m.tplMu.Unlock()
+	if !seen {
+		return -1
+	}
+	return int64(now.Sub(prev).Seconds())
+}
+
+// psiSomeAvg10 returns the "some avg10" pressure-stall figure from a PSI file
+// (e.g. /proc/pressure/cpu), or -1 if unavailable. Best-effort.
+func psiSomeAvg10(path string) float64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "some ") {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(f, "avg10="); ok {
+				n, perr := strconv.ParseFloat(v, 64)
+				if perr != nil {
+					return -1
+				}
+				return n
+			}
+		}
+	}
+	return -1
+}
+
 // restoreVMSnapshot is the implementation. recordToPath is empty for normal
 // restores; set to a writable file path by template-build access-pattern
 // recording, in which case the in-firecracker UFFD handler writes each served
@@ -1513,6 +1564,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
+	// Cold/hot segmentation tags for the phase log, sampled once (not per
+	// attempt): concurrency, template-cache age, and host CPU/mem pressure.
+	inflight := len(m.restoreSem)
+	tplAgeSecs := m.templateRestoreAge(memPath)
+	cpuPSI := psiSomeAvg10("/proc/pressure/cpu")
+	memPSI := psiSomeAvg10("/proc/pressure/memory")
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -1673,6 +1730,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Int64("disk_to_net_ms", tNetReady.Sub(netBase).Milliseconds()).
 			Int64("net_to_fc_ms", tFcReady.Sub(tNetReady).Milliseconds()).
 			Int64("entry_to_fc_ready_ms", tFcReady.Sub(tEntry).Milliseconds()).
+			Int("inflight", inflight).
+			Int64("secs_since_template_restore", tplAgeSecs).
+			Bool("inplace", inPlace).
+			Bool("uffd", useUffd).
+			Float64("cpu_psi_avg10", cpuPSI).
+			Float64("mem_psi_avg10", memPSI).
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
 
