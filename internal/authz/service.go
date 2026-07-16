@@ -120,6 +120,21 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 	return allowed, nil
 }
 
+// InvalidateTeam drops all cached permission grants for a team, across every
+// user and permission. Called after a role or membership change so revocation
+// takes effect immediately instead of after the cache TTL.
+func (s *Service) InvalidateTeam(teamID uuid.UUID) {
+	if s == nil {
+		return
+	}
+	s.teamPermCache.Range(func(k, _ any) bool {
+		if key, ok := k.(teamPermCacheKey); ok && key.teamID == teamID {
+			s.teamPermCache.Delete(k)
+		}
+		return true
+	})
+}
+
 // canTeamQuery runs the permission JOIN. Kept free of caching/HTTP side effects
 // so it can sit safely under singleflight.Group.
 func (s *Service) canTeamQuery(ctx context.Context, userID, teamID uuid.UUID, permission string) (bool, error) {

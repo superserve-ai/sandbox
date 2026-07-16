@@ -79,6 +79,29 @@ func TestCanTeamDoesNotCacheDenials(t *testing.T) {
 	}
 }
 
+func TestCanTeamInvalidateTeamForcesRequery(t *testing.T) {
+	store := &countingStore{result: true}
+	s := New(store)
+	user, team := uuid.New(), uuid.New()
+	other := uuid.New()
+
+	// Prime the cache for two teams.
+	_, _ = s.CanTeam(context.Background(), user, team, "settings:write")
+	_, _ = s.CanTeam(context.Background(), user, other, "settings:write")
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("expected 2 priming queries, got %d", n)
+	}
+
+	s.InvalidateTeam(team)
+
+	// The invalidated team re-queries; the untouched team still hits cache.
+	_, _ = s.CanTeam(context.Background(), user, team, "settings:write")
+	_, _ = s.CanTeam(context.Background(), user, other, "settings:write")
+	if n := store.calls.Load(); n != 3 {
+		t.Fatalf("expected 1 re-query for the invalidated team only, total 3, got %d", n)
+	}
+}
+
 func TestCanTeamSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	store := &countingStore{result: true, delay: 30 * time.Millisecond}
 	s := New(store)
