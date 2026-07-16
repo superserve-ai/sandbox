@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,12 +47,19 @@ type Service struct {
 
 	// teamPermCache caches positive team-permission results, keyed by
 	// teamPermCacheKey, value *teamPermCacheEntry. Only grants are cached, so a
-	// denied check always re-queries (revocation of a grant takes effect within
-	// one TTL; denied probes can't grow the map). teamPermGroup coalesces
-	// concurrent identical misses so a burst of creates from one caller issues a
-	// single DB query instead of one per request. Zero values are ready to use.
+	// denied check always re-queries (denied probes can't grow the map).
+	// teamPermGroup coalesces concurrent identical misses so a burst of creates
+	// from one caller issues a single DB query instead of one per request.
+	//
+	// teamPermGen is a per-team epoch (teamID -> *atomic.Uint64). Each cached
+	// entry records the epoch its query observed; InvalidateTeam bumps the epoch,
+	// so any entry cached under an older epoch is ignored on read. This closes the
+	// store-after-invalidate race: a miss whose query overlapped a revocation
+	// carries the pre-bump epoch, so its store is stale on arrival rather than
+	// resurrecting the grant for a TTL. Zero values are ready to use.
 	teamPermCache sync.Map
 	teamPermGroup singleflight.Group
+	teamPermGen   sync.Map
 }
 
 func New(store db.DBTX) *Service {
@@ -66,12 +74,30 @@ type teamPermCacheKey struct {
 
 type teamPermCacheEntry struct {
 	expiry time.Time
+	epoch  uint64
 }
 
-// teamPermCacheTTL bounds how long a cached grant is served after a revocation.
-// Matches the API-key cache's revocation window; role changes are rare and
-// admin-initiated, so this staleness is acceptable on the create hot path.
+// teamPermResult is the singleflight payload: the grant plus the team epoch
+// observed at query time, so every coalesced waiter caches under the same epoch.
+type teamPermResult struct {
+	allowed bool
+	epoch   uint64
+}
+
+// teamPermCacheTTL backstops the epoch invalidation: a grant is served at most
+// this long even absent an explicit invalidation. Role changes are rare and
+// admin-initiated, and InvalidateTeam makes revocation immediate, so this is
+// only a safety net on the create hot path.
 const teamPermCacheTTL = 30 * time.Second
+
+// teamEpoch returns the per-team epoch counter, creating it on first use.
+func (s *Service) teamEpoch(teamID uuid.UUID) *atomic.Uint64 {
+	if v, ok := s.teamPermGen.Load(teamID); ok {
+		return v.(*atomic.Uint64)
+	}
+	v, _ := s.teamPermGen.LoadOrStore(teamID, new(atomic.Uint64))
+	return v.(*atomic.Uint64)
+}
 
 // Can checks either team-scoped or platform-scoped access depending on teamID.
 // Team permissions require a non-nil teamID. Platform permissions must use the
@@ -92,41 +118,60 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 		return false, ErrScopeMismatch
 	}
 
+	epoch := s.teamEpoch(teamID)
 	key := teamPermCacheKey{userID: userID, teamID: teamID, permission: permission}
 	if v, ok := s.teamPermCache.Load(key); ok {
 		e := v.(*teamPermCacheEntry)
-		if time.Now().Before(e.expiry) {
+		if e.epoch == epoch.Load() && time.Now().Before(e.expiry) {
 			return true, nil
 		}
-		// CompareAndDelete so a concurrent fresh Store isn't clobbered.
+		// Stale epoch or expired — drop it. CompareAndDelete so a concurrent
+		// fresh Store isn't clobbered.
 		s.teamPermCache.CompareAndDelete(key, v)
 	}
 
 	sfKey := userID.String() + "|" + teamID.String() + "|" + permission
 	result, err, _ := s.teamPermGroup.Do(sfKey, func() (interface{}, error) {
+		// Capture the epoch before the query so every coalesced waiter caches
+		// under the epoch this query observed; a revocation that bumps the epoch
+		// after this point makes the resulting store stale on read.
+		observed := epoch.Load()
 		// Detach: coalesced waiters may outlive the caller that triggered the
 		// query, and a fresh deadline keeps a slow check from hanging.
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		return s.canTeamQuery(qctx, userID, teamID, permission)
+		allowed, err := s.canTeamQuery(qctx, userID, teamID, permission)
+		if err != nil {
+			return nil, err
+		}
+		return teamPermResult{allowed: allowed, epoch: observed}, nil
 	})
 	if err != nil {
 		return false, err
 	}
-	allowed := result.(bool)
-	if allowed {
-		s.teamPermCache.Store(key, &teamPermCacheEntry{expiry: time.Now().Add(teamPermCacheTTL)})
+	res := result.(teamPermResult)
+	if res.allowed {
+		s.teamPermCache.Store(key, &teamPermCacheEntry{
+			expiry: time.Now().Add(teamPermCacheTTL),
+			epoch:  res.epoch,
+		})
 	}
-	return allowed, nil
+	return res.allowed, nil
 }
 
-// InvalidateTeam drops all cached permission grants for a team, across every
+// InvalidateTeam makes cached grants for a team stale immediately, across every
 // user and permission. Called after a role or membership change so revocation
-// takes effect immediately instead of after the cache TTL.
+// takes effect at once instead of after the cache TTL.
+//
+// Bumping the epoch first is what closes the store-after-invalidate race: any
+// in-flight miss that observed the old epoch will store under it and be ignored
+// on read. The subsequent Range only reclaims memory for already-stored entries;
+// correctness rests on the epoch, not the delete.
 func (s *Service) InvalidateTeam(teamID uuid.UUID) {
 	if s == nil {
 		return
 	}
+	s.teamEpoch(teamID).Add(1)
 	s.teamPermCache.Range(func(k, _ any) bool {
 		if key, ok := k.(teamPermCacheKey); ok && key.teamID == teamID {
 			s.teamPermCache.Delete(k)

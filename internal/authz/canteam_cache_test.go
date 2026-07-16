@@ -102,6 +102,59 @@ func TestCanTeamInvalidateTeamForcesRequery(t *testing.T) {
 	}
 }
 
+// gateStore lets the test hold a query in flight, invalidate mid-query, then
+// release — reproducing the store-after-invalidate race.
+type gateStore struct {
+	result  bool
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+func (s *gateStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (s *gateStore) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
+	return nil, nil
+}
+func (s *gateStore) QueryRow(context.Context, string, ...interface{}) pgx.Row {
+	s.calls.Add(1)
+	close(s.entered)
+	<-s.release
+	return scanRow{result: s.result}
+}
+
+func TestCanTeamStoreAfterInvalidateDoesNotResurrectGrant(t *testing.T) {
+	store := &gateStore{result: true, entered: make(chan struct{}), release: make(chan struct{})}
+	s := New(store)
+	user, team := uuid.New(), uuid.New()
+
+	done := make(chan bool, 1)
+	go func() {
+		ok, _ := s.CanTeam(context.Background(), user, team, "settings:write")
+		done <- ok
+	}()
+
+	<-store.entered           // query is in flight, reading the (still valid) grant
+	s.InvalidateTeam(team)    // role revoked + committed → epoch bumped mid-query
+	close(store.release)      // query now returns the stale true and stores it
+	if !<-done {
+		t.Fatal("in-flight query should still return its observed grant")
+	}
+
+	// The store landed after invalidation. A subsequent check must NOT be served
+	// from cache — it must re-query, because the stored entry is a stale epoch.
+	countingBacking := &countingStore{result: false}
+	s.store = countingBacking
+	ok, _ := s.CanTeam(context.Background(), user, team, "settings:write")
+	if ok {
+		t.Fatal("revoked grant was resurrected from cache after invalidation")
+	}
+	if n := countingBacking.calls.Load(); n != 1 {
+		t.Fatalf("expected a re-query after invalidation, got %d queries", n)
+	}
+}
+
 func TestCanTeamSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	store := &countingStore{result: true, delay: 30 * time.Millisecond}
 	s := New(store)
