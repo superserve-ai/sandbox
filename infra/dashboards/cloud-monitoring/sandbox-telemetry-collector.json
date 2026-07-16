@@ -17,7 +17,6 @@
                   "prometheusQuery": "sum by (exporter) (rate(otelcol_exporter_send_failed_metric_points[5m]))"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{exporter}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -43,7 +42,6 @@
                   "prometheusQuery": "sum by (processor) (rate(otelcol_processor_dropped_metric_points[5m]))"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{processor}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -69,7 +67,6 @@
                   "prometheusQuery": "max by (exporter) (otelcol_exporter_queue_size / clamp_min(otelcol_exporter_queue_capacity, 1))"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{exporter}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -95,7 +92,6 @@
                   "prometheusQuery": "sum by (processor) (rate(otelcol_processor_refused_metric_points{processor=~\"memory_limiter.*\"}[5m]))"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{processor}}",
                 "targetAxis": "Y1"
               }
             ],

@@ -1450,7 +1450,9 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	} else if canWrite {
 		resp = h.sandboxToResponseWithToken(sandbox)
 	}
-	resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
+	if !isConsoleImpersonation(c) {
+		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
+	}
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1989,7 +1991,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	log.Info().
 		Str("sandbox_id", sandbox.ID.String()).
+		Int64("auth_ms", c.GetInt64("auth_ms")).
 		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
+		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
 		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
@@ -2002,6 +2006,25 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // ---------------------------------------------------------------------------
 // Sandbox Pause
 // ---------------------------------------------------------------------------
+
+// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
+// timed-out pause may have actually completed on the host, so reverting the
+// row to active would drift it against a paused VM; PauseVM is idempotent, so
+// the retry returns the recorded snapshot and the row converges to paused.
+// NotFound is terminal — the VM is genuinely gone.
+func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (snapshotPath, memPath string, err error) {
+	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+	snapshotPath, memPath, err = vmd.PauseInstance(ctx, id, "")
+	cancel()
+	if err == nil || isVMDNotFound(err) {
+		return snapshotPath, memPath, err
+	}
+	// Detach from the request ctx: the client's deadline may already have
+	// fired, but the reconciliation to a consistent state must still run.
+	rctx, rcancel := context.WithTimeout(context.WithoutCancel(reqCtx), vmdTimeout)
+	defer rcancel()
+	return vmd.PauseInstance(rctx, id, "")
+}
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
 	sandboxID, err := parseSandboxID(c)
@@ -2064,9 +2087,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	}
 
 	// Call VMD to pause and snapshot the VM.
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-	snapshotPath, memPath, err := vmd.PauseInstance(vmdCtx, sandboxID.String(), "")
+	snapshotPath, memPath, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String())
 	if err != nil {
 		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
 		// Mark the sandbox failed and return 410 Gone. No revert — the VM is

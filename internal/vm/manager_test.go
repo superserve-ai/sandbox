@@ -2,9 +2,12 @@ package vm
 
 import (
 	"context"
+	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/presence"
 )
 
 // TestPlanRestore pins the restore-decision behavior across the four input
@@ -281,16 +285,22 @@ func TestFreshenFirstPassOverlay(t *testing.T) {
 		t.Errorf("missing overlay: got %v, want nil", err)
 	}
 
-	// Existing overlay → removed, nil.
+	// Existing overlay (and its presence side-car) → both removed, nil.
 	f := filepath.Join(dir, "mem.diff")
 	if err := os.WriteFile(f, []byte("stale"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(presence.SidecarPath(f), []byte("stale bits"), 0o600); err != nil {
+		t.Fatalf("write side-car: %v", err)
 	}
 	if err := freshenFirstPassOverlay(f); err != nil {
 		t.Errorf("existing overlay: got %v, want nil", err)
 	}
 	if _, err := os.Stat(f); !os.IsNotExist(err) {
 		t.Errorf("overlay not removed: %v", err)
+	}
+	if _, err := os.Stat(presence.SidecarPath(f)); !os.IsNotExist(err) {
+		t.Errorf("presence side-car not removed: %v", err)
 	}
 
 	// Un-removable overlay (non-empty dir stands in for any remove failure) → error,
@@ -310,8 +320,9 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 	snap := filepath.Join(root, vmID, "vmstate.snap")
 	mem := filepath.Join(root, vmID, "mem.diff")
 	overlay := snap + ".overlay"
-	base := layeredBaseSidecarPath(mem) // mem.diff.base
-	for _, p := range []string{snap, mem, overlay, base} {
+	base := layeredBaseSidecarPath(mem)   // mem.diff.base
+	presence := presence.SidecarPath(mem) // mem.diff.presence
+	for _, p := range []string{snap, mem, overlay, base, presence} {
 		writeFile(t, p)
 	}
 
@@ -320,11 +331,42 @@ func TestDeleteSnapshotFiles_RemovesSidecars(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 	// A leftover sidecar would make a later restore mis-handle a non-layered
-	// mem file as a layered overlay — the fork-bug class both removals prevent.
-	for _, p := range []string{overlay, base} {
+	// mem file as a layered overlay — and a stale .presence next to a future
+	// same-size overlay passes Firecracker's geometry checks and silently
+	// mis-layers pages. All must go with the files they describe.
+	for _, p := range []string{overlay, base, presence} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("sidecar still exists: %s (%v)", p, err)
 		}
+	}
+}
+
+func TestGateOverlayPresence(t *testing.T) {
+	dir := t.TempDir()
+	mem := filepath.Join(dir, "mem.diff")
+	nop := zerolog.Nop()
+
+	// Missing side-car, gate off → allowed (warn-only compat for pre-side-car
+	// local snapshots).
+	m := &Manager{}
+	if err := m.gateOverlayPresence(mem, nop); err != nil {
+		t.Errorf("gate off: got %v, want nil", err)
+	}
+
+	// Missing side-car, gate on → refused, carrying the sentinel both restore
+	// entry points map to FailedPrecondition. Without the sentinel the fresh
+	// path would surface this deterministic refusal as a retryable error.
+	m = &Manager{cfg: ManagerConfig{RequirePresenceSidecar: "always"}}
+	err := m.gateOverlayPresence(mem, nop)
+	if !errors.Is(err, ErrPresenceSidecarMissing) {
+		t.Errorf("gate on: got %v, want ErrPresenceSidecarMissing", err)
+	}
+
+	// Side-car present → allowed regardless of the gate. Only confirmed
+	// absence gates; other stat outcomes defer to Firecracker's own read.
+	writeFile(t, presence.SidecarPath(mem))
+	if err := m.gateOverlayPresence(mem, nop); err != nil {
+		t.Errorf("side-car present: got %v, want nil", err)
 	}
 }
 
@@ -650,24 +692,62 @@ func TestInspectRecordedTrace_CountsLines(t *testing.T) {
 	}
 }
 
-func TestWaitForSocket_AlreadyPresent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sock")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
+// shortSockPath returns a socket path safely under sun_path's ~108-byte
+// cap — t.TempDir embeds long test names that can blow it.
+func shortSockPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "fcs")
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "s")
+}
+
+// bindOnlySocket creates a unix socket file via bind() WITHOUT listen() —
+// the exact state a connect() gets ECONNREFUSED from. Returns the fd so the
+// test can listen() later.
+func bindOnlySocket(t *testing.T, path string) int {
+	t.Helper()
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	return fd
+}
+
+func TestWaitForSocket_AlreadyListening(t *testing.T) {
+	path := shortSockPath(t)
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
 	if err := waitForSocket(path, time.Second); err != nil {
-		t.Errorf("waitForSocket on existing file: %v", err)
+		t.Errorf("waitForSocket on listening socket: %v", err)
 	}
 }
 
 func TestWaitForSocket_AppearsAfterStart(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sock")
+	path := shortSockPath(t)
 
+	lch := make(chan net.Listener, 1)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		_ = os.WriteFile(path, nil, 0o644)
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			t.Error(err)
+		}
+		lch <- l
+	}()
+	defer func() {
+		if l := <-lch; l != nil {
+			l.Close()
+		}
 	}()
 
 	start := time.Now()
@@ -687,17 +767,59 @@ func TestWaitForSocket_TimesOut(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected timeout error, got nil")
 	}
+	if !strings.Contains(err.Error(), "did not appear within 50ms") {
+		t.Errorf("error should state the budget, got: %v", err)
+	}
 }
 
-func TestWaitForSocketPolling_AppearsAfterStart(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sock")
+func TestWaitForSocket_BindListenGap(t *testing.T) {
+	// The socket FILE exists (bind done) but refuses connections until
+	// listen() — waitForSocket must wait out the gap, not return early.
+	path := shortSockPath(t)
+	fd := bindOnlySocket(t, path)
+
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		_ = os.WriteFile(path, nil, 0o644)
+		_ = syscall.Listen(fd, 8)
 	}()
-	if err := waitForSocketPolling(path, time.Second); err != nil {
-		t.Errorf("waitForSocketPolling: %v", err)
+
+	if err := waitForSocket(path, time.Second); err != nil {
+		t.Errorf("waitForSocket across the bind→listen gap: %v", err)
+	}
+}
+
+func TestWaitForSocket_NeverListens_FailsWithinCap(t *testing.T) {
+	// A bound-but-dead socket refuses forever; the connect phase must give
+	// up at its 1s cap, not spin the caller's full budget.
+	path := shortSockPath(t)
+	bindOnlySocket(t, path) // file exists, never listens
+
+	start := time.Now()
+	err := waitForSocket(path, 10*time.Second)
+	if err == nil {
+		t.Fatal("expected an error for a socket that never accepts")
+	}
+	if !strings.Contains(err.Error(), "not accepting connections") {
+		t.Errorf("error should name the refused state, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("gave up after %s; the connect phase is capped at 1s", elapsed)
+	}
+}
+
+func TestWaitForSocketConnectable_NonRefusedFailsFast(t *testing.T) {
+	// Anything but ECONNREFUSED (here: ENOENT from a teardown race) must
+	// surface immediately, not spin until the deadline.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gone")
+
+	start := time.Now()
+	err := waitForSocketConnectable(path, time.Now().Add(5*time.Second))
+	if err == nil {
+		t.Fatal("expected an error for a missing socket")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("non-refused error took %s to surface; must fail fast", elapsed)
 	}
 }
 
@@ -795,5 +917,229 @@ func TestWaitForPIDExit_DeadProcessReturnsPromptly(t *testing.T) {
 	// restore-error cleanup for the whole timeout.
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("returned after %v; expected a prompt return once the process exited", elapsed)
+	}
+}
+
+func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		SnapshotPath: snapPath,
+		MemFilePath:  memPath,
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+
+	snap, mem, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	if err != nil {
+		t.Fatalf("retried pause of a paused VM should succeed, got %v", err)
+	}
+	if snap != snapPath || mem != memPath {
+		t.Fatalf("got (%q, %q), want the recorded snapshot artifacts", snap, mem)
+	}
+}
+
+func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
+	dir := t.TempDir()
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		SnapshotPath: filepath.Join(dir, "gone-vmstate.snap"),
+		MemFilePath:  filepath.Join(dir, "gone-mem.snap"),
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+
+	_, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for dangling artifacts, got %v", err)
+	}
+}
+
+func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	if err != nil {
+		t.Fatalf("retried restore of a healthy running VM should succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing running instance, not a re-restore")
+	}
+	mgr.mu.RLock()
+	still := mgr.vms["vm-1"]
+	mgr.mu.RUnlock()
+	if still != existing {
+		t.Fatal("existing instance must remain tracked untouched")
+	}
+}
+
+func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The live VM was restored from other artifacts: the request must NOT
+	// short-circuit to it, even with boxd healthy.
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: filepath.Join(dir, "old-vmstate.snap"),
+		MemFilePath:  filepath.Join(dir, "old-mem.snap"),
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	inst, _ := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	if inst == existing {
+		t.Fatal("a restore for different artifacts must not return the old VM")
+	}
+}
+
+func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	if err != nil {
+		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing running instance, not a relaunch")
+	}
+}
+
+func TestVMOpLock_SerializesSameID_TryLockSkips(t *testing.T) {
+	m := &Manager{log: zerolog.Nop()}
+
+	unlock, err := m.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A different vmID is independent — must acquire freely.
+	if u2, ok := m.tryLockVMOp("vm-2"); !ok {
+		t.Fatal("different vmID must not contend")
+	} else {
+		u2()
+	}
+	// The held vmID must not be re-acquirable (this is what makes the
+	// reconciler skip a unit a launch is mid-flight on).
+	if _, ok := m.tryLockVMOp("vm-1"); ok {
+		t.Fatal("held vmID must fail TryLock")
+	}
+	// A queued acquire whose context is already cancelled returns ctx.Err()
+	// instead of waiting for the lock — no abandoned pause/restore work.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.lockVMOp(cancelled, "vm-1"); err == nil {
+		t.Fatal("cancelled context must not acquire a held lock")
+	}
+	// Free lock + already-cancelled ctx: even if the random select picks
+	// the send case, the post-acquire recheck must release and return err,
+	// not leave the lock held.
+	freeCancel, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if u, err := m.lockVMOp(freeCancel, "vm-free"); err == nil {
+		u()
+		t.Fatal("cancelled ctx must not acquire even a free lock")
+	}
+	if u, ok := m.tryLockVMOp("vm-free"); !ok {
+		t.Fatal("a cancelled acquire must not leave the lock held")
+	} else {
+		u()
+	}
+	unlock()
+	// Released — now acquirable.
+	if u, ok := m.tryLockVMOp("vm-1"); !ok {
+		t.Fatal("released vmID must be acquirable")
+	} else {
+		u()
+	}
+}
+
+func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
+	// A record can read Running while the firecracker process is gone. The
+	// retry guard must not hand back that corpse — it must fall through to
+	// a fresh restore.
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return true } // unit definitively dead
+	defer func() { vmUnitDead = orig }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	if got := m.retriedLaunchTarget("vm-1", snapPath, memPath); got != nil {
+		t.Fatal("a dead-unit Running record must not be returned as a retry target")
+	}
+}
+
+func TestInstanceRunning(t *testing.T) {
+	m := &Manager{
+		log: zerolog.Nop(),
+		vms: map[string]*VMInstance{
+			"run":   {ID: "run", Status: StatusRunning},
+			"pause": {ID: "pause", Status: StatusPaused},
+		},
+	}
+	if !m.instanceRunning("run") {
+		t.Fatal("running instance must report running")
+	}
+	if m.instanceRunning("pause") {
+		t.Fatal("paused instance must not report running (a genuine stale-unit target)")
+	}
+	if m.instanceRunning("absent") {
+		t.Fatal("absent instance must not report running")
 	}
 }

@@ -42,6 +42,14 @@ SELECT
     (storage.storage_mib_seconds / 1024.0)::numeric AS storage_gib_seconds
 FROM compute, storage;
 
+-- name: GetActiveTeamBillingPeriod :one
+SELECT *
+FROM team_billing_period
+WHERE team_id = sqlc.arg(team_id)
+  AND finalized_at IS NULL
+ORDER BY period_start DESC
+LIMIT 1;
+
 -- name: UpsertTeamBillingUsage :one
 -- Recomputes a team's period rollup from raw intervals. Exported/finalized
 -- rows are immutable so a billing export cannot be silently rewritten.
@@ -319,33 +327,6 @@ exported_usage AS (
 SELECT *
 FROM exported_period;
 
--- name: FinalizeTeamBillingPeriod :one
-WITH finalized_period AS (
-    UPDATE team_billing_period
-    SET status = 'finalized',
-        finalized_at = now(),
-        updated_at = now()
-    WHERE team_billing_period.team_id = sqlc.arg(team_id)
-      AND team_billing_period.period_start = sqlc.arg(period_start)
-      AND team_billing_period.period_end = sqlc.arg(period_end)
-      AND team_billing_period.status = 'exported'
-      AND team_billing_period.finalized_at IS NULL
-    RETURNING *
-),
-finalized_usage AS (
-    UPDATE team_billing_usage u
-    SET finalized_at = finalized_period.finalized_at,
-        updated_at = now()
-    FROM finalized_period
-    WHERE u.team_id = finalized_period.team_id
-      AND u.period_start = finalized_period.period_start
-      AND u.period_end = finalized_period.period_end
-      AND u.finalized_at IS NULL
-    RETURNING u.team_id
-)
-SELECT *
-FROM finalized_period;
-
 -- name: CreateBillingPeriodAnomaly :one
 INSERT INTO billing_period_anomaly (
     team_id, period_start, period_end, severity, kind, sandbox_id, details
@@ -538,6 +519,24 @@ VALUES (
     sqlc.narg(assigned_by)
 )
 RETURNING *;
+
+-- name: ListExportedTeamBillingPeriods :many
+WITH ranked AS (
+    SELECT
+        team_billing_period.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY team_id
+            ORDER BY period_end ASC, period_start ASC
+        ) AS team_rank
+    FROM team_billing_period
+    WHERE finalized_at IS NULL
+)
+SELECT *
+FROM ranked
+WHERE team_rank = 1
+  AND status = 'exported'
+ORDER BY period_end ASC, period_start ASC, team_id ASC
+LIMIT sqlc.arg(batch_size);
 
 -- name: GrantTeamCredit :one
 INSERT INTO team_credit_grant (

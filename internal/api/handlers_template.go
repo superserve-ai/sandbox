@@ -575,7 +575,7 @@ func (h *Handlers) GetTemplate(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	if !h.requireTeamSettingsRead(c, teamID) {
+	if !h.requireTeamTemplateRead(c, teamID) {
 		return
 	}
 
@@ -607,7 +607,7 @@ func (h *Handlers) ListTemplates(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	if !h.requireTeamSettingsRead(c, teamID) {
+	if !h.requireTeamTemplateRead(c, teamID) {
 		return
 	}
 
@@ -852,7 +852,7 @@ func (h *Handlers) GetTemplateBuild(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	if !h.requireTeamSettingsRead(c, teamID) {
+	if !h.requireTeamTemplateRead(c, teamID) {
 		return
 	}
 
@@ -883,7 +883,7 @@ func (h *Handlers) ListTemplateBuilds(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	if !h.requireTeamSettingsRead(c, teamID) {
+	if !h.requireTeamTemplateRead(c, teamID) {
 		return
 	}
 
@@ -1088,7 +1088,7 @@ func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	if !h.requireTeamSettingsRead(c, teamID) {
+	if !h.requireTeamTemplateRead(c, teamID) {
 		return
 	}
 

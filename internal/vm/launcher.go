@@ -23,10 +23,12 @@ const launcherPruneScript = `mount --make-rprivate / || exit 1
 umount -l /run/netns 2>/dev/null || true
 for m in $(grep ' /run/netns/' /proc/self/mounts | awk '{print $2}'); do umount -l "$m" 2>/dev/null || true; done`
 
-// launcherBuildTimeout bounds the boot-time launcher build. It must exceed the
-// O(fleet) prune, so it's far larger than the 5s single-exec bound used
-// elsewhere; on timeout the build errors and launches fall back to legacy.
-const launcherBuildTimeout = 90 * time.Second
+// launcherBuildTimeout reaps a genuinely wedged mount syscall — it does not
+// pace the build, which runs async with legacy-path fallback until done, so a
+// slow build costs nothing. The prune is O(host mount table), so the bound
+// must stay comfortably ahead of fleet growth: a bound the prune catches up
+// to silently strands the host on the legacy launch path.
+const launcherBuildTimeout = 10 * time.Minute
 
 // EnsureLauncherNamespace builds and pins the pruned launcher mount namespace at
 // m.launcherNSPath(). No-op when launcher mode is disabled. The pin snapshots the
@@ -215,12 +217,11 @@ func unescapeMountinfo(s string) string {
 	return b.String()
 }
 
-// StartMountCountSampler periodically logs the host mount-table size so the
-// O(1)-launch invariant — mount count should stay roughly flat, not grow with
-// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
-func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+// startSampler runs fn on a ticker until ctx is done. Shared scaffold for the
+// periodic host gauges below.
+func (m *Manager) startSampler(ctx context.Context, name string, every time.Duration, fn func()) {
 	go func() {
-		defer sentrylog.Recover("mount-count sampler")
+		defer sentrylog.Recover(name)
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
@@ -228,13 +229,34 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				total, nsfs := hostMountCounts()
-				m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
-					Msg("host mount table")
-				m.revalidateLauncher(ctx)
+				fn()
 			}
 		}
 	}()
+}
+
+// StartMountCountSampler periodically logs the host mount-table size so the
+// O(1)-launch invariant — mount count should stay roughly flat, not grow with
+// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
+func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+	m.startSampler(ctx, "mount-count sampler", every, func() {
+		total, nsfs := hostMountCounts()
+		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Msg("host mount table")
+		m.revalidateLauncher(ctx)
+	})
+}
+
+// StartNetnsLeakSampler periodically logs the host's network-namespace counts.
+// netns_orphaned (namespaces with no owning slot) is the leak signal: sustained
+// growth means teardown is leaking. One /run/netns readdir per tick.
+func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
+	m.startSampler(ctx, "netns-leak sampler", every, func() {
+		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
+		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
+			Int("netns_orphaned", orphaned).
+			Msg("netns leak gauge")
+	})
 }
 
 // revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to

@@ -52,12 +52,22 @@ func (s *LocalHTTPServer) ListenAndServe(ctx context.Context, addr string) error
 		return fmt.Errorf("local http server: invalid addr %q: %w", addr, err)
 	}
 	bindAddr := "127.0.0.1:" + port
-	s.server.Addr = bindAddr
-	s.log.Info().Str("addr", bindAddr).Msg("local HTTP server listening")
+	lis, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		return fmt.Errorf("local http server: %w", err)
+	}
+	return s.Serve(ctx, lis)
+}
+
+// Serve runs the server on an existing listener (e.g. one inherited from a
+// systemd socket unit, which keeps it alive across vmd restarts). The
+// caller guarantees the listener is loopback-only.
+func (s *LocalHTTPServer) Serve(ctx context.Context, lis net.Listener) error {
+	s.log.Info().Str("addr", lis.Addr().String()).Msg("local HTTP server listening")
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.server.Serve(lis); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 		close(errCh)

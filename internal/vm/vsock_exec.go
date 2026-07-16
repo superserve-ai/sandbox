@@ -27,7 +27,7 @@ var boxdHTTPClient = &http.Client{
 
 // waitForHTTPHealth polls boxd's /health endpoint until it responds or timeout.
 //
-// The probe interval ramps 1ms → 50ms (doubling): readiness in the tens of
+// The probe interval ramps 1ms → 10ms (doubling): readiness in the tens of
 // milliseconds would otherwise be quantized to the poll interval, so the
 // early probes must be dense; the cap keeps the steady-state cost of a slow
 // boot negligible. Probes ride the host↔guest veth, so each costs well
@@ -35,10 +35,14 @@ var boxdHTTPClient = &http.Client{
 func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) error {
 	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
 	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 500 * time.Millisecond}
+	client := &http.Client{
+		Timeout:   500 * time.Millisecond,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
 
-	const maxProbeInterval = 50 * time.Millisecond
+	const maxProbeInterval = 10 * time.Millisecond
 	interval := time.Millisecond
+	var lastErr error
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -52,15 +56,24 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
+			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 		}
+		lastErr = err
 
 		time.Sleep(interval)
 		interval = min(interval*2, maxProbeInterval)
 	}
+	if lastErr != nil {
+		return fmt.Errorf("boxd health check not ready after %s: %w", timeout, lastErr)
+	}
 	return fmt.Errorf("boxd health check not ready after %s", timeout)
 }
 
-var boxdInitClient = &http.Client{Timeout: 5 * time.Second}
+// Keep-alives disabled for the same IP-reuse reason as boxdHTTPClient.
+var boxdInitClient = &http.Client{
+	Timeout:   5 * time.Second,
+	Transport: &http.Transport{DisableKeepAlives: true},
+}
 
 
 // postBoxdInit sends sandbox-level configuration (env vars, hostname) to

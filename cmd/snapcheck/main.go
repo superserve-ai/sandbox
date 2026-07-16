@@ -16,6 +16,10 @@ import (
 func main() {
 	pageSize := flag.Int("page-size", 4096, "page size in bytes")
 	maxReport := flag.Int("max-report", 20, "max differing page offsets to print")
+	presence := flag.Bool("presence", false,
+		"compare as layered overlay/side-car pairs (<mem>.presence required next to each input): "+
+			"presence bits page by page, bytes only where both sides provide the page. "+
+			"Raw byte comparison is blind to presence — two byte-identical overlays can restore differently.")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: snapcheck [flags] <mem-a> <mem-b>")
 		flag.PrintDefaults()
@@ -31,6 +35,23 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *presence {
+		res, err := comparePresenceAware(flag.Arg(0), flag.Arg(1), *pageSize)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "snapcheck: %v\n", err)
+			os.Exit(2)
+		}
+		fmt.Printf("pages: %d  presence-differing: %d  content-differing: %d\n",
+			res.totalPages, len(res.presenceDiff), len(res.contentDiff))
+		reportPages("presence ", res.presenceDiff, *pageSize, *maxReport)
+		reportPages("content ", res.contentDiff, *pageSize, *maxReport)
+		if len(res.presenceDiff) > 0 || len(res.contentDiff) > 0 {
+			os.Exit(1)
+		}
+		fmt.Println("identical")
+		return
+	}
+
 	res, err := compareFiles(flag.Arg(0), flag.Arg(1), *pageSize)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "snapcheck: %v\n", err)
@@ -38,17 +59,24 @@ func main() {
 	}
 
 	fmt.Printf("pages: %d  differing: %d\n", res.totalPages, len(res.diffPages))
-	for i, p := range res.diffPages {
-		if i >= *maxReport {
-			fmt.Printf("  ... %d more\n", len(res.diffPages)-*maxReport)
-			break
-		}
-		fmt.Printf("  page %d  offset 0x%x\n", p, int64(p)*int64(*pageSize))
-	}
+	reportPages("", res.diffPages, *pageSize, *maxReport)
 	if len(res.diffPages) > 0 {
 		os.Exit(1)
 	}
 	fmt.Println("identical")
+}
+
+// reportPages prints up to maxReport page indices with their byte offsets.
+// prefix distinguishes the diff kind in presence mode ("presence ", "content ")
+// and is empty for the raw byte compare.
+func reportPages(prefix string, pages []int, pageSize, maxReport int) {
+	for i, p := range pages {
+		if i >= maxReport {
+			fmt.Printf("  ... %d more\n", len(pages)-maxReport)
+			break
+		}
+		fmt.Printf("  %spage %d  offset 0x%x\n", prefix, p, int64(p)*int64(pageSize))
+	}
 }
 
 type compareResult struct {

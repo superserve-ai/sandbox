@@ -59,7 +59,6 @@ resource "google_compute_instance" "this" {
       network_interface[0].access_config,
       scheduling,
       scratch_disk,
-      tags,
     ]
   }
 }

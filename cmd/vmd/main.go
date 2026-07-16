@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -29,6 +30,10 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
+
+// localHTTPPort is the loopback resolver server's port; must match the
+// socket unit's second ListenStream.
+const localHTTPPort = 9090
 
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
@@ -361,7 +366,28 @@ func main() {
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
+	// Tri-state: "auto" (default) lets vmd enforce only after its convergence
+	// sweep proves every layered overlay has a presence side-car; "always"
+	// forces enforcement (fresh migration-target hosts); "never" is the
+	// break-glass off switch. Legacy true/false map to always/never.
+	requirePresenceSidecar := envOrDefault("VMD_REQUIRE_PRESENCE_SIDECAR", "auto")
+	switch requirePresenceSidecar {
+	case "true":
+		requirePresenceSidecar = "always"
+	case "false":
+		requirePresenceSidecar = "never"
+	case "auto", "always", "never":
+	default:
+		log.Warn().Str("value", requirePresenceSidecar).Msg("unknown VMD_REQUIRE_PRESENCE_SIDECAR; using auto")
+		requirePresenceSidecar = "auto"
+	}
 	launchViaLauncherNS := envOrDefault("VMD_LAUNCH_VIA_LAUNCHER_NS", "false") == "true"
+
+	// Persistent systemd D-Bus connection for unit operations (vs forking
+	// systemctl per call). Falls back to systemctl per call when unavailable.
+	systemdDBus := envOrDefault("VMD_SYSTEMD_DBUS", "false") == "true"
+	vm.SetSystemdDBusEnabled(systemdDBus)
+	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:             cfg.FirecrackerBin,
@@ -381,6 +407,7 @@ func main() {
 		VerifySnapshotEnabled:      verifySnapshotEnabled,
 		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
 		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
+		RequirePresenceSidecar:     requirePresenceSidecar,
 		LaunchViaLauncherNS:        launchViaLauncherNS,
 		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
 	}, netMgr, log)
@@ -436,9 +463,64 @@ func main() {
 	notReady := func() error {
 		return status.Error(codes.Unavailable, "vmd is starting up (reattaching VMs), retry shortly")
 	}
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
-	if err != nil {
-		log.Fatal().Err(err).Int("port", cfg.GRPCPort).Msg("failed to listen")
+	// Inherit listeners from systemd when socket-activated: the socket
+	// unit owns the fds across vmd restarts, so connections arriving
+	// mid-deploy queue in the kernel accept backlog instead of being
+	// refused. Matched by port — fd order follows the unit file, but port
+	// matching survives reordering, and nil entries (non-listener fds)
+	// must be skipped. Without a socket unit (dev, tests, hosts not yet
+	// migrated) both servers bind directly, exactly as before.
+	var lis, localLis net.Listener
+	if inherited, aerr := activation.Listeners(); aerr == nil {
+		for _, l := range inherited {
+			if l == nil {
+				continue
+			}
+			ta, ok := l.Addr().(*net.TCPAddr)
+			if !ok {
+				_ = l.Close()
+				continue
+			}
+			switch ta.Port {
+			case cfg.GRPCPort:
+				// A bare ListenStream=<port> can pass separate v4/v6 fds; keep
+				// the first, close dups so the fd isn't leaked.
+				if lis != nil {
+					log.Warn().Str("addr", ta.String()).Msg("duplicate inherited gRPC listener — closing")
+					_ = l.Close()
+					continue
+				}
+				lis = l
+			case localHTTPPort:
+				if !ta.IP.IsLoopback() {
+					log.Fatal().Str("addr", ta.String()).Msg("inherited resolver listener must be loopback-only")
+				}
+				if localLis != nil {
+					log.Warn().Str("addr", ta.String()).Msg("duplicate inherited resolver listener — closing")
+					_ = l.Close()
+					continue
+				}
+				localLis = l
+			default:
+				log.Warn().Str("addr", ta.String()).Msg("inherited listener matches no known port — closing")
+				_ = l.Close()
+			}
+		}
+		// systemd already owns the port; a direct bind would EADDRINUSE or
+		// serve a port nothing dials. Fail loudly rather than split-brain.
+		if len(inherited) > 0 && lis == nil {
+			log.Fatal().Int("grpc_port", cfg.GRPCPort).
+				Msg("socket unit passed listeners but none matches GRPC_PORT — check the unit's ListenStream against GRPC_PORT")
+		}
+	}
+	if lis != nil {
+		log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
+	} else {
+		var lerr error
+		lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
+		if lerr != nil {
+			log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
+		}
 	}
 	// Set explicitly, else gRPC clients self-cap at 100 streams/conn
 	// (defaultMaxStreamsClient) because the server advertises no limit by default.
@@ -507,10 +589,15 @@ func main() {
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize:     netPoolFresh,
-		RecycleSize: netPoolRecycle,
+		NewSize:           netPoolFresh,
+		RecycleSize:       netPoolRecycle,
+		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+
+	// Leak gauge for network namespaces — independent of the launcher path, and
+	// started after StartPool so its first read observes an initialized pool.
+	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively
@@ -599,7 +686,10 @@ func main() {
 	// instanceID → vmIP before forwarding data-plane traffic.
 	localHTTP := vm.NewLocalHTTPServer(mgr, log)
 	lc.start("local http server", func() error {
-		return localHTTP.ListenAndServe(ctx, "localhost:9090")
+		if localLis != nil {
+			return localHTTP.Serve(ctx, localLis)
+		}
+		return localHTTP.ListenAndServe(ctx, fmt.Sprintf("localhost:%d", localHTTPPort))
 	})
 	lc.addCloser("local http server", func(shutdownCtx context.Context) error {
 		return localHTTP.Shutdown(shutdownCtx)

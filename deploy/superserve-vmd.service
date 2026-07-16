@@ -1,7 +1,8 @@
 [Unit]
 Description=Superserve VM Daemon
-After=network-online.target
+After=network-online.target superserve-vmd.socket
 Wants=network-online.target
+Requires=superserve-vmd.socket
 
 [Service]
 Type=simple

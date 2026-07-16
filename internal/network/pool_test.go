@@ -1,6 +1,9 @@
 package network
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +22,16 @@ func stubPidsInNs(t *testing.T, fn func(ns string) ([]int, bool)) {
 	t.Cleanup(func() { pidsInNsFunc = old })
 }
 
+// stubResetTap overrides resetTapFunc for the duration of the test and restores
+// it on cleanup, so the recycle path's tap0 rebuild is driven without a real
+// netns/tap device.
+func stubResetTap(t *testing.T, fn func(m *Manager, ctx context.Context, ns string) error) {
+	t.Helper()
+	old := resetTapFunc
+	resetTapFunc = fn
+	t.Cleanup(func() { resetTapFunc = old })
+}
+
 func newTestPool(t *testing.T, m *Manager) *Pool {
 	t.Helper()
 	p := &Pool{
@@ -30,6 +43,7 @@ func newTestPool(t *testing.T, m *Manager) *Pool {
 		stopCh:             make(chan struct{}),
 		verifyPollInterval: time.Millisecond,
 		verifyMaxWait:      50 * time.Millisecond,
+		resetSem:           make(chan struct{}, resetTapConcurrency),
 	}
 	t.Cleanup(func() {
 		select {
@@ -120,6 +134,223 @@ func TestPoolReturn_RecyclesOnceNamespaceIsClear(t *testing.T) {
 	m.mu.Unlock()
 	if owner != poolOwner {
 		t.Errorf("slotOwner[1] = %q, want poolOwner", owner)
+	}
+}
+
+// TestPoolReturn_ResetsTapBeforeRecycling: with the reset enabled, a cleared
+// namespace has its tap0 rebuilt before the slot is made claimable.
+func TestPoolReturn_ResetsTapBeforeRecycling(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+
+	var resetNS atomic.Value
+	stubResetTap(t, func(_ *Manager, _ context.Context, ns string) error {
+		resetNS.Store(ns)
+		return nil
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	select {
+	case slot := <-p.recycled:
+		if slot.idx != 1 {
+			t.Errorf("recycled slot idx = %d, want 1", slot.idx)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slot never appeared in recycled — reset-then-recycle did not complete")
+	}
+	if got, _ := resetNS.Load().(string); got != "ns-1" {
+		t.Errorf("resetTap called with ns %q, want ns-1", got)
+	}
+}
+
+// TestPoolReturn_BoundsConcurrentTapResets: a mass return drives many verify
+// goroutines at once, but at most resetTapConcurrency tap rebuilds may be in
+// flight — the rest queue on the semaphore instead of fork-storming the host.
+func TestPoolReturn_BoundsConcurrentTapResets(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+
+	var cur, peak atomic.Int32
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error {
+		c := cur.Add(1)
+		for {
+			p := peak.Load()
+			if c <= p || peak.CompareAndSwap(p, c) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		cur.Add(-1)
+		return nil
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	p.recycled = make(chan *preallocSlot, 64) // don't trip the overflow skip
+
+	const n = 32
+	for i := 0; i < n; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		touchNS(t, dir, ns)
+		m.assignSlotLocked(i, "old-vm")
+		p.Return(&preallocSlot{idx: i, info: &VMNetInfo{Namespace: ns}, vethName: fmt.Sprintf("veth-%d", i)})
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-p.recycled:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d/%d slots recycled", i, n)
+		}
+	}
+	if got := peak.Load(); got > resetTapConcurrency {
+		t.Errorf("concurrent tap resets peaked at %d, want <= %d", got, resetTapConcurrency)
+	}
+}
+
+// TestPoolReturn_ReleasesResetTokenOnPanic: a panicking rebuild must release
+// its semaphore token — Return's goroutine recovers panics, so a leaked token
+// would permanently shrink the reset window.
+func TestPoolReturn_ReleasesResetTokenOnPanic(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error { panic("rebuild blew up") })
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	// Wait for the verify goroutine (it holds a wg slot through the panic
+	// recovery) so the assertion — and the test's stub cleanup — can't race it.
+	p.wg.Wait()
+	if got := len(p.resetSem); got != 0 {
+		t.Errorf("resetSem holds %d token(s) after a panicking rebuild, want 0", got)
+	}
+}
+
+// TestPoolReturn_SkipsTapResetWhenRecycleFull: a slot that would overflow the
+// recycle pool is torn down without paying the tap rebuild first.
+func TestPoolReturn_SkipsTapResetWhenRecycleFull(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error {
+		t.Error("resetTap ran for a slot the full recycle pool was about to discard")
+		return nil
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	for i := 0; i < cap(p.recycled); i++ {
+		p.recycled <- &preallocSlot{idx: 100 + i, info: &VMNetInfo{Namespace: "ns-x"}}
+	}
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	// Synchronize with the verify goroutine via the slot release under m.mu.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		_, owned := m.slotOwner[1]
+		m.mu.Unlock()
+		if !owned || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	m.mu.Lock()
+	_, stillOwned := m.slotOwner[1]
+	m.mu.Unlock()
+	if stillOwned {
+		t.Error("slot 1 never released — overflow cleanup did not run")
+	}
+}
+
+// TestPoolReturn_TearsDownWhenTapResetFails: if tap0 can't be rebuilt, the slot
+// is torn down instead of recycled — never handed to the next VM.
+func TestPoolReturn_TearsDownWhenTapResetFails(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error {
+		return errors.New("tap busy")
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	// Let verifyAndRecycle run: it clears the namespace, fails the tap reset, and
+	// tears down instead of recycling.
+	time.Sleep(200 * time.Millisecond)
+
+	select {
+	case slot := <-p.recycled:
+		t.Fatalf("slot idx %d was recycled despite tap reset failure", slot.idx)
+	default:
+	}
+
+	// Reading the released slot under m.mu synchronizes with verifyAndRecycle's
+	// teardown so the test doesn't race its goroutine on the stub globals.
+	m.mu.Lock()
+	_, stillOwned := m.slotOwner[1]
+	freed := false
+	for _, idx := range m.freeSlots {
+		if idx == 1 {
+			freed = true
+		}
+	}
+	m.mu.Unlock()
+	if stillOwned || !freed {
+		t.Errorf("slot 1 not released after tap reset failure (owned=%v freed=%v)", stillOwned, freed)
+	}
+}
+
+// TestTeardownVM_ReclaimsSlotWithoutRecycling: a forced teardown of a suspect
+// slot reclaims its index to freeSlots and never hands it to the pool, so a
+// failed create's slot can't be immediately re-claimed with the same bad tap.
+func TestTeardownVM_ReclaimsSlotWithoutRecycling(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	m.pool = p
+	m.devices["vm-t"] = &VMNetInfo{Namespace: "ns-7", HostIP: "10.11.0.7"}
+	m.assignSlotLocked(7, "vm-t")
+
+	m.TeardownVM("vm-t")
+
+	if _, tracked := m.devices["vm-t"]; tracked {
+		t.Error("vm-t still tracked after TeardownVM")
+	}
+	freed := false
+	for _, idx := range m.freeSlots {
+		if idx == 7 {
+			freed = true
+		}
+	}
+	if !freed {
+		t.Errorf("slot 7 not reclaimed to freeSlots = %v", m.freeSlots)
+	}
+	select {
+	case slot := <-p.recycled:
+		t.Fatalf("slot %+v was recycled; TeardownVM must never recycle", slot)
+	default:
 	}
 }
 
