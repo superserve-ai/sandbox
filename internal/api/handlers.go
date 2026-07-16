@@ -1991,7 +1991,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	log.Info().
 		Str("sandbox_id", sandbox.ID.String()).
+		Int64("auth_ms", c.GetInt64("auth_ms")).
 		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
+		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
 		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).

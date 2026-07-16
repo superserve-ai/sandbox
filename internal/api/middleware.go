@@ -55,6 +55,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		}()
 	}
 	return func(c *gin.Context) {
+		authStart := time.Now()
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
@@ -76,6 +77,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			if entry.createdBy.Valid && !isConsoleImpersonation(c) {
 				c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
 			}
+			c.Set("auth_ms", time.Since(authStart).Milliseconds())
 			c.Next()
 			return
 		}
@@ -114,6 +116,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		if createdBy.Valid && !isConsoleImpersonation(c) {
 			c.Set("actor_id", uuid.UUID(createdBy.Bytes))
 		}
+		c.Set("auth_ms", time.Since(authStart).Milliseconds())
 		c.Next()
 	}
 }
