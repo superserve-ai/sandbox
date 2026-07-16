@@ -1472,24 +1472,34 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
 }
 
-// templateRestoreAge returns seconds since this host last restored the given
-// template mem file and records now, or -1 on first sighting. Only template
-// mem paths are tracked — per-VM resume snapshots are keyed by vmID and would
-// grow the map unbounded, so they short-circuit to -1. Best-effort.
+// templateRestoreAge returns seconds since this host last completed a restore of
+// the given template mem file (i.e. last warmed its page cache), or -1 if
+// untracked or first-seen. Read-only — markTemplateRestored does the recording,
+// so a restore that fails before the load can't stamp a false-warm reading.
 func (m *Manager) templateRestoreAge(memPath string) int64 {
 	if !m.isTemplateMemPath(memPath) {
 		return -1
 	}
-	key := filepath.Clean(memPath)
-	now := time.Now()
 	m.tplMu.Lock()
-	prev, seen := m.tplLastRestore[key]
-	m.tplLastRestore[key] = now
+	prev, seen := m.tplLastRestore[filepath.Clean(memPath)]
 	m.tplMu.Unlock()
 	if !seen {
 		return -1
 	}
-	return int64(now.Sub(prev).Seconds())
+	return int64(time.Since(prev).Seconds())
+}
+
+// markTemplateRestored records that a restore of the given template mem file
+// just loaded — when its page cache is warmed. Only template mem paths are
+// tracked (per-VM resume snapshots are keyed by vmID and would grow the map
+// unbounded), so those are a no-op.
+func (m *Manager) markTemplateRestored(memPath string) {
+	if !m.isTemplateMemPath(memPath) {
+		return
+	}
+	m.tplMu.Lock()
+	m.tplLastRestore[filepath.Clean(memPath)] = time.Now()
+	m.tplMu.Unlock()
 }
 
 // psiSomeAvg10 returns the "some avg10" pressure-stall figure from a PSI file
@@ -1816,6 +1826,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
+			// The load just read the mem file → its page cache is now warm;
+			// stamp it so the next restore's secs_since_template_restore is real.
+			m.markTemplateRestored(memPath)
 			break
 		}
 		// Retriable only for a fresh-restore tap0 busy. The overlay and inst are

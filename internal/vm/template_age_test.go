@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-// TestTemplateRestoreAge covers the phase-tag warmth proxy: a template mem file
-// is -1 on first sighting then a non-negative delta; a per-VM resume snapshot is
-// never tracked (always -1, so the map can't grow unbounded on vmIDs).
+// TestTemplateRestoreAge covers the phase-tag warmth proxy and the read/mark
+// split: age is -1 until a restore is marked (so a failed restore can't stamp a
+// false-warm reading), and per-VM resume snapshots are never tracked.
 func TestTemplateRestoreAge(t *testing.T) {
 	m := &Manager{
 		cfg:            ManagerConfig{SnapshotDir: "/var/lib/sandbox/snapshots"},
@@ -17,19 +17,25 @@ func TestTemplateRestoreAge(t *testing.T) {
 	}
 	const tpl = "/var/lib/sandbox/snapshots/templates/tpl-abc/mem.snap"
 
+	// Read alone must NOT record — an unmarked template stays -1 no matter how
+	// many times its age is read (the pre-mark / failed-restore case).
 	if age := m.templateRestoreAge(tpl); age != -1 {
-		t.Fatalf("first restore of a template must be -1, got %d", age)
+		t.Fatalf("unmarked template must be -1, got %d", age)
 	}
+	if age := m.templateRestoreAge(tpl); age != -1 {
+		t.Fatalf("reading age must not record; still -1, got %d", age)
+	}
+	// After a successful load is marked, age becomes a non-negative delta.
+	m.markTemplateRestored(tpl)
 	if age := m.templateRestoreAge(tpl); age < 0 {
-		t.Fatalf("second restore must be a non-negative delta, got %d", age)
+		t.Fatalf("after mark, age must be non-negative, got %d", age)
 	}
-	// A paused sandbox's per-VM snapshot must never be tracked or keyed.
+
+	// A paused sandbox's per-VM snapshot is never tracked, even if marked.
 	resume := "/var/lib/sandbox/snapshots/vm123/mem.snap"
+	m.markTemplateRestored(resume)
 	if age := m.templateRestoreAge(resume); age != -1 {
 		t.Fatalf("resume snapshot must be -1, got %d", age)
-	}
-	if age := m.templateRestoreAge(resume); age != -1 {
-		t.Fatalf("resume snapshot must stay -1 (not recorded), got %d", age)
 	}
 	if _, keyed := m.tplLastRestore[filepath.Clean(resume)]; keyed {
 		t.Fatal("resume snapshot must not be inserted into the map")
