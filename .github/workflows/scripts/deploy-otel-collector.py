@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Deploy the OTEL Collector binary, config, and systemd unit to VMD hosts."""
+"""Deploy the OTEL Collector binary, config, and systemd unit to VMD hosts.
+
+The default host selection still uses the `component=vmd` label; production
+can supply a full gcloud filter to scope the fan-out to a specific cell.
+"""
 
 import os
 import re
@@ -68,18 +72,24 @@ def prepare_collector_binaries() -> dict[str, str]:
 def main() -> int:
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
-    label = os.environ.get("VMD_LABEL", "component=vmd")
+    host_filter = os.environ.get("VMD_FILTER", "")
+    label = os.environ.get("VMD_LABEL") or "component=vmd"
     collector_project = os.environ.get("OTEL_COLLECTOR_PROJECT", project)
 
     if not re.fullmatch(r"[A-Za-z0-9._:-]+", collector_project):
         print("ERROR: OTEL_COLLECTOR_PROJECT contains disallowed characters", file=sys.stderr)
         return 1
 
+    if host_filter:
+        instance_filter = host_filter
+    else:
+        instance_filter = f"labels.{label}"
+
     result = subprocess.run(
         [
             "gcloud", "compute", "instances", "list",
             f"--project={project}",
-            f"--filter=labels.{label} AND status=RUNNING",
+            f"--filter={instance_filter} AND status=RUNNING",
             "--format=csv[no-heading](name,zone)",
         ],
         capture_output=True,
@@ -103,7 +113,7 @@ def main() -> int:
 
     where = f"{project} ({region})" if region else project
     if not instances:
-        print(f"No instances with label {label} found in {where}", file=sys.stderr)
+        print(f"No instances matching {instance_filter} found in {where}", file=sys.stderr)
         return 1
 
     collector_binaries = prepare_collector_binaries()

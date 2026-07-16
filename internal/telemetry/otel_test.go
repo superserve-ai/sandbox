@@ -1,8 +1,12 @@
 package telemetry
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestSafeResultBoundsValues(t *testing.T) {
@@ -84,6 +88,111 @@ func TestHostCapacityQueryTimeoutIndependentOfInterval(t *testing.T) {
 	for _, interval := range []time.Duration{500 * time.Millisecond, 2 * time.Second, 15 * time.Second} {
 		if got := hostCapacityQueryTimeoutForInterval(interval); got != hostCapacityQueryTimeout {
 			t.Fatalf("timeout(%s) = %s, want %s", interval, got, hostCapacityQueryTimeout)
+		}
+	}
+}
+func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+
+	meter := provider.Meter(instrumentationName)
+
+	vmdCalls, err := meter.Int64Counter("vmd_call_total")
+	if err != nil {
+		t.Fatalf("create VMD call counter: %v", err)
+	}
+
+	vmdDuration, err := meter.Float64Histogram(
+		"vmd_call_duration_seconds",
+	)
+	if err != nil {
+		t.Fatalf("create VMD duration histogram: %v", err)
+	}
+
+	recorder := &OTelRecorder{
+		provider:    provider,
+		serviceName: "sandbox-controlplane",
+		environment: "staging",
+		vmdCalls:    vmdCalls,
+		vmdDuration: vmdDuration,
+	}
+
+	recorder.RecordVMDCall(ctx, VMDCall{
+		Method:   "BuildTemplate",
+		Result:   ResultSuccess,
+		Region:   "us-central1",
+		HostID:   "host-123",
+		Duration: 250 * time.Millisecond,
+	})
+
+	var resourceMetrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	var datapoint *metricdata.HistogramDataPoint[float64]
+
+	for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			if metric.Name != "vmd_call_duration_seconds" {
+				continue
+			}
+
+			histogram, ok := metric.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf(
+					"metric data type = %T, want metricdata.Histogram[float64]",
+					metric.Data,
+				)
+			}
+
+			if len(histogram.DataPoints) != 1 {
+				t.Fatalf(
+					"histogram datapoints = %d, want 1",
+					len(histogram.DataPoints),
+				)
+			}
+
+			datapoint = &histogram.DataPoints[0]
+		}
+	}
+
+	if datapoint == nil {
+		t.Fatal("vmd_call_duration_seconds metric not found")
+	}
+
+	attributes := make(map[string]string)
+	for _, attr := range datapoint.Attributes.ToSlice() {
+		attributes[string(attr.Key)] = attr.Value.AsString()
+	}
+
+	want := map[string]string{
+		"service.name": "sandbox-controlplane",
+		"environment":  "staging",
+		"method":       "BuildTemplate",
+		"result":       ResultSuccess,
+		"region":       "us-central1",
+		"host_id":      "host-123",
+	}
+
+	for key, wantValue := range want {
+		if got := attributes[key]; got != wantValue {
+			t.Errorf(
+				"attribute %q = %q, want %q; all attributes: %#v",
+				key,
+				got,
+				wantValue,
+				attributes,
+			)
 		}
 	}
 }

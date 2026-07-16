@@ -21,21 +21,20 @@ provider "google" {
 }
 
 locals {
-  project_id             = var.project_id
-  environment            = var.environment
-  region                 = var.region
-  zone                   = var.zone
-  resource_suffix        = coalesce(var.resource_suffix, var.environment)
-  service_account_suffix = coalesce(var.service_account_suffix, local.resource_suffix)
-  api_sa_key             = "superserve_api"
+  project_id                = var.project_id
+  environment               = var.environment
+  region                    = var.region
+  zone                      = var.zone
+  resource_suffix           = coalesce(var.resource_suffix, var.environment)
+  service_account_suffix    = coalesce(var.service_account_suffix, local.resource_suffix)
+  api_sa_key                = "superserve_api"
+  api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 
   common_labels = {
     environment = local.environment
     managed_by  = "terraform"
     region      = local.region
   }
-
-  api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
 
 module "network" {
@@ -82,6 +81,19 @@ module "network" {
       ]
       description = null
     }
+    allow_otel_ingress = {
+      name          = "superserve-prod-allow-cr-to-host-otel"
+      direction     = "INGRESS"
+      source_ranges = [var.connector_subnet_cidr]
+      target_tags   = ["superserve-vmd"]
+      allow = [
+        {
+          protocol = "tcp"
+          ports    = ["4317", "4318"]
+        }
+      ]
+      description = "Allow Cloud Run connector traffic to host-local OTLP endpoints."
+    }
   }
 
   labels = local.common_labels
@@ -96,6 +108,14 @@ module "iam" {
     (local.api_sa_key) = {
       account_id   = "superserve-api-runner"
       display_name = "Superserve API Cloud Run Service Account"
+    }
+  }
+  project_bindings = {
+    production_host_metric_writer = {
+      role = "roles/monitoring.metricWriter"
+      members = [
+        "serviceAccount:${local.api_service_account_email}"
+      ]
     }
   }
   labels = local.common_labels
@@ -155,7 +175,7 @@ module "sandbox_host" {
   machine_type  = var.machine_type
   subnet        = module.network.subnetwork_self_link
   internal_ip   = "10.0.0.3"
-  tags          = []
+  tags          = ["superserve-vmd"]
   labels = merge(local.common_labels, {
     component               = "vmd"
     sandbox_role            = "vmd"
@@ -175,4 +195,42 @@ module "observability" {
   project_id  = local.project_id
   environment = local.environment
   labels      = local.common_labels
+  dashboards = {
+    sandbox_operations = {
+      display_name = "Sandbox Telemetry / Production Operations"
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-operations.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Production Operations"
+      })
+    }
+
+    sandbox_collector = {
+      display_name = "Sandbox Telemetry / Collector"
+      definition   = file("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-collector.json")
+    }
+
+    sandbox_fleet = {
+      display_name = "Sandbox Telemetry / Production Fleet"
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-fleet.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Production Fleet"
+      })
+    }
+
+    sandbox_hosts = {
+      display_name = "Sandbox Telemetry / Production Hosts"
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-hosts.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Production Hosts"
+      })
+    }
+
+    sandbox_database = {
+      display_name = "Sandbox Telemetry / Production Database"
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-database.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Production Database"
+      })
+    }
+  }
 }

@@ -234,13 +234,41 @@ module "observability" {
   project_id  = local.project_id
   environment = local.environment
   dashboards = {
-    sandbox_phase2_operations = {
+    sandbox_operations = {
       display_name = "Sandbox Telemetry / Staging Operations"
-      definition   = file("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-staging-operations.json")
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-operations.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Staging Operations"
+      })
     }
-    sandbox_phase2_collector = {
+
+    sandbox_collector = {
       display_name = "Sandbox Telemetry / Collector"
       definition   = file("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-collector.json")
+    }
+
+    sandbox_fleet = {
+      display_name = "Sandbox Telemetry / Staging Fleet"
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-fleet.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Staging Fleet"
+      })
+    }
+
+    sandbox_hosts = {
+      display_name = "Sandbox Telemetry / Staging Hosts"
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-hosts.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Staging Hosts"
+      })
+    }
+
+    sandbox_database = {
+      display_name = "Sandbox Telemetry / Staging Database"
+      definition = templatefile("${path.module}/../../../dashboards/cloud-monitoring/sandbox-telemetry-database.json.tftpl", {
+        environment  = local.environment
+        display_name = "Sandbox Telemetry / Staging Database"
+      })
     }
   }
   uptime_checks = {

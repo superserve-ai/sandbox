@@ -1,0 +1,234 @@
+{
+  "displayName": "${display_name}",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "xPos": 0,
+        "yPos": 0,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "Used vCPU by Host",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (host_id) (host_capacity_used_vcpu{environment=\"${environment}\"})"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "vCPU",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 4,
+        "yPos": 0,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "Used Memory by Host",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (host_id) (host_capacity_used_memory_mib{environment=\"${environment}\"})"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "MiB",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 8,
+        "yPos": 0,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "Running Sandboxes by Host",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (host_id) (host_capacity_running_sandboxes{environment=\"${environment}\"})"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "sandboxes",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "VMD Call Rate by Host and Method",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (host_id, method) (rate(vmd_call_total{environment=\"${environment}\"}[30m]))"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "calls/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "VMD Error Rate by Host and Method",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (host_id, method) (rate(vmd_call_total{environment=\"${environment}\",result=\"error\"}[30m]))"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "errors/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "VMD p95 Latency by Host and Method",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, host_id, method) (rate(vmd_call_duration_seconds_bucket{environment=\"${environment}\"}[1h])))"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "seconds",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "VMD Outcomes",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (method, result) (rate(vmd_call_total{environment=\"${environment}\"}[30m]))"
+                },
+                "plotType": "STACKED_BAR",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "calls/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 12,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "VMD Calls by Method",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (method) (rate(vmd_call_total{environment=\"${environment}\"}[30m]))"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "calls/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 12,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Hosts Reporting Capacity",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "count(max by (host_id) (host_capacity_running_sandboxes{environment=\"${environment}\"}))"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "reporting hosts"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "hosts",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
