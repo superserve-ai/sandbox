@@ -1420,7 +1420,9 @@ func snapshotArtifactSizesWithShared(dir string, sharedOwnedPaths []string, refe
 
 // reflinkImmutableFileContext creates a new inode whose existing extents stay
 // physically shared with src. --reflink=always is intentional: a transparent
-// byte-copy fallback would make deduplicated shadow usage dishonest.
+// byte-copy fallback would make deduplicated shadow usage dishonest. GNU cp
+// only permits reflink copies with sparse=auto; the clone still preserves the
+// source's holes and shared extents.
 func reflinkImmutableFileContext(ctx context.Context, src, dst string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1436,7 +1438,7 @@ func reflinkImmutableFileContext(ctx context.Context, src, dst string) error {
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "cp", "--reflink=always", "--sparse=always", "--", src, dst)
+	cmd := exec.CommandContext(ctx, "cp", "--reflink=always", "--sparse=auto", "--", src, dst)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("mandatory reflink %s to %s: %s: %w", src, dst, strings.TrimSpace(string(out)), err)
 	}

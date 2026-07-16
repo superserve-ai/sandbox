@@ -2719,7 +2719,7 @@ func (m *Manager) copySavedRootfs(ctx context.Context, dirName, srcRootfs string
 		return "", fmt.Errorf("mkdir vm dir: %w", err)
 	}
 	diskPath := filepath.Join(vmDir, "rootfs.ext4")
-	if err := copyWritableDisk(ctx, "clone saved rootfs", srcRootfs, diskPath, "--reflink=always", "--sparse=always"); err != nil {
+	if err := copyWritableDisk(ctx, "clone saved rootfs", srcRootfs, diskPath, "--reflink=always", "--sparse=auto"); err != nil {
 		return "", err
 	}
 	return diskPath, nil
@@ -2734,7 +2734,7 @@ func (m *Manager) cloneSavedOverlay(ctx context.Context, dirName, source string)
 		return "", fmt.Errorf("mkdir vm dir: %w", err)
 	}
 	dst := filepath.Join(vmDir, "overlay.ext4")
-	if err := copyWritableDisk(ctx, "clone saved overlay", source, dst, "--reflink=always", "--sparse=always"); err != nil {
+	if err := copyWritableDisk(ctx, "clone saved overlay", source, dst, "--reflink=always", "--sparse=auto"); err != nil {
 		return "", err
 	}
 	return dst, nil
