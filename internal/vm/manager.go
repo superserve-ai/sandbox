@@ -1490,8 +1490,8 @@ func (m *Manager) templateRestoreAge(memPath string) int64 {
 }
 
 // markTemplateRestored records that a restore of the given template mem file
-// just loaded — when its page cache is warmed. Only template mem paths are
-// tracked (per-VM resume snapshots are keyed by vmID and would grow the map
+// completed (guest booted → working set now cached). Only template mem paths
+// are tracked (per-VM resume snapshots are keyed by vmID and would grow the map
 // unbounded), so those are a no-op.
 func (m *Manager) markTemplateRestored(memPath string) {
 	if !m.isTemplateMemPath(memPath) {
@@ -1826,9 +1826,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
-			// The load just read the mem file → its page cache is now warm;
-			// stamp it so the next restore's secs_since_template_restore is real.
-			m.markTemplateRestored(memPath)
 			break
 		}
 		// Retriable only for a fresh-restore tap0 busy. The overlay and inst are
@@ -1919,6 +1916,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
+
+	// boxd is up → the guest has booted, so this template's working set is now
+	// in page cache: read eagerly at load (File) or faulted in during boot
+	// (UFFD). Stamp it here (not at the load) so the next restore's
+	// secs_since_template_restore reflects real warmth for either backend.
+	m.markTemplateRestored(memPath)
 
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)
