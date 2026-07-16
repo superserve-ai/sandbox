@@ -53,6 +53,9 @@ type Service struct {
 	teamPermCache sync.Map
 	teamPermGroup singleflight.Group
 	teamPermGen   sync.Map
+	// teamPermCount tracks teamPermCache's size (sync.Map has no cheap Len);
+	// every store/delete path keeps it in step so overflow can trigger a sweep.
+	teamPermCount atomic.Int64
 }
 
 func New(store db.DBTX) *Service {
@@ -84,6 +87,11 @@ type teamPermResult struct {
 // the API-key cache. If a permission ever requires immediate cross-instance
 // revocation, replace this cache with a DB-backed per-team generation.
 const teamPermCacheTTL = 10 * time.Second
+
+// teamPermCacheMaxEntries bounds the map so churned user/team/permission
+// triples can't grow process memory; a backstop, not an expected operating
+// point (mirrors apiKeyCacheMaxEntries).
+const teamPermCacheMaxEntries = 4096
 
 // teamEpoch returns the per-team epoch counter, creating it on first use.
 func (s *Service) teamEpoch(teamID uuid.UUID) *atomic.Uint64 {
@@ -121,9 +129,9 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 		if e.epoch == observed && time.Now().Before(e.expiry) {
 			return true, nil
 		}
-		// Stale epoch or expired — drop it. CompareAndDelete so a concurrent
-		// fresh Store isn't clobbered.
-		s.teamPermCache.CompareAndDelete(key, v)
+		// Stale epoch or expired — drop it (guarded so a concurrent fresh
+		// store isn't clobbered).
+		s.deleteTeamPerm(key, v)
 	}
 
 	// The epoch is in the singleflight key: a request that observes a newer epoch
@@ -146,12 +154,44 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 	}
 	res := result.(teamPermResult)
 	if res.allowed {
-		s.teamPermCache.Store(key, &teamPermCacheEntry{
+		s.storeTeamPerm(key, &teamPermCacheEntry{
 			expiry: time.Now().Add(teamPermCacheTTL),
 			epoch:  res.epoch,
 		})
 	}
 	return res.allowed, nil
+}
+
+// storeTeamPerm caches a grant, sweeping expired entries first when the map is
+// at capacity. If the sweep frees nothing (all entries live), the cache is
+// cleared — costing one query per live triple to refill; unreachable in practice.
+func (s *Service) storeTeamPerm(key teamPermCacheKey, e *teamPermCacheEntry) {
+	if s.teamPermCount.Load() >= teamPermCacheMaxEntries {
+		now := time.Now()
+		s.teamPermCache.Range(func(k, v any) bool {
+			if now.After(v.(*teamPermCacheEntry).expiry) {
+				s.deleteTeamPerm(k, v)
+			}
+			return true
+		})
+		if s.teamPermCount.Load() >= teamPermCacheMaxEntries {
+			s.teamPermCache.Range(func(k, v any) bool {
+				s.deleteTeamPerm(k, v)
+				return true
+			})
+		}
+	}
+	if _, loaded := s.teamPermCache.Swap(key, e); !loaded {
+		s.teamPermCount.Add(1)
+	}
+}
+
+// deleteTeamPerm removes an entry and keeps the size counter in step; the
+// CompareAndDelete guard means a concurrent fresh Swap is never miscounted.
+func (s *Service) deleteTeamPerm(k, v any) {
+	if s.teamPermCache.CompareAndDelete(k, v) {
+		s.teamPermCount.Add(-1)
+	}
 }
 
 // InvalidateTeam makes a team's cached grants stale on THIS instance after a
@@ -164,9 +204,9 @@ func (s *Service) InvalidateTeam(teamID uuid.UUID) {
 		return
 	}
 	s.teamEpoch(teamID).Add(1)
-	s.teamPermCache.Range(func(k, _ any) bool {
+	s.teamPermCache.Range(func(k, v any) bool {
 		if key, ok := k.(teamPermCacheKey); ok && key.teamID == teamID {
-			s.teamPermCache.Delete(k)
+			s.deleteTeamPerm(k, v)
 		}
 		return true
 	})

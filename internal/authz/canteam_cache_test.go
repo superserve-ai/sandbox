@@ -186,6 +186,27 @@ func TestCanTeamLateJoinerAfterInvalidateStartsFreshQuery(t *testing.T) {
 	<-aResult // A drains (its pre-revocation grant is acceptable)
 }
 
+func TestCanTeamCacheStaysBounded(t *testing.T) {
+	store := &countingStore{result: true}
+	s := New(store)
+	team := uuid.New()
+
+	// Insert well past the cap with distinct users; the overflow store sweeps
+	// (nothing expired) and then clears, so the map never exceeds the cap.
+	for i := 0; i < teamPermCacheMaxEntries+50; i++ {
+		_, _ = s.CanTeam(context.Background(), uuid.New(), team, "settings:write")
+	}
+	if n := s.teamPermCount.Load(); n > teamPermCacheMaxEntries {
+		t.Fatalf("cache grew past the cap: %d > %d", n, teamPermCacheMaxEntries)
+	}
+	// The counter must agree with the map's real size.
+	var real int64
+	s.teamPermCache.Range(func(_, _ any) bool { real++; return true })
+	if real != s.teamPermCount.Load() {
+		t.Fatalf("size counter drifted: counter=%d map=%d", s.teamPermCount.Load(), real)
+	}
+}
+
 func TestCanTeamSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	store := &countingStore{result: true, delay: 30 * time.Millisecond}
 	s := New(store)
