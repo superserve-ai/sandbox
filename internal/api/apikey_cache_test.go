@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -225,22 +226,37 @@ func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
 // (waiters may outlive the triggering request), the disabled branch must NOT
 // (a client disconnect has to cancel the lookup).
 func TestAPIKeyCache_FetchContextContract(t *testing.T) {
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-
+	// The shared flight runs detached from the caller: no cancellation, own
+	// deadline. Exercised with a LIVE caller ctx so fn actually runs.
 	c := newAPIKeyCache(10 * time.Second)
-	if _, err := c.fetch(cancelled, "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
+	if _, err := c.fetch(context.Background(), "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
 		if qctx.Err() != nil {
-			t.Errorf("coalescing flight must be detached from the caller, got %v", qctx.Err())
+			t.Errorf("shared flight must be detached from the caller, got %v", qctx.Err())
 		}
 		if _, ok := qctx.Deadline(); !ok {
-			t.Error("coalescing flight must carry its own deadline")
+			t.Error("shared flight must carry its own deadline")
 		}
 		return apiKeyCacheEntry{id: "id1"}, nil
 	}); err != nil {
 		t.Errorf("fetch: %v", err)
 	}
 
+	// A waiter whose own context is done returns immediately rather than
+	// blocking on the flight. fn is gated open so the only way fetch can
+	// return is via the caller's cancellation.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	gate := make(chan struct{})
+	if _, err := c.fetch(cancelled, "hash2", func(context.Context) (apiKeyCacheEntry, error) {
+		<-gate // never released
+		return apiKeyCacheEntry{}, nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled caller must return context.Canceled, got %v", err)
+	}
+	close(gate)
+
+	// Disabled cache (nil) runs fn directly under the caller's context, so a
+	// client disconnect cancels the lookup.
 	var disabled *apiKeyCache
 	if _, err := disabled.fetch(cancelled, "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
 		if qctx.Err() == nil {

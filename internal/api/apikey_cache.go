@@ -103,24 +103,33 @@ func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry
 
 // fetch coalesces concurrent misses for the same key: one caller runs fn (the
 // DB lookup) and every concurrent waiter shares its result, so a burst hitting
-// an expired entry issues a single query instead of one per request. The
-// detached context exists only for the coalescing branch — waiters may outlive
-// the triggering request. With caching disabled (nil receiver) there are no
-// waiters, so fn runs directly under the caller's context and a client
-// disconnect cancels the lookup, matching the fully-uncached contract.
+// an expired entry issues a single query instead of one per request.
+//
+// The shared flight runs under a detached, 5s-bounded context — it may outlive
+// the request that triggered it, so it must not die when that caller
+// disconnects. But each waiter still selects on its own ctx via DoChan, so a
+// waiter whose client hangs up (or whose deadline fires) returns immediately
+// instead of blocking on the flight; the flight itself keeps running for the
+// remaining waiters. With caching disabled (nil receiver) there are no waiters,
+// so fn runs directly under the caller's context.
 func (c *apiKeyCache) fetch(ctx context.Context, keyHash string, fn func(context.Context) (apiKeyCacheEntry, error)) (apiKeyCacheEntry, error) {
 	if c == nil {
 		return fn(ctx)
 	}
-	v, err, _ := c.group.Do(keyHash, func() (interface{}, error) {
+	ch := c.group.DoChan(keyHash, func() (interface{}, error) {
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		return fn(qctx)
 	})
-	if err != nil {
-		return apiKeyCacheEntry{}, err
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return apiKeyCacheEntry{}, res.Err
+		}
+		return res.Val.(apiKeyCacheEntry), nil
+	case <-ctx.Done():
+		return apiKeyCacheEntry{}, ctx.Err()
 	}
-	return v.(apiKeyCacheEntry), nil
 }
 
 // put stores a fresh lookup result and reports whether the caller should touch
