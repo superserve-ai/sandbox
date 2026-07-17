@@ -38,8 +38,11 @@ ALTER TABLE team_sandbox_counter ENABLE ROW LEVEL SECURITY;
 
 -- Individual shards may go negative (an increment lands on shard 3, the
 -- matching decrement on shard 7); only the SUM is meaningful, floored at 0
--- like the old column was.
-CREATE OR REPLACE VIEW team_active_sandbox_counts AS
+-- like the old column was. security_invoker so the underlying table's RLS
+-- applies to callers — a default (owner-rights) view in the exposed schema
+-- would let API-key holders read every team's counts.
+CREATE OR REPLACE VIEW team_active_sandbox_counts
+WITH (security_invoker = true) AS
 SELECT team_id,
        GREATEST(COALESCE(SUM(cnt), 0), 0)::int AS active_sandbox_count
 FROM team_sandbox_counter
