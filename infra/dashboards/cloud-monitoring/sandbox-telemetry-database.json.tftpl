@@ -1,0 +1,180 @@
+{
+  "displayName": "${display_name}",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "xPos": 0,
+        "yPos": 0,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Pool Pressure",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max(db_pool_acquired_conns{environment=\"${environment}\"} / clamp_min(db_pool_total_conns{environment=\"${environment}\"}, 1))"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "acquired / total"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "ratio",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 0,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Acquire Latency Avg",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "rate(db_pool_acquire_duration_seconds_total{environment=\"${environment}\"}[5m]) / clamp_min(rate(db_pool_acquire_total{environment=\"${environment}\"}[5m]), 1e-9)"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "avg wait"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "seconds",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Connections",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max(db_pool_acquired_conns{environment=\"${environment}\"})"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "acquired"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max(db_pool_idle_conns{environment=\"${environment}\"})"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "idle"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max(db_pool_total_conns{environment=\"${environment}\"})"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "total"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "connections",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Acquire Rate",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "rate(db_pool_acquire_total{environment=\"${environment}\"}[5m])"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "acquires"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "acquires/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Empty Acquire Rate",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "rate(db_pool_empty_acquire_total{environment=\"${environment}\"}[5m])"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "empty acquires"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "events/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "DB Canceled Acquire Rate",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "rate(db_pool_canceled_acquire_total{environment=\"${environment}\"}[5m])"
+                },
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "legendTemplate": "canceled acquires"
+              }
+            ],
+            "timeshiftDuration": "0s",
+            "yAxis": {
+              "label": "events/sec",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

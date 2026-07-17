@@ -83,6 +83,11 @@ type Handlers struct {
 	asyncMu    sync.Mutex
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
+
+	// authzSvc is a process-lifetime singleton so its permission cache persists
+	// across requests. Built lazily from Pool on first use.
+	authzOnce sync.Once
+	authzSvc  *authz.Service
 }
 
 // asyncBookkeeping runs a fire-and-forget post-VMD bookkeeping DB write in a
@@ -153,7 +158,10 @@ func (h *Handlers) authzService() *authz.Service {
 	if h == nil || h.Pool == nil {
 		return nil
 	}
-	return authz.New(h.Pool)
+	h.authzOnce.Do(func() {
+		h.authzSvc = authz.NewCached(h.Pool)
+	})
+	return h.authzSvc
 }
 
 // vmdForHost returns the VMDClient for the given host. When a registry is

@@ -67,6 +67,12 @@ variable "boot_disk_size_gb" {
   default     = 200
 }
 
+variable "boot_disk_type" {
+  description = "Boot disk type (e.g. hyperdisk-balanced, pd-balanced). Null lets the Compute API pick its default (pd-standard). Metal machine types with no Persistent Disk support (C4, Z3) must set a Hyperdisk type or the instance insert is rejected."
+  type        = string
+  default     = null
+}
+
 variable "metadata" {
   description = "Instance metadata."
   type        = map(string)
@@ -87,4 +93,10 @@ variable "on_host_maintenance" {
     condition     = contains(["MIGRATE", "TERMINATE"], var.on_host_maintenance)
     error_message = "on_host_maintenance must be MIGRATE or TERMINATE."
   }
+}
+
+variable "reservation_name" {
+  description = "Name of a SPECIFIC_RESERVATION to consume for this instance. Null to schedule normally (on-demand). The instance's zone must match the reservation's zone."
+  type        = string
+  default     = null
 }
