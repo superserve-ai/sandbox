@@ -143,14 +143,12 @@ module "api" {
 
   env = {
     API_PORT               = "8080"
-    EDGE_PROXY_DOMAIN      = "usc-sandbox.superserve.ai"
     SUPABASE_URL           = var.supabase_url
     SENTRY_DSN             = "https://4497bf1fc61a2388b355489982086ac7@o4511499764760576.ingest.us.sentry.io/4511499780620288"
     SECRETS_SIGNING_KEY_ID = "v1"
     VMD_GRPC_ADDRESS       = "10.0.0.3:50051"
     SYSTEM_TEAM_ID         = "258e290e-d30d-4d2a-b751-07da118248c0"
     ALLOW_EPHEMERAL_SEED   = "0"
-    API_PORT               = "8080"
     DB_MAX_CONNS           = "12"
     EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"

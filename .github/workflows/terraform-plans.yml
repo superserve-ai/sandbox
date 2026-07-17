@@ -29,6 +29,8 @@ jobs:
             dir: infra/envs/production/us-central1
           - name: production-us-west2
             dir: infra/envs/production/us-west2
+          - name: production-us-east4
+            dir: infra/envs/production/us-east4
     env:
       TF_IN_AUTOMATION: "true"
       HAS_GCP_AUTH: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
@@ -49,13 +51,14 @@ jobs:
       - name: Skip plan when GCP auth is unavailable
         if: env.HAS_GCP_AUTH != 'true'
         run: |
+          summary_file="${GITHUB_WORKSPACE}/terraform-plan-summary-${{ matrix.name }}.txt"
           echo "::notice title=Terraform plan skipped::GCP auth secrets are not configured."
           echo "Terraform plan skipped because GCP auth secrets are not configured for this workflow." >> "$GITHUB_STEP_SUMMARY"
           {
             echo "## Terraform plan: ${{ matrix.name }}"
             echo
             echo "Skipped because GCP auth secrets are not configured."
-          } > terraform-plan-summary.txt
+          } > "$summary_file"
 
       - name: Validate and plan
         if: env.HAS_GCP_AUTH == 'true'
@@ -63,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          summary_file="terraform-plan-summary.txt"
+          summary_file="${GITHUB_WORKSPACE}/terraform-plan-summary-${{ matrix.name }}.txt"
           {
             echo "## Terraform plan: ${{ matrix.name }}"
             echo
@@ -109,24 +112,26 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: terraform-plan-summary-${{ matrix.name }}
-          path: terraform-plan-summary.txt
+          path: terraform-plan-summary-${{ matrix.name }}.txt
           if-no-files-found: error
 
   terraform-plan-summary:
     name: Terraform Plan Summary
     runs-on: ubuntu-latest
     needs: [terraform-plan]
+    if: always()
     permissions:
       contents: read
     steps:
       - name: Download plan summaries
+        if: always()
         uses: actions/download-artifact@v4
         with:
           pattern: terraform-plan-summary-*
           path: terraform-plan-summaries
-          merge-multiple: true
 
       - name: Publish consolidated summary
+        if: always()
         shell: bash
         run: |
           set -euo pipefail

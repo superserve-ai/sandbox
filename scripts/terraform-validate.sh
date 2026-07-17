@@ -8,6 +8,7 @@ terraform_dirs=(
   infra/envs/staging/us-central1
   infra/envs/production/us-central1
   infra/envs/production/us-west2
+  infra/envs/production/us-east4
 )
 
 if [[ ${#terraform_dirs[@]} -eq 0 ]]; then
