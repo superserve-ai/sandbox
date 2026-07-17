@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"regexp"
@@ -9,6 +10,10 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func TestValidateSecretName(t *testing.T) {
@@ -893,4 +898,77 @@ func TestProviderShortcutsHaveDisplayNames(t *testing.T) {
 			t.Errorf("provider %q missing Display field", name)
 		}
 	}
+}
+
+// resolveSecretBindingsForCreate now fetches all referenced secrets in one
+// batched query. This exercises the mapping, de-duplication of shared names,
+// and the not-found error.
+func TestResolveSecretBindingsForCreate_Batches(t *testing.T) {
+	teamID := uuid.New()
+	shortcut := "anthropic"
+	secA := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "anthropic-key", AuthType: "bearer", ProviderShortcut: &shortcut}
+	secB := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "openai-key", AuthType: "bearer"}
+	byName := map[string]db.Secret{secA.Name: secA, secB.Name: secB}
+
+	var queryCount int
+	mock := &mockDBTX{
+		queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+			if !strings.Contains(sql, "GetSecretsByNames") {
+				t.Fatalf("unexpected query: %s", sql)
+			}
+			queryCount++
+			names := args[1].([]string)
+			rows := make([]func(dest ...any) error, 0, len(names))
+			for _, n := range names {
+				if s, ok := byName[n]; ok {
+					rows = append(rows, secretRow(s).scanFn)
+				}
+			}
+			return &scanRows{rows: rows}, nil
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+
+	t.Run("distinct secrets, one query", func(t *testing.T) {
+		queryCount = 0
+		bindings, meta, appErr := h.resolveSecretBindingsForCreate(context.Background(), teamID, map[string]string{
+			"ANTHROPIC_API_KEY": "anthropic-key",
+			"OPENAI_API_KEY":    "openai-key",
+		})
+		if appErr != nil {
+			t.Fatalf("unexpected error: %+v", appErr)
+		}
+		if queryCount != 1 {
+			t.Fatalf("expected 1 batched query, got %d", queryCount)
+		}
+		if len(bindings) != 2 || len(meta) != 2 {
+			t.Fatalf("expected 2 bindings/meta, got %d/%d", len(bindings), len(meta))
+		}
+	})
+
+	t.Run("shared name de-duplicated", func(t *testing.T) {
+		queryCount = 0
+		bindings, _, appErr := h.resolveSecretBindingsForCreate(context.Background(), teamID, map[string]string{
+			"KEY_ONE": "anthropic-key",
+			"KEY_TWO": "anthropic-key",
+		})
+		if appErr != nil {
+			t.Fatalf("unexpected error: %+v", appErr)
+		}
+		if len(bindings) != 2 {
+			t.Fatalf("both env keys must bind, got %d", len(bindings))
+		}
+		if bindings[0].SecretID != secA.ID || bindings[1].SecretID != secA.ID {
+			t.Fatalf("both bindings must reference the shared secret")
+		}
+	})
+
+	t.Run("missing secret is a 400", func(t *testing.T) {
+		_, _, appErr := h.resolveSecretBindingsForCreate(context.Background(), teamID, map[string]string{
+			"GHOST": "does-not-exist",
+		})
+		if appErr == nil || appErr.Code != "secret_not_found" {
+			t.Fatalf("expected secret_not_found, got %+v", appErr)
+		}
+	})
 }
