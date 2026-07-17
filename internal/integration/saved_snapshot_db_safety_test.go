@@ -25,8 +25,30 @@ type savedSnapshotForkFixture struct {
 	forkID     uuid.UUID
 }
 
+// seedSavedSnapshotTestHost satisfies the same host-admission invariant as
+// production: every sandbox that can mutate host-local snapshot artifacts must
+// belong to an active host row. Keep this scoped to the snapshot fixtures so a
+// synthetic host cannot affect unrelated scheduler tests.
+func seedSavedSnapshotTestHost(t *testing.T) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO host (
+			id, vmd_addr, proxy_addr, region,
+			capacity_memory_mib, capacity_vcpus, status
+		) VALUES (
+			'snapshot-host', '127.0.0.1:1', '127.0.0.1:2', 'test',
+			65536, 64, 'active'
+		)
+		ON CONFLICT (id) DO UPDATE
+		SET status = 'active', updated_at = now()
+	`); err != nil {
+		t.Fatalf("seed snapshot test host: %v", err)
+	}
+}
+
 func seedSavedSnapshotForkFixture(t *testing.T, destroyed bool) savedSnapshotForkFixture {
 	t.Helper()
+	seedSavedSnapshotTestHost(t)
 
 	ctx := context.Background()
 	team, err := testQueries.CreateTeam(ctx, "snapshot-db-safety-"+uuid.NewString())
@@ -255,6 +277,7 @@ func TestIntegration_SnapshotForkActivationSkipsLegacyStorageInterval(t *testing
 }
 
 func TestIntegration_BeginSavedSnapshotRejectsExhaustedStorageQuota(t *testing.T) {
+	seedSavedSnapshotTestHost(t)
 	ctx := context.Background()
 	team, err := testQueries.CreateTeam(ctx, "snapshot-quota-full-"+uuid.NewString())
 	if err != nil {
@@ -416,6 +439,7 @@ func TestIntegration_UpsertSandboxRevocationNeverShortensExpiry(t *testing.T) {
 }
 
 func TestIntegration_FailSavedSnapshotAndSourcePersistsRevocationAtomically(t *testing.T) {
+	seedSavedSnapshotTestHost(t)
 	ctx := context.Background()
 	team, err := testQueries.CreateTeam(ctx, "snapshot-source-failure-"+uuid.NewString())
 	if err != nil {
@@ -478,6 +502,7 @@ func TestIntegration_FailSavedSnapshotAndSourcePersistsRevocationAtomically(t *t
 }
 
 func TestIntegration_FinalizeSavedSnapshotEnforcesActualLayerQuotaAtomically(t *testing.T) {
+	seedSavedSnapshotTestHost(t)
 	ctx := context.Background()
 	team, err := testQueries.CreateTeam(ctx, "snapshot-finalize-quota-"+uuid.NewString())
 	if err != nil {
@@ -874,6 +899,7 @@ func TestIntegration_SavedSnapshotLayerLedgerCountsSharedLayersOnce(t *testing.T
 }
 
 func TestIntegration_WritableMeasurementCollapsesOwnerOnlySourceGenerations(t *testing.T) {
+	seedSavedSnapshotTestHost(t)
 	ctx := context.Background()
 	team, err := testQueries.CreateTeam(ctx, "snapshot-generation-collapse-"+uuid.NewString())
 	if err != nil {

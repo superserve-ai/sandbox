@@ -14,6 +14,7 @@ import (
 )
 
 func TestIntegration_FailSavedSnapshotSourceAfterRevocationClearsHeldClaimAndClosesUsage(t *testing.T) {
+	seedSavedSnapshotTestHost(t)
 	ctx := context.Background()
 	team, err := testQueries.CreateTeam(ctx, "snapshot-source-fallback-"+uuid.NewString())
 	if err != nil {
