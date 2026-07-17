@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -45,9 +46,11 @@ func activeCount(t *testing.T, teamID uuid.UUID) int {
 	err := testPool.QueryRow(context.Background(),
 		`SELECT COALESCE(active_sandbox_count, 0) FROM team_active_sandbox_counts WHERE team_id = $1`,
 		teamID).Scan(&n)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0 // no shard rows yet reads as zero
+	}
 	if err != nil {
-		// No shard rows yet reads as zero.
-		return 0
+		t.Fatalf("query active count: %v", err)
 	}
 	return n
 }
@@ -131,9 +134,9 @@ func TestIntegration_QuotaHardLimitAcrossFastPathBoundary(t *testing.T) {
 	}
 }
 
-// Increments and decrements land on random shards, so individual shard rows go
-// negative; the summed view must stay correct across the lifecycle and floor
-// at zero.
+// Increments and decrements can land on different shards, so individual shard
+// rows go negative; the summed view must stay correct across the lifecycle and
+// floor at zero.
 func TestIntegration_QuotaShardSumTracksLifecycle(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
