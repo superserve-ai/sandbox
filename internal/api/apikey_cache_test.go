@@ -2,6 +2,8 @@ package api
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,5 +177,38 @@ func TestAPIKeyCacheTTLFromEnv(t *testing.T) {
 	t.Setenv("API_KEY_CACHE_TTL", "garbage")
 	if got := apiKeyCacheTTLFromEnv(); got != defaultAPIKeyCacheTTL {
 		t.Errorf("garbage: expected default, got %v", got)
+	}
+}
+
+func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
+	c := newAPIKeyCache(10 * time.Second)
+	var calls atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			entry, err := c.fetch("hash1", func() (apiKeyCacheEntry, error) {
+				calls.Add(1)
+				time.Sleep(20 * time.Millisecond) // hold the flight open so misses pile up
+				return apiKeyCacheEntry{id: "id1"}, nil
+			})
+			if err != nil || entry.id != "id1" {
+				t.Errorf("fetch: entry=%+v err=%v", entry, err)
+			}
+		}()
+	}
+	wg.Wait()
+	// 50 concurrent identical misses should collapse to very few executions.
+	if n := calls.Load(); n > 5 {
+		t.Errorf("expected coalesced lookups (<=5), got %d", n)
+	}
+
+	// Disabled cache (nil) must still run fn directly.
+	var disabled *apiKeyCache
+	if _, err := disabled.fetch("hash1", func() (apiKeyCacheEntry, error) {
+		return apiKeyCacheEntry{id: "id2"}, nil
+	}); err != nil {
+		t.Errorf("nil-cache fetch: %v", err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/sync/singleflight"
 )
 
 // apiKeyCache is an in-process, TTL-bounded cache of successful API-key
@@ -56,9 +57,10 @@ type apiKeyCacheEntry struct {
 }
 
 type apiKeyCache struct {
-	ttl time.Duration
-	mu  sync.Mutex
-	m   map[string]*apiKeyCacheEntry
+	ttl   time.Duration
+	group singleflight.Group // coalesces concurrent misses for the same key
+	mu    sync.Mutex
+	m     map[string]*apiKeyCacheEntry
 }
 
 func newAPIKeyCache(ttl time.Duration) *apiKeyCache {
@@ -96,6 +98,24 @@ func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry
 		needTouch = true
 	}
 	return *e, needTouch, true
+}
+
+// fetch coalesces concurrent misses for the same key: one caller runs fn (the
+// DB lookup) and every concurrent waiter shares its result, so a burst hitting
+// an expired entry issues a single query instead of one per request. With
+// caching disabled (nil receiver) fn runs directly — no coalescing, matching
+// the fully-uncached contract.
+func (c *apiKeyCache) fetch(keyHash string, fn func() (apiKeyCacheEntry, error)) (apiKeyCacheEntry, error) {
+	if c == nil {
+		return fn()
+	}
+	v, err, _ := c.group.Do(keyHash, func() (interface{}, error) {
+		return fn()
+	})
+	if err != nil {
+		return apiKeyCacheEntry{}, err
+	}
+	return v.(apiKeyCacheEntry), nil
 }
 
 // put stores a fresh lookup result and reports whether the caller should touch
