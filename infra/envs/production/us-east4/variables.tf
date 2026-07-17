@@ -58,6 +58,12 @@ variable "machine_type" {
   default     = "c4-highmem-288-lssd-metal"
 }
 
+variable "boot_disk_type" {
+  description = "Boot disk type. C4 metal has no Persistent Disk support, so this must be a Hyperdisk type."
+  type        = string
+  default     = "hyperdisk-balanced"
+}
+
 variable "reservation_name" {
   description = "SPECIFIC_RESERVATION to consume for the vmd host. Must be in the same zone as var.zone."
   type        = string

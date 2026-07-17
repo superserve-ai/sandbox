@@ -101,23 +101,26 @@ module "sandbox_host" {
 
   # Label-last: deliberately NOT setting component=vmd/sandbox_role=vmd here.
   # CD and the scheduler key on these labels, so the host stays out of prod
-  # rotation until bring-up (SS-189) and validation (Phase C) are done. Flip
-  # to component=vmd / sandbox_role=vmd via `gcloud compute instances
-  # add-labels` at cutover — `labels` is in the module's ignore_changes, so a
-  # later `terraform apply` won't revert that.
+  # rotation until host bring-up and pre-cutover validation are done. Flip to
+  # component=vmd / sandbox_role=vmd via `gcloud compute instances add-labels`
+  # at cutover — `labels` is in the module's ignore_changes, so a later
+  # `terraform apply` won't revert that.
   labels = merge(local.common_labels, {
     sandbox_status = "provisioning"
   })
 
   service_account_email = data.google_service_account.api_runner.email
 
-  # Matches the live us-central1 prod host (Ubuntu 22.04.5 LTS), NOT this
-  # module's typical ubuntu-2404-lts default — verified 2026-07-17 via direct
-  # SSH that us-central1 actually runs 22.04.5, and SS-173 showed a host-OS
-  # kernel mismatch (west's newer default vs prod's) breaks snapshot restore.
-  # Since this host must restore snapshots copied from us-central1 (SS-195),
-  # matching its OS/kernel family is the safe choice.
+  # Matches the live us-central1 prod host (Ubuntu 22.04 LTS), NOT this
+  # module's typical 24.04 default — the current prod host actually runs
+  # 22.04, and a host-OS kernel mismatch between hosts has been observed to
+  # break snapshot restore. Since this host must restore snapshots copied
+  # from us-central1, matching its OS/kernel family is the safe choice.
   boot_disk_image = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+
+  # C4 (like Z3) has no Persistent Disk support — the boot disk must be a
+  # Hyperdisk type, or the instance insert is rejected.
+  boot_disk_type = var.boot_disk_type
 
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
