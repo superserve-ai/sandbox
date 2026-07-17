@@ -1072,21 +1072,39 @@ func (h *Handlers) resolveSecretBindingsForCreate(
 	if len(refs) == 0 {
 		return nil, nil, nil
 	}
+
+	// Fetch every referenced secret in one query rather than one round trip
+	// per env var. Distinct names only — several env keys may map to the same
+	// secret.
+	names := make([]string, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	for _, name := range refs {
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	rows, err := h.DB.GetSecretsByNames(ctx, db.GetSecretsByNamesParams{
+		TeamID: teamID, Column2: names,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("DB GetSecretsByNames during sandbox create")
+		return nil, nil, ErrInternal
+	}
+	byName := make(map[string]db.Secret, len(rows))
+	for _, row := range rows {
+		byName[row.Name] = row
+	}
+
 	bindings = make([]db.AddSandboxSecretParams, 0, len(refs))
 	meta = make([]SecretBindingMeta, 0, len(refs))
-
 	for envKey, name := range refs {
-		row, err := h.DB.GetSecretByName(ctx, db.GetSecretByNameParams{
-			TeamID: teamID, Name: name,
-		})
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, nil, NewAppError("secret_not_found",
-					fmt.Sprintf("secrets[%s] references %q, which does not exist for this team", envKey, name),
-					http.StatusBadRequest)
-			}
-			log.Error().Err(err).Str("name", name).Msg("DB GetSecretByName during sandbox create")
-			return nil, nil, ErrInternal
+		row, ok := byName[name]
+		if !ok {
+			return nil, nil, NewAppError("secret_not_found",
+				fmt.Sprintf("secrets[%s] references %q, which does not exist for this team", envKey, name),
+				http.StatusBadRequest)
 		}
 		bindings = append(bindings, db.AddSandboxSecretParams{
 			SecretID: row.ID,

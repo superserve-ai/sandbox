@@ -17,6 +17,7 @@ resource "google_compute_instance" "this" {
     initialize_params {
       image = var.boot_disk_image
       size  = var.boot_disk_size_gb
+      type  = var.boot_disk_type
     }
   }
 
@@ -42,6 +43,17 @@ resource "google_compute_instance" "this" {
     provisioning_model  = "STANDARD"
   }
 
+  dynamic "reservation_affinity" {
+    for_each = var.reservation_name == null ? [] : [var.reservation_name]
+    content {
+      type = "SPECIFIC_RESERVATION"
+      specific_reservation {
+        key    = "compute.googleapis.com/reservation-name"
+        values = [reservation_affinity.value]
+      }
+    }
+  }
+
   shielded_instance_config {
     enable_integrity_monitoring = true
     enable_secure_boot          = false
@@ -59,7 +71,6 @@ resource "google_compute_instance" "this" {
       network_interface[0].access_config,
       scheduling,
       scratch_disk,
-      tags,
     ]
   }
 }
@@ -79,8 +90,10 @@ locals {
     service_account_email = var.service_account_email
     boot_disk_image       = var.boot_disk_image
     boot_disk_size_gb     = var.boot_disk_size_gb
+    boot_disk_type        = var.boot_disk_type
     can_ip_forward        = var.can_ip_forward
     metadata              = var.metadata
     host_platform         = lookup(var.labels, "sandbox_platform", "unspecified")
+    reservation_name      = var.reservation_name
   }
 }

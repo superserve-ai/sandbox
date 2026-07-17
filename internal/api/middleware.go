@@ -39,7 +39,7 @@ func apiKeyHasScope(c *gin.Context, scope string) bool {
 // On success, sets "team_id" and "api_key_id" in the Gin context.
 //
 // Successful lookups are cached in-process for API_KEY_CACHE_TTL (default
-// 30s), so steady-state requests skip the DB round trip entirely. Revocation
+// 10s), so steady-state requests skip the DB round trip entirely. Revocation
 // therefore takes up to one TTL to propagate; key expiry (expires_at) is
 // exact because it is checked on every cache hit.
 func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
@@ -55,6 +55,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		}()
 	}
 	return func(c *gin.Context) {
+		authStart := time.Now()
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
@@ -76,6 +77,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			if entry.createdBy.Valid && !isConsoleImpersonation(c) {
 				c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
 			}
+			c.Set("auth_ms", time.Since(authStart).Milliseconds())
 			c.Next()
 			return
 		}
@@ -97,15 +99,16 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			return
 		}
 
-		cache.put(keyHash, apiKeyCacheEntry{
+		if cache.put(keyHash, apiKeyCacheEntry{
 			id:        id,
 			teamID:    teamID,
 			name:      name,
 			scopes:    scopes,
 			createdBy: createdBy,
 			expiresAt: expiresAt,
-		}, time.Now())
-		touchLastUsed(context.WithoutCancel(c.Request.Context()), id)
+		}, time.Now()) {
+			touchLastUsed(context.WithoutCancel(c.Request.Context()), id)
+		}
 
 		c.Set("api_key_id", id)
 		c.Set("api_key_name", name)
@@ -114,6 +117,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		if createdBy.Valid && !isConsoleImpersonation(c) {
 			c.Set("actor_id", uuid.UUID(createdBy.Bytes))
 		}
+		c.Set("auth_ms", time.Since(authStart).Milliseconds())
 		c.Next()
 	}
 }

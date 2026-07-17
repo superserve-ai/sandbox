@@ -4,6 +4,15 @@ name: Deploy OTEL Collector
 
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        default: staging
+        options:
+          - staging
+          - production
   push:
     branches: [main]
     paths:
@@ -37,6 +46,36 @@ jobs:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
+          OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          python3 .github/workflows/scripts/deploy-otel-collector.py
+
+  deploy-production:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy OTEL Collector to production VMD instances
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: us-central1
+          VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-central1
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
           python3 .github/workflows/scripts/deploy-otel-collector.py

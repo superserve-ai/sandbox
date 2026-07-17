@@ -269,6 +269,11 @@ type Manager struct {
 	// channel; capacity = effective MaxConcurrentRestores.
 	restoreSem chan struct{}
 
+	// tplLastRestore: last restore time per template mem file, for the
+	// secs_since_template_restore phase tag (a page-cache warmth proxy).
+	tplMu          sync.Mutex
+	tplLastRestore map[string]time.Time
+
 	// builds tracks in-flight and completed template builds. Keyed by
 	// build VM id (which is also "build-" + templateID). Entries survive
 	// until process exit so late pollers can read terminal outcomes.
@@ -362,11 +367,12 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		}
 	}
 	m := &Manager{
-		cfg:        cfg,
-		netMgr:     netMgr,
-		log:        log.With().Str("component", "vm_manager").Logger(),
-		vms:        make(map[string]*VMInstance),
-		restoreSem: make(chan struct{}, maxRestores),
+		cfg:            cfg,
+		netMgr:         netMgr,
+		log:            log.With().Str("component", "vm_manager").Logger(),
+		vms:            make(map[string]*VMInstance),
+		restoreSem:     make(chan struct{}, maxRestores),
+		tplLastRestore: make(map[string]time.Time),
 	}
 	m.loadPresenceConverged()
 	return m, nil
@@ -1610,6 +1616,60 @@ func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
 }
 
+// templateRestoreAge returns seconds since this host last completed a restore of
+// the given template mem file (i.e. last warmed its page cache), or -1 if
+// untracked or first-seen. Read-only — markTemplateRestored does the recording,
+// so a restore that fails before the load can't stamp a false-warm reading.
+func (m *Manager) templateRestoreAge(memPath string) int64 {
+	if !m.isTemplateMemPath(memPath) {
+		return -1
+	}
+	m.tplMu.Lock()
+	prev, seen := m.tplLastRestore[filepath.Clean(memPath)]
+	m.tplMu.Unlock()
+	if !seen {
+		return -1
+	}
+	return int64(time.Since(prev).Seconds())
+}
+
+// markTemplateRestored records that a restore of the given template mem file
+// completed (guest booted → working set now cached). Only template mem paths
+// are tracked (per-VM resume snapshots are keyed by vmID and would grow the map
+// unbounded), so those are a no-op.
+func (m *Manager) markTemplateRestored(memPath string) {
+	if !m.isTemplateMemPath(memPath) {
+		return
+	}
+	m.tplMu.Lock()
+	m.tplLastRestore[filepath.Clean(memPath)] = time.Now()
+	m.tplMu.Unlock()
+}
+
+// psiSomeAvg10 returns the "some avg10" pressure-stall figure from a PSI file
+// (e.g. /proc/pressure/cpu), or -1 if unavailable. Best-effort.
+func psiSomeAvg10(path string) float64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "some ") {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(f, "avg10="); ok {
+				n, perr := strconv.ParseFloat(v, 64)
+				if perr != nil {
+					return -1
+				}
+				return n
+			}
+		}
+	}
+	return -1
+}
+
 // restoreVMSnapshot is the implementation. recordToPath is empty for normal
 // restores; set to a writable file path by template-build access-pattern
 // recording, in which case the in-firecracker UFFD handler writes each served
@@ -1658,6 +1718,22 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
+	// Cold/hot segmentation tags for the phase log, sampled once (not per
+	// attempt): concurrency, template-cache age, and host CPU/mem pressure.
+	// warmthPath is the file that actually drives fault-in — for a layered
+	// overlay it's the recorded template base (memPath is then a per-VM diff),
+	// else memPath itself — so layered restores segment by the base they use.
+	//
+	// inflight = other restores in flight (we already hold a slot, so subtract
+	// it); an uncontended restore reads 0. len >= 1 here, so no underflow.
+	inflight := len(m.restoreSem) - 1
+	warmthPath := memPath
+	if base, ok := readLayeredBase(memPath); ok {
+		warmthPath = base
+	}
+	tplAgeSecs := m.templateRestoreAge(warmthPath)
+	cpuPSI := psiSomeAvg10("/proc/pressure/cpu")
+	memPSI := psiSomeAvg10("/proc/pressure/memory")
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -1892,6 +1968,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Int64("disk_to_net_ms", tNetReady.Sub(netBase).Milliseconds()).
 			Int64("net_to_fc_ms", tFcReady.Sub(tNetReady).Milliseconds()).
 			Int64("entry_to_fc_ready_ms", tFcReady.Sub(tEntry).Milliseconds()).
+			Int("inflight", inflight).
+			Int64("secs_since_template_restore", tplAgeSecs).
+			Bool("inplace", inPlace).
+			Bool("uffd", useUffd).
+			Float64("cpu_psi_avg10", cpuPSI).
+			Float64("mem_psi_avg10", memPSI).
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
 
@@ -2094,6 +2176,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
+
+	// boxd is up → the guest has booted, so this template's working set is now
+	// in page cache: read eagerly at load (File) or faulted in during boot
+	// (UFFD). Stamp warmthPath (the layered base for an overlay restore, else
+	// memPath) here (not at the load) so the next restore's
+	// secs_since_template_restore reflects real warmth for either backend.
+	m.markTemplateRestored(warmthPath)
 
 	m.setStatus(vmID, StatusRunning)
 	m.persistState(inst)

@@ -1,5 +1,5 @@
 {
-  "displayName": "Sandbox Telemetry / Staging Operations",
+  "displayName": "${display_name}",
   "mosaicLayout": {
     "columns": 12,
     "tiles": [
@@ -14,7 +14,7 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "max(db_pool_acquired_conns{environment=\"staging\"} / clamp_min(db_pool_total_conns{environment=\"staging\"}, 1))"
+                  "prometheusQuery": "max(db_pool_acquired_conns{environment=\"${environment}\"} / clamp_min(db_pool_total_conns{environment=\"${environment}\"}, 1))"
                 },
                 "plotType": "LINE",
                 "legendTemplate": "acquired / total",
@@ -40,7 +40,7 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "rate(db_pool_acquire_duration_seconds_total{environment=\"staging\"}[5m]) / clamp_min(rate(db_pool_acquire_total{environment=\"staging\"}[5m]), 1)"
+                  "prometheusQuery": "rate(db_pool_acquire_duration_seconds_total{environment=\"${environment}\"}[5m]) / clamp_min(rate(db_pool_acquire_total{environment=\"${environment}\"}[5m]), 1e-9)"
                 },
                 "plotType": "LINE",
                 "legendTemplate": "avg wait",
@@ -66,10 +66,9 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "sum by (operation, result) (rate(sandbox_transition_total{environment=\"staging\"}[5m]))"
+                  "prometheusQuery": "sum by (operation, result) (rate(sandbox_transition_total{environment=\"${environment}\"}[5m]))"
                 },
                 "plotType": "STACKED_BAR",
-                "legendTemplate": "{{operation}} {{result}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -92,10 +91,9 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, operation) (rate(sandbox_transition_duration_seconds_bucket{environment=\"staging\"}[5m])))"
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, operation) (rate(sandbox_transition_duration_seconds_bucket{environment=\"${environment}\"}[1h])))"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{operation}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -118,10 +116,9 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "sum by (host_id, method) (rate(vmd_call_total{environment=\"staging\",result=\"error\"}[5m]))"
+                  "prometheusQuery": "sum by (host_id, method) (rate(vmd_call_total{environment=\"${environment}\",result=\"error\"}[5m]))"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{host_id}} {{method}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -144,10 +141,9 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, host_id, method) (rate(vmd_call_duration_seconds_bucket{environment=\"staging\"}[5m])))"
+                  "prometheusQuery": "histogram_quantile(0.95, sum by (le, host_id, method) (rate(vmd_call_duration_seconds_bucket{environment=\"${environment}\"}[1h])))"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{host_id}} {{method}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -170,10 +166,9 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "max by (host_id) (host_capacity_used_vcpu{environment=\"staging\"})"
+                  "prometheusQuery": "max by (host_id) (host_capacity_used_vcpu{environment=\"${environment}\"})"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{host_id}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -196,10 +191,9 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "max by (host_id) (host_capacity_used_memory_mib{environment=\"staging\"})"
+                  "prometheusQuery": "max by (host_id) (host_capacity_used_memory_mib{environment=\"${environment}\"})"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{host_id}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -222,10 +216,9 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "max by (host_id) (host_capacity_running_sandboxes{environment=\"staging\"})"
+                  "prometheusQuery": "max by (host_id) (host_capacity_running_sandboxes{environment=\"${environment}\"})"
                 },
                 "plotType": "LINE",
-                "legendTemplate": "{{host_id}}",
                 "targetAxis": "Y1"
               }
             ],
@@ -248,7 +241,7 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "sum(rate(sandbox_transition_total{environment=\"staging\",operation=\"create\",result=\"success\"}[5m]))"
+                  "prometheusQuery": "sum(rate(sandbox_transition_total{environment=\"${environment}\",operation=\"create\",result=\"success\"}[5m]))"
                 },
                 "plotType": "LINE",
                 "legendTemplate": "create success",
@@ -269,21 +262,20 @@
         "width": 6,
         "height": 4,
         "widget": {
-          "title": "Possible Abuse Signals",
+          "title": "Sandbox Error Rate",
           "xyChart": {
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "sum by (result) (rate(sandbox_transition_total{environment=\"staging\",operation=\"create\",result=~\"conflict|error|timeout\"}[5m]))"
+                  "prometheusQuery": "sum by (result) (rate(sandbox_transition_total{environment=\"${environment}\",result=~\"conflict|error|timeout\"}[5m]))"
                 },
-                "plotType": "STACKED_BAR",
-                "legendTemplate": "{{result}}",
+                "plotType": "LINE",
                 "targetAxis": "Y1"
               }
             ],
             "timeshiftDuration": "0s",
             "yAxis": {
-              "label": "events/sec",
+              "label": "errors/sec",
               "scale": "LINEAR"
             }
           }
