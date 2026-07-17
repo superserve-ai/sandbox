@@ -157,7 +157,6 @@ module "api" {
   secrets = {
     DATABASE_URL = {
       secret  = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
-      version = "5"
     }
     INTERNAL_API_TOKEN = {
       secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")

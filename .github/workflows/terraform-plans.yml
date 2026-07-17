@@ -139,7 +139,7 @@ jobs:
           echo "## Terraform Plan Summary" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
 
-          mapfile -t summaries < <(find terraform-plan-summaries -type f -name 'terraform-plan-summary.txt' | sort)
+          mapfile -t summaries < <(find terraform-plan-summaries -type f -name 'terraform-plan-summary-*.txt' | sort)
 
           if [[ ${#summaries[@]} -eq 0 ]]; then
             echo "No Terraform plan summaries were produced." >> "$GITHUB_STEP_SUMMARY"
