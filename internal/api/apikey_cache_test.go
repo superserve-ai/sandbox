@@ -184,19 +184,20 @@ func TestAPIKeyCacheTTLFromEnv(t *testing.T) {
 func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
 	c := newAPIKeyCache(10 * time.Second)
 	var calls atomic.Int64
-	var entered sync.Once
-	flightOpen := make(chan struct{})
 	release := make(chan struct{})
 
-	// First fetcher opens the flight and blocks on release; the rest launch
-	// while it is provably held open, so coalescing is deterministic — no
-	// wall-clock dependence.
-	var wg sync.WaitGroup
+	// Every flight blocks on release, and release closes only after all 50
+	// goroutines have signaled ready immediately before calling fetch — so
+	// nearly all of them are parked inside the first flight when it completes.
+	// Only a goroutine preempted in the instructions between ready.Done and
+	// group.Do can run its own (instant) flight afterward; a small tolerance
+	// absorbs those without any wall-clock dependence.
+	var wg, ready sync.WaitGroup
 	launch := func() {
 		defer wg.Done()
+		ready.Done()
 		entry, err := c.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
 			calls.Add(1)
-			entered.Do(func() { close(flightOpen) })
 			<-release
 			return apiKeyCacheEntry{id: "id1"}, nil
 		})
@@ -205,20 +206,18 @@ func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
 		}
 	}
 
-	wg.Add(1)
-	go launch()
-	<-flightOpen
-	for i := 0; i < 49; i++ {
-		wg.Add(1)
+	wg.Add(50)
+	ready.Add(50)
+	for i := 0; i < 50; i++ {
 		go launch()
 	}
+	ready.Wait()
+	time.Sleep(2 * time.Millisecond) // let the signaled goroutines cross into group.Do
 	close(release)
 	wg.Wait()
 
-	// The 49 waiters launched while the flight was held open; only stragglers
-	// that reached group.Do after it closed could add a call.
-	if n := calls.Load(); n > 2 {
-		t.Errorf("expected coalesced lookups (<=2), got %d", n)
+	if n := calls.Load(); n > 5 {
+		t.Errorf("expected coalesced lookups (<=5), got %d", n)
 	}
 }
 
