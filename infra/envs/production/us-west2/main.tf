@@ -37,29 +37,6 @@ locals {
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
-module "artifact_storage" {
-  source = "../../../modules/artifact-storage"
-
-  project_id  = local.project_id
-  environment = local.environment
-  region      = local.region
-
-  artifact_registry = {
-    superserve = {
-      repository_id = "superserve-${local.resource_suffix}"
-      format        = "DOCKER"
-      description   = "Superserve control plane images for ${local.region}"
-    }
-  }
-
-  labels = local.common_labels
-}
-
-import {
-  to = module.artifact_storage.google_artifact_registry_repository.repositories["superserve"]
-  id = "projects/${local.project_id}/locations/${local.region}/repositories/superserve-usw2"
-}
-
 module "network" {
   source = "../../../modules/network"
 
@@ -126,7 +103,7 @@ module "api" {
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
   service_account_email = data.google_service_account.api_runner.email
-  image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve-${local.resource_suffix}/controlplane:replace-me"
+  image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   cpu_limit         = "2"
   memory_limit      = "1Gi"
