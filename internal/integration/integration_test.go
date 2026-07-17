@@ -1431,7 +1431,7 @@ func TestIntegration_PauseRevertExemptFromQuota(t *testing.T) {
 	}
 
 	var count int
-	if err := testPool.QueryRow(ctx, `SELECT active_sandbox_count FROM team WHERE id = $1`, teamID).Scan(&count); err != nil {
+	if err := testPool.QueryRow(ctx, `SELECT active_sandbox_count FROM team_active_sandbox_counts WHERE team_id = $1`, teamID).Scan(&count); err != nil {
 		t.Fatalf("read count: %v", err)
 	}
 	if count != 2 {
