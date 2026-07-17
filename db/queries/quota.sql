@@ -1,21 +1,24 @@
 -- name: ListTeamQuotaUsage :many
 -- Per-team sandbox + template usage and limits, restricted to teams with any
 -- usage (an empty team can't be near a threshold). Used by the quota watcher.
+-- Sandbox counts come from the sharded-counter view; team.active_sandbox_count
+-- is no longer written.
 SELECT
     t.id,
     t.name,
-    t.active_sandbox_count,
+    COALESCE(sc.active_sandbox_count, 0)::int AS active_sandbox_count,
     t.max_sandboxes,
     t.max_templates,
     COALESCE(tpl.cnt, 0)::int AS template_count
 FROM team t
+LEFT JOIN team_active_sandbox_counts sc ON sc.team_id = t.id
 LEFT JOIN (
     SELECT team_id, COUNT(*) AS cnt
     FROM template
     WHERE deleted_at IS NULL
     GROUP BY team_id
 ) tpl ON tpl.team_id = t.id
-WHERE t.active_sandbox_count > 0 OR COALESCE(tpl.cnt, 0) > 0;
+WHERE COALESCE(sc.active_sandbox_count, 0) > 0 OR COALESCE(tpl.cnt, 0) > 0;
 
 -- name: ClaimQuotaAlert :execrows
 -- Atomically record that (team, quota_type, channel) has been alerted. Affects 1

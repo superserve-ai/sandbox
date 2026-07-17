@@ -527,6 +527,11 @@ type Team struct {
 	HomeRegion            string    `json:"home_region"`
 }
 
+type TeamActiveSandboxCount struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	ActiveSandboxCount int32     `json:"active_sandbox_count"`
+}
+
 type TeamBillingPeriod struct {
 	TeamID              uuid.UUID          `json:"team_id"`
 	PeriodStart         time.Time          `json:"period_start"`
@@ -623,6 +628,12 @@ type TeamPricingPlan struct {
 	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
 	AssignedBy    pgtype.UUID        `json:"assigned_by"`
 	CreatedAt     time.Time          `json:"created_at"`
+}
+
+type TeamSandboxCounter struct {
+	TeamID uuid.UUID `json:"team_id"`
+	Shard  int16     `json:"shard"`
+	Cnt    int32     `json:"cnt"`
 }
 
 type Template struct {
