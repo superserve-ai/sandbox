@@ -34,12 +34,30 @@ func TestAPIKeyCache_MissAfterTTL(t *testing.T) {
 	if _, _, ok := c.get("hash1", now.Add(31*time.Second)); ok {
 		t.Error("expected miss after TTL")
 	}
-	// Expired entry must have been evicted, not just skipped.
+	// The expired entry is retained (never served) so put can carry its
+	// lastTouch across the refill; the capacity sweep reclaims it eventually.
 	c.mu.Lock()
 	_, exists := c.m["hash1"]
 	c.mu.Unlock()
-	if exists {
-		t.Error("expected expired entry to be deleted")
+	if !exists {
+		t.Error("expected expired entry to be retained for touch-throttle continuity")
+	}
+}
+
+func TestAPIKeyCache_TouchThrottleSurvivesRefill(t *testing.T) {
+	c := newAPIKeyCache(10 * time.Second)
+	now := time.Now()
+	if !c.put("hash1", apiKeyCacheEntry{id: "id1"}, now) {
+		t.Fatal("first put must touch")
+	}
+
+	// TTL expires, the miss path refills within the touch interval: no touch.
+	if c.put("hash1", apiKeyCacheEntry{id: "id1"}, now.Add(11*time.Second)) {
+		t.Error("refill within lastUsedTouchInterval must not touch")
+	}
+	// A refill after the interval elapses touches again.
+	if !c.put("hash1", apiKeyCacheEntry{id: "id1"}, now.Add(lastUsedTouchInterval+time.Second)) {
+		t.Error("refill after the interval must touch")
 	}
 }
 

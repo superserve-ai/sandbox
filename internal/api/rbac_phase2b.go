@@ -154,7 +154,7 @@ func requestActorID(c *gin.Context, platform bool) (uuid.UUID, error) {
 	return customerActorID(c)
 }
 
-func (h *Handlers) withRBACMutation(ctx context.Context, fn func(q db.DBTX, svc *authz.Service) error) error {
+func (h *Handlers) withRBACMutation(ctx context.Context, teamID uuid.UUID, fn func(q db.DBTX, svc *authz.Service) error) error {
 	if h == nil {
 		return fmt.Errorf("handlers not configured")
 	}
@@ -170,7 +170,15 @@ func (h *Handlers) withRBACMutation(ctx context.Context, fn func(q db.DBTX, svc 
 	if err := fn(tx, authz.New(tx)); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	// Drop this instance's cached grants for the team; other instances converge
+	// within the cache TTL (see teamPermCacheTTL for the revocation contract).
+	if svc := h.authzService(); svc != nil {
+		svc.InvalidateTeam(teamID)
+	}
+	return nil
 }
 
 func lockTeamMutation(ctx context.Context, q db.DBTX, teamID uuid.UUID) error {
@@ -800,7 +808,7 @@ func (h *Handlers) addMember(c *gin.Context, platform bool) {
 	}
 
 	ctx := c.Request.Context()
-	err = h.withRBACMutation(ctx, func(q db.DBTX, svc *authz.Service) error {
+	err = h.withRBACMutation(ctx, teamID, func(q db.DBTX, svc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
 		}
@@ -945,7 +953,7 @@ func (h *Handlers) deactivateMember(c *gin.Context, platform bool) {
 	}
 
 	ctx := c.Request.Context()
-	err = h.withRBACMutation(ctx, func(q db.DBTX, svc *authz.Service) error {
+	err = h.withRBACMutation(ctx, teamID, func(q db.DBTX, svc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
 		}
@@ -1083,7 +1091,7 @@ func (h *Handlers) assignRole(c *gin.Context, platform bool) {
 	ctx := c.Request.Context()
 	var assignment roleAssignmentRecord
 	var assignmentEmail string
-	err = h.withRBACMutation(ctx, func(q db.DBTX, svc *authz.Service) error {
+	err = h.withRBACMutation(ctx, teamID, func(q db.DBTX, svc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
 		}
@@ -1260,7 +1268,7 @@ func (h *Handlers) revokeRole(c *gin.Context, platform bool) {
 	}
 
 	ctx := c.Request.Context()
-	err = h.withRBACMutation(ctx, func(q db.DBTX, svc *authz.Service) error {
+	err = h.withRBACMutation(ctx, teamID, func(q db.DBTX, svc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
 		}
@@ -1376,7 +1384,7 @@ func (h *Handlers) recoverTeam(c *gin.Context) {
 	var output struct {
 		Recovered bool `json:"recovered"`
 	}
-	err = h.withRBACMutation(ctx, func(q db.DBTX, txSvc *authz.Service) error {
+	err = h.withRBACMutation(ctx, teamID, func(q db.DBTX, txSvc *authz.Service) error {
 		if err := lockTeamMutation(ctx, q, teamID); err != nil {
 			return err
 		}

@@ -18,7 +18,7 @@ import (
 // bad keys cannot grow the map. The key's own expires_at is stored and
 // checked on every hit, so expiry is exact even inside the TTL window.
 const (
-	defaultAPIKeyCacheTTL = 30 * time.Second
+	defaultAPIKeyCacheTTL = 10 * time.Second
 	// apiKeyCacheMaxEntries bounds the map. Only valid keys enter the
 	// cache, so this is effectively "number of live keys used within one
 	// TTL" — the cap is a backstop, not an expected operating point.
@@ -81,8 +81,14 @@ func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry
 	if !exists {
 		return apiKeyCacheEntry{}, false, false
 	}
-	if now.Sub(e.fetchedAt) > c.ttl || (e.expiresAt.Valid && !now.Before(e.expiresAt.Time)) {
+	if e.expiresAt.Valid && !now.Before(e.expiresAt.Time) {
 		delete(c.m, keyHash)
+		return apiKeyCacheEntry{}, false, false
+	}
+	if now.Sub(e.fetchedAt) > c.ttl {
+		// TTL-expired: report a miss but keep the entry — it is never served,
+		// and put reads its lastTouch so the last_used_at throttle survives
+		// refills (otherwise every TTL expiry would write last_used_at).
 		return apiKeyCacheEntry{}, false, false
 	}
 	if now.Sub(e.lastTouch) >= lastUsedTouchInterval {
@@ -92,16 +98,24 @@ func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry
 	return *e, needTouch, true
 }
 
-// put stores a fresh lookup result. lastTouch starts at now because the
-// caller just touched last_used_at on the miss path.
-func (c *apiKeyCache) put(keyHash string, e apiKeyCacheEntry, now time.Time) {
+// put stores a fresh lookup result and reports whether the caller should touch
+// last_used_at. The prior entry's lastTouch (kept across TTL expiry by get)
+// carries the throttle over refills, so the touch rate stays bounded by
+// lastUsedTouchInterval no matter how short the TTL is.
+func (c *apiKeyCache) put(keyHash string, e apiKeyCacheEntry, now time.Time) (needTouch bool) {
 	if c == nil {
-		return
+		return true
 	}
 	e.fetchedAt = now
-	e.lastTouch = now
+	needTouch = true
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if old, ok := c.m[keyHash]; ok && now.Sub(old.lastTouch) < lastUsedTouchInterval {
+		e.lastTouch = old.lastTouch
+		needTouch = false
+	} else {
+		e.lastTouch = now
+	}
 	if len(c.m) >= apiKeyCacheMaxEntries {
 		for h, old := range c.m {
 			if now.Sub(old.fetchedAt) > c.ttl {
@@ -115,4 +129,5 @@ func (c *apiKeyCache) put(keyHash string, e apiKeyCacheEntry, now time.Time) {
 		}
 	}
 	c.m[keyHash] = &e
+	return needTouch
 }
