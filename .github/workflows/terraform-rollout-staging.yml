@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      snapshot_storage_only:
+        description: 'Target only the saved-snapshot data disk and attachment'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   staging:
@@ -60,13 +65,23 @@ jobs:
           command -v curl
 
       - name: Terraform apply staging/us-central1
+        env:
+          SNAPSHOT_STORAGE_ONLY: ${{ inputs.snapshot_storage_only }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
           cd infra/envs/staging/us-central1
           terraform init -input=false
           terraform validate
-          terraform plan -input=false -out=tfplan
+          target_args=()
+          if [[ "$SNAPSHOT_STORAGE_ONLY" == "true" ]]; then
+            target_args+=(
+              -target=google_compute_disk.sandbox_data
+              -target=google_compute_attached_disk.sandbox_data
+            )
+            echo "Targeted rollout: saved-snapshot storage only." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          terraform plan -input=false -out=tfplan "${target_args[@]}"
           terraform show -json tfplan > tfplan.json
           destructive=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' tfplan.json)
           if [[ "$destructive" != "0" ]]; then
