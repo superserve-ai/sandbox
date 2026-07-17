@@ -124,6 +124,7 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
   for_each = toset([
     "posthog-project-key",
     "slack-quota-alert-webhook",
+    coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
   ])
 
   project   = local.project_id
@@ -131,6 +132,13 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${local.api_service_account_email}"
 }
+
+resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
+  crypto_key_id = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${local.api_service_account_email}"
+}
+
 module "api" {
   source = "../../../modules/api"
 
@@ -144,10 +152,8 @@ module "api" {
   env = {
     API_PORT               = "8080"
     SUPABASE_URL           = var.supabase_url
-    SENTRY_DSN             = "https://4497bf1fc61a2388b355489982086ac7@o4511499764760576.ingest.us.sentry.io/4511499780620288"
     SECRETS_SIGNING_KEY_ID = "v1"
     VMD_GRPC_ADDRESS       = "10.0.0.3:50051"
-    SENTRY_DSN             = "https://4497bf1fc61a2388b355489982086ac7@o4511499764760576.ingest.us.sentry.io/4511499780620288"
     SYSTEM_TEAM_ID         = "258e290e-d30d-4d2a-b751-07da118248c0"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "12"
@@ -167,6 +173,9 @@ module "api" {
     }
     SECRETS_SIGNING_KEY = {
       secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
+    }
+    SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
     }
     SLACK_QUOTA_ALERT_WEBHOOK = {
       secret = "slack-quota-alert-webhook"

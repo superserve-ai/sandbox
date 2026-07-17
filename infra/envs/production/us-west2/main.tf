@@ -54,6 +54,12 @@ module "artifact_storage" {
 
   labels = local.common_labels
 }
+
+import {
+  to = module.artifact_storage.google_artifact_registry_repository.repositories["superserve"]
+  id = "projects/${local.project_id}/locations/${local.region}/repositories/superserve-usw2"
+}
+
 module "network" {
   source = "../../../modules/network"
 
@@ -134,8 +140,12 @@ module "api" {
     EDGE_PROXY_DOMAIN = "usw-sandbox.superserve.ai"
     SANDBOX_ID_REGION = "usw"
     SUPABASE_URL      = var.supabase_url
+ SECRETS_SIGNING_KEY_ID = "v1"
+ ALLOW_EPHEMERAL_SEED   = "0"
+    DB_MAX_CONNS           = "12"
     VMD_GRPC_ADDRESS  = "10.1.0.2:50051"
     SYSTEM_TEAM_ID    = "258e290e-d30d-4d2a-b751-07da118248c0"
+KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
 
   secrets = {
@@ -150,6 +160,14 @@ module "api" {
     }
     SECRETS_SIGNING_KEY = {
       secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
+    }SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
+    }
+    SLACK_QUOTA_ALERT_WEBHOOK = {
+      secret = "slack-quota-alert-webhook"
+    }
+    POSTHOG_KEY = {
+      secret = "posthog-project-key"
     }
   }
 
