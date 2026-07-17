@@ -435,7 +435,7 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
-	// Preview URL access policy: 'legacy_public' preserves all-port routing for compatibility; 'public' and 'private' require publication, with private token-gated. Callers can select public/private at create and via PATCH.
+	// Preview URL policy: legacy_public preserves pre-publication all-port routing; public and private require publication, with private token-gated. Callers may select public/private at create and via PATCH.
 	PreviewAccess         string `json:"preview_access"`
 	PreviewPolicyRevision int64  `json:"preview_policy_revision"`
 }
@@ -461,7 +461,7 @@ type SandboxComputeBillingInterval struct {
 	EndReason *string            `json:"end_reason"`
 }
 
-// Explicitly published preview ports for a private sandbox. Presence of a row is what makes a port routable at the edge; token_version is the per-port credential generation used for independent rotation.
+// Explicitly published preview ports for strict public/private sandboxes. Presence of a row is what makes a port routable at the edge; token_version is the per-port credential generation used for independent rotation.
 type SandboxPublishedPort struct {
 	SandboxID    uuid.UUID `json:"sandbox_id"`
 	Port         int32     `json:"port"`
