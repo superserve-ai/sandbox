@@ -124,6 +124,7 @@ jobs:
 
       - name: Diagnose staging host drain
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.diagnostics_only == 'true'
+        timeout-minutes: 10
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}

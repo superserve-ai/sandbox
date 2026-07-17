@@ -106,6 +106,7 @@ PG_CONNECT_TIMEOUT_SECONDS = 15
 PG_STATEMENT_TIMEOUT_MS = 30000
 PSQL_COMMAND_TIMEOUT_SECONDS = 45
 DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 60
+MAX_DIAGNOSTIC_HOSTS = 2
 
 HOST_LIFECYCLE_ACTIVITY_SQL = textwrap.dedent("""
     (
@@ -668,7 +669,7 @@ VMD_DRAIN_DIAGNOSTIC_SCRIPT = textwrap.dedent(r"""
       'firecracker@*.service' || true
     echo '=== firecracker processes ==='
     sudo pgrep -x firecracker | while read -r pid; do
-      sudo ps -p "$pid" -o pid=,etimes=,stat=,args=
+      sudo ps -p "$pid" -o pid=,etimes=,stat=
     done || true
 
     echo '=== direct firecracker states ==='
@@ -685,11 +686,27 @@ VMD_DRAIN_DIAGNOSTIC_SCRIPT = textwrap.dedent(r"""
       \( -name vmstate.snap -o -name mem.snap -o -name mem.diff \) \
       -printf '%TY-%Tm-%TdT%TT\t%s\t%p\n' 2>/dev/null | sort | tail -200 || true
 
-    echo '=== recent vmd pause errors ==='
+    echo '=== recent vmd pause classifications ==='
+    for classification in \
+      'not_found:not found' \
+      'orphan_state:orphan systemd' \
+      'no_space:no space' \
+      'deadline:deadline' \
+      'context_canceled:context canceled' \
+      'snapshot_failure:create .*snapshot.*failed|create snapshot:'; do
+      label=${classification%%:*}
+      pattern=${classification#*:}
+      count=$(sudo journalctl -u superserve-vmd.service \
+        --since '45 minutes ago' --no-pager -o cat 2>/dev/null | \
+        grep -Eic "$pattern" || true)
+      printf '%s\t%s\n' "$label" "$count"
+    done
+    echo '=== opaque ids in recent classified vmd events ==='
     sudo journalctl -u superserve-vmd.service --since '45 minutes ago' \
-      --no-pager -o short-iso 2>&1 | \
+      --no-pager -o cat 2>/dev/null | \
       grep -Ei 'pause|snapshot|not found|orphan systemd|no space|deadline|context canceled|failed' | \
-      tail -300 || true
+      grep -Eo '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | \
+      sort | uniq -c | tail -100 || true
 """).strip()
 
 
@@ -766,14 +783,14 @@ def report_host_drain_diagnostics(database_url, host_id, project, region, label,
         logging_filter = (
             'resource.type="cloud_run_revision" '
             f'AND resource.labels.service_name="{service}" '
-            'AND severity>=ERROR'
+            'AND jsonPayload.pause_operation="host_drain_pause"'
         )
         diagnostic_subprocess(
             [
                 "gcloud", "logging", "read", logging_filter,
                 f"--project={project}", "--freshness=45m", "--limit=200",
                 "--order=asc",
-                "--format=json(timestamp,severity,jsonPayload.message,jsonPayload.error,jsonPayload.sandbox_id,jsonPayload.pause_operation,textPayload)",
+                "--format=json(timestamp,severity,jsonPayload.sandbox_id,jsonPayload.pause_operation)",
             ],
             "recent staging API errors",
             database_url,
@@ -786,6 +803,7 @@ def report_host_drain_diagnostics(database_url, host_id, project, region, label,
             "gcloud", "compute", "instances", "list",
             f"--project={project}",
             f"--filter=labels.{label} AND status=RUNNING",
+            f"--limit={MAX_DIAGNOSTIC_HOSTS + 1}",
             "--format=csv[no-heading](name,zone)",
         ],
         env={key: value for key, value in os.environ.items() if key != "DATABASE_URL" and not key.startswith("PG")},
@@ -806,6 +824,12 @@ def report_host_drain_diagnostics(database_url, host_id, project, region, label,
     ]
     if not instances:
         print("VMD diagnostics: no matching running instances")
+        return
+    if len(instances) > MAX_DIAGNOSTIC_HOSTS:
+        print(
+            "VMD diagnostics refused: matching host count exceeds safe cap "
+            f"of {MAX_DIAGNOSTIC_HOSTS}"
+        )
         return
     for inst in instances:
         name, zone = inst["name"], inst["zone"]
