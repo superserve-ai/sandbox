@@ -67,6 +67,12 @@ variable "boot_disk_size_gb" {
   default     = 200
 }
 
+variable "boot_disk_type" {
+  description = "Boot disk type (e.g. hyperdisk-balanced, pd-balanced). Null lets the Compute API pick its default (pd-standard). Metal machine types with no Persistent Disk support (C4, Z3) must set a Hyperdisk type or the instance insert is rejected."
+  type        = string
+  default     = null
+}
+
 variable "metadata" {
   description = "Instance metadata."
   type        = map(string)

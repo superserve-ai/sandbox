@@ -17,6 +17,7 @@ resource "google_compute_instance" "this" {
     initialize_params {
       image = var.boot_disk_image
       size  = var.boot_disk_size_gb
+      type  = var.boot_disk_type
     }
   }
 
@@ -89,6 +90,7 @@ locals {
     service_account_email = var.service_account_email
     boot_disk_image       = var.boot_disk_image
     boot_disk_size_gb     = var.boot_disk_size_gb
+    boot_disk_type        = var.boot_disk_type
     can_ip_forward        = var.can_ip_forward
     metadata              = var.metadata
     host_platform         = lookup(var.labels, "sandbox_platform", "unspecified")
