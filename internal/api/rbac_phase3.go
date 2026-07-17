@@ -89,6 +89,13 @@ func (h *Handlers) requireTeamSettingsWrite(c *gin.Context, teamID uuid.UUID) bo
 	return h.requireCustomerTeamPermission(c, teamID, "settings:write")
 }
 
+func (h *Handlers) requireTeamActivityRead(c *gin.Context, teamID uuid.UUID) bool {
+	if isConsoleImpersonation(c) && apiKeyHasScope(c, "platform:activity:read") {
+		return true
+	}
+	return h.requireCustomerTeamPermission(c, teamID, "settings:read")
+}
+
 func (h *Handlers) requireTeamTemplateRead(c *gin.Context, teamID uuid.UUID) bool {
 	if isConsoleImpersonation(c) && apiKeyHasScope(c, "platform:template:read") {
 		return true

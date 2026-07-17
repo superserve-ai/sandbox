@@ -111,6 +111,32 @@ func TestConsoleImpersonation_TemplateReadScope(t *testing.T) {
 	}
 }
 
+func TestConsoleImpersonation_ActivityReadScope(t *testing.T) {
+	teamID, _ := seedTeamAndKey(t)
+	otherTeamID, _ := seedTeamAndKey(t)
+	r := newTokenRouter(t)
+
+	now := time.Now()
+	insertSecretActivity(t, teamID, "target-team-event", "target-secret", now)
+	insertSecretActivity(t, otherTeamID, "other-team-event", "other-secret", now.Add(time.Second))
+
+	allowedKey := seedConsoleImpersonationKey(t, teamID, []string{"platform:activity:read"}, nil)
+	resp := do(r, http.MethodGet, "/activity", allowedKey, "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("scoped activity list: expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 || rows[0]["action"] != "target-team-event" {
+		t.Fatalf("activity list = %v, want only the target team's event", rows)
+	}
+
+	deniedKey := seedConsoleImpersonationKey(t, teamID, []string{"platform:sandbox:read"}, nil)
+	deniedResp := do(r, http.MethodGet, "/activity", deniedKey, "")
+	if deniedResp.Code != http.StatusForbidden {
+		t.Fatalf("activity without scope: expected 403, got %d: %s", deniedResp.Code, deniedResp.Body.String())
+	}
+}
+
 func TestConsoleImpersonation_CannotMutateSandboxes(t *testing.T) {
 	teamID, ownerKey := seedTeamAndKey(t)
 	r := newTokenRouter(t)
@@ -157,7 +183,6 @@ func TestConsoleImpersonation_CannotAccessNonSandboxReadEndpoints(t *testing.T) 
 		method string
 		path   string
 	}{
-		{name: "activity", method: http.MethodGet, path: "/activity"},
 		{name: "files", method: http.MethodGet, path: "/sandboxes/" + sandboxID.String() + "/files?path=/"},
 		{name: "network", method: http.MethodGet, path: "/sandboxes/" + sandboxID.String() + "/network"},
 		{name: "secrets", method: http.MethodGet, path: "/secrets"},
@@ -253,6 +278,14 @@ func TestConsoleImpersonation_ScopeIsNarrow(t *testing.T) {
 	if resp := do(r, "GET", "/templates?owner=team", sandboxOnlyKey, ""); resp.Code != http.StatusForbidden {
 		t.Fatalf("sandbox-only key listing templates: expected 403, got %d: %s", resp.Code, resp.Body.String())
 	}
+
+	activityOnlyKey := seedConsoleImpersonationKey(t, teamID, []string{"platform:activity:read"}, nil)
+	if resp := do(r, "GET", "/sandboxes", activityOnlyKey, ""); resp.Code != http.StatusForbidden {
+		t.Fatalf("activity-only key listing sandboxes: expected 403, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if resp := do(r, "GET", "/templates?owner=team", activityOnlyKey, ""); resp.Code != http.StatusForbidden {
+		t.Fatalf("activity-only key listing templates: expected 403, got %d: %s", resp.Code, resp.Body.String())
+	}
 }
 
 func TestConsoleImpersonation_TemplateBuildReadsAllowed(t *testing.T) {
@@ -331,7 +364,7 @@ func TestConsoleImpersonation_TemporaryKeyNameOnly(t *testing.T) {
 		TeamID:  teamID,
 		KeyHash: keyHash,
 		Name:    "not-console-impersonation",
-		Scopes:  []string{"platform:sandbox:read", "platform:template:read"},
+		Scopes:  []string{"platform:sandbox:read", "platform:template:read", "platform:activity:read"},
 	}); err != nil {
 		t.Fatalf("create non-impersonation key: %v", err)
 	}
@@ -341,6 +374,9 @@ func TestConsoleImpersonation_TemporaryKeyNameOnly(t *testing.T) {
 	}
 	if resp := do(r, "GET", "/templates?owner=team", rawKey, ""); resp.Code != http.StatusForbidden {
 		t.Fatalf("non-impersonation key with scopes listing templates: expected 403, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if resp := do(r, "GET", "/activity", rawKey, ""); resp.Code != http.StatusForbidden {
+		t.Fatalf("non-impersonation key with scopes listing activity: expected 403, got %d: %s", resp.Code, resp.Body.String())
 	}
 }
 
