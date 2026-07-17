@@ -228,6 +228,37 @@ module "sandbox_host" {
   }
 }
 
+# Saved snapshots depend on mandatory copy-on-write clones between the mutable
+# VM runtime tree and the immutable snapshot tree. The imported staging host's
+# boot filesystem is ext4, so keep those two trees on a separate XFS Persistent
+# Disk without replacing the host or hiding its kernel, base rootfs, or BoltDB.
+resource "google_compute_disk" "sandbox_data" {
+  project = local.project_id
+  name    = "superserve-vmd-staging-sandbox-data"
+  zone    = local.zone
+  type    = "pd-balanced"
+  size    = 500
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_compute_attached_disk" "sandbox_data" {
+  project         = local.project_id
+  zone            = local.zone
+  disk            = google_compute_disk.sandbox_data.self_link
+  instance        = module.sandbox_host.instance_self_link
+  device_name     = "superserve-sandbox-data"
+  mode            = "READ_WRITE"
+  deletion_policy = "PREVENT"
+}
+
 module "observability" {
   source = "../../../modules/observability"
 

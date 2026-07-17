@@ -182,6 +182,11 @@ jobs:
       - name: Run unit tests
         run: go test -v -short -count=1 -race ./...
 
+      - name: Validate VMD deployment scripts
+        run: |
+          bash -n scripts/setup-sandbox-data-disk.sh
+          python3 -m unittest discover -s .github/workflows/scripts -p 'test_deploy_vmd.py' -v
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest

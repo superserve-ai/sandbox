@@ -8,6 +8,10 @@
 
 name: Deploy VMD
 
+concurrency:
+  group: deploy-vmd-hosts
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +25,8 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/workflows/deploy-vmd.yml'
+      - '.github/workflows/scripts/deploy-vmd.py'
       - 'cmd/vmd/**'
       - 'cmd/boxd/**'
       - 'cmd/template-builder/**'
@@ -36,7 +42,9 @@ on:
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
+      - 'deploy/sandbox-data-disk.service'
       - 'scripts/fc-cleanup'
+      - 'scripts/setup-sandbox-data-disk.sh'
 
 jobs:
   deploy-staging:
@@ -60,10 +68,10 @@ jobs:
         # to install boxd / secretsproxy, so a no-op is cheap at rest.
         run: |
           mkdir -p bin
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/secretsproxy ./cmd/secretsproxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/secretsproxy ./cmd/secretsproxy
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -91,6 +99,7 @@ jobs:
           VMD_RESUME_UFFD: 'true'
           VMD_INCREMENTAL_SNAPSHOT: 'true'
           VMD_SAVED_SNAPSHOT_PREFLIGHT: 'true'
+          SANDBOX_DATA_DISK_DEVICE: '/dev/disk/by-id/google-superserve-sandbox-data'
           SHA: ${{ github.sha }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
@@ -117,10 +126,10 @@ jobs:
         # Always build all four; hash-compare on the host decides install.
         run: |
           mkdir -p bin
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -trimpath -o bin/secretsproxy ./cmd/secretsproxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/boxd ./cmd/boxd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/template-builder ./cmd/template-builder
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -trimpath -o bin/secretsproxy ./cmd/secretsproxy
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2

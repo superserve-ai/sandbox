@@ -21,6 +21,10 @@ Env vars:
   VMD_SAVED_SNAPSHOT_PREFLIGHT
                        optional boolean — verify mandatory reflinks on the
                        target host before restarting vmd
+  SANDBOX_DATA_DISK_DEVICE
+                       optional stable /dev/disk/by-id/google-* path. When
+                       supplied, prepare persistent XFS storage before the
+                       saved-snapshot preflight.
   SHA                  required — commit SHA (only first 8 chars used)
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
@@ -35,6 +39,7 @@ preserving vmd's template cache.
 """
 
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -73,7 +78,9 @@ BUNDLE_FILES = [
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
     "deploy/sandboxes.slice",
+    "deploy/sandbox-data-disk.service",
     "scripts/fc-cleanup",
+    "scripts/setup-sandbox-data-disk.sh",
 ]
 
 VMD_BOOLEAN_ENV_VARS = (
@@ -113,6 +120,20 @@ def optional_boolean(environ, key):
     return value == "true"
 
 
+def optional_data_disk_device(environ=None):
+    """Return a shell-safe stable Google device path when configured."""
+    environ = os.environ if environ is None else environ
+    value = environ.get("SANDBOX_DATA_DISK_DEVICE", "").strip()
+    if not value:
+        return ""
+    if not re.fullmatch(r"/dev/disk/by-id/google-[A-Za-z0-9._-]+", value):
+        raise ValueError(
+            "SANDBOX_DATA_DISK_DEVICE must be a stable "
+            f"/dev/disk/by-id/google-* path, got {value!r}"
+        )
+    return value
+
+
 def main() -> int:
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
@@ -131,6 +152,7 @@ def main() -> int:
     saved_snapshot_preflight_call = (
         "verify_saved_snapshot_storage" if saved_snapshot_preflight else ":"
     )
+    data_disk_device = optional_data_disk_device()
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -175,6 +197,83 @@ def main() -> int:
 
     bundle_remote = f"/tmp/deploy-bundle-{sha}.tar.gz"
     extract_dir = f"/tmp/deploy-{sha}"
+    data_disk_setup_call = ":"
+    if data_disk_device:
+        data_disk_setup_call = textwrap.dedent(f"""
+            DATA_DISK_VMD_WAS_ACTIVE=0
+            if sudo systemctl is-active --quiet {service}; then
+                DATA_DISK_VMD_WAS_ACTIVE=1
+            fi
+
+            sudo install -m 0755 {extract_dir}/scripts/setup-sandbox-data-disk.sh /usr/local/bin/setup-sandbox-data-disk.sh
+            sudo install -m 0644 {extract_dir}/deploy/sandbox-data-disk.service /etc/systemd/system/sandbox-data-disk.service
+            sudo install -d -m 0755 /etc/sandbox
+            DATA_DISK_CONFIG_TMP=$(sudo mktemp /etc/sandbox/.data-disk.env.XXXXXX)
+            trap 'sudo rm -f "$DATA_DISK_CONFIG_TMP"' EXIT
+            printf '%s\\n' 'SANDBOX_DATA_DISK_DEVICE={data_disk_device}' | sudo tee "$DATA_DISK_CONFIG_TMP" > /dev/null
+            sudo chown root:root "$DATA_DISK_CONFIG_TMP"
+            sudo chmod 0644 "$DATA_DISK_CONFIG_TMP"
+            sudo mv -f "$DATA_DISK_CONFIG_TMP" /etc/sandbox/data-disk.env
+            DATA_DISK_CONFIG_TMP=
+            trap - EXIT
+
+            if ! command -v mkfs.xfs >/dev/null 2>&1 || ! command -v xfs_info >/dev/null 2>&1; then
+                if ! command -v apt-get >/dev/null 2>&1; then
+                    echo "ERROR: xfsprogs is required for staging snapshot storage" >&2
+                    exit 1
+                fi
+                sudo apt-get update -qq
+                sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfsprogs
+            fi
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable --quiet sandbox-data-disk.service
+            DATA_DISK_SETUP_RC=0
+            DATA_DISK_DIRECT_VERIFY=0
+            if sudo systemctl is-active --quiet sandbox-data-disk.service; then
+                # Never restart this required oneshot: systemd would propagate
+                # its stop to active VMD/Firecracker dependents. The direct
+                # verifier atomically reconciles the boot gate but never
+                # restarts the storage unit or a healthy VMD.
+                DATA_DISK_DIRECT_VERIFY=1
+                sudo /usr/local/bin/setup-sandbox-data-disk.sh --verify-only || DATA_DISK_SETUP_RC=$?
+            else
+                sudo systemctl start sandbox-data-disk.service || DATA_DISK_SETUP_RC=$?
+            fi
+
+            if [ "$DATA_DISK_SETUP_RC" != 0 ]; then
+                if [ "$DATA_DISK_DIRECT_VERIFY" = 1 ]; then
+                    # Defense in depth: the verifier also does this after it
+                    # sees the authority fence. Preserve Firecracker guests so
+                    # they can reattach after the storage issue is repaired.
+                    sudo systemctl stop superserve-vmd.socket {service} || true
+                    echo "Data-disk steady-state verification failed; the VMD control plane remains stopped" >&2
+                elif [ "$DATA_DISK_VMD_WAS_ACTIVE" = 1 ]; then
+                    for attempt in $(seq 1 30); do
+                        sudo systemctl is-active --quiet {service} && break
+                        sleep 1
+                    done
+                    if sudo systemctl is-active --quiet {service}; then
+                        echo "Data-disk setup failed before commit; {service} recovered on the original storage" >&2
+                    else
+                        echo "Data-disk setup failed closed after XFS became authoritative; {service} remains stopped" >&2
+                    fi
+                fi
+                exit "$DATA_DISK_SETUP_RC"
+            fi
+
+            if [ "$DATA_DISK_VMD_WAS_ACTIVE" = 1 ]; then
+                for attempt in $(seq 1 60); do
+                    sudo systemctl is-active --quiet {service} && break
+                    sleep 1
+                done
+                sudo systemctl is-active --quiet {service} || (
+                    echo "ERROR: {service} did not recover after the data-disk migration" >&2
+                    sudo systemctl status --no-pager {service} >&2 || true
+                    exit 1
+                )
+            fi
+        """).strip()
 
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
@@ -224,11 +323,16 @@ def main() -> int:
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 
+            # Staging supplies a stable attached-disk path. Production omits
+            # it, so this block does not install storage units, config, mounts,
+            # or service dependencies there.
+            {data_disk_setup_call}
+
             # Inject boxd + rebuild rootfs only when the new binary differs
-            # from what's already installed. `-trimpath -ldflags '-s -w'`
-            # makes Go builds reproducible, so hashes only differ when
-            # source actually changed. Skipping preserves the rootfs hash,
-            # which keeps vmd's template cache valid.
+            # from what's already installed. `-buildvcs=false -trimpath`
+            # removes checkout-specific build metadata, so hashes only differ
+            # when source or dependencies changed. Skipping preserves the
+            # rootfs hash, which keeps vmd's template cache valid.
             NEW_HASH=$(sha256sum {extract_dir}/bin/boxd | awk '{{print $1}}')
             CUR_HASH=$(sha256sum {install_dir}/boxd 2>/dev/null | awk '{{print $1}}' || echo none)
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Prepare persistent XFS storage for sandbox runtime and snapshots
+After=local-fs.target
+Before=superserve-vmd.service firecracker@.service
+RefuseManualStop=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/sandbox/data-disk.env
+ExecStart=/usr/local/bin/setup-sandbox-data-disk.sh
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
