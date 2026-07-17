@@ -170,7 +170,12 @@ jobs:
       # bring-up's usw2-sandbox.superserve.ai -> usw-sandbox.superserve.ai
       # pattern. Skipped until CLOUD_RUN_SERVICE_USE4 is set.
       - name: Deploy proxy to use4 host
-        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        # Require the region too: deploy-proxy.py treats an empty GCP_REGION as
+        # "no scoping" and would match every prod vmd host, rewriting each
+        # host's /etc/sandbox/proxy.env with the use4 domain values. Gating on
+        # the service flag alone risks clobbering the primary host's proxy
+        # config if the region var is unset.
+        if: vars.CLOUD_RUN_SERVICE_USE4 != '' && vars.GCP_REGION_USE4 != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
