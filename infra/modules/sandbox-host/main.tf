@@ -42,6 +42,17 @@ resource "google_compute_instance" "this" {
     provisioning_model  = "STANDARD"
   }
 
+  dynamic "reservation_affinity" {
+    for_each = var.reservation_name == null ? [] : [var.reservation_name]
+    content {
+      type = "SPECIFIC_RESERVATION"
+      specific_reservation {
+        key    = "compute.googleapis.com/reservation-name"
+        values = [reservation_affinity.value]
+      }
+    }
+  }
+
   shielded_instance_config {
     enable_integrity_monitoring = true
     enable_secure_boot          = false
@@ -81,5 +92,6 @@ locals {
     can_ip_forward        = var.can_ip_forward
     metadata              = var.metadata
     host_platform         = lookup(var.labels, "sandbox_platform", "unspecified")
+    reservation_name      = var.reservation_name
   }
 }

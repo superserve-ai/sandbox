@@ -88,3 +88,9 @@ variable "on_host_maintenance" {
     error_message = "on_host_maintenance must be MIGRATE or TERMINATE."
   }
 }
+
+variable "reservation_name" {
+  description = "Name of a SPECIFIC_RESERVATION to consume for this instance. Null to schedule normally (on-demand). The instance's zone must match the reservation's zone."
+  type        = string
+  default     = null
+}
