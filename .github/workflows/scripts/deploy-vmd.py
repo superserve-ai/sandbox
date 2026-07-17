@@ -14,6 +14,13 @@ Env vars:
   VMD_LABEL            required — gcloud instances list label filter (e.g. component=vmd)
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
+  VMD_UFFD_ENABLED     optional boolean — upsert into /etc/sandbox/vmd.env
+  VMD_RESUME_UFFD      optional boolean — upsert into /etc/sandbox/vmd.env
+  VMD_INCREMENTAL_SNAPSHOT
+                       optional boolean — upsert into /etc/sandbox/vmd.env
+  VMD_SAVED_SNAPSHOT_PREFLIGHT
+                       optional boolean — verify mandatory reflinks on the
+                       target host before restarting vmd
   SHA                  required — commit SHA (only first 8 chars used)
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
@@ -69,6 +76,42 @@ BUNDLE_FILES = [
     "scripts/fc-cleanup",
 ]
 
+VMD_BOOLEAN_ENV_VARS = (
+    "VMD_UFFD_ENABLED",
+    "VMD_RESUME_UFFD",
+    "VMD_INCREMENTAL_SNAPSHOT",
+)
+
+
+def collect_vmd_env_upserts(environ=None):
+    """Return validated optional boolean settings for vmd.env.
+
+    An omitted or empty setting is intentionally a no-op, allowing each
+    deployment environment to opt in without overwriting another
+    environment's host configuration.
+    """
+    environ = os.environ if environ is None else environ
+    upserts = []
+    for key in VMD_BOOLEAN_ENV_VARS:
+        raw_value = environ.get(key, "")
+        if not raw_value:
+            continue
+        value = raw_value.strip().lower()
+        if value not in {"true", "false"}:
+            raise ValueError(f"{key} must be true or false, got {raw_value!r}")
+        upserts.append((key, value))
+    return upserts
+
+
+def optional_boolean(environ, key):
+    raw_value = environ.get(key, "")
+    if not raw_value:
+        return None
+    value = raw_value.strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{key} must be true or false, got {raw_value!r}")
+    return value == "true"
+
 
 def main() -> int:
     project = os.environ["GCP_PROJECT"]
@@ -78,6 +121,16 @@ def main() -> int:
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    vmd_env_upserts = collect_vmd_env_upserts()
+    vmd_env_upsert_calls = "\n".join(
+        f"upsert_vmd_env {key} {value}" for key, value in vmd_env_upserts
+    )
+    saved_snapshot_preflight = optional_boolean(
+        os.environ, "VMD_SAVED_SNAPSHOT_PREFLIGHT"
+    )
+    saved_snapshot_preflight_call = (
+        "verify_saved_snapshot_storage" if saved_snapshot_preflight else ":"
+    )
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -247,6 +300,86 @@ def main() -> int:
                     echo 'SECRETSPROXY_SOCKET=/run/secretsproxy/control.sock' | sudo tee -a "$env_file" > /dev/null
                 fi
             done
+
+            # Apply only explicitly supplied, validated boolean settings to
+            # vmd.env. Preserve every unrelated line and avoid rewriting an
+            # already-canonical setting so repeated deploys are idempotent.
+            upsert_vmd_env() {{
+                local key="$1"
+                local value="$2"
+                local env_file=/etc/sandbox/vmd.env
+                local current_count
+
+                if ! sudo test -f "$env_file"; then
+                    echo "ERROR: $env_file is missing; cannot set $key" >&2
+                    return 1
+                fi
+
+                current_count=$(sudo grep -c "^${{key}}=" "$env_file" || true)
+                if [ "$current_count" -eq 1 ] && sudo grep -qxF "${{key}}=${{value}}" "$env_file"; then
+                    return
+                fi
+
+                sudo sed -i "/^${{key}}=/d" "$env_file"
+                printf '%s=%s\\n' "$key" "$value" | sudo tee -a "$env_file" > /dev/null
+            }}
+
+            # Saved snapshots require mandatory CoW clones both from RunDir
+            # into SnapshotDir and within SnapshotDir. When requested by the
+            # environment, fail the deploy here with filesystem diagnostics
+            # instead of leaving the API to return an opaque capability 503.
+            verify_saved_snapshot_storage() {{
+                local env_file=/etc/sandbox/vmd.env
+                local run_dir snapshot_dir run_source probe_dir snapshot_source
+
+                read_vmd_env() {{
+                    sudo awk -v key="$1" '
+                        index($0, key "=") == 1 {{ value = substr($0, length(key) + 2) }}
+                        END {{ print value }}
+                    ' "$env_file" | sed -e 's/^"//; s/"$//' -e "s/^'//; s/'$//"
+                }}
+
+                run_dir=$(read_vmd_env RUN_DIR)
+                snapshot_dir=$(read_vmd_env SNAPSHOT_DIR)
+                run_dir=${{run_dir:-/var/lib/sandbox/rundir}}
+                snapshot_dir=${{snapshot_dir:-/var/lib/sandbox/snapshots}}
+
+                echo "Saved-snapshot storage preflight:"
+                sudo findmnt -T "$run_dir" -no TARGET,SOURCE,FSTYPE,OPTIONS || true
+                sudo findmnt -T "$snapshot_dir" -no TARGET,SOURCE,FSTYPE,OPTIONS || true
+
+                if ! sudo test -d "$run_dir" || ! sudo test -d "$snapshot_dir"; then
+                    echo "ERROR: saved-snapshot directories are missing (RUN_DIR=$run_dir SNAPSHOT_DIR=$snapshot_dir)" >&2
+                    return 1
+                fi
+
+                run_source=$(sudo mktemp "$run_dir/.saved-snapshot-preflight.XXXXXX")
+                trap "sudo rm -f -- '$run_source'" EXIT
+                probe_dir=$(sudo mktemp -d "$snapshot_dir/.saved-snapshot-preflight.XXXXXX")
+                trap "sudo rm -f -- '$run_source'; sudo rm -rf -- '$probe_dir'" EXIT
+
+                printf '%s\n' superserve-saved-snapshot-reflink-preflight | sudo tee "$run_source" > /dev/null
+                if ! sudo cp --reflink=always --sparse=auto -- "$run_source" "$probe_dir/from-run"; then
+                    echo "ERROR: RUN_DIR -> SNAPSHOT_DIR mandatory reflink is unsupported" >&2
+                    return 1
+                fi
+
+                snapshot_source="$probe_dir/snapshot-source"
+                printf '%s\n' superserve-saved-snapshot-reflink-preflight | sudo tee "$snapshot_source" > /dev/null
+                if ! sudo cp --reflink=always --sparse=auto -- "$snapshot_source" "$probe_dir/within-snapshot"; then
+                    echo "ERROR: SNAPSHOT_DIR mandatory reflink is unsupported" >&2
+                    return 1
+                fi
+
+                sudo cmp -s "$run_source" "$probe_dir/from-run"
+                sudo cmp -s "$snapshot_source" "$probe_dir/within-snapshot"
+                sudo rm -f -- "$run_source"
+                sudo rm -rf -- "$probe_dir"
+                trap - EXIT
+                echo "Saved-snapshot mandatory reflink preflight passed"
+            }}
+            {saved_snapshot_preflight_call}
+            {vmd_env_upsert_calls}
 
             # Stop before starting the socket unit: on the first deploy of
             # socket activation the old direct-bound vmd still holds the

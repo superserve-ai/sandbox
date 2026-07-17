@@ -84,6 +84,13 @@ jobs:
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          # Saved-snapshot runtime capabilities are deliberately enabled in
+          # the staging playground. Production omits these optional deploy
+          # inputs and keeps the host's existing values unchanged.
+          VMD_UFFD_ENABLED: 'true'
+          VMD_RESUME_UFFD: 'true'
+          VMD_INCREMENTAL_SNAPSHOT: 'true'
+          VMD_SAVED_SNAPSHOT_PREFLIGHT: 'true'
           SHA: ${{ github.sha }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
