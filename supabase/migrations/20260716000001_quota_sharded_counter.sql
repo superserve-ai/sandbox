@@ -1,33 +1,23 @@
--- Shard the per-team active-sandbox counter to remove hot-row lock contention
--- on sandbox creation.
+-- Shard the per-team active-sandbox counter: the old single-row `UPDATE team
+-- SET active_sandbox_count = ...` held the team row's lock until commit, so
+-- concurrent creates for one team serialized single-file. Writes now land on
+-- one of 16 random shard rows and enforcement reads SUM(shards) — lock-free
+-- when far from the limit, serialized on an advisory lock and re-checked
+-- exactly when near it.
 --
--- Before: every counted INSERT/UPDATE did `UPDATE team SET active_sandbox_count
--- = ... WHERE id = team_id`, taking the team row's lock and holding it until
--- commit — concurrent creates for one team serialized single-file on that row.
---
--- After: increments and decrements land on one of 16 shard rows per team,
--- picked at random, so concurrent writers rarely collide. Enforcement reads
--- SUM(shards):
---   * far from the limit (sum <= max - margin): admit with no team-level
---     serialization at all — the common case;
---   * near the limit: serialize on a transaction-scoped advisory lock and
---     re-check exactly, so the limit cannot be crossed by racing admissions.
---
--- Enforcement bound, stated precisely: admissions that pass the fast path are
--- invisible to concurrent boundary checks until they commit, so exceeding
--- max_sandboxes would require a fast-path insert to stay in flight while an
--- entire margin's worth of boundary admissions serially commit — a window that
--- is practically unreachable (a single INSERT outliving dozens of serialized
--- commits). The margin must exceed the maximum concurrent in-flight inserts,
--- which is bounded by the API's DB connection pools; the default (64) covers
--- that with headroom and is tunable at runtime without a deploy:
---   ALTER DATABASE postgres SET app.sandbox_quota_margin = '96';
+-- Enforcement bound: fast-path admissions are invisible to concurrent boundary
+-- checks until they commit, so exceeding max_sandboxes would require a single
+-- fast-path INSERT to stay in flight while an entire margin's worth of
+-- boundary admissions serially commit — practically unreachable. The margin
+-- must exceed the maximum concurrent in-flight inserts (bounded by the API's
+-- DB connection pools); the default 64 covers that with headroom and is
+-- runtime-tunable: ALTER DATABASE postgres SET app.sandbox_quota_margin = '96'.
 -- Teams whose max_sandboxes <= margin always take the exact path — identical
--- behavior to the single-row counter they had before.
+-- to the single-row behavior they had before.
 --
--- team.active_sandbox_count is no longer written; it stays in place so a
--- rollback is a single reverse migration (restore the previous function bodies
--- and recompute the column from the shard sums). Readers move to the
+-- team.active_sandbox_count is no longer written but stays in place, so
+-- rollback is one reverse migration (restore the previous function bodies,
+-- recompute the column from shard sums). Readers move to the
 -- team_active_sandbox_counts view.
 
 BEGIN;
@@ -92,10 +82,9 @@ BEGIN
     RETURN; -- fast path: no team-level serialization
   END IF;
 
-  -- Near the limit: serialize admissions for this team and re-check exactly.
-  -- Transaction-scoped, so it releases on commit/abort and cannot leak through
-  -- the connection pooler. The key is namespaced so quota admissions never
-  -- contend with the team-mutation advisory lock.
+  -- Near the limit: serialize this team's admissions and re-check exactly.
+  -- xact-scoped (releases on commit/abort, pooler-safe); key namespaced away
+  -- from the team-mutation advisory lock.
   PERFORM pg_advisory_xact_lock(hashtext('sandbox_quota:' || p_team::text));
   SELECT COALESCE(SUM(cnt), 0) INTO total FROM team_sandbox_counter WHERE team_id = p_team;
   IF total > lim THEN
