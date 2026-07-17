@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -188,7 +189,7 @@ func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			entry, err := c.fetch("hash1", func() (apiKeyCacheEntry, error) {
+			entry, err := c.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
 				calls.Add(1)
 				time.Sleep(20 * time.Millisecond) // hold the flight open so misses pile up
 				return apiKeyCacheEntry{id: "id1"}, nil
@@ -206,7 +207,7 @@ func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
 
 	// Disabled cache (nil) must still run fn directly.
 	var disabled *apiKeyCache
-	if _, err := disabled.fetch("hash1", func() (apiKeyCacheEntry, error) {
+	if _, err := disabled.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
 		return apiKeyCacheEntry{id: "id2"}, nil
 	}); err != nil {
 		t.Errorf("nil-cache fetch: %v", err)

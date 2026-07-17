@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"os"
 	"sync"
 	"time"
@@ -102,15 +103,19 @@ func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry
 
 // fetch coalesces concurrent misses for the same key: one caller runs fn (the
 // DB lookup) and every concurrent waiter shares its result, so a burst hitting
-// an expired entry issues a single query instead of one per request. With
-// caching disabled (nil receiver) fn runs directly — no coalescing, matching
-// the fully-uncached contract.
-func (c *apiKeyCache) fetch(keyHash string, fn func() (apiKeyCacheEntry, error)) (apiKeyCacheEntry, error) {
+// an expired entry issues a single query instead of one per request. The
+// detached context exists only for the coalescing branch — waiters may outlive
+// the triggering request. With caching disabled (nil receiver) there are no
+// waiters, so fn runs directly under the caller's context and a client
+// disconnect cancels the lookup, matching the fully-uncached contract.
+func (c *apiKeyCache) fetch(ctx context.Context, keyHash string, fn func(context.Context) (apiKeyCacheEntry, error)) (apiKeyCacheEntry, error) {
 	if c == nil {
-		return fn()
+		return fn(ctx)
 	}
 	v, err, _ := c.group.Do(keyHash, func() (interface{}, error) {
-		return fn()
+		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		return fn(qctx)
 	})
 	if err != nil {
 		return apiKeyCacheEntry{}, err

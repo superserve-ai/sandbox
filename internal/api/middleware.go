@@ -79,12 +79,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		// arriving on an expired entry runs one query, not one per request.
 		// The touch and put happen inside fn so only the executing caller
 		// performs them — waiters share the entry without re-touching.
-		reqCtx := context.WithoutCancel(c.Request.Context())
-		entry, err := cache.fetch(keyHash, func() (apiKeyCacheEntry, error) {
-			// Detach: coalesced waiters may outlive the triggering request,
-			// and a fresh deadline keeps a slow lookup from hanging.
-			qctx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
-			defer cancel()
+		entry, err := cache.fetch(c.Request.Context(), keyHash, func(qctx context.Context) (apiKeyCacheEntry, error) {
 			var e apiKeyCacheEntry
 			err := pool.QueryRow(qctx,
 				"SELECT id, team_id, name, scopes, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
@@ -94,7 +89,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				return apiKeyCacheEntry{}, err
 			}
 			if cache.put(keyHash, e, time.Now()) {
-				touchLastUsed(reqCtx, e.id)
+				touchLastUsed(context.WithoutCancel(qctx), e.id)
 			}
 			return e, nil
 		})
