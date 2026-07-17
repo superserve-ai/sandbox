@@ -268,6 +268,51 @@ func (q *Queries) GetSecretByName(ctx context.Context, arg GetSecretByNameParams
 	return i, err
 }
 
+const getSecretsByNames = `-- name: GetSecretsByNames :many
+SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
+WHERE team_id = $1 AND name = ANY($2::text[]) AND deleted_at IS NULL
+`
+
+type GetSecretsByNamesParams struct {
+	TeamID  uuid.UUID `json:"team_id"`
+	Column2 []string  `json:"column_2"`
+}
+
+func (q *Queries) GetSecretsByNames(ctx context.Context, arg GetSecretsByNamesParams) ([]Secret, error) {
+	rows, err := q.db.Query(ctx, getSecretsByNames, arg.TeamID, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Secret{}
+	for rows.Next() {
+		var i Secret
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.AuthType,
+			&i.AuthConfig,
+			&i.ProviderShortcut,
+			&i.Hosts,
+			&i.Ciphertext,
+			&i.EncryptedDek,
+			&i.KekID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastUsedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertProxyAudit = `-- name: InsertProxyAudit :exec
 INSERT INTO proxy_audit (
     team_id, sandbox_id, secret_id,
