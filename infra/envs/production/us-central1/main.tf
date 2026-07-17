@@ -120,6 +120,25 @@ module "iam" {
   }
   labels = local.common_labels
 }
+resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
+  for_each = toset([
+    "posthog-project-key",
+    "slack-quota-alert-webhook",
+    coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
+    coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
+  ])
+
+  project   = local.project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.api_service_account_email}"
+}
+
+resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
+  crypto_key_id = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${local.api_service_account_email}"
+}
 
 module "api" {
   source = "../../../modules/api"
@@ -132,10 +151,14 @@ module "api" {
   image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   env = {
-    API_PORT          = "8080"
-    EDGE_PROXY_DOMAIN = "usc-sandbox.superserve.ai"
-    SUPABASE_URL      = var.supabase_url
-    VMD_GRPC_ADDRESS  = "10.0.0.3:50051"
+    API_PORT               = "8080"
+    SUPABASE_URL           = var.supabase_url
+    SECRETS_SIGNING_KEY_ID = "v1"
+    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
+    ALLOW_EPHEMERAL_SEED   = "0"
+    DB_MAX_CONNS           = "12"
+    EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
+    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
 
   secrets = {
@@ -151,6 +174,18 @@ module "api" {
     SECRETS_SIGNING_KEY = {
       secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
     }
+    SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
+    }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+    }
+    SLACK_QUOTA_ALERT_WEBHOOK = {
+      secret = "slack-quota-alert-webhook"
+    }
+    POSTHOG_KEY = {
+      secret = "posthog-project-key"
+    }
   }
   cpu_limit         = "2"
   memory_limit      = "1Gi"
@@ -162,6 +197,11 @@ module "api" {
   vpc_connector = module.network.vpc_connector_id
   vpc_egress    = "PRIVATE_RANGES_ONLY"
   labels        = local.common_labels
+
+  depends_on = [
+    google_secret_manager_secret_iam_member.api_runtime_secrets,
+    google_kms_crypto_key_iam_member.api_runtime_credentials_kms,
+  ]
 }
 
 module "sandbox_host" {

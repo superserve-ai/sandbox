@@ -149,7 +149,7 @@ module "api" {
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
-    VMD_GRPC_ADDRESS            = "10.0.0.2:50051"
+    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
   }
   secrets = {
     SANDBOX_ACCESS_TOKEN_SEED = {
@@ -164,9 +164,47 @@ module "api" {
     INTERNAL_API_TOKEN = {
       secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
     }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+    }
   }
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
+
+  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
+}
+resource "google_compute_disk" "sandbox_data" {
+  project = local.project_id
+  name    = "superserve-vmd-staging-sandbox-data"
+  zone    = local.zone
+  type    = "pd-balanced"
+  size    = 500
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_compute_attached_disk" "sandbox_data" {
+  project     = local.project_id
+  zone        = local.zone
+  disk        = google_compute_disk.sandbox_data.id
+  instance    = module.sandbox_host.instance_self_link
+  device_name = "superserve-sandbox-data"
+  mode        = "READ_WRITE"
+
+  deletion_policy = "PREVENT"
+}
+resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
+  project   = local.project_id
+  secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
 }
 
 module "sandbox_host" {

@@ -37,7 +37,6 @@ locals {
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
-
 module "network" {
   source = "../../../modules/network"
 
@@ -79,9 +78,23 @@ data "google_service_account" "api_runner" {
   account_id = "superserve-api-runner"
 }
 
+
 data "google_service_account" "github_actions" {
   project    = local.project_id
   account_id = "superserve-github-actions"
+}
+
+resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
+  crypto_key_id = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${local.api_service_account_email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
+  project   = local.project_id
+  secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.api_service_account_email}"
 }
 
 # deploy-proxy.yml fetches this secret directly via `gcloud secrets versions
@@ -103,7 +116,7 @@ module "api" {
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
   service_account_email = data.google_service_account.api_runner.email
-  image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve-${local.resource_suffix}/controlplane:replace-me"
+  image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   cpu_limit         = "2"
   memory_limit      = "1Gi"
@@ -113,11 +126,15 @@ module "api" {
   cpu_idle          = true
 
   env = {
-    API_PORT          = "8080"
-    EDGE_PROXY_DOMAIN = "usw-sandbox.superserve.ai"
-    SANDBOX_ID_REGION = "usw"
-    SUPABASE_URL      = var.supabase_url
-    VMD_GRPC_ADDRESS  = "10.1.0.2:50051"
+    API_PORT               = "8080"
+    EDGE_PROXY_DOMAIN      = "usw-sandbox.superserve.ai"
+    SANDBOX_ID_REGION      = "usw"
+    SUPABASE_URL           = var.supabase_url
+    SECRETS_SIGNING_KEY_ID = "v1"
+    ALLOW_EPHEMERAL_SEED   = "0"
+    DB_MAX_CONNS           = "12"
+    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
+    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
 
   secrets = {
@@ -133,6 +150,18 @@ module "api" {
     SECRETS_SIGNING_KEY = {
       secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
     }
+    SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
+    }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+    }
+    SLACK_QUOTA_ALERT_WEBHOOK = {
+      secret = "slack-quota-alert-webhook"
+    }
+    POSTHOG_KEY = {
+      secret = "posthog-project-key"
+    }
   }
 
   vpc_connector  = null
@@ -142,6 +171,11 @@ module "api" {
   vpc_tags       = ["cr-usw2"]
 
   labels = local.common_labels
+
+  depends_on = [
+    google_secret_manager_secret_iam_member.api_runtime_system_team_id,
+    google_kms_crypto_key_iam_member.api_runtime_credentials_kms,
+  ]
 }
 
 module "sandbox_host" {
