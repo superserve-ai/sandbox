@@ -624,14 +624,123 @@ class DeployVmdDataDiskTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DATABASE_URL is required"):
             deploy_vmd.require_database_lifecycle("")
 
+    def test_host_drain_diagnostics_are_allowlisted_and_redacted(self):
+        sql = deploy_vmd.HOST_DRAIN_DIAGNOSTICS_SQL
+        for required in (
+            "s.id::text",
+            "s.status",
+            "s.memory_mib::text",
+            "s.snapshot_operation_id IS NOT NULL",
+            "saved.id::text",
+            "build.id::text",
+            "LIMIT 50",
+        ):
+            self.assertIn(required, sql)
+        for sensitive in (
+            "team_id",
+            "s.name",
+            "metadata",
+            "failure_reason",
+            "error_message",
+            "snapshot_path",
+            "mem_path",
+        ):
+            self.assertNotIn(sensitive, sql)
+
+        database_url = (
+            "postgresql://db-user:db%3Asecret@db.example/staging"
+        )
+        output = (
+            f"url={database_url} password=db:secret "
+            "DATABASE_URL=postgresql://other:visible@db.example/test"
+        )
+        redacted = deploy_vmd.sanitize_diagnostic_output(
+            output, database_url
+        )
+        self.assertNotIn(database_url, redacted)
+        self.assertNotIn("db:secret", redacted)
+        self.assertNotIn("other:visible", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_diagnostic_subprocess_does_not_inherit_database_credentials(self):
+        database_url = "postgresql://db-user:secret@db.example/staging"
+        completed = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        with mock.patch.dict(
+            deploy_vmd.os.environ,
+            {
+                "DATABASE_URL": database_url,
+                "PGPASSWORD": "secret",
+                "PGDATABASE": "staging",
+            },
+            clear=False,
+        ), mock.patch.object(
+            deploy_vmd.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertTrue(
+                deploy_vmd.diagnostic_subprocess(
+                    ["gcloud", "version"],
+                    "test diagnostics",
+                    database_url,
+                )
+            )
+
+        command = run.call_args.args[0]
+        child_env = run.call_args.kwargs["env"]
+        self.assertNotIn(database_url, command)
+        self.assertNotIn("DATABASE_URL", child_env)
+        self.assertNotIn("PGPASSWORD", child_env)
+        self.assertNotIn("PGDATABASE", child_env)
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            deploy_vmd.DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS,
+        )
+
+    def test_diagnostics_only_main_skips_bundle_and_deploy(self):
+        database_url = "postgresql://db-user:secret@db.example/staging"
+        environ = {
+            "GCP_PROJECT": "test-project",
+            "GCP_REGION": "us-central1",
+            "VMD_LABEL": "component=vmd",
+            "VMD_SERVICE": "superserve-vmd",
+            "VMD_INSTALL_DIR": "/usr/local/bin",
+            "VMD_DRAIN_DIAGNOSTICS_ONLY": "true",
+            "VMD_DIAGNOSTIC_HOST_ID": "default",
+            "CLOUD_RUN_SERVICE": "superserve-api",
+            "DATABASE_URL": database_url,
+            "SHA": "0123456789abcdef",
+        }
+        with mock.patch.dict(
+            deploy_vmd.os.environ, environ, clear=True
+        ), mock.patch.object(
+            deploy_vmd, "report_host_drain_diagnostics"
+        ) as report, mock.patch.object(
+            deploy_vmd, "run_or_die"
+        ) as run_or_die:
+            self.assertEqual(deploy_vmd.main(), 0)
+
+        report.assert_called_once_with(
+            database_url=database_url,
+            host_id="default",
+            project="test-project",
+            region="us-central1",
+            label="component=vmd",
+            service="superserve-api",
+        )
+        run_or_die.assert_not_called()
+
     def test_workflow_only_sets_device_for_staging(self):
         workflow = (REPO_ROOT / ".github/workflows/deploy-vmd.yml").read_text()
         self.assertEqual(workflow.count("SANDBOX_DATA_DISK_DEVICE:"), 1)
-        self.assertEqual(workflow.count("DATABASE_URL:"), 1)
-        self.assertIn(
+        self.assertEqual(workflow.count("DATABASE_URL:"), 2)
+        self.assertEqual(
+            workflow.count(
             "DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}",
-            workflow,
+            ),
+            2,
         )
+        self.assertIn("diagnostics_only:", workflow)
+        self.assertIn("VMD_DRAIN_DIAGNOSTICS_ONLY: 'true'", workflow)
+        self.assertIn("CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}", workflow)
         self.assertNotIn("STAGING_INTERNAL_API_TOKEN", workflow)
         self.assertEqual(workflow.count("postgresql-client"), 1)
         self.assertEqual(workflow.count("command -v psql"), 1)
@@ -645,7 +754,7 @@ class DeployVmdDataDiskTests(unittest.TestCase):
         self.assertLess(database_setting, production_job)
         self.assertEqual(
             workflow.count("python3 -u .github/workflows/scripts/deploy-vmd.py"),
-            3,
+            4,
         )
 
 

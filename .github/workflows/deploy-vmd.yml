@@ -22,6 +22,11 @@ on:
         options:
           - staging
           - production
+      diagnostics_only:
+        description: 'Read-only staging host-drain diagnostics (no deploy)'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -58,12 +63,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Go
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.diagnostics_only != 'true'
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Build binaries
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.diagnostics_only != 'true'
         # Always build all four. Hash-compare on the host decides whether
         # to install boxd / secretsproxy, so a no-op is cheap at rest.
         run: |
@@ -93,6 +100,7 @@ jobs:
       # usw cell host (same project, same label) isn't folded into this
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy to VMD instances
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.diagnostics_only != 'true'
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
@@ -114,8 +122,24 @@ jobs:
           # output in Actions and hides the safety-gate state until job exit.
           python3 -u .github/workflows/scripts/deploy-vmd.py
 
+      - name: Diagnose staging host drain
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.diagnostics_only == 'true'
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_SERVICE: ${{ vars.VMD_SERVICE }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          VMD_DRAIN_DIAGNOSTICS_ONLY: 'true'
+          VMD_DIAGNOSTIC_HOST_ID: 'default'
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+          SHA: ${{ github.sha }}
+        run: |
+          python3 -u .github/workflows/scripts/deploy-vmd.py
+
   deploy-production:
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && (github.event_name != 'workflow_dispatch' || github.event.inputs.diagnostics_only != 'true')
     needs: [deploy-staging]
     runs-on: ubuntu-latest
     environment: production

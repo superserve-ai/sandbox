@@ -105,6 +105,7 @@ FIRECRACKER_DRAIN_POLL_SECONDS = 2
 PG_CONNECT_TIMEOUT_SECONDS = 15
 PG_STATEMENT_TIMEOUT_MS = 30000
 PSQL_COMMAND_TIMEOUT_SECONDS = 45
+DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 60
 
 HOST_LIFECYCLE_ACTIVITY_SQL = textwrap.dedent("""
     (
@@ -601,6 +602,225 @@ def run_lifecycle_sql(psql, database_url, host_id, sql, context):
     return result.stdout.strip()
 
 
+HOST_DRAIN_DIAGNOSTICS_SQL = textwrap.dedent(r"""
+    SELECT concat_ws(E'\t', 'host', h.id, h.status,
+                     round(extract(epoch FROM now() - h.updated_at))::text)
+    FROM host h
+    WHERE h.id = :'host_id';
+
+    SELECT concat_ws(E'\t', 'sandbox', s.id::text, s.status,
+                     s.memory_mib::text,
+                     (s.snapshot_operation_id IS NOT NULL)::text,
+                     coalesce(s.snapshot_operation_id::text, '-'),
+                     round(extract(epoch FROM now() - s.updated_at))::text)
+    FROM sandbox s
+    WHERE s.host_id = :'host_id'
+      AND s.destroyed_at IS NULL
+      AND (s.status IN ('starting', 'active', 'pausing', 'resuming')
+           OR s.snapshot_operation_id IS NOT NULL)
+    ORDER BY s.updated_at ASC, s.id ASC
+    LIMIT 50;
+
+    SELECT concat_ws(E'\t', 'saved_snapshot', saved.id::text,
+                     saved.sandbox_id::text, saved.status,
+                     round(extract(epoch FROM now() - saved.updated_at))::text)
+    FROM snapshot saved
+    WHERE saved.host_id = :'host_id'
+      AND saved.kind = 'saved'
+      AND saved.deleted_at IS NULL
+      AND saved.status IN ('creating', 'deleting')
+    ORDER BY saved.updated_at ASC, saved.id ASC
+    LIMIT 50;
+
+    SELECT concat_ws(E'\t', 'template_build', build.id::text,
+                     build.template_id::text, build.status,
+                     round(extract(epoch FROM now() - build.updated_at))::text)
+    FROM template_build build
+    WHERE build.vmd_host_id = :'host_id'
+      AND build.status IN ('building', 'snapshotting')
+    ORDER BY build.updated_at ASC, build.id ASC
+    LIMIT 50;
+""").strip()
+
+
+VMD_DRAIN_DIAGNOSTIC_SCRIPT = textwrap.dedent(r"""
+    set -uo pipefail
+    echo '=== vmd service ==='
+    sudo systemctl is-active superserve-vmd.service || true
+    sudo systemctl show superserve-vmd.service \
+      --property=ActiveState,SubState,MainPID --no-pager || true
+
+    echo '=== disk capacity ==='
+    sudo df -hT /var/lib/sandbox /var/lib/sandbox/snapshots 2>&1 || true
+    sudo df -hi /var/lib/sandbox /var/lib/sandbox/snapshots 2>&1 || true
+
+    echo '=== vmd state files and opaque record ids ==='
+    while IFS= read -r state_file; do
+      sudo stat -c '%n size=%s modified=%y' "$state_file" || true
+      sudo strings "$state_file" 2>/dev/null | \
+        grep -Eo '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | \
+        sort -u | head -100 || true
+    done < <(sudo find /var/lib -xdev -name vmd.db -type f -print 2>/dev/null)
+
+    echo '=== active firecracker units ==='
+    sudo systemctl list-units --type=service \
+      --state=active,activating,deactivating,reloading --no-legend --plain \
+      'firecracker@*.service' || true
+    echo '=== firecracker processes ==='
+    sudo pgrep -x firecracker | while read -r pid; do
+      sudo ps -p "$pid" -o pid=,etimes=,stat=,args=
+    done || true
+
+    echo '=== direct firecracker states ==='
+    while IFS= read -r socket; do
+      printf '%s\t' "$socket"
+      sudo curl --silent --show-error --max-time 2 \
+        --unix-socket "$socket" http://localhost/vm 2>&1 || true
+      printf '\n'
+    done < <(sudo find /var/lib/sandbox/rundir -maxdepth 2 \
+      -type s -name firecracker.sock -print 2>/dev/null | sort)
+
+    echo '=== checkpoint artifacts ==='
+    sudo find /var/lib/sandbox/snapshots -maxdepth 2 -type f \
+      \( -name vmstate.snap -o -name mem.snap -o -name mem.diff \) \
+      -printf '%TY-%Tm-%TdT%TT\t%s\t%p\n' 2>/dev/null | sort | tail -200 || true
+
+    echo '=== recent vmd pause errors ==='
+    sudo journalctl -u superserve-vmd.service --since '45 minutes ago' \
+      --no-pager -o short-iso 2>&1 | \
+      grep -Ei 'pause|snapshot|not found|orphan systemd|no space|deadline|context canceled|failed' | \
+      tail -300 || true
+""").strip()
+
+
+def sanitize_diagnostic_output(value, database_url):
+    """Redact DB credentials from best-effort diagnostic output."""
+    result = value or ""
+    secrets = [database_url]
+    try:
+        decoded_password = database_url_connection_env(database_url).get(
+            "PGPASSWORD", ""
+        )
+        encoded_password = urlsplit(database_url).password or ""
+        secrets.extend((decoded_password, encoded_password))
+    except ValueError:
+        pass
+    for secret in sorted({item for item in secrets if item}, key=len, reverse=True):
+        result = result.replace(secret, "[REDACTED]")
+    result = re.sub(
+        r"postgres(?:ql)?://[^\s'\"<>]+",
+        "[REDACTED_DATABASE_URL]",
+        result,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(
+        r"DATABASE_URL=[^\s]+",
+        "DATABASE_URL=[REDACTED]",
+        result,
+        flags=re.IGNORECASE,
+    )
+    return result
+
+
+def diagnostic_subprocess(cmd, context, database_url, timeout=DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS):
+    """Run a read-only diagnostic without inheriting database credentials."""
+    child_env = os.environ.copy()
+    child_env.pop("DATABASE_URL", None)
+    for key in tuple(child_env):
+        if key.startswith("PG") and key not in {"PATH"}:
+            child_env.pop(key, None)
+    try:
+        result = subprocess.run(
+            cmd,
+            env=child_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"{context}: {sanitize_diagnostic_output(str(error), database_url)}")
+        return False
+    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    print(f"=== {context} (exit={result.returncode}) ===")
+    print(sanitize_diagnostic_output(output or "(no output)", database_url))
+    return result.returncode == 0
+
+
+def report_host_drain_diagnostics(database_url, host_id, project, region, label, service):
+    """Collect bounded, read-only evidence for a staging drain."""
+    psql = require_database_lifecycle(database_url)
+    print("=== database lifecycle blockers ===")
+    try:
+        blockers = run_lifecycle_sql(
+            psql,
+            database_url,
+            host_id,
+            HOST_DRAIN_DIAGNOSTICS_SQL,
+            f"diagnose host {host_id} lifecycle blockers",
+        )
+        print(sanitize_diagnostic_output(blockers or "(none)", database_url))
+    except Exception as error:
+        print(f"database diagnostics failed: {sanitize_diagnostic_output(str(error), database_url)}")
+
+    if service:
+        logging_filter = (
+            'resource.type="cloud_run_revision" '
+            f'AND resource.labels.service_name="{service}" '
+            'AND severity>=ERROR'
+        )
+        diagnostic_subprocess(
+            [
+                "gcloud", "logging", "read", logging_filter,
+                f"--project={project}", "--freshness=45m", "--limit=200",
+                "--order=asc",
+                "--format=json(timestamp,severity,jsonPayload.message,jsonPayload.error,jsonPayload.sandbox_id,jsonPayload.pause_operation,textPayload)",
+            ],
+            "recent staging API errors",
+            database_url,
+        )
+    else:
+        print("recent staging API errors: CLOUD_RUN_SERVICE is not configured")
+
+    result = subprocess.run(
+        [
+            "gcloud", "compute", "instances", "list",
+            f"--project={project}",
+            f"--filter=labels.{label} AND status=RUNNING",
+            "--format=csv[no-heading](name,zone)",
+        ],
+        env={key: value for key, value in os.environ.items() if key != "DATABASE_URL" and not key.startswith("PG")},
+        capture_output=True,
+        text=True,
+        timeout=DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        print("VMD discovery failed: " + sanitize_diagnostic_output(result.stderr, database_url))
+        return
+    instances = [
+        {"name": fields[0], "zone": fields[1]}
+        for line in result.stdout.splitlines()
+        if line.strip()
+        for fields in [line.strip().split(",")]
+        if len(fields) == 2
+        and (not region or fields[1].split("/")[-1].startswith(f"{region}-"))
+    ]
+    if not instances:
+        print("VMD diagnostics: no matching running instances")
+        return
+    for inst in instances:
+        name, zone = inst["name"], inst["zone"]
+        diagnostic_subprocess(
+            [
+                "gcloud", "compute", "ssh", name,
+                f"--zone={zone}", f"--project={project}",
+                "--quiet", "--tunnel-through-iap",
+                "--command", VMD_DRAIN_DIAGNOSTIC_SCRIPT,
+            ],
+            f"VMD host {name}/{zone}",
+            database_url,
+        )
+
+
 def set_host_status(psql, database_url, host_id, status):
     """Set one existing host active/draining and prove the row was updated."""
     if status not in {"active", "draining"}:
@@ -737,8 +957,19 @@ def main() -> int:
     )
     data_disk_device = optional_data_disk_device()
     # Do not inherit the database secret into tar/gcloud/SSH subprocesses. It
-    # is reintroduced only as PGDATABASE for the narrowly scoped psql calls.
+    # is parsed into libpq-only environment fields for narrowly scoped psql.
     database_url = os.environ.pop("DATABASE_URL", "")
+
+    if os.environ.get("VMD_DRAIN_DIAGNOSTICS_ONLY", "") == "true":
+        report_host_drain_diagnostics(
+            database_url=database_url,
+            host_id=os.environ.get("VMD_DIAGNOSTIC_HOST_ID", "default"),
+            project=project,
+            region=region,
+            label=label,
+            service=os.environ.get("CLOUD_RUN_SERVICE", ""),
+        )
+        return 0
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
