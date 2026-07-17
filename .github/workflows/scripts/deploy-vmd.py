@@ -48,6 +48,7 @@ import sys
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 def run_or_die(cmd, context):
@@ -464,6 +465,72 @@ def require_database_lifecycle(database_url):
     return psql
 
 
+DATABASE_URL_QUERY_ENV = {
+    "application_name": "PGAPPNAME",
+    "channel_binding": "PGCHANNELBINDING",
+    "client_encoding": "PGCLIENTENCODING",
+    "connect_timeout": "PGCONNECT_TIMEOUT",
+    "gssencmode": "PGGSSENCMODE",
+    "options": "PGOPTIONS",
+    "requirepeer": "PGREQUIREPEER",
+    "sslcert": "PGSSLCERT",
+    "sslcrl": "PGSSLCRL",
+    "sslcrldir": "PGSSLCRLDIR",
+    "sslkey": "PGSSLKEY",
+    "ssl_max_protocol_version": "PGSSLMAXPROTOCOLVERSION",
+    "ssl_min_protocol_version": "PGSSLMINPROTOCOLVERSION",
+    "sslmode": "PGSSLMODE",
+    "sslrootcert": "PGSSLROOTCERT",
+    "sslsni": "PGSSLSNI",
+    "target_session_attrs": "PGTARGETSESSIONATTRS",
+}
+
+
+def database_url_connection_env(database_url):
+    """Translate one PostgreSQL URI into libpq's non-URI environment.
+
+    PGDATABASE does not interpret a URI; it treats the whole value as a
+    database name and silently falls back to the local socket. Splitting the
+    URI keeps the credential out of argv while giving psql the same remote
+    connection fields explicitly.
+    """
+    if not database_url or any(char.isspace() for char in database_url):
+        raise ValueError("DATABASE_URL must be a non-empty PostgreSQL URI")
+    parsed = urlsplit(database_url)
+    if parsed.scheme not in {"postgres", "postgresql"}:
+        raise ValueError("DATABASE_URL must use postgres:// or postgresql://")
+    if parsed.hostname is None or parsed.username is None:
+        raise ValueError("DATABASE_URL must include a host and user")
+    if parsed.fragment:
+        raise ValueError("DATABASE_URL must not contain a fragment")
+
+    database = unquote(parsed.path.removeprefix("/"))
+    if not database or "/" in database:
+        raise ValueError("DATABASE_URL must include exactly one database name")
+
+    connection_env = {
+        "PGHOST": parsed.hostname,
+        "PGDATABASE": database,
+        "PGUSER": unquote(parsed.username),
+    }
+    if parsed.password is not None:
+        connection_env["PGPASSWORD"] = unquote(parsed.password)
+    try:
+        if parsed.port is not None:
+            connection_env["PGPORT"] = str(parsed.port)
+    except ValueError as error:
+        raise ValueError("DATABASE_URL contains an invalid port") from error
+
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        env_name = DATABASE_URL_QUERY_ENV.get(key)
+        if env_name is None:
+            raise ValueError(
+                f"DATABASE_URL contains unsupported query parameter: {key}"
+            )
+        connection_env[env_name] = value
+    return connection_env
+
+
 def run_lifecycle_sql(psql, database_url, host_id, sql, context):
     """Run one lifecycle query without putting DATABASE_URL on the command line."""
     if not database_url:
@@ -473,7 +540,14 @@ def run_lifecycle_sql(psql, database_url, host_id, sql, context):
 
     child_env = os.environ.copy()
     child_env.pop("DATABASE_URL", None)
-    child_env["PGDATABASE"] = database_url
+    # Prevent ambient runner libpq settings (especially PGSERVICE) from
+    # changing how the explicitly parsed staging URI is interpreted.
+    for key in (
+        "PGDATABASE", "PGHOST", "PGHOSTADDR", "PGPASSFILE", "PGPASSWORD",
+        "PGPORT", "PGSERVICE", "PGSERVICEFILE", "PGUSER",
+    ):
+        child_env.pop(key, None)
+    child_env.update(database_url_connection_env(database_url))
     child_env["PGCONNECT_TIMEOUT"] = str(PG_CONNECT_TIMEOUT_SECONDS)
     bounded_options = (
         f"-c statement_timeout={PG_STATEMENT_TIMEOUT_MS} "

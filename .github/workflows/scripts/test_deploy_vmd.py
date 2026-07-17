@@ -405,8 +405,11 @@ class DeployVmdDataDiskTests(unittest.TestCase):
             check=True,
         )
 
-    def test_lifecycle_sql_uses_pgdatabase_without_url_in_command(self):
-        database_url = "postgresql://db-user:db-secret@db.example/staging"
+    def test_lifecycle_sql_parses_url_without_putting_secret_in_command(self):
+        database_url = (
+            "postgresql://db-user:db%3Asecret@db.example:6543/staging"
+            "?sslmode=require&application_name=vmd%20deploy"
+        )
         completed = SimpleNamespace(
             returncode=0,
             stdout="draining\n",
@@ -427,8 +430,16 @@ class DeployVmdDataDiskTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertNotIn(database_url, command)
         self.assertNotIn(database_url, " ".join(command))
-        self.assertEqual(run.call_args.kwargs["env"]["PGDATABASE"], database_url)
-        self.assertNotIn("DATABASE_URL", run.call_args.kwargs["env"])
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env["PGHOST"], "db.example")
+        self.assertEqual(child_env["PGPORT"], "6543")
+        self.assertEqual(child_env["PGDATABASE"], "staging")
+        self.assertEqual(child_env["PGUSER"], "db-user")
+        self.assertEqual(child_env["PGPASSWORD"], "db:secret")
+        self.assertEqual(child_env["PGSSLMODE"], "require")
+        self.assertEqual(child_env["PGAPPNAME"], "vmd deploy")
+        self.assertNotIn(database_url, child_env.values())
+        self.assertNotIn("DATABASE_URL", child_env)
         self.assertEqual(
             run.call_args.kwargs["env"]["PGCONNECT_TIMEOUT"],
             str(deploy_vmd.PG_CONNECT_TIMEOUT_SECONDS),
@@ -446,6 +457,20 @@ class DeployVmdDataDiskTests(unittest.TestCase):
             deploy_vmd.PSQL_COMMAND_TIMEOUT_SECONDS,
         )
         self.assertEqual(run.call_args.kwargs["input"], "SELECT :'host_id';")
+
+    def test_database_url_parser_rejects_ambiguous_or_unsupported_urls(self):
+        invalid_urls = (
+            "",
+            "mysql://user:secret@db.example/staging",
+            "postgresql://db.example/staging",
+            "postgresql://user:secret@db.example/",
+            "postgresql://user:secret@db.example/staging?unknown=value",
+        )
+        for database_url in invalid_urls:
+            with self.subTest(database_url=database_url), self.assertRaises(
+                ValueError
+            ):
+                deploy_vmd.database_url_connection_env(database_url)
 
     def test_lifecycle_sql_redacts_database_url_from_failures(self):
         database_url = "postgresql://db-user:db-secret@db.example/staging"
