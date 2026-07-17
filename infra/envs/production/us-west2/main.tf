@@ -84,6 +84,26 @@ data "google_service_account" "github_actions" {
   account_id = "superserve-github-actions"
 }
 
+resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
+  for_each = toset([
+    "posthog-project-key",
+    "slack-quota-alert-webhook",
+    coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
+    coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
+  ])
+
+  project   = local.project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.api_service_account_email}"
+}
+
+resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
+  crypto_key_id = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${local.api_service_account_email}"
+}
+
 # deploy-proxy.yml fetches this secret directly via `gcloud secrets versions
 # access` at deploy time for the usw cell step, instead of through a Cloud
 # Run secret binding — so the CI service account needs read access here too,
@@ -120,8 +140,7 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "12"
-    VMD_GRPC_ADDRESS       = "10.1.0.2:50051"
-    SYSTEM_TEAM_ID         = "258e290e-d30d-4d2a-b751-07da118248c0"
+    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
 
@@ -140,6 +159,9 @@ module "api" {
     }
     SENTRY_DSN = {
       secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
+    }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
     }
     SLACK_QUOTA_ALERT_WEBHOOK = {
       secret = "slack-quota-alert-webhook"

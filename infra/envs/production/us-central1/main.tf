@@ -125,6 +125,7 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
     "posthog-project-key",
     "slack-quota-alert-webhook",
     coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
+    coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
   ])
 
   project   = local.project_id
@@ -153,8 +154,7 @@ module "api" {
     API_PORT               = "8080"
     SUPABASE_URL           = var.supabase_url
     SECRETS_SIGNING_KEY_ID = "v1"
-    VMD_GRPC_ADDRESS       = "10.0.0.3:50051"
-    SYSTEM_TEAM_ID         = "258e290e-d30d-4d2a-b751-07da118248c0"
+    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "12"
     EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
@@ -176,6 +176,9 @@ module "api" {
     }
     SENTRY_DSN = {
       secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
+    }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
     }
     SLACK_QUOTA_ALERT_WEBHOOK = {
       secret = "slack-quota-alert-webhook"

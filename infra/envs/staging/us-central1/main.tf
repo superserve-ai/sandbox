@@ -149,8 +149,7 @@ module "api" {
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
-    VMD_GRPC_ADDRESS            = "10.0.0.2:50051"
-    SYSTEM_TEAM_ID              = "a79a37c6-8622-4caa-b0e8-008ab8e4b78e"
+    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
   }
   secrets = {
     SANDBOX_ACCESS_TOKEN_SEED = {
@@ -165,9 +164,19 @@ module "api" {
     INTERNAL_API_TOKEN = {
       secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
     }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+    }
   }
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
+  project   = local.project_id
+  secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
 }
 
 module "sandbox_host" {

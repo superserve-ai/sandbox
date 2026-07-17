@@ -27,7 +27,7 @@ for dir in "${terraform_dirs[@]}"; do
   echo "Validating ${dir}"
   (
     cd "$dir"
-    TF_IN_AUTOMATION=true terraform init -backend=false -input=false
+    TF_IN_AUTOMATION=true terraform init -backend=false -lockfile=readonly -input=false
     terraform validate
   )
 done
