@@ -152,3 +152,9 @@ jobs:
             echo "---" >> "$GITHUB_STEP_SUMMARY"
             echo >> "$GITHUB_STEP_SUMMARY"
           done
+
+      - name: Propagate plan failures
+        if: ${{ needs.terraform-plan.result != 'success' }}
+        run: |
+          echo "::error title=Terraform plan failed::One or more regional Terraform plans failed."
+          exit 1
