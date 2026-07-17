@@ -172,7 +172,10 @@ module "api" {
 
   labels = local.common_labels
 
-  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
+  depends_on = [
+    google_secret_manager_secret_iam_member.api_runtime_system_team_id,
+    google_kms_crypto_key_iam_member.api_runtime_credentials_kms,
+  ]
 }
 
 module "sandbox_host" {
