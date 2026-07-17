@@ -184,30 +184,69 @@ func TestAPIKeyCacheTTLFromEnv(t *testing.T) {
 func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
 	c := newAPIKeyCache(10 * time.Second)
 	var calls atomic.Int64
+	var entered sync.Once
+	flightOpen := make(chan struct{})
+	release := make(chan struct{})
+
+	// First fetcher opens the flight and blocks on release; the rest launch
+	// while it is provably held open, so coalescing is deterministic — no
+	// wall-clock dependence.
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			entry, err := c.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
-				calls.Add(1)
-				time.Sleep(20 * time.Millisecond) // hold the flight open so misses pile up
-				return apiKeyCacheEntry{id: "id1"}, nil
-			})
-			if err != nil || entry.id != "id1" {
-				t.Errorf("fetch: entry=%+v err=%v", entry, err)
-			}
-		}()
-	}
-	wg.Wait()
-	// 50 concurrent identical misses should collapse to very few executions.
-	if n := calls.Load(); n > 5 {
-		t.Errorf("expected coalesced lookups (<=5), got %d", n)
+	launch := func() {
+		defer wg.Done()
+		entry, err := c.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
+			calls.Add(1)
+			entered.Do(func() { close(flightOpen) })
+			<-release
+			return apiKeyCacheEntry{id: "id1"}, nil
+		})
+		if err != nil || entry.id != "id1" {
+			t.Errorf("fetch: entry=%+v err=%v", entry, err)
+		}
 	}
 
-	// Disabled cache (nil) must still run fn directly.
+	wg.Add(1)
+	go launch()
+	<-flightOpen
+	for i := 0; i < 49; i++ {
+		wg.Add(1)
+		go launch()
+	}
+	close(release)
+	wg.Wait()
+
+	// The 49 waiters launched while the flight was held open; only stragglers
+	// that reached group.Do after it closed could add a call.
+	if n := calls.Load(); n > 2 {
+		t.Errorf("expected coalesced lookups (<=2), got %d", n)
+	}
+}
+
+// fetch's context contract: the coalescing branch detaches from the caller
+// (waiters may outlive the triggering request), the disabled branch must NOT
+// (a client disconnect has to cancel the lookup).
+func TestAPIKeyCache_FetchContextContract(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	c := newAPIKeyCache(10 * time.Second)
+	if _, err := c.fetch(cancelled, "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
+		if qctx.Err() != nil {
+			t.Errorf("coalescing flight must be detached from the caller, got %v", qctx.Err())
+		}
+		if _, ok := qctx.Deadline(); !ok {
+			t.Error("coalescing flight must carry its own deadline")
+		}
+		return apiKeyCacheEntry{id: "id1"}, nil
+	}); err != nil {
+		t.Errorf("fetch: %v", err)
+	}
+
 	var disabled *apiKeyCache
-	if _, err := disabled.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
+	if _, err := disabled.fetch(cancelled, "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
+		if qctx.Err() == nil {
+			t.Error("disabled cache must run under the caller's context (cancellation invisible)")
+		}
 		return apiKeyCacheEntry{id: "id2"}, nil
 	}); err != nil {
 		t.Errorf("nil-cache fetch: %v", err)

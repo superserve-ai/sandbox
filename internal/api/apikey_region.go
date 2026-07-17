@@ -64,20 +64,30 @@ func apiKeyRegion(key string) string {
 	return region
 }
 
-// respondAuthFailed writes the 401 for a failed API-key lookup. When the key
-// is tagged with a known region other than this cell's, the body names the
-// fix; every other failure — invalid, legacy, same-region key not found,
-// unparseable — returns the identical generic 401, so the response reveals
-// nothing about whether a key exists. The region token is client-visible
-// plaintext, so echoing it back leaks nothing either.
-func respondAuthFailed(c *gin.Context, apiKey string) {
+// respondWrongRegion writes the redirect 401 when the key is tagged with a
+// known region other than this cell's, and reports whether it responded. The
+// hint comes from the key's own region tag, so it applies regardless of how
+// the lookup failed — a wrong-cell key can never authenticate here. The
+// region token is client-visible plaintext, so echoing it back leaks nothing.
+func respondWrongRegion(c *gin.Context, apiKey string) bool {
 	if region := apiKeyRegion(apiKey); region != "" && region != cellRegion() {
 		if endpoint, known := knownRegions[region]; known {
 			respondErrorMsg(c, "wrong_region",
 				"this API key belongs to region '"+region+"'; use that region's endpoint ("+endpoint+") or upgrade your SDK, which routes automatically",
 				http.StatusUnauthorized)
-			return
+			return true
 		}
+	}
+	return false
+}
+
+// respondAuthFailed writes the 401 for a key the lookup rejected. Every
+// failure other than the wrong-region redirect — invalid, legacy, same-region
+// key not found, unparseable — returns the identical generic 401, so the
+// response reveals nothing about whether a key exists.
+func respondAuthFailed(c *gin.Context, apiKey string) {
+	if respondWrongRegion(c, apiKey) {
+		return
 	}
 	respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
 }

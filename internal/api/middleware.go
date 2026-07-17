@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -44,10 +46,13 @@ func apiKeyHasScope(c *gin.Context, scope string) bool {
 func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 	cache := newAPIKeyCache(apiKeyCacheTTLFromEnv())
 	touchLastUsed := func(ctx context.Context, id string) {
-		// Fire and forget. The context is extracted by the caller before
-		// spawning so the goroutine does not capture c — gin recycles
-		// *Context back to the pool after ServeHTTP returns, causing a
-		// data race if the goroutine reads c.Request later.
+		// Fire and forget: detach here, not at call sites — the caller's ctx
+		// may be cancelled the moment it returns (request teardown, or fetch's
+		// deferred cancel on the flight ctx), which would kill the update
+		// before it runs. The ctx is extracted by the caller before spawning
+		// so the goroutine does not capture c — gin recycles *Context back to
+		// the pool after ServeHTTP returns.
+		ctx = context.WithoutCancel(ctx)
 		go func() {
 			_, _ = pool.Exec(ctx,
 				"UPDATE api_key SET last_used_at = now() WHERE id = $1", id)
@@ -67,7 +72,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 
 		if entry, needTouch, ok := cache.get(keyHash, time.Now()); ok {
 			if needTouch {
-				touchLastUsed(context.WithoutCancel(c.Request.Context()), entry.id)
+				touchLastUsed(c.Request.Context(), entry.id)
 			}
 			setAPIKeyContext(c, entry)
 			c.Set("auth_ms", time.Since(authStart).Milliseconds())
@@ -89,15 +94,29 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				return apiKeyCacheEntry{}, err
 			}
 			if cache.put(keyHash, e, time.Now()) {
-				touchLastUsed(context.WithoutCancel(qctx), e.id)
+				touchLastUsed(qctx, e.id)
 			}
 			return e, nil
 		})
 		if err != nil {
-			// Lookup failed — usually a bad key, but with per-cell databases
-			// it is also how a valid key presented to the wrong cell fails.
-			// respondAuthFailed names the right region when the key says so.
-			respondAuthFailed(c, apiKey)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				// The real bad-key case — with per-cell databases it is also
+				// how a valid key presented to the wrong cell fails;
+				// respondAuthFailed names the right region when the key says so.
+				respondAuthFailed(c, apiKey)
+			case respondWrongRegion(c, apiKey):
+				// A key tagged for another cell can never authenticate here,
+				// whatever the lookup said — the redirect hint already went out.
+			default:
+				// Infrastructure failure, shared by every coalesced waiter —
+				// a 401 here would read as mass key invalidation to SDKs.
+				// 503 is honest and retryable.
+				log.Error().Err(err).Msg("API key lookup failed")
+				respondErrorMsg(c, "service_unavailable",
+					"Authentication is temporarily unavailable. Please retry.",
+					http.StatusServiceUnavailable)
+			}
 			c.Abort()
 			return
 		}
@@ -109,13 +128,14 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 }
 
 // setAPIKeyContext copies an authenticated key's identity into the request
-// context, shared by the cache-hit and lookup paths.
+// context, shared by the cache-hit and lookup paths. The impersonation check
+// reads entry.name directly (not the gin key) so it cannot depend on Set order.
 func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 	c.Set("api_key_id", entry.id)
 	c.Set("api_key_name", entry.name)
 	c.Set("api_key_scopes", entry.scopes)
 	c.Set("team_id", entry.teamID)
-	if entry.createdBy.Valid && !isConsoleImpersonation(c) {
+	if entry.createdBy.Valid && entry.name != consoleImpersonationKeyName {
 		c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
 	}
 }

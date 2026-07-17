@@ -157,7 +157,13 @@ func TestAPIKeyAuth_WrongRegionKey_UseKeyOnUswCell(t *testing.T) {
 	}
 }
 
-func TestAPIKeyAuth_LookupFailureStaysGeneric(t *testing.T) {
+// An infrastructure failure (unreachable DB) must NOT read as a bad key: under
+// coalescing one flight's error reaches every waiter, so a transient DB error
+// as 401 would look like mass key invalidation to SDKs. Same-cell and
+// unparseable keys get 503; only wrong-region keys keep their prefix-derived
+// 401 hint (covered by the WrongRegionKey tests above, which also run on an
+// unreachable pool).
+func TestAPIKeyAuth_LookupInfraFailureIs503(t *testing.T) {
 	t.Setenv("SANDBOX_ID_REGION", "use")
 	r := newAuthTestRouter(newUnreachablePool(t))
 
@@ -165,7 +171,7 @@ func TestAPIKeyAuth_LookupFailureStaysGeneric(t *testing.T) {
 		name string
 		key  string
 	}{
-		{"same-region key not in DB", "ss_live_use_dGVzdHJhbmRvbQ"},
+		{"same-region key", "ss_live_use_dGVzdHJhbmRvbQ"},
 		{"legacy key", "ss_live_dGVzdHJhbmRvbQ"},
 		// Legacy randoms are base64url and may contain underscores; "abc"
 		// parses as a region but is not in knownRegions, so no hint.
@@ -179,14 +185,11 @@ func TestAPIKeyAuth_LookupFailureStaysGeneric(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			code, errObj := doAuthRequest(t, r, tc.key)
-			if code != http.StatusUnauthorized {
-				t.Fatalf("expected 401, got %d", code)
+			if code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d", code)
 			}
-			if errObj["code"] != "auth_failed" {
-				t.Errorf("expected code=auth_failed, got %v", errObj["code"])
-			}
-			if errObj["message"] != "Invalid or missing X-API-Key header." {
-				t.Errorf("expected the generic 401 message, got %v", errObj["message"])
+			if errObj["code"] != "service_unavailable" {
+				t.Errorf("expected code=service_unavailable, got %v", errObj["code"])
 			}
 		})
 	}
