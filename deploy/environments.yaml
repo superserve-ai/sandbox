@@ -171,8 +171,12 @@ environments:
               region: us-east4
               sandbox_role: vmd
               sandbox_status: ready
-            # Temporary validation domain — flips to usc-sandbox.superserve.ai
-            # (or whatever the final client-facing domain is) at cutover.
+            # Temporary validation domain while this host is pre-cutover. At
+            # cutover the "use" cell keeps serving sandbox.superserve.ai
+            # (legacy, permanent — every shipped SDK derives it for use/legacy
+            # keys) and adds use-sandbox.superserve.ai as its regional name
+            # once the proxy accepts the multi-domain set. The physical-region
+            # name (usc/use4) is never client-facing.
             domain: use4-sandbox.superserve.ai
         artifacts:
           docker_repository: us-east4-docker.pkg.dev/rayai-prod/superserve-use4
