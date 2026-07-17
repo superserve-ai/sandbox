@@ -691,6 +691,7 @@ VMD_DRAIN_DIAGNOSTIC_SCRIPT = textwrap.dedent(r"""
       'not_found:not found' \
       'orphan_state:orphan systemd' \
       'no_space:no space' \
+      'api_connections:too many open connections' \
       'deadline:deadline' \
       'context_canceled:context canceled' \
       'snapshot_failure:create .*snapshot.*failed|create snapshot:'; do
@@ -704,7 +705,7 @@ VMD_DRAIN_DIAGNOSTIC_SCRIPT = textwrap.dedent(r"""
     echo '=== opaque ids in recent classified vmd events ==='
     sudo journalctl -u superserve-vmd.service --since '45 minutes ago' \
       --no-pager -o cat 2>/dev/null | \
-      grep -Ei 'pause|snapshot|not found|orphan systemd|no space|deadline|context canceled|failed' | \
+      grep -Ei 'pause|snapshot|not found|orphan systemd|no space|too many open connections|deadline|context canceled|failed' | \
       grep -Eo '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | \
       sort | uniq -c | tail -100 || true
 """).strip()

@@ -120,6 +120,13 @@ type FirecrackerConfig struct {
 func newFCClient(socketPath string) *fcclient.Firecracker {
 	transport := httptransport.New(fcclient.DefaultHost, fcclient.DefaultBasePath, fcclient.DefaultSchemes)
 	transport.Transport = &http.Transport{
+		// A Firecracker process accepts only a small, fixed number of API
+		// connections. Each helper in this file creates a short-lived client;
+		// retaining its HTTP/1.1 idle connection therefore exhausts that limit
+		// after enough lifecycle operations and makes every later request fail
+		// with "Too many open connections". Unix-socket dials are local and
+		// cheap, so close every connection when its request completes.
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var dialer net.Dialer
 			return dialer.DialContext(ctx, "unix", socketPath)

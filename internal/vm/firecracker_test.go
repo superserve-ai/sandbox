@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,11 +11,67 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/vm/fc/client/operations"
 )
+
+// TestFCClientClosesConnections guards Firecracker's small API connection
+// budget. newFCClient is intentionally created per high-level operation, so a
+// keep-alive left behind by each client eventually makes the VMM reject every
+// request with "Too many open connections".
+func TestFCClientClosesConnections(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "fc.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	var openConnections atomic.Int32
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/" {
+				t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"app_name":"Firecracker","id":"vm-1","state":"Running","vmm_version":"test"}`)
+		}),
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateNew:
+				openConnections.Add(1)
+			case http.StateHijacked, http.StateClosed:
+				openConnections.Add(-1)
+			}
+		},
+	}
+	go srv.Serve(ln)
+	defer srv.Close()
+	waitForUnixSocket(t, socketPath)
+
+	for i := 0; i < 20; i++ {
+		state, err := FirecrackerVMStateContext(context.Background(), socketPath)
+		if err != nil {
+			t.Fatalf("state probe %d: %v", i, err)
+		}
+		if state != "Running" {
+			t.Fatalf("state probe %d = %q, want Running", i, state)
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for openConnections.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := openConnections.Load(); got != 0 {
+		t.Fatalf("Firecracker API connections still open after requests: %d", got)
+	}
+}
 
 // TestCreateSnapshot_FlattenFieldInJSONBody asserts that the Go-side enum
 // (SnapshotNormal/SnapshotFlatten) serializes the `flatten` field correctly
