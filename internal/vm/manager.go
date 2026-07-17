@@ -104,11 +104,11 @@ type VMInstance struct {
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
 
-	// PreviewAccess gates numeric-port (preview URL) traffic at the edge
-	// proxy: "private" is deny-by-default (only published ports route); empty
-	// means public (sandboxes that predate the field). PreviewPorts is the
-	// published-port allowlist keyed by port → token generation. Carried like
-	// TeamID so the proxy needs no database. PreviewPolicyRevision is the
+	// PreviewAccess gates numeric-port traffic at the edge proxy: "public" and
+	// "private" require publication, while empty/"legacy_public" preserve the
+	// old open behavior. PreviewPorts is the published-port allowlist keyed by
+	// port → token generation. Carried like TeamID so the proxy needs no
+	// database. PreviewPolicyRevision is the
 	// monotonic generation of (access + ports); a preview-policy update with a
 	// revision <= this one is a stale/reordered push and is ignored.
 	PreviewAccess         string

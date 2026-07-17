@@ -1606,10 +1606,10 @@ type RestoreSnapshotRequest struct {
 	TeamId  string `protobuf:"bytes,10,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
 	OwnerId string `protobuf:"bytes,11,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
 	// Preview-access policy carried onto the instance record so the edge proxy
-	// can gate numeric-port traffic without a database. "private" is
-	// deny-by-default (only published ports route); empty (older control planes)
-	// means public. preview_ports is the published-port allowlist, each with its
-	// own token generation; empty on a private sandbox denies every port.
+	// can gate numeric-port traffic without a database. "public" and "private"
+	// require publication; private additionally requires a token. Empty and
+	// "legacy_public" preserve old all-port behavior. preview_ports is the
+	// published-port allowlist, each with its own token generation.
 	PreviewAccess string         `protobuf:"bytes,12,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"`
 	PreviewPorts  []*PreviewPort `protobuf:"bytes,13,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`
 	// Monotonic generation of this preview policy. vmd records it and rejects
@@ -3050,7 +3050,7 @@ func (x *UpdateSandboxNetworkResponse) GetVmId() string {
 type UpdateSandboxPreviewPolicyRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
-	PreviewAccess  string                 `protobuf:"bytes,2,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"`     // "public" | "private"
+	PreviewAccess  string                 `protobuf:"bytes,2,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"`     // "legacy_public" | "public" | "private"
 	PreviewPorts   []*PreviewPort         `protobuf:"bytes,3,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`        // full published-port set (replace)
 	PolicyRevision int64                  `protobuf:"varint,4,opt,name=policy_revision,json=policyRevision,proto3" json:"policy_revision,omitempty"` // monotonic; vmd rejects <= current
 	unknownFields  protoimpl.UnknownFields

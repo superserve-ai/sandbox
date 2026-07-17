@@ -2,9 +2,11 @@
 --
 -- preview_access gates the edge proxy's numeric-port routes
 -- ({port}-{id}.<domain>):
---   'public'  — every listening port is routable with no auth (today's
---               behavior; the default, so existing sandboxes are unchanged).
---   'private' — deny-by-default: ONLY ports explicitly published (see
+--   'legacy_public' — every listening port is routable with no auth. Reserved
+--               for existing sandboxes and clients that omit the new policy.
+--   'public'  — ONLY ports explicitly published (see sandbox_published_port)
+--               are routable, with no token required.
+--   'private' — ONLY ports explicitly published (see
 --               sandbox_published_port) are routable, and each requires a
 --               per-port preview token. Every other port returns 404 at the
 --               edge, even with a valid token for a different port.
@@ -15,7 +17,7 @@
 -- /instances endpoint. The DB rows are the intent; the vmd record is the
 -- enforcement copy.
 ALTER TABLE sandbox
-    ADD COLUMN IF NOT EXISTS preview_access text NOT NULL DEFAULT 'public',
+    ADD COLUMN IF NOT EXISTS preview_access text NOT NULL DEFAULT 'legacy_public',
     -- Monotonic per-sandbox generation of the whole preview policy (access +
     -- published-port set). Bumped inside the same transaction as every preview
     -- mutation; carried to vmd on each push. vmd rejects any update whose
@@ -26,20 +28,19 @@ ALTER TABLE sandbox
 ALTER TABLE sandbox
     DROP CONSTRAINT IF EXISTS sandbox_preview_access_valid;
 
--- Defense in depth: a non-handler write path can't invent a third state. The
--- proxy treats any non-'private' value as public (legacy open), so a typo'd
--- value would silently expose a sandbox — reject it at the schema instead.
+-- Defense in depth: a non-handler write path cannot invent a fourth state.
+-- The proxy fails closed for unknown values, and the database rejects them.
 ALTER TABLE sandbox
     ADD CONSTRAINT sandbox_preview_access_valid
-    CHECK (preview_access IN ('public', 'private'));
+    CHECK (preview_access IN ('legacy_public', 'public', 'private'));
 
 COMMENT ON COLUMN sandbox.preview_access IS
-    'Preview URL access policy: ''public'' (unauthenticated, all ports, the '
-    'default) or ''private'' (deny-by-default; only published ports route, '
-    'each token-gated). Settable at create and via PATCH.';
+    'Preview URL policy: ''legacy_public'' preserves pre-publication all-port '
+    'routing; ''public'' and ''private'' require publication, with private '
+    'token-gated. Callers may select public/private at create and via PATCH.';
 
 -- One row per explicitly published preview port. A port is reachable on a
--- private sandbox only if it has a row here. token_version is the per-port
+-- strict public/private sandbox only if it has a row here. token_version is the per-port
 -- credential generation: bumping it (rotate) invalidates only that port's
 -- outstanding tokens, never another port's.
 CREATE TABLE IF NOT EXISTS sandbox_published_port (
@@ -56,6 +57,6 @@ CREATE TABLE IF NOT EXISTS sandbox_published_port (
 );
 
 COMMENT ON TABLE sandbox_published_port IS
-    'Explicitly published preview ports for a private sandbox. Presence of a '
+    'Explicitly published preview ports for strict public/private sandboxes. Presence of a '
     'row is what makes a port routable at the edge; token_version is the '
     'per-port credential generation used for independent rotation.';

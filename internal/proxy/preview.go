@@ -36,24 +36,26 @@ const (
 // unpublished port, 401 for a missing/invalid token, or the cookie-bootstrap
 // redirect).
 //
-// The order is deny-by-default → auth → status, all before the reverse proxy:
-//   - A private sandbox routes ONLY explicitly published ports. Any other
-//     port returns 404, even with a valid token for a different port —
+// The order is publication → auth → status, all before the reverse proxy:
+//   - public and private sandboxes route ONLY explicitly published ports. Any
+//     other port returns 404, even with a valid token for a different port —
 //     publishing 3001 never makes 3000 reachable.
-//   - A published port then requires a token scoped to that exact port and
-//     its current version.
+//   - A published public port routes without a token. A published private port
+//     requires a token scoped to that exact port and its current version.
+//   - Empty and legacy_public retain the pre-publication behavior for existing
+//     sandboxes and callers that omit the new policy field.
 //   - Auth runs before the status check, so an unauthenticated caller can't
 //     even learn whether the sandbox is running or paused.
 func (h *Handler) enforcePreviewAccess(w http.ResponseWriter, r *http.Request, instanceID string, port int, info InstanceInfo) bool {
 	switch info.PreviewAccess {
-	case "", auth.PreviewAccessPublic:
-		// Empty = the record predates the feature; both mean open (legacy:
-		// every listening port is routable with no auth).
+	case "", auth.PreviewAccessLegacyPublic:
+		// Empty = the record predates the feature. Both legacy values keep
+		// every listening port open so rollout cannot break existing URLs.
 		return true
 	}
-	// "private" — and any unknown future policy value, which an older proxy
-	// must interpret as the most restrictive thing it knows how to enforce,
-	// never as public.
+	// public, private, and any unknown future policy all require publication.
+	// An older proxy must interpret an unknown value as the most restrictive
+	// policy it knows how to enforce, never as legacy-public.
 
 	// Deny-by-default allowlist. A port is reachable only if it has been
 	// explicitly published; everything else is 404 before any auth or status
@@ -63,6 +65,10 @@ func (h *Handler) enforcePreviewAccess(w http.ResponseWriter, r *http.Request, i
 	if !published {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return false
+	}
+
+	if info.PreviewAccess == auth.PreviewAccessPublic {
+		return true
 	}
 
 	// CORS preflights carry no credentials or custom headers by spec —

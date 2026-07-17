@@ -25,14 +25,13 @@ type InstanceInfo struct {
 	TeamID    string // owning team, for usage attribution
 	OwnerID   string // creating user, for usage attribution; empty when unknown
 
-	// PreviewAccess gates numeric-port (preview URL) traffic: "private" means
-	// deny-by-default (only published ports route, each token-gated); anything
-	// else — including empty, for sandboxes that predate the field — is public
-	// (every port routable, no auth).
+	// PreviewAccess gates numeric-port traffic. "public" and "private" both
+	// require publication; private also requires the port token. Empty and
+	// "legacy_public" retain the old all-listening-ports behavior.
 	PreviewAccess string
 	// PreviewPorts maps each published port to its current token version.
-	// Only consulted when PreviewAccess is "private": a port absent from this
-	// map is not routable (404). Nil on a private sandbox denies every port.
+	// Consulted for both strict policies: a port absent from this map is not
+	// routable (404). Nil denies every port.
 	PreviewPorts map[int]int64
 }
 

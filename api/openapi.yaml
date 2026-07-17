@@ -595,9 +595,10 @@ paths:
         - `preview_access` — toggles the preview URL policy (`public` /
           `private`). Can be updated regardless of sandbox state and takes
           effect immediately on a running sandbox: switching to `private`
-          closes the ports to unauthenticated traffic mid-flight; switching
-          to `public` reopens them. Outstanding preview tokens survive the
-          toggle (rotate them explicitly if they should not).
+          makes each published port require its token; switching to `public`
+          leaves only published ports routable but removes the token check.
+          Outstanding preview tokens survive the toggle (rotate them
+          explicitly if they should not).
       security:
         - apiKey: []
       requestBody:
@@ -630,7 +631,8 @@ paths:
       summary: List published preview ports
       description: |
         Returns the sandbox's preview policy and its set of published ports.
-        On a `private` sandbox, only the ports listed here are reachable at
+        On a strict `public` or `private` sandbox, only the ports listed here
+        are reachable at
         `https://{port}-{id}.<sandbox-domain>` — every other port returns 404
         at the edge (deny-by-default). Tokens are never included; mint them
         per port.
@@ -655,7 +657,8 @@ paths:
       tags: [Sandboxes]
       summary: Publish a preview port
       description: |
-        Publishes a port so it becomes reachable on a `private` sandbox.
+        Publishes a port so it becomes reachable under a strict `public` or
+        `private` policy.
         Idempotent: re-publishing an already-published port keeps its current
         token version (so live tokens are not revoked). Publishing does not by
         itself require auth on the port — mint a token per published port via
@@ -694,16 +697,16 @@ paths:
       tags: [Sandboxes]
       summary: Unpublish a preview port
       description: |
-        Removes a port from the published set. On a `private` sandbox it is
+        Removes a port from the published set. Under a strict policy it is
         immediately no longer routable (404 at the edge) and its outstanding
         tokens stop working.
 
         This is a revocation, so it is **idempotent and retry-safe**: the
-        host's enforcement copy is updated before the record is removed, a
-        `500` means nothing changed and the call should be retried, and
-        repeating the DELETE (including for a port that is not currently
-        published) re-synchronizes enforcement and returns `204`. `404` is
-        returned only when the sandbox itself does not exist.
+        database mutation and policy-revision bump are atomic, every host push
+        is revision-ordered, and repeating the DELETE (including for a port
+        that is not currently published) re-synchronizes enforcement and
+        returns `204`. Retry a `500` to converge the host's enforcement copy.
+        `404` is returned only when the sandbox itself does not exist.
       security:
         - apiKey: []
       responses:
@@ -2289,16 +2292,14 @@ components:
         preview_access:
           type: string
           enum: [public, private]
-          default: public
           description: |
-            Preview URL access policy. `public` (the default) keeps today's
-            behavior: any process listening on a port is reachable at
-            `https://{port}-{id}.<sandbox-domain>` without authentication.
-            `private` is deny-by-default: only ports explicitly published via
-            `POST /sandboxes/{sandbox_id}/preview-ports` are reachable, and
-            each requires a per-port token. Set it at create and the sandbox is
-            never publicly reachable, not even briefly. Toggle the policy later
-            via `PATCH /sandboxes/{sandbox_id}`.
+            Opt into explicit preview publication. Under `public`, only ports
+            published via `POST /sandboxes/{sandbox_id}/preview-ports` are
+            reachable and they need no token. Under `private`, the same
+            publication rule applies and each port requires its own token.
+            Omit this field to preserve the legacy all-listening-ports behavior
+            for older clients. Toggle between strict policies later via
+            `PATCH /sandboxes/{sandbox_id}`.
 
     ActivityResponse:
       description: One audit-log activity row returned by the activity list endpoint.
@@ -2421,12 +2422,12 @@ components:
             owner: agent-7
         preview_access:
           type: string
-          enum: [public, private]
+          enum: [legacy_public, public, private]
           description: >
-            Preview URL access policy. `private` is deny-by-default (only
-            published ports route, each token-gated); `public` means every
-            port is reachable without authentication. Manage ports and tokens
-            under `/sandboxes/{sandbox_id}/preview-ports`.
+            Preview URL policy. `legacy_public` preserves pre-publication
+            all-port routing. `public` and `private` only route published
+            ports; private additionally requires each port's token. Manage
+            publication and tokens under `/sandboxes/{sandbox_id}/preview-ports`.
 
     SandboxResponse:
       description: Single-sandbox shape — `SandboxListItem` plus `access_token` and bound secrets.
@@ -2653,12 +2654,12 @@ components:
           type: string
           enum: [public, private]
           description: |
-            Toggle the preview URL policy. `private` is deny-by-default (only
-            published ports route, each token-gated); `public` restores
-            unauthenticated access to every port. Takes effect immediately on a
-            running sandbox and persists across pause/resume. The published-port
-            set and outstanding tokens are unchanged by the toggle — manage them
-            under `/sandboxes/{sandbox_id}/preview-ports`.
+            Move a sandbox onto a strict preview policy. Both values only
+            route explicitly published ports; `private` requires the port's
+            token and `public` does not. Takes effect immediately and persists
+            across pause/resume. `legacy_public` cannot be selected through
+            the API. The published-port set and outstanding tokens are
+            unchanged by the toggle.
       example:
         metadata:
           env: prod
@@ -2694,10 +2695,10 @@ components:
       properties:
         preview_access:
           type: string
-          enum: [public, private]
+          enum: [legacy_public, public, private]
           description: >
-            The sandbox's policy. `ports` only gate traffic when this is
-            `private`.
+            The sandbox's policy. `ports` gate traffic under `public` and
+            `private`; `legacy_public` preserves all-port routing.
         ports:
           type: array
           items:
@@ -2745,10 +2746,10 @@ components:
           description: Present only when the token was minted with an expiry.
         preview_access:
           type: string
-          enum: [public, private]
+          enum: [legacy_public, public, private]
           description: >
-            The sandbox's current policy — when `public`, the token is not
-            actually required yet.
+            The sandbox's current policy. Tokens are required only under
+            `private`; publication is still required under strict `public`.
         token_version:
           type: integer
           format: int32

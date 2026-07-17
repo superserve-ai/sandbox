@@ -12,12 +12,14 @@ import (
 )
 
 // Preview access policy values, as stored in the sandbox row, carried on the
-// vmd instance record, and returned by VMD's /instances endpoint. A missing
-// or empty value means public — sandboxes that predate the feature keep
-// today's behavior.
+// vmd instance record, and returned by VMD's /instances endpoint. Empty and
+// legacy_public preserve the pre-publication behavior for sandboxes and
+// clients that predate the feature. New public/private policies both require
+// an explicitly published port; private additionally requires its token.
 const (
-	PreviewAccessPublic  = "public"
-	PreviewAccessPrivate = "private"
+	PreviewAccessLegacyPublic = "legacy_public"
+	PreviewAccessPublic       = "public"
+	PreviewAccessPrivate      = "private"
 )
 
 // Preview token carrier names. Defined here — next to the token itself — so

@@ -1172,16 +1172,15 @@ type createSandboxRequest struct {
 	// per-binding proxy token, swapped for the real value at egress.
 	Secrets map[string]string `json:"secrets,omitempty"`
 
-	// PreviewAccess sets the preview-URL policy: "public" (default —
-	// today's unauthenticated behavior) or "private", which makes the edge
-	// proxy require a preview token on every {port}-{id} request. Setting it
-	// at create means the sandbox is never publicly reachable, not even
-	// briefly. Also settable via PATCH /sandboxes/:id.
+	// PreviewAccess opts into the published-port preview model. "public" routes
+	// only explicitly published ports without auth; "private" routes only
+	// explicitly published ports with per-port auth. Omission preserves legacy
+	// all-port behavior for older clients. Also settable via PATCH.
 	PreviewAccess *string `json:"preview_access,omitempty"`
 }
 
 // validatePreviewAccess rejects anything but the two policy values. nil is
-// allowed (create defaults to public; PATCH treats nil as "not patched").
+// allowed (create preserves legacy behavior; PATCH treats nil as unmodified).
 func validatePreviewAccess(v *string) error {
 	if v == nil || *v == auth.PreviewAccessPublic || *v == auth.PreviewAccessPrivate {
 		return nil
@@ -1209,9 +1208,10 @@ type sandboxResponse struct {
 	Network      *networkConfigRequest  `json:"network,omitempty"`
 	Metadata     map[string]string      `json:"metadata"`
 	Secrets      []sandboxSecretBinding `json:"secrets,omitempty"`
-	// PreviewAccess is the preview-URL policy ("public" | "private").
+	// PreviewAccess is the preview-URL policy. "legacy_public" is returned for
+	// compatibility sandboxes but is not accepted as a caller-selected policy.
 	// The preview token itself is never included here — mint it via
-	// POST /sandboxes/:id/preview-token.
+	// POST /sandboxes/:id/preview-ports/:port/token.
 	PreviewAccess string `json:"preview_access"`
 }
 
@@ -1596,10 +1596,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Preview policy applies from the very first moment the VM is routable:
 	// it rides the RestoreSnapshot call itself, so a "private" sandbox never
-	// has a public window. A brand-new sandbox has no published ports yet —
-	// deny-by-default means every port 404s until one is explicitly published
-	// via POST /sandboxes/:id/preview-ports.
-	previewAccess := auth.PreviewAccessPublic
+	// has a public window. When the caller selects a strict public/private
+	// policy, the new sandbox has no published ports yet, so every port 404s
+	// until one is explicitly published via POST /sandboxes/:id/preview-ports.
+	previewAccess := auth.PreviewAccessLegacyPublic
 	if req.PreviewAccess != nil {
 		previewAccess = *req.PreviewAccess
 	}

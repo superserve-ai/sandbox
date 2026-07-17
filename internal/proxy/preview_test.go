@@ -142,11 +142,11 @@ func (e *previewTestEnv) captured() previewCapturedRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Public sandboxes — unchanged behavior
+// Legacy compatibility and strict public publication
 // ---------------------------------------------------------------------------
 
-func TestPreview_PublicNoCredentialNeeded(t *testing.T) {
-	for _, access := range []string{"", auth.PreviewAccessPublic} {
+func TestPreview_LegacyPublicNoCredentialNeeded(t *testing.T) {
+	for _, access := range []string{"", auth.PreviewAccessLegacyPublic} {
 		env := newPreviewTestEnv(t, access, nil)
 		w := env.serve(env.request(http.MethodGet, "http://unused/index.html"))
 		if w.Code != http.StatusOK {
@@ -158,8 +158,30 @@ func TestPreview_PublicNoCredentialNeeded(t *testing.T) {
 	}
 }
 
-func TestPreview_PublicStrayCredentialStripped(t *testing.T) {
+func TestPreview_PublicUnpublishedPort404(t *testing.T) {
 	env := newPreviewTestEnv(t, auth.PreviewAccessPublic, nil)
+	w := env.serve(env.request(http.MethodGet, "http://unused/"))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for an unpublished public port", w.Code)
+	}
+	if env.captured().received {
+		t.Error("unpublished public port reached the app")
+	}
+}
+
+func TestPreview_PublicPublishedPortNeedsNoCredential(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPublic, publishedPort(1))
+	w := env.serve(env.request(http.MethodGet, "http://unused/"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if !env.captured().received {
+		t.Fatal("published public port did not reach the app")
+	}
+}
+
+func TestPreview_PublicPublishedPortStripsStrayCredential(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPublic, publishedPort(1))
 	req := env.request(http.MethodGet, "http://unused/p?keep=1&"+previewQueryParam+"=old-token")
 	req.Header.Set(previewTokenHeader, "old-token")
 	req.AddCookie(&http.Cookie{Name: previewCookieName, Value: "old-token"})

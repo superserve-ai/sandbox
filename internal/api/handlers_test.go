@@ -26,16 +26,17 @@ import (
 )
 
 type stubVMD struct {
-	destroyFn        func(ctx context.Context, id string, force bool) error
-	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
-	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
-	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
-	deleteSnapsFn    func(ctx context.Context, id string) error
-	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
-	updatePreviewFn  func(ctx context.Context, id, previewAccess string, previewPorts map[int32]int64, policyRevision int64) error
-	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
-	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
+	destroyFn            func(ctx context.Context, id string, force bool) error
+	pauseFn              func(ctx context.Context, id, snapshotDir string) (string, string, error)
+	resumeFn             func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	restoreFn            func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	deleteSnapshotFn     func(ctx context.Context, id, snapshotPath, memPath string) error
+	deleteSnapsFn        func(ctx context.Context, id string) error
+	updateNetworkFn      func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	updatePreviewFn      func(ctx context.Context, id, previewAccess string, previewPorts map[int32]int64, policyRevision int64) error
+	injectEnvFn          func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
+	listDirFn            func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
+	restorePreviewAccess string
 }
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
@@ -57,7 +58,8 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ string, _ map[int32]int64, _ int64, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, previewAccess string, _ map[int32]int64, _ int64, _ map[string]string) (string, uint32, uint32, error) {
+	s.restorePreviewAccess = previewAccess
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -1549,6 +1551,9 @@ func TestCreateSandbox_Success(t *testing.T) {
 	}
 	if v := body["memory_mib"].(float64); v == 0 {
 		t.Error("memory_mib is 0 — VMD's reported value was not propagated to the response")
+	}
+	if vmd.restorePreviewAccess != "legacy_public" {
+		t.Errorf("omitted preview_access sent %q to VMD, want legacy_public", vmd.restorePreviewAccess)
 	}
 }
 

@@ -117,9 +117,9 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 
 	// Reject malformed preview policy up front — booting a VM whose record
 	// carries a value the proxy can't classify helps nobody. Empty is fine
-	// (older control planes; means public).
-	if pa := req.GetPreviewAccess(); pa != "" && pa != "public" && pa != "private" {
-		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, \"public\" or \"private\", got %q", pa)
+	// (older control planes; means legacy-public).
+	if pa := req.GetPreviewAccess(); pa != "" && pa != "legacy_public" && pa != "public" && pa != "private" {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, \"legacy_public\", \"public\" or \"private\", got %q", pa)
 	}
 	previewPorts, err := previewPortsFromProto(req.GetPreviewPorts())
 	if err != nil {
@@ -366,8 +366,8 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(ctx context.Context, req *vmdpb
 		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
 	}
 	access := req.GetPreviewAccess()
-	if access != "public" && access != "private" {
-		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be \"public\" or \"private\", got %q", access)
+	if access != "legacy_public" && access != "public" && access != "private" {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be \"legacy_public\", \"public\" or \"private\", got %q", access)
 	}
 	previewPorts, err := previewPortsFromProto(req.GetPreviewPorts())
 	if err != nil {

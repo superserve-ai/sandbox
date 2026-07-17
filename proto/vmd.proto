@@ -345,10 +345,10 @@ message RestoreSnapshotRequest {
   string team_id = 10;
   string owner_id = 11;
   // Preview-access policy carried onto the instance record so the edge proxy
-  // can gate numeric-port traffic without a database. "private" is
-  // deny-by-default (only published ports route); empty (older control planes)
-  // means public. preview_ports is the published-port allowlist, each with its
-  // own token generation; empty on a private sandbox denies every port.
+  // can gate numeric-port traffic without a database. "public" and "private"
+  // require publication; private additionally requires a token. Empty and
+  // "legacy_public" preserve old all-port behavior. preview_ports is the
+  // published-port allowlist, each with its own token generation.
   string preview_access = 12;
   repeated PreviewPort preview_ports = 13;
   // Monotonic generation of this preview policy. vmd records it and rejects
@@ -537,7 +537,7 @@ message UpdateSandboxNetworkResponse {
 
 message UpdateSandboxPreviewPolicyRequest {
   string vm_id = 1;
-  string preview_access = 2;              // "public" | "private"
+  string preview_access = 2;              // "legacy_public" | "public" | "private"
   repeated PreviewPort preview_ports = 3; // full published-port set (replace)
   int64 policy_revision = 4;              // monotonic; vmd rejects <= current
 }

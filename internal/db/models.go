@@ -435,7 +435,7 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
-	// Preview URL access policy: 'public' (unauthenticated, all ports, the default) or 'private' (deny-by-default; only published ports route, each token-gated). Settable at create and via PATCH.
+	// Preview URL access policy: 'legacy_public' preserves all-port routing for compatibility; 'public' and 'private' require publication, with private token-gated. Callers can select public/private at create and via PATCH.
 	PreviewAccess         string `json:"preview_access"`
 	PreviewPolicyRevision int64  `json:"preview_policy_revision"`
 }
