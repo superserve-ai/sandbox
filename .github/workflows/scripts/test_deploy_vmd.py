@@ -35,10 +35,47 @@ deploy_vmd = load_deploy_module()
 
 
 class DeployVmdDataDiskTests(unittest.TestCase):
-    def render_remote_script(self, data_disk_device=""):
+    def render_remote_script(
+        self,
+        data_disk_device="",
+        migration_probe_output=None,
+        deploy_returncode=0,
+        expected_result=0,
+        return_events=False,
+        lifecycle_fail_action=None,
+        expect_lifecycle_exception=False,
+    ):
         ssh_commands = []
+        events = []
+
+        if migration_probe_output is None:
+            migration_probe_output = f"{deploy_vmd.DATA_DISK_READY}\n"
+
+        def fake_run_or_die(command, _context):
+            self.assertNotIn("DATABASE_URL", deploy_vmd.os.environ)
+            if (
+                command[:3] == ["gcloud", "compute", "ssh"]
+                and command[command.index("--command") + 1]
+                == deploy_vmd.DATA_DISK_MIGRATION_PROBE_SCRIPT
+            ):
+                events.append("probe")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=migration_probe_output,
+                    stderr="",
+                )
+            if command[:3] == ["gcloud", "compute", "ssh"]:
+                remote_command = command[command.index("--command") + 1]
+                if remote_command == deploy_vmd.DATA_DISK_SET_PENDING_SCRIPT:
+                    events.append("set-pending")
+                elif remote_command == deploy_vmd.DATA_DISK_CLEAR_PENDING_SCRIPT:
+                    events.append("clear-pending")
+                elif remote_command == deploy_vmd.FIRECRACKER_DRAIN_PROBE_SCRIPT:
+                    events.append("wait-firecracker")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         def fake_subprocess_run(command, *args, **kwargs):
+            self.assertNotIn("DATABASE_URL", deploy_vmd.os.environ)
             if command[:4] == ["gcloud", "compute", "instances", "list"]:
                 return SimpleNamespace(
                     returncode=0,
@@ -46,9 +83,28 @@ class DeployVmdDataDiskTests(unittest.TestCase):
                     stderr="",
                 )
             if command[:3] == ["gcloud", "compute", "ssh"]:
+                events.append("deploy")
                 ssh_commands.append(command[command.index("--command") + 1])
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(
+                    returncode=deploy_returncode,
+                    stdout="",
+                    stderr="remote deploy failed" if deploy_returncode else "",
+                )
             self.fail(f"unexpected subprocess.run command: {command!r}")
+
+        def fake_drain_host(_psql, _database_url, _host_id):
+            events.append("drain")
+            if lifecycle_fail_action == "drain":
+                raise RuntimeError("simulated drain failure")
+
+        def fake_set_host_status(_psql, _database_url, _host_id, status):
+            events.append(status)
+            if status == lifecycle_fail_action:
+                raise RuntimeError(f"simulated {status} failure")
+
+        def fake_require_database(_database_url):
+            events.append("require-psql")
+            return "/usr/bin/psql"
 
         environ = {
             "GCP_PROJECT": "test-project",
@@ -60,17 +116,36 @@ class DeployVmdDataDiskTests(unittest.TestCase):
         }
         if data_disk_device:
             environ["SANDBOX_DATA_DISK_DEVICE"] = data_disk_device
+            environ["DATABASE_URL"] = "postgresql://test:secret@db/staging"
 
         with mock.patch.dict(deploy_vmd.os.environ, environ, clear=True), mock.patch.object(
-            deploy_vmd, "run_or_die"
+            deploy_vmd, "run_or_die", side_effect=fake_run_or_die
         ), mock.patch.object(
             deploy_vmd.subprocess, "run", side_effect=fake_subprocess_run
         ), mock.patch.object(
             deploy_vmd.os.path, "getsize", return_value=123
+        ), mock.patch.object(
+            deploy_vmd,
+            "require_database_lifecycle",
+            side_effect=fake_require_database,
+        ), mock.patch.object(
+            deploy_vmd,
+            "drain_host_via_database",
+            side_effect=fake_drain_host,
+        ), mock.patch.object(
+            deploy_vmd,
+            "set_host_status",
+            side_effect=fake_set_host_status,
         ):
-            self.assertEqual(deploy_vmd.main(), 0)
+            if expect_lifecycle_exception:
+                with self.assertRaisesRegex(RuntimeError, "simulated"):
+                    deploy_vmd.main()
+            else:
+                self.assertEqual(deploy_vmd.main(), expected_result)
 
         self.assertEqual(len(ssh_commands), 1)
+        if return_events:
+            return ssh_commands[0], events
         return ssh_commands[0]
 
     def test_data_disk_device_validation(self):
@@ -129,9 +204,105 @@ class DeployVmdDataDiskTests(unittest.TestCase):
             ),
             remote_script.index("# Saved snapshots require mandatory CoW clones"),
         )
+        subprocess.run(
+            [shutil.which("bash") or "bash", "-n"],
+            input=remote_script,
+            text=True,
+            check=True,
+        )
+
+    def test_initial_migration_drains_before_deploy_then_activates(self):
+        device = "/dev/disk/by-id/google-superserve-sandbox-data"
+        remote_script, events = self.render_remote_script(
+            device,
+            migration_probe_output=(
+                f"{deploy_vmd.DATA_DISK_MIGRATION_PREFIX}default\n"
+            ),
+            return_events=True,
+        )
+
+        self.assertIn("setup-sandbox-data-disk.sh", remote_script)
+        self.assertEqual(
+            events,
+            [
+                "probe",
+                "require-psql",
+                "set-pending",
+                "drain",
+                "wait-firecracker",
+                "deploy",
+                "active",
+                "clear-pending",
+            ],
+        )
+
+    def test_failed_migration_deploy_leaves_host_draining(self):
+        device = "/dev/disk/by-id/google-superserve-sandbox-data"
+        _, events = self.render_remote_script(
+            device,
+            migration_probe_output=(
+                f"{deploy_vmd.DATA_DISK_MIGRATION_PREFIX}default\n"
+            ),
+            deploy_returncode=1,
+            expected_result=1,
+            return_events=True,
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "probe",
+                "require-psql",
+                "set-pending",
+                "drain",
+                "wait-firecracker",
+                "deploy",
+            ],
+        )
+
+    def test_activation_failure_is_retried_without_a_second_drain(self):
+        device = "/dev/disk/by-id/google-superserve-sandbox-data"
+        _, failed_events = self.render_remote_script(
+            device,
+            migration_probe_output=(
+                f"{deploy_vmd.DATA_DISK_MIGRATION_PREFIX}default\n"
+            ),
+            lifecycle_fail_action="active",
+            expect_lifecycle_exception=True,
+            return_events=True,
+        )
+        self.assertEqual(
+            failed_events,
+            [
+                "probe",
+                "require-psql",
+                "set-pending",
+                "drain",
+                "wait-firecracker",
+                "deploy",
+                "active",
+            ],
+        )
+
+        _, retry_events = self.render_remote_script(
+            device,
+            migration_probe_output=(
+                f"{deploy_vmd.DATA_DISK_REACTIVATION_PENDING_PREFIX}default\n"
+            ),
+            return_events=True,
+        )
+        self.assertEqual(
+            retry_events,
+            ["probe", "require-psql", "deploy", "active", "clear-pending"],
+        )
+
+    def test_authoritative_steady_state_skips_host_lifecycle_calls(self):
+        device = "/dev/disk/by-id/google-superserve-sandbox-data"
+        _, events = self.render_remote_script(device, return_events=True)
+        self.assertEqual(events, ["probe", "deploy"])
 
     def test_omitted_device_is_a_production_noop(self):
-        remote_script = self.render_remote_script()
+        remote_script, events = self.render_remote_script(return_events=True)
         forbidden_fragments = (
             "/etc/sandbox/data-disk.env",
             "/etc/systemd/system/sandbox-data-disk.service",
@@ -143,15 +314,310 @@ class DeployVmdDataDiskTests(unittest.TestCase):
         )
         for fragment in forbidden_fragments:
             self.assertNotIn(fragment, remote_script)
+        self.assertEqual(events, ["deploy"])
+        subprocess.run(
+            [shutil.which("bash") or "bash", "-n"],
+            input=remote_script,
+            text=True,
+            check=True,
+        )
+
+    def test_migration_probe_parsing_and_host_agreement(self):
+        self.assertEqual(
+            deploy_vmd.parse_data_disk_migration_probe(
+                f"login banner\n{deploy_vmd.DATA_DISK_READY}\n"
+            ),
+            ("ready", None),
+        )
+        self.assertEqual(
+            deploy_vmd.parse_data_disk_migration_probe(
+                f"{deploy_vmd.DATA_DISK_MIGRATION_PREFIX}default\n"
+            ),
+            ("migration", "default"),
+        )
+        for output in (
+            "",
+            f"{deploy_vmd.DATA_DISK_MIGRATION_PREFIX}bad/id\n",
+            f"{deploy_vmd.DATA_DISK_READY}\n{deploy_vmd.DATA_DISK_READY}\n",
+        ):
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                deploy_vmd.parse_data_disk_migration_probe(output)
+
+        instances = [
+            {"name": "vmd-a", "zone": "us-central1-a"},
+            {"name": "vmd-b", "zone": "us-central1-b"},
+        ]
+        with mock.patch.object(
+            deploy_vmd,
+            "probe_data_disk_migration",
+            return_value=("migration", "default"),
+        ):
+            plan = deploy_vmd.data_disk_migration_plan(instances, "test-project")
+            self.assertEqual(plan["host_id"], "default")
+            self.assertTrue(plan["needs_drain"])
+            self.assertEqual(plan["pending_instances"], instances)
+            self.assertEqual(plan["new_pending_instances"], instances)
+            self.assertEqual(plan["migration_instances"], instances)
+        with mock.patch.object(
+            deploy_vmd,
+            "probe_data_disk_migration",
+            side_effect=lambda inst, _project: ("migration", inst["name"]),
+        ), self.assertRaisesRegex(RuntimeError, "disagree on HOST_ID"):
+            deploy_vmd.data_disk_migration_plan(instances, "test-project")
+
+        with mock.patch.object(
+            deploy_vmd,
+            "probe_data_disk_migration",
+            return_value=("reactivation_pending", "default"),
+        ):
+            retry_plan = deploy_vmd.data_disk_migration_plan(
+                instances, "test-project"
+            )
+            self.assertEqual(retry_plan["host_id"], "default")
+            self.assertFalse(retry_plan["needs_drain"])
+            self.assertEqual(retry_plan["new_pending_instances"], [])
+            self.assertEqual(retry_plan["migration_instances"], [])
+
+    def test_probe_reads_host_id_without_sourcing_env_file(self):
+        probe = deploy_vmd.DATA_DISK_MIGRATION_PROBE_SCRIPT
+        self.assertIn("/etc/sandbox/data-disk-authoritative", probe)
+        self.assertIn("/etc/sandbox/data-disk-reactivation-pending", probe)
+        self.assertIn("host_id=default", probe)
+        self.assertIn("sudo awk", probe)
+        self.assertNotIn("source /etc/sandbox/vmd.env", probe)
+        subprocess.run(
+            [shutil.which("bash") or "bash", "-n"],
+            input=probe,
+            text=True,
+            check=True,
+        )
+
+        firecracker_probe = deploy_vmd.FIRECRACKER_DRAIN_PROBE_SCRIPT
+        self.assertIn("firecracker@*.service", firecracker_probe)
+        self.assertIn("pgrep -x firecracker", firecracker_probe)
+        self.assertIn("Active/transitional systemd units:", firecracker_probe)
+        self.assertIn("Firecracker process IDs:", firecracker_probe)
+        self.assertIn('printf \'%s\\n\' "$units"', firecracker_probe)
+        subprocess.run(
+            [shutil.which("bash") or "bash", "-n"],
+            input=firecracker_probe,
+            text=True,
+            check=True,
+        )
+
+    def test_lifecycle_sql_uses_pgdatabase_without_url_in_command(self):
+        database_url = "postgresql://db-user:db-secret@db.example/staging"
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout="draining\n",
+            stderr="",
+        )
+        with mock.patch.object(
+            deploy_vmd.subprocess, "run", return_value=completed
+        ) as run:
+            result = deploy_vmd.run_lifecycle_sql(
+                "/usr/bin/psql",
+                database_url,
+                "default",
+                "SELECT :'host_id';",
+                "test query",
+            )
+
+        self.assertEqual(result, "draining")
+        command = run.call_args.args[0]
+        self.assertNotIn(database_url, command)
+        self.assertNotIn(database_url, " ".join(command))
+        self.assertEqual(run.call_args.kwargs["env"]["PGDATABASE"], database_url)
+        self.assertNotIn("DATABASE_URL", run.call_args.kwargs["env"])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["PGCONNECT_TIMEOUT"],
+            str(deploy_vmd.PG_CONNECT_TIMEOUT_SECONDS),
+        )
+        self.assertIn(
+            f"statement_timeout={deploy_vmd.PG_STATEMENT_TIMEOUT_MS}",
+            run.call_args.kwargs["env"]["PGOPTIONS"],
+        )
+        self.assertIn(
+            f"lock_timeout={deploy_vmd.PG_STATEMENT_TIMEOUT_MS}",
+            run.call_args.kwargs["env"]["PGOPTIONS"],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            deploy_vmd.PSQL_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(run.call_args.kwargs["input"], "SELECT :'host_id';")
+
+    def test_lifecycle_sql_redacts_database_url_from_failures(self):
+        database_url = "postgresql://db-user:db-secret@db.example/staging"
+        completed = SimpleNamespace(
+            returncode=2,
+            stdout=f"bad database {database_url}",
+            stderr=f"could not connect to {database_url}",
+        )
+        with mock.patch.object(
+            deploy_vmd.subprocess, "run", return_value=completed
+        ), self.assertRaises(RuntimeError) as raised:
+            deploy_vmd.run_lifecycle_sql(
+                "/usr/bin/psql",
+                database_url,
+                "default",
+                "SELECT 1;",
+                "test query",
+            )
+
+        self.assertNotIn(database_url, str(raised.exception))
+        self.assertIn("[REDACTED]", str(raised.exception))
+
+    def test_lifecycle_sql_timeout_is_bounded_and_redacted(self):
+        database_url = "postgresql://db-user:db-secret@db.example/staging"
+        timeout = subprocess.TimeoutExpired(
+            cmd=["psql"],
+            timeout=deploy_vmd.PSQL_COMMAND_TIMEOUT_SECONDS,
+            output=f"connecting to {database_url}",
+            stderr=f"waiting for {database_url}",
+        )
+        with mock.patch.object(
+            deploy_vmd.subprocess, "run", side_effect=timeout
+        ), self.assertRaisesRegex(RuntimeError, "timed out") as raised:
+            deploy_vmd.run_lifecycle_sql(
+                "/usr/bin/psql",
+                database_url,
+                "default",
+                "SELECT 1;",
+                "test query",
+            )
+
+        self.assertNotIn(database_url, str(raised.exception))
+        self.assertIn("[REDACTED]", str(raised.exception))
+
+    def test_database_drain_updates_status_and_polls_exact_activity_fence(self):
+        calls = []
+
+        def fake_sql(_psql, _database_url, _host_id, sql, _context):
+            calls.append(sql)
+            if "UPDATE host" in sql:
+                return "draining"
+            return "0"
+
+        with mock.patch.object(
+            deploy_vmd, "run_lifecycle_sql", side_effect=fake_sql
+        ):
+            deploy_vmd.drain_host_via_database(
+                "/usr/bin/psql",
+                "postgresql://secret",
+                "default",
+                timeout_seconds=0,
+                poll_seconds=0,
+            )
+
+        self.assertIn("SET status = 'draining'", calls[0])
+        self.assertIn("preserved AS", calls[0])
+        self.assertIn("SET auto_delete_at = NULL", calls[0])
+        self.assertIn("sandbox.destroyed_at IS NULL", calls[0])
+        self.assertIn("sandbox.auto_delete_at IS NOT NULL", calls[0])
+        self.assertIn("SELECT id FROM draining", calls[0])
+        activity_sql = calls[1]
+        self.assertIn("destroyed_at IS NULL", activity_sql)
+        self.assertIn(
+            "status IN ('starting', 'active', 'pausing', 'resuming')",
+            activity_sql,
+        )
+        self.assertIn("snapshot_operation_id IS NOT NULL", activity_sql)
+        self.assertIn("FROM snapshot", activity_sql)
+        self.assertIn("kind = 'saved'", activity_sql)
+        self.assertIn("status IN ('creating', 'deleting')", activity_sql)
+        self.assertIn("FROM template_build", activity_sql)
+        self.assertIn("vmd_host_id = :'host_id'", activity_sql)
+        self.assertIn("status IN ('building', 'snapshotting')", activity_sql)
+
+    def test_database_activation_does_not_change_auto_delete_deadlines(self):
+        calls = []
+
+        def fake_sql(_psql, _database_url, _host_id, sql, _context):
+            calls.append(sql)
+            return "active"
+
+        with mock.patch.object(
+            deploy_vmd, "run_lifecycle_sql", side_effect=fake_sql
+        ):
+            deploy_vmd.set_host_status(
+                "/usr/bin/psql",
+                "postgresql://secret",
+                "default",
+                "active",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("SET status = 'active'", calls[0])
+        self.assertIn("status = 'draining'", calls[0])
+        self.assertIn("lifecycle_fence AS MATERIALIZED", calls[0])
+        self.assertIn("(SELECT remaining FROM lifecycle_fence) = 0", calls[0])
+        self.assertIn("already_active AS", calls[0])
+        self.assertIn("WHERE id = :'host_id' AND status = 'active'", calls[0])
+        self.assertIn("WHERE NOT EXISTS (SELECT 1 FROM updated)", calls[0])
+        self.assertIn("snapshot_operation_id IS NOT NULL", calls[0])
+        self.assertIn("status IN ('creating', 'deleting')", calls[0])
+        self.assertIn("status IN ('building', 'snapshotting')", calls[0])
+        self.assertNotIn("auto_delete_at", calls[0])
+
+    def test_database_activation_refuses_busy_draining_unhealthy_or_missing_host(self):
+        with mock.patch.object(
+            deploy_vmd, "run_lifecycle_sql", return_value=""
+        ), self.assertRaisesRegex(RuntimeError, "host row was not updated"):
+            deploy_vmd.set_host_status(
+                "/usr/bin/psql",
+                "postgresql://secret",
+                "default",
+                "active",
+            )
+
+    def test_database_drain_timeout_leaves_host_draining(self):
+        with mock.patch.object(
+            deploy_vmd, "set_host_status"
+        ) as set_status, mock.patch.object(
+            deploy_vmd, "count_host_lifecycle_activity", return_value=3
+        ), self.assertRaisesRegex(RuntimeError, "host remains draining"):
+            deploy_vmd.drain_host_via_database(
+                "/usr/bin/psql",
+                "postgresql://secret",
+                "default",
+                timeout_seconds=0,
+                poll_seconds=0,
+            )
+
+        set_status.assert_called_once_with(
+            "/usr/bin/psql",
+            "postgresql://secret",
+            "default",
+            "draining",
+        )
+
+    def test_psql_is_required_only_for_migration_or_recovery(self):
+        with mock.patch.object(deploy_vmd.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "psql is required"):
+                deploy_vmd.require_database_lifecycle("postgresql://secret")
+        with self.assertRaisesRegex(ValueError, "DATABASE_URL is required"):
+            deploy_vmd.require_database_lifecycle("")
 
     def test_workflow_only_sets_device_for_staging(self):
         workflow = (REPO_ROOT / ".github/workflows/deploy-vmd.yml").read_text()
         self.assertEqual(workflow.count("SANDBOX_DATA_DISK_DEVICE:"), 1)
+        self.assertEqual(workflow.count("DATABASE_URL:"), 1)
+        self.assertIn(
+            "DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}",
+            workflow,
+        )
+        self.assertNotIn("STAGING_INTERNAL_API_TOKEN", workflow)
+        self.assertEqual(workflow.count("postgresql-client"), 1)
+        self.assertEqual(workflow.count("command -v psql"), 1)
         staging_job = workflow.index("deploy-staging:")
         production_job = workflow.index("deploy-production:")
         device_setting = workflow.index("SANDBOX_DATA_DISK_DEVICE:")
+        database_setting = workflow.index("DATABASE_URL:")
         self.assertLess(staging_job, device_setting)
         self.assertLess(device_setting, production_job)
+        self.assertLess(staging_job, database_setting)
+        self.assertLess(database_setting, production_job)
 
 
 class SetupSandboxDataDiskTests(unittest.TestCase):

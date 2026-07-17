@@ -70,12 +70,28 @@ WHERE team_id = sqlc.arg(team_id)
 -- LockSandboxForSecretWrites in the same transaction so secret_bindings is an
 -- exact snapshot of the source configuration.
 --
--- A fork's parent snapshot is locked FOR KEY SHARE. Leaf deletion locks the
--- same row FOR UPDATE, so a child snapshot and parent deletion cannot both win.
-WITH parent_locked AS MATERIALIZED (
+-- Lock the host before claiming the source. This is the durable admission
+-- boundary for a host drain: either capture owns the active-host lease first
+-- (and drain waits, then observes snapshot_operation_id), or drain flips the
+-- host first and this statement returns no row without touching host storage.
+-- A fork's parent snapshot is then locked FOR KEY SHARE. Leaf deletion locks
+-- the same row FOR UPDATE, so a child snapshot and parent deletion cannot both
+-- win.
+WITH host_admitted AS MATERIALIZED (
+  SELECT h.id
+  FROM sandbox source
+  JOIN host h ON h.id = source.host_id
+  WHERE source.id = sqlc.arg(sandbox_id)
+    AND source.team_id = sqlc.arg(team_id)
+    AND source.destroyed_at IS NULL
+    AND h.status = 'active'
+  FOR SHARE OF h
+),
+parent_locked AS MATERIALIZED (
   SELECT p.id
   FROM sandbox source
   JOIN snapshot p ON p.id = source.source_snapshot_id
+  JOIN host_admitted admitted ON admitted.id = source.host_id
   WHERE source.id = sqlc.arg(sandbox_id)
     AND source.team_id = sqlc.arg(team_id)
     AND p.team_id = sqlc.arg(team_id)
@@ -95,6 +111,7 @@ claimed AS (
     AND s.status IN ('active', 'paused')
     AND s.snapshot_operation_id IS NULL
     AND feature_enabled('sandbox_snapshots_v1', s.team_id)
+    AND EXISTS (SELECT 1 FROM host_admitted)
     AND (s.source_snapshot_id IS NULL
          OR EXISTS (SELECT 1 FROM parent_locked))
   RETURNING s.*
@@ -570,17 +587,33 @@ WHERE parent_snapshot_id = sqlc.arg(snapshot_id)
 ORDER BY created_at ASC, id ASC;
 
 -- name: ClaimDeleteSavedSnapshotIfLeaf :one
+-- Host admission is locked before the source/snapshot rows. A drain that wins
+-- first rejects a new delete before it can mutate host-local artifacts; a
+-- delete that wins first makes drain wait and then exposes status='deleting'
+-- to the drain convergence check.
 -- Child creation holds FOR KEY SHARE on this row. This FOR UPDATE claim waits
 -- for those inserts, then re-checks dependencies before making the snapshot
 -- unavailable to new forks. The source is locked first to match capture
 -- finalize/failure lock ordering. Cancelling a creating capture also releases
 -- only its matching source operation claim in the same statement. Zero rows
 -- means not found, non-leaf, or already deleting.
-WITH source_locked AS MATERIALIZED (
+WITH host_admitted AS MATERIALIZED (
+  SELECT h.id
+  FROM snapshot target
+  JOIN host h ON h.id = target.host_id
+  WHERE target.id = sqlc.arg(snapshot_id)
+    AND target.team_id = sqlc.arg(team_id)
+    AND target.kind = 'saved'
+    AND target.deleted_at IS NULL
+    AND h.status = 'active'
+  FOR SHARE OF h
+),
+source_locked AS MATERIALIZED (
   SELECT source.id
   FROM snapshot target
   JOIN sandbox source
     ON source.id = target.sandbox_id AND source.team_id = target.team_id
+  JOIN host_admitted admitted ON admitted.id = target.host_id
   WHERE target.id = sqlc.arg(snapshot_id)
     AND target.team_id = sqlc.arg(team_id)
     AND target.kind = 'saved'

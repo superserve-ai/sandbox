@@ -101,6 +101,13 @@ type Handlers struct {
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
 
+	// hostDrainMu guards the reaper's per-process draining-host worker set.
+	// Ticks only schedule work; one bounded worker per host performs the slow
+	// convergence without blocking unrelated reaper cleanup tasks.
+	hostDrainMu      sync.Mutex
+	hostDrainScan    bool
+	hostDrainWorkers map[string]struct{}
+
 	// authzSvc is a process-lifetime singleton so its permission cache persists
 	// across requests. Built lazily from Pool on first use.
 	authzOnce sync.Once
@@ -191,6 +198,32 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 		return h.VMD, nil
 	}
 	c, err := h.Hosts.ClientFor(ctx, hostID)
+	if err == nil {
+		return c, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) && h.VMD != nil {
+		log.Warn().Err(err).Str("host_id", hostID).Msg("unknown host row; falling back to default VMD client")
+		return h.VMD, nil
+	}
+	return nil, err
+}
+
+// activeVMDForHost is the admission-strength host resolver used by lifecycle
+// operations that can start a Firecracker process. A draining or unhealthy
+// host remains reachable through vmdForHost for pause, cleanup, and rollback,
+// but must not accept creates or resumes while an operator is draining it.
+//
+// Lightweight/legacy registries that do not implement activeHostRegistry keep
+// their historical behavior; the production registry always implements it.
+func (h *Handlers) activeVMDForHost(ctx context.Context, hostID string) (VMDClient, error) {
+	if h.Hosts == nil {
+		return h.VMD, nil
+	}
+	activeHosts, ok := h.Hosts.(activeHostRegistry)
+	if !ok {
+		return h.vmdForHost(ctx, hostID)
+	}
+	c, err := activeHosts.ActiveClientFor(ctx, hostID)
 	if err == nil {
 		return c, nil
 	}
@@ -495,6 +528,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	// Check host lifecycle state before claiming paused -> resuming. Cleanup
+	// and the timeout-reaper must still reach a draining host, but a customer
+	// resume would create a new Firecracker process and defeat the drain.
+	vmd, vmdLookupErr := h.activeVMDForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Warn().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Str("host_id", sandbox.HostID).Msg("resume host is not accepting lifecycle work")
+		c.Header("Retry-After", "5")
+		respondErrorMsg(c, "sandbox_host_unavailable", "The sandbox host is temporarily unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+
 	// Serialize the paused→resuming claim with attach/detach via a DB advisory
 	// lock (held only for the claim). Both take the same lock and re-read status
 	// under it, so across API instances a mutation can't read a stale 'paused' and
@@ -586,14 +630,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		if tplErr == nil && tpl.BasePath != nil {
 			resumeBasePath = *tpl.BasePath
 		}
-	}
-
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if vmdLookupErr != nil {
-		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
-		revertToPaused()
-		respondError(c, ErrInternal)
-		return false
 	}
 
 	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
@@ -1816,25 +1852,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Resolve the VMD client up front so we don't waste a DB INSERT on
 	// a host we can't reach.
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), hostID)
+	vmd, vmdLookupErr := h.activeVMDForHost(c.Request.Context(), hostID)
 	if vmdLookupErr != nil {
-		log.Error().Err(vmdLookupErr).Msg("resolve VMD for create failed")
-		respondError(c, ErrInternal)
+		log.Warn().Err(vmdLookupErr).Str("host_id", hostID).Msg("create host is not accepting lifecycle work")
+		c.Header("Retry-After", "5")
+		respondErrorMsg(c, "sandbox_host_unavailable", "The sandbox host is temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Generate the sandbox ID in Go so the DB INSERT and the VMD call
-	// can run in parallel — both need the same ID and neither needs to
-	// wait on the other. This hides the ~10-20ms INSERT roundtrip behind
-	// VMD's ~100-200ms create latency, shaving that much off the p50.
+	// Generate the sandbox ID in Go, then persist the starting row before
+	// asking VMD to boot it. The INSERT holds the active host-row admission
+	// lock; ordering the side effect after that durable claim guarantees a host
+	// drain cannot observe zero work and return while a pre-authorized VMD boot
+	// is still waiting to start. The extra DB roundtrip is a small price for a
+	// real maintenance boundary.
 	sandboxID := uuid.New()
 
 	insertCtx := context.WithoutCancel(c.Request.Context())
-	type insertResult struct {
-		sandbox db.Sandbox
-		err     error
-	}
-	insertCh := make(chan insertResult, 1)
 	// runInsert performs the INSERT against the supplied tx-bound queries.
 	// Closure captures sandboxID/teamID/req/templateID/hostID/metadataJSON.
 	runInsert := func(q *db.Queries) (db.Sandbox, error) {
@@ -1855,9 +1889,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				TimeoutSeconds:    req.TimeoutSeconds.Value,
 				AutoDeleteSeconds: req.AutoDeleteSeconds.Value,
 				Metadata:          metadataJSON,
-				ID_2:              uuid.UUID(templateID.Bytes),
-				TeamID_2:          teamID,
-				TeamID_3:          h.systemTeamID(),
+				TemplateID:        uuid.UUID(templateID.Bytes),
+				SystemTeamID:      h.systemTeamID(),
 				SnapshotPath:      nullableStr(snapshotPath),
 				MemPath:           nullableStr(snapshotMemPath),
 				BasePath:          nullableStr(basePath),
@@ -1932,14 +1965,38 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return sb, nil
 	}
 
-	var tInsertStart, tInsertEnd time.Time
-	go func() {
-		tInsertStart = time.Now()
-		// Quota is enforced by the sandbox_quota_on_insert trigger.
-		sb, err := insertWithBindings()
-		tInsertEnd = time.Now()
-		insertCh <- insertResult{sandbox: sb, err: err}
-	}()
+	// Quota and active-host admission are enforced by the INSERT. Do not launch
+	// Firecracker until this returns a durable starting row (see above).
+	tInsertStart := time.Now()
+	sandbox, dbErr := insertWithBindings()
+	tInsertEnd := time.Now()
+	if dbErr != nil {
+		quotaExceeded := isSandboxQuotaErr(dbErr)
+		if quotaExceeded {
+			h.respondQuotaExceeded(c, teamID)
+			return
+		}
+
+		if errors.Is(dbErr, pgx.ErrNoRows) {
+			// Both host admission and a template deletion race intentionally
+			// return no row. Re-read the host to preserve the useful 503 vs 404
+			// distinction without weakening the locked SQL boundary.
+			host, hostErr := h.DB.GetHost(c.Request.Context(), hostID)
+			if hostErr == nil && host.Status != "active" {
+				c.Header("Retry-After", "5")
+				respondErrorMsg(c, "sandbox_host_unavailable", "The sandbox host is temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if templateID.Valid && hostErr == nil {
+				respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+				return
+			}
+		}
+
+		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: admission INSERT failed")
+		respondError(c, ErrInternal)
+		return
+	}
 
 	// Boot the VM synchronously — the client gets a response only after
 	// the sandbox is fully running and ready to use. This call is still
@@ -1958,52 +2015,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	tVmdEnd := time.Now()
 
-	// Wait for the parallel INSERT to complete — its result determines
-	// how we handle a VMD failure (mark row failed vs. nothing to mark).
-	insertRes := <-insertCh
-	tInsertReceive := time.Now()
-	sandbox := insertRes.sandbox
-	dbErr := insertRes.err
-
-	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
-	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
-
-	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
-	quotaExceeded := isSandboxQuotaErr(dbErr)
-
-	switch {
-	case dbErr != nil && vmdErr != nil:
-		// Both failed — nothing persisted, nothing to clean up.
-		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
-		if templateRace {
-			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
-			return
-		}
-		if quotaExceeded {
-			h.respondQuotaExceeded(c, teamID)
-			return
-		}
-		respondError(c, ErrInternal)
-		return
-	case dbErr != nil:
-		// DB insert failed but VMD succeeded — destroy the orphan VM so
-		// it doesn't linger on the host. Use a detached context so client
-		// disconnect doesn't leak the VM.
-		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed, destroying orphan VM")
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
-		cleanupCancel()
-		if templateRace {
-			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
-			return
-		}
-		if quotaExceeded {
-			h.respondQuotaExceeded(c, teamID)
-			return
-		}
-		respondError(c, ErrInternal)
-		return
-	case vmdErr != nil:
+	if vmdErr != nil {
 		// VMD failed but DB row exists — mark it failed so the reaper
 		// doesn't leave it stuck in "starting". The request middleware
 		// records the create failure metric from the HTTP status, so avoid
@@ -2174,11 +2186,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Str("sandbox_id", sandbox.ID.String()).
 		Int64("auth_ms", c.GetInt64("auth_ms")).
 		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
-		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
-		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
+		Int64("admission_ms", tInsertEnd.Sub(tLookupDone).Milliseconds()).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
-		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
-		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
+		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
+		Int64("post_ms", tPostDone.Sub(tVmdEnd).Milliseconds()).
 		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
 		Msg("CreateSandbox phases")
 	c.JSON(http.StatusCreated, resp)

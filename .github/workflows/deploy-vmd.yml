@@ -82,6 +82,13 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Ensure PostgreSQL client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+
       # GCP_REGION scopes label discovery to the primary region so the
       # usw cell host (same project, same label) isn't folded into this
       # fan-out — the cell deploys sequentially after production below.
@@ -100,6 +107,7 @@ jobs:
           VMD_INCREMENTAL_SNAPSHOT: 'true'
           VMD_SAVED_SNAPSHOT_PREFLIGHT: 'true'
           SANDBOX_DATA_DISK_DEVICE: '/dev/disk/by-id/google-superserve-sandbox-data'
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
           SHA: ${{ github.sha }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py

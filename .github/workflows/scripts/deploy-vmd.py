@@ -25,6 +25,8 @@ Env vars:
                        optional stable /dev/disk/by-id/google-* path. When
                        supplied, prepare persistent XFS storage before the
                        saved-snapshot preflight.
+  DATABASE_URL         required for initial data-disk migration/recovery —
+                       PostgreSQL URL used to drain and reactivate the host
   SHA                  required — commit SHA (only first 8 chars used)
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
@@ -40,9 +42,11 @@ preserving vmd's template cache.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -89,6 +93,167 @@ VMD_BOOLEAN_ENV_VARS = (
     "VMD_INCREMENTAL_SNAPSHOT",
 )
 
+DATA_DISK_READY = "DATA_DISK_READY"
+DATA_DISK_MIGRATION_PREFIX = "DATA_DISK_MIGRATION\t"
+DATA_DISK_MIGRATION_PENDING_PREFIX = "DATA_DISK_MIGRATION_PENDING\t"
+DATA_DISK_REACTIVATION_PENDING_PREFIX = "DATA_DISK_REACTIVATION_PENDING\t"
+HOST_DRAIN_TIMEOUT_SECONDS = 600
+HOST_DRAIN_POLL_SECONDS = 2
+FIRECRACKER_DRAIN_TIMEOUT_SECONDS = 600
+FIRECRACKER_DRAIN_POLL_SECONDS = 2
+PG_CONNECT_TIMEOUT_SECONDS = 15
+PG_STATEMENT_TIMEOUT_MS = 30000
+PSQL_COMMAND_TIMEOUT_SECONDS = 45
+
+HOST_LIFECYCLE_ACTIVITY_SQL = textwrap.dedent("""
+    (
+        SELECT count(*)::bigint
+        FROM sandbox
+        WHERE host_id = :'host_id'
+          AND destroyed_at IS NULL
+          AND (
+            status IN ('starting', 'active', 'pausing', 'resuming')
+            OR snapshot_operation_id IS NOT NULL
+          )
+    ) + (
+        SELECT count(*)::bigint
+        FROM snapshot
+        WHERE host_id = :'host_id'
+          AND kind = 'saved'
+          AND deleted_at IS NULL
+          AND status IN ('creating', 'deleting')
+    ) + (
+        SELECT count(*)::bigint
+        FROM template_build
+        WHERE vmd_host_id = :'host_id'
+          AND status IN ('building', 'snapshotting')
+    )
+""").strip()
+
+# Read HOST_ID without sourcing the environment file: it is configuration,
+# not trusted shell code. A narrow character set also keeps the probe output
+# unambiguous; the runner binds the value as a quoted psql variable.
+DATA_DISK_MIGRATION_PROBE_SCRIPT = textwrap.dedent(r"""
+    set -euo pipefail
+
+    authority_present=0
+    pending_reactivation=0
+    if sudo test -e /etc/sandbox/data-disk-authoritative; then
+        authority_present=1
+    fi
+    if sudo test -e /etc/sandbox/data-disk-reactivation-pending; then
+        pending_reactivation=1
+    fi
+
+    if [ "$authority_present" = 1 ] && [ "$pending_reactivation" = 0 ]; then
+        printf '%s\n' DATA_DISK_READY
+        exit 0
+    fi
+
+    host_id=default
+    if sudo test -f /etc/sandbox/vmd.env; then
+        if ! configured_host_id=$(sudo awk '
+            BEGIN { count = 0 }
+            {
+                line = $0
+                sub(/\r$/, "", line)
+                if (line !~ /^[[:space:]]*HOST_ID[[:space:]]*=/) next
+                count++
+                sub(/^[[:space:]]*HOST_ID[[:space:]]*=[[:space:]]*/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                if (length(line) >= 2 &&
+                    ((substr(line, 1, 1) == "\"" && substr(line, length(line), 1) == "\"") ||
+                     (substr(line, 1, 1) == "\047" && substr(line, length(line), 1) == "\047"))) {
+                    line = substr(line, 2, length(line) - 2)
+                }
+                value = line
+            }
+            END {
+                if (count > 1) exit 42
+                if (count == 1) print value
+            }
+        ' /etc/sandbox/vmd.env); then
+            echo "ERROR: /etc/sandbox/vmd.env must contain at most one HOST_ID assignment" >&2
+            exit 1
+        fi
+        if [ -n "$configured_host_id" ]; then
+            host_id=$configured_host_id
+        fi
+    fi
+
+    case "$host_id" in
+        *[!A-Za-z0-9._:-]*|'')
+            echo "ERROR: HOST_ID contains unsupported characters" >&2
+            exit 1
+            ;;
+    esac
+    if [ "${#host_id}" -gt 128 ]; then
+        echo "ERROR: HOST_ID is longer than 128 characters" >&2
+        exit 1
+    fi
+
+    if [ "$authority_present" = 1 ]; then
+        printf 'DATA_DISK_REACTIVATION_PENDING\t%s\n' "$host_id"
+    elif [ "$pending_reactivation" = 1 ]; then
+        printf 'DATA_DISK_MIGRATION_PENDING\t%s\n' "$host_id"
+    else
+        printf 'DATA_DISK_MIGRATION\t%s\n' "$host_id"
+    fi
+""").strip()
+
+DATA_DISK_SET_PENDING_SCRIPT = textwrap.dedent(r"""
+    set -euo pipefail
+    sudo install -d -m 0755 /etc/sandbox
+    sudo install -m 0600 /dev/null /etc/sandbox/data-disk-reactivation-pending
+""").strip()
+
+DATA_DISK_CLEAR_PENDING_SCRIPT = textwrap.dedent(r"""
+    set -euo pipefail
+    sudo rm -f /etc/sandbox/data-disk-reactivation-pending
+""").strip()
+
+FIRECRACKER_DRAIN_PROBE_SCRIPT = textwrap.dedent(f"""
+    set -euo pipefail
+    deadline=$((SECONDS + {FIRECRACKER_DRAIN_TIMEOUT_SECONDS}))
+
+    while true; do
+        if ! units=$(sudo systemctl list-units \\
+            --type=service \\
+            --state=active,activating,deactivating,reloading \\
+            --no-legend \\
+            --plain \\
+            'firecracker@*.service' | awk '{{print $1}}'); then
+            echo "ERROR: failed to inspect Firecracker units" >&2
+            exit 1
+        fi
+        set +e
+        processes=$(sudo pgrep -x firecracker)
+        pgrep_rc=$?
+        set -e
+        if [ "$pgrep_rc" -gt 1 ]; then
+            echo "ERROR: failed to inspect Firecracker processes" >&2
+            exit 1
+        fi
+        if [ -z "$units" ] && [ -z "$processes" ]; then
+            echo "Firecracker runtime is quiescent"
+            exit 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: Firecracker runtime did not quiesce" >&2
+            if [ -n "$units" ]; then
+                echo "Active/transitional systemd units:" >&2
+                printf '%s\\n' "$units" | sed 's/^/  /' >&2
+            fi
+            if [ -n "$processes" ]; then
+                echo "Firecracker process IDs:" >&2
+                printf '%s\\n' "$processes" | sed 's/^/  /' >&2
+            fi
+            exit 1
+        fi
+        sleep {FIRECRACKER_DRAIN_POLL_SECONDS}
+    done
+""").strip()
+
 
 def collect_vmd_env_upserts(environ=None):
     """Return validated optional boolean settings for vmd.env.
@@ -134,6 +299,350 @@ def optional_data_disk_device(environ=None):
     return value
 
 
+def parse_data_disk_migration_probe(stdout):
+    """Parse the single machine-readable line emitted by the host probe."""
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    matches = [
+        line
+        for line in lines
+        if line == DATA_DISK_READY
+        or line.startswith(DATA_DISK_MIGRATION_PREFIX)
+        or line.startswith(DATA_DISK_MIGRATION_PENDING_PREFIX)
+        or line.startswith(DATA_DISK_REACTIVATION_PENDING_PREFIX)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "data-disk migration probe returned no unique status line"
+        )
+    status = matches[0]
+    if status == DATA_DISK_READY:
+        return "ready", None
+
+    prefixes = (
+        (DATA_DISK_MIGRATION_PREFIX, "migration"),
+        (DATA_DISK_MIGRATION_PENDING_PREFIX, "migration_pending"),
+        (DATA_DISK_REACTIVATION_PENDING_PREFIX, "reactivation_pending"),
+    )
+    prefix, state = next(
+        (prefix, state) for prefix, state in prefixes if status.startswith(prefix)
+    )
+    host_id = status[len(prefix):]
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", host_id):
+        raise RuntimeError("data-disk migration probe returned an invalid HOST_ID")
+    return state, host_id
+
+
+def probe_data_disk_migration(inst, project):
+    """Return migration/reactivation state and HOST_ID for one instance."""
+    name, zone = inst["name"], inst["zone"]
+    tag = f"{name}/{zone}"
+    result = run_or_die(
+        [
+            "gcloud", "compute", "ssh", name,
+            f"--zone={zone}", f"--project={project}",
+            "--quiet", "--tunnel-through-iap",
+            "--command", DATA_DISK_MIGRATION_PROBE_SCRIPT,
+        ],
+        f"[{tag}] data-disk migration probe",
+    )
+    return parse_data_disk_migration_probe(result.stdout)
+
+
+def data_disk_migration_plan(instances, project):
+    """Build one fail-safe lifecycle plan for all discovered instances.
+
+    The database status drains a logical scheduler host, so a mixed set of
+    HOST_ID values must fail before changing DB or VM state. The pending marker
+    makes activation retryable after a runner/database failure.
+    """
+    host_ids = []
+    needs_drain = False
+    pending_instances = []
+    new_pending_instances = []
+    migration_instances = []
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        futures = {
+            executor.submit(probe_data_disk_migration, inst, project): inst
+            for inst in instances
+        }
+        for future in as_completed(futures):
+            inst = futures[future]
+            state, host_id = future.result()
+            if state == "ready":
+                continue
+            host_ids.append(host_id)
+            pending_instances.append(inst)
+            if state == "migration":
+                new_pending_instances.append(inst)
+                migration_instances.append(inst)
+                needs_drain = True
+            elif state == "migration_pending":
+                migration_instances.append(inst)
+                needs_drain = True
+            elif state != "reactivation_pending":
+                raise RuntimeError(f"unknown data-disk migration state: {state}")
+
+    unique_ids = sorted(set(host_ids))
+    if len(unique_ids) > 1:
+        raise RuntimeError(
+            "data-disk migration instances disagree on HOST_ID: "
+            + ", ".join(unique_ids)
+        )
+    def sort_key(inst):
+        return inst["name"], inst["zone"]
+
+    return {
+        "host_id": unique_ids[0] if unique_ids else None,
+        "needs_drain": needs_drain,
+        "pending_instances": sorted(pending_instances, key=sort_key),
+        "new_pending_instances": sorted(new_pending_instances, key=sort_key),
+        "migration_instances": sorted(migration_instances, key=sort_key),
+    }
+
+
+def update_data_disk_pending_markers(instances, project, pending):
+    """Atomically create/remove the host-local reactivation retry marker."""
+    if not instances:
+        return
+    command = (
+        DATA_DISK_SET_PENDING_SCRIPT if pending else DATA_DISK_CLEAR_PENDING_SCRIPT
+    )
+    operation = "set" if pending else "clear"
+
+    def update(inst):
+        name, zone = inst["name"], inst["zone"]
+        tag = f"{name}/{zone}"
+        run_or_die(
+            [
+                "gcloud", "compute", "ssh", name,
+                f"--zone={zone}", f"--project={project}",
+                "--quiet", "--tunnel-through-iap",
+                "--command", command,
+            ],
+            f"[{tag}] {operation} data-disk reactivation marker",
+        )
+
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        futures = [executor.submit(update, inst) for inst in instances]
+        for future in as_completed(futures):
+            future.result()
+
+
+def wait_for_firecracker_quiescence(instances, project):
+    """Prove each target has no Firecracker systemd units or raw processes."""
+    if not instances:
+        return
+
+    def wait(inst):
+        name, zone = inst["name"], inst["zone"]
+        tag = f"{name}/{zone}"
+        run_or_die(
+            [
+                "gcloud", "compute", "ssh", name,
+                f"--zone={zone}", f"--project={project}",
+                "--quiet", "--tunnel-through-iap",
+                "--command", FIRECRACKER_DRAIN_PROBE_SCRIPT,
+            ],
+            f"[{tag}] wait for Firecracker drain",
+        )
+
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        futures = [executor.submit(wait, inst) for inst in instances]
+        for future in as_completed(futures):
+            future.result()
+
+
+def require_database_lifecycle(database_url):
+    """Validate DB lifecycle prerequisites only when a lifecycle is needed."""
+    if not database_url:
+        raise ValueError("DATABASE_URL is required for data-disk migration recovery")
+    psql = shutil.which("psql")
+    if not psql:
+        raise RuntimeError(
+            "psql is required for data-disk migration recovery but was not found"
+        )
+    return psql
+
+
+def run_lifecycle_sql(psql, database_url, host_id, sql, context):
+    """Run one lifecycle query without putting DATABASE_URL on the command line."""
+    if not database_url:
+        raise ValueError("DATABASE_URL is required for database lifecycle operation")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", host_id):
+        raise ValueError("invalid HOST_ID for database lifecycle operation")
+
+    child_env = os.environ.copy()
+    child_env.pop("DATABASE_URL", None)
+    child_env["PGDATABASE"] = database_url
+    child_env["PGCONNECT_TIMEOUT"] = str(PG_CONNECT_TIMEOUT_SECONDS)
+    bounded_options = (
+        f"-c statement_timeout={PG_STATEMENT_TIMEOUT_MS} "
+        f"-c lock_timeout={PG_STATEMENT_TIMEOUT_MS}"
+    )
+    child_env["PGOPTIONS"] = " ".join(
+        part for part in (child_env.get("PGOPTIONS", "").strip(), bounded_options)
+        if part
+    )
+    try:
+        result = subprocess.run(
+            [
+                psql,
+                "--no-psqlrc",
+                "--quiet",
+                "--tuples-only",
+                "--no-align",
+                "--set", "ON_ERROR_STOP=1",
+                "--set", f"host_id={host_id}",
+            ],
+            input=sql,
+            env=child_env,
+            capture_output=True,
+            text=True,
+            timeout=PSQL_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout or ""
+        stderr = error.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        stdout = stdout.replace(database_url, "[REDACTED]").strip()
+        stderr = stderr.replace(database_url, "[REDACTED]").strip()
+        raise RuntimeError(
+            f"{context} timed out after {PSQL_COMMAND_TIMEOUT_SECONDS}s\n"
+            f"--- stderr ---\n{stderr or '(empty)'}\n"
+            f"--- stdout ---\n{stdout or '(empty)'}"
+        ) from error
+    if result.returncode != 0:
+        # A malformed libpq URI can be repeated by client diagnostics. Redact
+        # the exact secret value before surfacing output in Actions.
+        stderr = (result.stderr or "").replace(database_url, "[REDACTED]").strip()
+        stdout = (result.stdout or "").replace(database_url, "[REDACTED]").strip()
+        raise RuntimeError(
+            f"{context} failed (exit={result.returncode})\n"
+            f"--- stderr ---\n{stderr or '(empty)'}\n"
+            f"--- stdout ---\n{stdout or '(empty)'}"
+        )
+    return result.stdout.strip()
+
+
+def set_host_status(psql, database_url, host_id, status):
+    """Set one existing host active/draining and prove the row was updated."""
+    if status not in {"active", "draining"}:
+        raise ValueError(f"unsupported host status: {status!r}")
+    if status == "draining":
+        status_sql = textwrap.dedent("""
+            WITH draining AS (
+                UPDATE host AS draining_host
+                SET status = 'draining',
+                    updated_at = CASE
+                        WHEN status = 'draining' THEN updated_at
+                        ELSE now()
+                    END
+                WHERE draining_host.id = :'host_id'
+                RETURNING draining_host.id, draining_host.status
+            ),
+            preserved AS (
+                UPDATE sandbox
+                SET auto_delete_at = NULL
+                WHERE sandbox.host_id IN (SELECT id FROM draining)
+                  AND sandbox.destroyed_at IS NULL
+                  AND sandbox.auto_delete_at IS NOT NULL
+                RETURNING sandbox.id
+            )
+            SELECT draining.status
+            FROM draining
+            LEFT JOIN (SELECT count(*) FROM preserved) preserved_count ON true;
+        """)
+    else:
+        status_sql = textwrap.dedent(f"""
+            WITH lifecycle_fence AS MATERIALIZED (
+                SELECT {HOST_LIFECYCLE_ACTIVITY_SQL} AS remaining
+            ),
+            updated AS (
+                UPDATE host
+                SET status = 'active', updated_at = now()
+                WHERE id = :'host_id'
+                  AND status = 'draining'
+                  AND (SELECT remaining FROM lifecycle_fence) = 0
+                RETURNING status
+            ),
+            already_active AS (
+                SELECT status
+                FROM host
+                WHERE id = :'host_id' AND status = 'active'
+            )
+            SELECT status FROM updated
+            UNION ALL
+            SELECT status FROM already_active
+            WHERE NOT EXISTS (SELECT 1 FROM updated)
+            LIMIT 1;
+        """)
+    updated = run_lifecycle_sql(
+        psql,
+        database_url,
+        host_id,
+        status_sql,
+        f"set host {host_id} {status}",
+    )
+    if updated != status:
+        raise RuntimeError(
+            f"cannot set host {host_id} {status}: host row was not updated"
+        )
+
+
+def count_host_lifecycle_activity(psql, database_url, host_id):
+    """Count host-local sandbox lifecycle/storage operations still in flight."""
+    raw_count = run_lifecycle_sql(
+        psql,
+        database_url,
+        host_id,
+        f"SELECT {HOST_LIFECYCLE_ACTIVITY_SQL};",
+        f"count lifecycle activity for host {host_id}",
+    )
+    if not re.fullmatch(r"[0-9]+", raw_count):
+        raise RuntimeError(
+            f"invalid lifecycle activity count for host {host_id}: {raw_count!r}"
+        )
+    return int(raw_count)
+
+
+def drain_host_via_database(
+    psql,
+    database_url,
+    host_id,
+    timeout_seconds=HOST_DRAIN_TIMEOUT_SECONDS,
+    poll_seconds=HOST_DRAIN_POLL_SECONDS,
+):
+    """Fence scheduling, then wait for the API reaper to quiesce the host."""
+    set_host_status(psql, database_url, host_id, "draining")
+    deadline = time.monotonic() + timeout_seconds
+    last_count = None
+    while True:
+        remaining = count_host_lifecycle_activity(
+            psql, database_url, host_id
+        )
+        if remaining == 0:
+            return
+        if remaining != last_count:
+            print(
+                f"Waiting for host {host_id} to drain: "
+                f"{remaining} lifecycle/storage operation(s) remain"
+            )
+            last_count = remaining
+
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"host {host_id} drain did not converge within "
+                f"{timeout_seconds}s; {remaining} lifecycle/storage "
+                "operation(s) remain; "
+                "host remains draining"
+            )
+        time.sleep(min(poll_seconds, deadline - now))
+
+
 def main() -> int:
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
@@ -153,6 +662,9 @@ def main() -> int:
         "verify_saved_snapshot_storage" if saved_snapshot_preflight else ":"
     )
     data_disk_device = optional_data_disk_device()
+    # Do not inherit the database secret into tar/gcloud/SSH subprocesses. It
+    # is reintroduced only as PGDATABASE for the narrowly scoped psql calls.
+    database_url = os.environ.pop("DATABASE_URL", "")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -194,6 +706,44 @@ def main() -> int:
         return 1
 
     print(f"Deploying VMD to {len(instances)} instance(s) in {where}")
+
+    lifecycle_plan = {
+        "host_id": None,
+        "needs_drain": False,
+        "pending_instances": [],
+        "new_pending_instances": [],
+        "migration_instances": [],
+    }
+    lifecycle_psql = None
+    if data_disk_device:
+        lifecycle_plan = data_disk_migration_plan(instances, project)
+        lifecycle_host_id = lifecycle_plan["host_id"]
+        if lifecycle_host_id is not None:
+            lifecycle_psql = require_database_lifecycle(database_url)
+            # Write the retry intent before draining. If this or the drain
+            # fails, the next run safely retries the drain while authority is
+            # absent. Once authority exists, the same marker retries only the
+            # activation and never pauses workloads again.
+            update_data_disk_pending_markers(
+                lifecycle_plan["new_pending_instances"], project, True
+            )
+        if lifecycle_plan["needs_drain"]:
+            print(
+                f"Initial data-disk migration required for host "
+                f"{lifecycle_host_id}; requesting graceful drain"
+            )
+            drain_host_via_database(
+                lifecycle_psql, database_url, lifecycle_host_id
+            )
+            wait_for_firecracker_quiescence(
+                lifecycle_plan["migration_instances"], project
+            )
+            print(f"Host {lifecycle_host_id} drained")
+        elif lifecycle_host_id is not None:
+            print(
+                f"Host {lifecycle_host_id} has a pending reactivation; "
+                "retrying it after deployment"
+            )
 
     bundle_remote = f"/tmp/deploy-bundle-{sha}.tar.gz"
     extract_dir = f"/tmp/deploy-{sha}"
@@ -561,6 +1111,17 @@ def main() -> int:
     if failed:
         print(f'Deploy failed on: {", ".join(failed)}', file=sys.stderr)
         return 1
+
+    lifecycle_host_id = lifecycle_plan["host_id"]
+    if lifecycle_host_id is not None:
+        print(f"Deployment succeeded; activating host {lifecycle_host_id}")
+        set_host_status(
+            lifecycle_psql, database_url, lifecycle_host_id, "active"
+        )
+        update_data_disk_pending_markers(
+            lifecycle_plan["pending_instances"], project, False
+        )
+        print(f"Host {lifecycle_host_id} active")
 
     print(f"Deployed VMD to {len(instances)} instance(s). sha={sha}")
     return 0

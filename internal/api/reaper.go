@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -72,6 +73,11 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	defer ticker.Stop()
 
 	runTick := func() {
+		// Declarative maintenance path: infrastructure can mark host.status as
+		// draining in Postgres and the control plane converges its sandboxes in
+		// the background. Scheduling returns immediately; slow VMD work never
+		// blocks interval, revocation, snapshot, or auto-delete reaping.
+		h.scheduleDrainingHostWorkers(ctx)
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
 		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
@@ -95,6 +101,75 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			runTick()
 		}
 	}
+}
+
+// scheduleDrainingHostWorkers asynchronously discovers declaratively draining
+// hosts. A scan and each per-host worker are deduplicated within this control
+// plane process; another replica may cooperate safely through SKIP LOCKED.
+func (h *Handlers) scheduleDrainingHostWorkers(ctx context.Context) {
+	h.hostDrainMu.Lock()
+	if h.hostDrainScan {
+		h.hostDrainMu.Unlock()
+		return
+	}
+	h.hostDrainScan = true
+	h.hostDrainMu.Unlock()
+
+	go func() {
+		defer sentrylog.Recover("host-drain-scan")
+		defer func() {
+			h.hostDrainMu.Lock()
+			h.hostDrainScan = false
+			h.hostDrainMu.Unlock()
+		}()
+
+		queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		hosts, err := h.DB.ListHosts(queryCtx)
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Msg("host drain scanner: ListHosts failed")
+			return
+		}
+		for _, host := range hosts {
+			if host.Status == "draining" {
+				h.startDrainingHostWorker(ctx, host.ID)
+			}
+		}
+	}()
+}
+
+func (h *Handlers) startDrainingHostWorker(ctx context.Context, hostID string) {
+	h.hostDrainMu.Lock()
+	if h.hostDrainWorkers == nil {
+		h.hostDrainWorkers = make(map[string]struct{})
+	}
+	if _, running := h.hostDrainWorkers[hostID]; running {
+		h.hostDrainMu.Unlock()
+		return
+	}
+	h.hostDrainWorkers[hostID] = struct{}{}
+	h.hostDrainMu.Unlock()
+
+	go func() {
+		defer sentrylog.Recover("host-drain-worker")
+		defer func() {
+			h.hostDrainMu.Lock()
+			delete(h.hostDrainWorkers, hostID)
+			h.hostDrainMu.Unlock()
+		}()
+
+		workCtx, cancel := context.WithTimeout(ctx, hostDrainTimeout)
+		defer cancel()
+		pausedCount, err := h.drainHostSandboxes(workCtx, hostID)
+		if err != nil {
+			log.Error().Err(err).
+				Str("host_id", hostID).
+				Int("paused_count", pausedCount).
+				Msg("background host drain failed; host remains draining and a later tick will retry")
+			return
+		}
+		log.Info().Str("host_id", hostID).Int("paused_count", pausedCount).Msg("background host drain converged")
+	}()
 }
 
 // sweepOrphanedIntervals closes intervals left open on no-longer-active
@@ -273,8 +348,28 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 	h.logSandboxActivity(tctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)
 }
 
+type pauseSagaOperation struct {
+	telemetryTransition string
+	snapshotTrigger     string
+	activityAction      string
+}
+
+var timeoutPauseOperation = pauseSagaOperation{
+	telemetryTransition: "timeout_pause",
+	snapshotTrigger:     "timeout",
+	activityAction:      "timeout_paused",
+}
+
+var hostDrainPauseOperation = pauseSagaOperation{
+	telemetryTransition: "host_drain_pause",
+	snapshotTrigger:     "host_drain",
+	activityAction:      "host_drained",
+}
+
 // pauseExpired pauses one sandbox that was atomically claimed by
-// ClaimExpiredSandboxes (already marked 'pausing' in DB).
+// ClaimExpiredSandboxes (already marked 'pausing' in DB). The drain endpoint
+// calls the same saga with a different trigger/action, keeping compensation
+// behavior identical across automatic timeout pauses and host maintenance.
 //
 // This is a distributed transaction across two systems (VMD + Postgres) so
 // we use a saga: if any DB step fails after VMD has stopped the VM, we
@@ -292,10 +387,28 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 //   - Step 1 fails → VM is still running → revert DB to 'active'.
 //   - Step 2 fails → VM is stopped → call rollbackPausedVM (resume + revert).
 func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow) {
+	if err := h.pauseClaimedSandbox(ctx, sbx, timeoutPauseOperation); err != nil {
+		// The timeout reaper is best-effort per sandbox. The saga has already
+		// converged or terminalized the row, so the next item can proceed.
+		return
+	}
+}
+
+// pauseClaimedSandbox executes the shared VMD + Postgres pause saga for a row
+// already transitioned to pausing. It returns an error to synchronous callers
+// such as host drain; all compensation/terminalization still happens here.
+func (h *Handlers) pauseClaimedSandbox(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, operation pauseSagaOperation) error {
+	// The claim already changed durable state to pausing. From this point on,
+	// request cancellation must not prevent convergence: a timed-out drain or
+	// disconnected client cannot be allowed to strand the row or drift DB state
+	// from a VMD pause that completed just before cancellation. Every operation
+	// using this detached context establishes its own bounded deadline below.
+	reconcileCtx := context.WithoutCancel(ctx)
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("team_id", sbx.TeamID.String()).
 		Str("name", sbx.Name).
+		Str("pause_operation", operation.telemetryTransition).
 		Logger()
 	started := time.Now()
 
@@ -305,27 +418,27 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 
 	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
 	if vmdLookupErr != nil {
-		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
-		return
+		l.Error().Err(vmdLookupErr).Msg("pause worker: resolve VMD failed — reverting to active")
+		RecordSandboxTransition(ctx, operation.telemetryTransition, telemetry.ResultError, sbx.HostID, time.Since(started))
+		h.revertToActiveOrFail(reconcileCtx, sbx, vmdLookupErr, l)
+		return fmt.Errorf("resolve VMD for sandbox %s: %w", sbx.ID, vmdLookupErr)
 	}
 
 	snapshotPath, memPath, err := pauseWithRetry(ctx, vmd, sbx.ID.String())
 	if err != nil {
 		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
 		// didn't pause, so revert to active and let the next tick retry.
-		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.revertToActiveOrFail(ctx, sbx, err, l)
-		return
+		l.Error().Err(err).Msg("pause worker: VMD PauseInstance failed — reverting to active")
+		RecordSandboxTransition(ctx, operation.telemetryTransition, telemetry.ResultError, sbx.HostID, time.Since(started))
+		h.revertToActiveOrFail(reconcileCtx, sbx, err, l)
+		return fmt.Errorf("pause sandbox %s: %w", sbx.ID, err)
 	}
 
 	// Reconcile shadow usage while VMD is still paused, but give FinalizePause
 	// a fresh deadline so telemetry can never roll back lifecycle correctness.
 	h.recordSandboxWritableLayerUsage(ctx, vmd, sbx.ID, sbx.TeamID)
 
-	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
+	postCtx, postCancel := context.WithTimeout(reconcileCtx, vmdTimeout)
 	defer postCancel()
 	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
 		ID:        sbx.ID,
@@ -333,18 +446,19 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Path:      snapshotPath,
 		MemPath:   &memPath,
 		SizeBytes: 0,
-		Trigger:   "timeout",
+		Trigger:   operation.snapshotTrigger,
 	}); err != nil {
-		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
-		return
+		l.Error().Err(err).Msg("pause worker: FinalizePause failed — rolling back VMD pause")
+		RecordSandboxTransition(ctx, operation.telemetryTransition, telemetry.ResultError, sbx.HostID, time.Since(started))
+		h.rollbackPausedVM(reconcileCtx, sbx, snapshotPath, memPath, err, l)
+		return fmt.Errorf("finalize pause for sandbox %s: %w", sbx.ID, err)
 	}
-	l.Info().Msg("reaper: sandbox paused due to timeout")
-	RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
+	l.Info().Msg("pause worker: sandbox paused")
+	RecordSandboxTransition(ctx, operation.telemetryTransition, telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	// Interval was already closed at the top of pauseExpired; FinalizePause
 	// is the end of the VMD pause work, not the leave-active moment.
-	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
+	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", operation.activityAction, "success", &sbx.Name, nil, nil)
+	return nil
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is
@@ -362,7 +476,9 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		AnErr("cause", cause).
 		Logger()
 
-	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, vmdTimeout)
+	vmd, vmdLookupErr := h.vmdForHost(lookupCtx, sbx.HostID)
+	lookupCancel()
 	if vmdLookupErr != nil {
 		rl.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD for rollback failed")
 		h.markSandboxFailed(ctx, sbx, "resolve VMD failed during rollback", rl)

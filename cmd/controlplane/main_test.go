@@ -89,6 +89,67 @@ func TestRetryUnavailableStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+type buildAdmissionStub struct {
+	vmdclient.Client
+	buildCalls int
+	pollCalls  int
+}
+
+func (s *buildAdmissionStub) BuildTemplate(context.Context, vmdclient.BuildTemplateInput) (string, error) {
+	s.buildCalls++
+	return "build-vm", nil
+}
+
+func (s *buildAdmissionStub) GetBuildStatus(context.Context, string) (vmdclient.BuildStatusResult, error) {
+	s.pollCalls++
+	return vmdclient.BuildStatusResult{Status: "running"}, nil
+}
+
+func TestBuildAdmissionClientGatesOnlyNewDispatch(t *testing.T) {
+	base := &buildAdmissionStub{}
+	active := &buildAdmissionStub{}
+	activeCalls := 0
+	client := &buildAdmissionClient{
+		Client: base,
+		active: func(context.Context) (vmdclient.Client, error) {
+			activeCalls++
+			return active, nil
+		},
+	}
+
+	if _, err := client.GetBuildStatus(context.Background(), "existing-build"); err != nil {
+		t.Fatalf("GetBuildStatus() error = %v", err)
+	}
+	if base.pollCalls != 1 || activeCalls != 0 {
+		t.Fatalf("poll routed base=%d active_resolutions=%d, want 1/0", base.pollCalls, activeCalls)
+	}
+
+	if _, err := client.BuildTemplate(context.Background(), vmdclient.BuildTemplateInput{}); err != nil {
+		t.Fatalf("BuildTemplate() error = %v", err)
+	}
+	if activeCalls != 1 || active.buildCalls != 1 || base.buildCalls != 0 {
+		t.Fatalf("dispatch routed active_resolutions=%d active_builds=%d base_builds=%d, want 1/1/0", activeCalls, active.buildCalls, base.buildCalls)
+	}
+}
+
+func TestBuildAdmissionClientRejectsInactiveHost(t *testing.T) {
+	base := &buildAdmissionStub{}
+	wantErr := errors.New("host is draining")
+	client := &buildAdmissionClient{
+		Client: base,
+		active: func(context.Context) (vmdclient.Client, error) {
+			return nil, wantErr
+		},
+	}
+
+	if _, err := client.BuildTemplate(context.Background(), vmdclient.BuildTemplateInput{}); !errors.Is(err, wantErr) {
+		t.Fatalf("BuildTemplate() error = %v, want %v", err, wantErr)
+	}
+	if base.buildCalls != 0 {
+		t.Fatalf("base BuildTemplate calls = %d, want 0", base.buildCalls)
+	}
+}
+
 // fakeVMDClient stubs only StreamBuildLogs; other methods panic via the
 // embedded nil interface.
 type fakeVMDClient struct {

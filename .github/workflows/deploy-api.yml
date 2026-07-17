@@ -197,10 +197,16 @@ jobs:
           docker push ${IMAGE}:${{ github.sha }}
 
       - name: Deploy to Cloud Run
+        # Staging runs DB-backed supervisors (timeouts, builds, saved snapshots,
+        # and declarative host drains). Keep one instance with idle CPU so the
+        # playground can converge maintenance work even when request traffic is
+        # zero. Production has its own independently managed scaling settings.
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
+            --min 1 \
+            --no-cpu-throttling \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 

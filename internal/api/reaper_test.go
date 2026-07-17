@@ -393,3 +393,76 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 	}
 	t.Fatal("reaper did not run immediately on startup")
 }
+
+func TestPauseSagaCancellationStillRunsDetachedCompensation(t *testing.T) {
+	row := expiredRow("cancelled-drain")
+	row.HostID = "host-a"
+	finalizeErr := errors.New("finalize unavailable")
+	var (
+		pauseCalls       atomic.Int32
+		resumeCalls      atomic.Int32
+		revertActiveSeen atomic.Bool
+		finalizeCtxErr   error
+	)
+
+	dbtx := &reaperMockDBTX{
+		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "upserted AS"):
+				finalizeCtxErr = ctx.Err()
+				return errorRow(finalizeErr)
+			case strings.Contains(sql, "FROM sandbox_active_interval"):
+				return notFoundRow()
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(ctx context.Context, _ string, args ...any) (pgconn.CommandTag, error) {
+			if err := ctx.Err(); err != nil {
+				t.Errorf("compensation DB context is canceled: %v", err)
+			}
+			for _, arg := range args {
+				if status, ok := arg.(db.SandboxStatus); ok && status == db.SandboxStatusActive {
+					revertActiveSeen.Store(true)
+				}
+			}
+			return pgconn.CommandTag{}, nil
+		},
+	}
+	vmd := &stubVMD{
+		pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
+			pauseCalls.Add(1)
+			if err := ctx.Err(); err != nil {
+				return "", "", err
+			}
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		},
+		resumeFn: func(ctx context.Context, _, _, _ string) (string, error) {
+			resumeCalls.Add(1)
+			if err := ctx.Err(); err != nil {
+				t.Errorf("rollback VMD context is canceled: %v", err)
+			}
+			return "10.0.0.1", nil
+		},
+	}
+	h := newReaperHandlers(dbtx, vmd)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := h.pauseClaimedSandbox(ctx, row, hostDrainPauseOperation)
+	if !errors.Is(err, finalizeErr) {
+		t.Fatalf("pauseClaimedSandbox error = %v, want finalize error", err)
+	}
+	if finalizeCtxErr != nil {
+		t.Fatalf("FinalizePause context is canceled: %v", finalizeCtxErr)
+	}
+	if got := pauseCalls.Load(); got != 2 {
+		t.Fatalf("PauseInstance calls = %d, want 2 (canceled request + detached retry)", got)
+	}
+	if got := resumeCalls.Load(); got != 1 {
+		t.Fatalf("rollback ResumeInstance calls = %d, want 1", got)
+	}
+	if !revertActiveSeen.Load() {
+		t.Fatal("rollback did not revert the sandbox row to active")
+	}
+}

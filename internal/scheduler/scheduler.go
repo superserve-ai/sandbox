@@ -15,6 +15,14 @@ type Scheduler interface {
 	SelectHost(ctx context.Context) (hostID string, err error)
 }
 
+// hostStore is the database surface the scheduler needs. Keeping this narrow
+// makes the zero-active-host admission rule unit-testable without a live
+// Postgres instance.
+type hostStore interface {
+	ListActiveHostsByLoad(ctx context.Context) ([]db.ListActiveHostsByLoadRow, error)
+	ListHosts(ctx context.Context) ([]db.Host, error)
+}
+
 const defaultCacheTTL = 30 * time.Second
 
 // LeastLoaded picks the active host with the fewest running sandboxes
@@ -30,7 +38,7 @@ const defaultCacheTTL = 30 * time.Second
 // If no host rows exist in the table, SelectHost falls back to
 // DefaultHostID so sandbox creation works without populating the host table.
 type LeastLoaded struct {
-	DB            *db.Queries
+	DB            hostStore
 	DefaultHostID string        // fallback when no host rows exist
 	TTL           time.Duration // 0 = use defaultCacheTTL
 
@@ -52,6 +60,17 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if len(hosts) == 0 {
+		// The legacy default-host fallback is valid only before the host table
+		// has been provisioned. Once any host row exists, an empty active set
+		// is an intentional admission fence (all hosts are draining/unhealthy),
+		// not permission to route around host lifecycle state.
+		knownHosts, listErr := s.DB.ListHosts(ctx)
+		if listErr != nil {
+			return "", fmt.Errorf("list hosts for fallback decision: %w", listErr)
+		}
+		if len(knownHosts) > 0 {
+			return "", fmt.Errorf("no active hosts available")
+		}
 		if s.DefaultHostID != "" {
 			return s.DefaultHostID, nil
 		}

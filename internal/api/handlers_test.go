@@ -1804,7 +1804,11 @@ func TestCreateSandbox_MissingTeamID(t *testing.T) {
 
 func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 	teamID := uuid.New()
-	vmd := &stubVMD{}
+	var restoreCalled bool
+	vmd := &stubVMD{restoreFn: func(context.Context, string, string, string) (string, error) {
+		restoreCalled = true
+		return "10.0.0.1", nil
+	}}
 
 	// SS001 is what the sandbox_quota_on_insert trigger raises on over-quota.
 	var destroyCalled bool
@@ -1844,8 +1848,11 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 	if errObj["code"] != "too_many_sandboxes" {
 		t.Errorf("error code = %v, want too_many_sandboxes", errObj["code"])
 	}
-	if !destroyCalled {
-		t.Error("orphan VM was not destroyed after quota rejection")
+	if restoreCalled {
+		t.Error("VMD boot started before DB quota admission succeeded")
+	}
+	if destroyCalled {
+		t.Error("DB-first quota rejection should not need orphan VM cleanup")
 	}
 }
 
@@ -2246,9 +2253,9 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
-				// Positional args (0-indexed): id, team_id, name, status,
-				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
-				if b, ok := args[11].([]byte); ok {
+				// Generated named-arg order (0-indexed): id, team_id, name,
+				// status, vcpu, mem, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[10].([]byte); ok {
 					capturedMetadata = b
 				}
 				// Echo metadata back through the row so the response carries it.
@@ -2306,9 +2313,9 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if strings.Contains(sql, "INSERT INTO sandbox") {
-				// Positional args (0-indexed): id, team_id, name, status,
-				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
-				if b, ok := args[11].([]byte); ok {
+				// Generated named-arg order (0-indexed): id, team_id, name,
+				// status, vcpu, mem, ip, pid, snapshot_id, timeout, metadata.
+				if b, ok := args[10].([]byte); ok {
 					capturedMetadata = b
 				}
 				return sandboxRow(db.Sandbox{

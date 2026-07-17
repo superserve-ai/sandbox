@@ -226,14 +226,29 @@ LIMIT $1;
 -- name: TryDispatchBuild :execrows
 -- Claims a pending row for dispatch. Stamps host + caller-generated
 -- build_vm_id up front so a timed-out BuildTemplate RPC can still be
--- reconciled by GetBuildStatus on the next tick.
+-- reconciled by GetBuildStatus on the next tick. Host admission is part of
+-- the same statement: either this shared lock commits a visible building row
+-- before drain proceeds, or a host already marked draining admits no build.
+-- The fallback is only for legacy installations with an empty host table.
+WITH active_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  WHERE h.id = sqlc.narg(vmd_host_id) AND h.status = 'active'
+  FOR SHARE
+),
+admitted_host AS MATERIALIZED (
+  SELECT id FROM active_host
+  UNION ALL
+  SELECT sqlc.narg(vmd_host_id)::text WHERE NOT EXISTS (SELECT 1 FROM host)
+)
 UPDATE template_build
 SET status = 'building',
     started_at = now(),
     updated_at = now(),
-    vmd_host_id = $2,
-    vmd_build_vm_id = $3
-WHERE id = $1 AND status = 'pending';
+    vmd_host_id = admitted_host.id,
+    vmd_build_vm_id = sqlc.narg(vmd_build_vm_id)
+FROM admitted_host
+WHERE template_build.id = sqlc.arg(id) AND template_build.status = 'pending';
 
 -- name: ListActiveBuilds :many
 -- Read-only: builds the supervisor is currently watching. Used per tick to

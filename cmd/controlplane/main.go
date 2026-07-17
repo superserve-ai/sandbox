@@ -236,12 +236,20 @@ func run() error {
 		if hostID == "" || handlers.Hosts == nil {
 			return vmdClient, nil
 		}
-		c, err := handlers.Hosts.ClientFor(rctx, hostID)
+		// Poll/cancel/reconcile must remain able to reach work admitted before a
+		// host began draining. Only BuildTemplate is new admission; the wrapper
+		// rechecks active status at that exact side-effect boundary.
+		c, err := hostRegistry.ClientFor(rctx, hostID)
 		if err != nil {
-			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: host lookup failed, using default client")
-			return vmdClient, nil
+			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: build host lookup failed")
+			return nil, err
 		}
-		return c, nil
+		return &buildAdmissionClient{
+			Client: c,
+			active: func(ctx context.Context) (vmdclient.Client, error) {
+				return hostRegistry.ActiveClientFor(ctx, hostID)
+			},
+		}, nil
 	}
 	supervisor.NewBuildSupervisor(
 		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
@@ -256,7 +264,11 @@ func run() error {
 		if hostID == "" || handlers.Hosts == nil {
 			return nil, fmt.Errorf("saved snapshot has no resolvable host")
 		}
-		client, err := hostRegistry.ActiveClientFor(rctx, hostID)
+		// This resolver repairs an operation already admitted by
+		// BeginSavedSnapshot. New capture/fork requests enforce active-host
+		// admission atomically in their DB claim; repair must still reach a
+		// draining host so it can converge and release the drain fence.
+		client, err := hostRegistry.ClientFor(rctx, hostID)
 		if err != nil {
 			return nil, err
 		}
@@ -394,6 +406,22 @@ func reconcileSystemTeamQuota(ctx context.Context, pool *pgxpool.Pool, systemTea
 type grpcVMDClient struct {
 	conn   *grpc.ClientConn
 	client vmdpb.VMDaemonClient
+}
+
+// buildAdmissionClient keeps status/poll/cancel calls available for an
+// already-running template build while applying the active-host fence only to
+// the RPC that can launch a new Firecracker process.
+type buildAdmissionClient struct {
+	vmdclient.Client
+	active func(context.Context) (vmdclient.Client, error)
+}
+
+func (c *buildAdmissionClient) BuildTemplate(ctx context.Context, req vmdclient.BuildTemplateInput) (string, error) {
+	active, err := c.active(ctx)
+	if err != nil {
+		return "", err
+	}
+	return active.BuildTemplate(ctx, req)
 }
 
 func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
