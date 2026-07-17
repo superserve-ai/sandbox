@@ -643,6 +643,10 @@ class DeployVmdDataDiskTests(unittest.TestCase):
         self.assertLess(device_setting, production_job)
         self.assertLess(staging_job, database_setting)
         self.assertLess(database_setting, production_job)
+        self.assertEqual(
+            workflow.count("python3 -u .github/workflows/scripts/deploy-vmd.py"),
+            3,
+        )
 
 
 class SetupSandboxDataDiskTests(unittest.TestCase):

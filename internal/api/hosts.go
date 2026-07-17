@@ -20,8 +20,12 @@ const (
 	hostDrainTimeout = 4 * time.Minute
 	// Claim at most one parallel wave at a time. Once rows are marked pausing,
 	// every claimed row must run the saga even if the request is canceled.
-	hostDrainBatchSize   = int32(10)
-	hostDrainParallelism = 10
+	hostDrainBatchSize = int32(10)
+	// Pause writes a VM-state and memory checkpoint to the same host disk.
+	// A ten-VM wave can saturate that disk until every 30-second VMD RPC times
+	// out, after which all retries herd again. Two concurrent checkpoints keep
+	// the device busy without starving every operation behind I/O contention.
+	hostDrainParallelism = 2
 	hostDrainPollEvery   = 500 * time.Millisecond
 )
 

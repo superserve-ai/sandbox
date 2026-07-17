@@ -110,7 +110,9 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
           SHA: ${{ github.sha }}
         run: |
-          python3 .github/workflows/scripts/deploy-vmd.py
+          # Emit drain counts as they change; Python otherwise block-buffers
+          # output in Actions and hides the safety-gate state until job exit.
+          python3 -u .github/workflows/scripts/deploy-vmd.py
 
   deploy-production:
     if: github.event_name == 'push' || github.event.inputs.environment == 'production'
@@ -161,7 +163,7 @@ jobs:
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          python3 .github/workflows/scripts/deploy-vmd.py
+          python3 -u .github/workflows/scripts/deploy-vmd.py
 
       # The usw cell deploys as a step in this job — not a separate job —
       # for the same reason Deploy API / CD Migrate / Seed Templates do it
@@ -184,4 +186,4 @@ jobs:
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          python3 .github/workflows/scripts/deploy-vmd.py
+          python3 -u .github/workflows/scripts/deploy-vmd.py
