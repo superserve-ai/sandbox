@@ -3,8 +3,9 @@
 #
 # This script is intentionally not part of the default regional smoke test.
 # The target team must have sandbox_snapshots_v1 enabled, a provisioned
-# snapshot-storage quota, secret write access, and capacity for one source plus
-# four active forks. Staging sign-off also requires a restart hook.
+# snapshot-storage quota, and capacity for one source plus four active forks.
+# Full mode also requires secret write access. Staging sign-off requires a
+# restart hook.
 set -euo pipefail
 
 usage() {
@@ -37,6 +38,11 @@ Optional environment variables:
                        Set to 1 to fail unless the restart hook is configured.
                        Defaults to 1; set explicitly to 0 only for a local
                        lifecycle smoke run that is not staging sign-off.
+  SKIP_SNAPSHOT_SECRET_CHECKS
+                       Set to 1 only when the target cannot create secrets.
+                       Skips secret creation, source binding, proxy-token
+                       freshness assertions, and secret deletion. Defaults to
+                       0; runs with this enabled are reported as degraded.
   CANARY_EGRESS_TEST_URL
                        Public URL used to prove that the source's deny-all
                        egress policy is inherited by every fork. Defaults to
@@ -103,6 +109,7 @@ POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-300}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-3}"
 SNAPSHOT_RESTART_HOOK="${SNAPSHOT_RESTART_HOOK:-}"
 REQUIRE_SNAPSHOT_RESTART_HOOK="${REQUIRE_SNAPSHOT_RESTART_HOOK:-1}"
+SKIP_SNAPSHOT_SECRET_CHECKS="${SKIP_SNAPSHOT_SECRET_CHECKS:-0}"
 CANARY_EGRESS_TEST_URL="${CANARY_EGRESS_TEST_URL:-https://example.com}"
 SNAPSHOT_SHADOW_DATABASE_URL="${SNAPSHOT_SHADOW_DATABASE_URL:-}"
 SNAPSHOT_TEAM_ID="${SNAPSHOT_TEAM_ID:-}"
@@ -112,6 +119,11 @@ require_positive_integer EXEC_TIMEOUT_S "$EXEC_TIMEOUT_S"
 require_positive_integer POLL_TIMEOUT_S "$POLL_TIMEOUT_S"
 require_positive_integer POLL_INTERVAL_S "$POLL_INTERVAL_S"
 require_boolean REQUIRE_SNAPSHOT_RESTART_HOOK "$REQUIRE_SNAPSHOT_RESTART_HOOK"
+require_boolean SKIP_SNAPSHOT_SECRET_CHECKS "$SKIP_SNAPSHOT_SECRET_CHECKS"
+
+if [[ "$SKIP_SNAPSHOT_SECRET_CHECKS" == "1" ]]; then
+  echo "WARNING: SKIP_SNAPSHOT_SECRET_CHECKS=1; running a degraded canary without secret creation, binding, proxy-token freshness, or deletion checks" >&2
+fi
 
 case "$CANARY_EGRESS_TEST_URL" in
   http://*|https://*) ;;
@@ -157,10 +169,11 @@ SOURCE_MARKER="snapshot-canary-source-${RUN_ID}"
 SOURCE_MUTATED_MARKER="snapshot-canary-source-mutated-${RUN_ID}"
 MEMORY_MARKER="snapshot-canary-memory-${RUN_ID}"
 SOURCE_MEMORY_MARKER="snapshot-canary-memory-source-${RUN_ID}"
-MEMORY_SOCKET_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.sock"
+MEMORY_REQUEST_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.request"
+MEMORY_RESPONSE_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.response"
 MEMORY_INPUT_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.input"
 MEMORY_PID_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.pid"
-MEMORY_SERVER_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.py"
+MEMORY_SERVER_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.sh"
 MEMORY_LOG_PATH="/tmp/superserve-snapshot-memory-${RUN_ID}.log"
 IDEMPOTENCY_KEY="snapshot-canary-capture-${RUN_ID}"
 PAUSED_IDEMPOTENCY_KEY="snapshot-canary-paused-capture-${RUN_ID}"
@@ -621,7 +634,7 @@ exec_expect_access_token_rejected() {
 
 memory_request_command() {
   local request="$1"
-  printf '%s' "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()); data=s.recv(4096); s.close(); sys.stdout.write(data.decode())' '${MEMORY_SOCKET_PATH}' '${request}'"
+  printf '%s' "printf '%s\\n' '${request}' > '${MEMORY_REQUEST_PATH}'; cat '${MEMORY_RESPONSE_PATH}'"
 }
 
 exec_expect_memory() {
@@ -653,31 +666,26 @@ exec_set_memory() {
 start_memory_process() {
   local server_code server_b64 command
   server_code="$(printf '%s\n' \
-    'import os' \
-    'import socket' \
-    'import sys' \
-    'socket_path, marker_path, pid_path = sys.argv[1:4]' \
-    'with open(marker_path, encoding="utf-8") as marker_file:' \
-    '    marker = marker_file.read()' \
-    'os.unlink(marker_path)' \
-    'try:' \
-    '    os.unlink(socket_path)' \
-    'except FileNotFoundError:' \
-    '    pass' \
-    'server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)' \
-    'server.bind(socket_path)' \
-    'server.listen(8)' \
-    'with open(pid_path, "w", encoding="utf-8") as pid_file:' \
-    '    pid_file.write(str(os.getpid()))' \
-    'while True:' \
-    '    connection, _ = server.accept()' \
-    '    with connection:' \
-    '        request = connection.recv(4096).decode()' \
-    '        if request.startswith("SET "):' \
-    '            marker = request[4:]' \
-    '        connection.sendall(marker.encode())')"
+    '#!/bin/sh' \
+    'set -eu' \
+    'request_path=$1' \
+    'response_path=$2' \
+    'marker_path=$3' \
+    'pid_path=$4' \
+    'marker=$(cat "$marker_path")' \
+    'rm -f "$marker_path"' \
+    'mkfifo "$request_path" "$response_path"' \
+    'printf "%s" "$$" > "$pid_path"' \
+    'while true; do' \
+    '    request=' \
+    '    IFS= read -r request < "$request_path" || true' \
+    '    case "$request" in' \
+    '        "SET "*) marker=${request#SET } ;;' \
+    '    esac' \
+    '    printf "%s" "$marker" > "$response_path"' \
+    'done')"
   server_b64="$(printf '%s' "$server_code" | base64 | tr -d '\n')"
-  command="set -eu; rm -f '${MEMORY_SOCKET_PATH}' '${MEMORY_PID_PATH}' '${MEMORY_INPUT_PATH}'; printf '%s' '${MEMORY_MARKER}' > '${MEMORY_INPUT_PATH}'; printf '%s' '${server_b64}' | base64 -d > '${MEMORY_SERVER_PATH}'; nohup python3 '${MEMORY_SERVER_PATH}' '${MEMORY_SOCKET_PATH}' '${MEMORY_INPUT_PATH}' '${MEMORY_PID_PATH}' </dev/null >'${MEMORY_LOG_PATH}' 2>&1 & i=0; while [ ! -S '${MEMORY_SOCKET_PATH}' ] && [ \"\$i\" -lt 100 ]; do i=\$((i + 1)); sleep 0.1; done; test -S '${MEMORY_SOCKET_PATH}'; pid=\$(cat '${MEMORY_PID_PATH}'); kill -0 \"\$pid\"; $(memory_request_command GET)"
+  command="set -eu; rm -f '${MEMORY_REQUEST_PATH}' '${MEMORY_RESPONSE_PATH}' '${MEMORY_PID_PATH}' '${MEMORY_INPUT_PATH}'; printf '%s' '${MEMORY_MARKER}' > '${MEMORY_INPUT_PATH}'; printf '%s' '${server_b64}' | base64 -d > '${MEMORY_SERVER_PATH}'; nohup sh '${MEMORY_SERVER_PATH}' '${MEMORY_REQUEST_PATH}' '${MEMORY_RESPONSE_PATH}' '${MEMORY_INPUT_PATH}' '${MEMORY_PID_PATH}' </dev/null >'${MEMORY_LOG_PATH}' 2>&1 & i=0; while { [ ! -p '${MEMORY_REQUEST_PATH}' ] || [ ! -p '${MEMORY_RESPONSE_PATH}' ]; } && [ \"\$i\" -lt 100 ]; do i=\$((i + 1)); sleep 0.1; done; if [ ! -p '${MEMORY_REQUEST_PATH}' ] || [ ! -p '${MEMORY_RESPONSE_PATH}' ] || [ ! -s '${MEMORY_PID_PATH}' ]; then cat '${MEMORY_LOG_PATH}' >&2 || true; exit 1; fi; pid=\$(cat '${MEMORY_PID_PATH}'); if ! kill -0 \"\$pid\"; then cat '${MEMORY_LOG_PATH}' >&2 || true; exit 1; fi; $(memory_request_command GET)"
   exec_expect_stdout \
     "start source in-memory process" \
     "$SOURCE_ID" \
@@ -726,6 +734,9 @@ cleanup() {
 
   trap - EXIT INT TERM
   set +e
+  # Bash 3.2 treats an initialized-but-empty array expansion as unbound under
+  # nounset. Cleanup is best-effort, so disable nounset before walking arrays.
+  set +u
 
   # Let any in-flight fork request finish before discovering tagged resources.
   for pid in "${BACKGROUND_PIDS[@]}"; do
@@ -802,25 +813,29 @@ else
   echo "Team shadow-storage verification skipped; no public API exposes it, and no staging database URL was supplied"
 fi
 
-echo "Creating canary secret binding ${SECRET_NAME}"
-secret_body="$(jq -cn \
-  --arg name "$SECRET_NAME" \
-  --arg value "$SECRET_VALUE" \
-  '{name: $name, value: $value, provider: "openai"}')"
-if ! response="$(api_request POST /secrets "$secret_body")"; then
-  fatal "canary secret create request failed"
+source_secrets='{}'
+if [[ "$SKIP_SNAPSHOT_SECRET_CHECKS" == "0" ]]; then
+  echo "Creating canary secret binding ${SECRET_NAME}"
+  secret_body="$(jq -cn \
+    --arg name "$SECRET_NAME" \
+    --arg value "$SECRET_VALUE" \
+    '{name: $name, value: $value, provider: "openai"}')"
+  if ! response="$(api_request POST /secrets "$secret_body")"; then
+    fatal "canary secret create request failed"
+  fi
+  status="$(response_status "$response")"
+  body="$(response_body "$response")"
+  expect_status "$status" 201 "$body" "create canary secret"
+  SECRET_CREATED=1
+  source_secrets="$(jq -cn --arg secret_name "$SECRET_NAME" '{SNAPSHOT_CANARY_SECRET: $secret_name}')"
 fi
-status="$(response_status "$response")"
-body="$(response_body "$response")"
-expect_status "$status" 201 "$body" "create canary secret"
-SECRET_CREATED=1
 
 echo "Creating active source sandbox ${SOURCE_NAME}"
 source_body="$(jq -cn \
   --arg name "$SOURCE_NAME" \
   --arg template "$SANDBOX_TEMPLATE" \
   --arg run_id "$RUN_ID" \
-  --arg secret_name "$SECRET_NAME" \
+  --argjson source_secrets "$source_secrets" \
   '{
     name: $name,
     from_template: $template,
@@ -829,15 +844,12 @@ source_body="$(jq -cn \
       allow_out: [],
       deny_out: ["0.0.0.0/0"]
     },
-    secrets: {
-      SNAPSHOT_CANARY_SECRET: $secret_name
-    },
     metadata: {
       snapshot_canary: "true",
       snapshot_canary_role: "source",
       snapshot_canary_run_id: $run_id
     }
-  }')"
+  } + if ($source_secrets | length) > 0 then {secrets: $source_secrets} else {} end')"
 if ! response="$(api_request POST /sandboxes "$source_body")"; then
   fatal "source sandbox create request failed"
 fi
@@ -854,14 +866,16 @@ if ! jq -e '.network.deny_out | index("0.0.0.0/0") != null' >/dev/null <<<"$body
 fi
 wait_for_sandbox_status "$SOURCE_ID" active
 
-exec_read_stdout \
-  "read source secret proxy token" \
-  "$SOURCE_ID" \
-  "$SOURCE_TOKEN" \
-  'test -n "$SNAPSHOT_CANARY_SECRET" && printf "%s" "$SNAPSHOT_CANARY_SECRET"'
-SOURCE_SECRET_TOKEN="$EXEC_STDOUT"
-if [[ -z "$SOURCE_SECRET_TOKEN" || "$SOURCE_SECRET_TOKEN" == "$SECRET_VALUE" ]]; then
-  fatal "source did not receive an opaque proxy token for its secret binding"
+if [[ "$SKIP_SNAPSHOT_SECRET_CHECKS" == "0" ]]; then
+  exec_read_stdout \
+    "read source secret proxy token" \
+    "$SOURCE_ID" \
+    "$SOURCE_TOKEN" \
+    'test -n "$SNAPSHOT_CANARY_SECRET" && printf "%s" "$SNAPSHOT_CANARY_SECRET"'
+  SOURCE_SECRET_TOKEN="$EXEC_STDOUT"
+  if [[ -z "$SOURCE_SECRET_TOKEN" || "$SOURCE_SECRET_TOKEN" == "$SECRET_VALUE" ]]; then
+    fatal "source did not receive an opaque proxy token for its secret binding"
+  fi
 fi
 exec_expect_blocked_egress \
   "source deny-all egress policy" \
@@ -1019,22 +1033,24 @@ fi
 
 for i in 0 1 2; do
   wait_for_sandbox_status "${FORK_IDS[$i]}" active
-  exec_read_stdout \
-    "fork $((i + 1)) fresh secret proxy token" \
-    "${FORK_IDS[$i]}" \
-    "${FORK_TOKENS[$i]}" \
-    'test -n "$SNAPSHOT_CANARY_SECRET" && printf "%s" "$SNAPSHOT_CANARY_SECRET"'
-  FORK_SECRET_TOKENS[$i]="$EXEC_STDOUT"
-  if [[ -z "${FORK_SECRET_TOKENS[$i]}" ||
-        "${FORK_SECRET_TOKENS[$i]}" == "$SOURCE_SECRET_TOKEN" ||
-        "${FORK_SECRET_TOKENS[$i]}" == "$SECRET_VALUE" ]]; then
-    fatal "fork $((i + 1)) reused a source/plaintext secret credential"
-  fi
-  for previous in 0 1 2; do
-    if (( previous < i )) && [[ "${FORK_SECRET_TOKENS[$i]}" == "${FORK_SECRET_TOKENS[$previous]}" ]]; then
-      fatal "fork $((i + 1)) reused fork $((previous + 1))'s secret proxy token"
+  if [[ "$SKIP_SNAPSHOT_SECRET_CHECKS" == "0" ]]; then
+    exec_read_stdout \
+      "fork $((i + 1)) fresh secret proxy token" \
+      "${FORK_IDS[$i]}" \
+      "${FORK_TOKENS[$i]}" \
+      'test -n "$SNAPSHOT_CANARY_SECRET" && printf "%s" "$SNAPSHOT_CANARY_SECRET"'
+    FORK_SECRET_TOKENS[$i]="$EXEC_STDOUT"
+    if [[ -z "${FORK_SECRET_TOKENS[$i]}" ||
+          "${FORK_SECRET_TOKENS[$i]}" == "$SOURCE_SECRET_TOKEN" ||
+          "${FORK_SECRET_TOKENS[$i]}" == "$SECRET_VALUE" ]]; then
+      fatal "fork $((i + 1)) reused a source/plaintext secret credential"
     fi
-  done
+    for previous in 0 1 2; do
+      if (( previous < i )) && [[ "${FORK_SECRET_TOKENS[$i]}" == "${FORK_SECRET_TOKENS[$previous]}" ]]; then
+        fatal "fork $((i + 1)) reused fork $((previous + 1))'s secret proxy token"
+      fi
+    done
+  fi
   exec_expect_access_token_rejected \
     "fork $((i + 1)) rejects source access token" \
     "${FORK_IDS[$i]}" \
@@ -1202,15 +1218,17 @@ if ! jq -e '.network.deny_out | index("0.0.0.0/0") != null' >/dev/null <<<"$body
   fatal "nested fork response omitted inherited deny-all egress policy: ${body}"
 fi
 wait_for_sandbox_status "$NESTED_FORK_ID" active
-exec_read_stdout \
-  "nested fork fresh secret proxy token" \
-  "$NESTED_FORK_ID" \
-  "$NESTED_FORK_TOKEN" \
-  'test -n "$SNAPSHOT_CANARY_SECRET" && printf "%s" "$SNAPSHOT_CANARY_SECRET"'
-NESTED_SECRET_TOKEN="$EXEC_STDOUT"
-if [[ -z "$NESTED_SECRET_TOKEN" || "$NESTED_SECRET_TOKEN" == "$SOURCE_SECRET_TOKEN" ||
-      "$NESTED_SECRET_TOKEN" == "${FORK_SECRET_TOKENS[0]}" || "$NESTED_SECRET_TOKEN" == "$SECRET_VALUE" ]]; then
-  fatal "nested fork reused an ancestor/plaintext secret credential"
+if [[ "$SKIP_SNAPSHOT_SECRET_CHECKS" == "0" ]]; then
+  exec_read_stdout \
+    "nested fork fresh secret proxy token" \
+    "$NESTED_FORK_ID" \
+    "$NESTED_FORK_TOKEN" \
+    'test -n "$SNAPSHOT_CANARY_SECRET" && printf "%s" "$SNAPSHOT_CANARY_SECRET"'
+  NESTED_SECRET_TOKEN="$EXEC_STDOUT"
+  if [[ -z "$NESTED_SECRET_TOKEN" || "$NESTED_SECRET_TOKEN" == "$SOURCE_SECRET_TOKEN" ||
+        "$NESTED_SECRET_TOKEN" == "${FORK_SECRET_TOKENS[0]}" || "$NESTED_SECRET_TOKEN" == "$SECRET_VALUE" ]]; then
+    fatal "nested fork reused an ancestor/plaintext secret credential"
+  fi
 fi
 exec_expect_access_token_rejected \
   "nested fork rejects parent access token" \
@@ -1372,10 +1390,20 @@ if [[ -n "$SNAPSHOT_SHADOW_DATABASE_URL" ]]; then
   assert_shadow_ledger_consistent "source final-reference deletion"
 fi
 
-response="$(api_request DELETE "/secrets/${SECRET_NAME}")"
-status="$(response_status "$response")"
-body="$(response_body "$response")"
-expect_status "$status" 204 "$body" "delete canary secret"
-SECRET_CREATED=0
+if [[ "$SKIP_SNAPSHOT_SECRET_CHECKS" == "0" ]]; then
+  response="$(api_request DELETE "/secrets/${SECRET_NAME}")"
+  status="$(response_status "$response")"
+  body="$(response_body "$response")"
+  expect_status "$status" 204 "$body" "delete canary secret"
+  SECRET_CREATED=0
+fi
 
-echo "Saved-snapshot canary passed: restart recovery, live process/memory capture, inherited restricted egress, fresh child secret tokens, active and paused sources, nested lineage, four independent forks, pause/resume, and dependency-safe deletion"
+restart_coverage="restart hooks skipped"
+if [[ -n "$SNAPSHOT_RESTART_HOOK" ]]; then
+  restart_coverage="restart recovery"
+fi
+if [[ "$SKIP_SNAPSHOT_SECRET_CHECKS" == "1" ]]; then
+  echo "Saved-snapshot canary passed in DEGRADED mode: ${restart_coverage}, live process/memory capture, inherited restricted egress, active and paused sources, nested lineage, four independent forks, pause/resume, and dependency-safe deletion. Secret checks were skipped."
+else
+  echo "Saved-snapshot canary passed: ${restart_coverage}, live process/memory capture, inherited restricted egress, fresh child secret tokens, active and paused sources, nested lineage, four independent forks, pause/resume, and dependency-safe deletion"
+fi
