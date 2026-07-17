@@ -121,6 +121,15 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			return
 		}
 
+		// A shared flight's result was evaluated at the executing caller's
+		// time; re-check key expiry at THIS request's time, exactly like the
+		// cache-hit path does on every get.
+		if entry.expiresAt.Valid && !time.Now().Before(entry.expiresAt.Time) {
+			respondAuthFailed(c, apiKey)
+			c.Abort()
+			return
+		}
+
 		setAPIKeyContext(c, entry)
 		c.Set("auth_ms", time.Since(authStart).Milliseconds())
 		c.Next()
