@@ -42,6 +42,56 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
 
+      - name: Ensure PostgreSQL client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+
+      # Staging is a shared playground: snapshots should work for every team
+      # without a manual feature-flag or quota provisioning step. Keep this
+      # environment policy outside the shared migrations so production remains
+      # gated until its rollout is explicitly approved.
+      - name: Enable snapshots for the staging playground
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+        run: |
+          psql --dbname="$DATABASE_URL" --no-psqlrc --set=ON_ERROR_STOP=1 <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '10s';
+          SET LOCAL statement_timeout = '2min';
+
+          INSERT INTO feature_flag (key, enabled, description)
+          VALUES (
+              'sandbox_snapshots_v1',
+              true,
+              'Allow a team to capture immutable saved snapshots and create sandboxes from them.'
+          )
+          ON CONFLICT (key) DO UPDATE
+          SET enabled = EXCLUDED.enabled,
+              updated_at = now();
+
+          -- Per-team values override the global flag, so staging should rely
+          -- solely on the globally enabled playground default.
+          DELETE FROM team_feature_flag
+          WHERE key = 'sandbox_snapshots_v1';
+
+          -- 100 GiB is intentionally generous for staging. Preserve any
+          -- larger quota that an existing staging team already has.
+          ALTER TABLE team
+              ALTER COLUMN snapshot_storage_quota_bytes
+              SET DEFAULT 107374182400;
+
+          UPDATE team
+          SET snapshot_storage_quota_bytes = 107374182400,
+              updated_at = now()
+          WHERE snapshot_storage_quota_bytes IS NULL
+             OR snapshot_storage_quota_bytes < 107374182400;
+
+          COMMIT;
+          SQL
+
   migrate-prod:
     name: Migrate Production
     if: github.event_name == 'push' || github.event.inputs.environment == 'production'
