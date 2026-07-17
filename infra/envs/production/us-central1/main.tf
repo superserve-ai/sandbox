@@ -147,6 +147,7 @@ module "api" {
     SENTRY_DSN             = "https://4497bf1fc61a2388b355489982086ac7@o4511499764760576.ingest.us.sentry.io/4511499780620288"
     SECRETS_SIGNING_KEY_ID = "v1"
     VMD_GRPC_ADDRESS       = "10.0.0.3:50051"
+    SENTRY_DSN             = "https://4497bf1fc61a2388b355489982086ac7@o4511499764760576.ingest.us.sentry.io/4511499780620288"
     SYSTEM_TEAM_ID         = "258e290e-d30d-4d2a-b751-07da118248c0"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "12"
