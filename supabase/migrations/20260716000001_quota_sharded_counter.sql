@@ -82,11 +82,9 @@ BEGIN
 END;
 $$;
 
--- Seed shard 0 with an exact recount of the counted set (not the old column,
--- which was clamp-protected rather than provably exact — the same reason the
--- previous quota migrations ended with a recount). The table lock makes this
--- race-free, and an exact seed is what keeps shard sums from ever starting
--- negative.
+-- Seed shard 0 with an exact recount of the counted set, not the old column —
+-- it was clamp-protected rather than provably exact, which is why the previous
+-- quota migrations also ended with a recount. The table lock makes this race-free.
 INSERT INTO team_sandbox_counter (team_id, shard, cnt)
 SELECT team_id, 0, COUNT(*)::int
 FROM sandbox
@@ -99,11 +97,10 @@ ON CONFLICT (team_id, shard) DO NOTHING;
 -- stopped, refusing the write would only strand truth).
 --
 -- The shard is chosen per backend, not per row: a multi-row statement (e.g. a
--- reaper batch) then touches at most one shard row per team, so two concurrent
--- batches can never hold-and-wait on each other's shards — random per-row
--- choice would deadlock them — while concurrent backends still spread across
--- shards. Sums are floored at 0 wherever they gate enforcement so a drifted
--- negative sum can never widen a team's quota.
+-- reaper batch) then locks at most one shard row per team, so concurrent
+-- batches can't hold-and-wait on each other's shards (random per-row choice
+-- deadlocks them), while concurrent backends still spread. Enforcement sums
+-- are floored at 0 so a drifted negative sum can never widen a team's quota.
 CREATE OR REPLACE FUNCTION sandbox_quota_admit(p_team uuid, p_enforce boolean)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
