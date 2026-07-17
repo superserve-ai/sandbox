@@ -197,6 +197,11 @@ module "api" {
   vpc_connector = module.network.vpc_connector_id
   vpc_egress    = "PRIVATE_RANGES_ONLY"
   labels        = local.common_labels
+
+  depends_on = [
+    google_secret_manager_secret_iam_member.api_runtime_secrets,
+    google_kms_crypto_key_iam_member.api_runtime_credentials_kms,
+  ]
 }
 
 module "sandbox_host" {

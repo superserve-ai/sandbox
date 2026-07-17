@@ -170,6 +170,8 @@ module "api" {
   }
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
+
+  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
 }
 resource "google_compute_disk" "sandbox_data" {
   project = local.project_id

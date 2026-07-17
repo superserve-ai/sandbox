@@ -84,24 +84,17 @@ data "google_service_account" "github_actions" {
   account_id = "superserve-github-actions"
 }
 
-resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
-  for_each = toset([
-    "posthog-project-key",
-    "slack-quota-alert-webhook",
-    coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
-    coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
-  ])
-
-  project   = local.project_id
-  secret_id = each.value
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${local.api_service_account_email}"
-}
-
 resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
   crypto_key_id = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
   member        = "serviceAccount:${local.api_service_account_email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
+  project   = local.project_id
+  secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${local.api_service_account_email}"
 }
 
 # deploy-proxy.yml fetches this secret directly via `gcloud secrets versions
@@ -178,6 +171,8 @@ module "api" {
   vpc_tags       = ["cr-usw2"]
 
   labels = local.common_labels
+
+  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
 }
 
 module "sandbox_host" {
