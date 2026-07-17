@@ -147,9 +147,9 @@ environments:
       - name: us-east4
         # Host-swap replacement for the primary us-central1 host, same "use"
         # cell (not a new cell — no separate DB/token-seed story like usw2).
-        # Keep disabled until bootstrap (B1) and pre-cutover validation
-        # (Phase C) pass; the host carries sandbox_status=provisioning
-        # until then, so this selector wouldn't match it yet regardless.
+        # Keep disabled until the host is bootstrapped and passes pre-cutover
+        # validation; the host carries sandbox_status=provisioning until then,
+        # so this selector wouldn't match it yet regardless.
         required: false
         api:
           platform: cloud_run

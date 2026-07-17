@@ -166,9 +166,9 @@ jobs:
       # usw2 it shares the cell's own token seed directly
       # (SANDBOX_ACCESS_TOKEN_SEED_PROD) — no separate secret fetch needed.
       # PROXY_DOMAIN_USE4 is a temporary validation-only hostname; it flips
-      # to the primary's domain at cutover (Phase D), matching the west
-      # bring-up's usw2-sandbox.superserve.ai -> usw-sandbox.superserve.ai
-      # pattern. Skipped until CLOUD_RUN_SERVICE_USE4 is set.
+      # to the primary's domain at cutover, matching the west host's
+      # usw2-sandbox.superserve.ai -> usw-sandbox.superserve.ai transition.
+      # Skipped until CLOUD_RUN_SERVICE_USE4 is set.
       - name: Deploy proxy to use4 host
         # Require the region too: deploy-proxy.py treats an empty GCP_REGION as
         # "no scoping" and would match every prod vmd host, rewriting each
