@@ -153,14 +153,9 @@ jobs:
       - name: Configure Docker
         run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
 
-      - name: Load and push image
+      - name: Load production image
         run: |
           gzip -dc /tmp/controlplane-image.tar.gz | docker load
-          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane"
-          docker tag controlplane:${{ github.sha }} ${IMAGE}:latest
-          docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
-          docker push ${IMAGE}:latest
-          docker push ${IMAGE}:${{ github.sha }}
 
       - name: Deploy to Cloud Run
         run: |
