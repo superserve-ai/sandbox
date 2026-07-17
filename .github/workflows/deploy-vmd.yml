@@ -161,3 +161,23 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
+
+      # us-east4 is a host-swap within the primary "use" cell, not a
+      # separate cell — same VMD_LABEL and DB as the primary step above,
+      # only GCP_REGION differs. Skipped until CLOUD_RUN_SERVICE_USE4 is
+      # set, same empty-until-ready gate as the usw cell step. Discovery
+      # is the same VMD_LABEL filter scoped to GCP_REGION_USE4, so the new
+      # host must carry the label; zero matches fails the deploy rather
+      # than silently skipping it.
+      - name: Deploy to use4 host
+        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_SERVICE: ${{ vars.VMD_SERVICE }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python3 .github/workflows/scripts/deploy-vmd.py

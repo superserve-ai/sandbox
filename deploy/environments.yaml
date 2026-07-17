@@ -144,3 +144,36 @@ environments:
         artifacts:
           docker_repository: us-west2-docker.pkg.dev/rayai-prod/superserve-usw2
           object_bucket: superserve-artifacts
+      - name: us-east4
+        # Host-swap replacement for the primary us-central1 host, same "use"
+        # cell (not a new cell — no separate DB/token-seed story like usw2).
+        # Keep disabled until bootstrap (B1) and pre-cutover validation
+        # (Phase C) pass; the host carries sandbox_status=provisioning
+        # until then, so this selector wouldn't match it yet regardless.
+        required: false
+        api:
+          platform: cloud_run
+          service: superserve-api-use4
+          region: us-east4
+          image_repository: us-east4-docker.pkg.dev/rayai-prod/superserve-use4/controlplane
+        host_deployments:
+          vmd:
+            enabled: false
+            selector:
+              environment: production
+              region: us-east4
+              sandbox_role: vmd
+              sandbox_status: ready
+          proxy:
+            enabled: false
+            selector:
+              environment: production
+              region: us-east4
+              sandbox_role: vmd
+              sandbox_status: ready
+            # Temporary validation domain — flips to usc-sandbox.superserve.ai
+            # (or whatever the final client-facing domain is) at cutover.
+            domain: use4-sandbox.superserve.ai
+        artifacts:
+          docker_repository: us-east4-docker.pkg.dev/rayai-prod/superserve-use4
+          object_bucket: superserve-artifacts

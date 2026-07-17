@@ -161,3 +161,27 @@ jobs:
             --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
           export SANDBOX_ACCESS_TOKEN_SEED
           python3 .github/workflows/scripts/deploy-proxy.py
+
+      # us-east4 is a host-swap within the primary "use" cell, so unlike
+      # usw2 it shares the cell's own token seed directly
+      # (SANDBOX_ACCESS_TOKEN_SEED_PROD) — no separate secret fetch needed.
+      # PROXY_DOMAIN_USE4 is a temporary validation-only hostname; it flips
+      # to the primary's domain at cutover (Phase D), matching the west
+      # bring-up's usw2-sandbox.superserve.ai -> usw-sandbox.superserve.ai
+      # pattern. Skipped until CLOUD_RUN_SERVICE_USE4 is set.
+      - name: Deploy proxy to use4 host
+        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USE4 }}
+          PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USE4 }}
+          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python3 .github/workflows/scripts/deploy-proxy.py
