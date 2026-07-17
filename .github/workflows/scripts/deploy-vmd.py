@@ -242,6 +242,9 @@ def main() -> int:
             fi
 
             if [ "$DATA_DISK_SETUP_RC" != 0 ]; then
+                echo "sandbox-data-disk.service diagnostics:" >&2
+                sudo systemctl status --no-pager sandbox-data-disk.service >&2 || true
+                sudo journalctl -u sandbox-data-disk.service --no-pager -n 160 >&2 || true
                 if [ "$DATA_DISK_DIRECT_VERIFY" = 1 ]; then
                     # Defense in depth: the verifier also does this after it
                     # sees the authority fence. Preserve Firecracker guests so

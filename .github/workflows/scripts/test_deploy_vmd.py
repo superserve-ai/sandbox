@@ -114,6 +114,7 @@ class DeployVmdDataDiskTests(unittest.TestCase):
             "if sudo systemctl is-active --quiet sandbox-data-disk.service; then",
             "sudo /usr/local/bin/setup-sandbox-data-disk.sh --verify-only",
             "sudo systemctl start sandbox-data-disk.service",
+            "sudo journalctl -u sandbox-data-disk.service --no-pager -n 160",
         )
         for fragment in expected_fragments:
             self.assertIn(fragment, remote_script)
