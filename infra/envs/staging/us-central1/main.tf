@@ -173,33 +173,7 @@ module "api" {
 
   depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
 }
-resource "google_compute_disk" "sandbox_data" {
-  project = local.project_id
-  name    = "superserve-vmd-staging-sandbox-data"
-  zone    = local.zone
-  type    = "pd-balanced"
-  size    = 500
 
-  labels = merge(local.common_labels, {
-    component = "vmd"
-    purpose   = "sandbox-data"
-  })
-
-  lifecycle {
-    prevent_destroy = true
-  }
-}
-
-resource "google_compute_attached_disk" "sandbox_data" {
-  project     = local.project_id
-  zone        = local.zone
-  disk        = google_compute_disk.sandbox_data.id
-  instance    = module.sandbox_host.instance_self_link
-  device_name = "superserve-sandbox-data"
-  mode        = "READ_WRITE"
-
-  deletion_policy = "PREVENT"
-}
 resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
   project   = local.project_id
   secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
