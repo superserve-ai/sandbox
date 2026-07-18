@@ -100,11 +100,11 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		})
 		if err != nil {
 			switch {
-			case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
-				// The caller's own context ended — client disconnected or its
-				// deadline fired while the lookup was in flight. Nothing to
-				// serve and no fault of ours; abort quietly (a 503 write to a
-				// gone client just errors, and an Error log would be noise).
+			case c.Request.Context().Err() != nil:
+				// Caller gone or its deadline fired; abort without an Error
+				// log. Keyed on the request context, not the error value: the
+				// shared flight's own timeout also surfaces DeadlineExceeded
+				// and must fall through to the cases below.
 				respondErrorMsg(c, "service_unavailable",
 					"Authentication is temporarily unavailable. Please retry.",
 					http.StatusServiceUnavailable)

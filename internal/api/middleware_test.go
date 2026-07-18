@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,6 +156,50 @@ func TestAPIKeyAuth_WrongRegionKey_UseKeyOnUswCell(t *testing.T) {
 	}
 	if strings.Contains(msg, "api-use") {
 		t.Errorf("message must not reference the nonexistent api-use host, got %q", msg)
+	}
+}
+
+// A lookup timeout is not caller cancellation: when the DB hangs until the
+// lookup's own deadline fires, the error is DeadlineExceeded but the request
+// context is still live — a wrong-region key must keep its redirect hint
+// instead of collapsing into a generic 503.
+func TestAPIKeyAuth_WrongRegionKey_LookupTimeout(t *testing.T) {
+	t.Setenv("SANDBOX_ID_REGION", "use")
+
+	// A listener that accepts and then never speaks: connect_timeout=1 makes
+	// the lookup fail with an error wrapping context.DeadlineExceeded.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		var conns []net.Conn
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				for _, c := range conns {
+					c.Close()
+				}
+				return
+			}
+			conns = append(conns, conn)
+		}
+	}()
+
+	pool, err := pgxpool.New(context.Background(),
+		fmt.Sprintf("postgres://u:p@%s/db?connect_timeout=1", ln.Addr()))
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	code, errObj := doAuthRequest(t, newAuthTestRouter(pool), "ss_live_usw_dGVzdHJhbmRvbQ")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 wrong-region hint on lookup timeout, got %d", code)
+	}
+	if errObj["code"] != "wrong_region" {
+		t.Errorf("expected code=wrong_region, got %v", errObj["code"])
 	}
 }
 
