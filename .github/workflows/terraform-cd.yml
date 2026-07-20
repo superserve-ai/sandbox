@@ -361,9 +361,9 @@ jobs:
       contents: read
       id-token: write
     env:
-      API_BASE_URL: https://usc-api.superserve.ai
+      API_BASE_URL: https://api.superserve.ai
       API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
-      SANDBOX_BASE_URL: https://usc-sandbox.superserve.ai
+      SANDBOX_BASE_URL: https://sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
 
