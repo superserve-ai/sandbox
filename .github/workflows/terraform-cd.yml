@@ -312,6 +312,7 @@ jobs:
             echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
             exit 1
           fi
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health" >/dev/null
 
   production-us-central1-infra:
     name: Apply production/us-central1
