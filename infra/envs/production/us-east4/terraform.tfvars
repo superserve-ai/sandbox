@@ -14,4 +14,4 @@ boot_disk_type         = "hyperdisk-balanced"
 # The reservation-us-east-c4-288-lssd-metal reservation is non-specific
 # (specificReservationRequired=false), so it can't be targeted by name. Null =
 # default affinity, which auto-consumes that matching reservation in the zone.
-reservation_name       = null
+reservation_name = null
