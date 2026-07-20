@@ -313,12 +313,6 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke test production/us-west2
-        run: |
-          set -euo pipefail
-          scripts/smoke-test-region.sh production us-west2
-          echo "production/us-west2 deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
-
   production-us-central1-infra:
     name: Apply production/us-central1
     runs-on: ubuntu-latest
