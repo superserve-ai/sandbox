@@ -65,9 +65,9 @@ variable "boot_disk_type" {
 }
 
 variable "reservation_name" {
-  description = "SPECIFIC_RESERVATION to consume for the vmd host. Must be in the same zone as var.zone."
+  description = "Name of a reservation to specifically target — only valid if that reservation has specificReservationRequired=true. Null uses default affinity, which automatically consumes a matching (non-specific) reservation in the zone. The us-east4 c4-metal reservation was created without specificReservationRequired, so it must be consumed this way rather than targeted by name."
   type        = string
-  default     = "reservation-us-east-c4-288-lssd-metal"
+  default     = null
 }
 
 variable "create_network" {
