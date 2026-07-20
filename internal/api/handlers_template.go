@@ -1065,9 +1065,8 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 			return e.tpl, nil
 		}
 		if now.Before(e.expiry.Add(templateCacheStaleGrace)) {
-			// Serve the just-expired entry and refresh behind the response, so
-			// a burst landing on an expired entry never queues. A refresh that
-			// finds the template gone drops the entry.
+			// Serve the just-expired entry, refresh behind the response; a
+			// refresh that finds the template gone drops the entry.
 			go h.refreshTemplateCache(sfKey, cacheKey, teamID, ref)
 			return e.tpl, nil
 		}

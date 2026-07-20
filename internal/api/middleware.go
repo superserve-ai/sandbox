@@ -93,10 +93,8 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				touchLastUsed(c.Request.Context(), entry.id)
 			}
 			if stale {
-				// Serve the just-expired entry and refresh behind the response,
-				// so a burst landing on an expired entry never queues. fetch's
-				// singleflight collapses concurrent refreshes; errors are
-				// ignored — the entry stays servable for the grace window and
+				// Serve the just-expired entry, refresh behind the response.
+				// fetch coalesces concurrent refreshes; errors are ignored —
 				// a real revocation lands via the refreshed lookup.
 				go func() { _, _ = cache.fetch(context.Background(), keyHash, lookup) }()
 			}

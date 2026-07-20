@@ -153,10 +153,9 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 			c.mu.Unlock()
 			return true, nil
 		case now.Before(e.expiry.Add(teamPermStaleGrace)):
-			// Serve the just-expired grant and refresh behind the response, so
-			// a burst landing on an expired entry never queues. Errors are
-			// ignored: the entry stays servable for the grace window, and a
-			// revocation lands via the refresh (or the generation bump).
+			// Serve the just-expired grant, refresh behind the response.
+			// Errors are ignored: the entry stays servable for the grace
+			// window, and a revocation lands via the refresh (or the bump).
 			c.mu.Unlock()
 			go func() { _, _ = s.flightTeamPerm(context.Background(), key, observed) }()
 			return true, nil
