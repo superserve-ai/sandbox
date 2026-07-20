@@ -90,12 +90,11 @@ resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
   member        = "serviceAccount:${local.api_service_account_email}"
 }
 
-resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
-  project   = local.project_id
-  secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${local.api_service_account_email}"
-}
+# The runtime grant for the shared system-team-id-production secret is owned
+# solely by production/us-central1 (its api_runtime_secrets set), matching how
+# the other shared runtime secrets (posthog/slack/sentry) are granted to the
+# shared api-runner SA — so this root doesn't double-manage the same binding
+# from a separate state.
 
 # deploy-proxy.yml fetches this secret directly via `gcloud secrets versions
 # access` at deploy time for the usw cell step, instead of through a Cloud
@@ -173,7 +172,6 @@ module "api" {
   labels = local.common_labels
 
   depends_on = [
-    google_secret_manager_secret_iam_member.api_runtime_system_team_id,
     google_kms_crypto_key_iam_member.api_runtime_credentials_kms,
   ]
 }
