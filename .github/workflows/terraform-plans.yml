@@ -1,0 +1,160 @@
+name: Terraform Plans
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "scripts/terraform-*.sh"
+      - ".github/workflows/terraform-*.yml"
+
+concurrency:
+  group: terraform-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  terraform-plan:
+    name: terraform-plan (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: staging-us-central1
+            dir: infra/envs/staging/us-central1
+          - name: production-us-central1
+            dir: infra/envs/production/us-central1
+          - name: production-us-west2
+            dir: infra/envs/production/us-west2
+          - name: production-us-east4
+            dir: infra/envs/production/us-east4
+    env:
+      TF_IN_AUTOMATION: "true"
+      HAS_GCP_AUTH: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        if: env.HAS_GCP_AUTH == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Skip plan when GCP auth is unavailable
+        if: env.HAS_GCP_AUTH != 'true'
+        run: |
+          summary_file="${GITHUB_WORKSPACE}/terraform-plan-summary-${{ matrix.name }}.txt"
+          echo "::notice title=Terraform plan skipped::GCP auth secrets are not configured."
+          echo "Terraform plan skipped because GCP auth secrets are not configured for this workflow." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Terraform plan: ${{ matrix.name }}"
+            echo
+            echo "Skipped because GCP auth secrets are not configured."
+          } > "$summary_file"
+
+      - name: Validate and plan
+        if: env.HAS_GCP_AUTH == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          summary_file="${GITHUB_WORKSPACE}/terraform-plan-summary-${{ matrix.name }}.txt"
+          {
+            echo "## Terraform plan: ${{ matrix.name }}"
+            echo
+          } > "$summary_file"
+
+          cd "${{ matrix.dir }}"
+
+          terraform init -input=false
+          terraform validate
+
+          set +e
+          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan
+          plan_status=$?
+          set -e
+
+          if [[ $plan_status -eq 0 ]]; then
+            echo "No changes."
+            echo "No changes." >> "$summary_file"
+            exit 0
+          fi
+
+          if [[ $plan_status -eq 2 ]]; then
+            echo "Changes detected."
+            echo "Changes detected." >> "$summary_file"
+            echo >> "$summary_file"
+            echo "Plan output:" >> "$summary_file"
+            echo '```' >> "$summary_file"
+            terraform show -no-color tfplan | head -n 200 >> "$summary_file" || true
+            echo '```' >> "$summary_file"
+            exit 0
+          fi
+
+          echo "::error title=Terraform plan failed::${{ matrix.name }} terraform plan failed."
+          {
+            echo "Terraform plan failed."
+            echo
+            echo "See the job logs for details."
+          } > "$summary_file"
+          exit "$plan_status"
+
+      - name: Upload Terraform plan summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-summary-${{ matrix.name }}
+          path: terraform-plan-summary-${{ matrix.name }}.txt
+          if-no-files-found: error
+
+  terraform-plan-summary:
+    name: Terraform Plan Details
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Download plan summaries
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: terraform-plan-summary-*
+          path: terraform-plan-summaries
+
+      - name: Publish consolidated summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "## Terraform Plan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+          mapfile -t summaries < <(find terraform-plan-summaries -type f -name 'terraform-plan-summary-*.txt' | sort)
+
+          if [[ ${#summaries[@]} -eq 0 ]]; then
+            echo "No Terraform plan summaries were produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          for summary in "${summaries[@]}"; do
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "---" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Propagate plan failures
+        if: ${{ needs.terraform-plan.result != 'success' }}
+        run: |
+          echo "::error title=Terraform plan failed::One or more regional Terraform plans failed."
+          exit 1

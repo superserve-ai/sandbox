@@ -166,7 +166,6 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 
@@ -250,8 +249,8 @@ jobs:
       contents: read
       id-token: write
     env:
-      API_BASE_URL: https://usw-api.superserve.ai
-      API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+      API_BASE_URL: https://api-usw.superserve.ai
+      API_KEY: ${{ secrets.PROD_USW_INTERNAL_API_TOKEN }}
       SANDBOX_BASE_URL: https://usw-sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
@@ -272,12 +271,12 @@ jobs:
           path: /tmp
 
       - name: Configure Docker
-        run: gcloud auth configure-docker ${{ vars.GCP_REGION_USW }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
 
       - name: Load and push image
         run: |
           gzip -dc /tmp/controlplane-image.tar.gz | docker load
-          IMAGE="${{ vars.GCP_REGION_USW }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve-usw2/controlplane"
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane"
           docker tag controlplane:${{ github.sha }} ${IMAGE}:latest
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
@@ -286,8 +285,7 @@ jobs:
       - name: Deploy to Cloud Run
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
-            --image ${{ vars.GCP_REGION_USW }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve-usw2/controlplane:${{ github.sha }} \
-            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
+            --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USW }} \
             --project ${{ vars.GCP_PROJECT }}
 
@@ -314,6 +312,12 @@ jobs:
             echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
             exit 1
           fi
+
+      - name: Smoke test production/us-west2
+        run: |
+          set -euo pipefail
+          scripts/smoke-test-region.sh production us-west2
+          echo "production/us-west2 deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
 
   production-us-central1-infra:
     name: Apply production/us-central1
@@ -363,9 +367,9 @@ jobs:
       contents: read
       id-token: write
     env:
-      API_BASE_URL: https://usc-api.superserve.ai
+      API_BASE_URL: https://api.superserve.ai
       API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
-      SANDBOX_BASE_URL: https://usc-sandbox.superserve.ai
+      SANDBOX_BASE_URL: https://sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
 
@@ -400,7 +404,6 @@ jobs:
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --update-env-vars SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ vars.GCP_PROJECT }}
 

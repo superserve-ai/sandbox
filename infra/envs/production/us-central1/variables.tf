@@ -99,3 +99,9 @@ variable "sentry_dsn_secret_name" {
   type        = string
   default     = null
 }
+
+variable "system_team_id_secret_name" {
+  description = "Secret Manager secret name for SYSTEM_TEAM_ID."
+  type        = string
+  default     = null
+}
