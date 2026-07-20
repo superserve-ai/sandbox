@@ -250,7 +250,7 @@ jobs:
       id-token: write
     env:
       API_BASE_URL: https://api-usw.superserve.ai
-      API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+      API_KEY: ${{ secrets.PROD_USW_INTERNAL_API_TOKEN }}
       SANDBOX_BASE_URL: https://usw-sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
