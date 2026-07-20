@@ -38,6 +38,7 @@ type LeastLoaded struct {
 	mu         sync.RWMutex
 	cached     []db.ListActiveHostsByLoadRow
 	cachedAt   time.Time
+	gen        uint64      // bumped by Invalidate; discards refreshes that started earlier
 	refreshing atomic.Bool // one background refresh at a time
 }
 
@@ -85,7 +86,7 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 // actions, which call Invalidate for an immediate reload.
 func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoadRow, error) {
 	s.mu.RLock()
-	cached, cachedAt := s.cached, s.cachedAt
+	cached, cachedAt, startGen := s.cached, s.cachedAt, s.gen
 	s.mu.RUnlock()
 	if cached != nil {
 		if time.Since(cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
@@ -100,8 +101,12 @@ func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoad
 					return
 				}
 				s.mu.Lock()
-				s.cached = hosts
-				s.cachedAt = time.Now()
+				// Discard results from before the latest Invalidate: storing
+				// them would resurrect a host list the invalidation retired.
+				if s.gen == startGen {
+					s.cached = hosts
+					s.cachedAt = time.Now()
+				}
 				s.mu.Unlock()
 			}()
 		}
@@ -126,6 +131,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoad
 // changes immediately.
 func (s *LeastLoaded) Invalidate() {
 	s.mu.Lock()
+	s.gen++
 	s.cached = nil
 	s.cachedAt = time.Time{}
 	s.mu.Unlock()

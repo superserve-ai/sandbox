@@ -152,3 +152,49 @@ func TestInvalidateForcesBlockingReload(t *testing.T) {
 		t.Fatalf("invalidate must force a blocking reload, got %d queries", n)
 	}
 }
+
+func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	// Hold a background refresh in flight, then invalidate underneath it.
+	store.block = make(chan struct{})
+	s.mu.Lock()
+	s.cachedAt = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+	if _, err := s.SelectHost(context.Background()); err != nil { // triggers the refresh
+		t.Fatalf("stale select: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 2 { // refresh goroutine reached its (blocked) query
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh never started, calls=%d", store.calls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	s.Invalidate()      // host retired while the refresh holds the old list
+	close(store.block)  // the pre-invalidation refresh now returns
+
+	// The stale refresh must be discarded: the cache stays empty until a
+	// fresh blocking load, not resurrected with the pre-invalidation list.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		s.mu.RLock()
+		resurrected := s.cached != nil
+		s.mu.RUnlock()
+		if !resurrected && !s.refreshing.Load() {
+			break // refresh finished and stored nothing
+		}
+		if resurrected {
+			t.Fatal("pre-invalidation refresh resurrected the retired host list")
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresh goroutine never finished")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
