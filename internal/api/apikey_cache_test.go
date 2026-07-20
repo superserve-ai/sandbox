@@ -277,3 +277,15 @@ func TestAPIKeyCache_FetchContextContract(t *testing.T) {
 		t.Errorf("nil-cache fetch: %v", err)
 	}
 }
+
+func TestAPIKeyCache_RemoveDropsEntry(t *testing.T) {
+	c := newAPIKeyCache(10 * time.Second)
+	now := time.Now()
+	c.put("hash1", apiKeyCacheEntry{id: "id1"}, now)
+	c.remove("hash1")
+	if _, _, _, ok := c.get("hash1", now); ok {
+		t.Fatal("removed entry must not be served")
+	}
+	var disabled *apiKeyCache
+	disabled.remove("hash1") // nil-safe, must not panic
+}

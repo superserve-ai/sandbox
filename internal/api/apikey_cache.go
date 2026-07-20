@@ -107,6 +107,17 @@ func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry
 	return *e, needTouch, age > c.ttl, true
 }
 
+// remove drops a cached entry. Used when a refresh returns a definitive
+// not-found: the key was revoked, so its stale entry must stop being servable.
+func (c *apiKeyCache) remove(keyHash string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.m, keyHash)
+	c.mu.Unlock()
+}
+
 // fetch coalesces concurrent misses for the same key: one caller runs fn (the
 // DB lookup) and every concurrent waiter shares its result, so a burst hitting
 // an expired entry issues a single query instead of one per request.

@@ -94,9 +94,14 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			}
 			if stale {
 				// Serve the just-expired entry, refresh behind the response.
-				// fetch coalesces concurrent refreshes; errors are ignored —
-				// a real revocation lands via the refreshed lookup.
-				go func() { _, _ = cache.fetch(context.Background(), keyHash, lookup) }()
+				// fetch coalesces concurrent refreshes. A definitive not-found
+				// means the key was revoked — evict so the stale entry stops
+				// being servable; transient errors leave it for the grace window.
+				go func() {
+					if _, err := cache.fetch(context.Background(), keyHash, lookup); errors.Is(err, pgx.ErrNoRows) {
+						cache.remove(keyHash)
+					}
+				}()
 			}
 			setAPIKeyContext(c, entry)
 			c.Set("auth_ms", time.Since(authStart).Milliseconds())
