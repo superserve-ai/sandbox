@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,13 @@ const (
 	execChStdin  = 0x00
 	execChStdout = 0x01
 	execChStderr = 0x02
+
+	// maxExecReadBytes bounds a single client frame on the exec socket. Exec
+	// frames legitimately carry a whole command string (start frame) or a
+	// stdin chunk — unlike the terminal's keystroke-sized maxReadBytes — so
+	// this is sized for payloads, not keystrokes, while still capping what a
+	// single frame can make the bridge buffer.
+	maxExecReadBytes = 4 << 20
 )
 
 // execPingInterval is how often the bridge pings the client; a missed pong
@@ -143,7 +151,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		h.log.Warn().Err(err).Msg("exec/ws: WS upgrade failed")
 		return
 	}
-	ws.SetReadLimit(maxReadBytes)
+	ws.SetReadLimit(maxExecReadBytes)
 
 	transport := h.transports.get(instanceID, info)
 	httpClient := &http.Client{Transport: transport}
@@ -166,6 +174,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	typ, raw, err := ws.Read(readCtx)
 	readCancel()
 	if err != nil {
+		logExecReadEnd(l, err)
 		_ = ws.Close(websocket.StatusPolicyViolation, "expected start message")
 		return
 	}
@@ -308,10 +317,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 			typ, data, err := ws.Read(bridgeCtx)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
-					closeErr := websocket.CloseStatus(err)
-					if closeErr != websocket.StatusNormalClosure && closeErr != websocket.StatusGoingAway {
-						l.Debug().Err(err).Msg("exec/ws: WS read ended")
-					}
+					logExecReadEnd(l, err)
 				}
 				return
 			}
@@ -374,6 +380,22 @@ func (h *Handler) handleExecControl(ctx context.Context, client boxdpbconnect.Pr
 
 	default:
 		l.Debug().Str("type", msg.Type).Msg("exec/ws: unknown control type")
+	}
+}
+
+// logExecReadEnd separates a frame that blew the read limit — a client-visible
+// failure worth a warn — from routine socket teardown. The library reports the
+// limit breach only via error text, and has already closed the connection with
+// StatusMessageTooBig by the time Read returns.
+func logExecReadEnd(l zerolog.Logger, err error) {
+	if strings.Contains(err.Error(), "read limited at") {
+		l.Warn().Err(err).Int("limit_bytes", maxExecReadBytes).
+			Msg("exec/ws: client frame exceeded read limit")
+		return
+	}
+	closeErr := websocket.CloseStatus(err)
+	if closeErr != websocket.StatusNormalClosure && closeErr != websocket.StatusGoingAway {
+		l.Debug().Err(err).Msg("exec/ws: WS read ended")
 	}
 }
 
