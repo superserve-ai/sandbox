@@ -37,6 +37,25 @@ locals {
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
+
+module "artifact_storage" {
+  source = "../../../modules/artifact-storage"
+
+  project_id  = local.project_id
+  environment = local.environment
+  region      = local.region
+
+  artifact_registry = {
+    superserve = {
+      repository_id = "superserve-${local.resource_suffix}"
+      format        = "DOCKER"
+      description   = "Superserve control plane images for ${local.region}"
+    }
+  }
+
+  labels = local.common_labels
+}
+
 module "network" {
   source = "../../../modules/network"
 
