@@ -8,16 +8,20 @@ import (
 	"strings"
 	"testing"
 
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 var previewTestSeed = []byte("test-seed-for-hmac-32-bytes-min!!")
@@ -34,8 +38,9 @@ func grpcUnavailable(msg string) error {
 
 // portRows is a pgx.Rows over published-port rows for ListPublishedPorts.
 type portRows struct {
-	rows [][2]int32 // {port, token_version}
-	i    int
+	rows   [][2]int32 // {port, token_version}
+	access string     // access column returned for every row
+	i      int
 }
 
 func (r *portRows) Close()                                       {}
@@ -50,6 +55,7 @@ func (r *portRows) Scan(dest ...any) error {
 	row := r.rows[r.i-1]
 	*dest[0].(*int32) = row[0]
 	*dest[1].(*int32) = row[1]
+	*dest[2].(*string) = r.access
 	return nil
 }
 
@@ -62,13 +68,16 @@ type previewHandlerEnv struct {
 	router    *gin.Engine
 
 	// Controllable query results (adjust before a request).
-	getPortVersion   int32      // GetPublishedPort → this version; 0 => ErrNoRows
-	publishToVersion int32      // PublishPort RETURNING token_version
-	bumpToVersion    int32      // BumpPublishedPortVersion RETURNING token_version
-	bumpNoRow        bool       // BumpPublishedPortVersion → ErrNoRows (unpublished)
-	unpublishRows    int64      // rows affected by UnpublishPort
-	policyRevision   int64      // BumpPreviewPolicyRevision → this revision
-	listPorts        [][2]int32 // ListPublishedPorts rows (post-mutation state)
+	getPortVersion   int32           // GetPublishedPort → this version; 0 => ErrNoRows
+	publishToVersion int32           // PublishPort RETURNING token_version
+	bumpToVersion    int32           // BumpPublishedPortVersion RETURNING token_version
+	bumpNoRow        bool            // BumpPublishedPortVersion → ErrNoRows (unpublished)
+	unpublishRows    int64           // rows affected by UnpublishPort
+	policyRevision   int64           // BumpPreviewPolicyRevision → this revision
+	listPorts        [][2]int32      // ListPublishedPorts rows (post-mutation state)
+	listAccess       string          // access column for every listed/loaded port row
+	disabledFlags    map[string]bool // feature_enabled(key) → !disabledFlags[key]
+	hostCaps         []string        // host row capability advertisement
 }
 
 func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
@@ -83,6 +92,9 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 		unpublishRows:    1,
 		policyRevision:   5,
 		listPorts:        [][2]int32{{3000, 1}},
+		listAccess:       auth.PreviewAccessPrivate,
+		disabledFlags:    map[string]bool{},
+		hostCaps:         []string{auth.HostCapabilityPreviewPorts, auth.HostCapabilityPreviewPortTokens},
 	}
 	env.sb = db.Sandbox{
 		ID:            env.sandboxID,
@@ -105,6 +117,27 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
+			case strings.Contains(sql, "feature_enabled"):
+				return &mockRow{scanFn: func(dest ...any) error {
+					key, _ := args[0].(string)
+					*dest[0].(*bool) = !env.disabledFlags[key]
+					return nil
+				}}
+			case strings.Contains(sql, "FROM host"):
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*string) = env.sb.HostID
+					*dest[1].(*string) = "vmd:50051"
+					*dest[2].(*string) = "proxy:443"
+					*dest[3].(*string) = "test-region"
+					*dest[4].(*string) = "active"
+					*dest[5].(*int32) = 1
+					*dest[6].(*int32) = 1
+					*dest[7].(*pgtype.Timestamptz) = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+					*dest[8].(*time.Time) = time.Now()
+					*dest[9].(*time.Time) = time.Now()
+					*dest[10].(*[]string) = env.hostCaps
+					return nil
+				}}
 			case strings.Contains(sql, "preview_policy_revision = preview_policy_revision + 1"):
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*int64) = env.policyRevision
@@ -117,12 +150,21 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*int32) = portFromArgs(args)
 					*dest[1].(*int32) = env.bumpToVersion
+					*dest[2].(*string) = env.listAccess
 					return nil
 				}}
 			case strings.Contains(sql, "INSERT INTO sandbox_published_port"):
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*int32) = portFromArgs(args)
 					*dest[1].(*int32) = env.publishToVersion
+					// Echo the requested access back, like the real upsert.
+					if len(args) >= 3 {
+						if a, ok := args[2].(string); ok {
+							*dest[2].(*string) = a
+							return nil
+						}
+					}
+					*dest[2].(*string) = env.listAccess
 					return nil
 				}}
 			case strings.Contains(sql, "sandbox_published_port"): // GetPublishedPort
@@ -132,6 +174,7 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 				return &mockRow{scanFn: func(dest ...any) error {
 					*dest[0].(*int32) = portFromArgs(args)
 					*dest[1].(*int32) = env.getPortVersion
+					*dest[2].(*string) = env.listAccess
 					return nil
 				}}
 			case strings.Contains(sql, "FROM sandbox"):
@@ -142,7 +185,7 @@ func newPreviewHandlerEnv(t *testing.T) *previewHandlerEnv {
 		},
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			if strings.Contains(sql, "sandbox_published_port") {
-				return &portRows{rows: env.listPorts}, nil
+				return &portRows{rows: env.listPorts, access: env.listAccess}, nil
 			}
 			return emptyRows{}, nil
 		},
@@ -198,8 +241,8 @@ func (e *previewHandlerEnv) base() string {
 func TestPublishPort_PushesFullSetToHost(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
 	var pushedAccess string
-	var pushed map[int32]int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _ string, access string, ports map[int32]int64, _ int64) error {
+	var pushed map[int32]vmdclient.PortPolicy
+	env.vmd.updatePreviewFn = func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, _ int64) error {
 		pushedAccess, pushed = access, ports
 		return nil
 	}
@@ -208,7 +251,7 @@ func TestPublishPort_PushesFullSetToHost(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	if pushedAccess != auth.PreviewAccessPrivate || pushed[3000] != 1 {
+	if pushedAccess != auth.PreviewAccessPrivate || pushed[3000].Version != 1 {
 		t.Errorf("vmd push = (%q, %v), want (private, {3000:1})", pushedAccess, pushed)
 	}
 	body := parseJSON(t, w)
@@ -228,7 +271,7 @@ func TestPublishPort_InvalidPort400(t *testing.T) {
 
 func TestPublishPort_VMDHardErrorIs500(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
 		return grpcUnavailable("vmd down")
 	}
 	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusInternalServerError {
@@ -238,7 +281,7 @@ func TestPublishPort_VMDHardErrorIs500(t *testing.T) {
 
 func TestPublishPort_VMDNotFoundIsOK(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
 		return grpcNotFound("no record on host")
 	}
 	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusOK {
@@ -254,9 +297,9 @@ func TestUnpublishPort_PushesResultingSetWithRevision(t *testing.T) {
 	env.policyRevision = 9
 	env.listPorts = [][2]int32{{8080, 2}} // state after 3000 is removed
 
-	var pushed map[int32]int64
+	var pushed map[int32]vmdclient.PortPolicy
 	var pushedRev int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, rev int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]vmdclient.PortPolicy, rev int64) error {
 		pushed, pushedRev = ports, rev
 		return nil
 	}
@@ -265,7 +308,7 @@ func TestUnpublishPort_PushesResultingSetWithRevision(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
 	}
-	if _, still := pushed[3000]; still || pushed[8080] != 2 {
+	if _, still := pushed[3000]; still || pushed[8080].Version != 2 {
 		t.Errorf("pushed set = %v, want {8080:2}", pushed)
 	}
 	if pushedRev != 9 {
@@ -278,7 +321,7 @@ func TestUnpublishPort_HostPushFailureIs500(t *testing.T) {
 	// get it. That is recoverable — a retry re-bumps the revision and re-pushes,
 	// and vmd accepts the higher revision — so this is not split-brain.
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
 		return grpcUnavailable("vmd down")
 	}
 	if w := env.do(http.MethodDelete, env.base()+"/3000", ""); w.Code != http.StatusInternalServerError {
@@ -295,9 +338,9 @@ func TestUnpublishPort_IdempotentRetryRepairsHost(t *testing.T) {
 	env.listPorts = [][2]int32{{8080, 2}} // 3000 already absent from the DB
 	env.unpublishRows = 0                 // delete affects no rows
 
-	var pushed map[int32]int64
+	var pushed map[int32]vmdclient.PortPolicy
 	called := false
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, _ int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]vmdclient.PortPolicy, _ int64) error {
 		called, pushed = true, ports
 		return nil
 	}
@@ -309,7 +352,7 @@ func TestUnpublishPort_IdempotentRetryRepairsHost(t *testing.T) {
 	if !called {
 		t.Fatal("host never received the corrected allowlist on retry")
 	}
-	if _, still := pushed[3000]; still || pushed[8080] != 2 {
+	if _, still := pushed[3000]; still || pushed[8080].Version != 2 {
 		t.Errorf("pushed set = %v, want {8080:2}", pushed)
 	}
 }
@@ -317,9 +360,9 @@ func TestUnpublishPort_IdempotentRetryRepairsHost(t *testing.T) {
 func TestUnpublishPort_LastPortPushesEmptySet(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
 	env.listPorts = nil // post-delete state: nothing left published
-	var pushed map[int32]int64
+	var pushed map[int32]vmdclient.PortPolicy
 	called := false
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, _ int64) error {
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]vmdclient.PortPolicy, _ int64) error {
 		called, pushed = true, ports
 		return nil
 	}
@@ -408,8 +451,8 @@ func TestRotateToken_BumpsOnlyThisPort(t *testing.T) {
 	env.bumpToVersion = 2
 	env.listPorts = [][2]int32{{3000, 2}, {8080, 1}} // 8080 untouched
 
-	var pushed map[int32]int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]int64, _ int64) error {
+	var pushed map[int32]vmdclient.PortPolicy
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]vmdclient.PortPolicy, _ int64) error {
 		pushed = ports
 		return nil
 	}
@@ -418,7 +461,7 @@ func TestRotateToken_BumpsOnlyThisPort(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	if pushed[3000] != 2 || pushed[8080] != 1 {
+	if pushed[3000].Version != 2 || pushed[8080].Version != 1 {
 		t.Errorf("pushed set = %v, want {3000:2, 8080:1}", pushed)
 	}
 	body := parseJSON(t, w)
@@ -441,7 +484,7 @@ func TestRotateToken_UnpublishedPort404(t *testing.T) {
 
 func TestRotateToken_VMDHardErrorIs500(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
-	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]int64, int64) error {
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
 		return grpcUnavailable("vmd down")
 	}
 	if w := env.do(http.MethodPost, env.base()+"/3000/token/rotate", ""); w.Code != http.StatusInternalServerError {
@@ -457,8 +500,8 @@ func TestPatchSandbox_PreviewAccessPushesPublishedSet(t *testing.T) {
 	env := newPreviewHandlerEnv(t)
 	env.listPorts = [][2]int32{{3000, 1}}
 	var pushedAccess string
-	var pushed map[int32]int64
-	env.vmd.updatePreviewFn = func(_ context.Context, _, access string, ports map[int32]int64, _ int64) error {
+	var pushed map[int32]vmdclient.PortPolicy
+	env.vmd.updatePreviewFn = func(_ context.Context, _, access string, ports map[int32]vmdclient.PortPolicy, _ int64) error {
 		pushedAccess, pushed = access, ports
 		return nil
 	}
@@ -468,7 +511,178 @@ func TestPatchSandbox_PreviewAccessPushesPublishedSet(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
 	}
-	if pushedAccess != auth.PreviewAccessPublic || pushed[3000] != 1 {
+	if pushedAccess != auth.PreviewAccessPublic || pushed[3000].Version != 1 {
 		t.Errorf("vmd push = (%q, %v), want (public, {3000:1})", pushedAccess, pushed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-port access modes and rollout gates
+// ---------------------------------------------------------------------------
+
+// Publishing defaults the port's mode from the sandbox policy (private here)
+// and both the response and the vmd push carry it.
+func TestPublishPort_DefaultsAccessFromSandboxPolicy(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	var pushed map[int32]vmdclient.PortPolicy
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]vmdclient.PortPolicy, _ int64) error {
+		pushed = ports
+		return nil
+	}
+	w := env.do(http.MethodPost, env.base(), `{"port": 3000}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if parseJSON(t, w)["access"] != auth.PreviewAccessPrivate {
+		t.Errorf("response access = %v, want private (sandbox default)", parseJSON(t, w)["access"])
+	}
+	if pushed[3000].Access != auth.PreviewAccessPrivate {
+		t.Errorf("pushed access = %q, want private", pushed[3000].Access)
+	}
+}
+
+// An explicit access overrides the sandbox default — and a PUBLIC publish must
+// not consult the private-access flag (only private enablement is gated on it).
+func TestPublishPort_ExplicitPublicAccess(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.disabledFlags[flagPreviewPortPrivateAccess] = true
+	env.listAccess = auth.PreviewAccessPublic // post-mutation published set
+	var pushed map[int32]vmdclient.PortPolicy
+	env.vmd.updatePreviewFn = func(_ context.Context, _, _ string, ports map[int32]vmdclient.PortPolicy, _ int64) error {
+		pushed = ports
+		return nil
+	}
+	w := env.do(http.MethodPost, env.base(), `{"port": 3000, "access": "public"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if parseJSON(t, w)["access"] != auth.PreviewAccessPublic {
+		t.Errorf("response access = %v, want public", parseJSON(t, w)["access"])
+	}
+	if pushed[3000].Access != auth.PreviewAccessPublic {
+		t.Errorf("pushed access = %q, want public", pushed[3000].Access)
+	}
+}
+
+func TestPublishPort_InvalidAccess400(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	for _, body := range []string{
+		`{"port": 3000, "access": "legacy_public"}`,
+		`{"port": 3000, "access": "open"}`,
+	} {
+		if w := env.do(http.MethodPost, env.base(), body); w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, w.Code)
+		}
+	}
+}
+
+// Publication is flag-gated; the vmd must never see a push for a rejected
+// publish.
+func TestPublishPort_PublicationFlagOff403(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.disabledFlags[flagPreviewPortPublication] = true
+	pushed := false
+	env.vmd.updatePreviewFn = func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
+		pushed = true
+		return nil
+	}
+	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 with publication flag off", w.Code)
+	}
+	if pushed {
+		t.Error("rejected publish still pushed policy to the host")
+	}
+}
+
+func TestPublishPort_PrivateFlagOff403(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.disabledFlags[flagPreviewPortPrivateAccess] = true
+	// Sandbox default is private, so a bare publish resolves to private.
+	if w := env.do(http.MethodPost, env.base(), `{"port": 3000}`); w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 with private-access flag off", w.Code)
+	}
+}
+
+// A host that does not advertise enforcement cannot accept a publish: the API
+// fails instead of recording a policy nothing enforces.
+func TestPublishPort_HostWithoutCapabilities409(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.hostCaps = nil
+	if w := env.do(http.MethodPost, env.base(), `{"port": 3000, "access": "public"}`); w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 when the host advertises nothing", w.Code)
+	}
+}
+
+// Port publication alone is not enough for a PRIVATE port — token
+// verification must also be advertised. A public port on the same host is
+// fine.
+func TestPublishPort_PrivateNeedsTokensCapability(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.hostCaps = []string{auth.HostCapabilityPreviewPorts}
+	if w := env.do(http.MethodPost, env.base(), `{"port": 3000, "access": "private"}`); w.Code != http.StatusConflict {
+		t.Fatalf("private publish: status = %d, want 409 without the tokens capability", w.Code)
+	}
+	if w := env.do(http.MethodPost, env.base(), `{"port": 3000, "access": "public"}`); w.Code != http.StatusOK {
+		t.Fatalf("public publish: status = %d, want 200 with only the ports capability; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// Revocation is never gated: with every flag off and a host that advertises
+// nothing, unpublish and rotate still work. Turning a flag off must not
+// strand a customer with credentials they cannot revoke.
+func TestUnpublishAndRotate_UngatedByFlagsAndCapabilities(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.disabledFlags[flagPreviewPortPublication] = true
+	env.disabledFlags[flagPreviewPortPrivateAccess] = true
+	env.hostCaps = nil
+
+	if w := env.do(http.MethodDelete, env.base()+"/3000", ""); w.Code != http.StatusNoContent {
+		t.Fatalf("unpublish: status = %d, want 204 (revocation is ungated); body: %s", w.Code, w.Body.String())
+	}
+	if w := env.do(http.MethodPost, env.base()+"/3000/token/rotate", ""); w.Code != http.StatusOK {
+		t.Fatalf("rotate: status = %d, want 200 (revocation is ungated); body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMintToken_ResponseCarriesPortAccess(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	w := env.do(http.MethodPost, env.base()+"/3000/token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if parseJSON(t, w)["access"] != auth.PreviewAccessPrivate {
+		t.Errorf("token response access = %v, want private", parseJSON(t, w)["access"])
+	}
+}
+
+// PATCHing the sandbox policy is enablement: flag-gated and host-checked.
+func TestPatchPreviewAccess_FlagOff403(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.disabledFlags[flagPreviewPortPublication] = true
+	env.router.PATCH("/sandboxes/:sandbox_id", env.handlers.PatchSandbox)
+	w := env.do(http.MethodPatch, "/sandboxes/"+env.sandboxID.String(), `{"preview_access": "public"}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 with publication flag off; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// Moving to strict "public" still needs token enforcement when an existing
+// published port is private — its mode survives the sandbox-level change.
+func TestPatchPreviewAccess_ExistingPrivatePortNeedsTokensCapability(t *testing.T) {
+	env := newPreviewHandlerEnv(t)
+	env.hostCaps = []string{auth.HostCapabilityPreviewPorts}
+	env.router.PATCH("/sandboxes/:sandbox_id", env.handlers.PatchSandbox)
+
+	// Existing port is private (env.listAccess default) → 409.
+	w := env.do(http.MethodPatch, "/sandboxes/"+env.sandboxID.String(), `{"preview_access": "public"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 while a private port exists; body: %s", w.Code, w.Body.String())
+	}
+
+	// All ports public → the ports capability alone suffices.
+	env.listAccess = auth.PreviewAccessPublic
+	w = env.do(http.MethodPatch, "/sandboxes/"+env.sandboxID.String(), `{"preview_access": "public"}`)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 with only public ports; body: %s", w.Code, w.Body.String())
 	}
 }

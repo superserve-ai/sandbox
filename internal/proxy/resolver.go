@@ -25,14 +25,27 @@ type InstanceInfo struct {
 	TeamID    string // owning team, for usage attribution
 	OwnerID   string // creating user, for usage attribution; empty when unknown
 
-	// PreviewAccess gates numeric-port traffic. "public" and "private" both
-	// require publication; private also requires the port token. Empty and
-	// "legacy_public" retain the old all-listening-ports behavior.
+	// PreviewAccess gates numeric-port traffic. Empty and "legacy_public"
+	// retain the old all-listening-ports behavior; anything else requires
+	// publication, with the per-port access mode deciding whether a token is
+	// needed. It is also the fallback mode for a published port whose record
+	// predates per-port access.
 	PreviewAccess string
-	// PreviewPorts maps each published port to its current token version.
-	// Consulted for both strict policies: a port absent from this map is not
+	// PreviewPorts maps each published port to its enforcement state. Only
+	// consulted for strict policies: a port absent from this map is not
 	// routable (404). Nil denies every port.
-	PreviewPorts map[int]int64
+	PreviewPorts map[int]PreviewPortState
+}
+
+// PreviewPortState is one published port's enforcement state as served by
+// vmd: the token generation its tokens must match, and its access mode.
+// Access "public" routes without a token and "private" requires this port's
+// token; empty falls back to the sandbox-level PreviewAccess (a record pushed
+// before per-port modes existed). Any other value is treated as private —
+// unknown modes fail closed.
+type PreviewPortState struct {
+	Version int64
+	Access  string
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -136,6 +149,10 @@ type vmdResponse struct {
 	OwnerID       string           `json:"owner_id"`
 	PreviewAccess string           `json:"preview_access"`
 	PreviewPorts  map[string]int64 `json:"preview_ports"` // port (string key for JSON) → token version
+	// Parallel per-port access map. Kept separate from preview_ports so the
+	// wire stays readable by proxies that predate per-port modes; a port
+	// absent here falls back to preview_access.
+	PreviewPortAccess map[string]string `json:"preview_port_access"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, error) {
@@ -171,7 +188,7 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInf
 		TeamID:        raw.TeamID,
 		OwnerID:       raw.OwnerID,
 		PreviewAccess: raw.PreviewAccess,
-		PreviewPorts:  decodePreviewPorts(raw.PreviewPorts),
+		PreviewPorts:  decodePreviewPorts(raw.PreviewPorts, raw.PreviewPortAccess),
 	}
 	r.store(instanceID, info, nil, r.ttl)
 	return info, nil
@@ -181,17 +198,20 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInf
 // into the int-keyed map the enforcement path uses. A malformed port key or a
 // non-positive version is dropped rather than trusted — a port that can't be
 // parsed can't be published, so it falls through to the deny-by-default 404.
-func decodePreviewPorts(raw map[string]int64) map[int]int64 {
+// The access value is carried verbatim: enforcement maps empty to the
+// sandbox-level policy and any unknown value to private (fail closed), so a
+// corrupt access string can only ever tighten the port.
+func decodePreviewPorts(raw map[string]int64, access map[string]string) map[int]PreviewPortState {
 	if len(raw) == 0 {
 		return nil
 	}
-	out := make(map[int]int64, len(raw))
+	out := make(map[int]PreviewPortState, len(raw))
 	for k, v := range raw {
 		port, err := strconv.Atoi(k)
 		if err != nil || port < 1 || port > 65535 || v <= 0 {
 			continue
 		}
-		out[port] = v
+		out[port] = PreviewPortState{Version: v, Access: access[k]}
 	}
 	return out
 }

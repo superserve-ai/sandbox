@@ -22,6 +22,22 @@ const (
 	PreviewAccessPrivate      = "private"
 )
 
+// Host data-plane capabilities, advertised by vmd on every heartbeat and
+// checked by the control plane before it enables a preview policy on a
+// sandbox. Defined here — next to the policy values they authorize — so the
+// advertiser (vmd) and the checker (API) can never drift apart. A host that
+// advertises nothing cannot hold strict-preview sandboxes: on a partially
+// deployed fleet the API call fails instead of recording a policy that the
+// host's proxy would not enforce.
+const (
+	// HostCapabilityPreviewPorts: the host enforces the published-port
+	// allowlist (unpublished ports 404 for strict sandboxes).
+	HostCapabilityPreviewPorts = "preview_ports_v1"
+	// HostCapabilityPreviewPortTokens: the host verifies per-port preview
+	// tokens (header, signed-link query param, and cookie carriers).
+	HostCapabilityPreviewPortTokens = "preview_port_tokens_v1"
+)
+
 // Preview token carrier names. Defined here — next to the token itself — so
 // the edge proxy (which consumes them) and the control plane (which returns
 // them from the mint endpoints) can never drift apart.

@@ -54,8 +54,12 @@ type VMRecord struct {
 	// Persisted so the preview-access policy survives a vmd restart —
 	// otherwise a reattach would silently reopen a private sandbox's ports.
 	// Absent in records that predate the feature → zero values → public.
-	PreviewAccess string          `json:"preview_access,omitempty"`
-	PreviewPorts  map[int32]int64 `json:"preview_ports,omitempty"`
+	// Per-port access lives in a parallel map (not a struct value) so records
+	// written before the field exist keep decoding; a port missing from the
+	// access map falls back to the sandbox-level policy at the proxy.
+	PreviewAccess     string           `json:"preview_access,omitempty"`
+	PreviewPorts      map[int32]int64  `json:"preview_ports,omitempty"`
+	PreviewPortAccess map[int32]string `json:"preview_port_access,omitempty"`
 	// Persisted so the monotonic revision survives a vmd restart — otherwise a
 	// reattach would reset it to 0 and then accept a stale push that reopens a
 	// port.
@@ -217,9 +221,52 @@ func toRecord(inst *VMInstance) VMRecord {
 		OwnerID:      inst.OwnerID,
 
 		PreviewAccess:         inst.PreviewAccess,
-		PreviewPorts:          inst.PreviewPorts,
+		PreviewPorts:          previewPortVersions(inst.PreviewPorts),
+		PreviewPortAccess:     previewPortAccess(inst.PreviewPorts),
 		PreviewPolicyRevision: inst.PreviewPolicyRevision,
 	}
+}
+
+// previewPortVersions / previewPortAccess split the in-memory per-port policy
+// into the two parallel maps the persisted record (and the local HTTP wire)
+// use for backward compatibility with readers of the old version-only shape.
+func previewPortVersions(in map[int32]PreviewPortPolicy) map[int32]int64 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int32]int64, len(in))
+	for port, p := range in {
+		out[port] = p.Version
+	}
+	return out
+}
+
+func previewPortAccess(in map[int32]PreviewPortPolicy) map[int32]string {
+	out := make(map[int32]string, len(in))
+	for port, p := range in {
+		if p.Access != "" {
+			out[port] = p.Access
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// mergePreviewPorts rejoins the two persisted maps into the in-memory shape.
+// A port present only in the access map has no version and is dropped —
+// without a version no token can verify, and a versionless entry could not
+// have been written by any sender.
+func mergePreviewPorts(versions map[int32]int64, access map[int32]string) map[int32]PreviewPortPolicy {
+	if len(versions) == 0 {
+		return nil
+	}
+	out := make(map[int32]PreviewPortPolicy, len(versions))
+	for port, v := range versions {
+		out[port] = PreviewPortPolicy{Version: v, Access: access[port]}
+	}
+	return out
 }
 
 // toInstance converts a VMRecord back to a VMInstance.
@@ -245,7 +292,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		OwnerID:      rec.OwnerID,
 
 		PreviewAccess:         rec.PreviewAccess,
-		PreviewPorts:          rec.PreviewPorts,
+		PreviewPorts:          mergePreviewPorts(rec.PreviewPorts, rec.PreviewPortAccess),
 		PreviewPolicyRevision: rec.PreviewPolicyRevision,
 
 		Config: VMConfig{

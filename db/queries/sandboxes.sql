@@ -386,22 +386,24 @@ RETURNING preview_policy_revision;
 -- name: ListPublishedPorts :many
 -- The published-port set for a sandbox, ascending. Backs both the API list
 -- response and the full set pushed to vmd after any publish/unpublish/rotate.
-SELECT port, token_version FROM sandbox_published_port
+SELECT port, token_version, access FROM sandbox_published_port
 WHERE sandbox_id = $1
 ORDER BY port;
 
 -- name: GetPublishedPort :one
-SELECT port, token_version FROM sandbox_published_port
+SELECT port, token_version, access FROM sandbox_published_port
 WHERE sandbox_id = $1 AND port = $2;
 
 -- name: PublishPort :one
 -- Idempotent publish: first publish starts at version 1; re-publishing an
--- existing port is a no-op that returns the current version (it must NOT
--- reset the version, or a republish would silently revoke live tokens).
-INSERT INTO sandbox_published_port (sandbox_id, port)
-VALUES ($1, $2)
-ON CONFLICT (sandbox_id, port) DO UPDATE SET updated_at = now()
-RETURNING port, token_version;
+-- existing port updates only its access mode and returns the current version
+-- (it must NOT reset the version, or a republish would silently revoke live
+-- tokens — an explicit mode switch deliberately keeps them valid).
+INSERT INTO sandbox_published_port (sandbox_id, port, access)
+VALUES ($1, $2, $3)
+ON CONFLICT (sandbox_id, port) DO UPDATE
+SET access = EXCLUDED.access, updated_at = now()
+RETURNING port, token_version, access;
 
 -- name: UnpublishPort :execrows
 DELETE FROM sandbox_published_port
@@ -414,7 +416,7 @@ WHERE sandbox_id = $1 AND port = $2;
 UPDATE sandbox_published_port
 SET token_version = token_version + 1, updated_at = now()
 WHERE sandbox_id = $1 AND port = $2
-RETURNING port, token_version;
+RETURNING port, token_version, access;
 
 -- name: GetSandboxNetworkConfig :one
 SELECT network_config FROM sandbox

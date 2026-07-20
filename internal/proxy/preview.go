@@ -37,11 +37,14 @@ const (
 // redirect).
 //
 // The order is publication → auth → status, all before the reverse proxy:
-//   - public and private sandboxes route ONLY explicitly published ports. Any
-//     other port returns 404, even with a valid token for a different port —
-//     publishing 3001 never makes 3000 reachable.
-//   - A published public port routes without a token. A published private port
-//     requires a token scoped to that exact port and its current version.
+//   - Strict sandboxes route ONLY explicitly published ports. Any other port
+//     returns 404, even with a valid token for a different port — publishing
+//     3001 never makes 3000 reachable.
+//   - Enforcement is per port: a published port's own access mode decides
+//     whether it routes without a token ("public") or requires a token scoped
+//     to that exact port and its current version ("private"). A port with no
+//     recorded mode (pushed by an older control plane) falls back to the
+//     sandbox-level policy; an unrecognized mode is treated as private.
 //   - Empty and legacy_public retain the pre-publication behavior for existing
 //     sandboxes and callers that omit the new policy field.
 //   - Auth runs before the status check, so an unauthenticated caller can't
@@ -59,15 +62,24 @@ func (h *Handler) enforcePreviewAccess(w http.ResponseWriter, r *http.Request, i
 
 	// Deny-by-default allowlist. A port is reachable only if it has been
 	// explicitly published; everything else is 404 before any auth or status
-	// is revealed. A nil/empty set (private sandbox with nothing published,
+	// is revealed. A nil/empty set (strict sandbox with nothing published,
 	// or an older vmd record) therefore denies every port — fail closed.
-	version, published := info.PreviewPorts[port]
+	state, published := info.PreviewPorts[port]
 	if !published {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return false
 	}
+	version := state.Version
 
-	if info.PreviewAccess == auth.PreviewAccessPublic {
+	// Per-port mode, falling back to the sandbox-level policy for records
+	// pushed before per-port modes existed. Only the exact string "public"
+	// routes without a token — every other value (private, or anything a
+	// newer control plane may define later) requires this port's token.
+	mode := state.Access
+	if mode == "" {
+		mode = info.PreviewAccess
+	}
+	if mode == auth.PreviewAccessPublic {
 		return true
 	}
 

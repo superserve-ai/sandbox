@@ -381,13 +381,15 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(ctx context.Context, req *vmdpb
 
 // previewPortsFromProto validates and converts the repeated PreviewPort into
 // the int-keyed map the manager stores. Rejects out-of-range ports, non-
-// positive versions, and duplicate ports so a malformed record can't reach
-// the proxy's deny-by-default lookup.
-func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]int64, error) {
+// positive versions, invalid per-port access values, and duplicate ports so a
+// malformed record can't reach the proxy's deny-by-default lookup. An empty
+// access is legal — it means the sender predates per-port modes and the
+// proxy falls back to the sandbox-level policy.
+func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]PreviewPortPolicy, error) {
 	if len(in) == 0 {
 		return nil, nil
 	}
-	out := make(map[int32]int64, len(in))
+	out := make(map[int32]PreviewPortPolicy, len(in))
 	for _, p := range in {
 		port := p.GetPort()
 		if port < 1 || port > 65535 {
@@ -396,10 +398,13 @@ func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]int64, error) {
 		if p.GetTokenVersion() <= 0 {
 			return nil, status.Errorf(codes.InvalidArgument, "preview port %d has a non-positive token_version", port)
 		}
+		if a := p.GetAccess(); a != "" && a != "public" && a != "private" {
+			return nil, status.Errorf(codes.InvalidArgument, "preview port %d access must be empty, \"public\" or \"private\", got %q", port, a)
+		}
 		if _, dup := out[port]; dup {
 			return nil, status.Errorf(codes.InvalidArgument, "duplicate preview port: %d", port)
 		}
-		out[port] = p.GetTokenVersion()
+		out[port] = PreviewPortPolicy{Version: p.GetTokenVersion(), Access: p.GetAccess()}
 	}
 	return out, nil
 }

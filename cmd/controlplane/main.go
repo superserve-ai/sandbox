@@ -406,7 +406,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]int64, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -522,7 +522,7 @@ func (c *grpcVMDClient) DeleteTemplateArtifacts(ctx context.Context, templateID 
 	return nil
 }
 
-func (c *grpcVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, vmID, previewAccess string, previewPorts map[int32]int64, policyRevision int64) error {
+func (c *grpcVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, vmID, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, policyRevision int64) error {
 	_, err := c.client.UpdateSandboxPreviewPolicy(ctx, &vmdpb.UpdateSandboxPreviewPolicyRequest{
 		VmId:           vmID,
 		PreviewAccess:  previewAccess,
@@ -535,15 +535,15 @@ func (c *grpcVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, vmID, pr
 	return nil
 }
 
-// previewPortsToProto converts the control plane's port→version map into the
+// previewPortsToProto converts the control plane's port→policy map into the
 // repeated proto form vmd expects.
-func previewPortsToProto(in map[int32]int64) []*vmdpb.PreviewPort {
+func previewPortsToProto(in map[int32]vmdclient.PortPolicy) []*vmdpb.PreviewPort {
 	if len(in) == 0 {
 		return nil
 	}
 	out := make([]*vmdpb.PreviewPort, 0, len(in))
-	for port, version := range in {
-		out = append(out, &vmdpb.PreviewPort{Port: port, TokenVersion: version})
+	for port, p := range in {
+		out = append(out, &vmdpb.PreviewPort{Port: port, TokenVersion: p.Version, Access: p.Access})
 	}
 	return out
 }

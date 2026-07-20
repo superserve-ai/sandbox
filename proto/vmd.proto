@@ -361,6 +361,11 @@ message RestoreSnapshotRequest {
 message PreviewPort {
   int32 port = 1;
   int64 token_version = 2;
+  // Per-port access mode: "public" routes without a token, "private" requires
+  // this port's token. Empty (a sender that predates the field) falls back to
+  // the sandbox-level preview_access; the proxy treats any other unknown value
+  // as private (fail closed).
+  string access = 3;
 }
 
 message RestoreSnapshotResponse {

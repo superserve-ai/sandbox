@@ -295,6 +295,8 @@ type Host struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	// Data-plane capabilities the host's running vmd/proxy pair advertises via heartbeat (e.g. preview_ports_v1, preview_port_tokens_v1). The control plane rejects enabling a policy the assigned host cannot enforce.
+	Capabilities []string `json:"capabilities"`
 }
 
 type NetFlow struct {
@@ -468,6 +470,8 @@ type SandboxPublishedPort struct {
 	TokenVersion int32     `json:"token_version"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	// Per-port preview mode: 'public' routes without a token, 'private' requires this port's token. The sandbox's preview_access is only the default for newly published ports.
+	Access string `json:"access"`
 }
 
 type SandboxRevocation struct {

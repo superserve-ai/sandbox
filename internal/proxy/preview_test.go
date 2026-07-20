@@ -81,7 +81,7 @@ func newPreviewTestEnv(t *testing.T, access string, ports map[int]int64) *previe
 			Status:        "running",
 			StartedAt:     time.Now().UnixNano(),
 			PreviewAccess: access,
-			PreviewPorts:  ports,
+			PreviewPorts:  portStates(ports),
 		},
 	}
 
@@ -107,6 +107,20 @@ func newPreviewTestEnv(t *testing.T, access string, ports map[int]int64) *previe
 
 // publishedPort is a convenience for the common "port 3000 at version v" set.
 func publishedPort(v int64) map[int]int64 { return map[int]int64{previewReqPort: v} }
+
+// portStates lifts a port→version map into per-port states with no explicit
+// access mode — the sandbox-level fallback path most of these tests exercise.
+// Per-port-mode tests overwrite env.resolver.info.PreviewPorts directly.
+func portStates(ports map[int]int64) map[int]PreviewPortState {
+	if ports == nil {
+		return nil
+	}
+	out := make(map[int]PreviewPortState, len(ports))
+	for p, v := range ports {
+		out[p] = PreviewPortState{Version: v}
+	}
+	return out
+}
 
 func (e *previewTestEnv) token(claims auth.PreviewClaims) string {
 	e.t.Helper()
@@ -504,5 +518,97 @@ func TestPreview_StaleCookieFreshQueryParamStillBootstraps(t *testing.T) {
 	w := env.serve(req)
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302 bootstrap despite stale cookie", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-port access modes (the sandbox-level policy is only the fallback)
+// ---------------------------------------------------------------------------
+
+// A public port on a private sandbox routes without any credential: the
+// per-port mode, not the sandbox default, is what the proxy enforces.
+func TestPreview_PerPortPublicOnPrivateSandbox(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, nil)
+	env.resolver.info.PreviewPorts = map[int]PreviewPortState{
+		previewReqPort: {Version: 1, Access: "public"},
+	}
+	w := env.serve(env.request(http.MethodGet, "http://unused/"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a per-port public port; body: %s", w.Code, w.Body.String())
+	}
+	if !env.captured().received {
+		t.Fatal("per-port public port did not reach the app")
+	}
+}
+
+// A private port on a public sandbox requires its token — a sandbox-level
+// "public" default never opens a port that was explicitly published private.
+func TestPreview_PerPortPrivateOnPublicSandboxRequiresToken(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPublic, nil)
+	env.resolver.info.PreviewPorts = map[int]PreviewPortState{
+		previewReqPort: {Version: 1, Access: "private"},
+	}
+
+	w := env.serve(env.request(http.MethodGet, "http://unused/"))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("bare request: status = %d, want 401", w.Code)
+	}
+	if env.captured().received {
+		t.Fatal("unauthenticated request reached the app")
+	}
+
+	req := env.request(http.MethodGet, "http://unused/")
+	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Version: 1}))
+	if w := env.serve(req); w.Code != http.StatusOK {
+		t.Fatalf("with token: status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// An unrecognized per-port mode fails closed to private: no bare routing, but
+// the port's own token still works.
+func TestPreview_PerPortUnknownModeFailsClosed(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPublic, nil)
+	env.resolver.info.PreviewPorts = map[int]PreviewPortState{
+		previewReqPort: {Version: 1, Access: "everyone"},
+	}
+
+	if w := env.serve(env.request(http.MethodGet, "http://unused/")); w.Code != http.StatusUnauthorized {
+		t.Fatalf("bare request: status = %d, want 401 (unknown mode must not route)", w.Code)
+	}
+	req := env.request(http.MethodGet, "http://unused/")
+	req.Header.Set(previewTokenHeader, env.token(auth.PreviewClaims{Version: 1}))
+	if w := env.serve(req); w.Code != http.StatusOK {
+		t.Fatalf("with token: status = %d, want 200", w.Code)
+	}
+}
+
+// A public sibling never opens a private port: modes are strictly per port.
+func TestPreview_PerPortPublicSiblingDoesNotOpenPrivatePort(t *testing.T) {
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, nil)
+	env.resolver.info.PreviewPorts = map[int]PreviewPortState{
+		previewReqPort: {Version: 1, Access: "private"},
+		3001:           {Version: 1, Access: "public"},
+	}
+	if w := env.serve(env.request(http.MethodGet, "http://unused/")); w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 — the public sibling must not open the private port", w.Code)
+	}
+	if env.captured().received {
+		t.Fatal("request reached the app without the private port's token")
+	}
+}
+
+// Empty per-port mode falls back to the sandbox-level policy — the exact
+// behavior of a record pushed by a control plane that predates per-port modes.
+func TestPreview_PerPortEmptyModeFallsBackToSandboxPolicy(t *testing.T) {
+	// Fallback to private: token required.
+	env := newPreviewTestEnv(t, auth.PreviewAccessPrivate, publishedPort(1))
+	if w := env.serve(env.request(http.MethodGet, "http://unused/")); w.Code != http.StatusUnauthorized {
+		t.Fatalf("private fallback: status = %d, want 401", w.Code)
+	}
+
+	// Fallback to public: routes bare.
+	env = newPreviewTestEnv(t, auth.PreviewAccessPublic, publishedPort(1))
+	if w := env.serve(env.request(http.MethodGet, "http://unused/")); w.Code != http.StatusOK {
+		t.Fatalf("public fallback: status = %d, want 200", w.Code)
 	}
 }

@@ -1,13 +1,17 @@
 package vm
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
 // HeartbeatConfig controls the VMD → control plane heartbeat loop.
@@ -64,12 +68,35 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	}
 }
 
+// hostCapabilities is what this vmd build's data plane enforces, advertised on
+// every heartbeat. The control plane refuses to enable a preview policy on a
+// host that has not advertised the matching capability, so a fleet where only
+// some hosts run this build fails those API calls instead of recording
+// policies the old hosts would not enforce. Hardcoded per build on purpose:
+// the binary that serves the /instances records IS the enforcement surface,
+// so what it ships is what it can advertise.
+var hostCapabilities = []string{
+	auth.HostCapabilityPreviewPorts,
+	auth.HostCapabilityPreviewPortTokens,
+}
+
+// heartbeatRequest is the JSON body POSTed to the control plane.
+type heartbeatRequest struct {
+	Capabilities []string `json:"capabilities"`
+}
+
 func sendHeartbeat(ctx context.Context, client *http.Client, url, token string, log zerolog.Logger) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	body, err := json.Marshal(heartbeatRequest{Capabilities: hostCapabilities})
+	if err != nil {
+		log.Error().Err(err).Msg("failed to encode heartbeat body")
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create heartbeat request")
 		return
 	}
+	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

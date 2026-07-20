@@ -104,15 +104,16 @@ type VMInstance struct {
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
 
-	// PreviewAccess gates numeric-port traffic at the edge proxy: "public" and
-	// "private" require publication, while empty/"legacy_public" preserve the
-	// old open behavior. PreviewPorts is the published-port allowlist keyed by
-	// port → token generation. Carried like TeamID so the proxy needs no
-	// database. PreviewPolicyRevision is the
-	// monotonic generation of (access + ports); a preview-policy update with a
-	// revision <= this one is a stale/reordered push and is ignored.
+	// PreviewAccess gates numeric-port traffic at the edge proxy:
+	// empty/"legacy_public" preserve the old open behavior, anything else
+	// requires publication. PreviewPorts is the published-port allowlist keyed
+	// by port → per-port policy (token generation + access mode); enforcement
+	// is per port. Carried like TeamID so the proxy needs no database.
+	// PreviewPolicyRevision is the monotonic generation of (access + ports); a
+	// preview-policy update with a revision <= this one is a stale/reordered
+	// push and is ignored.
 	PreviewAccess         string
-	PreviewPorts          map[int32]int64
+	PreviewPorts          map[int32]PreviewPortPolicy
 	PreviewPolicyRevision int64
 
 	// BaseMemPath is the immutable base (template) memory file for a layered
@@ -1476,10 +1477,20 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 	return nil
 }
 
+// PreviewPortPolicy is one published preview port's enforcement state: its
+// token generation and its access mode. Access "public" routes without a
+// token, "private" requires this port's token; empty means the sender
+// predates per-port modes and the proxy falls back to the sandbox-level
+// policy. Any other value is treated as private (fail closed).
+type PreviewPortPolicy struct {
+	Version int64
+	Access  string
+}
+
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]int64, previewPolicyRevision int64,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64,
 ) (*VMInstance, error) {
 	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, "")
 }
@@ -1544,7 +1555,7 @@ func psiSomeAvg10(path string) float64 {
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]int64, previewPolicyRevision int64, recordToPath string,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -2410,7 +2421,7 @@ type InstanceInfo struct {
 	OwnerID   string
 
 	PreviewAccess string
-	PreviewPorts  map[int32]int64
+	PreviewPorts  map[int32]PreviewPortPolicy
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -2443,11 +2454,11 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 
 // clonePreviewPorts returns an independent copy so a caller reading the
 // instance snapshot can't mutate the live record's map.
-func clonePreviewPorts(in map[int32]int64) map[int32]int64 {
+func clonePreviewPorts(in map[int32]PreviewPortPolicy) map[int32]PreviewPortPolicy {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[int32]int64, len(in))
+	out := make(map[int32]PreviewPortPolicy, len(in))
 	for k, v := range in {
 		out[k] = v
 	}
@@ -2468,7 +2479,7 @@ func clonePreviewPorts(in map[int32]int64) map[int32]int64 {
 // snapshot would reopen a just-unpublished port or revive a just-rotated
 // token. Ignoring is a success, not an error — the caller wanted enforcement
 // at least as current as its revision, and that is already true.
-func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]int64, revision int64) error {
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]PreviewPortPolicy, revision int64) error {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return err

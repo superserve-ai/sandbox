@@ -930,7 +930,7 @@ func TestUpdateSandboxPreviewPolicy_MonotonicRevision(t *testing.T) {
 	m.vms[id] = &VMInstance{
 		ID:                    id,
 		PreviewAccess:         "private",
-		PreviewPorts:          map[int32]int64{3000: 1},
+		PreviewPorts:          map[int32]PreviewPortPolicy{3000: {Version: 1, Access: "private"}},
 		PreviewPolicyRevision: 5,
 	}
 
@@ -938,7 +938,7 @@ func TestUpdateSandboxPreviewPolicy_MonotonicRevision(t *testing.T) {
 	// deliberately omits the revision (CP↔vmd internal).
 
 	// Lower revision: ignored.
-	if err := m.UpdateSandboxPreviewPolicy(id, "private", map[int32]int64{3000: 1, 4000: 1}, 4); err != nil {
+	if err := m.UpdateSandboxPreviewPolicy(id, "private", map[int32]PreviewPortPolicy{3000: {Version: 1}, 4000: {Version: 1}}, 4); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if inst.PreviewPolicyRevision != 5 || len(inst.PreviewPorts) != 1 {
@@ -954,10 +954,10 @@ func TestUpdateSandboxPreviewPolicy_MonotonicRevision(t *testing.T) {
 	}
 
 	// Higher revision: applied, and fully replaces the port set.
-	if err := m.UpdateSandboxPreviewPolicy(id, "private", map[int32]int64{8080: 3}, 6); err != nil {
+	if err := m.UpdateSandboxPreviewPolicy(id, "private", map[int32]PreviewPortPolicy{8080: {Version: 3, Access: "public"}}, 6); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if inst.PreviewPolicyRevision != 6 || len(inst.PreviewPorts) != 1 || inst.PreviewPorts[8080] != 3 {
+	if inst.PreviewPolicyRevision != 6 || len(inst.PreviewPorts) != 1 || inst.PreviewPorts[8080] != (PreviewPortPolicy{Version: 3, Access: "public"}) {
 		t.Errorf("newer update not applied cleanly: rev=%d ports=%v", inst.PreviewPolicyRevision, inst.PreviewPorts)
 	}
 }

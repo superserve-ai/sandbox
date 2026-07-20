@@ -265,7 +265,7 @@ const bumpPublishedPortVersion = `-- name: BumpPublishedPortVersion :one
 UPDATE sandbox_published_port
 SET token_version = token_version + 1, updated_at = now()
 WHERE sandbox_id = $1 AND port = $2
-RETURNING port, token_version
+RETURNING port, token_version, access
 `
 
 type BumpPublishedPortVersionParams struct {
@@ -274,8 +274,9 @@ type BumpPublishedPortVersionParams struct {
 }
 
 type BumpPublishedPortVersionRow struct {
-	Port         int32 `json:"port"`
-	TokenVersion int32 `json:"token_version"`
+	Port         int32  `json:"port"`
+	TokenVersion int32  `json:"token_version"`
+	Access       string `json:"access"`
 }
 
 // Rotate one port's credential: advance only this port's generation, leaving
@@ -284,7 +285,7 @@ type BumpPublishedPortVersionRow struct {
 func (q *Queries) BumpPublishedPortVersion(ctx context.Context, arg BumpPublishedPortVersionParams) (BumpPublishedPortVersionRow, error) {
 	row := q.db.QueryRow(ctx, bumpPublishedPortVersion, arg.SandboxID, arg.Port)
 	var i BumpPublishedPortVersionRow
-	err := row.Scan(&i.Port, &i.TokenVersion)
+	err := row.Scan(&i.Port, &i.TokenVersion, &i.Access)
 	return i, err
 }
 
@@ -858,7 +859,7 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 }
 
 const getPublishedPort = `-- name: GetPublishedPort :one
-SELECT port, token_version FROM sandbox_published_port
+SELECT port, token_version, access FROM sandbox_published_port
 WHERE sandbox_id = $1 AND port = $2
 `
 
@@ -868,14 +869,15 @@ type GetPublishedPortParams struct {
 }
 
 type GetPublishedPortRow struct {
-	Port         int32 `json:"port"`
-	TokenVersion int32 `json:"token_version"`
+	Port         int32  `json:"port"`
+	TokenVersion int32  `json:"token_version"`
+	Access       string `json:"access"`
 }
 
 func (q *Queries) GetPublishedPort(ctx context.Context, arg GetPublishedPortParams) (GetPublishedPortRow, error) {
 	row := q.db.QueryRow(ctx, getPublishedPort, arg.SandboxID, arg.Port)
 	var i GetPublishedPortRow
-	err := row.Scan(&i.Port, &i.TokenVersion)
+	err := row.Scan(&i.Port, &i.TokenVersion, &i.Access)
 	return i, err
 }
 
@@ -987,14 +989,15 @@ func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 }
 
 const listPublishedPorts = `-- name: ListPublishedPorts :many
-SELECT port, token_version FROM sandbox_published_port
+SELECT port, token_version, access FROM sandbox_published_port
 WHERE sandbox_id = $1
 ORDER BY port
 `
 
 type ListPublishedPortsRow struct {
-	Port         int32 `json:"port"`
-	TokenVersion int32 `json:"token_version"`
+	Port         int32  `json:"port"`
+	TokenVersion int32  `json:"token_version"`
+	Access       string `json:"access"`
 }
 
 // The published-port set for a sandbox, ascending. Backs both the API list
@@ -1008,7 +1011,7 @@ func (q *Queries) ListPublishedPorts(ctx context.Context, sandboxID uuid.UUID) (
 	items := []ListPublishedPortsRow{}
 	for rows.Next() {
 		var i ListPublishedPortsRow
-		if err := rows.Scan(&i.Port, &i.TokenVersion); err != nil {
+		if err := rows.Scan(&i.Port, &i.TokenVersion, &i.Access); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -1280,29 +1283,33 @@ func (q *Queries) MarkSandboxFailedInTeam(ctx context.Context, arg MarkSandboxFa
 }
 
 const publishPort = `-- name: PublishPort :one
-INSERT INTO sandbox_published_port (sandbox_id, port)
-VALUES ($1, $2)
-ON CONFLICT (sandbox_id, port) DO UPDATE SET updated_at = now()
-RETURNING port, token_version
+INSERT INTO sandbox_published_port (sandbox_id, port, access)
+VALUES ($1, $2, $3)
+ON CONFLICT (sandbox_id, port) DO UPDATE
+SET access = EXCLUDED.access, updated_at = now()
+RETURNING port, token_version, access
 `
 
 type PublishPortParams struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	Port      int32     `json:"port"`
+	Access    string    `json:"access"`
 }
 
 type PublishPortRow struct {
-	Port         int32 `json:"port"`
-	TokenVersion int32 `json:"token_version"`
+	Port         int32  `json:"port"`
+	TokenVersion int32  `json:"token_version"`
+	Access       string `json:"access"`
 }
 
 // Idempotent publish: first publish starts at version 1; re-publishing an
-// existing port is a no-op that returns the current version (it must NOT
-// reset the version, or a republish would silently revoke live tokens).
+// existing port updates only its access mode and returns the current version
+// (it must NOT reset the version, or a republish would silently revoke live
+// tokens — an explicit mode switch deliberately keeps them valid).
 func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (PublishPortRow, error) {
-	row := q.db.QueryRow(ctx, publishPort, arg.SandboxID, arg.Port)
+	row := q.db.QueryRow(ctx, publishPort, arg.SandboxID, arg.Port, arg.Access)
 	var i PublishPortRow
-	err := row.Scan(&i.Port, &i.TokenVersion)
+	err := row.Scan(&i.Port, &i.TokenVersion, &i.Access)
 	return i, err
 }
 

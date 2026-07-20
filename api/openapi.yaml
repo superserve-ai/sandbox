@@ -2657,11 +2657,17 @@ components:
           enum: [public, private]
           description: |
             Move a sandbox onto a strict preview policy. Both values only
-            route explicitly published ports; `private` requires the port's
-            token and `public` does not. Takes effect immediately and persists
-            across pause/resume. `legacy_public` cannot be selected through
-            the API. The published-port set and outstanding tokens are
-            unchanged by the toggle.
+            route explicitly published ports; each published port's own
+            `access` mode decides whether it needs a token, and this value is
+            the default mode for newly published ports. Takes effect
+            immediately and persists across pause/resume. `legacy_public`
+            cannot be selected through the API. The published-port set and
+            outstanding tokens are unchanged by the toggle.
+
+            Rollout-gated: requires the `preview_port_publication_enabled`
+            feature flag (and `preview_port_private_access_enabled` for
+            `private`), otherwise 403. Returns 409 when the sandbox's host
+            does not yet advertise enforcement of the requested policy.
       example:
         metadata:
           env: prod
@@ -2676,10 +2682,19 @@ components:
           minimum: 1024
           maximum: 65535
           description: The port to publish.
+        access:
+          type: string
+          enum: [public, private]
+          description: >
+            Per-port access mode. `public` routes without a token; `private`
+            requires this port's token. Omitted, it defaults to the sandbox's
+            `preview_access` when that is `public` and to `private` otherwise.
+            Re-publishing with a different mode updates the mode and keeps the
+            port's token generation (live tokens stay valid).
 
     PreviewPort:
       type: object
-      required: [port, token_version]
+      required: [port, token_version, access]
       properties:
         port:
           type: integer
@@ -2690,6 +2705,12 @@ components:
           description: >
             The port's current token generation. Tokens embed it; rotating the
             port advances it and invalidates the port's outstanding tokens.
+        access:
+          type: string
+          enum: [public, private]
+          description: >
+            This port's enforcement mode. Per-port — a private port needs its
+            token even when a sibling port is public.
 
     PreviewPortList:
       type: object
@@ -2699,8 +2720,9 @@ components:
           type: string
           enum: [legacy_public, public, private]
           description: >
-            The sandbox's policy. `ports` gate traffic under `public` and
-            `private`; `legacy_public` preserves all-port routing.
+            The sandbox's policy: the default `access` for newly published
+            ports. `ports` gate traffic under `public` and `private`;
+            `legacy_public` preserves all-port routing.
         ports:
           type: array
           items:
@@ -2723,7 +2745,7 @@ components:
 
     PreviewTokenResponse:
       type: object
-      required: [token, port, header, query_param, preview_access, token_version]
+      required: [token, port, header, query_param, access, preview_access, token_version]
       properties:
         token:
           type: string
@@ -2746,12 +2768,18 @@ components:
           type: string
           format: date-time
           description: Present only when the token was minted with an expiry.
+        access:
+          type: string
+          enum: [public, private]
+          description: >
+            THIS port's mode — the one that decides whether the token is
+            required (`private`) or informational (`public`).
         preview_access:
           type: string
           enum: [legacy_public, public, private]
           description: >
-            The sandbox's current policy. Tokens are required only under
-            `private`; publication is still required under strict `public`.
+            The sandbox's current policy (the default mode for newly
+            published ports), kept for callers that predate per-port modes.
         token_version:
           type: integer
           format: int32

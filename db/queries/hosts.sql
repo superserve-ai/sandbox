@@ -24,8 +24,13 @@ WHERE id = $1;
 -- Returns the host row so the caller can verify the host exists. Also
 -- re-activates unhealthy hosts that resume heartbeating — this is the
 -- automatic recovery path after a transient network outage.
+-- capabilities is the authoritative advertisement of what the host's RUNNING
+-- vmd enforces, replaced on every beat: a rolled-back binary stops sending
+-- them and the host immediately stops qualifying for strict-preview
+-- sandboxes (fail closed).
 UPDATE host
 SET last_heartbeat_at = now(),
+    capabilities = $2,
     status = CASE WHEN status = 'unhealthy' THEN 'active' ELSE status END,
     updated_at = now()
 WHERE id = $1

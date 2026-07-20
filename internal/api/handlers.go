@@ -1610,6 +1610,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	previewAccess := auth.PreviewAccessLegacyPublic
 	if req.PreviewAccess != nil {
 		previewAccess = *req.PreviewAccess
+
+		// Strict policies are rollout-gated: the team must have the flags and
+		// (checked below, once a host is selected) the host must advertise
+		// enforcement. Checked before any resource is provisioned.
+		flags := []string{flagPreviewPortPublication}
+		if previewAccess == auth.PreviewAccessPrivate {
+			flags = append(flags, flagPreviewPortPrivateAccess)
+		}
+		if !h.requirePreviewFlags(c, teamID, flags...) {
+			return
+		}
 	}
 
 	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
@@ -1688,6 +1699,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		hostID = "default"
 	}
 	SetTelemetryHostID(c, hostID)
+
+	// A strict preview policy is only recorded if the host that will serve
+	// this sandbox advertises the enforcement for it — otherwise the create
+	// fails here, before any resource exists.
+	if req.PreviewAccess != nil {
+		if !h.requireHostPreviewCapabilities(c, hostID, previewAccess == auth.PreviewAccessPrivate) {
+			return
+		}
+	}
 
 	// Resolve the VMD client up front so we don't waste a DB INSERT on
 	// a host we can't reach.
@@ -2576,6 +2596,39 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 // is fine: no record on the host means the next restore seeds the policy from
 // the DB.
 func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID, access string) bool {
+	// Moving to (or between) strict policies is an enablement operation:
+	// flag-gated, and only recorded if the sandbox's host enforces it. Token
+	// enforcement is needed as soon as any port is private — either because
+	// the new default is private or because an already-published private port
+	// exists (its mode survives the sandbox-level change). The pre-read is
+	// safe against a concurrent private publish: that publish carries its own
+	// tokens-capability check.
+	flags := []string{flagPreviewPortPublication}
+	if access == auth.PreviewAccessPrivate {
+		flags = append(flags, flagPreviewPortPrivateAccess)
+	}
+	if !h.requirePreviewFlags(c, teamID, flags...) {
+		return false
+	}
+	needTokens := access == auth.PreviewAccessPrivate
+	if !needTokens {
+		existing, err := h.loadPreviewPorts(c.Request.Context(), sandbox.ID)
+		if err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB ListPublishedPorts failed")
+			respondError(c, ErrInternal)
+			return false
+		}
+		for _, p := range existing {
+			if p.Access != auth.PreviewAccessPublic {
+				needTokens = true
+				break
+			}
+		}
+	}
+	if !h.requireHostPreviewCapabilities(c, sandbox.HostID, needTokens) {
+		return false
+	}
+
 	// The sandbox struct carries the new access into the push.
 	sandbox.PreviewAccess = access
 	var rows int64

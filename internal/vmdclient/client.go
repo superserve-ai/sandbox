@@ -7,6 +7,16 @@ import (
 	"context"
 )
 
+// PortPolicy is one published preview port's enforcement state as pushed to
+// vmd: its token generation and its access mode ("public" routes without a
+// token, "private" requires this port's token). The API always sets Access;
+// the empty value exists only so an older reader's record decodes safely
+// (the proxy falls back to the sandbox-level policy for it).
+type PortPolicy struct {
+	Version int64
+	Access  string
+}
+
 // Client defines the subset of the VM daemon gRPC interface used by the
 // control plane. Implementations: grpcVMDClient in cmd/controlplane,
 // stubVMD in tests.
@@ -23,10 +33,10 @@ type Client interface {
 	// policy (the edge proxy's numeric-port gate); callers pass the sandbox
 	// row's current values so a restore never resets a private sandbox to
 	// public or drops its published ports. previewPorts maps published port →
-	// token version. For sandboxes with secrets the caller passes envVars=nil
-	// here and uses InjectSandboxEnv below once the source IP is known and a
-	// JWT is minted.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]int64, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// per-port policy (token version + access mode). For sandboxes with
+	// secrets the caller passes envVars=nil here and uses InjectSandboxEnv
+	// below once the source IP is known and a JWT is minted.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -56,11 +66,11 @@ type Client interface {
 	// UpdateSandboxPreviewPolicy replaces the preview-URL access policy and the
 	// full published-port set on the host's instance record (any VM state —
 	// the record is what the edge proxy reads). previewPorts maps published
-	// port → token version. gRPC NotFound means the host has no record; callers
-	// treat that as "applies on the next restore" since restores carry the
-	// policy. policyRevision orders concurrent pushes: vmd ignores a revision
-	// <= the one it already holds.
-	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]int64, policyRevision int64) error
+	// port → per-port policy (token version + access mode). gRPC NotFound
+	// means the host has no record; callers treat that as "applies on the next
+	// restore" since restores carry the policy. policyRevision orders
+	// concurrent pushes: vmd ignores a revision <= the one it already holds.
+	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]PortPolicy, policyRevision int64) error
 
 	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the
 	// cached cleartext for secretID. Used by the control plane to push

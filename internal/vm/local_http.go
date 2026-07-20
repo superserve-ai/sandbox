@@ -97,8 +97,12 @@ type instanceResponse struct {
 	// Preview-access policy for the edge proxy's numeric-port gate.
 	// Omitted (→ zero values) for sandboxes that predate the feature = public.
 	// preview_ports keys are strings because JSON object keys must be.
-	PreviewAccess string           `json:"preview_access,omitempty"`
-	PreviewPorts  map[string]int64 `json:"preview_ports,omitempty"`
+	// preview_port_access is the parallel per-port mode map; a port absent
+	// from it falls back to preview_access at the proxy, which keeps the wire
+	// readable by proxies that predate per-port modes.
+	PreviewAccess     string            `json:"preview_access,omitempty"`
+	PreviewPorts      map[string]int64  `json:"preview_ports,omitempty"`
+	PreviewPortAccess map[string]string `json:"preview_port_access,omitempty"`
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -128,8 +132,9 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		TeamID:    info.TeamID,
 		OwnerID:   info.OwnerID,
 
-		PreviewAccess: info.PreviewAccess,
-		PreviewPorts:  previewPortsToJSON(info.PreviewPorts),
+		PreviewAccess:     info.PreviewAccess,
+		PreviewPorts:      previewPortsToJSON(info.PreviewPorts),
+		PreviewPortAccess: previewPortAccessToJSON(info.PreviewPorts),
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
 	}
@@ -175,13 +180,28 @@ func (s *LocalHTTPServer) handleVerifySnapshot(w http.ResponseWriter, r *http.Re
 // previewPortsToJSON renders the int-keyed published-port map with string keys
 // for the /instances JSON body (JSON object keys must be strings). Nil in →
 // nil out, so an unset/public sandbox omits the field entirely.
-func previewPortsToJSON(in map[int32]int64) map[string]int64 {
+func previewPortsToJSON(in map[int32]PreviewPortPolicy) map[string]int64 {
 	if len(in) == 0 {
 		return nil
 	}
 	out := make(map[string]int64, len(in))
-	for port, version := range in {
-		out[strconv.Itoa(int(port))] = version
+	for port, p := range in {
+		out[strconv.Itoa(int(port))] = p.Version
+	}
+	return out
+}
+
+// previewPortAccessToJSON renders the parallel per-port access map. Ports with
+// an empty access (sandbox-level fallback) are omitted.
+func previewPortAccessToJSON(in map[int32]PreviewPortPolicy) map[string]string {
+	out := make(map[string]string, len(in))
+	for port, p := range in {
+		if p.Access != "" {
+			out[strconv.Itoa(int(port))] = p.Access
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
