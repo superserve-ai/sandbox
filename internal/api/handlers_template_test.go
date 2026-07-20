@@ -333,3 +333,51 @@ func TestTemplateCache_NotFound_NotCached(t *testing.T) {
 		t.Errorf("DB calls = %d, want 3 (not-found results must not be cached)", got)
 	}
 }
+
+// A team creating its own template with a cached system template's name must
+// stop being served the system entry once the stale refresh sees the override
+// (the lookup prefers team-owned rows).
+func TestTemplateCache_StaleRefreshEvictsOnTeamOverride(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	env.tplReturned = db.Template{
+		ID:     uuid.New(),
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+	callerTeam := uuid.New()
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	// The team creates its own template under the same name; age the cached
+	// system entry into the stale window and serve once (kicks the refresh).
+	teamTpl := db.Template{ID: uuid.New(), TeamID: callerTeam, Name: "superserve/base", Status: db.TemplateStatusReady}
+	env.tplReturned = teamTpl
+	key := templateCacheKey{teamID: callerTeam, ref: "superserve/base"}
+	v, _ := templateCache.Load(key)
+	v.(*templateCacheEntry).expiry = time.Now().Add(-time.Second)
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("stale serve: %v", err)
+	}
+
+	// The refresh resolves to the team-owned row and must evict the entry.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := templateCache.Load(key); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stale system entry kept shadowing the team override")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Next lookup returns the override.
+	tpl, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base")
+	if err != nil {
+		t.Fatalf("post-evict lookup: %v", err)
+	}
+	if tpl.TeamID != callerTeam {
+		t.Fatalf("expected the team-owned template, got team %s", tpl.TeamID)
+	}
+}

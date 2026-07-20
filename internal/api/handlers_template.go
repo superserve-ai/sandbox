@@ -1000,6 +1000,11 @@ func (h *Handlers) refreshTemplateCache(sfKey string, cacheKey templateCacheKey,
 			tpl:    tpl,
 			expiry: time.Now().Add(templateCacheTTL),
 		})
+	} else {
+		// The name now resolves to a team-owned template (lookup prefers it
+		// over the system one). Only system templates are cached, and the old
+		// system entry must not keep shadowing the override for the grace window.
+		templateCache.Delete(cacheKey)
 	}
 }
 

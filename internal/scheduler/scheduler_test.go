@@ -67,7 +67,7 @@ func TestLoadHostsServesStaleAndRefreshesInBackground(t *testing.T) {
 	// Age the cache far past the TTL; the next call must serve instantly from
 	// the stale list and refresh behind it.
 	s.mu.Lock()
-	s.cachedAt = time.Now().Add(-time.Hour)
+	s.cachedAt = time.Now().Add(-s.ttl() - 5*time.Second) // stale, inside grace
 	s.mu.Unlock()
 
 	if _, err := s.SelectHost(context.Background()); err != nil {
@@ -107,7 +107,7 @@ func TestLoadHostsStaleServeDoesNotBlockOnSlowRefresh(t *testing.T) {
 	// CAS guard must keep it to a single in-flight refresh.
 	store.block = make(chan struct{})
 	s.mu.Lock()
-	s.cachedAt = time.Now().Add(-time.Hour)
+	s.cachedAt = time.Now().Add(-s.ttl() - 5*time.Second) // stale, inside grace
 	s.mu.Unlock()
 
 	done := make(chan struct{})
@@ -163,7 +163,7 @@ func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
 	// Hold a background refresh in flight, then invalidate underneath it.
 	store.block = make(chan struct{})
 	s.mu.Lock()
-	s.cachedAt = time.Now().Add(-time.Hour)
+	s.cachedAt = time.Now().Add(-s.ttl() - 5*time.Second) // stale, inside grace
 	s.mu.Unlock()
 	if _, err := s.SelectHost(context.Background()); err != nil { // triggers the refresh
 		t.Fatalf("stale select: %v", err)
@@ -196,5 +196,26 @@ func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
 			t.Fatal("refresh goroutine never finished")
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestLoadHostsPastGraceBlocksInsteadOfServingStale(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	// Way past ttl+grace (refreshes never landed): must block on a fresh
+	// load, not keep serving a possibly-dead host list.
+	s.mu.Lock()
+	s.cachedAt = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("past-grace select: %v", err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("past-grace select must reload synchronously, got %d queries", n)
 	}
 }
