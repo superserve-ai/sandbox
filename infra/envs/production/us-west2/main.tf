@@ -84,11 +84,10 @@ data "google_service_account" "github_actions" {
   account_id = "superserve-github-actions"
 }
 
-resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
-  crypto_key_id = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
-  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = "serviceAccount:${local.api_service_account_email}"
-}
+# The api-runner SA's encrypt/decrypt grant on the credentials-kek KMS key is
+# managed out-of-band and owned centrally: the CD Terraform SA lacks KMS
+# setIamPolicy on the key, and the SA is shared across cells, so this follows
+# the same out-of-band pattern as the shared runtime secrets.
 
 # The runtime grant for the shared system-team-id-production secret is owned
 # solely by production/us-central1 (its api_runtime_secrets set), matching how
@@ -170,10 +169,6 @@ module "api" {
   vpc_tags       = ["cr-usw2"]
 
   labels = local.common_labels
-
-  depends_on = [
-    google_kms_crypto_key_iam_member.api_runtime_credentials_kms,
-  ]
 }
 
 module "sandbox_host" {

@@ -134,11 +134,10 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
   member    = "serviceAccount:${local.api_service_account_email}"
 }
 
-resource "google_kms_crypto_key_iam_member" "api_runtime_credentials_kms" {
-  crypto_key_id = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
-  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = "serviceAccount:${local.api_service_account_email}"
-}
+# The api-runner SA's encrypt/decrypt grant on the credentials-kek KMS key is
+# managed out-of-band: the CD Terraform SA lacks KMS setIamPolicy on the key,
+# and the SA is shared across cells, so this follows the same out-of-band
+# pattern as the shared runtime secrets.
 
 module "api" {
   source = "../../../modules/api"
@@ -200,7 +199,6 @@ module "api" {
 
   depends_on = [
     google_secret_manager_secret_iam_member.api_runtime_secrets,
-    google_kms_crypto_key_iam_member.api_runtime_credentials_kms,
   ]
 }
 
