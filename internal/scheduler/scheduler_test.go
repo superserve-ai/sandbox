@@ -1,0 +1,154 @@
+package scheduler
+
+import (
+	"context"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/superserve-ai/sandbox/internal/db"
+)
+
+// hostStore is a fake db.DBTX serving one host row per Query and counting calls.
+type hostStore struct {
+	calls atomic.Int64
+	block chan struct{} // non-nil: Query waits until closed
+}
+
+func (h *hostStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (h *hostStore) QueryRow(context.Context, string, ...interface{}) pgx.Row { return nil }
+func (h *hostStore) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
+	h.calls.Add(1)
+	if h.block != nil {
+		<-h.block
+	}
+	return &hostRows{}, nil
+}
+
+// hostRows yields a single minimal host row.
+type hostRows struct{ done bool }
+
+func (r *hostRows) Close()                                       {}
+func (r *hostRows) Err() error                                   { return nil }
+func (r *hostRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *hostRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *hostRows) Values() ([]any, error)                       { return nil, nil }
+func (r *hostRows) RawValues() [][]byte                          { return nil }
+func (r *hostRows) Conn() *pgx.Conn                              { return nil }
+func (r *hostRows) Next() bool {
+	if r.done {
+		return false
+	}
+	r.done = true
+	return true
+}
+func (r *hostRows) Scan(dest ...any) error {
+	*dest[0].(*string) = "host-1" // id; remaining columns keep zero values
+	return nil
+}
+
+func TestLoadHostsServesStaleAndRefreshesInBackground(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+
+	// First call blocks and fills the cache.
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("first select: %v", err)
+	}
+	if n := store.calls.Load(); n != 1 {
+		t.Fatalf("expected 1 query, got %d", n)
+	}
+
+	// Age the cache far past the TTL; the next call must serve instantly from
+	// the stale list and refresh behind it.
+	s.mu.Lock()
+	s.cachedAt = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("stale select: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh never ran, calls=%d", store.calls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Refresh landed: cache is fresh again, further calls stay cached.
+	s.mu.RLock()
+	fresh := time.Since(s.cachedAt) < time.Minute
+	s.mu.RUnlock()
+	if !fresh {
+		t.Fatal("refresh must restore a fresh cachedAt")
+	}
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("post-refresh select: %v", err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("fresh cache must not re-query, got %d", n)
+	}
+}
+
+func TestLoadHostsStaleServeDoesNotBlockOnSlowRefresh(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	// Refresh query hangs; stale selects must return instantly anyway, and the
+	// CAS guard must keep it to a single in-flight refresh.
+	store.block = make(chan struct{})
+	s.mu.Lock()
+	s.cachedAt = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 10; i++ {
+			_, _ = s.SelectHost(context.Background())
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stale selects blocked behind the hanging refresh")
+	}
+	// Wait for the (single) guarded refresh goroutine to reach its query, then
+	// confirm the CAS kept it to exactly one despite 10 stale selects.
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh goroutine never started, calls=%d", store.calls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if n := store.calls.Load(); n != 2 { // prime + one guarded refresh
+		t.Errorf("expected a single in-flight refresh, got %d queries", n)
+	}
+	close(store.block)
+}
+
+func TestInvalidateForcesBlockingReload(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	s.Invalidate()
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("post-invalidate select: %v", err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("invalidate must force a blocking reload, got %d queries", n)
+	}
+}

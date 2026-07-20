@@ -975,6 +975,34 @@ var (
 
 const templateCacheTTL = 5 * time.Second
 
+// templateCacheStaleGrace: a TTL-expired entry is still served for this long
+// while one background flight refreshes it, so a burst landing on an expired
+// entry never queues behind the refresh. Bounds how long a rebuilt or deleted
+// template's old snapshot paths can still be handed out.
+const templateCacheStaleGrace = 30 * time.Second
+
+// refreshTemplateCache re-runs the coalesced lookup behind a stale-serve and
+// restores the cache entry; a template that is gone drops its entry.
+func (h *Handlers) refreshTemplateCache(sfKey string, cacheKey templateCacheKey, teamID uuid.UUID, ref string) {
+	result, err, _ := templateLookupGroup.Do(sfKey, func() (interface{}, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return h.pureLookupTemplate(ctx, teamID, ref)
+	})
+	if err != nil {
+		if errors.Is(err, errTemplateNotFound) {
+			templateCache.Delete(cacheKey)
+		}
+		return // transient error: the stale entry stays servable for the grace window
+	}
+	if tpl := result.(db.Template); tpl.TeamID == h.systemTeamID() {
+		templateCache.Store(cacheKey, &templateCacheEntry{
+			tpl:    tpl,
+			expiry: time.Now().Add(templateCacheTTL),
+		})
+	}
+}
+
 // pureLookupTemplate runs the DB query. Must stay free of HTTP side-effects
 // so it can safely sit under singleflight.Group.
 func (h *Handlers) pureLookupTemplate(ctx context.Context, teamID uuid.UUID, ref string) (db.Template, error) {
@@ -1029,16 +1057,24 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 	}
 
 	cacheKey := templateCacheKey{teamID: teamID, ref: ref}
+	sfKey := teamID.String() + "|" + ref
 	if entry, ok := templateCache.Load(cacheKey); ok {
 		e := entry.(*templateCacheEntry)
-		if time.Now().Before(e.expiry) {
+		now := time.Now()
+		if now.Before(e.expiry) {
+			return e.tpl, nil
+		}
+		if now.Before(e.expiry.Add(templateCacheStaleGrace)) {
+			// Serve the just-expired entry and refresh behind the response, so
+			// a burst landing on an expired entry never queues. A refresh that
+			// finds the template gone drops the entry.
+			go h.refreshTemplateCache(sfKey, cacheKey, teamID, ref)
 			return e.tpl, nil
 		}
 		// CompareAndDelete so a concurrent fresh Store isn't clobbered.
 		templateCache.CompareAndDelete(cacheKey, entry)
 	}
 
-	sfKey := teamID.String() + "|" + ref
 	result, err, _ := templateLookupGroup.Do(sfKey, func() (interface{}, error) {
 		// Detach: other coalesced waiters may still need the result.
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)

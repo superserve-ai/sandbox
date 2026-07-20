@@ -287,13 +287,30 @@ func TestTemplateCache_ExpiredEntry_RefetchedFromDB(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected entry present after first call")
 	}
-	v.(*templateCacheEntry).expiry = time.Now().Add(-time.Second)
 
+	// Expired but inside the stale grace: served immediately, refreshed in
+	// the background (one coalesced DB call).
+	v.(*templateCacheEntry).expiry = time.Now().Add(-time.Second)
 	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
-		t.Fatalf("second lookup: %v", err)
+		t.Fatalf("stale lookup: %v", err)
 	}
-	if got := env.dbCalls.Load(); got != 2 {
-		t.Errorf("after expired entry: db_calls=%d, want 2", got)
+	deadline := time.Now().Add(2 * time.Second)
+	for env.dbCalls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh never ran, db_calls=%d", env.dbCalls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Past the grace window: a blocking refetch.
+	if v, ok := templateCache.Load(key); ok {
+		v.(*templateCacheEntry).expiry = time.Now().Add(-templateCacheStaleGrace - time.Second)
+	}
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("past-grace lookup: %v", err)
+	}
+	if got := env.dbCalls.Load(); got != 3 {
+		t.Errorf("past-grace entry must block on a refetch: db_calls=%d, want 3", got)
 	}
 }
 

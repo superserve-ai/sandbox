@@ -29,6 +29,11 @@ const (
 	// UPDATE to at most one write per key per interval, instead of one
 	// per request.
 	lastUsedTouchInterval = time.Minute
+	// apiKeyCacheStaleGrace: a TTL-expired entry is still served for this long
+	// while one background flight refreshes it, so a burst landing on an
+	// expired entry never queues behind the refresh. Widens the worst-case
+	// revocation window from ttl to ttl+grace.
+	apiKeyCacheStaleGrace = 2 * time.Second
 )
 
 // apiKeyCacheTTLFromEnv reads API_KEY_CACHE_TTL (a Go duration, e.g. "30s").
@@ -71,34 +76,35 @@ func newAPIKeyCache(ttl time.Duration) *apiKeyCache {
 	return &apiKeyCache{ttl: ttl, m: make(map[string]*apiKeyCacheEntry)}
 }
 
-// get returns a copy of the cached entry for keyHash if it is still fresh
-// and the key itself has not expired. needTouch reports whether the caller
+// get returns a copy of the cached entry for keyHash if the key itself has not
+// expired and the entry is within ttl+grace. stale reports that the entry is
+// past its TTL — served anyway, but the caller should kick a background
+// refresh. Past the grace window it is a miss (kept only so put can carry the
+// last_used_at throttle across refills). needTouch reports whether the caller
 // should update last_used_at (throttled to lastUsedTouchInterval).
-func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry, needTouch, ok bool) {
+func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry, needTouch, stale, ok bool) {
 	if c == nil {
-		return apiKeyCacheEntry{}, false, false
+		return apiKeyCacheEntry{}, false, false, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, exists := c.m[keyHash]
 	if !exists {
-		return apiKeyCacheEntry{}, false, false
+		return apiKeyCacheEntry{}, false, false, false
 	}
 	if e.expiresAt.Valid && !now.Before(e.expiresAt.Time) {
 		delete(c.m, keyHash)
-		return apiKeyCacheEntry{}, false, false
+		return apiKeyCacheEntry{}, false, false, false
 	}
-	if now.Sub(e.fetchedAt) > c.ttl {
-		// TTL-expired: report a miss but keep the entry — it is never served,
-		// and put reads its lastTouch so the last_used_at throttle survives
-		// refills (otherwise every TTL expiry would write last_used_at).
-		return apiKeyCacheEntry{}, false, false
+	age := now.Sub(e.fetchedAt)
+	if age > c.ttl+apiKeyCacheStaleGrace {
+		return apiKeyCacheEntry{}, false, false, false
 	}
 	if now.Sub(e.lastTouch) >= lastUsedTouchInterval {
 		e.lastTouch = now
 		needTouch = true
 	}
-	return *e, needTouch, true
+	return *e, needTouch, age > c.ttl, true
 }
 
 // fetch coalesces concurrent misses for the same key: one caller runs fn (the

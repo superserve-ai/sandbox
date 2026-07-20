@@ -111,6 +111,12 @@ const teamPermCacheTTL = 10 * time.Second
 // point (mirrors apiKeyCacheMaxEntries).
 const teamPermCacheMaxEntries = 4096
 
+// teamPermStaleGrace: a TTL-expired grant is still served for this long while
+// one background flight refreshes it, so a burst landing on an expired entry
+// never queues behind the refresh. Widens the worst-case revocation window to
+// ttl+grace; an invalidated (generation-bumped) entry is never stale-served.
+const teamPermStaleGrace = 2 * time.Second
+
 // Can checks either team-scoped or platform-scoped access depending on teamID.
 // Team permissions require a non-nil teamID. Platform permissions must use the
 // platform:* naming convention and must not pass a teamID.
@@ -138,21 +144,37 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 	c := s.cache
 
 	key := teamPermCacheKey{userID: userID, teamID: teamID, permission: permission}
+	now := time.Now()
 	c.mu.Lock()
 	observed := c.gen[teamID]
-	if e, ok := c.m[key]; ok {
-		if e.epoch == observed && time.Now().Before(e.expiry) {
+	if e, ok := c.m[key]; ok && e.epoch == observed {
+		switch {
+		case now.Before(e.expiry):
 			c.mu.Unlock()
 			return true, nil
+		case now.Before(e.expiry.Add(teamPermStaleGrace)):
+			// Serve the just-expired grant and refresh behind the response, so
+			// a burst landing on an expired entry never queues. Errors are
+			// ignored: the entry stays servable for the grace window, and a
+			// revocation lands via the refresh (or the generation bump).
+			c.mu.Unlock()
+			go func() { _, _ = s.flightTeamPerm(context.Background(), key, observed) }()
+			return true, nil
 		}
-		delete(c.m, key) // stale generation or expired
 	}
+	delete(c.m, key) // wrong generation or past grace
 	c.mu.Unlock()
 
-	// The generation is in the singleflight key: a request that observes a newer
-	// generation (post-revocation) will not coalesce onto an in-flight
-	// pre-revocation query, so it can't be handed that query's stale grant.
-	sfKey := fmt.Sprintf("%s|%s|%s|%d", userID, teamID, permission, observed)
+	return s.flightTeamPerm(ctx, key, observed)
+}
+
+// flightTeamPerm runs the coalesced permission query and stores a positive
+// result. The generation is in the singleflight key: a request that observes a
+// newer generation (post-revocation) will not coalesce onto an in-flight
+// pre-revocation query, so it can't be handed that query's stale grant.
+func (s *Service) flightTeamPerm(ctx context.Context, key teamPermCacheKey, observed uint64) (bool, error) {
+	c := s.cache
+	sfKey := fmt.Sprintf("%s|%s|%s|%d", key.userID, key.teamID, key.permission, observed)
 	result, err, _ := c.group.Do(sfKey, func() (interface{}, error) {
 		// Expiry is stamped from the query start so a slow query can't stretch
 		// the revocation window past the TTL.
@@ -161,7 +183,7 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 		// fresh deadline keeps a slow check from hanging.
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		allowed, err := s.canTeamQuery(qctx, userID, teamID, permission)
+		allowed, err := s.canTeamQuery(qctx, key.userID, key.teamID, key.permission)
 		if err != nil {
 			return nil, err
 		}
@@ -171,19 +193,22 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 		return false, err
 	}
 	res := result.(teamPermResult)
-	if res.allowed {
-		c.mu.Lock()
-		// Store only if the generation is still current: a revocation that
-		// landed while the query was in flight makes this result stale, and
-		// storing it would clobber a fresher post-revocation entry.
-		if c.gen[teamID] == res.epoch {
+	c.mu.Lock()
+	// Store only if the generation is still current: a revocation that landed
+	// while the query was in flight makes this result stale, and storing it
+	// would clobber a fresher post-revocation entry. A refreshed denial drops
+	// the entry so a revoked grant stops being stale-servable immediately.
+	if c.gen[key.teamID] == res.epoch {
+		if res.allowed {
 			if len(c.m) >= teamPermCacheMaxEntries {
 				c.sweepLocked(time.Now())
 			}
 			c.m[key] = teamPermCacheEntry{expiry: res.start.Add(c.ttl), epoch: res.epoch}
+		} else {
+			delete(c.m, key)
 		}
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
 	return res.allowed, nil
 }
 

@@ -70,21 +70,10 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		hash := sha256.Sum256([]byte(apiKey))
 		keyHash := hex.EncodeToString(hash[:])
 
-		if entry, needTouch, ok := cache.get(keyHash, time.Now()); ok {
-			if needTouch {
-				touchLastUsed(c.Request.Context(), entry.id)
-			}
-			setAPIKeyContext(c, entry)
-			c.Set("auth_ms", time.Since(authStart).Milliseconds())
-			c.Next()
-			return
-		}
-
-		// Miss: fetch coalesces concurrent identical lookups, so a burst
-		// arriving on an expired entry runs one query, not one per request.
-		// The touch and put happen inside fn so only the executing caller
-		// performs them — waiters share the entry without re-touching.
-		entry, err := cache.fetch(c.Request.Context(), keyHash, func(qctx context.Context) (apiKeyCacheEntry, error) {
+		// lookup is the DB fetch used by both the blocking miss path and the
+		// stale-refresh path; put and the throttled touch happen inside so
+		// only the executing flight performs them.
+		lookup := func(qctx context.Context) (apiKeyCacheEntry, error) {
 			var e apiKeyCacheEntry
 			err := pool.QueryRow(qctx,
 				"SELECT id, team_id, name, scopes, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
@@ -97,7 +86,29 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				touchLastUsed(qctx, e.id)
 			}
 			return e, nil
-		})
+		}
+
+		if entry, needTouch, stale, ok := cache.get(keyHash, time.Now()); ok {
+			if needTouch {
+				touchLastUsed(c.Request.Context(), entry.id)
+			}
+			if stale {
+				// Serve the just-expired entry and refresh behind the response,
+				// so a burst landing on an expired entry never queues. fetch's
+				// singleflight collapses concurrent refreshes; errors are
+				// ignored — the entry stays servable for the grace window and
+				// a real revocation lands via the refreshed lookup.
+				go func() { _, _ = cache.fetch(context.Background(), keyHash, lookup) }()
+			}
+			setAPIKeyContext(c, entry)
+			c.Set("auth_ms", time.Since(authStart).Milliseconds())
+			c.Next()
+			return
+		}
+
+		// Miss: fetch coalesces concurrent identical lookups, so a burst
+		// arriving with nothing cached runs one query, not one per request.
+		entry, err := cache.fetch(c.Request.Context(), keyHash, lookup)
 		if err != nil {
 			switch {
 			case c.Request.Context().Err() != nil:

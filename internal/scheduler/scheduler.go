@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -34,9 +35,10 @@ type LeastLoaded struct {
 	DefaultHostID string        // fallback when no host rows exist
 	TTL           time.Duration // 0 = use defaultCacheTTL
 
-	mu       sync.RWMutex
-	cached   []db.ListActiveHostsByLoadRow
-	cachedAt time.Time
+	mu         sync.RWMutex
+	cached     []db.ListActiveHostsByLoadRow
+	cachedAt   time.Time
+	refreshing atomic.Bool // one background refresh at a time
 }
 
 func (s *LeastLoaded) ttl() time.Duration {
@@ -76,21 +78,41 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 	return hosts[b].ID, nil
 }
 
+// loadHosts serves whatever list is cached — stale included — and refreshes it
+// in the background once the TTL lapses, so callers never queue behind the
+// refresh. Only the very first call (or the first after Invalidate) blocks.
+// Serving an arbitrarily stale list is safe here: the host set changes via ops
+// actions, which call Invalidate for an immediate reload.
 func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoadRow, error) {
 	s.mu.RLock()
-	if s.cached != nil && time.Since(s.cachedAt) < s.ttl() {
-		hosts := s.cached
-		s.mu.RUnlock()
-		return hosts, nil
-	}
+	cached, cachedAt := s.cached, s.cachedAt
 	s.mu.RUnlock()
+	if cached != nil {
+		if time.Since(cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
+			// Detached: the refresh outlives the triggering request. On error
+			// the stale list stays servable and the next expired call retries.
+			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			go func() {
+				defer cancel()
+				defer s.refreshing.Store(false)
+				hosts, err := s.DB.ListActiveHostsByLoad(qctx)
+				if err != nil {
+					return
+				}
+				s.mu.Lock()
+				s.cached = hosts
+				s.cachedAt = time.Now()
+				s.mu.Unlock()
+			}()
+		}
+		return cached, nil
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cached != nil && time.Since(s.cachedAt) < s.ttl() {
+	if s.cached != nil {
 		return s.cached, nil
 	}
-
 	hosts, err := s.DB.ListActiveHostsByLoad(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list active hosts by load: %w", err)
