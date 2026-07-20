@@ -393,11 +393,7 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 			typ, data, err := ws.Read(bridgeCtx)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
-					// Normal close is not an error.
-					closeErr := websocket.CloseStatus(err)
-					if closeErr != websocket.StatusNormalClosure && closeErr != websocket.StatusGoingAway {
-						l.Debug().Err(err).Msg("terminal: WS read ended")
-					}
+					logWSReadEnd(l, err, maxReadBytes, "terminal")
 				}
 				return
 			}
@@ -477,6 +473,23 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 // case-sensitively (the prefix is ASCII, no folding needed).
 //
 // Returns "" if no token entry is found. The caller logs and rejects.
+// logWSReadEnd classifies a bridge read error, shared by the terminal and
+// exec bridges: a frame that blew the connection's read limit is a
+// client-visible failure worth a warn (the library has already closed the
+// connection with StatusMessageTooBig); anything else that isn't a clean
+// close is routine teardown at debug.
+func logWSReadEnd(l zerolog.Logger, err error, limitBytes int, bridge string) {
+	if errors.Is(err, websocket.ErrMessageTooBig) {
+		l.Warn().Err(err).Int("limit_bytes", limitBytes).
+			Msg(bridge + ": client frame exceeded read limit")
+		return
+	}
+	closeErr := websocket.CloseStatus(err)
+	if closeErr != websocket.StatusNormalClosure && closeErr != websocket.StatusGoingAway {
+		l.Debug().Err(err).Msg(bridge + ": WS read ended")
+	}
+}
+
 func extractTerminalToken(r *http.Request) string {
 	for _, hv := range r.Header.Values("Sec-WebSocket-Protocol") {
 		for _, part := range strings.Split(hv, ",") {
