@@ -184,6 +184,7 @@ type templateCacheTestEnv struct {
 	dbCalls      *atomic.Int64
 	tplReturned  db.Template
 	tplErr       error
+	onQuery      func() // when set, runs inside the template query, before the row returns
 }
 
 func newTemplateCacheTestEnv(t *testing.T) *templateCacheTestEnv {
@@ -196,6 +197,9 @@ func newTemplateCacheTestEnv(t *testing.T) *templateCacheTestEnv {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			if strings.Contains(sql, "FROM template") {
 				env.dbCalls.Add(1)
+				if env.onQuery != nil {
+					env.onQuery()
+				}
 				if env.tplErr != nil {
 					return errorRow(env.tplErr)
 				}
@@ -412,5 +416,38 @@ func TestInvalidateTemplateCache_DropsAllTeamsEntries(t *testing.T) {
 	}
 	if got := env.dbCalls.Load(); got != 4 {
 		t.Errorf("post-invalidate lookups must refetch: db_calls=%d, want 4", got)
+	}
+}
+
+// A lookup whose DB flight straddles an invalidation (template deleted or
+// rebuilt mid-flight) may serve its result but must not store it — otherwise
+// the retired row comes back with a fresh TTL right after eviction.
+func TestTemplateCache_MidFlightInvalidationVetoesStore(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	tplID := uuid.New()
+	env.tplReturned = db.Template{
+		ID:     tplID,
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+	env.onQuery = func() { InvalidateTemplateCache(tplID) }
+
+	callerTeam := uuid.New()
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	key := templateCacheKey{teamID: callerTeam, ref: "superserve/base"}
+	if _, ok := templateCache.Load(key); ok {
+		t.Fatal("a flight that began before the invalidation must not store its row")
+	}
+
+	// With no invalidation racing it, the next lookup stores normally.
+	env.onQuery = nil
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("second lookup: %v", err)
+	}
+	if _, ok := templateCache.Load(key); !ok {
+		t.Fatal("expected the entry to be cached once no invalidation raced the flight")
 	}
 }

@@ -976,7 +976,15 @@ type templateCacheEntry struct {
 var (
 	templateCache       sync.Map           // key: templateCacheKey, value: *templateCacheEntry
 	templateLookupGroup singleflight.Group // coalesces concurrent identical misses
+	templateCacheGen    atomic.Uint64      // bumped by InvalidateTemplateCache; retires in-flight lookups
 )
+
+// templateFlightResult carries the generation observed when the flight began,
+// so a result computed before an invalidation is never stored after it.
+type templateFlightResult struct {
+	tpl db.Template
+	gen uint64
+}
 
 const templateCacheTTL = 5 * time.Second
 
@@ -994,10 +1002,17 @@ const templateCacheStaleGrace = 30 * time.Second
 // slow result can never clobber or evict a newer entry; nil means there is
 // nothing to replace (the blocking miss path).
 func (h *Handlers) fetchTemplate(ctx context.Context, sfKey string, cacheKey templateCacheKey, teamID uuid.UUID, ref string, old *templateCacheEntry) (db.Template, error) {
-	result, err, _ := templateLookupGroup.Do(sfKey, func() (interface{}, error) {
+	// The generation is in the singleflight key: a lookup that starts after an
+	// invalidation never coalesces onto a flight that read the retired row.
+	startGen := templateCacheGen.Load()
+	result, err, _ := templateLookupGroup.Do(fmt.Sprintf("%s|%d", sfKey, startGen), func() (interface{}, error) {
 		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		return h.pureLookupTemplate(qctx, teamID, ref)
+		tpl, err := h.pureLookupTemplate(qctx, teamID, ref)
+		if err != nil {
+			return nil, err
+		}
+		return templateFlightResult{tpl: tpl, gen: startGen}, nil
 	})
 	if err != nil {
 		if errors.Is(err, errTemplateNotFound) && old != nil {
@@ -1005,22 +1020,30 @@ func (h *Handlers) fetchTemplate(ctx context.Context, sfKey string, cacheKey tem
 		}
 		return db.Template{}, err
 	}
-	tpl := result.(db.Template)
-	switch {
-	case tpl.TeamID != h.systemTeamID():
+	res := result.(templateFlightResult)
+	tpl := res.tpl
+	if tpl.TeamID != h.systemTeamID() {
 		if old != nil {
 			templateCache.CompareAndDelete(cacheKey, old)
 		}
-	case old != nil:
-		templateCache.CompareAndSwap(cacheKey, old, &templateCacheEntry{
-			tpl:    tpl,
-			expiry: time.Now().Add(templateCacheTTL),
-		})
-	default:
-		templateCache.Store(cacheKey, &templateCacheEntry{
-			tpl:    tpl,
-			expiry: time.Now().Add(templateCacheTTL),
-		})
+		return tpl, nil
+	}
+	if templateCacheGen.Load() != res.gen {
+		// An invalidation landed after this flight began: its row may predate
+		// the delete or rebuild, so serve it to this caller but store nothing.
+		return tpl, nil
+	}
+	entry := &templateCacheEntry{tpl: tpl, expiry: time.Now().Add(templateCacheTTL)}
+	stored := true
+	if old != nil {
+		stored = templateCache.CompareAndSwap(cacheKey, old, entry)
+	} else {
+		templateCache.Store(cacheKey, entry)
+	}
+	// Re-check after the store: an invalidation racing it has already swept the
+	// map, so a store that slipped past that sweep must undo itself.
+	if stored && templateCacheGen.Load() != res.gen {
+		templateCache.CompareAndDelete(cacheKey, entry)
 	}
 	return tpl, nil
 }
@@ -1041,6 +1064,10 @@ func (h *Handlers) refreshTemplateCache(sfKey string, cacheKey templateCacheKey,
 // of after the stale grace. System templates are cached once per calling team,
 // hence the sweep. Called on template deletion and on a finalized rebuild.
 func InvalidateTemplateCache(templateID uuid.UUID) {
+	// Bump first: lookups already in flight read the pre-invalidation row and
+	// are retired at store time; lookups starting after the bump use a new
+	// singleflight key, so they cannot coalesce onto those older flights.
+	templateCacheGen.Add(1)
 	templateCache.Range(func(k, v any) bool {
 		if v.(*templateCacheEntry).tpl.ID == templateID {
 			templateCache.Delete(k)
