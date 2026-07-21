@@ -150,14 +150,19 @@ module "api" {
   image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   env = {
-    API_PORT               = "8080"
-    SUPABASE_URL           = var.supabase_url
-    SECRETS_SIGNING_KEY_ID = "v1"
-    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
-    ALLOW_EPHEMERAL_SEED   = "0"
-    DB_MAX_CONNS           = "12"
-    EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
-    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+    API_PORT                    = "8080"
+    SUPABASE_URL                = var.supabase_url
+    SECRETS_SIGNING_KEY_ID      = "v1"
+    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
+    ALLOW_EPHEMERAL_SEED        = "0"
+    DB_MAX_CONNS                = "12"
+    EDGE_PROXY_DOMAIN           = "sandbox.superserve.ai"
+    KMS_KEY_RESOURCE            = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+    OTEL_ENVIRONMENT            = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${module.sandbox_host.internal_ip}:4318"
+    OTEL_EXPORT_INTERVAL        = "15s"
+    OTEL_METRICS_ENABLED        = "true"
+    OTEL_SERVICE_NAME           = "sandbox-controlplane"
   }
 
   secrets = {

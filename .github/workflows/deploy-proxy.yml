@@ -161,3 +161,25 @@ jobs:
             --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
           export SANDBOX_ACCESS_TOKEN_SEED
           python3 .github/workflows/scripts/deploy-proxy.py
+
+      # us-east4 is the same "use" cell as the primary region, so it reuses the
+      # primary proxy env (domain + seed) and only changes the region — unlike
+      # the usw step, a distinct cell with its own domain and seed. Gated on
+      # GCP_REGION_USE4; deploy-proxy.py fails on zero VMD_LABEL matches, so
+      # leave the var unset until the east host carries the label.
+      - name: Deploy proxy to us-east4 use-cell VMD instance
+        if: vars.GCP_REGION_USE4 != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
+          PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
+          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python3 .github/workflows/scripts/deploy-proxy.py

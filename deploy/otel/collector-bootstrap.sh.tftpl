@@ -1,0 +1,48 @@
+#!/bin/bash
+set -euo pipefail
+
+exec > /var/log/startup-script.log 2>&1
+
+echo "=== Superserve OTEL collector bootstrap ==="
+
+COLLECTOR_VERSION="0.156.0"
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64)
+    COLLECTOR_ARCH="amd64"
+    ;;
+  aarch64|arm64)
+    COLLECTOR_ARCH="arm64"
+    ;;
+  *)
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+    ;;
+esac
+
+if ! command -v otelcol-contrib >/dev/null 2>&1; then
+  tmp_tarball="/tmp/otelcol-contrib_$${COLLECTOR_VERSION}_linux_$${COLLECTOR_ARCH}.tar.gz"
+  curl -fsSL -o "$tmp_tarball" \
+    "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v$${COLLECTOR_VERSION}/otelcol-contrib_$${COLLECTOR_VERSION}_linux_$${COLLECTOR_ARCH}.tar.gz"
+  tar -xzf "$tmp_tarball" -C /tmp
+  install -m 0755 /tmp/otelcol-contrib /usr/local/bin/otelcol-contrib
+fi
+
+install -d -m 0755 /etc/sandbox/otel
+cat <<'EOF' >/etc/sandbox/otel/collector-gmp.yaml
+${collector_config}
+EOF
+
+cat <<'EOF' >/etc/systemd/system/superserve-otel-collector.service
+${collector_service}
+EOF
+
+cat <<'EOF' >/etc/sandbox/otel/collector.env
+GCP_PROJECT=${project_id}
+GCP_ZONE=${zone}
+EOF
+
+systemctl daemon-reload
+systemctl enable --now superserve-otel-collector
+
+echo "=== Superserve OTEL collector bootstrap complete ==="
