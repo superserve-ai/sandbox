@@ -193,14 +193,14 @@ func TestMintLeafRemintsExpiredCacheEntry(t *testing.T) {
 	base := time.Now()
 	ca.cache.now = func() time.Time { return base }
 
-	leaf1, err := ca.MintLeaf("api.anthropic.com")
+	leaf1, err := ca.MintLeaf("api.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Still inside the leaf's life, minus the renew window: cache hit.
 	ca.cache.now = func() time.Time { return base.Add(leafLifetime - leafRenewBefore - time.Minute) }
-	if leaf2, err := ca.MintLeaf("api.anthropic.com"); err != nil {
+	if leaf2, err := ca.MintLeaf("api.example.com"); err != nil {
 		t.Fatal(err)
 	} else if leaf1 != leaf2 {
 		t.Errorf("expected cache hit before the renew window; got a re-mint")
@@ -208,7 +208,7 @@ func TestMintLeafRemintsExpiredCacheEntry(t *testing.T) {
 
 	// Inside the renew window (about to expire): must re-mint, not serve stale.
 	ca.cache.now = func() time.Time { return base.Add(leafLifetime - leafRenewBefore/2) }
-	leaf3, err := ca.MintLeaf("api.anthropic.com")
+	leaf3, err := ca.MintLeaf("api.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
