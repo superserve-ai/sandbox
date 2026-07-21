@@ -260,6 +260,9 @@ func (c *leafCache) get(sni string) (*tls.Certificate, bool) {
 	}
 	entry := el.Value.(*leafCacheEntry)
 	if !c.now().Add(leafRenewBefore).Before(entry.notAfter) {
+		// Concurrent connections in the renew window each re-mint (set is
+		// last-writer-wins) until the first fresh cert lands — a handful of
+		// extra sub-ms signs once per 72h per SNI, not worth coalescing.
 		return nil, false
 	}
 	c.order.MoveToFront(el)
