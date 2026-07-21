@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -83,8 +84,9 @@ type teamPermCacheKey struct {
 }
 
 type teamPermCacheEntry struct {
-	expiry time.Time
-	epoch  uint64
+	expiry     time.Time
+	epoch      uint64
+	refreshing bool // a stale-serve refresh is in flight; cleared when the entry is replaced or the refresh fails
 }
 
 // teamPermResult is the singleflight payload: the grant, the generation
@@ -96,13 +98,14 @@ type teamPermResult struct {
 	start   time.Time
 }
 
-// teamPermCacheTTL is the revocation contract: a role or membership change
-// takes effect within this window, everywhere. The cache is per-process and
-// instances don't coordinate, so InvalidateTeam can only tighten the instance
-// that handled the change — other instances, and RBAC writes that bypass the
-// API entirely (team-migration tooling, support SQL, the DB-trigger cascade on
-// membership rows), converge at TTL expiry. Same accepted window as the
-// API-key cache. If a permission ever requires immediate cross-instance
+// teamPermCacheTTL plus teamPermStaleGrace is the revocation contract: a role
+// or membership change takes effect within ttl+grace, everywhere. The cache is
+// per-process and instances don't coordinate, so InvalidateTeam can only
+// tighten the instance that handled the change — other instances, and RBAC
+// writes that bypass the API entirely (team-migration tooling, support SQL,
+// the DB-trigger cascade on membership rows), converge once their entries
+// expire and the stale-serve refresh observes the change. Same accepted window
+// as the API-key cache. If a permission ever requires immediate cross-instance
 // revocation, replace this cache with a DB-backed per-team generation.
 const teamPermCacheTTL = 10 * time.Second
 
@@ -153,11 +156,18 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 			c.mu.Unlock()
 			return true, nil
 		case now.Before(e.expiry.Add(teamPermStaleGrace)):
-			// Serve the just-expired grant, refresh behind the response.
-			// Errors are ignored: the entry stays servable for the grace
-			// window, and a revocation lands via the refresh (or the bump).
+			// Serve the just-expired grant; the first observer arms the one
+			// background refresh. A revocation lands via the refresh (a
+			// refreshed denial deletes the entry) or via the generation bump.
+			spawn := !e.refreshing
+			if spawn {
+				e.refreshing = true
+				c.m[key] = e
+			}
 			c.mu.Unlock()
-			go func() { _, _ = s.flightTeamPerm(context.Background(), key, observed) }()
+			if spawn {
+				go s.refreshTeamPerm(key, observed)
+			}
 			return true, nil
 		}
 	}
@@ -165,6 +175,23 @@ func (s *Service) CanTeam(ctx context.Context, userID, teamID uuid.UUID, permiss
 	c.mu.Unlock()
 
 	return s.flightTeamPerm(ctx, key, observed)
+}
+
+// refreshTeamPerm runs the background refresh behind a stale serve. On success
+// the flight replaces (or, on denial, deletes) the entry, which re-arms the
+// trigger; on a transient error the trigger re-arms here so a later request
+// inside the grace window retries, and the stale entry stays servable.
+func (s *Service) refreshTeamPerm(key teamPermCacheKey, observed uint64) {
+	if _, err := s.flightTeamPerm(context.Background(), key, observed); err != nil {
+		log.Warn().Err(err).Msg("team permission refresh failed; serving stale until the grace window expires")
+		c := s.cache
+		c.mu.Lock()
+		if e, ok := c.m[key]; ok && e.epoch == observed {
+			e.refreshing = false
+			c.m[key] = e
+		}
+		c.mu.Unlock()
+	}
 }
 
 // flightTeamPerm runs the coalesced permission query and stores a positive
@@ -229,8 +256,8 @@ func (c *teamPermCache) sweepLocked(now time.Time) {
 // role or membership change. Bumping the generation is the correctness
 // mechanism — in-flight misses that observed the old generation are discarded
 // at store time; the deletes just reclaim memory. Other instances converge
-// within the TTL (the cross-instance contract lives on defaultTeamPermCacheTTL).
-// No-op on uncached instances.
+// within ttl+grace (the cross-instance contract lives on teamPermCacheTTL and
+// teamPermStaleGrace). No-op on uncached instances.
 func (s *Service) InvalidateTeam(teamID uuid.UUID) {
 	if s == nil || s.cache == nil {
 		return

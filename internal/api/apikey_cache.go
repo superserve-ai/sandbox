@@ -52,14 +52,15 @@ func apiKeyCacheTTLFromEnv() time.Duration {
 }
 
 type apiKeyCacheEntry struct {
-	id        string
-	teamID    string
-	name      string
-	scopes    []string
-	createdBy pgtype.UUID
-	expiresAt pgtype.Timestamptz
-	fetchedAt time.Time
-	lastTouch time.Time
+	id         string
+	teamID     string
+	name       string
+	scopes     []string
+	createdBy  pgtype.UUID
+	expiresAt  pgtype.Timestamptz
+	fetchedAt  time.Time
+	lastTouch  time.Time
+	refreshing bool // a stale-serve refresh is in flight; armed by get, cleared by put/refreshFailed
 }
 
 type apiKeyCache struct {
@@ -77,12 +78,13 @@ func newAPIKeyCache(ttl time.Duration) *apiKeyCache {
 }
 
 // get returns a copy of the cached entry for keyHash if the key itself has not
-// expired and the entry is within ttl+grace. stale reports that the entry is
-// past its TTL — served anyway, but the caller should kick a background
-// refresh. Past the grace window it is a miss (kept only so put can carry the
-// last_used_at throttle across refills). needTouch reports whether the caller
-// should update last_used_at (throttled to lastUsedTouchInterval).
-func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry, needTouch, stale, ok bool) {
+// expired and the entry is within ttl+grace. refresh reports that the entry is
+// past its TTL and THIS caller should kick the background refresh — at most
+// one is armed at a time; put and refreshFailed re-arm. Past the grace window
+// it is a miss (kept only so put can carry the last_used_at throttle across
+// refills). needTouch reports whether the caller should update last_used_at
+// (throttled to lastUsedTouchInterval).
+func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry, needTouch, refresh, ok bool) {
 	if c == nil {
 		return apiKeyCacheEntry{}, false, false, false
 	}
@@ -104,7 +106,11 @@ func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry
 		e.lastTouch = now
 		needTouch = true
 	}
-	return *e, needTouch, age > c.ttl, true
+	if age > c.ttl && !e.refreshing {
+		e.refreshing = true
+		refresh = true
+	}
+	return *e, needTouch, refresh, true
 }
 
 // remove drops a cached entry. Used when a refresh returns a definitive
@@ -115,6 +121,20 @@ func (c *apiKeyCache) remove(keyHash string) {
 	}
 	c.mu.Lock()
 	delete(c.m, keyHash)
+	c.mu.Unlock()
+}
+
+// refreshFailed re-arms the stale-refresh trigger after a transient refresh
+// error, so a later request inside the grace window retries. (A successful
+// refresh re-arms via put; a revoked key is removed outright.)
+func (c *apiKeyCache) refreshFailed(keyHash string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if e, ok := c.m[keyHash]; ok {
+		e.refreshing = false
+	}
 	c.mu.Unlock()
 }
 

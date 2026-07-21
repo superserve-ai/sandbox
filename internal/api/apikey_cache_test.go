@@ -35,14 +35,24 @@ func TestAPIKeyCache_StaleServeThenMiss(t *testing.T) {
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1", teamID: "team1"}, now)
 
-	// Inside the grace window past the TTL: served, flagged stale.
-	entry, _, stale, ok := c.get("hash1", now.Add(31*time.Second))
-	if !ok || !stale || entry.id != "id1" {
-		t.Fatalf("expected stale serve inside grace, got ok=%v stale=%v", ok, stale)
+	// Inside the grace window past the TTL: served, and this caller is told
+	// to kick the refresh.
+	entry, _, refresh, ok := c.get("hash1", now.Add(31*time.Second))
+	if !ok || !refresh || entry.id != "id1" {
+		t.Fatalf("expected stale serve inside grace, got ok=%v refresh=%v", ok, refresh)
+	}
+	// The trigger is armed: further stale hits serve but must not re-kick.
+	if _, _, refresh, ok := c.get("hash1", now.Add(31*time.Second)); !ok || refresh {
+		t.Errorf("second stale hit must not arm another refresh, got ok=%v refresh=%v", ok, refresh)
+	}
+	// A transient refresh failure re-arms the trigger.
+	c.refreshFailed("hash1")
+	if _, _, refresh, ok := c.get("hash1", now.Add(31*time.Second)); !ok || !refresh {
+		t.Errorf("refreshFailed must re-arm the trigger, got ok=%v refresh=%v", ok, refresh)
 	}
 	// Fresh entries are not flagged.
-	if _, _, stale, ok := c.get("hash1", now.Add(time.Second)); !ok || stale {
-		t.Errorf("fresh entry must not be stale, got ok=%v stale=%v", ok, stale)
+	if _, _, refresh, ok := c.get("hash1", now.Add(time.Second)); !ok || refresh {
+		t.Errorf("fresh entry must not trigger a refresh, got ok=%v refresh=%v", ok, refresh)
 	}
 	// Past ttl+grace: a real miss.
 	if _, _, _, ok := c.get("hash1", now.Add(30*time.Second+apiKeyCacheStaleGrace+time.Second)); ok {

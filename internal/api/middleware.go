@@ -88,18 +88,25 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			return e, nil
 		}
 
-		if entry, needTouch, stale, ok := cache.get(keyHash, time.Now()); ok {
+		if entry, needTouch, refresh, ok := cache.get(keyHash, time.Now()); ok {
 			if needTouch {
 				touchLastUsed(c.Request.Context(), entry.id)
 			}
-			if stale {
-				// Serve the just-expired entry, refresh behind the response.
-				// fetch coalesces concurrent refreshes. A definitive not-found
-				// means the key was revoked — evict so the stale entry stops
-				// being servable; transient errors leave it for the grace window.
+			if refresh {
+				// Serve the just-expired entry, refresh behind the response;
+				// get arms at most one refresh per entry. A definitive
+				// not-found means the key was revoked — evict so the stale
+				// entry stops being servable; transient errors re-arm the
+				// trigger and leave it for the grace window.
 				go func() {
-					if _, err := cache.fetch(context.Background(), keyHash, lookup); errors.Is(err, pgx.ErrNoRows) {
+					_, err := cache.fetch(context.Background(), keyHash, lookup)
+					switch {
+					case err == nil:
+					case errors.Is(err, pgx.ErrNoRows):
 						cache.remove(keyHash)
+					default:
+						log.Warn().Err(err).Msg("API key refresh failed; serving stale until the grace window expires")
+						cache.refreshFailed(keyHash)
 					}
 				}()
 			}
