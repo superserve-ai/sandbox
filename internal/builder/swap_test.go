@@ -16,10 +16,11 @@ func TestGuestSwapSetupScript(t *testing.T) {
 		"swap_mib=128",              // floor
 		"swap_mib=4096",             // cap
 		"df -P -k /",                // POSIX single-line df for the guard
-		`fallocate -l "${swap_mib}"M /swapfile`,
-		"mkswap /swapfile",
-		"swapon /swapfile",
-		"rm -f /swapfile", // best-effort cleanup on failure
+		`fallocate -l "${swap_mib}"M /.superserve-swapfile`,
+		"mkswap /.superserve-swapfile",
+		"swapon /.superserve-swapfile",
+		"rm -f /.superserve-swapfile",    // best-effort cleanup on failure
+		"[ ! -f /.superserve-swapfile ]", // guard on the builder-owned path
 	} {
 		if !strings.Contains(GuestSwapSetupScript, want) {
 			t.Fatalf("GuestSwapSetupScript missing %q", want)

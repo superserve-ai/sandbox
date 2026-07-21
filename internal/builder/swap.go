@@ -16,6 +16,12 @@ const (
 	guestSwapMinMib      = 128  // floor so small guests still get a margin
 	guestSwapMaxMib      = 4096 // cap so large-RAM guests don't over-reserve disk
 	guestSwapHeadroomMib = 512  // rootfs free must exceed swap + this to enable
+
+	// A builder-owned path, not the conventional /swapfile, so the "already
+	// present" guard can't be tripped by a base image or build step that left
+	// an unrelated file at /swapfile — which would skip setup and ship a
+	// template with no swap.
+	guestSwapPath = "/.superserve-swapfile"
 )
 
 // GuestSwapSetupScript is run once in the build VM, after the user's build
@@ -34,7 +40,7 @@ const (
 // whose PATH may omit /sbin (where mkswap/swapon live), which would otherwise
 // make them silently not-found and skip swap.
 var GuestSwapSetupScript = fmt.Sprintf(`export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin
-if [ ! -f /swapfile ]; then
+if [ ! -f %[5]s ]; then
   mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   swap_mib=$((mem_mib / %[1]d))
   [ "$swap_mib" -lt %[2]d ] && swap_mib=%[2]d
@@ -42,11 +48,11 @@ if [ ! -f /swapfile ]; then
   free_kb=$(df -P -k / | awk 'END{print $4}')
   need_kb=$(( (swap_mib + %[4]d) * 1024 ))
   if [ "${free_kb:-0}" -gt "$need_kb" ]; then
-    if ! { fallocate -l "${swap_mib}"M /swapfile 2>/dev/null &&
-      chmod 600 /swapfile &&
-      mkswap /swapfile >/dev/null 2>&1 &&
-      swapon /swapfile 2>/dev/null; }; then
-      rm -f /swapfile
+    if ! { fallocate -l "${swap_mib}"M %[5]s 2>/dev/null &&
+      chmod 600 %[5]s &&
+      mkswap %[5]s >/dev/null 2>&1 &&
+      swapon %[5]s 2>/dev/null; }; then
+      rm -f %[5]s
     fi
   fi
-fi`, guestSwapRAMDivisor, guestSwapMinMib, guestSwapMaxMib, guestSwapHeadroomMib)
+fi`, guestSwapRAMDivisor, guestSwapMinMib, guestSwapMaxMib, guestSwapHeadroomMib, guestSwapPath)
