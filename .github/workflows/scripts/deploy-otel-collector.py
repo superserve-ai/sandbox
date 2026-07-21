@@ -176,8 +176,6 @@ def main() -> int:
                     "--quiet", "--tunnel-through-iap",
                 ],
                 check=True,
-                capture_output=True,
-                text=True,
             )
 
         print(f"[{tag}] collector files uploaded")
