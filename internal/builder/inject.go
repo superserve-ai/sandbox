@@ -333,15 +333,6 @@ nameserver 8.8.8.8
 options timeout:2 attempts:2
 `
 
-// Guest swap settings baked into initScript (see the init block for rationale).
-const (
-	SwapModeGuest        = "guest"
-	guestSwapRAMDivisor  = 4    // swap = RAM / 4
-	guestSwapMinMib      = 128  // floor so small guests still get a margin
-	guestSwapMaxMib      = 4096 // cap so large-RAM guests don't over-reserve disk
-	guestSwapHeadroomMib = 512  // rootfs free must exceed swap + this to enable
-)
-
 // initScript runs first as PID 1, mounts the filesystems the kernel doesn't
 // auto-mount, then exec's tini to take over. After the exec, tini is PID 1
 // (not the shell) and owns boxd as its supervised child.
@@ -356,11 +347,7 @@ const (
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
 // POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
-var initScript = fmt.Sprintf(initScriptTemplate, guestSwapRAMDivisor, guestSwapMinMib, guestSwapMaxMib, guestSwapHeadroomMib)
-
-// initScriptTemplate placeholders: %[1]d = RAM divisor, %[2]d = swap floor (MiB),
-// %[3]d = swap cap (MiB), %[4]d = required free-disk headroom above swap (MiB).
-const initScriptTemplate = `#!/bin/sh
+const initScript = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
 
@@ -373,29 +360,6 @@ mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mkdir -p /dev/pts /home/user
 mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
-
-# Guest swap: without it a memory spike past the RAM ceiling faults the
-# process (SIGBUS) — with it, the spike pages out. Sized as RAM/%[1]d (capped
-# at %[2]d MiB) so it scales with the workload. On the rootfs so snapshots
-# capture it; enabled here (not per-boot) so restore does no work. Best-effort:
-# failure means no swap, never a broken boot. Skipped when disk is tight.
-if [ ! -f /swapfile ]; then
-  mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-  swap_mib=$((mem_mib / %[1]d))
-  [ "$swap_mib" -lt %[2]d ] && swap_mib=%[2]d
-  [ "$swap_mib" -gt %[3]d ] && swap_mib=%[3]d
-  free_kb=$(df -k / | awk 'NR==2{print $4}')
-  need_kb=$(( (swap_mib + %[4]d) * 1024 ))
-  if [ "${free_kb:-0}" -gt "$need_kb" ]; then
-    if ! { { fallocate -l "${swap_mib}"M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mib" 2>/dev/null; } &&
-      chmod 600 /swapfile &&
-      mkswap /swapfile >/dev/null 2>&1 &&
-      swapon /swapfile 2>/dev/null; }; then
-      # Any step failed: drop the file so a dead swapfile isn't snapshotted.
-      rm -f /swapfile
-    fi
-  fi
-fi
 
 # Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The

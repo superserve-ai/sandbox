@@ -290,12 +290,20 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
 		bc.user, bc.workdir, len(bc.env))
 
+	// Enable guest swap now — after build steps (so it never competes with
+	// them for rootfs space) and before the snapshot (so it's captured active
+	// and every restored sandbox has it with no per-boot work). Best-effort:
+	// the script itself swallows failures, so ignore a non-zero exit.
+	rootCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
+	if err := runShellCmd(ctx, netInfo.HostIP, builder.GuestSwapSetupScript, rootCtx); err != nil {
+		emitInternal("system", "guest swap setup skipped: %v", err)
+	}
+
 	// Push pending guest writes through virtio-block before snapshot —
 	// otherwise dirty pages only live in mem.snap and resumed sandboxes
 	// corrupt files when the kernel evicts them.
 	emitInternal("system", "syncing guest filesystem")
-	syncCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
-	if err := runShellCmd(ctx, netInfo.HostIP, "sync && sync", syncCtx); err != nil {
+	if err := runShellCmd(ctx, netInfo.HostIP, "sync && sync", rootCtx); err != nil {
 		return fmt.Errorf("guest sync: %w", err)
 	}
 

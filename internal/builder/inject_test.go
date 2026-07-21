@@ -258,29 +258,3 @@ func readTestFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-func TestInitScriptGuestSwap(t *testing.T) {
-	t.Parallel()
-
-	// The swap block must run before the tini handoff (nothing after exec runs)
-	// and stay best-effort: a guard on free disk, and no set -e style aborts.
-	execIdx := strings.Index(initScript, "exec /usr/local/bin/tini")
-	swapIdx := strings.Index(initScript, "swapon /swapfile")
-	if swapIdx == -1 {
-		t.Fatal("initScript does not enable guest swap")
-	}
-	if execIdx == -1 || swapIdx > execIdx {
-		t.Fatal("guest swap block must precede the tini exec handoff")
-	}
-	for _, want := range []string{
-		"MemTotal",                  // sizes swap from guest RAM
-		"swap_mib=$((mem_mib / 4))", // RAM/4
-		"swap_mib=128",              // floored
-		"swap_mib=4096",             // capped
-		`fallocate -l "${swap_mib}"M /swapfile`,
-		"mkswap /swapfile",
-	} {
-		if !strings.Contains(initScript, want) {
-			t.Fatalf("initScript missing %q", want)
-		}
-	}
-}
