@@ -114,7 +114,11 @@ function issueInput(issue, teamId, projectId, parentId) {
 export async function sync({ issues, state, client, teamId, projectId, dryRun }) {
   validateManifest({ issues });
   const knownIds = state.issues ?? {};
-  const resolved = dryRun ? { team: { id: teamId || "dry-run:team" }, project: { id: projectId || "dry-run:project" } } : await client.resolveTeamAndProject(teamId, projectId);
+  const resolved = dryRun
+    ? { team: { id: teamId || "dry-run:team" }, project: { id: projectId || "dry-run:project" } }
+    : teamId && projectId
+      ? { team: { id: teamId }, project: { id: projectId } }
+      : await client.resolveTeamAndProject(teamId, projectId);
   const nextState = { teamId: resolved.team.id, projectId: resolved.project.id, issues: { ...knownIds } };
 
   const ids = new Map(Object.entries(knownIds));

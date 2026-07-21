@@ -48,11 +48,20 @@ test("fresh apply creates children with the real root ID", async () => {
 });
 
 test("ID overrides avoid all resolver queries", async () => {
+  let resolverCalled = false;
   const client = {
-    resolveTeamAndProject: async () => { throw new Error("resolver should not run"); },
-    createIssue: async () => ({ id: "issue" }),
+    resolveTeamAndProject: async () => { resolverCalled = true; throw new Error("resolver should not run"); },
+    updateIssue: async (id) => ({ id }),
   };
-  const state = await sync({ issues: [{ key: "program", title: "Security program" }], state: {}, client, teamId: "team", projectId: "project", dryRun: true });
+  const state = await sync({
+    issues: [{ key: "program", title: "Security program" }],
+    state: { issues: { program: "issue" } },
+    client,
+    teamId: "team",
+    projectId: "project",
+    dryRun: false,
+  });
+  assert.equal(resolverCalled, false);
   assert.equal(state.teamId, "team");
   assert.equal(state.projectId, "project");
 });
