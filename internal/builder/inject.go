@@ -337,9 +337,13 @@ options timeout:2 attempts:2
 // snapshot consumers know which swap mode a template was built under.
 const (
 	SwapModeGuest = "guest"
-	// GuestSwapMib is a spike margin, not working memory — large enough to
-	// absorb brief allocation peaks, small enough to not squeeze the rootfs.
-	GuestSwapMib = 512
+	// Swap is sized as a fraction of guest RAM (so it scales with workload
+	// size) and capped, then only created if the rootfs has room. Sized from
+	// RAM rather than a fixed value because a brief allocation peak scales with
+	// how much memory the workload uses, not a constant.
+	guestSwapRAMDivisor  = 4    // swap = RAM / 4
+	guestSwapMaxMib      = 4096 // capped so large-RAM guests don't over-reserve disk
+	guestSwapHeadroomMib = 512  // rootfs free must exceed swap + this to enable
 )
 
 // initScript runs first as PID 1, mounts the filesystems the kernel doesn't
@@ -356,10 +360,10 @@ const (
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
 // POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
-var initScript = fmt.Sprintf(initScriptTemplate, GuestSwapMib, 3*GuestSwapMib*1024)
+var initScript = fmt.Sprintf(initScriptTemplate, guestSwapRAMDivisor, guestSwapMaxMib, guestSwapHeadroomMib)
 
-// initScriptTemplate placeholders: %[1]d = swap size in MiB, %[2]d = minimum
-// free rootfs KiB required to enable swap (3x the swap size).
+// initScriptTemplate placeholders: %[1]d = RAM divisor, %[2]d = swap cap (MiB),
+// %[3]d = required free-disk headroom above the swap size (MiB).
 const initScriptTemplate = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
@@ -375,13 +379,18 @@ mkdir -p /dev/pts /home/user
 mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 
 # Guest swap: without it a memory spike past the RAM ceiling faults the
-# process (SIGBUS) — with it, the spike pages out. On the rootfs so snapshots
+# process (SIGBUS) — with it, the spike pages out. Sized as RAM/%[1]d (capped
+# at %[2]d MiB) so it scales with the workload. On the rootfs so snapshots
 # capture it; enabled here (not per-boot) so restore does no work. Best-effort:
 # failure means no swap, never a broken boot. Skipped when disk is tight.
 if [ ! -f /swapfile ]; then
+  mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+  swap_mib=$((mem_mib / %[1]d))
+  [ "$swap_mib" -gt %[2]d ] && swap_mib=%[2]d
   free_kb=$(df -k / | awk 'NR==2{print $4}')
-  if [ "${free_kb:-0}" -gt %[2]d ]; then
-    { fallocate -l %[1]dM /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=%[1]d 2>/dev/null; } &&
+  need_kb=$(( (swap_mib + %[3]d) * 1024 ))
+  if [ "${swap_mib:-0}" -ge 128 ] && [ "${free_kb:-0}" -gt "$need_kb" ]; then
+    { fallocate -l "${swap_mib}"M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mib" 2>/dev/null; } &&
       chmod 600 /swapfile &&
       mkswap /swapfile >/dev/null 2>&1 &&
       swapon /swapfile 2>/dev/null

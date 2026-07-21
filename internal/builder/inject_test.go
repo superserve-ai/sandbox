@@ -271,7 +271,13 @@ func TestInitScriptGuestSwap(t *testing.T) {
 	if execIdx == -1 || swapIdx > execIdx {
 		t.Fatal("guest swap block must precede the tini exec handoff")
 	}
-	for _, want := range []string{"fallocate -l 512M /swapfile", "mkswap /swapfile", "df -k /"} {
+	for _, want := range []string{
+		"MemTotal",                   // sizes swap from guest RAM
+		"swap_mib=$((mem_mib / 4))",  // RAM/4
+		"swap_mib=4096",              // capped
+		`fallocate -l "${swap_mib}"M /swapfile`,
+		"mkswap /swapfile",
+	} {
 		if !strings.Contains(initScript, want) {
 			t.Fatalf("initScript missing %q", want)
 		}
