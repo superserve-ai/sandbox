@@ -32,6 +32,12 @@ type CA struct {
 const (
 	leafLifetime = 72 * time.Hour
 	rootLifetime = 10 * 365 * 24 * time.Hour
+
+	// leafRenewBefore re-mints a cached leaf this long before it expires, so a
+	// hot SNI that never falls out of the LRU can't be served a stale cert (and
+	// so a cert can't expire mid-connection). Comfortably larger than any single
+	// request, negligible waste against the 72h lifetime.
+	leafRenewBefore = 1 * time.Hour
 )
 
 // NewCA loads the CA from disk or generates a new one and persists the key with mode 0600.
@@ -155,11 +161,12 @@ func (ca *CA) MintLeaf(sni string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	notAfter := ca.cache.now().Add(leafLifetime)
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: sni},
-		NotBefore:    time.Now().Add(-5 * time.Minute),
-		NotAfter:     time.Now().Add(leafLifetime),
+		NotBefore:    ca.cache.now().Add(-5 * time.Minute),
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
@@ -177,7 +184,7 @@ func (ca *CA) MintLeaf(sni string) (*tls.Certificate, error) {
 		Certificate: [][]byte{der, ca.rootCert.Raw},
 		PrivateKey:  leafKey,
 	}
-	ca.cache.set(sni, cert)
+	ca.cache.set(sni, cert, notAfter)
 	return cert, nil
 }
 
@@ -217,11 +224,15 @@ type leafCache struct {
 	capacity int
 	items    map[string]*list.Element
 	order    *list.List
+	// now is the clock, injectable for tests. Both minting (leaf validity) and
+	// cache expiry read it, so a test can advance one clock past a leaf's life.
+	now func() time.Time
 }
 
 type leafCacheEntry struct {
-	sni  string
-	cert *tls.Certificate
+	sni      string
+	cert     *tls.Certificate
+	notAfter time.Time
 }
 
 func newLeafCache(capacity int) *leafCache {
@@ -232,9 +243,14 @@ func newLeafCache(capacity int) *leafCache {
 		capacity: capacity,
 		items:    make(map[string]*list.Element, capacity),
 		order:    list.New(),
+		now:      time.Now,
 	}
 }
 
+// get returns a cached leaf only while it stays valid past the renew window. A
+// leaf within leafRenewBefore of expiry is treated as a miss so the caller
+// re-mints — without this the LRU would serve a hot SNI's expired cert forever
+// (evicting only under capacity pressure, never on age).
 func (c *leafCache) get(sni string) (*tls.Certificate, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -242,19 +258,28 @@ func (c *leafCache) get(sni string) (*tls.Certificate, bool) {
 	if !ok {
 		return nil, false
 	}
+	entry := el.Value.(*leafCacheEntry)
+	if !c.now().Add(leafRenewBefore).Before(entry.notAfter) {
+		// Concurrent connections in the renew window each re-mint (set is
+		// last-writer-wins) until the first fresh cert lands — a handful of
+		// extra sub-ms signs once per 72h per SNI, not worth coalescing.
+		return nil, false
+	}
 	c.order.MoveToFront(el)
-	return el.Value.(*leafCacheEntry).cert, true
+	return entry.cert, true
 }
 
-func (c *leafCache) set(sni string, cert *tls.Certificate) {
+func (c *leafCache) set(sni string, cert *tls.Certificate, notAfter time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.items[sni]; ok {
-		el.Value.(*leafCacheEntry).cert = cert
+		entry := el.Value.(*leafCacheEntry)
+		entry.cert = cert
+		entry.notAfter = notAfter
 		c.order.MoveToFront(el)
 		return
 	}
-	el := c.order.PushFront(&leafCacheEntry{sni: sni, cert: cert})
+	el := c.order.PushFront(&leafCacheEntry{sni: sni, cert: cert, notAfter: notAfter})
 	c.items[sni] = el
 	if c.order.Len() > c.capacity {
 		oldest := c.order.Back()

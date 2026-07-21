@@ -9,7 +9,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+// farFuture is an expiry well beyond any test's clock, so LRU-eviction tests
+// exercise capacity, not the leaf-expiry check.
+var farFuture = time.Now().Add(1000 * time.Hour)
 
 func TestNewCAGeneratesAndPersists(t *testing.T) {
 	dir := t.TempDir()
@@ -174,6 +179,47 @@ func TestMintLeafCachesHits(t *testing.T) {
 	}
 }
 
+// TestMintLeafRemintsExpiredCacheEntry guards the leaf-cache expiry bug: a hot
+// SNI never falls out of the LRU, so without an age check the cache would serve
+// the same leaf past its 72h validity forever (observed as CERT_HAS_EXPIRED
+// through the proxy). Advancing the clock past the renew window must force a
+// re-mint, not a stale hit.
+func TestMintLeafRemintsExpiredCacheEntry(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := NewCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now()
+	ca.cache.now = func() time.Time { return base }
+
+	leaf1, err := ca.MintLeaf("api.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Still inside the leaf's life, minus the renew window: cache hit.
+	ca.cache.now = func() time.Time { return base.Add(leafLifetime - leafRenewBefore - time.Minute) }
+	if leaf2, err := ca.MintLeaf("api.example.com"); err != nil {
+		t.Fatal(err)
+	} else if leaf1 != leaf2 {
+		t.Errorf("expected cache hit before the renew window; got a re-mint")
+	}
+
+	// Inside the renew window (about to expire): must re-mint, not serve stale.
+	ca.cache.now = func() time.Time { return base.Add(leafLifetime - leafRenewBefore/2) }
+	leaf3, err := ca.MintLeaf("api.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaf1 == leaf3 {
+		t.Errorf("expected re-mint within the renew window; cache served the stale leaf")
+	}
+	if ca.cache.len() != 1 {
+		t.Errorf("re-mint should replace the entry in place, got %d entries", ca.cache.len())
+	}
+}
+
 func TestMintLeafConcurrentSafe(t *testing.T) {
 	dir := t.TempDir()
 	ca, err := NewCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), 64)
@@ -208,9 +254,9 @@ func TestMintLeafConcurrentSafe(t *testing.T) {
 
 func TestLeafCacheEvictsLRU(t *testing.T) {
 	c := newLeafCache(2)
-	c.set("a", &tls.Certificate{})
-	c.set("b", &tls.Certificate{})
-	c.set("c", &tls.Certificate{}) // evicts a
+	c.set("a", &tls.Certificate{}, farFuture)
+	c.set("b", &tls.Certificate{}, farFuture)
+	c.set("c", &tls.Certificate{}, farFuture) // evicts a
 
 	if _, ok := c.get("a"); ok {
 		t.Errorf("a should have been evicted as LRU")
@@ -225,13 +271,13 @@ func TestLeafCacheEvictsLRU(t *testing.T) {
 
 func TestLeafCachePromotesOnGet(t *testing.T) {
 	c := newLeafCache(2)
-	c.set("a", &tls.Certificate{})
-	c.set("b", &tls.Certificate{})
+	c.set("a", &tls.Certificate{}, farFuture)
+	c.set("b", &tls.Certificate{}, farFuture)
 	// Touch a so it's no longer the LRU; b should evict next.
 	if _, ok := c.get("a"); !ok {
 		t.Fatal("a missing before LRU promotion")
 	}
-	c.set("c", &tls.Certificate{}) // should evict b, not a
+	c.set("c", &tls.Certificate{}, farFuture) // should evict b, not a
 	if _, ok := c.get("a"); !ok {
 		t.Errorf("a was unexpectedly evicted after being touched")
 	}
@@ -244,7 +290,7 @@ func TestLeafCacheZeroCapacityDefaults(t *testing.T) {
 	// A 0 capacity would otherwise immediately evict every entry; we
 	// expect a sensible default so callers can pass 0 safely.
 	c := newLeafCache(0)
-	c.set("a", &tls.Certificate{})
+	c.set("a", &tls.Certificate{}, farFuture)
 	if _, ok := c.get("a"); !ok {
 		t.Errorf("zero-capacity cache should have fallen back to a default")
 	}
