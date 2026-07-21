@@ -290,10 +290,8 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
 		bc.user, bc.workdir, len(bc.env))
 
-	// Enable guest swap now — after build steps (so it never competes with
-	// them for rootfs space) and before the snapshot (so it's captured active
-	// and every restored sandbox has it with no per-boot work). Best-effort:
-	// the script itself swallows failures, so ignore a non-zero exit.
+	// Enable guest swap after build steps, before the snapshot (see
+	// GuestSwapSetupScript). Best-effort — the script swallows failures.
 	rootCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
 	if err := runShellCmdQuiet(ctx, netInfo.HostIP, builder.GuestSwapSetupScript, rootCtx); err != nil {
 		emitInternal("system", "guest swap setup skipped: %v", err)
@@ -862,9 +860,7 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		ResolvedDigest string `json:"resolved_digest"`
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
-		// Build-time swap policy, not a runtime assertion — the build enables
-		// guest swap best-effort and may skip it on a tight rootfs.
-		SwapMode string `json:"swap_mode"`
+		SwapMode       string `json:"swap_mode"` // see builder.SwapModeGuest
 	}{
 		SnapshotPath:   snapPath,
 		MemPath:        memPath,

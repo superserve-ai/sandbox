@@ -9,8 +9,7 @@ import "fmt"
 // the workload uses, not a constant.
 const (
 	// SwapModeGuest is the build-time swap policy recorded in build.meta.json.
-	// It is a policy label, not a runtime assertion — setup is best-effort and
-	// is skipped on a tight rootfs.
+	// A policy label, not a runtime assertion — setup (below) is best-effort.
 	SwapModeGuest = "guest"
 
 	guestSwapRAMDivisor  = 4    // swap = RAM / 4
