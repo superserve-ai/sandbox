@@ -443,9 +443,9 @@ jobs:
   # traffic-split cutover away from us-central1. During bring-up this applies
   # infrastructure only: the api service is created (on an existing image tag;
   # see the module's image pin) but there is deliberately NO api-deploy/traffic
-  # /smoke stage yet — us-east4 has no public endpoint until the D3 routing work
-  # lands, so a region smoke test would have nothing to hit. Chained last so it
-  # never gates the live us-central1/us-west2 rollouts above.
+  # /smoke stage yet — us-east4 has no public endpoint until the routing/
+  # traffic-split work lands, so a region smoke test would have nothing to hit.
+  # Chained last so it never gates the live us-central1/us-west2 rollouts above.
   production-us-east4-infra:
     name: Apply production/us-east4
     runs-on: ubuntu-latest
