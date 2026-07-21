@@ -333,6 +333,15 @@ nameserver 8.8.8.8
 options timeout:2 attempts:2
 `
 
+// Guest swap settings baked into initScript, recorded in build.meta.json so
+// snapshot consumers know which swap mode a template was built under.
+const (
+	SwapModeGuest = "guest"
+	// GuestSwapMib is a spike margin, not working memory — large enough to
+	// absorb brief allocation peaks, small enough to not squeeze the rootfs.
+	GuestSwapMib = 512
+)
+
 // initScript runs first as PID 1, mounts the filesystems the kernel doesn't
 // auto-mount, then exec's tini to take over. After the exec, tini is PID 1
 // (not the shell) and owns boxd as its supervised child.
@@ -347,7 +356,11 @@ options timeout:2 attempts:2
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
 // POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
-const initScript = `#!/bin/sh
+var initScript = fmt.Sprintf(initScriptTemplate, GuestSwapMib, 3*GuestSwapMib*1024)
+
+// initScriptTemplate placeholders: %[1]d = swap size in MiB, %[2]d = minimum
+// free rootfs KiB required to enable swap (3x the swap size).
+const initScriptTemplate = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
 
@@ -360,6 +373,20 @@ mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mkdir -p /dev/pts /home/user
 mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
+
+# Guest swap: without it a memory spike past the RAM ceiling faults the
+# process (SIGBUS) — with it, the spike pages out. On the rootfs so snapshots
+# capture it; enabled here (not per-boot) so restore does no work. Best-effort:
+# failure means no swap, never a broken boot. Skipped when disk is tight.
+if [ ! -f /swapfile ]; then
+  free_kb=$(df -k / | awk 'NR==2{print $4}')
+  if [ "${free_kb:-0}" -gt %[2]d ]; then
+    { fallocate -l %[1]dM /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=%[1]d 2>/dev/null; } &&
+      chmod 600 /swapfile &&
+      mkswap /swapfile >/dev/null 2>&1 &&
+      swapon /swapfile 2>/dev/null
+  fi
+fi
 
 # Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The

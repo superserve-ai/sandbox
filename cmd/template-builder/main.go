@@ -841,6 +841,8 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		ResolvedDigest string `json:"resolved_digest"`
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
+		SwapMode       string `json:"swap_mode"`
+		SwapMib        int    `json:"swap_mib"`
 	}{
 		SnapshotPath:   snapPath,
 		MemPath:        memPath,
@@ -850,6 +852,8 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		ResolvedDigest: br.ResolvedDigest,
 		SizeBytes:      br.SizeBytes,
 		BuiltAt:        time.Now().UTC().Format(time.RFC3339),
+		SwapMode:       builder.SwapModeGuest,
+		SwapMib:        builder.GuestSwapMib,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
