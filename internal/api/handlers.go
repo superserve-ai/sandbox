@@ -56,6 +56,9 @@ func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
 	SelectHost(ctx context.Context) (hostID string, err error)
+	// Invalidate drops any cached host state so the next SelectHost
+	// reflects host status changes immediately.
+	Invalidate()
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -74,9 +77,6 @@ type Handlers struct {
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
 	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
-	// HostCacheInvalidate drops the scheduler's cached host list; wired to
-	// LeastLoaded.Invalidate so host status changes take effect immediately.
-	HostCacheInvalidate func()
 
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
 	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;

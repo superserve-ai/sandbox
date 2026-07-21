@@ -35,8 +35,8 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		// The heartbeat just recovered this host; drop the scheduler's cached
 		// list so its capacity is usable now, not after the cache TTL.
 		log.Info().Str("host_id", hostID).Msg("host recovered via heartbeat")
-		if h.HostCacheInvalidate != nil {
-			h.HostCacheInvalidate()
+		if h.Scheduler != nil {
+			h.Scheduler.Invalidate()
 		}
 	}
 

@@ -219,7 +219,6 @@ func run() error {
 	handlers.Hosts = hostreg.New(queries, dialVMD)
 	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 	handlers.Scheduler = sched
-	handlers.HostCacheInvalidate = sched.Invalidate
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
