@@ -110,7 +110,13 @@ module "api" {
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
   service_account_email = data.google_service_account.api_runner.email
-  image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
+  # First create must reference a tag that actually exists, or the initial
+  # revision never goes ready and the apply fails. The other regions can carry
+  # a ":replace-me" placeholder only because their services already exist and
+  # image is in the module's ignore_changes. us-east4's service is new, so pin
+  # ":latest" for the create; CD's deploy step later moves it to the commit SHA
+  # and ignore_changes keeps terraform from reverting that.
+  image = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:latest"
 
   cpu_limit         = "2"
   memory_limit      = "1Gi"
