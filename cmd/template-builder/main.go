@@ -295,7 +295,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// and every restored sandbox has it with no per-boot work). Best-effort:
 	// the script itself swallows failures, so ignore a non-zero exit.
 	rootCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
-	if err := runShellCmd(ctx, netInfo.HostIP, builder.GuestSwapSetupScript, rootCtx); err != nil {
+	if err := runShellCmdQuiet(ctx, netInfo.HostIP, builder.GuestSwapSetupScript, rootCtx); err != nil {
 		emitInternal("system", "guest swap setup skipped: %v", err)
 	}
 
@@ -303,7 +303,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// otherwise dirty pages only live in mem.snap and resumed sandboxes
 	// corrupt files when the kernel evicts them.
 	emitInternal("system", "syncing guest filesystem")
-	if err := runShellCmd(ctx, netInfo.HostIP, "sync && sync", rootCtx); err != nil {
+	if err := runShellCmdQuiet(ctx, netInfo.HostIP, "sync && sync", rootCtx); err != nil {
 		return fmt.Errorf("guest sync: %w", err)
 	}
 
@@ -669,8 +669,21 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 	}
 }
 
+// runShellCmd runs a user build step: the command and its output stream to the
+// customer's build log.
 func runShellCmd(ctx context.Context, vmIP, cmd string, bc buildCtx) error {
-	emitUser("system", "$ %s", truncate(cmd, 256))
+	return runShellCmdEmit(ctx, vmIP, cmd, bc, emitUser)
+}
+
+// runShellCmdQuiet runs an internal finalization step (e.g. swap setup, fs
+// sync): its command echo and output go to operator logs only, so the
+// customer's build log shows their build steps, not our plumbing.
+func runShellCmdQuiet(ctx context.Context, vmIP, cmd string, bc buildCtx) error {
+	return runShellCmdEmit(ctx, vmIP, cmd, bc, emitInternal)
+}
+
+func runShellCmdEmit(ctx context.Context, vmIP, cmd string, bc buildCtx, emit func(string, string, ...any)) error {
+	emit("system", "$ %s", truncate(cmd, 256))
 
 	stepCtx, cancel := context.WithTimeout(ctx, stepTimeout)
 	defer cancel()
@@ -699,12 +712,12 @@ func runShellCmd(ctx context.Context, vmIP, cmd string, bc buildCtx) error {
 			case *pb.DataEvent_Stdout:
 				text := strings.TrimRight(string(o.Stdout), "\n")
 				if text != "" {
-					emitUser("stdout", "%s", text)
+					emit("stdout", "%s", text)
 				}
 			case *pb.DataEvent_Stderr:
 				text := strings.TrimRight(string(o.Stderr), "\n")
 				if text != "" {
-					emitUser("stderr", "%s", text)
+					emit("stderr", "%s", text)
 				}
 			}
 		case *pb.ProcessEvent_End:
