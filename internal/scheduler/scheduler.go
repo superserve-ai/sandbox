@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -38,7 +40,7 @@ type LeastLoaded struct {
 	mu         sync.RWMutex
 	cached     []db.ListActiveHostsByLoadRow
 	cachedAt   time.Time
-	gen        uint64      // bumped by Invalidate; discards refreshes that started earlier
+	gen        uint64      // bumped by Invalidate and blocking reloads; discards refreshes that started earlier
 	refreshing atomic.Bool // one background refresh at a time
 }
 
@@ -110,11 +112,13 @@ func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoad
 				defer s.refreshing.Store(false)
 				hosts, err := s.DB.ListActiveHostsByLoad(qctx)
 				if err != nil {
+					log.Warn().Err(err).Msg("host list refresh failed; serving stale until the grace window expires")
 					return
 				}
 				s.mu.Lock()
-				// Discard results from before the latest Invalidate: storing
-				// them would resurrect a host list the invalidation retired.
+				// Discard results from before the latest Invalidate or blocking
+				// reload: storing them would resurrect a host list a newer,
+				// fresher load already replaced.
 				if s.gen == startGen {
 					s.cached = hosts
 					s.cachedAt = time.Now()
@@ -136,6 +140,9 @@ func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoad
 	if err != nil {
 		return nil, fmt.Errorf("list active hosts by load: %w", err)
 	}
+	// Bump the generation so an older in-flight background refresh cannot
+	// land after this load and replace it with its earlier snapshot.
+	s.gen++
 	s.cached = hosts
 	s.cachedAt = time.Now()
 	return hosts, nil

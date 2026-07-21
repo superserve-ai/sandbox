@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,8 +15,9 @@ import (
 
 // hostStore is a fake db.DBTX serving one host row per Query and counting calls.
 type hostStore struct {
-	calls atomic.Int64
-	block chan struct{} // non-nil: Query waits until closed
+	calls       atomic.Int64
+	block       chan struct{} // non-nil: Query waits until closed
+	blockOnCall int64         // 0 = block every call; N = block only the Nth
 }
 
 func (h *hostStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
@@ -23,15 +25,19 @@ func (h *hostStore) Exec(context.Context, string, ...interface{}) (pgconn.Comman
 }
 func (h *hostStore) QueryRow(context.Context, string, ...interface{}) pgx.Row { return nil }
 func (h *hostStore) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
-	h.calls.Add(1)
-	if h.block != nil {
+	n := h.calls.Add(1)
+	if h.block != nil && (h.blockOnCall == 0 || n == h.blockOnCall) {
 		<-h.block
 	}
-	return &hostRows{}, nil
+	return &hostRows{id: fmt.Sprintf("host-%d", n)}, nil
 }
 
-// hostRows yields a single minimal host row.
-type hostRows struct{ done bool }
+// hostRows yields a single minimal host row whose ID names the query that
+// produced it, so tests can tell which load's result the cache holds.
+type hostRows struct {
+	id   string
+	done bool
+}
 
 func (r *hostRows) Close()                                       {}
 func (r *hostRows) Err() error                                   { return nil }
@@ -48,7 +54,7 @@ func (r *hostRows) Next() bool {
 	return true
 }
 func (r *hostRows) Scan(dest ...any) error {
-	*dest[0].(*string) = "host-1" // id; remaining columns keep zero values
+	*dest[0].(*string) = r.id // remaining columns keep zero values
 	return nil
 }
 
@@ -217,5 +223,54 @@ func TestLoadHostsPastGraceBlocksInsteadOfServingStale(t *testing.T) {
 	}
 	if n := store.calls.Load(); n != 2 {
 		t.Fatalf("past-grace select must reload synchronously, got %d queries", n)
+	}
+}
+
+func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if _, err := s.SelectHost(context.Background()); err != nil { // query 1
+		t.Fatalf("prime: %v", err)
+	}
+
+	// Hold only the background refresh (query 2) in flight.
+	store.block = make(chan struct{})
+	store.blockOnCall = 2
+	s.mu.Lock()
+	s.cachedAt = time.Now().Add(-s.ttl() - 5*time.Second) // stale, inside grace
+	s.mu.Unlock()
+	if _, err := s.SelectHost(context.Background()); err != nil { // kicks the refresh
+		t.Fatalf("stale select: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 2 { // refresh goroutine reached its (blocked) query
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh never started, calls=%d", store.calls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Age past grace: the next call reloads synchronously (query 3) and must
+	// retire the still-hanging refresh so its older result cannot land on top.
+	s.mu.Lock()
+	s.cachedAt = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+	if _, err := s.SelectHost(context.Background()); err != nil {
+		t.Fatalf("past-grace select: %v", err)
+	}
+	close(store.block) // the pre-reload refresh now returns
+
+	deadline = time.Now().Add(2 * time.Second)
+	for s.refreshing.Load() { // wait until the refresh goroutine finished
+		if time.Now().After(deadline) {
+			t.Fatal("refresh goroutine never finished")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	s.mu.RLock()
+	id := s.cached[0].ID
+	s.mu.RUnlock()
+	if id != "host-3" {
+		t.Fatalf("older refresh clobbered the blocking reload: cached %s, want host-3", id)
 	}
 }
