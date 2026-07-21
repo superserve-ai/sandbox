@@ -36,6 +36,13 @@ PROXY_REDIRECT_PORT=5008       # HTTP->HTTPS redirect listener
 echo "==> [1/3] Unmanaged instance group (${IG}) with the east host"
 if ! gcloud compute instance-groups unmanaged describe "${IG}" --zone="${ZONE}" --project="${PROJECT}" &>/dev/null; then
   gcloud compute instance-groups unmanaged create "${IG}" --zone="${ZONE}" --project="${PROJECT}"
+fi
+# Ensure the east host is a member on every run — a create whose add-instances
+# failed, or a pre-created group, must not slip through and leave the cutover
+# pointed at an empty group.
+if ! gcloud compute instance-groups unmanaged list-instances "${IG}" \
+     --zone="${ZONE}" --project="${PROJECT}" --format="value(instance)" 2>/dev/null \
+     | grep -q "/${INSTANCE}$"; then
   gcloud compute instance-groups unmanaged add-instances "${IG}" \
     --instances="${INSTANCE}" --zone="${ZONE}" --project="${PROJECT}"
 fi
@@ -69,13 +76,19 @@ if ! gcloud compute backend-services describe "${BACKEND}" --global --project="$
     --timeout=86400 \
     --project="${PROJECT}"
 fi
-gcloud compute backend-services add-backend "${BACKEND}" \
-  --global \
-  --instance-group="${IG}" \
-  --instance-group-zone="${ZONE}" \
-  --balancing-mode=UTILIZATION \
-  --max-utilization=0.8 \
-  --project="${PROJECT}" 2>/dev/null || true
+# Attach the east IG only if it isn't already a backend — so real failures
+# (bad zone/IG, permission, quota) surface instead of being swallowed and
+# leaving dp-use4 with no backend.
+if ! gcloud compute backend-services describe "${BACKEND}" --global --project="${PROJECT}" \
+     --format="value(backends[].group)" 2>/dev/null | grep -q "/${IG}$"; then
+  gcloud compute backend-services add-backend "${BACKEND}" \
+    --global \
+    --instance-group="${IG}" \
+    --instance-group-zone="${ZONE}" \
+    --balancing-mode=UTILIZATION \
+    --max-utilization=0.8 \
+    --project="${PROJECT}"
+fi
 
 echo ""
 echo "Done. ${BACKEND} is created and INERT (not on any URL map)."
