@@ -438,3 +438,43 @@ jobs:
           set -euo pipefail
           scripts/smoke-test-region.sh production us-central1
           echo "production/us-central1 deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
+
+  # us-east4 is the "use" cell's new host + control plane, being stood up for a
+  # traffic-split cutover away from us-central1. During bring-up this applies
+  # infrastructure only: the api service is created (on an existing image tag;
+  # see the module's image pin) but there is deliberately NO api-deploy/traffic
+  # /smoke stage yet — us-east4 has no public endpoint until the routing/
+  # traffic-split work lands, so a region smoke test would have nothing to hit.
+  # Chained last so it never gates the live us-central1/us-west2 rollouts above.
+  production-us-east4-infra:
+    name: Apply production/us-east4
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [production-us-central1-api]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Terraform apply production/us-east4
+        run: |
+          set -euo pipefail
+          echo "## Terraform rollout: production/us-east4" >> "$GITHUB_STEP_SUMMARY"
+          cd infra/envs/production/us-east4
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
