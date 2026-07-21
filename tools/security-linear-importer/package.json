@@ -1,0 +1,9 @@
+{
+  "name": "security-linear-importer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/index.mjs",
+    "test": "node --test"
+  }
+}
