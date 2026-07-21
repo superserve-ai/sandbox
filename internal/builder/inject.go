@@ -337,6 +337,7 @@ options timeout:2 attempts:2
 const (
 	SwapModeGuest        = "guest"
 	guestSwapRAMDivisor  = 4    // swap = RAM / 4
+	guestSwapMinMib      = 128  // floor so small guests still get a margin
 	guestSwapMaxMib      = 4096 // cap so large-RAM guests don't over-reserve disk
 	guestSwapHeadroomMib = 512  // rootfs free must exceed swap + this to enable
 )
@@ -355,10 +356,10 @@ const (
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
 // POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
-var initScript = fmt.Sprintf(initScriptTemplate, guestSwapRAMDivisor, guestSwapMaxMib, guestSwapHeadroomMib)
+var initScript = fmt.Sprintf(initScriptTemplate, guestSwapRAMDivisor, guestSwapMinMib, guestSwapMaxMib, guestSwapHeadroomMib)
 
-// initScriptTemplate placeholders: %[1]d = RAM divisor, %[2]d = swap cap (MiB),
-// %[3]d = required free-disk headroom above the swap size (MiB).
+// initScriptTemplate placeholders: %[1]d = RAM divisor, %[2]d = swap floor (MiB),
+// %[3]d = swap cap (MiB), %[4]d = required free-disk headroom above swap (MiB).
 const initScriptTemplate = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
@@ -381,10 +382,11 @@ mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 if [ ! -f /swapfile ]; then
   mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   swap_mib=$((mem_mib / %[1]d))
-  [ "$swap_mib" -gt %[2]d ] && swap_mib=%[2]d
+  [ "$swap_mib" -lt %[2]d ] && swap_mib=%[2]d
+  [ "$swap_mib" -gt %[3]d ] && swap_mib=%[3]d
   free_kb=$(df -k / | awk 'NR==2{print $4}')
-  need_kb=$(( (swap_mib + %[3]d) * 1024 ))
-  if [ "${swap_mib:-0}" -ge 128 ] && [ "${free_kb:-0}" -gt "$need_kb" ]; then
+  need_kb=$(( (swap_mib + %[4]d) * 1024 ))
+  if [ "${free_kb:-0}" -gt "$need_kb" ]; then
     if ! { { fallocate -l "${swap_mib}"M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mib" 2>/dev/null; } &&
       chmod 600 /swapfile &&
       mkswap /swapfile >/dev/null 2>&1 &&

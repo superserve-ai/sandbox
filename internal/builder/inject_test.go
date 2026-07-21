@@ -272,9 +272,10 @@ func TestInitScriptGuestSwap(t *testing.T) {
 		t.Fatal("guest swap block must precede the tini exec handoff")
 	}
 	for _, want := range []string{
-		"MemTotal",                   // sizes swap from guest RAM
-		"swap_mib=$((mem_mib / 4))",  // RAM/4
-		"swap_mib=4096",              // capped
+		"MemTotal",                  // sizes swap from guest RAM
+		"swap_mib=$((mem_mib / 4))", // RAM/4
+		"swap_mib=128",              // floored
+		"swap_mib=4096",             // capped
 		`fallocate -l "${swap_mib}"M /swapfile`,
 		"mkswap /swapfile",
 	} {
