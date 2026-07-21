@@ -1,8 +1,9 @@
 package builder
 
-import "strings"
-
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestGuestSwapSetupScript(t *testing.T) {
 	t.Parallel()

@@ -849,7 +849,7 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		ResolvedDigest string `json:"resolved_digest"`
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
-		// Build-time swap policy, not a runtime assertion — the init enables
+		// Build-time swap policy, not a runtime assertion — the build enables
 		// guest swap best-effort and may skip it on a tight rootfs.
 		SwapMode string `json:"swap_mode"`
 	}{

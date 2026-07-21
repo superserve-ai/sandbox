@@ -257,4 +257,3 @@ func readTestFile(t *testing.T, path string) string {
 	}
 	return string(b)
 }
-
