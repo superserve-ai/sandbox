@@ -333,16 +333,11 @@ nameserver 8.8.8.8
 options timeout:2 attempts:2
 `
 
-// Guest swap settings baked into initScript, recorded in build.meta.json so
-// snapshot consumers know which swap mode a template was built under.
+// Guest swap settings baked into initScript (see the init block for rationale).
 const (
-	SwapModeGuest = "guest"
-	// Swap is sized as a fraction of guest RAM (so it scales with workload
-	// size) and capped, then only created if the rootfs has room. Sized from
-	// RAM rather than a fixed value because a brief allocation peak scales with
-	// how much memory the workload uses, not a constant.
+	SwapModeGuest        = "guest"
 	guestSwapRAMDivisor  = 4    // swap = RAM / 4
-	guestSwapMaxMib      = 4096 // capped so large-RAM guests don't over-reserve disk
+	guestSwapMaxMib      = 4096 // cap so large-RAM guests don't over-reserve disk
 	guestSwapHeadroomMib = 512  // rootfs free must exceed swap + this to enable
 )
 
@@ -390,10 +385,13 @@ if [ ! -f /swapfile ]; then
   free_kb=$(df -k / | awk 'NR==2{print $4}')
   need_kb=$(( (swap_mib + %[3]d) * 1024 ))
   if [ "${swap_mib:-0}" -ge 128 ] && [ "${free_kb:-0}" -gt "$need_kb" ]; then
-    { fallocate -l "${swap_mib}"M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mib" 2>/dev/null; } &&
+    if ! { { fallocate -l "${swap_mib}"M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mib" 2>/dev/null; } &&
       chmod 600 /swapfile &&
       mkswap /swapfile >/dev/null 2>&1 &&
-      swapon /swapfile 2>/dev/null
+      swapon /swapfile 2>/dev/null; }; then
+      # Any step failed: drop the file so a dead swapfile isn't snapshotted.
+      rm -f /swapfile
+    fi
   fi
 fi
 
