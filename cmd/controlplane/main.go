@@ -245,7 +245,7 @@ func run() error {
 		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
 		queries,
 		buildResolver,
-	).WithAnalytics(analyticsClient).Start(ctx)
+	).WithAnalytics(analyticsClient).WithFinalizeHook(api.InvalidateTemplateCache).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler

@@ -381,3 +381,36 @@ func TestTemplateCache_StaleRefreshEvictsOnTeamOverride(t *testing.T) {
 		t.Fatalf("expected the team-owned template, got team %s", tpl.TeamID)
 	}
 }
+
+// Deleting or rebuilding a template must drop its cached entries immediately —
+// every calling team's — so the next lookup refetches instead of serving the
+// retired paths for the stale grace.
+func TestInvalidateTemplateCache_DropsAllTeamsEntries(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	env.tplReturned = db.Template{
+		ID:     uuid.New(),
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+	teamA, teamB := uuid.New(), uuid.New()
+	for _, team := range []uuid.UUID{teamA, teamB} {
+		if _, err := env.h.lookupTemplateForCreate(env.c, team, "superserve/base"); err != nil {
+			t.Fatalf("prime team %s: %v", team, err)
+		}
+	}
+	if got := env.dbCalls.Load(); got != 2 {
+		t.Fatalf("prime: db_calls=%d, want 2", got)
+	}
+
+	InvalidateTemplateCache(env.tplReturned.ID)
+
+	for _, team := range []uuid.UUID{teamA, teamB} {
+		if _, err := env.h.lookupTemplateForCreate(env.c, team, "superserve/base"); err != nil {
+			t.Fatalf("post-invalidate lookup team %s: %v", team, err)
+		}
+	}
+	if got := env.dbCalls.Load(); got != 4 {
+		t.Errorf("post-invalidate lookups must refetch: db_calls=%d, want 4", got)
+	}
+}

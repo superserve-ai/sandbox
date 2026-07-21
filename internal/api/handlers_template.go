@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -731,6 +732,9 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 		return
 	}
 
+	// The template is gone; cached entries must stop handing out its paths.
+	InvalidateTemplateCache(tplID)
+
 	c.Status(http.StatusNoContent)
 	h.logTemplateActivity(c.Request.Context(), tplID, teamID, actorIDFromContext(c), "template", "deleted", "success", nil)
 
@@ -964,8 +968,9 @@ type templateCacheKey struct {
 }
 
 type templateCacheEntry struct {
-	tpl    db.Template
-	expiry time.Time
+	tpl        db.Template
+	expiry     time.Time
+	refreshing atomic.Bool // a stale-serve refresh is in flight; at most one per entry
 }
 
 var (
@@ -981,31 +986,67 @@ const templateCacheTTL = 5 * time.Second
 // template's old snapshot paths can still be handed out.
 const templateCacheStaleGrace = 30 * time.Second
 
-// refreshTemplateCache re-runs the coalesced lookup behind a stale-serve and
-// restores the cache entry; a template that is gone drops its entry.
-func (h *Handlers) refreshTemplateCache(sfKey string, cacheKey templateCacheKey, teamID uuid.UUID, ref string) {
+// fetchTemplate runs the coalesced lookup and reconciles the cache: a system
+// template is (re)stored; a definitive not-found, or a name that now resolves
+// to a team-owned override (the lookup prefers team rows, and only system
+// templates are cached), removes the old entry so it can't keep shadowing.
+// old is the entry this call replaces — reconciliation is compare-based so a
+// slow result can never clobber or evict a newer entry; nil means there is
+// nothing to replace (the blocking miss path).
+func (h *Handlers) fetchTemplate(ctx context.Context, sfKey string, cacheKey templateCacheKey, teamID uuid.UUID, ref string, old *templateCacheEntry) (db.Template, error) {
 	result, err, _ := templateLookupGroup.Do(sfKey, func() (interface{}, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		return h.pureLookupTemplate(ctx, teamID, ref)
+		return h.pureLookupTemplate(qctx, teamID, ref)
 	})
 	if err != nil {
-		if errors.Is(err, errTemplateNotFound) {
-			templateCache.Delete(cacheKey)
+		if errors.Is(err, errTemplateNotFound) && old != nil {
+			templateCache.CompareAndDelete(cacheKey, old)
 		}
-		return // transient error: the stale entry stays servable for the grace window
+		return db.Template{}, err
 	}
-	if tpl := result.(db.Template); tpl.TeamID == h.systemTeamID() {
+	tpl := result.(db.Template)
+	switch {
+	case tpl.TeamID != h.systemTeamID():
+		if old != nil {
+			templateCache.CompareAndDelete(cacheKey, old)
+		}
+	case old != nil:
+		templateCache.CompareAndSwap(cacheKey, old, &templateCacheEntry{
+			tpl:    tpl,
+			expiry: time.Now().Add(templateCacheTTL),
+		})
+	default:
 		templateCache.Store(cacheKey, &templateCacheEntry{
 			tpl:    tpl,
 			expiry: time.Now().Add(templateCacheTTL),
 		})
-	} else {
-		// The name now resolves to a team-owned template (lookup prefers it
-		// over the system one). Only system templates are cached, and the old
-		// system entry must not keep shadowing the override for the grace window.
-		templateCache.Delete(cacheKey)
 	}
+	return tpl, nil
+}
+
+// refreshTemplateCache runs the fetch behind a stale serve. On a transient
+// error the stale entry stays servable for the grace window and the trigger
+// re-arms so a later request retries.
+func (h *Handlers) refreshTemplateCache(sfKey string, cacheKey templateCacheKey, teamID uuid.UUID, ref string, old *templateCacheEntry) {
+	_, err := h.fetchTemplate(context.Background(), sfKey, cacheKey, teamID, ref, old)
+	if err != nil && !errors.Is(err, errTemplateNotFound) {
+		log.Warn().Err(err).Str("ref", ref).Msg("template refresh failed; serving stale until the grace window expires")
+		old.refreshing.Store(false)
+	}
+}
+
+// InvalidateTemplateCache drops every cached entry for the given template, so
+// creates stop receiving its retired snapshot paths at the next lookup instead
+// of after the stale grace. System templates are cached once per calling team,
+// hence the sweep. Called on template deletion and on a finalized rebuild.
+func InvalidateTemplateCache(templateID uuid.UUID) {
+	templateCache.Range(func(k, v any) bool {
+		if v.(*templateCacheEntry).tpl.ID == templateID {
+			templateCache.Delete(k)
+		}
+		return true
+	})
 }
 
 // pureLookupTemplate runs the DB query. Must stay free of HTTP side-effects
@@ -1070,21 +1111,19 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 			return e.tpl, nil
 		}
 		if now.Before(e.expiry.Add(templateCacheStaleGrace)) {
-			// Serve the just-expired entry, refresh behind the response; a
-			// refresh that finds the template gone drops the entry.
-			go h.refreshTemplateCache(sfKey, cacheKey, teamID, ref)
+			// Serve the just-expired entry; the first observer kicks the one
+			// background refresh, which drops the entry if the template is gone.
+			if e.refreshing.CompareAndSwap(false, true) {
+				go h.refreshTemplateCache(sfKey, cacheKey, teamID, ref, e)
+			}
 			return e.tpl, nil
 		}
 		// CompareAndDelete so a concurrent fresh Store isn't clobbered.
 		templateCache.CompareAndDelete(cacheKey, entry)
 	}
 
-	result, err, _ := templateLookupGroup.Do(sfKey, func() (interface{}, error) {
-		// Detach: other coalesced waiters may still need the result.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
-		defer cancel()
-		return h.pureLookupTemplate(ctx, teamID, ref)
-	})
+	// Detach: other coalesced waiters may still need the result.
+	tpl, err := h.fetchTemplate(context.WithoutCancel(c.Request.Context()), sfKey, cacheKey, teamID, ref, nil)
 	if err != nil {
 		if errors.Is(err, errTemplateNotFound) {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
@@ -1094,15 +1133,6 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 		respondError(c, ErrInternal)
 		return db.Template{}, err
 	}
-	tpl := result.(db.Template)
-
-	if tpl.TeamID == h.systemTeamID() {
-		templateCache.Store(cacheKey, &templateCacheEntry{
-			tpl:    tpl,
-			expiry: time.Now().Add(templateCacheTTL),
-		})
-	}
-
 	return tpl, nil
 }
 
