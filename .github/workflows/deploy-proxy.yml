@@ -161,3 +161,30 @@ jobs:
             --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
           export SANDBOX_ACCESS_TOKEN_SEED
           python3 .github/workflows/scripts/deploy-proxy.py
+
+      # us-east4 is NOT a new cell — it's the migration target for the primary
+      # "use" cell (the host is being moved us-central1 -> us-east4). So unlike
+      # the usw step above, it reuses the PRIMARY values verbatim: same domain
+      # (sandbox.superserve.ai) and the SAME token seed as us-central1, because
+      # both control planes sign access tokens with the one shared use-cell
+      # seed. Only the region differs. Gated on GCP_REGION_USE4 so this stays
+      # skipped until cutover — set that var only once the east host carries
+      # VMD_LABEL (flipped at the cutover window); discovery fails on zero
+      # matches rather than silently skipping, so an early flag would fail the
+      # deploy. After central is decommissioned this step becomes the primary.
+      - name: Deploy proxy to us-east4 use-cell VMD instance
+        if: vars.GCP_REGION_USE4 != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
+          PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
+          REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python3 .github/workflows/scripts/deploy-proxy.py
