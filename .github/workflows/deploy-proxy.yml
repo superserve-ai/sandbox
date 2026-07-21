@@ -162,16 +162,11 @@ jobs:
           export SANDBOX_ACCESS_TOKEN_SEED
           python3 .github/workflows/scripts/deploy-proxy.py
 
-      # us-east4 is NOT a new cell — it's the migration target for the primary
-      # "use" cell (the host is being moved us-central1 -> us-east4). So unlike
-      # the usw step above, it reuses the PRIMARY values verbatim: same domain
-      # (sandbox.superserve.ai) and the SAME token seed as us-central1, because
-      # both control planes sign access tokens with the one shared use-cell
-      # seed. Only the region differs. Gated on GCP_REGION_USE4 so this stays
-      # skipped until cutover — set that var only once the east host carries
-      # VMD_LABEL (flipped at the cutover window); discovery fails on zero
-      # matches rather than silently skipping, so an early flag would fail the
-      # deploy. After central is decommissioned this step becomes the primary.
+      # us-east4 is the same "use" cell as the primary region, so it reuses the
+      # primary proxy env (domain + seed) and only changes the region — unlike
+      # the usw step, a distinct cell with its own domain and seed. Gated on
+      # GCP_REGION_USE4; deploy-proxy.py fails on zero VMD_LABEL matches, so
+      # leave the var unset until the east host carries the label.
       - name: Deploy proxy to us-east4 use-cell VMD instance
         if: vars.GCP_REGION_USE4 != ''
         env:
