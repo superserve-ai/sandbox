@@ -30,7 +30,12 @@ const (
 // Best-effort: any failure removes a partial file and the script still exits 0,
 // so a swap problem never fails the build. Requires fallocate/mkswap/swapon
 // (util-linux) and awk/df — all present in our allowed Debian-family bases.
-var GuestSwapSetupScript = fmt.Sprintf(`if [ ! -f /swapfile ]; then
+//
+// Sets an explicit system PATH first: this runs with the template's build env,
+// whose PATH may omit /sbin (where mkswap/swapon live), which would otherwise
+// make them silently not-found and skip swap.
+var GuestSwapSetupScript = fmt.Sprintf(`export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin
+if [ ! -f /swapfile ]; then
   mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   swap_mib=$((mem_mib / %[1]d))
   [ "$swap_mib" -lt %[2]d ] && swap_mib=%[2]d
