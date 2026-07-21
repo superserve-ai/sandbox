@@ -264,14 +264,15 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 
 const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :one
 WITH prev AS (
-    SELECT h.status FROM host h WHERE h.id = $1
+    SELECT h.id, h.status FROM host h WHERE h.id = $1 FOR UPDATE
 )
 UPDATE host
 SET last_heartbeat_at = now(),
     status = CASE WHEN host.status = 'unhealthy' THEN 'active' ELSE host.status END,
     updated_at = now()
-WHERE host.id = $1
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, (SELECT prev.status FROM prev) AS prev_status
+FROM prev
+WHERE host.id = prev.id
+RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, prev.status AS prev_status
 `
 
 type UpdateHostHeartbeatRow struct {
@@ -291,9 +292,11 @@ type UpdateHostHeartbeatRow struct {
 // Returns the host row so the caller can verify the host exists. Also
 // re-activates unhealthy hosts that resume heartbeating — this is the
 // automatic recovery path after a transient network outage. prev_status lets
-// the caller detect that transition (the CTE reads the pre-update snapshot)
-// and invalidate the scheduler's host cache so recovered capacity is usable
-// immediately instead of after the cache TTL.
+// the caller detect that transition and invalidate the scheduler's host cache
+// so recovered capacity is usable immediately instead of after the cache TTL.
+// The pre-image is read FOR UPDATE so it reflects the row version this
+// statement actually modifies; a plain snapshot read racing a concurrent
+// status write could report the transition as active→active and hide it.
 func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHostHeartbeatRow, error) {
 	row := q.db.QueryRow(ctx, updateHostHeartbeat, id)
 	var i UpdateHostHeartbeatRow

@@ -24,18 +24,21 @@ WHERE id = $1;
 -- Returns the host row so the caller can verify the host exists. Also
 -- re-activates unhealthy hosts that resume heartbeating — this is the
 -- automatic recovery path after a transient network outage. prev_status lets
--- the caller detect that transition (the CTE reads the pre-update snapshot)
--- and invalidate the scheduler's host cache so recovered capacity is usable
--- immediately instead of after the cache TTL.
+-- the caller detect that transition and invalidate the scheduler's host cache
+-- so recovered capacity is usable immediately instead of after the cache TTL.
+-- The pre-image is read FOR UPDATE so it reflects the row version this
+-- statement actually modifies; a plain snapshot read racing a concurrent
+-- status write could report the transition as active→active and hide it.
 WITH prev AS (
-    SELECT h.status FROM host h WHERE h.id = $1
+    SELECT h.id, h.status FROM host h WHERE h.id = $1 FOR UPDATE
 )
 UPDATE host
 SET last_heartbeat_at = now(),
     status = CASE WHEN host.status = 'unhealthy' THEN 'active' ELSE host.status END,
     updated_at = now()
-WHERE host.id = $1
-RETURNING *, (SELECT prev.status FROM prev) AS prev_status;
+FROM prev
+WHERE host.id = prev.id
+RETURNING host.*, prev.status AS prev_status;
 
 -- name: MarkHostUnhealthy :exec
 UPDATE host
