@@ -1,0 +1,57 @@
+{
+  "issues": [
+    {
+      "key": "august-readiness",
+      "title": "August security readiness",
+      "description": "Coordinate the security work required for August readiness."
+    },
+    {
+      "key": "august-readiness-asset-inventory",
+      "title": "Complete asset inventory and ownership review",
+      "parentKey": "august-readiness",
+      "priority": 2
+    },
+    {
+      "key": "august-readiness-access-review",
+      "title": "Complete access and privileged-account review",
+      "parentKey": "august-readiness",
+      "priority": 2
+    },
+    {
+      "key": "august-readiness-secrets",
+      "title": "Review secrets storage, rotation, and revocation",
+      "parentKey": "august-readiness",
+      "priority": 2
+    },
+    {
+      "key": "august-readiness-vulnerability-management",
+      "title": "Validate vulnerability scanning and remediation tracking",
+      "parentKey": "august-readiness",
+      "priority": 2
+    },
+    {
+      "key": "august-readiness-logging",
+      "title": "Validate security logging, alerting, and retention",
+      "parentKey": "august-readiness",
+      "priority": 2
+    },
+    {
+      "key": "august-readiness-incident-response",
+      "title": "Exercise incident response and escalation procedures",
+      "parentKey": "august-readiness",
+      "priority": 2
+    },
+    {
+      "key": "august-readiness-backup-recovery",
+      "title": "Verify backup, restore, and recovery procedures",
+      "parentKey": "august-readiness",
+      "priority": 2
+    },
+    {
+      "key": "august-readiness-vendor-review",
+      "title": "Review security requirements for external dependencies",
+      "parentKey": "august-readiness",
+      "priority": 3
+    }
+  ]
+}

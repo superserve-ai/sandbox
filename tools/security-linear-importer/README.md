@@ -1,22 +1,14 @@
 # Security Linear importer
 
-This tool synchronizes a small issue manifest into the **Superserve** team and
+This tool synchronizes the August-readiness issue manifest into the **Superserve** team and
 the **Security Engineering Program** project. It uses two deterministic passes:
 roots are created or updated first, then children are created or updated with
 their resolved parent IDs. The local state file makes repeat runs idempotent.
 
 ## Manifest
 
-Create `security-program/issues.json`:
-
-```json
-{
-  "issues": [
-    { "key": "security-program", "title": "Security engineering program", "description": "Program overview" },
-    { "key": "access-review", "title": "Access review", "parentKey": "security-program", "priority": 2 }
-  ]
-}
-```
+The repository includes `security-program/issues.json`. Edit that file when the
+program scope changes.
 
 Each key must be unique. `parentKey` refers to another issue in the same
 manifest. The importer does not make broad workspace queries: it resolves only
@@ -35,6 +27,11 @@ Dry-run assigns in-memory `dry-run:<key>` IDs, so child payloads can be
 inspected without contacting Linear. It does not write those temporary IDs to
 the state file. The state file is written after an apply run and is ignored by
 git.
+
+Idempotency is based on that local state file. Preserve
+`security-program/.linear-state.json` between apply runs and do not commit it;
+if it is deleted or unavailable, the importer cannot identify previously
+created issues and will create duplicates.
 
 To apply changes, provide an API key and an explicit confirmation flag:
 

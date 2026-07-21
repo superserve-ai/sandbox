@@ -42,9 +42,7 @@ export function temporaryId(key) {
 export function planSync(issues, knownIds = {}, dryRun = true) {
   const ids = new Map(Object.entries(knownIds));
   const plan = [];
-  const roots = issues.filter((issue) => !issue.parentKey);
-  const children = issues.filter((issue) => issue.parentKey);
-  for (const issue of [...roots, ...children]) {
+  for (const issue of [...issues.filter((issue) => !issue.parentKey), ...issues.filter((issue) => issue.parentKey)]) {
     const parentId = issue.parentKey ? ids.get(issue.parentKey) : undefined;
     if (issue.parentKey && !parentId) throw new Error(`Parent ID is unavailable for ${issue.key}`);
     const knownId = ids.get(issue.key);
@@ -55,7 +53,7 @@ export function planSync(issues, knownIds = {}, dryRun = true) {
   return plan;
 }
 
-class LinearClient {
+export class LinearClient {
   constructor(apiKey, fetchImpl = fetch) {
     this.fetch = fetchImpl;
     this.apiKey = apiKey;
@@ -72,20 +70,28 @@ class LinearClient {
     return body.data;
   }
 
-  resolveTeamAndProject(teamId, projectId) {
-    if (teamId && projectId) return Promise.resolve({ team: { id: teamId }, project: { id: projectId } });
-    return this.query(`query ResolveProgram($teamId: String, $projectId: String, $teamName: String!, $projectName: String!) {
-      team(id: $teamId) { id name }
-      project(id: $projectId) { id name }
-      teams(filter: { name: { eq: $teamName } }, first: 1) { nodes { id name } }
-      projects(filter: { name: { eq: $projectName } }, first: 1) { nodes { id name } }
-    }`, { teamId: teamId || null, projectId: projectId || null, teamName: DEFAULT_TEAM_NAME, projectName: DEFAULT_PROJECT_NAME }).then((data) => {
-      const team = data.team ?? data.teams?.nodes?.[0];
-      const project = data.project ?? data.projects?.nodes?.[0];
-      if (!team) throw new Error(`Linear team not found: ${DEFAULT_TEAM_NAME}`);
-      if (!project) throw new Error(`Linear project not found: ${DEFAULT_PROJECT_NAME}`);
-      return { team, project };
-    });
+  async resolveTeamAndProject(teamId, projectId) {
+    const team = teamId ? { id: teamId } : await this.resolveTeam();
+    const project = projectId ? { id: projectId } : await this.resolveProject();
+    return { team, project };
+  }
+
+  async resolveTeam() {
+    const data = await this.query(`query ResolveTeam($name: String!) {
+      teams(filter: { name: { eq: $name } }, first: 1) { nodes { id name } }
+    }`, { name: DEFAULT_TEAM_NAME });
+    const team = data.teams?.nodes?.[0];
+    if (!team) throw new Error(`Linear team not found: ${DEFAULT_TEAM_NAME}`);
+    return team;
+  }
+
+  async resolveProject() {
+    const data = await this.query(`query ResolveProject($name: String!) {
+      projects(filter: { name: { eq: $name } }, first: 1) { nodes { id name } }
+    }`, { name: DEFAULT_PROJECT_NAME });
+    const project = data.projects?.nodes?.[0];
+    if (!project) throw new Error(`Linear project not found: ${DEFAULT_PROJECT_NAME}`);
+    return project;
   }
 
   async createIssue(input) {
@@ -108,16 +114,33 @@ function issueInput(issue, teamId, projectId, parentId) {
 export async function sync({ issues, state, client, teamId, projectId, dryRun }) {
   validateManifest({ issues });
   const knownIds = state.issues ?? {};
-  const plan = planSync(issues, knownIds, dryRun);
   const resolved = dryRun ? { team: { id: teamId || "dry-run:team" }, project: { id: projectId || "dry-run:project" } } : await client.resolveTeamAndProject(teamId, projectId);
   const nextState = { teamId: resolved.team.id, projectId: resolved.project.id, issues: { ...knownIds } };
-  for (const item of plan) {
-    const input = issueInput(item.issue, resolved.team.id, resolved.project.id, item.parentId);
-    const result = dryRun ? { id: item.id, identifier: item.id } : item.id ? await client.updateIssue(item.id, input) : await client.createIssue(input);
-    nextState.issues[item.issue.key] = result.id;
-    console.log(`${item.action} ${item.issue.key}: ${item.issue.title}${item.parentId ? ` (parent ${item.parentId})` : ""}`);
+
+  const ids = new Map(Object.entries(knownIds));
+  const roots = issues.filter((issue) => !issue.parentKey);
+  const children = issues.filter((issue) => issue.parentKey);
+  for (const issue of roots) {
+    const result = await syncIssue({ issue, id: ids.get(issue.key), teamId: resolved.team.id, projectId: resolved.project.id, client, dryRun });
+    ids.set(issue.key, result.id);
+    nextState.issues[issue.key] = result.id;
+  }
+  for (const issue of children) {
+    const parentId = ids.get(issue.parentKey);
+    if (!parentId) throw new Error(`Parent ID is unavailable for ${issue.key}`);
+    const result = await syncIssue({ issue, id: ids.get(issue.key), parentId, teamId: resolved.team.id, projectId: resolved.project.id, client, dryRun });
+    ids.set(issue.key, result.id);
+    nextState.issues[issue.key] = result.id;
   }
   return nextState;
+}
+
+async function syncIssue({ issue, id, parentId, teamId, projectId, client, dryRun }) {
+  const action = id ? "update" : "create";
+  const input = issueInput(issue, teamId, projectId, parentId);
+  const result = dryRun ? { id: id || temporaryId(issue.key) } : id ? await client.updateIssue(id, input) : await client.createIssue(input);
+  console.log(`${action} ${issue.key}: ${issue.title}${parentId ? ` (parent ${parentId})` : ""}`);
+  return result;
 }
 
 async function main() {

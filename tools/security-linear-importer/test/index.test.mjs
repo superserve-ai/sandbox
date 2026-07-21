@@ -28,3 +28,31 @@ test("sync updates cached IDs in root-before-child order", async () => {
   assert.deepEqual(calls, [["update", "existing-program", undefined], ["create", "Access review", "existing-program"], ["create", "Logging review", "existing-program"]]);
   assert.equal(state.issues.access, "new:Access review");
 });
+
+test("fresh apply creates children with the real root ID", async () => {
+  const calls = [];
+  const client = {
+    resolveTeamAndProject: async () => ({ team: { id: "team" }, project: { id: "project" } }),
+    createIssue: async (input) => {
+      calls.push(input);
+      return { id: input.parentId ? "child-id" : "root-id" };
+    },
+    updateIssue: async () => { throw new Error("unexpected update"); },
+  };
+  await sync({ issues, state: {}, client, dryRun: false });
+  assert.deepEqual(calls.map(({ title, parentId }) => ({ title, parentId })), [
+    { title: "Security program", parentId: undefined },
+    { title: "Access review", parentId: "root-id" },
+    { title: "Logging review", parentId: "root-id" },
+  ]);
+});
+
+test("ID overrides avoid all resolver queries", async () => {
+  const client = {
+    resolveTeamAndProject: async () => { throw new Error("resolver should not run"); },
+    createIssue: async () => ({ id: "issue" }),
+  };
+  const state = await sync({ issues: [{ key: "program", title: "Security program" }], state: {}, client, teamId: "team", projectId: "project", dryRun: true });
+  assert.equal(state.teamId, "team");
+  assert.equal(state.projectId, "project");
+});
