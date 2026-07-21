@@ -79,3 +79,48 @@ variable "network_name" {
   type    = string
   default = "superserve-production-vpc"
 }
+
+# A5 control-plane inputs. The *_secret_name defaults are null so the api
+# module falls back to per-suffix names via coalesce(); terraform.tfvars
+# overrides them to the shared (suffix-less) use-cell secrets.
+variable "supabase_url" {
+  description = "Supabase project URL for this deployment."
+  type        = string
+  default     = "https://use.supabase.co"
+}
+
+variable "database_url_secret_name" {
+  description = "Secret Manager secret name containing the DATABASE_URL for this deployment."
+  type        = string
+  default     = null
+}
+
+variable "internal_api_token_secret_name" {
+  description = "Secret Manager secret name for INTERNAL_API_TOKEN."
+  type        = string
+  default     = null
+}
+
+variable "sandbox_access_token_seed_secret_name" {
+  description = "Secret Manager secret name for SANDBOX_ACCESS_TOKEN_SEED."
+  type        = string
+  default     = null
+}
+
+variable "secrets_signing_key_secret_name" {
+  description = "Secret Manager secret name for SECRETS_SIGNING_KEY."
+  type        = string
+  default     = null
+}
+
+variable "sentry_dsn_secret_name" {
+  description = "Secret Manager secret name for SENTRY_DSN."
+  type        = string
+  default     = null
+}
+
+variable "system_team_id_secret_name" {
+  description = "Secret Manager secret name for SYSTEM_TEAM_ID."
+  type        = string
+  default     = null
+}

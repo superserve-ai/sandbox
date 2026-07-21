@@ -36,6 +36,15 @@ const (
 	execChStdin  = 0x00
 	execChStdout = 0x01
 	execChStderr = 0x02
+
+	// maxExecReadBytes bounds a single client frame on the exec socket. Exec
+	// frames legitimately carry a whole command string (start frame) or a
+	// stdin chunk — unlike the terminal's keystroke-sized maxReadBytes — so
+	// this is sized for payloads, not keystrokes, while still capping what a
+	// single frame can make the bridge buffer. The SDKs chunk stdin at
+	// 32 KiB; never lower this below that or chunked stdin starts dying
+	// with 1009 closes.
+	maxExecReadBytes = 4 << 20
 )
 
 // execPingInterval is how often the bridge pings the client; a missed pong
@@ -143,7 +152,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		h.log.Warn().Err(err).Msg("exec/ws: WS upgrade failed")
 		return
 	}
-	ws.SetReadLimit(maxReadBytes)
+	ws.SetReadLimit(maxExecReadBytes)
 
 	transport := h.transports.get(instanceID, info)
 	httpClient := &http.Client{Transport: transport}
@@ -166,6 +175,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	typ, raw, err := ws.Read(readCtx)
 	readCancel()
 	if err != nil {
+		logWSReadEnd(l, err, maxExecReadBytes, "exec/ws")
 		_ = ws.Close(websocket.StatusPolicyViolation, "expected start message")
 		return
 	}
@@ -308,10 +318,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 			typ, data, err := ws.Read(bridgeCtx)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
-					closeErr := websocket.CloseStatus(err)
-					if closeErr != websocket.StatusNormalClosure && closeErr != websocket.StatusGoingAway {
-						l.Debug().Err(err).Msg("exec/ws: WS read ended")
-					}
+					logWSReadEnd(l, err, maxExecReadBytes, "exec/ws")
 				}
 				return
 			}

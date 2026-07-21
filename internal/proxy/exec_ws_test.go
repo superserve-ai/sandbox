@@ -67,6 +67,9 @@ func newExecWSTestEnv(t *testing.T) *execWSTestEnv {
 			t.Errorf("ws accept: %v", err)
 			return
 		}
+		// Mirror serveExecWS so tests exercise the production frame limit,
+		// not the library's much smaller default.
+		ws.SetReadLimit(maxExecReadBytes)
 		h.bridgeExecWS(r.Context(), ws, procClient, "sbx-test")
 	}))
 
@@ -238,6 +241,56 @@ func TestExecWS_BinaryFrameIsStdin(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for SendInput")
+	}
+}
+
+// TestExecWS_LargeStdinFrameForwarded guards the exec socket's frame budget:
+// a stdin frame well past the terminal bridge's 64 KiB keystroke limit must
+// reach boxd intact, since exec frames carry command payloads, not keystrokes.
+func TestExecWS_LargeStdinFrameForwarded(t *testing.T) {
+	env := newExecWSTestEnv(t)
+	env.sendStart(7, "cat")
+
+	payload := bytes.Repeat([]byte("x"), 128*1024)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := env.clientWS.Write(ctx, websocket.MessageBinary, append([]byte{execChStdin}, payload...)); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	select {
+	case got := <-env.fake.inputs:
+		if !bytes.Equal(got.Data, payload) {
+			t.Errorf("SendInput.Data = %d bytes, want %d intact", len(got.Data), len(payload))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SendInput — large frame likely rejected by read limit")
+	}
+}
+
+// TestExecWS_OversizedFrameClosesTooBig pins the failure mode when a client
+// exceeds maxExecReadBytes: the bridge closes with StatusMessageTooBig so the
+// client sees why, instead of an unexplained drop.
+func TestExecWS_OversizedFrameClosesTooBig(t *testing.T) {
+	env := newExecWSTestEnv(t)
+	env.sendStart(7, "cat")
+
+	payload := bytes.Repeat([]byte("x"), maxExecReadBytes+2)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := env.clientWS.Write(ctx, websocket.MessageBinary, append([]byte{execChStdin}, payload...)); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	for {
+		_, _, err := env.clientWS.Read(ctx)
+		if err == nil {
+			continue // drain any in-flight frames until the close arrives
+		}
+		if got := websocket.CloseStatus(err); got != websocket.StatusMessageTooBig {
+			t.Fatalf("close status = %v (err %v), want StatusMessageTooBig", got, err)
+		}
+		return
 	}
 }
 

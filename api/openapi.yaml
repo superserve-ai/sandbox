@@ -972,7 +972,9 @@ paths:
         - Client frames: a binary frame is stdin, prefixed with channel `0x00`
           (`[0x00][bytes]`); a text frame is JSON control —
           `{"type":"stdin_close"}` or `{"type":"signal","name":"SIGINT"}`.
-          Frames are capped at 64 KiB, so chunk larger stdin.
+          Client frames are capped at 4 MiB (servers may enforce as low as
+          64 KiB during rollout); frames over the cap close the socket with
+          code 1009, so chunk larger stdin.
         - Server frames: a binary frame is output, prefixed with its channel
           (`0x01` stdout, `0x02` stderr); a text frame is JSON lifecycle —
           `{"exit_code":N,"finished":true}`, or `{"error":"...","code":"..."}`.
