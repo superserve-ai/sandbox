@@ -47,11 +47,13 @@ module "network" {
   subnet_name = "superserve-use4-subnet"
   subnet_cidr = var.subnet_cidr
 
-  # Cloud Run networking (connector or direct-VPC-egress subnet) is deferred
-  # to the us-east4 Cloud Run rollout — this environment stands up the vmd
-  # host only.
+  # Cloud Run reaches the vmd host over direct VPC egress (no connector),
+  # matching the usw2 cell. The dedicated egress subnet carries the Cloud Run
+  # sender range; the firewall rules below admit it to vmd gRPC + host OTLP.
   create_vpc_connector        = false
-  create_vpc_connector_subnet = false
+  create_vpc_connector_subnet = true
+  vpc_connector_subnet        = "superserve-use4-cr-subnet"
+  vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
     allow_vmd_grpc = {
@@ -84,6 +86,90 @@ module "network" {
 data "google_service_account" "api_runner" {
   project    = local.project_id
   account_id = "superserve-api-runner"
+}
+
+# A5: us-east4 control plane for the "use" cell.
+#
+# This is a host swap, not a new cell: us-east4 shares the use-cell Supabase,
+# runtime secrets, api-runner service account, and KMS key with us-central1.
+# Only the service name, region, and VMD address are region-local — traffic
+# splits between this service and the us-central1 one during cutover, then
+# us-central1 drains. Secrets resolve to the shared (suffix-less) use-cell
+# names via the *_secret_name overrides in terraform.tfvars.
+#
+# No per-root secret IAM here: the shared api-runner SA already holds the
+# runtime accessor grants (owned by us-central1's api_runtime_secrets) and the
+# credentials-kek encrypt/decrypt grant (owned out-of-band). Re-declaring them
+# from this state would double-manage the same bindings — the same split we
+# settled for usw2 in #232/#233.
+module "api" {
+  source = "../../../modules/api"
+
+  project_id            = local.project_id
+  environment           = local.environment
+  region                = local.region
+  service_name          = "superserve-api-${local.resource_suffix}"
+  service_account_email = data.google_service_account.api_runner.email
+  # First create must reference a tag that actually exists, or the initial
+  # revision never goes ready and the apply fails. The other regions can carry
+  # a ":replace-me" placeholder only because their services already exist and
+  # image is in the module's ignore_changes. us-east4's service is new, so pin
+  # ":latest" for the create; CD's deploy step later moves it to the commit SHA
+  # and ignore_changes keeps terraform from reverting that.
+  image = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:latest"
+
+  cpu_limit         = "2"
+  memory_limit      = "1Gi"
+  min_instances     = 2
+  max_instances     = 100
+  startup_cpu_boost = true
+  cpu_idle          = true
+
+  env = {
+    API_PORT               = "8080"
+    EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
+    SUPABASE_URL           = var.supabase_url
+    SECRETS_SIGNING_KEY_ID = "v1"
+    ALLOW_EPHEMERAL_SEED   = "0"
+    DB_MAX_CONNS           = "12"
+    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
+    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+  }
+
+  secrets = {
+    DATABASE_URL = {
+      secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
+    }
+    INTERNAL_API_TOKEN = {
+      secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
+    }
+    SANDBOX_ACCESS_TOKEN_SEED = {
+      secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
+    }
+    SECRETS_SIGNING_KEY = {
+      secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
+    }
+    SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
+    }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+    }
+    SLACK_QUOTA_ALERT_WEBHOOK = {
+      secret = "slack-quota-alert-webhook"
+    }
+    POSTHOG_KEY = {
+      secret = "posthog-project-key"
+    }
+  }
+
+  vpc_connector  = null
+  vpc_egress     = "PRIVATE_RANGES_ONLY"
+  vpc_network    = var.network_name
+  vpc_subnetwork = module.network.vpc_connector_subnetwork_name
+  vpc_tags       = ["cr-use4"]
+
+  labels = local.common_labels
 }
 
 module "sandbox_host" {

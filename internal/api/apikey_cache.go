@@ -29,6 +29,11 @@ const (
 	// UPDATE to at most one write per key per interval, instead of one
 	// per request.
 	lastUsedTouchInterval = time.Minute
+	// apiKeyCacheStaleGrace: a TTL-expired entry is still served for this long
+	// while one background flight refreshes it, so a burst landing on an
+	// expired entry never queues behind the refresh. Widens the worst-case
+	// revocation window from ttl to ttl+grace.
+	apiKeyCacheStaleGrace = 2 * time.Second
 )
 
 // apiKeyCacheTTLFromEnv reads API_KEY_CACHE_TTL (a Go duration, e.g. "30s").
@@ -47,14 +52,15 @@ func apiKeyCacheTTLFromEnv() time.Duration {
 }
 
 type apiKeyCacheEntry struct {
-	id        string
-	teamID    string
-	name      string
-	scopes    []string
-	createdBy pgtype.UUID
-	expiresAt pgtype.Timestamptz
-	fetchedAt time.Time
-	lastTouch time.Time
+	id         string
+	teamID     string
+	name       string
+	scopes     []string
+	createdBy  pgtype.UUID
+	expiresAt  pgtype.Timestamptz
+	fetchedAt  time.Time
+	lastTouch  time.Time
+	refreshing bool // a stale-serve refresh is in flight; armed by get, cleared by put/refreshFailed
 }
 
 type apiKeyCache struct {
@@ -71,34 +77,65 @@ func newAPIKeyCache(ttl time.Duration) *apiKeyCache {
 	return &apiKeyCache{ttl: ttl, m: make(map[string]*apiKeyCacheEntry)}
 }
 
-// get returns a copy of the cached entry for keyHash if it is still fresh
-// and the key itself has not expired. needTouch reports whether the caller
-// should update last_used_at (throttled to lastUsedTouchInterval).
-func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry, needTouch, ok bool) {
+// get returns a copy of the cached entry for keyHash if the key itself has not
+// expired and the entry is within ttl+grace. refresh reports that the entry is
+// past its TTL and THIS caller should kick the background refresh — at most
+// one is armed at a time; put and refreshFailed re-arm. Past the grace window
+// it is a miss (kept only so put can carry the last_used_at throttle across
+// refills). needTouch reports whether the caller should update last_used_at
+// (throttled to lastUsedTouchInterval).
+func (c *apiKeyCache) get(keyHash string, now time.Time) (entry apiKeyCacheEntry, needTouch, refresh, ok bool) {
 	if c == nil {
-		return apiKeyCacheEntry{}, false, false
+		return apiKeyCacheEntry{}, false, false, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, exists := c.m[keyHash]
 	if !exists {
-		return apiKeyCacheEntry{}, false, false
+		return apiKeyCacheEntry{}, false, false, false
 	}
 	if e.expiresAt.Valid && !now.Before(e.expiresAt.Time) {
 		delete(c.m, keyHash)
-		return apiKeyCacheEntry{}, false, false
+		return apiKeyCacheEntry{}, false, false, false
 	}
-	if now.Sub(e.fetchedAt) > c.ttl {
-		// TTL-expired: report a miss but keep the entry — it is never served,
-		// and put reads its lastTouch so the last_used_at throttle survives
-		// refills (otherwise every TTL expiry would write last_used_at).
-		return apiKeyCacheEntry{}, false, false
+	age := now.Sub(e.fetchedAt)
+	if age > c.ttl+apiKeyCacheStaleGrace {
+		return apiKeyCacheEntry{}, false, false, false
 	}
 	if now.Sub(e.lastTouch) >= lastUsedTouchInterval {
 		e.lastTouch = now
 		needTouch = true
 	}
-	return *e, needTouch, true
+	if age > c.ttl && !e.refreshing {
+		e.refreshing = true
+		refresh = true
+	}
+	return *e, needTouch, refresh, true
+}
+
+// remove drops a cached entry. Used when a refresh returns a definitive
+// not-found: the key was revoked, so its stale entry must stop being servable.
+func (c *apiKeyCache) remove(keyHash string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.m, keyHash)
+	c.mu.Unlock()
+}
+
+// refreshFailed re-arms the stale-refresh trigger after a transient refresh
+// error, so a later request inside the grace window retries. (A successful
+// refresh re-arms via put; a revoked key is removed outright.)
+func (c *apiKeyCache) refreshFailed(keyHash string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if e, ok := c.m[keyHash]; ok {
+		e.refreshing = false
+	}
+	c.mu.Unlock()
 }
 
 // fetch coalesces concurrent misses for the same key: one caller runs fn (the

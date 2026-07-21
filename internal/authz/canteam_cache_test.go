@@ -263,3 +263,110 @@ func TestCanTeamSingleflightCollapsesConcurrentMisses(t *testing.T) {
 		t.Fatalf("expected concurrent misses to coalesce (<=5 queries), got %d", n)
 	}
 }
+
+// ageTeamPermEntry rewinds a cached entry's expiry so tests can enter the
+// stale-grace and past-grace windows without waiting out real TTLs.
+func ageTeamPermEntry(s *Service, key teamPermCacheKey, expiry time.Time) {
+	s.cache.mu.Lock()
+	e := s.cache.m[key]
+	e.expiry = expiry
+	s.cache.m[key] = e
+	s.cache.mu.Unlock()
+}
+
+func waitForCalls(t *testing.T, c *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d calls, have %d", want, c.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestCanTeamStaleServeRefreshesInBackground(t *testing.T) {
+	store := &countingStore{result: true}
+	s := newCachedForTest(store)
+	user, team := uuid.New(), uuid.New()
+	key := teamPermCacheKey{userID: user, teamID: team, permission: "settings:write"}
+
+	if ok, _ := s.CanTeam(context.Background(), user, team, "settings:write"); !ok {
+		t.Fatal("prime failed")
+	}
+	ageTeamPermEntry(s, key, time.Now().Add(-time.Second)) // expired, inside grace
+
+	// Served instantly from the stale entry — no blocking on the refresh.
+	if ok, err := s.CanTeam(context.Background(), user, team, "settings:write"); !ok || err != nil {
+		t.Fatalf("stale entry must be served: ok=%v err=%v", ok, err)
+	}
+	// The background refresh runs exactly one more query and re-freshens the entry.
+	waitForCalls(t, &store.calls, 2)
+	s.cache.mu.Lock()
+	fresh := time.Now().Before(s.cache.m[key].expiry)
+	s.cache.mu.Unlock()
+	if !fresh {
+		t.Fatal("background refresh must restore a fresh expiry")
+	}
+}
+
+func TestCanTeamStaleNeverServedAcrossGenerationBump(t *testing.T) {
+	store := &countingStore{result: true}
+	s := newCachedForTest(store)
+	user, team := uuid.New(), uuid.New()
+	key := teamPermCacheKey{userID: user, teamID: team, permission: "settings:write"}
+
+	_, _ = s.CanTeam(context.Background(), user, team, "settings:write")
+	ageTeamPermEntry(s, key, time.Now().Add(-time.Second))
+	// Out-of-band generation bump (what a revocation does) without touching
+	// the entry: the stale grant must NOT be served on the old generation.
+	s.cache.mu.Lock()
+	s.cache.gen[team]++
+	s.cache.mu.Unlock()
+	store.result = false
+
+	if ok, _ := s.CanTeam(context.Background(), user, team, "settings:write"); ok {
+		t.Fatal("revoked (generation-bumped) grant was stale-served")
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("expected a blocking re-query, got %d calls", n)
+	}
+}
+
+func TestCanTeamStaleDenialRefreshDropsEntry(t *testing.T) {
+	store := &countingStore{result: true}
+	s := newCachedForTest(store)
+	user, team := uuid.New(), uuid.New()
+	key := teamPermCacheKey{userID: user, teamID: team, permission: "settings:write"}
+
+	_, _ = s.CanTeam(context.Background(), user, team, "settings:write")
+	ageTeamPermEntry(s, key, time.Now().Add(-time.Second))
+	store.result = false // the grant has been revoked upstream
+
+	// Grace window: the stale grant is served once while the refresh runs.
+	if ok, _ := s.CanTeam(context.Background(), user, team, "settings:write"); !ok {
+		t.Fatal("expected stale serve inside grace")
+	}
+	waitForCalls(t, &store.calls, 2)
+	// The refresh saw the denial and dropped the entry: no more stale serves.
+	if ok, _ := s.CanTeam(context.Background(), user, team, "settings:write"); ok {
+		t.Fatal("denial-refreshed entry must not be served")
+	}
+}
+
+func TestCanTeamPastGraceBlocks(t *testing.T) {
+	store := &countingStore{result: true}
+	s := newCachedForTest(store)
+	user, team := uuid.New(), uuid.New()
+	key := teamPermCacheKey{userID: user, teamID: team, permission: "settings:write"}
+
+	_, _ = s.CanTeam(context.Background(), user, team, "settings:write")
+	ageTeamPermEntry(s, key, time.Now().Add(-teamPermStaleGrace-time.Second))
+
+	if ok, _ := s.CanTeam(context.Background(), user, team, "settings:write"); !ok {
+		t.Fatal("past-grace check must still succeed via blocking query")
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("past-grace entry must block on a fresh query, got %d calls", n)
+	}
+}

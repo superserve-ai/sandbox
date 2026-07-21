@@ -217,7 +217,8 @@ func run() error {
 		return telemetry.WrapVMDClient(newGRPCVMDClient(conn), recorder, api.SandboxIDRegion(), hostID), nil
 	}
 	handlers.Hosts = hostreg.New(queries, dialVMD)
-	handlers.Scheduler = &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
+	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
+	handlers.Scheduler = sched
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
@@ -244,12 +245,15 @@ func run() error {
 		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
 		queries,
 		buildResolver,
-	).WithAnalytics(analyticsClient).Start(ctx)
+	).WithAnalytics(analyticsClient).WithFinalizeHook(api.InvalidateTemplateCache).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
 	// excludes unhealthy hosts from placement.
-	go api.StartHostDetector(ctx, queries)
+	// The detector invalidates the scheduler's host cache when it marks a
+	// host unhealthy, so this instance stops routing to it at detection time
+	// rather than at cache expiry.
+	go api.StartHostDetector(ctx, queries, sched.Invalidate)
 
 	// Billing dashboard rollups are provisional and recomputable from raw
 	// interval rows. Team-level feature flags decide which tenants roll up.

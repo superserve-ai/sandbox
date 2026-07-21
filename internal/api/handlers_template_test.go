@@ -184,6 +184,7 @@ type templateCacheTestEnv struct {
 	dbCalls      *atomic.Int64
 	tplReturned  db.Template
 	tplErr       error
+	onQuery      func() // when set, runs inside the template query, before the row returns
 }
 
 func newTemplateCacheTestEnv(t *testing.T) *templateCacheTestEnv {
@@ -196,6 +197,9 @@ func newTemplateCacheTestEnv(t *testing.T) *templateCacheTestEnv {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			if strings.Contains(sql, "FROM template") {
 				env.dbCalls.Add(1)
+				if env.onQuery != nil {
+					env.onQuery()
+				}
 				if env.tplErr != nil {
 					return errorRow(env.tplErr)
 				}
@@ -287,13 +291,30 @@ func TestTemplateCache_ExpiredEntry_RefetchedFromDB(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected entry present after first call")
 	}
-	v.(*templateCacheEntry).expiry = time.Now().Add(-time.Second)
 
+	// Expired but inside the stale grace: served immediately, refreshed in
+	// the background (one coalesced DB call).
+	v.(*templateCacheEntry).expiry = time.Now().Add(-time.Second)
 	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
-		t.Fatalf("second lookup: %v", err)
+		t.Fatalf("stale lookup: %v", err)
 	}
-	if got := env.dbCalls.Load(); got != 2 {
-		t.Errorf("after expired entry: db_calls=%d, want 2", got)
+	deadline := time.Now().Add(2 * time.Second)
+	for env.dbCalls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh never ran, db_calls=%d", env.dbCalls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Past the grace window: a blocking refetch.
+	if v, ok := templateCache.Load(key); ok {
+		v.(*templateCacheEntry).expiry = time.Now().Add(-templateCacheStaleGrace - time.Second)
+	}
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("past-grace lookup: %v", err)
+	}
+	if got := env.dbCalls.Load(); got != 3 {
+		t.Errorf("past-grace entry must block on a refetch: db_calls=%d, want 3", got)
 	}
 }
 
@@ -314,5 +335,119 @@ func TestTemplateCache_NotFound_NotCached(t *testing.T) {
 	}
 	if got := env.dbCalls.Load(); got != 3 {
 		t.Errorf("DB calls = %d, want 3 (not-found results must not be cached)", got)
+	}
+}
+
+// A team creating its own template with a cached system template's name must
+// stop being served the system entry once the stale refresh sees the override
+// (the lookup prefers team-owned rows).
+func TestTemplateCache_StaleRefreshEvictsOnTeamOverride(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	env.tplReturned = db.Template{
+		ID:     uuid.New(),
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+	callerTeam := uuid.New()
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	// The team creates its own template under the same name; age the cached
+	// system entry into the stale window and serve once (kicks the refresh).
+	teamTpl := db.Template{ID: uuid.New(), TeamID: callerTeam, Name: "superserve/base", Status: db.TemplateStatusReady}
+	env.tplReturned = teamTpl
+	key := templateCacheKey{teamID: callerTeam, ref: "superserve/base"}
+	v, _ := templateCache.Load(key)
+	v.(*templateCacheEntry).expiry = time.Now().Add(-time.Second)
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("stale serve: %v", err)
+	}
+
+	// The refresh resolves to the team-owned row and must evict the entry.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := templateCache.Load(key); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stale system entry kept shadowing the team override")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Next lookup returns the override.
+	tpl, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base")
+	if err != nil {
+		t.Fatalf("post-evict lookup: %v", err)
+	}
+	if tpl.TeamID != callerTeam {
+		t.Fatalf("expected the team-owned template, got team %s", tpl.TeamID)
+	}
+}
+
+// Deleting or rebuilding a template must drop its cached entries immediately —
+// every calling team's — so the next lookup refetches instead of serving the
+// retired paths for the stale grace.
+func TestInvalidateTemplateCache_DropsAllTeamsEntries(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	env.tplReturned = db.Template{
+		ID:     uuid.New(),
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+	teamA, teamB := uuid.New(), uuid.New()
+	for _, team := range []uuid.UUID{teamA, teamB} {
+		if _, err := env.h.lookupTemplateForCreate(env.c, team, "superserve/base"); err != nil {
+			t.Fatalf("prime team %s: %v", team, err)
+		}
+	}
+	if got := env.dbCalls.Load(); got != 2 {
+		t.Fatalf("prime: db_calls=%d, want 2", got)
+	}
+
+	InvalidateTemplateCache(env.tplReturned.ID)
+
+	for _, team := range []uuid.UUID{teamA, teamB} {
+		if _, err := env.h.lookupTemplateForCreate(env.c, team, "superserve/base"); err != nil {
+			t.Fatalf("post-invalidate lookup team %s: %v", team, err)
+		}
+	}
+	if got := env.dbCalls.Load(); got != 4 {
+		t.Errorf("post-invalidate lookups must refetch: db_calls=%d, want 4", got)
+	}
+}
+
+// A lookup whose DB flight straddles an invalidation (template deleted or
+// rebuilt mid-flight) may serve its result but must not store it — otherwise
+// the retired row comes back with a fresh TTL right after eviction.
+func TestTemplateCache_MidFlightInvalidationVetoesStore(t *testing.T) {
+	env := newTemplateCacheTestEnv(t)
+	tplID := uuid.New()
+	env.tplReturned = db.Template{
+		ID:     tplID,
+		TeamID: env.systemTeamID,
+		Name:   "superserve/base",
+		Status: db.TemplateStatusReady,
+	}
+	env.onQuery = func() { InvalidateTemplateCache(tplID) }
+
+	callerTeam := uuid.New()
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	key := templateCacheKey{teamID: callerTeam, ref: "superserve/base"}
+	if _, ok := templateCache.Load(key); ok {
+		t.Fatal("a flight that began before the invalidation must not store its row")
+	}
+
+	// With no invalidation racing it, the next lookup stores normally.
+	env.onQuery = nil
+	if _, err := env.h.lookupTemplateForCreate(env.c, callerTeam, "superserve/base"); err != nil {
+		t.Fatalf("second lookup: %v", err)
+	}
+	if _, ok := templateCache.Load(key); !ok {
+		t.Fatal("expected the entry to be cached once no invalidation raced the flight")
 	}
 }

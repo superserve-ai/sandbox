@@ -103,11 +103,12 @@ type Resolver func(ctx context.Context, hostID string) (vmdclient.Client, error)
 // state lives in the DB. Safe to instantiate once at controlplane boot and
 // Start() with the process-lifetime context.
 type BuildSupervisor struct {
-	cfg       BuildSupervisorConfig
-	q         *db.Queries
-	resolve   Resolver
-	log       zerolog.Logger
-	analytics *analytics.Client // when set, emits build-outcome events; nil is a no-op
+	cfg        BuildSupervisorConfig
+	q          *db.Queries
+	resolve    Resolver
+	log        zerolog.Logger
+	analytics  *analytics.Client   // when set, emits build-outcome events; nil is a no-op
+	onFinalize func(tpl uuid.UUID) // when set, runs after a build lands new template paths; nil is a no-op
 }
 
 // NewBuildSupervisor constructs a supervisor.
@@ -123,6 +124,14 @@ func NewBuildSupervisor(cfg BuildSupervisorConfig, q *db.Queries, resolve Resolv
 // WithAnalytics enables build-outcome events (succeeded/failed).
 func (s *BuildSupervisor) WithAnalytics(a *analytics.Client) *BuildSupervisor {
 	s.analytics = a
+	return s
+}
+
+// WithFinalizeHook runs fn with the template ID after a build finalizes new
+// snapshot paths — wired to the API's template-cache invalidation so creates
+// pick up a rebuilt template at the next lookup instead of at cache expiry.
+func (s *BuildSupervisor) WithFinalizeHook(fn func(tpl uuid.UUID)) *BuildSupervisor {
+	s.onFinalize = fn
 	return s
 }
 
@@ -443,7 +452,7 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		if res.DeltaPath != "" {
 			deltaPathArg = &res.DeltaPath
 		}
-		_, err := s.q.FinalizeBuild(finCtx, db.FinalizeBuildParams{
+		tpl, err := s.q.FinalizeBuild(finCtx, db.FinalizeBuildParams{
 			ID:           row.ID,
 			RootfsPath:   &rootfs,
 			SnapshotPath: &snapPath,
@@ -460,6 +469,9 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 		if err != nil {
 			rowLog.Error().Err(err).Msg("finalize build")
 			return
+		}
+		if s.onFinalize != nil {
+			s.onFinalize(tpl.ID)
 		}
 		rowLog.Info().Str("digest", res.ResolvedDigest).Int64("size", size).Msg("build ready")
 		s.logBuildCompleted(ctx, row, "success", "", res.ResolvedDigest)

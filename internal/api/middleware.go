@@ -70,21 +70,10 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		hash := sha256.Sum256([]byte(apiKey))
 		keyHash := hex.EncodeToString(hash[:])
 
-		if entry, needTouch, ok := cache.get(keyHash, time.Now()); ok {
-			if needTouch {
-				touchLastUsed(c.Request.Context(), entry.id)
-			}
-			setAPIKeyContext(c, entry)
-			c.Set("auth_ms", time.Since(authStart).Milliseconds())
-			c.Next()
-			return
-		}
-
-		// Miss: fetch coalesces concurrent identical lookups, so a burst
-		// arriving on an expired entry runs one query, not one per request.
-		// The touch and put happen inside fn so only the executing caller
-		// performs them — waiters share the entry without re-touching.
-		entry, err := cache.fetch(c.Request.Context(), keyHash, func(qctx context.Context) (apiKeyCacheEntry, error) {
+		// lookup is the DB fetch used by both the blocking miss path and the
+		// stale-refresh path; put and the throttled touch happen inside so
+		// only the executing flight performs them.
+		lookup := func(qctx context.Context) (apiKeyCacheEntry, error) {
 			var e apiKeyCacheEntry
 			err := pool.QueryRow(qctx,
 				"SELECT id, team_id, name, scopes, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
@@ -97,7 +86,39 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				touchLastUsed(qctx, e.id)
 			}
 			return e, nil
-		})
+		}
+
+		if entry, needTouch, refresh, ok := cache.get(keyHash, time.Now()); ok {
+			if needTouch {
+				touchLastUsed(c.Request.Context(), entry.id)
+			}
+			if refresh {
+				// Serve the just-expired entry, refresh behind the response;
+				// get arms at most one refresh per entry. A definitive
+				// not-found means the key was revoked — evict so the stale
+				// entry stops being servable; transient errors re-arm the
+				// trigger and leave it for the grace window.
+				go func() {
+					_, err := cache.fetch(context.Background(), keyHash, lookup)
+					switch {
+					case err == nil:
+					case errors.Is(err, pgx.ErrNoRows):
+						cache.remove(keyHash)
+					default:
+						log.Warn().Err(err).Msg("API key refresh failed; serving stale until the grace window expires")
+						cache.refreshFailed(keyHash)
+					}
+				}()
+			}
+			setAPIKeyContext(c, entry)
+			c.Set("auth_ms", time.Since(authStart).Milliseconds())
+			c.Next()
+			return
+		}
+
+		// Miss: fetch coalesces concurrent identical lookups, so a burst
+		// arriving with nothing cached runs one query, not one per request.
+		entry, err := cache.fetch(c.Request.Context(), keyHash, lookup)
 		if err != nil {
 			switch {
 			case c.Request.Context().Err() != nil:

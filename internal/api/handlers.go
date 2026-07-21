@@ -56,6 +56,9 @@ func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
 	SelectHost(ctx context.Context) (hostID string, err error)
+	// Invalidate drops any cached host state so the next SelectHost
+	// reflects host status changes immediately.
+	Invalidate()
 }
 
 // HostRegistry resolves a host ID to a VMD client.
