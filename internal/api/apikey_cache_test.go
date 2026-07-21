@@ -17,7 +17,7 @@ func TestAPIKeyCache_HitReturnsEntry(t *testing.T) {
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1", teamID: "team1"}, now)
 
-	entry, needTouch, ok := c.get("hash1", now.Add(time.Second))
+	entry, needTouch, _, ok := c.get("hash1", now.Add(time.Second))
 	if !ok {
 		t.Fatal("expected cache hit")
 	}
@@ -30,16 +30,36 @@ func TestAPIKeyCache_HitReturnsEntry(t *testing.T) {
 	}
 }
 
-func TestAPIKeyCache_MissAfterTTL(t *testing.T) {
+func TestAPIKeyCache_StaleServeThenMiss(t *testing.T) {
 	c := newAPIKeyCache(30 * time.Second)
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1", teamID: "team1"}, now)
 
-	if _, _, ok := c.get("hash1", now.Add(31*time.Second)); ok {
-		t.Error("expected miss after TTL")
+	// Inside the grace window past the TTL: served, and this caller is told
+	// to kick the refresh.
+	entry, _, refresh, ok := c.get("hash1", now.Add(31*time.Second))
+	if !ok || !refresh || entry.id != "id1" {
+		t.Fatalf("expected stale serve inside grace, got ok=%v refresh=%v", ok, refresh)
 	}
-	// The expired entry is retained (never served) so put can carry its
-	// lastTouch across the refill; the capacity sweep reclaims it eventually.
+	// The trigger is armed: further stale hits serve but must not re-kick.
+	if _, _, refresh, ok := c.get("hash1", now.Add(31*time.Second)); !ok || refresh {
+		t.Errorf("second stale hit must not arm another refresh, got ok=%v refresh=%v", ok, refresh)
+	}
+	// A transient refresh failure re-arms the trigger.
+	c.refreshFailed("hash1")
+	if _, _, refresh, ok := c.get("hash1", now.Add(31*time.Second)); !ok || !refresh {
+		t.Errorf("refreshFailed must re-arm the trigger, got ok=%v refresh=%v", ok, refresh)
+	}
+	// Fresh entries are not flagged.
+	if _, _, refresh, ok := c.get("hash1", now.Add(time.Second)); !ok || refresh {
+		t.Errorf("fresh entry must not trigger a refresh, got ok=%v refresh=%v", ok, refresh)
+	}
+	// Past ttl+grace: a real miss.
+	if _, _, _, ok := c.get("hash1", now.Add(30*time.Second+apiKeyCacheStaleGrace+time.Second)); ok {
+		t.Error("expected miss past the grace window")
+	}
+	// The entry is retained through the miss so put can carry its lastTouch
+	// across the refill; the capacity sweep reclaims it eventually.
 	c.mu.Lock()
 	_, exists := c.m["hash1"]
 	c.mu.Unlock()
@@ -67,7 +87,7 @@ func TestAPIKeyCache_TouchThrottleSurvivesRefill(t *testing.T) {
 
 func TestAPIKeyCache_MissUnknownKey(t *testing.T) {
 	c := newAPIKeyCache(30 * time.Second)
-	if _, _, ok := c.get("nope", time.Now()); ok {
+	if _, _, _, ok := c.get("nope", time.Now()); ok {
 		t.Error("expected miss for unknown key")
 	}
 }
@@ -82,11 +102,11 @@ func TestAPIKeyCache_KeyExpiryCheckedOnHit(t *testing.T) {
 	}, now)
 
 	// Inside TTL and before expires_at: hit.
-	if _, _, ok := c.get("hash1", now.Add(5*time.Second)); !ok {
+	if _, _, _, ok := c.get("hash1", now.Add(5*time.Second)); !ok {
 		t.Error("expected hit before expires_at")
 	}
 	// Inside TTL but past expires_at: miss, even though TTL hasn't lapsed.
-	if _, _, ok := c.get("hash1", now.Add(11*time.Second)); ok {
+	if _, _, _, ok := c.get("hash1", now.Add(11*time.Second)); ok {
 		t.Error("expected miss after expires_at despite fresh TTL")
 	}
 }
@@ -96,14 +116,14 @@ func TestAPIKeyCache_TouchThrottle(t *testing.T) {
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1"}, now)
 
-	if _, needTouch, _ := c.get("hash1", now.Add(30*time.Second)); needTouch {
+	if _, needTouch, _, _ := c.get("hash1", now.Add(30*time.Second)); needTouch {
 		t.Error("expected no touch before interval elapses")
 	}
-	if _, needTouch, _ := c.get("hash1", now.Add(lastUsedTouchInterval)); !needTouch {
+	if _, needTouch, _, _ := c.get("hash1", now.Add(lastUsedTouchInterval)); !needTouch {
 		t.Error("expected touch once interval elapsed")
 	}
 	// The touch above reset the clock; immediately after, no touch again.
-	if _, needTouch, _ := c.get("hash1", now.Add(lastUsedTouchInterval+time.Second)); needTouch {
+	if _, needTouch, _, _ := c.get("hash1", now.Add(lastUsedTouchInterval+time.Second)); needTouch {
 		t.Error("expected no touch right after a touch")
 	}
 }
@@ -115,7 +135,7 @@ func TestAPIKeyCache_DisabledNilSafe(t *testing.T) {
 	}
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1"}, now) // must not panic
-	if _, _, ok := c.get("hash1", now); ok {
+	if _, _, _, ok := c.get("hash1", now); ok {
 		t.Error("disabled cache must always miss")
 	}
 }
@@ -131,7 +151,7 @@ func TestAPIKeyCache_SweepAtCapacity(t *testing.T) {
 	later := now.Add(31 * time.Second)
 	c.put("fresh", apiKeyCacheEntry{id: "fresh"}, later)
 
-	if _, _, ok := c.get("fresh", later); !ok {
+	if _, _, _, ok := c.get("fresh", later); !ok {
 		t.Error("expected fresh entry after sweep")
 	}
 	c.mu.Lock()
@@ -152,7 +172,7 @@ func TestAPIKeyCache_ResetWhenFullOfFreshEntries(t *testing.T) {
 	// exceed the cap and the new entry must be present.
 	c.put("fresh", apiKeyCacheEntry{id: "fresh"}, now.Add(time.Second))
 
-	if _, _, ok := c.get("fresh", now.Add(2*time.Second)); !ok {
+	if _, _, _, ok := c.get("fresh", now.Add(2*time.Second)); !ok {
 		t.Error("expected fresh entry after reset")
 	}
 	c.mu.Lock()
@@ -266,4 +286,16 @@ func TestAPIKeyCache_FetchContextContract(t *testing.T) {
 	}); err != nil {
 		t.Errorf("nil-cache fetch: %v", err)
 	}
+}
+
+func TestAPIKeyCache_RemoveDropsEntry(t *testing.T) {
+	c := newAPIKeyCache(10 * time.Second)
+	now := time.Now()
+	c.put("hash1", apiKeyCacheEntry{id: "id1"}, now)
+	c.remove("hash1")
+	if _, _, _, ok := c.get("hash1", now); ok {
+		t.Fatal("removed entry must not be served")
+	}
+	var disabled *apiKeyCache
+	disabled.remove("hash1") // nil-safe, must not panic
 }

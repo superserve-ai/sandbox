@@ -31,5 +31,14 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		return
 	}
 
+	if host.PrevStatus == "unhealthy" && host.Status == "active" {
+		// The heartbeat just recovered this host; drop the scheduler's cached
+		// list so its capacity is usable now, not after the cache TTL.
+		log.Info().Str("host_id", hostID).Msg("host recovered via heartbeat")
+		if h.Scheduler != nil {
+			h.Scheduler.Invalidate()
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{"status": host.Status})
 }

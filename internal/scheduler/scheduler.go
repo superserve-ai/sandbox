@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -34,9 +37,11 @@ type LeastLoaded struct {
 	DefaultHostID string        // fallback when no host rows exist
 	TTL           time.Duration // 0 = use defaultCacheTTL
 
-	mu       sync.RWMutex
-	cached   []db.ListActiveHostsByLoadRow
-	cachedAt time.Time
+	mu         sync.RWMutex
+	cached     []db.ListActiveHostsByLoadRow
+	cachedAt   time.Time
+	gen        uint64      // bumped by Invalidate and blocking reloads; discards refreshes that started earlier
+	refreshing atomic.Bool // one background refresh at a time
 }
 
 func (s *LeastLoaded) ttl() time.Duration {
@@ -76,25 +81,68 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 	return hosts[b].ID, nil
 }
 
+// hostsStaleGrace bounds how long an expired host list keeps being served
+// while refreshes run (or fail) in the background. Host health flows through
+// the DB — the detector marks missed-heartbeat hosts unhealthy and the next
+// refresh drops them — so the worst case for routing to a dead host is
+// ttl+grace, and persistent refresh failures degrade to blocking (erroring)
+// loads instead of serving a dead list forever.
+const hostsStaleGrace = 30 * time.Second
+
+// loadHosts serves the cached list — stale included, up to hostsStaleGrace —
+// and refreshes it in the background once the TTL lapses, so callers never
+// queue behind the refresh. The very first call, a post-Invalidate call, and
+// any call past the grace window block on a fresh load.
 func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoadRow, error) {
 	s.mu.RLock()
-	if s.cached != nil && time.Since(s.cachedAt) < s.ttl() {
-		hosts := s.cached
-		s.mu.RUnlock()
-		return hosts, nil
-	}
+	cached, cachedAt, startGen := s.cached, s.cachedAt, s.gen
 	s.mu.RUnlock()
+	if cached != nil && time.Since(cachedAt) >= s.ttl()+hostsStaleGrace {
+		// Past the grace window (refreshes failing or never landing): stop
+		// serving the old list and force a blocking reload below.
+		cached = nil
+	}
+	if cached != nil {
+		if time.Since(cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
+			// Detached: the refresh outlives the triggering request. On error
+			// the stale list stays servable and the next expired call retries.
+			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			go func() {
+				defer cancel()
+				defer s.refreshing.Store(false)
+				hosts, err := s.DB.ListActiveHostsByLoad(qctx)
+				if err != nil {
+					log.Warn().Err(err).Msg("host list refresh failed; serving stale until the grace window expires")
+					return
+				}
+				s.mu.Lock()
+				// Discard results from before the latest Invalidate or blocking
+				// reload: storing them would resurrect a host list a newer,
+				// fresher load already replaced.
+				if s.gen == startGen {
+					s.cached = hosts
+					s.cachedAt = time.Now()
+				}
+				s.mu.Unlock()
+			}()
+		}
+		return cached, nil
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cached != nil && time.Since(s.cachedAt) < s.ttl() {
+	// Double-check: another blocked caller may have reloaded while we waited.
+	// A past-grace list does not count — it is what we are here to replace.
+	if s.cached != nil && time.Since(s.cachedAt) < s.ttl()+hostsStaleGrace {
 		return s.cached, nil
 	}
-
 	hosts, err := s.DB.ListActiveHostsByLoad(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list active hosts by load: %w", err)
 	}
+	// Bump the generation so an older in-flight background refresh cannot
+	// land after this load and replace it with its earlier snapshot.
+	s.gen++
 	s.cached = hosts
 	s.cachedAt = time.Now()
 	return hosts, nil
@@ -104,6 +152,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoad
 // changes immediately.
 func (s *LeastLoaded) Invalidate() {
 	s.mu.Lock()
+	s.gen++
 	s.cached = nil
 	s.cachedAt = time.Time{}
 	s.mu.Unlock()

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -731,6 +732,9 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 		return
 	}
 
+	// The template is gone; cached entries must stop handing out its paths.
+	InvalidateTemplateCache(tplID)
+
 	c.Status(http.StatusNoContent)
 	h.logTemplateActivity(c.Request.Context(), tplID, teamID, actorIDFromContext(c), "template", "deleted", "success", nil)
 
@@ -964,16 +968,113 @@ type templateCacheKey struct {
 }
 
 type templateCacheEntry struct {
-	tpl    db.Template
-	expiry time.Time
+	tpl        db.Template
+	expiry     time.Time
+	refreshing atomic.Bool // a stale-serve refresh is in flight; at most one per entry
 }
 
 var (
 	templateCache       sync.Map           // key: templateCacheKey, value: *templateCacheEntry
 	templateLookupGroup singleflight.Group // coalesces concurrent identical misses
+	templateCacheGen    atomic.Uint64      // bumped by InvalidateTemplateCache; retires in-flight lookups
 )
 
+// templateFlightResult carries the generation observed when the flight began,
+// so a result computed before an invalidation is never stored after it.
+type templateFlightResult struct {
+	tpl db.Template
+	gen uint64
+}
+
 const templateCacheTTL = 5 * time.Second
+
+// templateCacheStaleGrace: a TTL-expired entry is still served for this long
+// while one background flight refreshes it, so a burst landing on an expired
+// entry never queues behind the refresh. Bounds how long a rebuilt or deleted
+// template's old snapshot paths can still be handed out.
+const templateCacheStaleGrace = 30 * time.Second
+
+// fetchTemplate runs the coalesced lookup and reconciles the cache: a system
+// template is (re)stored; a definitive not-found, or a name that now resolves
+// to a team-owned override (the lookup prefers team rows, and only system
+// templates are cached), removes the old entry so it can't keep shadowing.
+// old is the entry this call replaces — reconciliation is compare-based so a
+// slow result can never clobber or evict a newer entry; nil means there is
+// nothing to replace (the blocking miss path).
+func (h *Handlers) fetchTemplate(ctx context.Context, sfKey string, cacheKey templateCacheKey, teamID uuid.UUID, ref string, old *templateCacheEntry) (db.Template, error) {
+	// The generation is in the singleflight key: a lookup that starts after an
+	// invalidation never coalesces onto a flight that read the retired row.
+	startGen := templateCacheGen.Load()
+	result, err, _ := templateLookupGroup.Do(fmt.Sprintf("%s|%d", sfKey, startGen), func() (interface{}, error) {
+		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		tpl, err := h.pureLookupTemplate(qctx, teamID, ref)
+		if err != nil {
+			return nil, err
+		}
+		return templateFlightResult{tpl: tpl, gen: startGen}, nil
+	})
+	if err != nil {
+		if errors.Is(err, errTemplateNotFound) && old != nil {
+			templateCache.CompareAndDelete(cacheKey, old)
+		}
+		return db.Template{}, err
+	}
+	res := result.(templateFlightResult)
+	tpl := res.tpl
+	if tpl.TeamID != h.systemTeamID() {
+		if old != nil {
+			templateCache.CompareAndDelete(cacheKey, old)
+		}
+		return tpl, nil
+	}
+	if templateCacheGen.Load() != res.gen {
+		// An invalidation landed after this flight began: its row may predate
+		// the delete or rebuild, so serve it to this caller but store nothing.
+		return tpl, nil
+	}
+	entry := &templateCacheEntry{tpl: tpl, expiry: time.Now().Add(templateCacheTTL)}
+	stored := true
+	if old != nil {
+		stored = templateCache.CompareAndSwap(cacheKey, old, entry)
+	} else {
+		templateCache.Store(cacheKey, entry)
+	}
+	// Re-check after the store: an invalidation racing it has already swept the
+	// map, so a store that slipped past that sweep must undo itself.
+	if stored && templateCacheGen.Load() != res.gen {
+		templateCache.CompareAndDelete(cacheKey, entry)
+	}
+	return tpl, nil
+}
+
+// refreshTemplateCache runs the fetch behind a stale serve. On a transient
+// error the stale entry stays servable for the grace window and the trigger
+// re-arms so a later request retries.
+func (h *Handlers) refreshTemplateCache(sfKey string, cacheKey templateCacheKey, teamID uuid.UUID, ref string, old *templateCacheEntry) {
+	_, err := h.fetchTemplate(context.Background(), sfKey, cacheKey, teamID, ref, old)
+	if err != nil && !errors.Is(err, errTemplateNotFound) {
+		log.Warn().Err(err).Str("ref", ref).Msg("template refresh failed; serving stale until the grace window expires")
+		old.refreshing.Store(false)
+	}
+}
+
+// InvalidateTemplateCache drops every cached entry for the given template, so
+// creates stop receiving its retired snapshot paths at the next lookup instead
+// of after the stale grace. System templates are cached once per calling team,
+// hence the sweep. Called on template deletion and on a finalized rebuild.
+func InvalidateTemplateCache(templateID uuid.UUID) {
+	// Bump first: lookups already in flight read the pre-invalidation row and
+	// are retired at store time; lookups starting after the bump use a new
+	// singleflight key, so they cannot coalesce onto those older flights.
+	templateCacheGen.Add(1)
+	templateCache.Range(func(k, v any) bool {
+		if v.(*templateCacheEntry).tpl.ID == templateID {
+			templateCache.Delete(k)
+		}
+		return true
+	})
+}
 
 // pureLookupTemplate runs the DB query. Must stay free of HTTP side-effects
 // so it can safely sit under singleflight.Group.
@@ -1029,22 +1130,27 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 	}
 
 	cacheKey := templateCacheKey{teamID: teamID, ref: ref}
+	sfKey := teamID.String() + "|" + ref
 	if entry, ok := templateCache.Load(cacheKey); ok {
 		e := entry.(*templateCacheEntry)
-		if time.Now().Before(e.expiry) {
+		now := time.Now()
+		if now.Before(e.expiry) {
+			return e.tpl, nil
+		}
+		if now.Before(e.expiry.Add(templateCacheStaleGrace)) {
+			// Serve the just-expired entry; the first observer kicks the one
+			// background refresh, which drops the entry if the template is gone.
+			if e.refreshing.CompareAndSwap(false, true) {
+				go h.refreshTemplateCache(sfKey, cacheKey, teamID, ref, e)
+			}
 			return e.tpl, nil
 		}
 		// CompareAndDelete so a concurrent fresh Store isn't clobbered.
 		templateCache.CompareAndDelete(cacheKey, entry)
 	}
 
-	sfKey := teamID.String() + "|" + ref
-	result, err, _ := templateLookupGroup.Do(sfKey, func() (interface{}, error) {
-		// Detach: other coalesced waiters may still need the result.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
-		defer cancel()
-		return h.pureLookupTemplate(ctx, teamID, ref)
-	})
+	// Detach: other coalesced waiters may still need the result.
+	tpl, err := h.fetchTemplate(context.WithoutCancel(c.Request.Context()), sfKey, cacheKey, teamID, ref, nil)
 	if err != nil {
 		if errors.Is(err, errTemplateNotFound) {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
@@ -1054,15 +1160,6 @@ func (h *Handlers) lookupTemplateForCreate(c *gin.Context, teamID uuid.UUID, ref
 		respondError(c, ErrInternal)
 		return db.Template{}, err
 	}
-	tpl := result.(db.Template)
-
-	if tpl.TeamID == h.systemTeamID() {
-		templateCache.Store(cacheKey, &templateCacheEntry{
-			tpl:    tpl,
-			expiry: time.Now().Add(templateCacheTTL),
-		})
-	}
-
 	return tpl, nil
 }
 

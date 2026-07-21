@@ -263,20 +263,43 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 }
 
 const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :one
+WITH prev AS (
+    SELECT h.id, h.status FROM host h WHERE h.id = $1 FOR UPDATE
+)
 UPDATE host
 SET last_heartbeat_at = now(),
-    status = CASE WHEN status = 'unhealthy' THEN 'active' ELSE status END,
+    status = CASE WHEN host.status = 'unhealthy' THEN 'active' ELSE host.status END,
     updated_at = now()
-WHERE id = $1
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+FROM prev
+WHERE host.id = prev.id
+RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, prev.status AS prev_status
 `
+
+type UpdateHostHeartbeatRow struct {
+	ID                string             `json:"id"`
+	VmdAddr           string             `json:"vmd_addr"`
+	ProxyAddr         string             `json:"proxy_addr"`
+	Region            string             `json:"region"`
+	Status            string             `json:"status"`
+	CapacityMemoryMib int32              `json:"capacity_memory_mib"`
+	CapacityVcpus     int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	PrevStatus        string             `json:"prev_status"`
+}
 
 // Returns the host row so the caller can verify the host exists. Also
 // re-activates unhealthy hosts that resume heartbeating — this is the
-// automatic recovery path after a transient network outage.
-func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (Host, error) {
+// automatic recovery path after a transient network outage. prev_status lets
+// the caller detect that transition and invalidate the scheduler's host cache
+// so recovered capacity is usable immediately instead of after the cache TTL.
+// The pre-image is read FOR UPDATE so it reflects the row version this
+// statement actually modifies; a plain snapshot read racing a concurrent
+// status write could report the transition as active→active and hide it.
+func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHostHeartbeatRow, error) {
 	row := q.db.QueryRow(ctx, updateHostHeartbeat, id)
-	var i Host
+	var i UpdateHostHeartbeatRow
 	err := row.Scan(
 		&i.ID,
 		&i.VmdAddr,
@@ -288,6 +311,7 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (Host, err
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PrevStatus,
 	)
 	return i, err
 }
