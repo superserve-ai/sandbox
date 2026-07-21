@@ -65,3 +65,26 @@ test("ID overrides avoid all resolver queries", async () => {
   assert.equal(state.teamId, "team");
   assert.equal(state.projectId, "project");
 });
+
+test("persists each successful mutation before a later failure", async () => {
+  const persisted = [];
+  const client = {
+    resolveTeamAndProject: async () => ({ team: { id: "team" }, project: { id: "project" } }),
+    createIssue: async (input) => {
+      if (input.title === "Logging review") throw new Error("temporary Linear failure");
+      return { id: input.parentId ? `child:${input.title}` : "root-id" };
+    },
+  };
+  await assert.rejects(() => sync({
+    issues,
+    state: {},
+    client,
+    dryRun: false,
+    persistState: async (state) => persisted.push(structuredClone(state)),
+  }), /temporary Linear failure/);
+  assert.deepEqual(persisted.at(-1), {
+    teamId: "team",
+    projectId: "project",
+    issues: { program: "root-id", access: "child:Access review" },
+  });
+});

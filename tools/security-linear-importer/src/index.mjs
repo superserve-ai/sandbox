@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import process from "node:process";
 
 const DEFAULT_TEAM_NAME = "Superserve";
@@ -111,7 +111,7 @@ function issueInput(issue, teamId, projectId, parentId) {
   return { teamId, projectId, title: issue.title, ...(issue.description ? { description: issue.description } : {}), ...(issue.priority !== undefined ? { priority: issue.priority } : {}), ...(parentId ? { parentId } : {}) };
 }
 
-export async function sync({ issues, state, client, teamId, projectId, dryRun }) {
+export async function sync({ issues, state, client, teamId, projectId, dryRun, persistState }) {
   validateManifest({ issues });
   const knownIds = state.issues ?? {};
   const resolved = dryRun
@@ -128,6 +128,7 @@ export async function sync({ issues, state, client, teamId, projectId, dryRun })
     const result = await syncIssue({ issue, id: ids.get(issue.key), teamId: resolved.team.id, projectId: resolved.project.id, client, dryRun });
     ids.set(issue.key, result.id);
     nextState.issues[issue.key] = result.id;
+    if (!dryRun && persistState) await persistState(nextState);
   }
   for (const issue of children) {
     const parentId = ids.get(issue.parentKey);
@@ -135,8 +136,15 @@ export async function sync({ issues, state, client, teamId, projectId, dryRun })
     const result = await syncIssue({ issue, id: ids.get(issue.key), parentId, teamId: resolved.team.id, projectId: resolved.project.id, client, dryRun });
     ids.set(issue.key, result.id);
     nextState.issues[issue.key] = result.id;
+    if (!dryRun && persistState) await persistState(nextState);
   }
   return nextState;
+}
+
+export async function writeStateAtomic(stateFile, state) {
+  const temporaryFile = `${stateFile}.tmp-${process.pid}`;
+  await writeFile(temporaryFile, `${JSON.stringify(state, null, 2)}\n`);
+  await rename(temporaryFile, stateFile);
 }
 
 async function syncIssue({ issue, id, parentId, teamId, projectId, client, dryRun }) {
@@ -158,8 +166,16 @@ async function main() {
   const manifest = JSON.parse(await readFile(options.manifest, "utf8"));
   let state = {};
   try { state = JSON.parse(await readFile(stateFile, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  const result = await sync({ issues: manifest.issues, state, client: new LinearClient(process.env.LINEAR_API_KEY), teamId: process.env.LINEAR_TEAM_ID || state.teamId, projectId: process.env.LINEAR_PROJECT_ID || state.projectId, dryRun: !options.apply });
-  if (options.apply) await writeFile(stateFile, `${JSON.stringify(result, null, 2)}\n`);
+  const result = await sync({
+    issues: manifest.issues,
+    state,
+    client: new LinearClient(process.env.LINEAR_API_KEY),
+    teamId: process.env.LINEAR_TEAM_ID || state.teamId,
+    projectId: process.env.LINEAR_PROJECT_ID || state.projectId,
+    dryRun: !options.apply,
+    persistState: options.apply ? (nextState) => writeStateAtomic(stateFile, nextState) : undefined,
+  });
+  if (options.apply) await writeStateAtomic(stateFile, result);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) main().catch((error) => { console.error(`error: ${error.message}`); process.exitCode = 1; });

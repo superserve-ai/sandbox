@@ -28,7 +28,9 @@ inspected without contacting Linear. It does not write those temporary IDs to
 the state file. The state file is written after an apply run and is ignored by
 git.
 
-Idempotency is based on that local state file. Preserve
+Idempotency is based on that local state file. Apply mode atomically rewrites
+it after every successful issue mutation, so a later request failure preserves
+the IDs already created. Preserve
 `security-program/.linear-state.json` between apply runs and do not commit it;
 if it is deleted or unavailable, the importer cannot identify previously
 created issues and will create duplicates.
