@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -224,22 +225,25 @@ func AttachFirewall(cfg FirewallConfig) (*Firewall, error) {
 	}, nil
 }
 
-// VerifyInstalled confirms the kernel actually holds this firewall's chains
-// with rules in them. AttachFirewall only binds names — it succeeds against a
-// half-built namespace (a crash between chain creation and rule install), so
-// callers re-binding to state of unknown provenance must verify before
-// trusting enforcement. Must be called from within the target namespace.
-func (fw *Firewall) VerifyInstalled() error {
-	for _, ch := range []*nftables.Chain{fw.filterChain, fw.natChain, fw.postChain, fw.fwdChain} {
-		rules, err := fw.conn.GetRules(fw.table, ch)
-		if err != nil {
-			return fmt.Errorf("verify chain %s: %w", ch.Name, err)
-		}
-		if len(rules) == 0 {
-			return fmt.Errorf("verify chain %s: no rules installed", ch.Name)
-		}
+// ReinstallFirewall replaces whatever nftables state a namespace carries with
+// the current base ruleset: any existing table — complete, stale, or half
+// built — is deleted, then NewFirewall installs from scratch. AttachFirewall
+// only binds names and would silently trust the previous writer's rules, so
+// re-binding to state of unknown provenance must rebuild instead. Must be
+// called from within the target namespace, with no live occupant (the delete
+// briefly drops enforcement).
+func ReinstallFirewall(cfg FirewallConfig) (*Firewall, error) {
+	conn, err := nftables.New()
+	if err != nil {
+		return nil, fmt.Errorf("new nftables conn: %w", err)
 	}
-	return nil
+	conn.DelTable(&nftables.Table{Name: tableName, Family: nftables.TableFamilyINet})
+	if err := conn.Flush(); err != nil && !errors.Is(err, unix.ENOENT) {
+		// Anything but "no such table" means the stale table may survive —
+		// installing over it would append duplicate rules, so fail instead.
+		return nil, fmt.Errorf("delete stale table: %w", err)
+	}
+	return NewFirewall(cfg)
 }
 
 // Close tears down the nftables connection. Kernel-level table and

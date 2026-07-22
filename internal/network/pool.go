@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,10 +70,12 @@ type preallocSlot struct {
 	info *VMNetInfo
 	// vethName is needed for cleanup if the slot is never claimed.
 	vethName string
-	// forceTapReset rebuilds tap0 in verifyAndRecycle regardless of the
-	// pool-level flag. Set on adopted slots: their provenance is unknown, and
-	// a previous owner may have died holding the tap fd.
-	forceTapReset bool
+	// adopted marks a slot recovered from a previous vmd lifetime: its tap is
+	// rebuilt in verifyAndRecycle regardless of the pool-level flag (unknown
+	// provenance — a previous owner may have died holding the fd), and it may
+	// overflow into the fresh channel when the recycle channel is full, since
+	// it is fully built and counts against the refill target.
+	adopted bool
 }
 
 // pidsInNsFunc is a seam over pidsInNs so tests can simulate a namespace
@@ -175,6 +178,11 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			default:
 				return nil
 			}
+		}
+		if slot == nil {
+			// mustAllocate returns nil at shutdown and the refill select can
+			// still win the send arm — fall back to on-demand setup.
+			return nil
 		}
 		tPopped := time.Now()
 
@@ -281,12 +289,12 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 
 	// Process-free doesn't prove tap0's fd is released, so rebuild the tap
 	// before recycling; if it can't be rebuilt, tear down instead.
-	if p.resetTapOnRecycle || slot.forceTapReset {
-		// A full recycle pool means this slot is headed for teardown anyway —
-		// skip the rebuild rather than pay it for a slot about to be destroyed
+	if p.resetTapOnRecycle || slot.adopted {
+		// A full pool means this slot is headed for teardown anyway — skip
+		// the rebuild rather than pay it for a slot about to be destroyed
 		// (mass deletes overflow the pool by design). Racy but safe: the send
 		// below still has a default arm.
-		if len(p.recycled) == cap(p.recycled) {
+		if p.placementFull(slot) {
 			p.cleanup(slot)
 			return
 		}
@@ -304,7 +312,7 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 			defer func() { <-p.resetSem }()
 			// Recheck after queueing: a mass return can fill the pool while
 			// this slot waited, and a doomed slot shouldn't pay for a rebuild.
-			if len(p.recycled) == cap(p.recycled) {
+			if p.placementFull(slot) {
 				return true, nil
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), resetTapTimeout)
@@ -331,9 +339,29 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		// (pool shutting down mid-verify) can't race a send on a closed channel.
 		p.stopSlot(slot)
 	default:
-		// Recycle pool full — tear down (cleanup releases the pool's ownership).
+		// Recycle pool full. An adopted slot is fully built, so it counts as
+		// fresh inventory instead of being destroyed while the refill loop
+		// rebuilds its twin from scratch; otherwise tear down (cleanup
+		// releases the pool's ownership).
+		if slot.adopted {
+			select {
+			case p.fresh <- slot:
+				return
+			default:
+			}
+		}
 		p.cleanup(slot)
 	}
+}
+
+// placementFull reports that slot has nowhere to go, so pre-recycle work
+// (the tap rebuild) would be wasted on it. Adopted slots can also land in
+// the fresh channel; returned slots only ever recycle.
+func (p *Pool) placementFull(slot *preallocSlot) bool {
+	if len(p.recycled) < cap(p.recycled) {
+		return false
+	}
+	return !slot.adopted || len(p.fresh) == cap(p.fresh)
 }
 
 // stopSlot disposes of a slot the shutdown path can no longer place: torn
@@ -350,56 +378,41 @@ func (p *Pool) stopSlot(slot *preallocSlot) {
 // AdoptOrphanSlots claims every namespace a previous vmd lifetime left behind
 // and feeds the valid ones through the recycle verification path, so a restart
 // starts with a warm pool instead of rebuilding it from scratch. Slots that
-// fail validation are torn down. Must run after startup slot reservation (so
-// record-owned indexes are never candidates); returns when the pass completes.
-func (p *Pool) AdoptOrphanSlots(ctx context.Context) {
+// fail validation are torn down; slots that couldn't be judged (shutdown,
+// slow host) are left for a later pass. Must run after startup slot
+// reservation completed successfully — record-owned indexes must never be
+// candidates. Returns the pass's counts.
+func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped int64) {
 	indexes := p.mgr.claimOrphanSlots()
 	if len(indexes) > 0 {
 		p.log.Info().Int("candidates", len(indexes)).Msg("pool: adopting slots left by previous run")
 
-		var validated, invalid atomic.Int64
+		var nAdopted, nInvalid, nSkipped atomic.Int64
 		work := make(chan int)
 		var workers sync.WaitGroup
 		for i := 0; i < adoptConcurrency; i++ {
 			workers.Add(1)
-			p.wg.Add(1)
 			go func() {
 				defer workers.Done()
-				defer p.wg.Done()
 				defer sentrylog.Recover("netpool-adopt")
 				for idx := range work {
-					actx, cancel := context.WithTimeout(ctx, adoptSlotTimeout)
-					info, vethName, err := adoptSlotFunc(p.mgr, actx, idx)
-					cancel()
-					if err != nil {
-						p.log.Warn().Err(err).Int("slot", idx).
-							Msg("pool: orphan slot failed validation — tearing down")
-						// Kill occupants first (mirrors the startup sweep):
-						// deleting the netns name while a process holds it
-						// leaves the namespace running anonymously, beyond
-						// the reach of adoption, sweeps, and the leak gauge.
-						killProcessesInNs(nsNameForSlot(idx))
-						p.cleanup(&preallocSlot{
-							idx:      idx,
-							info:     &VMNetInfo{Namespace: nsNameForSlot(idx)},
-							vethName: vethNameForSlot(idx),
-						})
-						invalid.Add(1)
-						continue
-					}
-					p.verifyAndRecycle(&preallocSlot{
-						idx:           idx,
-						info:          info,
-						vethName:      vethName,
-						forceTapReset: true,
-					})
-					validated.Add(1)
+					p.adoptOne(ctx, idx, &nAdopted, &nInvalid, &nSkipped)
 				}
 			}()
 		}
 
 	feed:
 		for _, idx := range indexes {
+			// Priority check: once shutdown fires, no more work may be
+			// dispatched — the plain select below picks randomly among ready
+			// arms, which would keep feeding a dying process.
+			select {
+			case <-p.stopCh:
+				break feed
+			case <-ctx.Done():
+				break feed
+			default:
+			}
 			select {
 			case work <- idx:
 			case <-p.stopCh:
@@ -412,11 +425,69 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) {
 		}
 		close(work)
 		workers.Wait()
-		p.log.Info().Int64("adopted", validated.Load()).Int64("torn_down", invalid.Load()).
-			Msg("pool: adoption pass complete")
+		p.log.Info().Int64("adopted", nAdopted.Load()).Int64("torn_down", nInvalid.Load()).
+			Int64("skipped", nSkipped.Load()).Msg("pool: adoption pass complete")
+		adopted, invalid, skipped = nAdopted.Load(), nInvalid.Load(), nSkipped.Load()
 	}
 
 	p.mgr.SweepStrayHostVeths()
+	return adopted, invalid, skipped
+}
+
+// adoptOne validates and places a single claimed orphan. Outcomes: adopted
+// (into the pool via the recycle verification path), torn down (definitively
+// invalid), or skipped — released but left intact in the kernel — when the
+// slot couldn't be judged: shutdown cancelled the pass, validation timed out
+// on a congested boot, or validation panicked. Skipped slots surface in the
+// leak gauge as orphans and are re-adopted on the next boot; destroying them
+// on an ambiguous signal would defeat abandon-on-stop.
+func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped *atomic.Int64) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.log.Error().Interface("panic", r).Int("slot", idx).
+				Msg("pool: adoption panicked — releasing slot")
+			p.mgr.releaseIfOwned(idx, poolOwner)
+			skipped.Add(1)
+		}
+	}()
+
+	actx, cancel := context.WithTimeout(ctx, adoptSlotTimeout)
+	info, vethName, err := adoptSlotFunc(p.mgr, actx, idx)
+	cancel()
+	if err != nil {
+		switch {
+		case ctx.Err() != nil:
+			// Shutdown, not a bad slot: keep it abandoned for the next boot.
+			skipped.Add(1)
+		case errors.Is(err, context.DeadlineExceeded):
+			p.log.Warn().Err(err).Int("slot", idx).
+				Msg("pool: orphan slot validation timed out — leaving for a later pass")
+			p.mgr.releaseIfOwned(idx, poolOwner)
+			skipped.Add(1)
+		default:
+			p.log.Warn().Err(err).Int("slot", idx).
+				Msg("pool: orphan slot failed validation — tearing down")
+			// Kill occupants first (mirrors the startup sweep): deleting the
+			// netns name while a process holds it leaves the namespace
+			// running anonymously, beyond the reach of adoption, sweeps, and
+			// the leak gauge.
+			killProcessesInNs(nsNameForSlot(idx))
+			p.cleanup(&preallocSlot{
+				idx:      idx,
+				info:     &VMNetInfo{Namespace: nsNameForSlot(idx)},
+				vethName: vethNameForSlot(idx),
+			})
+			invalid.Add(1)
+		}
+		return
+	}
+	p.verifyAndRecycle(&preallocSlot{
+		idx:      idx,
+		info:     info,
+		vethName: vethName,
+		adopted:  true,
+	})
+	adopted.Add(1)
 }
 
 // Stop shuts the pool down. Under abandon-on-stop, warm slots are left in the
@@ -535,6 +606,11 @@ func (p *Pool) allocate(ctx context.Context) (*preallocSlot, error) {
 func (p *Pool) cleanup(slot *preallocSlot) {
 	if slot == nil || slot.info == nil {
 		return
+	}
+	// Release the netlink handle with the slot (mirrors the VM teardown
+	// path) — adopted slots each carry one, and leaking it survives the ns.
+	if slot.info.Firewall != nil {
+		_ = slot.info.Firewall.Close()
 	}
 	nsName := slot.info.Namespace
 	p.mgr.cleanupFull(nsName, slot.vethName)

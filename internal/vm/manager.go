@@ -2220,12 +2220,17 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 	if m.state == nil {
 		return
 	}
+	recs, err := m.state.All()
+	if err != nil {
+		// Sweeping with an empty keep-set would delete every live VM's
+		// namespace — skip entirely when the records can't be read.
+		m.log.Error().Err(err).Msg("sweep: cannot read state — skipping orphan namespace sweep")
+		return
+	}
 	keepNs := make(map[string]bool)
-	if recs, err := m.state.All(); err == nil {
-		for _, rec := range recs {
-			if rec.Namespace != "" {
-				keepNs[rec.Namespace] = true
-			}
+	for _, rec := range recs {
+		if rec.Namespace != "" {
+			keepNs[rec.Namespace] = true
 		}
 	}
 	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
@@ -2239,16 +2244,21 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 // an index a record holds. Every record is reserved unconditionally — a dead
 // record's slot is reclaimed later when the reattach cleans it up. Cheap: parses
 // slot indices, no kernel work, no systemctl.
-func (m *Manager) ReserveStartupSlots(context.Context) {
+//
+// Reports whether the reservation pass provably completed. Callers whose
+// safety depends on record slots being reserved — pool adoption treats every
+// unreserved namespace as claimable — must not proceed on false.
+func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	if m.state == nil {
-		return
+		return false
 	}
 	recs, err := m.state.All()
 	if err != nil {
 		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
-		return
+		return false
 	}
 	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
+	return true
 }
 
 // collectStartupSlots returns vmID→namespace for every record that has one, so

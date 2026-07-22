@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -988,13 +989,16 @@ func (m *Manager) claimOrphanSlots() []int {
 		if !ok {
 			continue
 		}
-		if idx >= MaxSlots {
-			// Outside the allocator's range: claiming it would push the
-			// high-water mark past the ceiling and starve fresh allocation.
-			outOfRange = append(outOfRange, idx)
+		// Ownership outranks everything: a record or pinned build may hold any
+		// index, including ones a changed ceiling would now call out of range.
+		if _, owned := m.slotOwner[idx]; owned {
 			continue
 		}
-		if _, owned := m.slotOwner[idx]; owned {
+		if idx > MaxSlots {
+			// Beyond the allocator's inclusive ceiling (claimSlotIndex hands
+			// out MaxSlots itself): claiming would push the high-water mark
+			// past it and starve fresh allocation.
+			outOfRange = append(outOfRange, idx)
 			continue
 		}
 		m.assignSlotLocked(idx, poolOwner)
@@ -1028,14 +1032,13 @@ func (m *Manager) claimOrphanSlots() []int {
 	return out
 }
 
-// adoptSlot rebuilds the in-memory identity of an existing ns-<idx> so it can
-// re-enter the pool: verifies the host-side veth and the in-namespace peer,
-// re-binds the in-namespace nftables handle (mirrors ReattachVM), and re-adds
-// the host route (idempotent). No kernel objects are created — validation
-// doubles as the layout/version check, so a namespace built by an incompatible
-// vmd simply fails here and gets torn down. tap0 is NOT checked: adopted slots
-// always rebuild it before recycling (unknown provenance — the previous owner
-// may have died holding its fd).
+// adoptSlot rebuilds the identity of an existing ns-<idx> so it can re-enter
+// the pool: kills any occupant, verifies the veth pair and the peer's derived
+// address, reinstalls the current base firewall from scratch, and re-adds the
+// host route (idempotent). The structural checks double as the layout/version
+// check, so a namespace built by an incompatible vmd fails here and gets torn
+// down. tap0 is NOT checked: adopted slots always rebuild it before recycling
+// (unknown provenance — the previous owner may have died holding its fd).
 func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, error) {
 	nsName := nsNameForSlot(idx)
 	vethName := vethNameForSlot(idx)
@@ -1044,11 +1047,13 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	if !nsExists(nsName) {
 		return nil, "", fmt.Errorf("adopt slot %d: namespace vanished", idx)
 	}
-	if err := run(ctx, "ip", "link", "show", vethName); err != nil {
+	// Kill first: everything below rewrites enforcement state, which must
+	// never happen around a live occupant (a crash can strand a workload here
+	// with its egress restrictions still configured).
+	killProcessesInNs(nsName)
+
+	if _, err := os.Stat("/sys/class/net/" + vethName); err != nil {
 		return nil, "", fmt.Errorf("adopt slot %d: host veth missing: %w", idx, err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "show", "eth0"); err != nil {
-		return nil, "", fmt.Errorf("adopt slot %d: in-namespace peer missing: %w", idx, err)
 	}
 
 	fwCfg := FirewallConfig{
@@ -1060,24 +1065,33 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	}
 	var fw *Firewall
 	if err := nsExecGo(nsName, func() error {
-		f, err := AttachFirewall(fwCfg)
+		iface, err := net.InterfaceByName("eth0")
+		if err != nil {
+			return fmt.Errorf("in-namespace peer missing: %w", err)
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return fmt.Errorf("peer addrs: %w", err)
+		}
+		want := vpeerIPForSlot(idx)
+		found := false
+		for _, a := range addrs {
+			if strings.HasPrefix(a.String(), want+"/") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("peer address mismatch: want %s", want)
+		}
+		f, err := ReinstallFirewall(fwCfg)
 		if err != nil {
 			return err
-		}
-		if err := f.VerifyInstalled(); err != nil {
-			_ = f.Close()
-			return err
-		}
-		// The previous owner's user egress sets must not survive into the
-		// pool — mirrors the recycle path's sanitation before Return.
-		if err := f.ReplaceUserRules(nil, nil); err != nil {
-			_ = f.Close()
-			return fmt.Errorf("clear user rules: %w", err)
 		}
 		fw = f
 		return nil
 	}); err != nil {
-		return nil, "", fmt.Errorf("adopt slot %d: firewall: %w", idx, err)
+		return nil, "", fmt.Errorf("adopt slot %d: %w", idx, err)
 	}
 
 	// Heal the host route if it didn't survive; mirrors setupSlot's tolerance.
@@ -1111,21 +1125,25 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 		if !isVeth || err != nil || idx < 0 {
 			continue
 		}
-		if nsExists(nsNameForSlot(idx)) {
-			continue
-		}
+		// Hold the index through the delete: checking and then deleting
+		// unowned would race the refill loop building a fresh slot at this
+		// idx between the check and the `ip link del` — which would sever a
+		// brand-new live slot's host side.
 		m.mu.Lock()
-		_, owned := m.slotOwner[idx]
-		m.mu.Unlock()
-		if owned {
+		if _, owned := m.slotOwner[idx]; owned || nsExists(nsNameForSlot(idx)) {
+			m.mu.Unlock()
 			continue
 		}
+		m.assignSlotLocked(idx, teardownOwner)
+		m.mu.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := run(ctx, "ip", "link", "del", veth); err == nil {
 			m.log.Info().Str("veth", veth).Msg("swept stray host veth")
 			swept++
 		}
 		cancel()
+		m.releaseIfOwned(idx, teardownOwner)
 	}
 	return swept
 }

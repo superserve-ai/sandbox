@@ -657,3 +657,114 @@ func TestClaimOrphanSlots_RejectsOutOfRangeIndex(t *testing.T) {
 		t.Fatalf("high-water mark must stay within the allocator range, got %d", next)
 	}
 }
+
+func TestClaimOrphanSlots_CeilingIndexIsAdoptable(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, fmt.Sprintf("ns-%d", MaxSlots)) // the allocator hands out MaxSlots itself
+	m := newTestManager()
+
+	got := m.claimOrphanSlots()
+	if len(got) != 1 || got[0] != MaxSlots {
+		t.Fatalf("the inclusive ceiling index must be adoptable, got %v", got)
+	}
+}
+
+func TestClaimOrphanSlots_OwnedOutOfRangeSurvives(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-99999998")
+	m := newTestManager()
+	m.mu.Lock()
+	m.assignSlotLocked(99999998, "vm-live") // e.g. a record above a lowered ceiling
+	m.mu.Unlock()
+
+	if got := m.claimOrphanSlots(); len(got) != 0 {
+		t.Fatalf("owned namespace must never be a candidate, got %v", got)
+	}
+	m.mu.Lock()
+	owner := m.slotOwner[99999998]
+	m.mu.Unlock()
+	if owner != "vm-live" {
+		t.Fatalf("ownership must be untouched, got %q", owner)
+	}
+}
+
+func TestAdoptOrphanSlots_OverflowLandsInFresh(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-7")
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	// Recycle channel already full: the adopted slot must become fresh
+	// inventory, not be destroyed while refill would rebuild its twin.
+	for i := 0; i < cap(p.recycled); i++ {
+		p.recycled <- &preallocSlot{idx: 100 + i, info: &VMNetInfo{Namespace: "ns-x"}}
+	}
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		return &VMNetInfo{Namespace: nsNameForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	adopted, invalid, _ := p.AdoptOrphanSlots(context.Background())
+	if adopted != 1 || invalid != 0 {
+		t.Fatalf("expected 1 adopted / 0 torn down, got %d/%d", adopted, invalid)
+	}
+	if len(p.fresh) != 1 {
+		t.Fatalf("overflow adoptee must land in the fresh channel, got %d", len(p.fresh))
+	}
+}
+
+func TestAdoptOrphanSlots_TimeoutSkipsAndReleases(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-7")
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	stubAdoptSlot(t, func(*Manager, context.Context, int) (*VMNetInfo, string, error) {
+		return nil, "", fmt.Errorf("host veth check: %w", context.DeadlineExceeded)
+	})
+
+	adopted, invalid, skipped := p.AdoptOrphanSlots(context.Background())
+	if adopted != 0 || invalid != 0 || skipped != 1 {
+		t.Fatalf("timeout must skip, not tear down: adopted=%d invalid=%d skipped=%d", adopted, invalid, skipped)
+	}
+	// Released for a later pass, namespace left intact for the leak gauge
+	// and the next boot.
+	m.mu.Lock()
+	_, owned := m.slotOwner[7]
+	m.mu.Unlock()
+	if owned {
+		t.Fatal("timed-out slot must be released, not held")
+	}
+}
+
+func TestAdoptOrphanSlots_WorkerPanicReleasesAndContinues(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-7")
+	touchNS(t, dir, "ns-8")
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		if idx == 7 {
+			panic("unexpected kernel state")
+		}
+		return &VMNetInfo{Namespace: nsNameForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	adopted, _, skipped := p.AdoptOrphanSlots(context.Background())
+	if adopted != 1 || skipped != 1 {
+		t.Fatalf("panic must be contained per slot: adopted=%d skipped=%d", adopted, skipped)
+	}
+	m.mu.Lock()
+	_, owned7 := m.slotOwner[7]
+	m.mu.Unlock()
+	if owned7 {
+		t.Fatal("panicked slot must be released so it isn't stranded invisibly")
+	}
+}
