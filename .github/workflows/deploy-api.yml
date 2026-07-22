@@ -349,3 +349,42 @@ jobs:
             echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
             exit 1
           fi
+
+      # The use4 cell is the primary production cell — api.superserve.ai routes
+      # here. Same step-based pattern as usw; reuses the SHA-tagged image pushed
+      # above. Steps skip until CLOUD_RUN_SERVICE_USE4 is set. Unlike usw, use4
+      # has a public invoker binding, so /health is a meaningful probe.
+      - name: Deploy use4 cell to Cloud Run
+        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        run: |
+          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
+            --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --region ${{ vars.GCP_REGION_USE4 }} \
+            --project ${{ vars.GCP_PROJECT }}
+
+      - name: Route use4 cell traffic to the new revision
+        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USE4 }}
+          ARGS="--region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
+          if [ "$SERVING" != "$LATEST" ]; then
+            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
+          fi
+          gcloud run services update-traffic $SVC --to-latest $ARGS
+
+      - name: Verify use4 cell latest revision serves traffic
+        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USE4 }}
+          ARGS="--region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
+          if [ "$PCT" != "100" ]; then
+            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
+            exit 1
+          fi
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
