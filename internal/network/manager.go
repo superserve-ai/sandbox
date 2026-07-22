@@ -995,10 +995,12 @@ func (m *Manager) claimOrphanSlots() []int {
 		if _, owned := m.slotOwner[idx]; owned {
 			continue
 		}
-		if idx > MaxSlots {
-			// Beyond the allocator's inclusive ceiling (claimSlotIndex hands
-			// out MaxSlots itself): claiming would push the high-water mark
-			// past it and starve fresh allocation.
+		if idx < 1 || idx > MaxSlots {
+			// Outside the allocator's range: it starts at 1 and hands out up
+			// to and including MaxSlots. Below it: ns-0 is never built (and a
+			// long-enough name overflows slotFromNamespace negative); above
+			// it, claiming would push the high-water mark past the ceiling
+			// and starve fresh allocation.
 			outOfRange = append(outOfRange, idx)
 			continue
 		}

@@ -639,6 +639,8 @@ func TestClaimOrphanSlots_SkipsOwnedAndBumpsHighWater(t *testing.T) {
 func TestClaimOrphanSlots_RejectsOutOfRangeIndex(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-99999999") // beyond MaxSlots: must never enter the allocator
+	touchNS(t, dir, "ns-0")        // below it: the allocator starts at 1
+	touchNS(t, dir, "ns-9999999999999999999999") // overflows the parse negative
 	touchNS(t, dir, "ns-2")
 	m := newTestManager()
 
