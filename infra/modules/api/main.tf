@@ -100,6 +100,21 @@ resource "google_cloud_run_v2_service" "this" {
   deletion_protection = true
 }
 
+# Public, unauthenticated invoker. The API is reached through an external
+# HTTPS load balancer (serverless NEG -> this service), which forwards requests
+# as allUsers, so the service must grant run.invoker to allUsers. This binding
+# was applied imperatively (`gcloud run services add-iam-policy-binding`) in
+# every cell; declaring it here adopts the live grants via import.
+resource "google_cloud_run_v2_service_iam_member" "public_invoker" {
+  count = var.allow_public_invoker ? 1 : 0
+
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.this.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
 locals {
   api_contract = {
     project_id            = var.project_id

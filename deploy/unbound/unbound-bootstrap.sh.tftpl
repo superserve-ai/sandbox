@@ -1,0 +1,61 @@
+#!/bin/bash
+# Host startup step: stand up unbound as the guest DNS resolver.
+#
+# WHY: sandbox guests must not talk to arbitrary DNS. Guests are pointed at the
+# host on :53; the host redirects that to a local unbound instance which
+# forwards every query over DoT (DNS-over-TLS) to a Cloudflare Zero Trust
+# Gateway location. That gateway enforces the egress DNS policy for the fleet.
+# Only the guest range (${guest_cidr}) is allowed to query the resolver.
+#
+# This runs on boot. unbound + the redirect are idempotent, so re-runs are
+# safe. Shape mirrors deploy/otel/collector-bootstrap.sh.tftpl.
+set -euo pipefail
+
+exec >> /var/log/unbound-bootstrap.log 2>&1
+
+echo "=== Superserve unbound bootstrap $(date -Is) ==="
+
+if ! command -v unbound >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y unbound
+fi
+
+install -d -m 0755 /etc/unbound/unbound.conf.d
+cat <<'EOF' >/etc/unbound/unbound.conf.d/sandbox.conf
+# Managed by unbound-bootstrap.sh.tftpl — do not edit by hand.
+server:
+    # Guests are DNAT-redirected here; listen only on loopback.
+    interface: 127.0.0.1@${local_dns_port}
+    access-control: 127.0.0.0/8 allow
+    access-control: ${guest_cidr} allow
+    do-not-query-localhost: no
+    hide-identity: yes
+    hide-version: yes
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    # Cloudflare Zero Trust Gateway (DoT). The @853#hostname pins the TLS SNI /
+    # cert name to the location endpoint so the policy is applied.
+%{ for addr in dot_upstream_addrs ~}
+    forward-addr: ${addr}@853#${dot_hostname}
+%{ endfor ~}
+EOF
+
+# Redirect guest DNS (:53) to the local unbound. route_localnet lets forwarded
+# packets be DNAT'd to a loopback address.
+sysctl -w net.ipv4.conf.all.route_localnet=1
+
+for proto in udp tcp; do
+  if ! iptables -t nat -C PREROUTING -s ${guest_cidr} -p "$proto" --dport 53 \
+      -j DNAT --to-destination 127.0.0.1:${local_dns_port} 2>/dev/null; then
+    iptables -t nat -A PREROUTING -s ${guest_cidr} -p "$proto" --dport 53 \
+      -j DNAT --to-destination 127.0.0.1:${local_dns_port}
+  fi
+done
+
+systemctl enable --now unbound
+systemctl restart unbound
+
+echo "=== Superserve unbound bootstrap complete ==="

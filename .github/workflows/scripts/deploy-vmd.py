@@ -15,6 +15,17 @@ Env vars:
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
   SHA                  required — commit SHA (only first 8 chars used)
+  SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
+  CONTROL_PLANE_URL    optional — control-plane base URL (e.g.
+                       https://api.superserve.ai). Upserted into vmd.env when
+                       set. vmd reads it via os.Getenv("CONTROL_PLANE_URL").
+  INTERNAL_API_TOKEN   optional — shared control-plane/host auth token, sourced
+                       from CI secrets / Secret Manager (never hardcode). When
+                       set it is upserted into vmd.env as INTERNAL_API_TOKEN and
+                       into /etc/sandbox/secretsproxy.env as DAEMON_AUTH_TOKEN
+                       (secretsproxy authenticates callers with the same token
+                       the control plane presents). Hosts previously had these
+                       provisioned out-of-band via Packer/manual staging.
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
@@ -78,6 +89,8 @@ def main() -> int:
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
+    internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -247,6 +260,29 @@ def main() -> int:
                     echo 'SECRETSPROXY_SOCKET=/run/secretsproxy/control.sock' | sudo tee -a "$env_file" > /dev/null
                 fi
             done
+
+            # Upsert the control-plane URL into vmd.env. Empty = skip (leave any
+            # value already provisioned out-of-band untouched).
+            if [ -n '{control_plane_url}' ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^CONTROL_PLANE_URL=/d' /etc/sandbox/vmd.env
+                echo 'CONTROL_PLANE_URL={control_plane_url}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert the shared control-plane auth token. vmd reads it as
+            # INTERNAL_API_TOKEN; secretsproxy authenticates callers with the
+            # same value as DAEMON_AUTH_TOKEN. Sourced from CI secrets / Secret
+            # Manager — never hardcoded. Empty = leave existing values alone.
+            if [ -n '{internal_api_token}' ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env
+                sudo chmod 0600 /etc/sandbox/secretsproxy.env
+                sudo sed -i '/^INTERNAL_API_TOKEN=/d' /etc/sandbox/vmd.env
+                echo 'INTERNAL_API_TOKEN={internal_api_token}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                sudo sed -i '/^DAEMON_AUTH_TOKEN=/d' /etc/sandbox/secretsproxy.env
+                echo 'DAEMON_AUTH_TOKEN={internal_api_token}' | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
+            fi
 
             # Stop before starting the socket unit: on the first deploy of
             # socket activation the old direct-bound vmd still holds the
