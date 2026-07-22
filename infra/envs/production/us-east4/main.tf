@@ -44,8 +44,11 @@ module "network" {
   create_network = var.create_network
   network_name   = var.network_name
 
-  subnet_name = "superserve-use4-subnet"
-  subnet_cidr = var.subnet_cidr
+  subnet_name            = "superserve-use4-subnet"
+  subnet_cidr            = var.subnet_cidr
+  manage_public_ssh_deny = true
+  enable_iap_ssh         = false
+  iap_ssh_target_tags    = ["vmd-use4"]
 
   # Cloud Run reaches the vmd host over direct VPC egress (no connector),
   # matching the usw2 cell. The dedicated egress subnet carries the Cloud Run
@@ -185,12 +188,9 @@ module "sandbox_host" {
   internal_ip   = var.host_internal_ip
   tags          = ["vmd-use4"]
 
-  # Label-last: deliberately NOT setting component=vmd/sandbox_role=vmd here.
-  # CD and the scheduler key on these labels, so the host stays out of prod
-  # rotation until host bring-up and pre-cutover validation are done. Flip to
-  # component=vmd / sandbox_role=vmd via `gcloud compute instances add-labels`
-  # at cutover — `labels` is in the module's ignore_changes, so a later
-  # `terraform apply` won't revert that.
+  # Keep the host out of production discovery until bring-up and pre-cutover
+  # validation are complete. CD and the scheduler use workload labels for
+  # host discovery, so those labels must be added through the cutover process.
   labels = merge(local.common_labels, {
     sandbox_status = "provisioning"
   })

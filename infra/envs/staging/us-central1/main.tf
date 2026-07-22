@@ -48,27 +48,22 @@ module "network" {
   vpc_connector_name          = "ss-vpc-conn-f1b3552"
   vpc_connector_mode          = "ip_cidr_range"
   vpc_connector_ip_cidr_range = "10.8.0.0/28"
+  manage_public_ssh_deny      = true
+  enable_iap_ssh              = true
+  iap_ssh_target_tags         = ["superserve-vmd"]
   firewall_rules = {
     vmd_grpc = {
       name          = "superserve-allow-internal-7506206"
       direction     = "INGRESS"
       source_ranges = ["10.0.0.0/24"]
-      target_tags   = []
+      target_tags   = ["superserve-vmd"]
       allow = [
         {
           protocol = "tcp"
-          ports    = ["0-65535"]
-        },
-        {
-          protocol = "udp"
-          ports    = ["0-65535"]
-        },
-        {
-          protocol = "icmp"
-          ports    = []
+          ports    = ["5007", "5008", "50051"]
         }
       ]
-      description = null
+      description = "Allow private sandbox control traffic only."
     }
     api_to_host_otel = {
       name          = "superserve-staging-api-to-host-otel"

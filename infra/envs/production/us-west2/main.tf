@@ -47,8 +47,11 @@ module "network" {
   create_network = var.create_network
   network_name   = var.network_name
 
-  subnet_name = "superserve-usw2-subnet"
-  subnet_cidr = var.subnet_cidr
+  subnet_name            = "superserve-usw2-subnet"
+  subnet_cidr            = var.subnet_cidr
+  manage_public_ssh_deny = true
+  enable_iap_ssh         = true
+  iap_ssh_target_tags    = ["vmd-usw2"]
 
   create_vpc_connector        = false
   create_vpc_connector_subnet = true

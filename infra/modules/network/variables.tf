@@ -102,6 +102,29 @@ variable "firewall_rules" {
   default = {}
 }
 
+variable "enable_iap_ssh" {
+  description = "Whether to manage the restricted IAP SSH allow rule."
+  type        = bool
+  default     = false
+}
+
+variable "manage_public_ssh_deny" {
+  description = "Whether to deny public TCP/UDP port 22 ingress for the tagged instances."
+  type        = bool
+  default     = false
+}
+
+variable "iap_ssh_target_tags" {
+  description = "Network tags identifying instances protected by the SSH controls. Required when either SSH control is enabled."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = (!var.enable_iap_ssh && !var.manage_public_ssh_deny) || length(var.iap_ssh_target_tags) > 0
+    error_message = "iap_ssh_target_tags must contain at least one tag when SSH controls are enabled."
+  }
+}
+
 variable "labels" {
   description = "Labels to apply to managed resources."
   type        = map(string)
