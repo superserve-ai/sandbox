@@ -105,8 +105,8 @@ func TestIntegration_QuotaHardLimitAcrossFastPathBoundary(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
 
-	const max = 100 // > margin (64): starts on the fast path, ends on the boundary path
-	const attempts = 160
+	const max = 200 // > margin (128): starts on the fast path, ends on the boundary path
+	const attempts = 260
 	if _, err := testPool.Exec(ctx, `UPDATE team SET max_sandboxes = $2 WHERE id = $1`, teamID, max); err != nil {
 		t.Fatalf("set max_sandboxes: %v", err)
 	}

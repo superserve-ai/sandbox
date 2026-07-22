@@ -5,14 +5,16 @@
 -- far from the limit, serialized on an advisory lock and re-checked exactly
 -- when near it.
 --
--- Enforcement bound: fast-path admissions are invisible to concurrent boundary
--- checks until they commit, so exceeding max_sandboxes would require a single
--- fast-path INSERT to stay in flight while an entire margin's worth of
--- boundary admissions serially commit — practically unreachable. The margin
--- must exceed the maximum concurrent in-flight inserts (bounded by the API's
--- DB connection pools); the default 64 covers that with headroom and is
--- runtime-tunable: ALTER DATABASE postgres SET app.sandbox_quota_margin = '96'
--- (invalid or non-positive values fall back to the default). Teams whose
+-- Enforcement bound: fast-path admissions are invisible to each other until
+-- they commit, so the margin must exceed the maximum number of INSERTs that
+-- can be in flight simultaneously. The API's own connection pools do NOT
+-- bound that (instances scale out, each with its own pool); the real bound is
+-- the connection pooler's server pool size — the number of transactions it
+-- admits concurrently, regardless of client count. The default margin of 128
+-- is sized to survive a substantial pooler resize; anyone raising the pooler
+-- pool size past the margin must raise the margin first. Runtime-tunable:
+-- ALTER DATABASE postgres SET app.sandbox_quota_margin = '192' (values below
+-- the floor, invalid, or unset fall back to the default). Teams whose
 -- max_sandboxes <= margin always take the exact path — identical to the
 -- single-row behavior they had before.
 --
@@ -63,8 +65,10 @@ RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
 $$;
 
 -- The fast-path margin, tunable at runtime without a deploy. Defensive parse:
--- a mistyped ALTER DATABASE value must not turn every create into an error,
--- and a negative value must not silently widen the fast path past the limit.
+-- a mistyped ALTER DATABASE value must not turn every create into an error.
+-- The floor keeps the knob one-directional: it can make enforcement more
+-- conservative, but can never be set below plausible in-flight concurrency
+-- and silently soften the hard limit.
 CREATE OR REPLACE FUNCTION sandbox_quota_margin()
 RETURNS integer LANGUAGE plpgsql STABLE AS $$
 DECLARE
@@ -72,12 +76,12 @@ DECLARE
 BEGIN
   raw := NULLIF(current_setting('app.sandbox_quota_margin', true), '');
   IF raw IS NULL THEN
-    RETURN 64;
+    RETURN 128;
   END IF;
   BEGIN
-    RETURN GREATEST(raw::integer, 1);
+    RETURN GREATEST(raw::integer, 64);
   EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
-    RETURN 64;
+    RETURN 128;
   END;
 END;
 $$;

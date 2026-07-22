@@ -115,10 +115,11 @@ func run() error {
 	// Connect to PostgreSQL. DB_MAX_CONNS overrides the pool size; unset
 	// uses the pgxpool default of max(4, NumCPU).
 	//
-	// Raising DB_MAX_CONNS (or the instance count) raises the possible
-	// concurrent sandbox INSERTs, which must stay below the quota fast-path
-	// margin (app.sandbox_quota_margin, default 64) or the sharded quota
-	// counter's enforcement bound weakens. Revisit the margin when scaling.
+	// Concurrent sandbox INSERTs must stay below the quota fast-path margin
+	// (app.sandbox_quota_margin, default 128) or the sharded quota counter's
+	// enforcement bound weakens. This pool does not bound them — instances
+	// scale out, each with its own pool; the transaction pooler's server pool
+	// size is the real cap. Anyone resizing that pool must check the margin.
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("parse database url: %w", err)
