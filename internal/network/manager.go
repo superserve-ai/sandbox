@@ -1063,40 +1063,68 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		HostIP:       hostIP,
 		GatewayIP:    VMGatewayIP,
 	}
-	var fw *Firewall
-	if err := nsExecGo(nsName, func() error {
-		iface, err := net.InterfaceByName("eth0")
-		if err != nil {
-			return fmt.Errorf("in-namespace peer missing: %w", err)
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			return fmt.Errorf("peer addrs: %w", err)
-		}
-		want := vpeerIPForSlot(idx)
-		found := false
-		for _, a := range addrs {
-			if strings.HasPrefix(a.String(), want+"/") {
-				found = true
-				break
+	// The in-namespace work (netlink, nftables) cannot observe ctx once it is
+	// on the pinned thread, and a wedged netlink socket would otherwise hang
+	// the adoption worker forever — bound it from outside. On timeout the
+	// abandoned goroutine is reaped when (if) it finishes: its thread stays
+	// pinned until then, an accepted, bounded cost of surviving a wedge.
+	type nsResult struct {
+		fw  *Firewall
+		err error
+	}
+	resCh := make(chan nsResult, 1)
+	go func() {
+		var fw *Firewall
+		err := nsExecGo(nsName, func() error {
+			iface, err := net.InterfaceByName("eth0")
+			if err != nil {
+				return fmt.Errorf("in-namespace peer missing: %w", err)
 			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				return fmt.Errorf("peer addrs: %w", err)
+			}
+			want := vpeerIPForSlot(idx)
+			found := false
+			for _, a := range addrs {
+				if strings.HasPrefix(a.String(), want+"/") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("peer address mismatch: want %s", want)
+			}
+			f, err := ReinstallFirewall(fwCfg)
+			if err != nil {
+				return err
+			}
+			fw = f
+			return nil
+		})
+		resCh <- nsResult{fw: fw, err: err}
+	}()
+	var fw *Firewall
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return nil, "", fmt.Errorf("adopt slot %d: %w", idx, res.err)
 		}
-		if !found {
-			return fmt.Errorf("peer address mismatch: want %s", want)
-		}
-		f, err := ReinstallFirewall(fwCfg)
-		if err != nil {
-			return err
-		}
-		fw = f
-		return nil
-	}); err != nil {
-		return nil, "", fmt.Errorf("adopt slot %d: %w", idx, err)
+		fw = res.fw
+	case <-ctx.Done():
+		go func() {
+			if res := <-resCh; res.fw != nil {
+				_ = res.fw.Close()
+			}
+		}()
+		return nil, "", fmt.Errorf("adopt slot %d: namespace validation: %w", idx, ctx.Err())
 	}
 
-	// Heal the host route if it didn't survive; mirrors setupSlot's tolerance.
-	if err := run(ctx, "ip", "route", "add", hostIP+"/32", "via", vpeerIPForSlot(idx), "dev", vethName); err != nil {
-		m.log.Debug().Err(err).Str("ns", nsName).Msg("host route (may already exist)")
+	// The host route must exist for the claimed VM to be reachable; replace is
+	// idempotent, so any failure means the slot is structurally broken.
+	if err := run(ctx, "ip", "route", "replace", hostIP+"/32", "via", vpeerIPForSlot(idx), "dev", vethName); err != nil {
+		_ = fw.Close()
+		return nil, "", fmt.Errorf("adopt slot %d: host route: %w", idx, err)
 	}
 
 	return &VMNetInfo{
