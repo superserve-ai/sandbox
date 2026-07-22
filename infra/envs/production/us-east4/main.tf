@@ -223,14 +223,16 @@ module "sandbox_host" {
   internal_ip   = var.host_internal_ip
   tags          = ["vmd-use4"]
 
-  # Label-last: deliberately NOT setting component=vmd/sandbox_role=vmd here.
-  # CD and the scheduler key on these labels, so the host stays out of prod
-  # rotation until host bring-up and pre-cutover validation are done. Flip to
-  # component=vmd / sandbox_role=vmd via `gcloud compute instances add-labels`
-  # at cutover — `labels` is in the module's ignore_changes, so a later
-  # `terraform apply` won't revert that.
+  # Cutover complete: this is the live primary host, so it must carry the prod
+  # discovery labels CD and the scheduler key on. `labels` is NOT in the
+  # module's ignore_changes, so these must be declared here or a `terraform
+  # apply` would strip the ones added out-of-band at cutover and break host
+  # discovery (deploy-vmd / deploy-otel filter on component=vmd). Mirrors the
+  # us-central1 host.
   labels = merge(local.common_labels, {
-    sandbox_status = "provisioning"
+    component               = "vmd"
+    sandbox_role            = "vmd"
+    "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
   service_account_email = data.google_service_account.api_runner.email

@@ -261,13 +261,18 @@ def main() -> int:
                 fi
             done
 
-            # Upsert the control-plane URL into vmd.env. Empty = skip (leave any
-            # value already provisioned out-of-band untouched).
+            # Upsert the control-plane URL. Empty = skip (leave any value already
+            # provisioned out-of-band untouched). secretsproxy reads
+            # CONTROL_PLANE_URL from its OWN env file and exits if it is unset, so
+            # write it into both vmd.env and secretsproxy.env.
             if [ -n '{control_plane_url}' ]; then
                 sudo install -d -m 0755 /etc/sandbox
-                sudo touch /etc/sandbox/vmd.env
-                sudo sed -i '/^CONTROL_PLANE_URL=/d' /etc/sandbox/vmd.env
-                echo 'CONTROL_PLANE_URL={control_plane_url}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                for f in /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env; do
+                    sudo touch "$f"
+                    sudo sed -i '/^CONTROL_PLANE_URL=/d' "$f"
+                    echo 'CONTROL_PLANE_URL={control_plane_url}' | sudo tee -a "$f" > /dev/null
+                done
+                sudo chmod 0600 /etc/sandbox/secretsproxy.env
             fi
 
             # Upsert the shared control-plane auth token. vmd reads it as
@@ -277,7 +282,8 @@ def main() -> int:
             if [ -n '{internal_api_token}' ]; then
                 sudo install -d -m 0755 /etc/sandbox
                 sudo touch /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env
-                sudo chmod 0600 /etc/sandbox/secretsproxy.env
+                # Both files hold the bearer token — keep them root-only.
+                sudo chmod 0600 /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env
                 sudo sed -i '/^INTERNAL_API_TOKEN=/d' /etc/sandbox/vmd.env
                 echo 'INTERNAL_API_TOKEN={internal_api_token}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
                 sudo sed -i '/^DAEMON_AUTH_TOKEN=/d' /etc/sandbox/secretsproxy.env
