@@ -1982,13 +1982,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			stampErr := vmd.InjectSandboxEnv(sctx, sandboxID.String(), envVarsToShip, secretsJWT)
 			scancel()
 			switch {
-			case stampErr == nil, isVMDUnimplemented(stampErr), isVMDNotFound(stampErr):
-				// NotFound: the VM is already gone (reaped); nothing to stamp.
+			case stampErr == nil, isVMDUnimplemented(stampErr):
 			default:
 				// The stamp's payload is cosmetic but its transport is not:
 				// a POST into the guest just failed — the same signal the
 				// synchronous path treats as an unusable sandbox. Fail the
 				// row instead of activating a sandbox whose guest is dead.
+				// NotFound lands here too: destroy is gated on 'active', so
+				// pre-activation the VM can only be gone abnormally — and
+				// ActivateSandbox has no status guard, so proceeding could
+				// resurrect a row another path just marked failed.
 				log.Error().Err(stampErr).Str("sandbox_id", sandboxID.String()).
 					Int64("stamp_ms", time.Since(tStamp).Milliseconds()).
 					Msg("post-boot guest init failed; failing sandbox instead of activating")

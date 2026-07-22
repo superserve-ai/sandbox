@@ -1756,10 +1756,11 @@ func TestCreateSandbox_HostnameStampFailureFailsRow(t *testing.T) {
 	}
 }
 
-// NotFound means the VM is already gone (reaped between boot and stamp) —
-// benign: no teardown, activation proceeds and the status-gated lifecycle
-// resolves the row.
-func TestCreateSandbox_HostnameStampNotFoundTolerated(t *testing.T) {
+// NotFound before activation means the VM vanished abnormally (destroy is
+// status-gated on 'active', so no user path removes it this early) — the row
+// must go failed, never active-without-a-VM, and never resurrect a
+// concurrently-failed row through ActivateSandbox's unguarded UPDATE.
+func TestCreateSandbox_HostnameStampNotFoundFailsRow(t *testing.T) {
 	e := newHostnameStampEnv(t, status.Error(codes.NotFound, "vm not found"))
 	w := httptest.NewRecorder()
 	setupTestRouter(e.h, e.teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
@@ -1769,11 +1770,11 @@ func TestCreateSandbox_HostnameStampNotFoundTolerated(t *testing.T) {
 	}
 	e.release()
 	e.h.WaitAsyncBookkeeping()
-	if e.destroyed.Load() {
-		t.Error("NotFound from an already-gone VM must not trigger teardown")
+	if e.activated.Load() {
+		t.Error("a vanished VM must not produce an active row")
 	}
-	if !e.activated.Load() {
-		t.Error("NotFound must not block activation")
+	if !e.destroyed.Load() {
+		t.Error("NotFound must take the failure path (failSandboxAfterBoot)")
 	}
 }
 
