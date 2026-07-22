@@ -25,20 +25,26 @@ WHERE COALESCE(sc.active_sandbox_count, 0) > 0 OR COALESCE(tpl.cnt, 0) > 0;
 -- aggregates read one snapshot (single statement), so in-flight admissions
 -- are invisible to both sides and any nonzero difference is real drift —
 -- the triggers can't cause it, but row surgery on sandbox can, and a
--- low-biased sum silently widens the team's quota. FULL JOIN catches both
--- directions: shard rows with no live sandboxes and vice versa.
+-- low-biased sum silently widens the team's quota. Raw SUM, not the floored
+-- view: flooring would hide a negative sum on a team with no live sandboxes
+-- (still-dormant undercount). FULL JOIN catches both directions: shard rows
+-- with no live sandboxes and vice versa.
 SELECT
     COALESCE(sc.team_id, tc.team_id)::uuid AS team_id,
-    COALESCE(sc.active_sandbox_count, 0)::int AS shard_sum,
+    COALESCE(sc.raw_sum, 0)::int AS shard_sum,
     COALESCE(tc.cnt, 0)::int AS true_count
-FROM team_active_sandbox_counts sc
+FROM (
+    SELECT team_id, SUM(cnt)::int AS raw_sum
+    FROM team_sandbox_counter
+    GROUP BY team_id
+) sc
 FULL JOIN (
     SELECT team_id, COUNT(*)::int AS cnt
     FROM sandbox
     WHERE sandbox_quota_counted(destroyed_at, status)
     GROUP BY team_id
 ) tc ON tc.team_id = sc.team_id
-WHERE COALESCE(sc.active_sandbox_count, 0) <> COALESCE(tc.cnt, 0);
+WHERE COALESCE(sc.raw_sum, 0) <> COALESCE(tc.cnt, 0);
 
 -- name: ClaimQuotaAlert :execrows
 -- Atomically record that (team, quota_type, channel) has been alerted. Affects 1

@@ -188,6 +188,24 @@ func TestIntegration_QuotaCounterDriftDetection(t *testing.T) {
 	if r, found := driftFor(); found {
 		t.Fatalf("repaired state still reported as drift: sum=%d true=%d", r.ShardSum, r.TrueCount)
 	}
+
+	// Dormant undercount: a negative raw sum with zero counted sandboxes must
+	// still be reported — the floored view reads 0 here and would hide it.
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox WHERE team_id = $1`, teamID); err != nil {
+		t.Fatalf("clear sandboxes: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_sandbox_counter AS c (team_id, shard, cnt) VALUES ($1, 14, -1)
+		 ON CONFLICT (team_id, shard) DO UPDATE SET cnt = c.cnt - 1`, teamID); err != nil {
+		t.Fatalf("inject dormant drift: %v", err)
+	}
+	r, found = driftFor()
+	if !found {
+		t.Fatal("dormant negative sum (no counted sandboxes) not reported as drift")
+	}
+	if r.ShardSum != -1 || r.TrueCount != 0 {
+		t.Errorf("dormant drift row sum=%d true=%d, want -1/0", r.ShardSum, r.TrueCount)
+	}
 }
 
 // Increments and decrements can land on different shards, so individual shard
