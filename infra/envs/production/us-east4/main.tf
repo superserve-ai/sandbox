@@ -264,10 +264,9 @@ module "sandbox_host" {
       local_dns_port = "19053"
       # Cloudflare Zero Trust Gateway DoT location endpoint.
       dot_hostname = "j0mqwd9sm7.cloudflare-gateway.com"
-      # Anycast IPs the location endpoint resolves to. VERIFY these against the
-      # live host's unbound config before a rebuild — unbound needs an IP here,
-      # not a hostname, and the migration set these out-of-band.
-      dot_upstream_addrs = ["172.64.36.1", "172.64.36.2"]
+      # Anycast IPs the location endpoint resolves to (unbound needs an IP here,
+      # not a hostname). Matches the live host's unbound config, verified 2026-07-22.
+      dot_upstream_addrs = ["162.159.36.5", "162.159.46.5"]
     })
   }
 }
