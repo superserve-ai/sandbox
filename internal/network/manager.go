@@ -826,6 +826,18 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	return true
 }
 
+// dropIfOwned removes owner's hold on idx WITHOUT returning it to freeSlots —
+// for indexes whose kernel state is still suspect (e.g. a stray host link
+// that failed to delete). The index stays unclaimable this lifetime; the next
+// boot's sweep retries it.
+func (m *Manager) dropIfOwned(idx int, owner string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.slotOwner[idx] == owner {
+		delete(m.slotOwner, idx)
+	}
+}
+
 // ClaimFreshSlot claims a fresh, unused slot index under owner without building
 // any kernel network state. The caller — a template-builder subprocess —
 // creates ns-<idx>/veth-<idx> itself; the reservation is what stops vmd's
@@ -1160,7 +1172,19 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 	for _, veth := range veths {
 		idxStr, isVeth := strings.CutPrefix(veth, "veth-")
 		idx, err := strconv.Atoi(idxStr)
-		if !isVeth || err != nil || idx < 0 {
+		if !isVeth || err != nil {
+			continue
+		}
+		if idx < 1 || idx > MaxSlots {
+			// Outside the allocator's range nothing can race us building
+			// here, and the index must never become claimable — delete the
+			// stray link and move on.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+				m.log.Info().Str("veth", veth).Msg("swept stray host veth")
+				swept++
+			}
+			cancel()
 			continue
 		}
 		// Hold the index through the delete: checking and then deleting
@@ -1176,12 +1200,19 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 		m.mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := run(ctx, "ip", "link", "del", veth); err == nil {
+		delErr := run(ctx, "ip", "link", "del", veth)
+		cancel()
+		if delErr == nil {
 			m.log.Info().Str("veth", veth).Msg("swept stray host veth")
 			swept++
+			m.releaseIfOwned(idx, teardownOwner)
+			continue
 		}
-		cancel()
-		m.releaseIfOwned(idx, teardownOwner)
+		// The link may still exist: freeing the index would let the refill
+		// loop build here and collide with it on the move-to-host step. Keep
+		// it out of the free list; the next boot's sweep retries.
+		m.log.Warn().Err(delErr).Str("veth", veth).Msg("stray host veth delete failed — index withheld")
+		m.dropIfOwned(idx, teardownOwner)
 	}
 	return swept
 }
