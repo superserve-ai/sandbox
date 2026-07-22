@@ -94,6 +94,8 @@ type Manager struct {
 	//   - a VM/record vmID   (a live VM, or a record reserving its index)
 	//   - poolOwner          (a warm/mid-build pool slot not yet handed to a VM)
 	//   - teardownOwner      (a slot being torn down; held so no one re-claims it)
+	//   - withheldOwner      (kernel state known dirty and unremovable; parked
+	//                         for this process lifetime, next boot retries)
 	// An index is free (claimable) iff it has NO entry.
 	//
 	// Identity is load-bearing, not decoration: a release/teardown acts ONLY when
@@ -790,6 +792,7 @@ func slotFromNamespace(namespace string) (int, bool) {
 const (
 	poolOwner     = "\x00pool"     // warm/mid-build pool slot, not yet a VM's
 	teardownOwner = "\x00teardown" // slot mid-teardown; held so it isn't reclaimed
+	withheldOwner = "\x00withheld" // kernel state dirty and unremovable; parked until next boot
 )
 
 // assignSlotLocked sets the owner of idx (a fresh claim or an owner transfer,
@@ -826,15 +829,17 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	return true
 }
 
-// dropIfOwned removes owner's hold on idx WITHOUT returning it to freeSlots —
-// for indexes whose kernel state is still suspect (e.g. a stray host link
-// that failed to delete). The index stays unclaimable this lifetime; the next
-// boot's sweep retries it.
-func (m *Manager) dropIfOwned(idx int, owner string) {
+// withholdIfOwned converts owner's hold on idx into a process-lifetime park —
+// for indexes whose kernel state is known dirty but couldn't be removed (e.g.
+// a stray host link that failed to delete). Merely dropping ownership would
+// only protect until the sequential allocator's high-water mark reaches the
+// index; the sentinel keeps every allocation path off it. Next boot starts
+// clean and retries.
+func (m *Manager) withholdIfOwned(idx int, owner string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.slotOwner[idx] == owner {
-		delete(m.slotOwner, idx)
+		m.slotOwner[idx] = withheldOwner
 	}
 }
 
@@ -1208,11 +1213,11 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 			m.releaseIfOwned(idx, teardownOwner)
 			continue
 		}
-		// The link may still exist: freeing the index would let the refill
-		// loop build here and collide with it on the move-to-host step. Keep
-		// it out of the free list; the next boot's sweep retries.
+		// The link may still exist: any future build here collides with it on
+		// the move-to-host step. Park the index for this process lifetime;
+		// the next boot's sweep retries.
 		m.log.Warn().Err(delErr).Str("veth", veth).Msg("stray host veth delete failed — index withheld")
-		m.dropIfOwned(idx, teardownOwner)
+		m.withholdIfOwned(idx, teardownOwner)
 	}
 	return swept
 }
