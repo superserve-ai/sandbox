@@ -42,7 +42,7 @@ for example:
 
 ```sh
 TF_VAR_notification_channel_ids='["projects/example-project/notificationChannels/123456789"]' \
-  terraform plan -input=false -no-color -out=tfplan
+  terraform -chdir=infra/envs/production/us-central1 plan -input=false -no-color -out=tfplan
 scripts/sanitize-terraform-plan.sh infra/envs/production/us-central1/tfplan > plan.txt
 ```
 
