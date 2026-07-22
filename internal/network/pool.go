@@ -476,13 +476,18 @@ func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped,
 
 	actx, cancel := context.WithTimeout(ctx, adoptSlotTimeout)
 	info, vethName, err := adoptSlotFunc(p.mgr, actx, idx)
+	// Read the budget verdict from the context itself, BEFORE cancel makes
+	// Err() unconditionally non-nil: an exec killed by the deadline surfaces
+	// as an exit error ("signal: killed"), not as DeadlineExceeded, and
+	// misreading that as a bad slot would tear down an adoptable namespace.
+	budgetExpired := errors.Is(actx.Err(), context.DeadlineExceeded)
 	cancel()
 	if err != nil {
 		switch {
 		case ctx.Err() != nil:
 			// Shutdown, not a bad slot: keep it abandoned for the next boot.
 			skipped.Add(1)
-		case errors.Is(err, context.DeadlineExceeded):
+		case budgetExpired || errors.Is(err, context.DeadlineExceeded):
 			p.log.Warn().Err(err).Int("slot", idx).
 				Msg("pool: orphan slot validation timed out — leaving for a later pass")
 			p.mgr.releaseIfOwned(idx, poolOwner)
