@@ -149,7 +149,12 @@ environments:
         # not a fresh cell: it shares the use-cell Supabase, secrets, and the
         # us-central1 Artifact Registry image repo. Only the Cloud Run service
         # name, region, and vmd host are region-local.
-        required: true
+        #
+        # required=false until the CD deploy steps for this cell land (the use4
+        # API step in deploy-api.yml and the use4 host step in deploy-vmd.yml).
+        # Declaring it required before then would mark a target CD doesn't yet
+        # push to, letting releases skew this cell. Flip to true with that wiring.
+        required: false
         api:
           platform: cloud_run
           service: superserve-api-use4

@@ -26,6 +26,12 @@ Env vars:
                        (secretsproxy authenticates callers with the same token
                        the control plane presents). Hosts previously had these
                        provisioned out-of-band via Packer/manual staging.
+  VMD_DNS_REDIRECT_PORT optional — local resolver port vmd REDIRECTs guest :53
+                       to via its SANDBOX_DNS_REDIRECT nat chain. Defaults to
+                       19053 and MUST match the unbound bootstrap's
+                       local_dns_port. Upserted into vmd.env so a rebuilt host
+                       actually wires the redirect (unbound answers there but
+                       vmd owns the redirect rules).
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
@@ -91,6 +97,8 @@ def main() -> int:
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
+    # Fleet-standard local resolver port; must match unbound's local_dns_port.
+    dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "19053")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -273,6 +281,17 @@ def main() -> int:
                     echo 'CONTROL_PLANE_URL={control_plane_url}' | sudo tee -a "$f" > /dev/null
                 done
                 sudo chmod 0600 /etc/sandbox/secretsproxy.env
+            fi
+
+            # Upsert the guest DNS redirect port so vmd rebuilds its
+            # SANDBOX_DNS_REDIRECT nat chain on a fresh host. unbound answers on
+            # this port; without the env var vmd never redirects guest :53 there
+            # and guests bypass the Cloudflare Gateway resolver.
+            if [ -n '{dns_redirect_port}' ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_DNS_REDIRECT_PORT=/d' /etc/sandbox/vmd.env
+                echo 'VMD_DNS_REDIRECT_PORT={dns_redirect_port}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert the shared control-plane auth token. vmd reads it as
