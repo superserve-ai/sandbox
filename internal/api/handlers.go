@@ -93,12 +93,14 @@ type Handlers struct {
 	authzSvc  *authz.Service
 }
 
-// asyncBookkeeping runs a fire-and-forget post-VMD bookkeeping DB write in a
-// background goroutine. These writes are off the hot path by design: the gate
-// write (BeginPause/BeginResume/create INSERT) already owns the row, and every
-// subsequent transition is status-gated, so nothing can proceed until the
-// bookkeeping lands — a racing request just sees the transitional status and
-// 409s until the write commits.
+// asyncBookkeeping runs fire-and-forget post-VMD work in a background
+// goroutine — bookkeeping DB writes, and the create path's hostname stamp.
+// This is off the hot path by design: the gate write (BeginPause/BeginResume/
+// create INSERT) already owns the row, and every subsequent transition is
+// status-gated, so nothing can proceed until the job lands — a racing request
+// just sees the transitional status and 409s until it commits. Work that
+// needs that protection must therefore run BEFORE the status flip inside the
+// same job, the way the create path orders its stamp before ActivateSandbox.
 func (h *Handlers) asyncBookkeeping(name string, fn func()) {
 	h.asyncMu.Lock()
 	h.asyncCount++
@@ -1865,7 +1867,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// (when secrets are configured) and push env vars to the running boxd.
 	// If injection fails, tear the VM down and mark the row failed — a
 	// sandbox that boots without its env vars is unusable. (Hostname-only
-	// creates are the exception; see the async branch below.)
+	// creates run the same call inside the activation goroutine instead;
+	// a failure there fails the row before it ever goes active.)
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
@@ -1894,28 +1897,26 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		secretsJWT = jwt
 	}
-	if len(envVarsToShip) == 0 && secretsJWT == "" {
-		// Only the hostname stamp would ship. Nothing in the platform reads
-		// the guest hostname (it is user-facing only) and every resume
-		// re-stamps it, so it must not gate the response; a failed stamp
-		// leaves the template hostname behind — logged, not fatal.
-		h.asyncBookkeeping("inject-hostname", func() {
-			ictx, icancel := context.WithTimeout(context.Background(), vmdTimeout)
-			defer icancel()
-			if injErr := vmd.InjectSandboxEnv(ictx, sandboxID.String(), nil, ""); injErr != nil && !isVMDUnimplemented(injErr) {
-				log.Warn().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("hostname stamp failed; sandbox keeps the template hostname")
+	// When the inject would carry nothing but the hostname stamp (the payload
+	// is exactly env vars + JWT + hostname — a new always-shipped field must
+	// join this condition), it moves off the response path: the stamp runs in
+	// the activation goroutine below, ordered before the status flip.
+	// The deeper form — vmd stamping the hostname itself during
+	// RestoreSnapshot, where the round trip is on-host — would remove this
+	// branch entirely; it needs a cross-version vmd rollout to adopt.
+	stampAsync := len(envVarsToShip) == 0 && secretsJWT == ""
+	if !stampAsync {
+		if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+			// A vmd without this RPC already applied these env vars during
+			// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
+			if secretsJWT == "" && isVMDUnimplemented(injErr) {
+				log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
+			} else {
+				log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
+				h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+				respondError(c, ErrInternal)
+				return
 			}
-		})
-	} else if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
-		// A vmd without this RPC already applied these env vars during
-		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
-		if secretsJWT == "" && isVMDUnimplemented(injErr) {
-			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
-		} else {
-			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
-			respondError(c, ErrInternal)
-			return
 		}
 	}
 
@@ -1968,6 +1969,35 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	actorID := actorIDFromContext(c)
 	activateCtx := context.WithoutCancel(c.Request.Context())
 	h.asyncBookkeeping("activate-sandbox", func() {
+		if stampAsync {
+			// The hostname stamp runs here, BEFORE the row goes active:
+			// pause and destroy are status-gated on 'active', so this
+			// ordering keeps the sync path's invariant that nothing can
+			// freeze or tear down a guest mid-stamp — and a snapshot can
+			// never capture the template hostname, which matters because
+			// the stateless-resume fallback never re-stamps. The deadline
+			// matches the sync path's budget.
+			sctx, scancel := context.WithTimeout(activateCtx, vmdTimeout)
+			tStamp := time.Now()
+			stampErr := vmd.InjectSandboxEnv(sctx, sandboxID.String(), envVarsToShip, secretsJWT)
+			scancel()
+			switch {
+			case stampErr == nil, isVMDUnimplemented(stampErr), isVMDNotFound(stampErr):
+				// NotFound: the VM is already gone (reaped); nothing to stamp.
+			default:
+				// The stamp's payload is cosmetic but its transport is not:
+				// a POST into the guest just failed — the same signal the
+				// synchronous path treats as an unusable sandbox. Fail the
+				// row instead of activating a sandbox whose guest is dead.
+				log.Error().Err(stampErr).Str("sandbox_id", sandboxID.String()).
+					Int64("stamp_ms", time.Since(tStamp).Milliseconds()).
+					Msg("post-boot guest init failed; failing sandbox instead of activating")
+				fctx, fcancel := context.WithTimeout(activateCtx, vmdTimeout)
+				defer fcancel()
+				h.failSandboxAfterBoot(fctx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+				return
+			}
+		}
 		actx, acancel := context.WithTimeout(activateCtx, asyncTimeout)
 		defer acancel()
 		if err := h.DB.ActivateSandbox(actx, db.ActivateSandboxParams{
