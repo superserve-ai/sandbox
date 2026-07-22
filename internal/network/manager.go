@@ -1064,8 +1064,6 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		if err != nil {
 			return err
 		}
-		// Attach binds names without proving the ruleset exists; a crash
-		// mid-setup leaves adoptable-looking namespaces with no enforcement.
 		if err := f.VerifyInstalled(); err != nil {
 			_ = f.Close()
 			return err

@@ -374,6 +374,11 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) {
 					if err != nil {
 						p.log.Warn().Err(err).Int("slot", idx).
 							Msg("pool: orphan slot failed validation — tearing down")
+						// Kill occupants first (mirrors the startup sweep):
+						// deleting the netns name while a process holds it
+						// leaves the namespace running anonymously, beyond
+						// the reach of adoption, sweeps, and the leak gauge.
+						killProcessesInNs(nsNameForSlot(idx))
 						p.cleanup(&preallocSlot{
 							idx:      idx,
 							info:     &VMNetInfo{Namespace: nsNameForSlot(idx)},
