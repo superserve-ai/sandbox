@@ -224,6 +224,24 @@ func AttachFirewall(cfg FirewallConfig) (*Firewall, error) {
 	}, nil
 }
 
+// VerifyInstalled confirms the kernel actually holds this firewall's chains
+// with rules in them. AttachFirewall only binds names — it succeeds against a
+// half-built namespace (a crash between chain creation and rule install), so
+// callers re-binding to state of unknown provenance must verify before
+// trusting enforcement. Must be called from within the target namespace.
+func (fw *Firewall) VerifyInstalled() error {
+	for _, ch := range []*nftables.Chain{fw.filterChain, fw.natChain, fw.postChain, fw.fwdChain} {
+		rules, err := fw.conn.GetRules(fw.table, ch)
+		if err != nil {
+			return fmt.Errorf("verify chain %s: %w", ch.Name, err)
+		}
+		if len(rules) == 0 {
+			return fmt.Errorf("verify chain %s: no rules installed", ch.Name)
+		}
+	}
+	return nil
+}
+
 // Close tears down the nftables connection. Kernel-level table and
 // rules persist across the close — they're owned by the kernel, not
 // by this netlink handle. AttachFirewall can re-bind to them later.

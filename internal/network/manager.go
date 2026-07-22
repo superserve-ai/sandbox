@@ -979,13 +979,19 @@ func (m *Manager) claimOrphanSlots() []int {
 		}
 		return nil
 	}
+	var outOfRange []int
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	var out []int
 	claimed := make(map[int]bool)
 	for _, e := range entries {
 		idx, ok := slotFromNamespace(e.Name())
 		if !ok {
+			continue
+		}
+		if idx >= MaxSlots {
+			// Outside the allocator's range: claiming it would push the
+			// high-water mark past the ceiling and starve fresh allocation.
+			outOfRange = append(outOfRange, idx)
 			continue
 		}
 		if _, owned := m.slotOwner[idx]; owned {
@@ -1008,6 +1014,16 @@ func (m *Manager) claimOrphanSlots() []int {
 			}
 		}
 		m.freeSlots = kept
+	}
+	m.mu.Unlock()
+
+	// Not adoptable — remove like the legacy sweep would (outside the lock:
+	// teardown execs kernel commands).
+	for _, idx := range outOfRange {
+		ns := nsNameForSlot(idx)
+		m.log.Warn().Str("ns", ns).Msg("adopt: namespace outside allocator range — sweeping")
+		killProcessesInNs(ns)
+		m.cleanupFull(ns, vethNameForSlot(idx))
 	}
 	return out
 }
@@ -1048,10 +1064,22 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		if err != nil {
 			return err
 		}
+		// Attach binds names without proving the ruleset exists; a crash
+		// mid-setup leaves adoptable-looking namespaces with no enforcement.
+		if err := f.VerifyInstalled(); err != nil {
+			_ = f.Close()
+			return err
+		}
+		// The previous owner's user egress sets must not survive into the
+		// pool — mirrors the recycle path's sanitation before Return.
+		if err := f.ReplaceUserRules(nil, nil); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("clear user rules: %w", err)
+		}
 		fw = f
 		return nil
 	}); err != nil {
-		return nil, "", fmt.Errorf("adopt slot %d: attach firewall: %w", idx, err)
+		return nil, "", fmt.Errorf("adopt slot %d: firewall: %w", idx, err)
 	}
 
 	// Heal the host route if it didn't survive; mirrors setupSlot's tolerance.

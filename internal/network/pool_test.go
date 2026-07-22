@@ -635,3 +635,25 @@ func TestClaimOrphanSlots_SkipsOwnedAndBumpsHighWater(t *testing.T) {
 		t.Fatalf("nextSlot must advance past adopted indexes, got %d", next)
 	}
 }
+
+func TestClaimOrphanSlots_RejectsOutOfRangeIndex(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-99999999") // beyond MaxSlots: must never enter the allocator
+	touchNS(t, dir, "ns-2")
+	m := newTestManager()
+
+	got := m.claimOrphanSlots()
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("expected only slot 2 claimed, got %v", got)
+	}
+	m.mu.Lock()
+	_, owned := m.slotOwner[99999999]
+	next := m.nextSlot
+	m.mu.Unlock()
+	if owned {
+		t.Fatal("out-of-range index must not be claimed")
+	}
+	if next > MaxSlots {
+		t.Fatalf("high-water mark must stay within the allocator range, got %d", next)
+	}
+}
