@@ -200,9 +200,12 @@ const asyncTimeout = 5 * time.Second
 // starting/resuming→active flip commits, so the owner's immediate follow-up
 // (create then exec — the canonical SDK flow) may read the pre-flip status;
 // waiting briefly preserves read-your-writes instead of 409ing it. Normally
-// the write lands in single-digit ms; a genuinely lost write still 409s once
-// the window expires. Var, not const, so tests can shrink it.
-var activateSettleWindow = 2 * time.Second
+// the write lands in single-digit ms, but a hostname-only create's stamp runs
+// before the flip and its guest round trip is bounded by the boxd client's
+// timeout — the window must outlast that bound, or a slow-but-alive guest
+// turns the canonical follow-up into a 409. A genuinely lost write still 409s
+// once the window expires. Var, not const, so tests can shrink it.
+var activateSettleWindow = 6 * time.Second
 
 // activateSettlePoll is the re-read interval within activateSettleWindow.
 const activateSettlePoll = 50 * time.Millisecond
