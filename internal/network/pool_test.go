@@ -770,3 +770,40 @@ func TestAdoptOrphanSlots_WorkerPanicReleasesAndContinues(t *testing.T) {
 		t.Fatal("panicked slot must be released so it isn't stranded invisibly")
 	}
 }
+
+// Systemic validation timeouts (a wedged host) must abort the pass instead of
+// stranding one pinned thread per candidate; the remainder is released so
+// nothing stays pool-owned and invisible.
+func TestAdoptOrphanSlots_SystemicTimeoutsAbortPass(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	for i := 1; i <= 12; i++ {
+		touchNS(t, dir, fmt.Sprintf("ns-%d", i))
+	}
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	stubAdoptSlot(t, func(*Manager, context.Context, int) (*VMNetInfo, string, error) {
+		return nil, "", fmt.Errorf("wedged: %w", context.DeadlineExceeded)
+	})
+
+	adopted, invalid, skipped := p.AdoptOrphanSlots(context.Background())
+	if adopted != 0 || invalid != 0 {
+		t.Fatalf("wedged host must not adopt or tear down: adopted=%d invalid=%d", adopted, invalid)
+	}
+	if skipped != 12 {
+		t.Fatalf("every candidate must end up skipped (judged or released), got %d", skipped)
+	}
+	m.mu.Lock()
+	stranded := 0
+	for idx, owner := range m.slotOwner {
+		if owner == poolOwner {
+			stranded++
+			t.Logf("stranded slot %d", idx)
+		}
+	}
+	m.mu.Unlock()
+	if stranded != 0 {
+		t.Fatalf("aborted pass must release every claimed index, %d stranded", stranded)
+	}
+}

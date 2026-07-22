@@ -117,6 +117,12 @@ const (
 	// adoptSlotTimeout bounds one slot's validation (a handful of ip/netlink
 	// calls); a hung namespace shouldn't stall the whole adoption pass.
 	adoptSlotTimeout = 10 * time.Second
+	// adoptTimeoutAbort ends the whole pass after this many validation
+	// timeouts. Each timeout strands one pinned OS thread in the wedged
+	// syscall, and wedges are systemic (a stuck netlink wedges every
+	// candidate) — better to stop early and leave the rest for a healthier
+	// boot than to accumulate a thread per slot.
+	adoptTimeoutAbort = 3
 )
 
 // adoptSlotFunc is a seam over Manager.adoptSlot so tests can drive adoption
@@ -387,7 +393,7 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 	if len(indexes) > 0 {
 		p.log.Info().Int("candidates", len(indexes)).Msg("pool: adopting slots left by previous run")
 
-		var nAdopted, nInvalid, nSkipped atomic.Int64
+		var nAdopted, nInvalid, nSkipped, nTimeouts atomic.Int64
 		work := make(chan int)
 		var workers sync.WaitGroup
 		for i := 0; i < adoptConcurrency; i++ {
@@ -396,13 +402,14 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 				defer workers.Done()
 				defer sentrylog.Recover("netpool-adopt")
 				for idx := range work {
-					p.adoptOne(ctx, idx, &nAdopted, &nInvalid, &nSkipped)
+					p.adoptOne(ctx, idx, &nAdopted, &nInvalid, &nSkipped, &nTimeouts)
 				}
 			}()
 		}
 
+		aborted := false
 	feed:
-		for _, idx := range indexes {
+		for i, idx := range indexes {
 			// Priority check: once shutdown fires, no more work may be
 			// dispatched — the plain select below picks randomly among ready
 			// arms, which would keep feeding a dying process.
@@ -412,6 +419,18 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 			case <-ctx.Done():
 				break feed
 			default:
+			}
+			if nTimeouts.Load() >= adoptTimeoutAbort {
+				// The host is wedged, not the slots: each timeout strands a
+				// pinned thread, so stop dispatching. Unlike a shutdown break
+				// this process lives on — release the remainder so it isn't
+				// held pool-owned and invisible to the leak gauge.
+				aborted = true
+				for _, rest := range indexes[i:] {
+					p.mgr.releaseIfOwned(rest, poolOwner)
+					nSkipped.Add(1)
+				}
+				break feed
 			}
 			select {
 			case work <- idx:
@@ -425,6 +444,10 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 		}
 		close(work)
 		workers.Wait()
+		if aborted {
+			p.log.Error().Int64("timeouts", nTimeouts.Load()).
+				Msg("pool: adoption aborted — validation timing out systemically; remaining slots left for a later boot")
+		}
 		p.log.Info().Int64("adopted", nAdopted.Load()).Int64("torn_down", nInvalid.Load()).
 			Int64("skipped", nSkipped.Load()).Msg("pool: adoption pass complete")
 		adopted, invalid, skipped = nAdopted.Load(), nInvalid.Load(), nSkipped.Load()
@@ -441,7 +464,7 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 // on a congested boot, or validation panicked. Skipped slots surface in the
 // leak gauge as orphans and are re-adopted on the next boot; destroying them
 // on an ambiguous signal would defeat abandon-on-stop.
-func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped *atomic.Int64) {
+func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped, timeouts *atomic.Int64) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.log.Error().Interface("panic", r).Int("slot", idx).
@@ -464,6 +487,7 @@ func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped 
 				Msg("pool: orphan slot validation timed out — leaving for a later pass")
 			p.mgr.releaseIfOwned(idx, poolOwner)
 			skipped.Add(1)
+			timeouts.Add(1)
 		default:
 			p.log.Warn().Err(err).Int("slot", idx).
 				Msg("pool: orphan slot failed validation — tearing down")
