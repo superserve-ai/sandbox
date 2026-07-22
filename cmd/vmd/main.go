@@ -564,8 +564,13 @@ func main() {
 	// Reserve slots held by existing VMs (so the pool can't hand out a colliding
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
-	mgr.ReserveStartupSlots(ctx)
-	mgr.SweepStartupOrphanNamespaces()
+	slotsReserved := mgr.ReserveStartupSlots(ctx)
+	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
+	if !adoptNetPool {
+		// Under adoption, orphan namespaces are warm-pool candidates instead
+		// of garbage; the adoption pass below validates or sweeps each one.
+		mgr.SweepStartupOrphanNamespaces()
+	}
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
 	if launchViaLauncherNS {
@@ -592,8 +597,24 @@ func main() {
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
+		AbandonOnStop:     adoptNetPool,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+	switch {
+	case adoptNetPool && slotsReserved:
+		// Adopt the slots the previous run abandoned (or crashed out of) in
+		// the background: the pool starts warm within seconds instead of
+		// refilling from scratch, and boot never blocks on the pass.
+		go func() {
+			defer sentrylog.Recover("netpool adoption")
+			netPool.AdoptOrphanSlots(ctx)
+		}()
+	case adoptNetPool:
+		// Without a completed reservation pass, adoption cannot tell live VM
+		// namespaces from orphans — leave everything in place; the pool
+		// refills fresh and the next healthy boot adopts.
+		log.Error().Msg("skipping network pool adoption: startup slot reservation did not complete")
+	}
 
 	// Leak gauge for network namespaces — independent of the launcher path, and
 	// started after StartPool so its first read observes an initialized pool.

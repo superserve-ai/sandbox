@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -93,6 +94,8 @@ type Manager struct {
 	//   - a VM/record vmID   (a live VM, or a record reserving its index)
 	//   - poolOwner          (a warm/mid-build pool slot not yet handed to a VM)
 	//   - teardownOwner      (a slot being torn down; held so no one re-claims it)
+	//   - withheldOwner      (kernel state known dirty and unremovable; parked
+	//                         for this process lifetime, next boot retries)
 	// An index is free (claimable) iff it has NO entry.
 	//
 	// Identity is load-bearing, not decoration: a release/teardown acts ONLY when
@@ -304,6 +307,15 @@ func hostIPForSlot(idx int) string {
 	return fmt.Sprintf("10.11.%d.%d", idx/256, idx%256)
 }
 
+// Deterministic slot identity: everything about a slot derives from its index,
+// which is what makes namespaces left by a previous vmd lifetime adoptable —
+// the kernel objects carry all the state, nothing needs to be persisted.
+func nsNameForSlot(idx int) string    { return fmt.Sprintf("ns-%d", idx) }
+func vethNameForSlot(idx int) string  { return fmt.Sprintf("veth-%d", idx) }
+func vpeerIPForSlot(idx int) string   { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
+func vethIPForSlot(idx int) string    { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
+func macForSlot(idx int) string       { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
+
 // setupSlot runs the expensive network setup (namespace, veth, TAP,
 // nftables, routing) for a single slot index. Used by both SetupVM
 // (on-demand) and Pool (pre-allocation).
@@ -312,10 +324,10 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	// runs (pool/on-demand), and record paths reserve it. On success the slot is
 	// live and stays owned; on failure the caller releases idx (freeSlot).
 	hostIP := hostIPForSlot(idx)
-	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
-	vethIP := fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256)
-	nsName := fmt.Sprintf("ns-%d", idx)
-	vethName := fmt.Sprintf("veth-%d", idx)
+	vpeerIP := vpeerIPForSlot(idx)
+	vethIP := vethIPForSlot(idx)
+	nsName := nsNameForSlot(idx)
+	vethName := vethNameForSlot(idx)
 	vpeerName := "eth0"
 	hostCIDR := fmt.Sprintf("%s/32", hostIP)
 
@@ -400,7 +412,7 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		m.log.Debug().Err(err).Str("ns", nsName).Msg("host route (may already exist)")
 	}
 
-	mac := fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256)
+	mac := macForSlot(idx)
 
 	info := &VMNetInfo{
 		Namespace:  nsName,
@@ -780,6 +792,7 @@ func slotFromNamespace(namespace string) (int, bool) {
 const (
 	poolOwner     = "\x00pool"     // warm/mid-build pool slot, not yet a VM's
 	teardownOwner = "\x00teardown" // slot mid-teardown; held so it isn't reclaimed
+	withheldOwner = "\x00withheld" // kernel state dirty and unremovable; parked until next boot
 )
 
 // assignSlotLocked sets the owner of idx (a fresh claim or an owner transfer,
@@ -814,6 +827,20 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	delete(m.slotOwner, idx)
 	m.freeSlots = append(m.freeSlots, idx)
 	return true
+}
+
+// withholdIfOwned converts owner's hold on idx into a process-lifetime park —
+// for indexes whose kernel state is known dirty but couldn't be removed (e.g.
+// a stray host link that failed to delete). Merely dropping ownership would
+// only protect until the sequential allocator's high-water mark reaches the
+// index; the sentinel keeps every allocation path off it. Next boot starts
+// clean and retries.
+func (m *Manager) withholdIfOwned(idx int, owner string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.slotOwner[idx] == owner {
+		m.slotOwner[idx] = withheldOwner
+	}
 }
 
 // ClaimFreshSlot claims a fresh, unused slot index under owner without building
@@ -954,6 +981,259 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 		}
 	}
 
+	return swept
+}
+
+// claimOrphanSlots takes ownership of every ns-N namespace present in the
+// kernel but owned by nothing — slots a previous vmd lifetime left behind
+// (graceful abandon and crash look identical here). Reservation happens in one
+// locked pass before any validation, so the refill loop can never build over a
+// namespace that is about to be adopted. Callers must either adopt or tear
+// down every returned index; the ownership taken here is not dropped otherwise.
+func (m *Manager) claimOrphanSlots() []int {
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.log.Warn().Err(err).Msg("adopt: list netns dir failed")
+		}
+		return nil
+	}
+	var outOfRange []int
+	m.mu.Lock()
+	var out []int
+	claimed := make(map[int]bool)
+	for _, e := range entries {
+		idx, ok := slotFromNamespace(e.Name())
+		if !ok {
+			continue
+		}
+		// Ownership outranks everything: a record or pinned build may hold any
+		// index, including ones a changed ceiling would now call out of range.
+		if _, owned := m.slotOwner[idx]; owned {
+			continue
+		}
+		if idx < 1 || idx > MaxSlots {
+			// Outside the allocator's range: it starts at 1 and hands out up
+			// to and including MaxSlots. Below it: ns-0 is never built (and a
+			// long-enough name overflows slotFromNamespace negative); above
+			// it, claiming would push the high-water mark past the ceiling
+			// and starve fresh allocation.
+			outOfRange = append(outOfRange, idx)
+			continue
+		}
+		m.assignSlotLocked(idx, poolOwner)
+		claimed[idx] = true
+		if idx >= m.nextSlot {
+			m.nextSlot = idx + 1
+		}
+		out = append(out, idx)
+	}
+	if len(claimed) > 0 && len(m.freeSlots) > 0 {
+		// Preserve the freeSlots invariant (never overlaps slotOwner) rather
+		// than lean on claimSlotIndex's discard path to absorb the breach.
+		kept := m.freeSlots[:0]
+		for _, idx := range m.freeSlots {
+			if !claimed[idx] {
+				kept = append(kept, idx)
+			}
+		}
+		m.freeSlots = kept
+	}
+	m.mu.Unlock()
+
+	// Not adoptable — remove like the legacy sweep would (outside the lock:
+	// teardown execs kernel commands).
+	for _, idx := range outOfRange {
+		ns := nsNameForSlot(idx)
+		m.log.Warn().Str("ns", ns).Msg("adopt: namespace outside allocator range — sweeping")
+		killProcessesInNs(ns)
+		m.cleanupFull(ns, vethNameForSlot(idx))
+	}
+	return out
+}
+
+// adoptSlot rebuilds the identity of an existing ns-<idx> so it can re-enter
+// the pool: kills any occupant, verifies the veth pair and the peer's derived
+// address, reinstalls the current base firewall from scratch, and re-adds the
+// host route (idempotent). The structural checks double as the layout/version
+// check, so a namespace built by an incompatible vmd fails here and gets torn
+// down. tap0 is NOT checked: adopted slots always rebuild it before recycling
+// (unknown provenance — the previous owner may have died holding its fd).
+func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, error) {
+	nsName := nsNameForSlot(idx)
+	vethName := vethNameForSlot(idx)
+	hostIP := hostIPForSlot(idx)
+
+	if !nsExists(nsName) {
+		return nil, "", fmt.Errorf("adopt slot %d: namespace vanished", idx)
+	}
+	// Kill any occupant and prove the namespace empty before touching
+	// enforcement: SIGKILL is asynchronous for a process in an uninterruptible
+	// wait, and the firewall rewrite below would leave a still-running
+	// workload without its egress restrictions (briefly without any table at
+	// all). A failed /proc scan is "don't know", never "empty". If emptiness
+	// can't be proven within the slot's budget, the caller skips the slot —
+	// with the occupant's rules untouched.
+	killProcessesInNs(nsName)
+	for {
+		pids, ok := pidsInNsFunc(nsName)
+		if ok && len(pids) == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, "", fmt.Errorf("adopt slot %d: namespace still occupied: %w", idx, ctx.Err())
+		case <-time.After(defaultVerifyPollInterval):
+		}
+	}
+
+	if _, err := os.Stat("/sys/class/net/" + vethName); err != nil {
+		return nil, "", fmt.Errorf("adopt slot %d: host veth missing: %w", idx, err)
+	}
+
+	fwCfg := FirewallConfig{
+		TAPInterface: TAPName,
+		VethPeer:     "eth0",
+		VMIP:         VMInternalIP,
+		HostIP:       hostIP,
+		GatewayIP:    VMGatewayIP,
+	}
+	// The in-namespace work (netlink, nftables) cannot observe ctx once it is
+	// on the pinned thread, and a wedged netlink socket would otherwise hang
+	// the adoption worker forever — bound it from outside. On timeout the
+	// abandoned goroutine is reaped when (if) it finishes: its thread stays
+	// pinned until then, an accepted, bounded cost of surviving a wedge.
+	type nsResult struct {
+		fw  *Firewall
+		err error
+	}
+	resCh := make(chan nsResult, 1)
+	go func() {
+		var fw *Firewall
+		err := nsExecGo(nsName, func() error {
+			iface, err := net.InterfaceByName("eth0")
+			if err != nil {
+				return fmt.Errorf("in-namespace peer missing: %w", err)
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				return fmt.Errorf("peer addrs: %w", err)
+			}
+			want := vpeerIPForSlot(idx)
+			found := false
+			for _, a := range addrs {
+				if strings.HasPrefix(a.String(), want+"/") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("peer address mismatch: want %s", want)
+			}
+			f, err := ReinstallFirewall(fwCfg)
+			if err != nil {
+				return err
+			}
+			fw = f
+			return nil
+		})
+		resCh <- nsResult{fw: fw, err: err}
+	}()
+	var fw *Firewall
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return nil, "", fmt.Errorf("adopt slot %d: %w", idx, res.err)
+		}
+		fw = res.fw
+	case <-ctx.Done():
+		go func() {
+			if res := <-resCh; res.fw != nil {
+				_ = res.fw.Close()
+			}
+		}()
+		return nil, "", fmt.Errorf("adopt slot %d: namespace validation: %w", idx, ctx.Err())
+	}
+
+	// Both routes must exist for the claimed VM to work — host side to reach
+	// it, namespace side for its outbound traffic — and a crash can strand a
+	// namespace between address config and route install. Replace is
+	// idempotent, so any failure means the slot is structurally broken.
+	if err := run(ctx, "ip", "route", "replace", hostIP+"/32", "via", vpeerIPForSlot(idx), "dev", vethName); err != nil {
+		_ = fw.Close()
+		return nil, "", fmt.Errorf("adopt slot %d: host route: %w", idx, err)
+	}
+	if err := nsRun(ctx, nsName, "ip", "route", "replace", "default", "via", vethIPForSlot(idx)); err != nil {
+		_ = fw.Close()
+		return nil, "", fmt.Errorf("adopt slot %d: namespace default route: %w", idx, err)
+	}
+	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
+
+	return &VMNetInfo{
+		Namespace:  nsName,
+		TAPDevice:  TAPName,
+		VMIP:       VMInternalIP,
+		GatewayIP:  VMGatewayIP,
+		HostIP:     hostIP,
+		MACAddress: macForSlot(idx),
+		Firewall:   fw,
+	}, vethName, nil
+}
+
+// SweepStrayHostVeths deletes host-side veth-N interfaces whose namespace is
+// gone and whose slot nothing owns — leftovers of a namespace deletion that
+// raced the host-side link. Owned slots are skipped: a mid-build pool slot
+// parks its veth on the host before the namespace side is complete.
+func (m *Manager) SweepStrayHostVeths() (swept int) {
+	veths, err := listHostVeths()
+	if err != nil {
+		return 0
+	}
+	for _, veth := range veths {
+		idxStr, isVeth := strings.CutPrefix(veth, "veth-")
+		idx, err := strconv.Atoi(idxStr)
+		if !isVeth || err != nil {
+			continue
+		}
+		if idx < 1 || idx > MaxSlots {
+			// Outside the allocator's range nothing can race us building
+			// here, and the index must never become claimable — delete the
+			// stray link and move on.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+				m.log.Info().Str("veth", veth).Msg("swept stray host veth")
+				swept++
+			}
+			cancel()
+			continue
+		}
+		// Hold the index through the delete: checking and then deleting
+		// unowned would race the refill loop building a fresh slot at this
+		// idx between the check and the `ip link del` — which would sever a
+		// brand-new live slot's host side.
+		m.mu.Lock()
+		if _, owned := m.slotOwner[idx]; owned || nsExists(nsNameForSlot(idx)) {
+			m.mu.Unlock()
+			continue
+		}
+		m.assignSlotLocked(idx, teardownOwner)
+		m.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		delErr := run(ctx, "ip", "link", "del", veth)
+		cancel()
+		if delErr == nil {
+			m.log.Info().Str("veth", veth).Msg("swept stray host veth")
+			swept++
+			m.releaseIfOwned(idx, teardownOwner)
+			continue
+		}
+		// The link may still exist: any future build here collides with it on
+		// the move-to-host step. Park the index for this process lifetime;
+		// the next boot's sweep retries.
+		m.log.Warn().Err(delErr).Str("veth", veth).Msg("stray host veth delete failed — index withheld")
+		m.withholdIfOwned(idx, teardownOwner)
+	}
 	return swept
 }
 

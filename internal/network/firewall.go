@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -222,6 +223,27 @@ func AttachFirewall(cfg FirewallConfig) (*Firewall, error) {
 		hostIP:             cfg.HostIP,
 		gatewayIP:          cfg.GatewayIP,
 	}, nil
+}
+
+// ReinstallFirewall replaces whatever nftables state a namespace carries with
+// the current base ruleset: any existing table — complete, stale, or half
+// built — is deleted, then NewFirewall installs from scratch. AttachFirewall
+// only binds names and would silently trust the previous writer's rules, so
+// re-binding to state of unknown provenance must rebuild instead. Must be
+// called from within the target namespace, with no live occupant (the delete
+// briefly drops enforcement).
+func ReinstallFirewall(cfg FirewallConfig) (*Firewall, error) {
+	conn, err := nftables.New()
+	if err != nil {
+		return nil, fmt.Errorf("new nftables conn: %w", err)
+	}
+	conn.DelTable(&nftables.Table{Name: tableName, Family: nftables.TableFamilyINet})
+	if err := conn.Flush(); err != nil && !errors.Is(err, unix.ENOENT) {
+		// Anything but "no such table" means the stale table may survive —
+		// installing over it would append duplicate rules, so fail instead.
+		return nil, fmt.Errorf("delete stale table: %w", err)
+	}
+	return NewFirewall(cfg)
 }
 
 // Close tears down the nftables connection. Kernel-level table and
