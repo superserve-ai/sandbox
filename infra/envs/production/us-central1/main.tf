@@ -47,8 +47,11 @@ module "network" {
   create_network = var.create_network
   network_name   = var.network_name
 
-  subnet_name = "superserve-prod-subnet"
-  subnet_cidr = var.subnet_cidr
+  subnet_name            = "superserve-prod-subnet"
+  subnet_cidr            = var.subnet_cidr
+  manage_public_ssh_deny = true
+  enable_iap_ssh         = true
+  iap_ssh_target_tags    = ["superserve-vmd"]
 
   create_vpc_connector        = true
   create_vpc_connector_subnet = false
@@ -64,22 +67,14 @@ module "network" {
       name          = "superserve-prod-allow-internal"
       direction     = "INGRESS"
       source_ranges = [var.subnet_cidr]
-      target_tags   = []
+      target_tags   = ["superserve-vmd"]
       allow = [
         {
-          protocol = "icmp"
-          ports    = []
-        },
-        {
           protocol = "tcp"
-          ports    = ["0-65535"]
-        },
-        {
-          protocol = "udp"
-          ports    = ["0-65535"]
+          ports    = ["5007", "5008", "50051"]
         }
       ]
-      description = null
+      description = "Allow private host-to-host sandbox control traffic only."
     }
     allow_otel_ingress = {
       name          = "superserve-prod-allow-cr-to-host-otel"
@@ -93,6 +88,17 @@ module "network" {
         }
       ]
       description = "Allow Cloud Run connector traffic to host-local OTLP endpoints."
+    }
+    allow_vmd_grpc = {
+      name          = "superserve-prod-allow-cr-to-host-vmd"
+      direction     = "INGRESS"
+      source_ranges = [var.connector_subnet_cidr]
+      target_tags   = ["superserve-vmd"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["50051"]
+      }]
+      description = "Allow Cloud Run connector traffic to the host VMD gRPC endpoint."
     }
   }
 
