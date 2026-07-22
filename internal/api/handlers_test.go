@@ -1586,14 +1586,19 @@ func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {
 	if body := parseJSON(t, w); body["status"] != "active" {
 		t.Errorf("status = %q, want active", body["status"])
 	}
+	// The no-env stamp runs behind the response; drain it so the stub
+	// outlives the goroutine.
+	h.WaitAsyncBookkeeping()
 }
 
 func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
-	// A real injection failure (not Unimplemented) has no fallback: the VM is
-	// torn down and the request fails.
+	// A real injection failure (not Unimplemented) on a create that ships env
+	// vars has no fallback: the VM is torn down and the request fails. Env
+	// vars in the request keep this on the synchronous path — a hostname-only
+	// create handles the same failure asynchronously (test below).
 	var destroyed bool
 	vmd := &stubVMD{
 		injectEnvFn: func(context.Context, string, map[string]string, string) error {
@@ -1625,13 +1630,79 @@ func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb","env_vars":{"FOO":"bar"}}`))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
 	}
 	if !destroyed {
 		t.Error("VM was not torn down after injection failure")
+	}
+}
+
+// A create with nothing to inject but the hostname must not pay for — or fail
+// on — the guest round trip: the stamp runs behind the response, and its
+// failure leaves the sandbox alive with the template hostname.
+func TestCreateSandbox_HostnameStampAsyncAndNonFatal(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	injectStarted := make(chan struct{})
+	injectRelease := make(chan struct{})
+	var destroyed atomic.Bool
+	vmd := &stubVMD{
+		injectEnvFn: func(_ context.Context, _ string, envVars map[string]string, jwt string) error {
+			close(injectStarted)
+			<-injectRelease // hold the stamp until the response is asserted
+			if len(envVars) != 0 || jwt != "" {
+				t.Errorf("hostname-only path must ship no env/jwt, got env=%v jwt=%q", envVars, jwt)
+			}
+			return status.Error(codes.Internal, "post-init failed")
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	// The response must not have waited for the (still-held) stamp.
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	select {
+	case <-injectStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hostname stamp was never attempted")
+	}
+	close(injectRelease)
+	h.WaitAsyncBookkeeping()
+
+	// The async failure must not have torn the sandbox down.
+	if destroyed.Load() {
+		t.Error("async hostname-stamp failure must not destroy the sandbox")
 	}
 }
 

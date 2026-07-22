@@ -1864,7 +1864,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// Phase 2: with the source IP known, mint the per-sandbox secrets JWT
 	// (when secrets are configured) and push env vars to the running boxd.
 	// If injection fails, tear the VM down and mark the row failed — a
-	// sandbox that boots without its env vars is unusable.
+	// sandbox that boots without its env vars is unusable. (Hostname-only
+	// creates are the exception; see the async branch below.)
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
@@ -1893,7 +1894,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		secretsJWT = jwt
 	}
-	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+	if len(envVarsToShip) == 0 && secretsJWT == "" {
+		// Only the hostname stamp would ship. Nothing in the platform reads
+		// the guest hostname (it is user-facing only) and every resume
+		// re-stamps it, so it must not gate the response; a failed stamp
+		// leaves the template hostname behind — logged, not fatal.
+		h.asyncBookkeeping("inject-hostname", func() {
+			ictx, icancel := context.WithTimeout(context.Background(), vmdTimeout)
+			defer icancel()
+			if injErr := vmd.InjectSandboxEnv(ictx, sandboxID.String(), nil, ""); injErr != nil && !isVMDUnimplemented(injErr) {
+				log.Warn().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("hostname stamp failed; sandbox keeps the template hostname")
+			}
+		})
+	} else if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
 		// A vmd without this RPC already applied these env vars during
 		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
 		if secretsJWT == "" && isVMDUnimplemented(injErr) {
