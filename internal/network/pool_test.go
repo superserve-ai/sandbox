@@ -486,3 +486,152 @@ func TestPoolReturn_FailedScanIsNotTreatedAsClear(t *testing.T) {
 		t.Fatal("slot never recycled once scans started succeeding")
 	}
 }
+
+// stubAdoptSlot overrides adoptSlotFunc for the duration of the test, so
+// adoption runs without real kernel namespaces.
+func stubAdoptSlot(t *testing.T, fn func(m *Manager, ctx context.Context, idx int) (*VMNetInfo, string, error)) {
+	t.Helper()
+	old := adoptSlotFunc
+	adoptSlotFunc = fn
+	t.Cleanup(func() { adoptSlotFunc = old })
+}
+
+func TestPoolStop_AbandonLeavesSlotsOwnedAndIntact(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	// A verify goroutine is parked on an occupied namespace when Stop fires.
+	stubPidsInNs(t, func(string) ([]int, bool) { return []int{1234}, true })
+	m.mu.Lock()
+	m.assignSlotLocked(3, poolOwner)
+	m.mu.Unlock()
+	p.Return(&preallocSlot{idx: 3, info: &VMNetInfo{Namespace: "ns-3"}, vethName: "veth-3"})
+
+	// A warm slot is sitting in the fresh channel.
+	m.mu.Lock()
+	m.assignSlotLocked(4, poolOwner)
+	m.mu.Unlock()
+	p.fresh <- &preallocSlot{idx: 4, info: &VMNetInfo{Namespace: "ns-4"}, vethName: "veth-4"}
+
+	done := make(chan struct{})
+	go func() { p.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("abandon-on-stop Stop did not return promptly")
+	}
+
+	// Both slots must remain pool-owned (abandoned, not torn down) so the
+	// next process's adoption pass finds a consistent kernel state.
+	m.mu.Lock()
+	o3, o4 := m.slotOwner[3], m.slotOwner[4]
+	m.mu.Unlock()
+	if o3 != poolOwner || o4 != poolOwner {
+		t.Fatalf("abandoned slots must stay owned: slot3=%q slot4=%q", o3, o4)
+	}
+}
+
+func TestPoolStop_LegacyTearsDownParkedVerify(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	stubPidsInNs(t, func(string) ([]int, bool) { return []int{1234}, true })
+	m.mu.Lock()
+	m.assignSlotLocked(3, poolOwner)
+	m.mu.Unlock()
+	p.Return(&preallocSlot{idx: 3, info: &VMNetInfo{Namespace: "ns-3"}, vethName: "veth-3"})
+
+	p.Stop()
+
+	m.mu.Lock()
+	_, owned := m.slotOwner[3]
+	m.mu.Unlock()
+	if owned {
+		t.Fatal("legacy Stop must tear down and release the parked slot")
+	}
+}
+
+func TestAdoptOrphanSlots_ValidSlotBecomesClaimable(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-7")
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	var resets atomic.Int64
+	stubResetTap(t, func(*Manager, context.Context, string) error { resets.Add(1); return nil })
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		return &VMNetInfo{Namespace: nsNameForSlot(idx), HostIP: hostIPForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	p.AdoptOrphanSlots(context.Background())
+
+	// Adoption must force the tap rebuild even with resetTapOnRecycle off.
+	if resets.Load() != 1 {
+		t.Fatalf("adopted slot must rebuild its tap, got %d resets", resets.Load())
+	}
+	info := p.Claim("vm-new")
+	if info == nil || info.Namespace != "ns-7" {
+		t.Fatalf("adopted slot must be claimable, got %+v", info)
+	}
+	m.mu.Lock()
+	owner := m.slotOwner[7]
+	m.mu.Unlock()
+	if owner != "vm-new" {
+		t.Fatalf("claimed adopted slot must transfer ownership, got %q", owner)
+	}
+}
+
+func TestAdoptOrphanSlots_InvalidSlotTornDown(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-7")
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	stubAdoptSlot(t, func(*Manager, context.Context, int) (*VMNetInfo, string, error) {
+		return nil, "", errors.New("host veth missing")
+	})
+
+	p.AdoptOrphanSlots(context.Background())
+
+	m.mu.Lock()
+	_, owned := m.slotOwner[7]
+	m.mu.Unlock()
+	if owned {
+		t.Fatal("invalid orphan must be torn down and its index released")
+	}
+	if got := p.Claim("vm-new"); got != nil {
+		t.Fatalf("nothing should be claimable, got %+v", got)
+	}
+}
+
+func TestClaimOrphanSlots_SkipsOwnedAndBumpsHighWater(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	touchNS(t, dir, "ns-6")
+	touchNS(t, dir, "not-a-slot")
+	m := newTestManager()
+	m.mu.Lock()
+	m.assignSlotLocked(1, "vm-live") // reserved by a record: not adoptable
+	m.mu.Unlock()
+
+	got := m.claimOrphanSlots()
+	if len(got) != 1 || got[0] != 6 {
+		t.Fatalf("expected exactly slot 6 claimed, got %v", got)
+	}
+	m.mu.Lock()
+	owner := m.slotOwner[6]
+	next := m.nextSlot
+	m.mu.Unlock()
+	if owner != poolOwner {
+		t.Fatalf("claimed orphan must be pool-owned, got %q", owner)
+	}
+	if next <= 6 {
+		t.Fatalf("nextSlot must advance past adopted indexes, got %d", next)
+	}
+}

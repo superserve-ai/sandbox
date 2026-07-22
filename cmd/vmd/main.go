@@ -565,7 +565,12 @@ func main() {
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
 	mgr.ReserveStartupSlots(ctx)
-	mgr.SweepStartupOrphanNamespaces()
+	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
+	if !adoptNetPool {
+		// Under adoption, orphan namespaces are warm-pool candidates instead
+		// of garbage; the adoption pass below validates or sweeps each one.
+		mgr.SweepStartupOrphanNamespaces()
+	}
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
 	if launchViaLauncherNS {
@@ -592,8 +597,18 @@ func main() {
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
+		AbandonOnStop:     adoptNetPool,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+	if adoptNetPool {
+		// Adopt the slots the previous run abandoned (or crashed out of) in
+		// the background: the pool starts warm within seconds instead of
+		// refilling from scratch, and boot never blocks on the pass.
+		go func() {
+			defer sentrylog.Recover("netpool adoption")
+			netPool.AdoptOrphanSlots(ctx)
+		}()
+	}
 
 	// Leak gauge for network namespaces — independent of the launcher path, and
 	// started after StartPool so its first read observes an initialized pool.

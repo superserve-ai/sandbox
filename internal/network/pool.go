@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -23,6 +24,11 @@ type PoolConfig struct {
 	// ResetTapOnRecycle recreates a returned slot's tap0 before it is made
 	// claimable again (see verifyAndRecycle). Off by default.
 	ResetTapOnRecycle bool
+	// AbandonOnStop makes Stop leave warm slots in the kernel instead of
+	// tearing them down, so shutdown is near-instant regardless of pool depth
+	// and the next process adopts the slots via AdoptOrphanSlots. Off by
+	// default (legacy teardown).
+	AbandonOnStop bool
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -48,6 +54,9 @@ type Pool struct {
 
 	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
 	resetTapOnRecycle bool
+	// abandonOnStop: Stop leaves slots in the kernel for the next process
+	// to adopt instead of tearing them down (see PoolConfig.AbandonOnStop).
+	abandonOnStop bool
 	// resetSem bounds concurrent tap rebuilds so a mass delete's returns can't
 	// fork-storm the kernel's netlink lock.
 	resetSem chan struct{}
@@ -60,6 +69,10 @@ type preallocSlot struct {
 	info *VMNetInfo
 	// vethName is needed for cleanup if the slot is never claimed.
 	vethName string
+	// forceTapReset rebuilds tap0 in verifyAndRecycle regardless of the
+	// pool-level flag. Set on adopted slots: their provenance is unknown, and
+	// a previous owner may have died holding the tap fd.
+	forceTapReset bool
 }
 
 // pidsInNsFunc is a seam over pidsInNs so tests can simulate a namespace
@@ -90,7 +103,22 @@ const (
 	// under a second, and a tight bound keeps a stalled backlog (and Stop)
 	// from dragging.
 	resetTapTimeout = 3 * time.Second
+	// abandonStopWait bounds Stop's wait for in-flight pool goroutines under
+	// abandon-on-stop. Only quiesces logging — abandoned slots are recovered
+	// by boot-time adoption regardless.
+	abandonStopWait = 2 * time.Second
+	// adoptConcurrency bounds parallel orphan adoptions: each runs /proc
+	// scans and possibly a tap rebuild, and boot is exactly when the host is
+	// also reattaching VMs — keep the sweep gentle.
+	adoptConcurrency = 4
+	// adoptSlotTimeout bounds one slot's validation (a handful of ip/netlink
+	// calls); a hung namespace shouldn't stall the whole adoption pass.
+	adoptSlotTimeout = 10 * time.Second
 )
+
+// adoptSlotFunc is a seam over Manager.adoptSlot so tests can drive adoption
+// without real kernel namespaces.
+var adoptSlotFunc = (*Manager).adoptSlot
 
 // StartPool creates the network slot pool and fills it in the background, so
 // startup (and the gRPC readiness gate) doesn't block on ~newSize slot setups;
@@ -114,6 +142,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		recycled:          make(chan *preallocSlot, recycleSize),
 		stopCh:            make(chan struct{}),
 		resetTapOnRecycle: cfg.ResetTapOnRecycle,
+		abandonOnStop:     cfg.AbandonOnStop,
 		resetSem:          make(chan struct{}, resetTapConcurrency),
 	}
 	m.pool = p
@@ -245,14 +274,14 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		select {
 		case <-time.After(pollInterval):
 		case <-p.stopCh:
-			p.cleanup(slot)
+			p.stopSlot(slot)
 			return
 		}
 	}
 
 	// Process-free doesn't prove tap0's fd is released, so rebuild the tap
 	// before recycling; if it can't be rebuilt, tear down instead.
-	if p.resetTapOnRecycle {
+	if p.resetTapOnRecycle || slot.forceTapReset {
 		// A full recycle pool means this slot is headed for teardown anyway —
 		// skip the rebuild rather than pay it for a slot about to be destroyed
 		// (mass deletes overflow the pool by design). Racy but safe: the send
@@ -266,7 +295,7 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		select {
 		case p.resetSem <- struct{}{}:
 		case <-p.stopCh:
-			p.cleanup(slot)
+			p.stopSlot(slot)
 			return
 		}
 		poolFull, err := func() (bool, error) {
@@ -300,16 +329,115 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		// Stop() closes p.recycled only after p.wg.Wait() returns, and this
 		// goroutine holds a wg slot until it returns — so stopCh firing here
 		// (pool shutting down mid-verify) can't race a send on a closed channel.
-		p.cleanup(slot)
+		p.stopSlot(slot)
 	default:
 		// Recycle pool full — tear down (cleanup releases the pool's ownership).
 		p.cleanup(slot)
 	}
 }
 
-// Stop drains both pools and cleans up unclaimed slots.
+// stopSlot disposes of a slot the shutdown path can no longer place: torn
+// down under legacy shutdown, left in the kernel under abandon-on-stop (the
+// next process adopts or sweeps it — a graceful stop and a crash leave the
+// host in the same state, so boot only needs one recovery path).
+func (p *Pool) stopSlot(slot *preallocSlot) {
+	if p.abandonOnStop {
+		return
+	}
+	p.cleanup(slot)
+}
+
+// AdoptOrphanSlots claims every namespace a previous vmd lifetime left behind
+// and feeds the valid ones through the recycle verification path, so a restart
+// starts with a warm pool instead of rebuilding it from scratch. Slots that
+// fail validation are torn down. Must run after startup slot reservation (so
+// record-owned indexes are never candidates); returns when the pass completes.
+func (p *Pool) AdoptOrphanSlots(ctx context.Context) {
+	indexes := p.mgr.claimOrphanSlots()
+	if len(indexes) > 0 {
+		p.log.Info().Int("candidates", len(indexes)).Msg("pool: adopting slots left by previous run")
+
+		var validated, invalid atomic.Int64
+		work := make(chan int)
+		var workers sync.WaitGroup
+		for i := 0; i < adoptConcurrency; i++ {
+			workers.Add(1)
+			p.wg.Add(1)
+			go func() {
+				defer workers.Done()
+				defer p.wg.Done()
+				defer sentrylog.Recover("netpool-adopt")
+				for idx := range work {
+					actx, cancel := context.WithTimeout(ctx, adoptSlotTimeout)
+					info, vethName, err := adoptSlotFunc(p.mgr, actx, idx)
+					cancel()
+					if err != nil {
+						p.log.Warn().Err(err).Int("slot", idx).
+							Msg("pool: orphan slot failed validation — tearing down")
+						p.cleanup(&preallocSlot{
+							idx:      idx,
+							info:     &VMNetInfo{Namespace: nsNameForSlot(idx)},
+							vethName: vethNameForSlot(idx),
+						})
+						invalid.Add(1)
+						continue
+					}
+					p.verifyAndRecycle(&preallocSlot{
+						idx:           idx,
+						info:          info,
+						vethName:      vethName,
+						forceTapReset: true,
+					})
+					validated.Add(1)
+				}
+			}()
+		}
+
+	feed:
+		for _, idx := range indexes {
+			select {
+			case work <- idx:
+			case <-p.stopCh:
+				// Shutdown mid-pass: un-fed indexes stay claimed and in the
+				// kernel — the same abandoned state the next boot adopts from.
+				break feed
+			case <-ctx.Done():
+				break feed
+			}
+		}
+		close(work)
+		workers.Wait()
+		p.log.Info().Int64("adopted", validated.Load()).Int64("torn_down", invalid.Load()).
+			Msg("pool: adoption pass complete")
+	}
+
+	p.mgr.SweepStrayHostVeths()
+}
+
+// Stop shuts the pool down. Under abandon-on-stop, warm slots are left in the
+// kernel for the next process to adopt and Stop returns near-instantly —
+// per-slot teardown scales with pool depth and host congestion, and vmd's
+// exit gates the restart's whole unavailability window. Legacy mode drains
+// both pools and cleans up every unclaimed slot.
 func (p *Pool) Stop() {
 	close(p.stopCh)
+
+	if p.abandonOnStop {
+		// Bounded wait purely to let in-flight goroutines observe stopCh and
+		// quiesce; slots stay in the kernel either way, so an expired wait
+		// abandons nothing that boot-time adoption doesn't already cover.
+		done := make(chan struct{})
+		go func() { p.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(abandonStopWait):
+			p.log.Warn().Msg("pool: in-flight workers still settling at exit — slots remain adoptable")
+		}
+		p.log.Info().Int("fresh", len(p.fresh)).Int("recycled", len(p.recycled)).
+			Msg("network pool stopped (slots abandoned for adoption)")
+		return
+	}
+
 	p.wg.Wait()
 
 	close(p.fresh)
@@ -354,10 +482,10 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		select {
 		case p.fresh <- slot:
 		case <-p.stopCh:
-			p.cleanup(slot)
+			p.stopSlot(slot)
 			return
 		case <-ctx.Done():
-			p.cleanup(slot)
+			p.stopSlot(slot)
 			return
 		}
 	}
