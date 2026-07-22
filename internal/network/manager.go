@@ -1067,10 +1067,25 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	if !nsExists(nsName) {
 		return nil, "", fmt.Errorf("adopt slot %d: namespace vanished", idx)
 	}
-	// Kill first: everything below rewrites enforcement state, which must
-	// never happen around a live occupant (a crash can strand a workload here
-	// with its egress restrictions still configured).
+	// Kill any occupant and prove the namespace empty before touching
+	// enforcement: SIGKILL is asynchronous for a process in an uninterruptible
+	// wait, and the firewall rewrite below would leave a still-running
+	// workload without its egress restrictions (briefly without any table at
+	// all). A failed /proc scan is "don't know", never "empty". If emptiness
+	// can't be proven within the slot's budget, the caller skips the slot —
+	// with the occupant's rules untouched.
 	killProcessesInNs(nsName)
+	for {
+		pids, ok := pidsInNsFunc(nsName)
+		if ok && len(pids) == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, "", fmt.Errorf("adopt slot %d: namespace still occupied: %w", idx, ctx.Err())
+		case <-time.After(defaultVerifyPollInterval):
+		}
+	}
 
 	if _, err := os.Stat("/sys/class/net/" + vethName); err != nil {
 		return nil, "", fmt.Errorf("adopt slot %d: host veth missing: %w", idx, err)
