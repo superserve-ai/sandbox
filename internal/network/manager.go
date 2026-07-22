@@ -311,6 +311,7 @@ func hostIPForSlot(idx int) string {
 func nsNameForSlot(idx int) string    { return fmt.Sprintf("ns-%d", idx) }
 func vethNameForSlot(idx int) string  { return fmt.Sprintf("veth-%d", idx) }
 func vpeerIPForSlot(idx int) string   { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
+func vethIPForSlot(idx int) string    { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
 func macForSlot(idx int) string       { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
 
 // setupSlot runs the expensive network setup (namespace, veth, TAP,
@@ -322,7 +323,7 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	// live and stays owned; on failure the caller releases idx (freeSlot).
 	hostIP := hostIPForSlot(idx)
 	vpeerIP := vpeerIPForSlot(idx)
-	vethIP := fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256)
+	vethIP := vethIPForSlot(idx)
 	nsName := nsNameForSlot(idx)
 	vethName := vethNameForSlot(idx)
 	vpeerName := "eth0"
@@ -1120,12 +1121,19 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", fmt.Errorf("adopt slot %d: namespace validation: %w", idx, ctx.Err())
 	}
 
-	// The host route must exist for the claimed VM to be reachable; replace is
+	// Both routes must exist for the claimed VM to work — host side to reach
+	// it, namespace side for its outbound traffic — and a crash can strand a
+	// namespace between address config and route install. Replace is
 	// idempotent, so any failure means the slot is structurally broken.
 	if err := run(ctx, "ip", "route", "replace", hostIP+"/32", "via", vpeerIPForSlot(idx), "dev", vethName); err != nil {
 		_ = fw.Close()
 		return nil, "", fmt.Errorf("adopt slot %d: host route: %w", idx, err)
 	}
+	if err := nsRun(ctx, nsName, "ip", "route", "replace", "default", "via", vethIPForSlot(idx)); err != nil {
+		_ = fw.Close()
+		return nil, "", fmt.Errorf("adopt slot %d: namespace default route: %w", idx, err)
+	}
+	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
 
 	return &VMNetInfo{
 		Namespace:  nsName,
