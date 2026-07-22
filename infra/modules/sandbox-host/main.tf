@@ -67,6 +67,7 @@ resource "google_compute_instance" "this" {
     ignore_changes = [
       advanced_machine_features,
       boot_disk,
+      labels,
       metadata,
       network_interface[0].access_config,
       scheduling,
