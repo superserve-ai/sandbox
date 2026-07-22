@@ -93,12 +93,14 @@ type Handlers struct {
 	authzSvc  *authz.Service
 }
 
-// asyncBookkeeping runs a fire-and-forget post-VMD bookkeeping DB write in a
-// background goroutine. These writes are off the hot path by design: the gate
-// write (BeginPause/BeginResume/create INSERT) already owns the row, and every
-// subsequent transition is status-gated, so nothing can proceed until the
-// bookkeeping lands — a racing request just sees the transitional status and
-// 409s until the write commits.
+// asyncBookkeeping runs fire-and-forget post-VMD work in a background
+// goroutine — bookkeeping DB writes, and the create path's hostname stamp.
+// This is off the hot path by design: the gate write (BeginPause/BeginResume/
+// create INSERT) already owns the row, and every subsequent transition is
+// status-gated, so nothing can proceed until the job lands — a racing request
+// just sees the transitional status and 409s until it commits. Work that
+// needs that protection must therefore run BEFORE the status flip inside the
+// same job, the way the create path orders its stamp before ActivateSandbox.
 func (h *Handlers) asyncBookkeeping(name string, fn func()) {
 	h.asyncMu.Lock()
 	h.asyncCount++
@@ -198,9 +200,12 @@ const asyncTimeout = 5 * time.Second
 // starting/resuming→active flip commits, so the owner's immediate follow-up
 // (create then exec — the canonical SDK flow) may read the pre-flip status;
 // waiting briefly preserves read-your-writes instead of 409ing it. Normally
-// the write lands in single-digit ms; a genuinely lost write still 409s once
-// the window expires. Var, not const, so tests can shrink it.
-var activateSettleWindow = 2 * time.Second
+// the write lands in single-digit ms, but a hostname-only create's stamp runs
+// before the flip and its guest round trip is bounded by the boxd client's
+// timeout — the window must outlast that bound, or a slow-but-alive guest
+// turns the canonical follow-up into a 409. A genuinely lost write still 409s
+// once the window expires. Var, not const, so tests can shrink it.
+var activateSettleWindow = 6 * time.Second
 
 // activateSettlePoll is the re-read interval within activateSettleWindow.
 const activateSettlePoll = 50 * time.Millisecond
@@ -1864,7 +1869,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// Phase 2: with the source IP known, mint the per-sandbox secrets JWT
 	// (when secrets are configured) and push env vars to the running boxd.
 	// If injection fails, tear the VM down and mark the row failed — a
-	// sandbox that boots without its env vars is unusable.
+	// sandbox that boots without its env vars is unusable. (Hostname-only
+	// creates run the same call inside the activation goroutine instead;
+	// a failure there fails the row before it ever goes active.)
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
@@ -1893,16 +1900,26 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		secretsJWT = jwt
 	}
-	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
-		// A vmd without this RPC already applied these env vars during
-		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
-		if secretsJWT == "" && isVMDUnimplemented(injErr) {
-			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
-		} else {
-			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
-			respondError(c, ErrInternal)
-			return
+	// When the inject would carry nothing but the hostname stamp (the payload
+	// is exactly env vars + JWT + hostname — a new always-shipped field must
+	// join this condition), it moves off the response path: the stamp runs in
+	// the activation goroutine below, ordered before the status flip.
+	// The deeper form — vmd stamping the hostname itself during
+	// RestoreSnapshot, where the round trip is on-host — would remove this
+	// branch entirely; it needs a cross-version vmd rollout to adopt.
+	stampAsync := len(envVarsToShip) == 0 && secretsJWT == ""
+	if !stampAsync {
+		if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+			// A vmd without this RPC already applied these env vars during
+			// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
+			if secretsJWT == "" && isVMDUnimplemented(injErr) {
+				log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
+			} else {
+				log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
+				h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 	}
 
@@ -1955,6 +1972,38 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	actorID := actorIDFromContext(c)
 	activateCtx := context.WithoutCancel(c.Request.Context())
 	h.asyncBookkeeping("activate-sandbox", func() {
+		if stampAsync {
+			// The hostname stamp runs here, BEFORE the row goes active:
+			// pause and destroy are status-gated on 'active', so this
+			// ordering keeps the sync path's invariant that nothing can
+			// freeze or tear down a guest mid-stamp — and a snapshot can
+			// never capture the template hostname, which matters because
+			// the stateless-resume fallback never re-stamps. The deadline
+			// matches the sync path's budget.
+			sctx, scancel := context.WithTimeout(activateCtx, vmdTimeout)
+			tStamp := time.Now()
+			stampErr := vmd.InjectSandboxEnv(sctx, sandboxID.String(), envVarsToShip, secretsJWT)
+			scancel()
+			switch {
+			case stampErr == nil, isVMDUnimplemented(stampErr):
+			default:
+				// The stamp's payload is cosmetic but its transport is not:
+				// a POST into the guest just failed — the same signal the
+				// synchronous path treats as an unusable sandbox. Fail the
+				// row instead of activating a sandbox whose guest is dead.
+				// NotFound lands here too: destroy is gated on 'active', so
+				// pre-activation the VM can only be gone abnormally — and
+				// ActivateSandbox has no status guard, so proceeding could
+				// resurrect a row another path just marked failed.
+				log.Error().Err(stampErr).Str("sandbox_id", sandboxID.String()).
+					Int64("stamp_ms", time.Since(tStamp).Milliseconds()).
+					Msg("post-boot guest init failed; failing sandbox instead of activating")
+				fctx, fcancel := context.WithTimeout(activateCtx, vmdTimeout)
+				defer fcancel()
+				h.failSandboxAfterBoot(fctx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+				return
+			}
+		}
 		actx, acancel := context.WithTimeout(activateCtx, asyncTimeout)
 		defer acancel()
 		if err := h.DB.ActivateSandbox(actx, db.ActivateSandboxParams{
