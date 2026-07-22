@@ -19,10 +19,12 @@ import (
 )
 
 // insertSandboxRow drives the quota trigger directly with a minimal counted
-// row, concurrently safe on the shared pool.
-func insertSandboxRow(ctx context.Context, teamID uuid.UUID, name string) error {
+// row, concurrently safe on the shared pool. Returns the generated ID so
+// lifecycle tests can transition the row afterwards.
+func insertSandboxRow(ctx context.Context, teamID uuid.UUID, name string) (uuid.UUID, error) {
+	id := uuid.New()
 	_, err := testQueries.CreateSandbox(ctx, db.CreateSandboxParams{
-		ID:         uuid.New(),
+		ID:         id,
 		TeamID:     teamID,
 		Name:       name,
 		Status:     db.SandboxStatusStarting,
@@ -32,7 +34,7 @@ func insertSandboxRow(ctx context.Context, teamID uuid.UUID, name string) error 
 		Metadata:   []byte(`{}`),
 		TemplateID: pgtype.UUID{},
 	})
-	return err
+	return id, err
 }
 
 func isQuotaErr(err error) bool {
@@ -75,7 +77,7 @@ func TestIntegration_QuotaHardLimitUnderConcurrentBurst(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			err := insertSandboxRow(ctx, teamID, fmt.Sprintf("burst-%d", i))
+			_, err := insertSandboxRow(ctx, teamID, fmt.Sprintf("burst-%d", i))
 			switch {
 			case err == nil:
 				admitted.Add(1)
@@ -117,7 +119,7 @@ func TestIntegration_QuotaHardLimitAcrossFastPathBoundary(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if err := insertSandboxRow(ctx, teamID, fmt.Sprintf("band-%d", i)); err == nil {
+			if _, err := insertSandboxRow(ctx, teamID, fmt.Sprintf("band-%d", i)); err == nil {
 				admitted.Add(1)
 			} else if !isQuotaErr(err) {
 				t.Errorf("insert %d: unexpected error: %v", i, err)
@@ -134,6 +136,60 @@ func TestIntegration_QuotaHardLimitAcrossFastPathBoundary(t *testing.T) {
 	}
 }
 
+// The watcher's drift check must flag a shard sum that disagrees with the
+// counted truth — drift has no other detection path, and a low-biased sum
+// silently widens the team's quota.
+func TestIntegration_QuotaCounterDriftDetection(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	if _, err := insertSandboxRow(ctx, teamID, "drift-probe"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	driftFor := func() (db.ListQuotaCounterDriftRow, bool) {
+		t.Helper()
+		rows, err := testQueries.ListQuotaCounterDrift(ctx)
+		if err != nil {
+			t.Fatalf("drift query: %v", err)
+		}
+		for _, r := range rows {
+			if r.TeamID == teamID {
+				return r, true
+			}
+		}
+		return db.ListQuotaCounterDriftRow{}, false
+	}
+
+	if r, found := driftFor(); found {
+		t.Fatalf("clean state reported as drift: sum=%d true=%d", r.ShardSum, r.TrueCount)
+	}
+
+	// Simulate the undetectable-by-triggers fault: a stray decrement biasing
+	// the sum below truth (the quota-widening direction).
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_sandbox_counter AS c (team_id, shard, cnt) VALUES ($1, 15, -1)
+		 ON CONFLICT (team_id, shard) DO UPDATE SET cnt = c.cnt - 1`, teamID); err != nil {
+		t.Fatalf("inject drift: %v", err)
+	}
+	r, found := driftFor()
+	if !found {
+		t.Fatal("low-biased shard sum not reported as drift")
+	}
+	if r.ShardSum != r.TrueCount-1 {
+		t.Errorf("drift row sum=%d true=%d, want sum = true-1", r.ShardSum, r.TrueCount)
+	}
+
+	// Repair and confirm the report clears.
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_sandbox_counter AS c (team_id, shard, cnt) VALUES ($1, 15, 1)
+		 ON CONFLICT (team_id, shard) DO UPDATE SET cnt = c.cnt + 1`, teamID); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if r, found := driftFor(); found {
+		t.Fatalf("repaired state still reported as drift: sum=%d true=%d", r.ShardSum, r.TrueCount)
+	}
+}
+
 // Increments and decrements can land on different shards, so individual shard
 // rows go negative; the summed view must stay correct across the lifecycle and
 // floor at zero.
@@ -143,12 +199,8 @@ func TestIntegration_QuotaShardSumTracksLifecycle(t *testing.T) {
 
 	ids := make([]uuid.UUID, 3)
 	for i := range ids {
-		ids[i] = uuid.New()
-		if _, err := testQueries.CreateSandbox(ctx, db.CreateSandboxParams{
-			ID: ids[i], TeamID: teamID, Name: fmt.Sprintf("lc-%d", i),
-			Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 1,
-			HostID: "default", Metadata: []byte(`{}`),
-		}); err != nil {
+		var err error
+		if ids[i], err = insertSandboxRow(ctx, teamID, fmt.Sprintf("lc-%d", i)); err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
 	}

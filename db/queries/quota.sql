@@ -20,6 +20,26 @@ LEFT JOIN (
 ) tpl ON tpl.team_id = t.id
 WHERE COALESCE(sc.active_sandbox_count, 0) > 0 OR COALESCE(tpl.cnt, 0) > 0;
 
+-- name: ListQuotaCounterDrift :many
+-- Teams whose shard sum disagrees with a recount of the counted set. Both
+-- aggregates read one snapshot (single statement), so in-flight admissions
+-- are invisible to both sides and any nonzero difference is real drift —
+-- the triggers can't cause it, but row surgery on sandbox can, and a
+-- low-biased sum silently widens the team's quota. FULL JOIN catches both
+-- directions: shard rows with no live sandboxes and vice versa.
+SELECT
+    COALESCE(sc.team_id, tc.team_id)::uuid AS team_id,
+    COALESCE(sc.active_sandbox_count, 0)::int AS shard_sum,
+    COALESCE(tc.cnt, 0)::int AS true_count
+FROM team_active_sandbox_counts sc
+FULL JOIN (
+    SELECT team_id, COUNT(*)::int AS cnt
+    FROM sandbox
+    WHERE sandbox_quota_counted(destroyed_at, status)
+    GROUP BY team_id
+) tc ON tc.team_id = sc.team_id
+WHERE COALESCE(sc.active_sandbox_count, 0) <> COALESCE(tc.cnt, 0);
+
 -- name: ClaimQuotaAlert :execrows
 -- Atomically record that (team, quota_type, channel) has been alerted. Affects 1
 -- row when this caller wins the claim, 0 when the channel was already alerted

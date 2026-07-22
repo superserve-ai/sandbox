@@ -143,6 +143,21 @@ func StartQuotaWatcher(ctx context.Context, queries *db.Queries, notifiers []Quo
 }
 
 func quotaWatchOnce(ctx context.Context, queries *db.Queries, notifiers []QuotaNotifier) {
+	// The sharded counter has no write-time reconciliation; a sum biased low
+	// (row surgery, partial restore) silently widens a team's quota. Both
+	// aggregates in the query share one snapshot, so any mismatch is real.
+	// Error level so it reaches Sentry; repair is re-running the migration's
+	// seed recount.
+	if drift, err := queries.ListQuotaCounterDrift(ctx); err != nil {
+		log.Error().Err(err).Msg("quota watcher: ListQuotaCounterDrift failed")
+	} else {
+		for _, d := range drift {
+			log.Error().Str("team", d.TeamID.String()).
+				Int32("shard_sum", d.ShardSum).Int32("true_count", d.TrueCount).
+				Msg("quota watcher: sandbox counter drift detected")
+		}
+	}
+
 	rows, err := queries.ListTeamQuotaUsage(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("quota watcher: ListTeamQuotaUsage failed")

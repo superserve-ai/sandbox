@@ -6,22 +6,31 @@
 -- when near it.
 --
 -- Enforcement bound: fast-path admissions are invisible to each other until
--- they commit, so the margin must exceed the maximum number of INSERTs that
--- can be in flight simultaneously. The API's own connection pools do NOT
--- bound that (instances scale out, each with its own pool); the real bound is
--- the connection pooler's server pool size — the number of transactions it
--- admits concurrently, regardless of client count. The default margin of 128
--- is sized to survive a substantial pooler resize; anyone raising the pooler
--- pool size past the margin must raise the margin first. Runtime-tunable:
--- ALTER DATABASE postgres SET app.sandbox_quota_margin = '192' (values below
--- the floor, invalid, or unset fall back to the default). Teams whose
+-- they commit, so the margin must exceed the number of admissions that can
+-- be in flight at once. The API's own connection pools do NOT bound that
+-- (instances scale out, each with its own pool); the real cap is the
+-- connection pooler's server pool size. Transaction duration stretches the
+-- window too: an admission inside a multi-statement transaction stays
+-- invisible until that transaction commits, so the bound assumes create
+-- transactions are short-lived. The default margin of 128 covers both with
+-- room for a substantial pooler resize; anyone raising the pooler pool size
+-- past the margin must raise the margin first:
+--   UPDATE sandbox_quota_config SET margin = 192;
+-- A table read takes effect immediately on every session — a database-level
+-- GUC would not (pooled sessions only merge those at connect time) — and a
+-- mistyped value fails the UPDATE loudly instead of silently keeping the
+-- old margin. Values below the floor read as the floor. Teams whose
 -- max_sandboxes <= margin always take the exact path — identical to the
 -- single-row behavior they had before.
 --
 -- team.active_sandbox_count is no longer written but stays in place, so
 -- rollback is one reverse migration (restore the previous function bodies,
--- recompute the column from shard sums). Readers move to the
--- team_active_sandbox_counts view.
+-- recompute the column from the counted set). Readers move to the
+-- team_active_sandbox_counts view. The triggers alone cannot drift the sum
+-- (admit and release share one predicate), but row surgery on sandbox can;
+-- the control plane's quota watcher cross-checks the sum against a
+-- same-snapshot recount and reports any mismatch, and the repair is
+-- re-running this file's seed recount under the same table lock.
 
 BEGIN;
 
@@ -34,15 +43,28 @@ SET LOCAL lock_timeout = '5s';
 -- trigger-function swap. Reads stay allowed.
 LOCK TABLE sandbox IN EXCLUSIVE MODE;
 
+-- fillfactor: every counted transition upserts one of at most 16 rows per
+-- team, so pages fill with dead tuples fast; headroom keeps updates HOT so
+-- the enforcement SUM scans ~16 live tuples instead of update chains.
 CREATE TABLE IF NOT EXISTS team_sandbox_counter (
   team_id uuid     NOT NULL REFERENCES team(id) ON DELETE CASCADE,
   shard   smallint NOT NULL,
   cnt     integer  NOT NULL DEFAULT 0,
   PRIMARY KEY (team_id, shard)
-);
+) WITH (fillfactor = 50);
 
 -- Internal table: only the service role and trigger functions touch it.
 ALTER TABLE team_sandbox_counter ENABLE ROW LEVEL SECURITY;
+
+-- The margin, tunable at runtime without a deploy (see header). Single row.
+CREATE TABLE IF NOT EXISTS sandbox_quota_config (
+  single_row boolean PRIMARY KEY DEFAULT true CHECK (single_row),
+  margin     integer NOT NULL
+);
+ALTER TABLE sandbox_quota_config ENABLE ROW LEVEL SECURITY;
+-- DO NOTHING deliberately: a re-apply must keep the operator's tuned margin.
+INSERT INTO sandbox_quota_config (single_row, margin) VALUES (true, 128)
+ON CONFLICT (single_row) DO NOTHING;
 
 -- Individual shards may go negative (an increment lands on shard 3, the
 -- matching decrement on shard 7); only the SUM is meaningful, floored at 0
@@ -64,47 +86,45 @@ RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
   SELECT p_destroyed_at IS NULL AND p_status NOT IN ('failed', 'paused', 'pausing')
 $$;
 
--- The fast-path margin, tunable at runtime without a deploy. Defensive parse:
--- a mistyped ALTER DATABASE value must not turn every create into an error.
--- The floor keeps the knob one-directional: it can make enforcement more
--- conservative, but can never be set below plausible in-flight concurrency
--- and silently soften the hard limit.
+-- The floor keeps the margin knob one-directional: it can make enforcement
+-- more conservative, but can never be set below plausible in-flight
+-- concurrency and silently soften the hard limit.
 CREATE OR REPLACE FUNCTION sandbox_quota_margin()
-RETURNS integer LANGUAGE plpgsql STABLE AS $$
-DECLARE
-  raw text;
-BEGIN
-  raw := NULLIF(current_setting('app.sandbox_quota_margin', true), '');
-  IF raw IS NULL THEN
-    RETURN 128;
-  END IF;
-  BEGIN
-    RETURN GREATEST(raw::integer, 64);
-  EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
-    RETURN 128;
-  END;
-END;
+RETURNS integer LANGUAGE sql STABLE AS $$
+  SELECT GREATEST(COALESCE((SELECT margin FROM sandbox_quota_config), 128), 64)
 $$;
 
--- Seed shard 0 with an exact recount of the counted set, not the old column —
--- it was clamp-protected rather than provably exact, which is why the previous
--- quota migrations also ended with a recount. The table lock makes this race-free.
+-- One team's count, via the view so the sum has exactly one definition.
+CREATE OR REPLACE FUNCTION sandbox_quota_total(p_team uuid)
+RETURNS integer LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(
+    (SELECT active_sandbox_count FROM team_active_sandbox_counts WHERE team_id = p_team),
+    0)
+$$;
+
+-- Seed with an exact recount of the counted set, not the old column — it was
+-- clamp-protected rather than provably exact, which is why the previous quota
+-- migrations also ended with a recount. Unconditional (delete + insert, not
+-- upsert-skip) so a re-apply — roll-forward after the documented rollback, or
+-- a table pre-created under older counted-set semantics — can never resume
+-- enforcement from stale sums. The table lock makes this race-free: the
+-- counter is only ever written from sandbox triggers, which the lock blocks.
+DELETE FROM team_sandbox_counter;
 INSERT INTO team_sandbox_counter (team_id, shard, cnt)
 SELECT team_id, 0, COUNT(*)::int
 FROM sandbox
 WHERE sandbox_quota_counted(destroyed_at, status)
-GROUP BY team_id
-ON CONFLICT (team_id, shard) DO NOTHING;
+GROUP BY team_id;
 
 -- Admit one sandbox into the counted set. p_enforce=false records the
 -- transition without the cap check (the pause-revert exemption: the VM never
 -- stopped, refusing the write would only strand truth).
 --
--- The shard is chosen per backend, not per row: a multi-row statement (e.g. a
--- reaper batch) then locks at most one shard row per team, so concurrent
--- batches can't hold-and-wait on each other's shards (random per-row choice
--- deadlocks them), while concurrent backends still spread. Enforcement sums
--- are floored at 0 so a drifted negative sum can never widen a team's quota.
+-- The shard is chosen per transaction: a multi-row statement (e.g. a reaper
+-- batch) then locks at most one shard row per team, so concurrent batches
+-- can't hold-and-wait on each other's shards (random per-row choice
+-- deadlocks them), while separate transactions spread uniformly — unlike
+-- pg_backend_pid(), whose long-lived pooled backends can cluster mod 16.
 CREATE OR REPLACE FUNCTION sandbox_quota_admit(p_team uuid, p_enforce boolean)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
@@ -112,17 +132,20 @@ DECLARE
   total  integer;
   margin integer;
 BEGIN
-  SELECT max_sandboxes INTO lim FROM team WHERE id = p_team;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'team % does not exist', p_team;
-  END IF;
-
+  -- A missing team fails the FK here on the insert path; the explicit
+  -- NOT FOUND guards below cover the conflict-update path, where no RI
+  -- check runs (team_id is unchanged by the UPDATE).
   INSERT INTO team_sandbox_counter AS c (team_id, shard, cnt)
-  VALUES (p_team, (pg_backend_pid() % 16)::smallint, 1)
+  VALUES (p_team, (txid_current() % 16)::smallint, 1)
   ON CONFLICT (team_id, shard) DO UPDATE SET cnt = c.cnt + 1;
 
   IF NOT p_enforce THEN
     RETURN;
+  END IF;
+
+  SELECT max_sandboxes INTO lim FROM team WHERE id = p_team;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'team % does not exist', p_team;
   END IF;
 
   margin := sandbox_quota_margin();
@@ -130,22 +153,30 @@ BEGIN
   -- The fast path only exists for teams whose limit exceeds the margin;
   -- for the rest the check below could never pass, so skip its SUM.
   IF lim > margin THEN
-    SELECT GREATEST(COALESCE(SUM(cnt), 0), 0) INTO total
-    FROM team_sandbox_counter WHERE team_id = p_team;
+    total := sandbox_quota_total(p_team);
     IF total <= lim - margin THEN
       RETURN; -- fast path: no team-level serialization
     END IF;
   END IF;
 
   -- Near the limit: serialize this team's admissions and re-check exactly.
-  -- xact-scoped (releases on commit/abort, pooler-safe); key namespaced away
-  -- from the team-mutation advisory lock. The limit is re-read under the lock:
-  -- it may have been lowered (abuse response) while this admission was queued,
-  -- and the team row cannot vanish — the shard insert's FK holds KEY SHARE.
-  PERFORM pg_advisory_xact_lock(hashtext('sandbox_quota:' || p_team::text));
+  -- xact-scoped (releases on commit/abort, pooler-safe). The two-argument
+  -- lock form is a separate keyspace from every single-argument advisory
+  -- lock in the schema, so a hash collision with an unrelated lock (team
+  -- mutations, per-sandbox locks) cannot block admissions; the class hash
+  -- partitions quota from any future two-argument user. The limit is
+  -- re-read under the lock: it may have been lowered (abuse response)
+  -- while this admission was queued. In practice the team row cannot
+  -- vanish mid-admission — a team delete cascades into our locked shard
+  -- row and blocks until we commit — but that protection is incidental to
+  -- the FK's ON DELETE CASCADE, so the guard stays: an unguarded NULL
+  -- limit would make the comparison NULL and silently skip enforcement.
+  PERFORM pg_advisory_xact_lock(hashtext('sandbox_quota'), hashtext(p_team::text));
   SELECT max_sandboxes INTO lim FROM team WHERE id = p_team;
-  SELECT GREATEST(COALESCE(SUM(cnt), 0), 0) INTO total
-  FROM team_sandbox_counter WHERE team_id = p_team;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'team % does not exist', p_team;
+  END IF;
+  total := sandbox_quota_total(p_team);
   IF total > lim THEN
     RAISE EXCEPTION 'sandbox quota exceeded (count=%, max=%)', total, lim
       USING ERRCODE = 'SS001';
@@ -153,13 +184,13 @@ BEGIN
 END;
 $$;
 
--- Release one sandbox from the counted set. Same per-backend shard choice as
--- admit, for the same batch-deadlock reason.
+-- Release one sandbox from the counted set. Same per-transaction shard
+-- choice as admit, for the same batch-deadlock reason.
 CREATE OR REPLACE FUNCTION sandbox_quota_release(p_team uuid)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO team_sandbox_counter AS c (team_id, shard, cnt)
-  VALUES (p_team, (pg_backend_pid() % 16)::smallint, -1)
+  VALUES (p_team, (txid_current() % 16)::smallint, -1)
   ON CONFLICT (team_id, shard) DO UPDATE SET cnt = c.cnt - 1;
 END;
 $$;
@@ -215,5 +246,10 @@ BEGIN
   RETURN OLD;
 END;
 $$;
+
+-- The column is frozen, not dropped, so rollback stays one migration; mark
+-- it so a future reader (or cross-repo consumer) doesn't trust it live.
+COMMENT ON COLUMN team.active_sandbox_count IS
+  'Frozen at the sharded-counter migration; read team_active_sandbox_counts instead.';
 
 COMMIT;

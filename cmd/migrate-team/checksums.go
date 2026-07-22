@@ -25,9 +25,9 @@ import (
 // and carry no migration-correctness signal. updated_at is excluded
 // globally below; per-table entries go here.
 var checksumExclusions = map[string]map[string]bool{
-	// The dest quota trigger recounts as rows land; with every sandbox
-	// paused by precondition the counter is 0 on both sides, but the
-	// source's value is not part of what the copy promises to preserve.
+	// Frozen since the sharded-counter migration (live counts are in
+	// team_sandbox_counter, which is not copied); the stale snapshot it
+	// holds is not part of what the copy promises to preserve.
 	"team": {"active_sandbox_count": true},
 }
 
