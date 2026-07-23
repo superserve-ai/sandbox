@@ -95,6 +95,16 @@ data "google_service_account" "api_runner" {
   account_id = "superserve-api-runner"
 }
 
+# The CD service account needs Certificate Manager access to read/manage the
+# api.superserve.ai cert map + DNS authorization this cell owns (the plan's
+# import 403'd without it). Granted out-of-band to unblock; declared here so it
+# survives. google_project_iam_member is additive/idempotent — no import needed.
+resource "google_project_iam_member" "cd_certificatemanager" {
+  project = local.project_id
+  role    = "roles/certificatemanager.editor"
+  member  = "serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"
+}
+
 # A5: us-east4 control plane for the "use" cell.
 #
 # This is a host swap, not a new cell: us-east4 shares the use-cell Supabase,
