@@ -252,6 +252,14 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// Hidden re-exec entry: the launcher-namespace build runs the prune as
+	// `unshare --mount=<pin> -- /proc/self/exe launcher-prune` so the
+	// detach syscalls execute inside the freshly cloned namespace. Must
+	// dispatch before any daemon setup.
+	if len(os.Args) > 1 && os.Args[1] == "launcher-prune" {
+		os.Exit(vm.LauncherPruneMain())
+	}
+
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
