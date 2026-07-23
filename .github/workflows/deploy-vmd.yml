@@ -37,6 +37,11 @@ on:
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
       - 'scripts/fc-cleanup'
+      # The workflow + its deploy script must self-trigger (as deploy-otel does),
+      # or a new cell/step lands without ever running until an unrelated vmd
+      # asset changes — leaving that host on stale binaries.
+      - '.github/workflows/deploy-vmd.yml'
+      - '.github/workflows/scripts/deploy-vmd.py'
 
 jobs:
   deploy-staging:
