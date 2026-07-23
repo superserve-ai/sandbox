@@ -147,6 +147,10 @@ jobs:
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
+          # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
+          # filter and fan out to every VMD_LABEL match. use4 is the permanent
+          # primary, so a missing GCP_REGION_USE4 must abort, not run unscoped.
+          : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary fan-out}"
           python3 .github/workflows/scripts/deploy-vmd.py
 
       # The usw cell deploys as a step in this job — not a separate job —
