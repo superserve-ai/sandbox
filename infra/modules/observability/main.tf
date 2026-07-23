@@ -55,9 +55,10 @@ resource "google_monitoring_alert_policy" "compute_instance_cpu" {
   }
 
   alert_strategy {
-    notification_rate_limit {
-      period = "900s"
-    }
+    # notification_rate_limit is only valid on log-based alert policies; this is
+    # a metric-threshold policy, so GCP rejects it (Error 400: "only log-based
+    # alert policies may specify a notification rate limit"). auto_close is valid
+    # for metric policies and is kept.
     auto_close = "1800s"
   }
 
