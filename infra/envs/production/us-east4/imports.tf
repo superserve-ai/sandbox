@@ -65,6 +65,14 @@ import {
   id = "projects/rayai-prod/locations/us-east4/services/superserve-api-use4 roles/run.invoker allUsers"
 }
 
+# CD service account's certificatemanager.editor grant, added out-of-band during
+# the #257 incident to unblock the cert-map / dns-auth import. Import so the
+# apply adopts the existing binding instead of planning a create.
+import {
+  to = google_project_iam_member.cd_certificatemanager
+  id = "rayai-prod roles/certificatemanager.editor serviceAccount:superserve-github-actions@rayai-prod.iam.gserviceaccount.com"
+}
+
 # IAP SSH allow rule (enable_iap_ssh = true). Created imperatively (gcloud) to
 # unblock the vmd deploy after manage_public_ssh_deny closed :22 with no IAP
 # allow; import so the apply adopts it instead of failing AlreadyExists.

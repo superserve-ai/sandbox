@@ -97,8 +97,9 @@ data "google_service_account" "api_runner" {
 
 # The CD service account needs Certificate Manager access to read/manage the
 # api.superserve.ai cert map + DNS authorization this cell owns (the plan's
-# import 403'd without it). Granted out-of-band to unblock; declared here so it
-# survives. google_project_iam_member is additive/idempotent — no import needed.
+# import 403'd without it). Granted out-of-band to unblock; imported (see
+# imports.tf) so the apply adopts the existing binding instead of creating a
+# duplicate.
 resource "google_project_iam_member" "cd_certificatemanager" {
   project = local.project_id
   role    = "roles/certificatemanager.editor"
