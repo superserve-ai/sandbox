@@ -574,9 +574,10 @@ func main() {
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
 	if launchViaLauncherNS {
-		// Build the pruned launcher mount namespace in the background: the prune is
-		// O(fleet) (up to launcherBuildTimeout), and launches fall back to legacy
-		// until the pin is ready, so boot and the warm pool aren't held behind it.
+		// Build the pruned launcher mount namespace in the background. The batched
+		// prune normally takes seconds, but a wedged mount syscall can hold it for
+		// up to launcherBuildTimeout — boot and the warm pool must not be held
+		// behind that; launches fall back to legacy until the pin is ready.
 		go func() {
 			defer sentrylog.Recover("launcher namespace build")
 			if err := mgr.EnsureLauncherNamespace(ctx); err != nil {

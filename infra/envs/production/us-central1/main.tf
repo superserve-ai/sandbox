@@ -47,60 +47,18 @@ module "network" {
   create_network = var.create_network
   network_name   = var.network_name
 
-  subnet_name            = "superserve-prod-subnet"
-  subnet_cidr            = var.subnet_cidr
-  manage_public_ssh_deny = true
-  enable_iap_ssh         = true
-  iap_ssh_target_tags    = ["superserve-vmd"]
+  # The us-central1 primary control plane and vmd host are decommissioned. This
+  # root now keeps only its subnet in the shared superserve-production-vpc; the
+  # host's firewall rules, IAP-SSH allow, public-SSH deny, and the Cloud Run VPC
+  # connector (used only by the removed control plane) are all removed. The
+  # us-east4 cell owns its own equivalents in the same VPC.
+  subnet_name = "superserve-prod-subnet"
+  subnet_cidr = var.subnet_cidr
 
-  create_vpc_connector        = true
-  create_vpc_connector_subnet = false
-  vpc_connector_name          = "superserve-prod-conn"
-  vpc_connector_mode          = "ip_cidr_range"
-  vpc_connector_ip_cidr_range = var.connector_subnet_cidr
-  vpc_connector_machine_type  = "e2-micro"
-  vpc_connector_min_instances = 2
-  vpc_connector_max_instances = 10
-
-  firewall_rules = {
-    allow_internal = {
-      name          = "superserve-prod-allow-internal"
-      direction     = "INGRESS"
-      source_ranges = [var.subnet_cidr]
-      target_tags   = ["superserve-vmd"]
-      allow = [
-        {
-          protocol = "tcp"
-          ports    = ["5007", "5008", "50051"]
-        }
-      ]
-      description = "Allow private host-to-host sandbox control traffic only."
-    }
-    allow_otel_ingress = {
-      name          = "superserve-prod-allow-cr-to-host-otel"
-      direction     = "INGRESS"
-      source_ranges = [var.connector_subnet_cidr]
-      target_tags   = ["superserve-vmd"]
-      allow = [
-        {
-          protocol = "tcp"
-          ports    = ["4317", "4318"]
-        }
-      ]
-      description = "Allow Cloud Run connector traffic to host-local OTLP endpoints."
-    }
-    allow_vmd_grpc = {
-      name          = "superserve-prod-allow-cr-to-host-vmd"
-      direction     = "INGRESS"
-      source_ranges = [var.connector_subnet_cidr]
-      target_tags   = ["superserve-vmd"]
-      allow = [{
-        protocol = "tcp"
-        ports    = ["50051"]
-      }]
-      description = "Allow Cloud Run connector traffic to the host VMD gRPC endpoint."
-    }
-  }
+  manage_public_ssh_deny = false
+  enable_iap_ssh         = false
+  create_vpc_connector   = false
+  firewall_rules         = {}
 
   labels = local.common_labels
 }
@@ -145,116 +103,20 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
 # and the SA is shared across cells, so this follows the same out-of-band
 # pattern as the shared runtime secrets.
 
-module "api" {
-  source = "../../../modules/api"
 
-  project_id            = local.project_id
-  environment           = local.environment
-  region                = local.region
-  service_name          = "superserve-api"
-  service_account_email = module.iam.service_account_emails[local.api_sa_key]
-  image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
-
-  env = {
-    API_PORT                    = "8080"
-    SUPABASE_URL                = var.supabase_url
-    SECRETS_SIGNING_KEY_ID      = "v1"
-    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
-    ALLOW_EPHEMERAL_SEED        = "0"
-    DB_MAX_CONNS                = "12"
-    EDGE_PROXY_DOMAIN           = "sandbox.superserve.ai"
-    KMS_KEY_RESOURCE            = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
-    OTEL_ENVIRONMENT            = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${module.sandbox_host.internal_ip}:4318"
-    OTEL_EXPORT_INTERVAL        = "15s"
-    OTEL_METRICS_ENABLED        = "true"
-    OTEL_SERVICE_NAME           = "sandbox-controlplane"
-  }
-
-  secrets = {
-    DATABASE_URL = {
-      secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
-    }
-    INTERNAL_API_TOKEN = {
-      secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
-    }
-    SANDBOX_ACCESS_TOKEN_SEED = {
-      secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
-    }
-    SECRETS_SIGNING_KEY = {
-      secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
-    }
-    SENTRY_DSN = {
-      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
-    }
-    SYSTEM_TEAM_ID = {
-      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
-    }
-    SLACK_QUOTA_ALERT_WEBHOOK = {
-      secret = "slack-quota-alert-webhook"
-    }
-    POSTHOG_KEY = {
-      secret = "posthog-project-key"
-    }
-  }
-  cpu_limit    = "2"
-  memory_limit = "1Gi"
-  # 0 matches the live service: this cell was scaled to idle after the us-east4
-  # cutover and is pending decommission. Declaring the live value keeps the plan
-  # a no-op instead of re-inflating the idle cell to 6 on the next apply.
-  min_instances     = 0
-  max_instances     = 10
-  startup_cpu_boost = true
-  cpu_idle          = true
-
-  vpc_connector = module.network.vpc_connector_id
-  vpc_egress    = "PRIVATE_RANGES_ONLY"
-  labels        = local.common_labels
-
-  depends_on = [
-    google_secret_manager_secret_iam_member.api_runtime_secrets,
-  ]
-}
-
-module "sandbox_host" {
-  source = "../../../modules/sandbox-host"
-
-  project_id    = local.project_id
-  environment   = local.environment
-  region        = local.region
-  zone          = local.zone
-  instance_name = "superserve-vmd-prod"
-  machine_type  = var.machine_type
-  subnet        = module.network.subnetwork_self_link
-  internal_ip   = "10.0.0.3"
-  tags          = ["superserve-vmd"]
-  labels = merge(local.common_labels, {
-    component               = "vmd"
-    sandbox_role            = "vmd"
-    "goog-ops-agent-policy" = "v2-template-1-7-0"
-  })
-
-  service_account_email = module.iam.service_account_emails[local.api_sa_key]
-  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts"
-  can_ip_forward        = false
-  on_host_maintenance   = "TERMINATE"
-  metadata              = {}
-}
-
+# Production monitoring dashboards. These are fleet-wide (whole-fleet
+# operations/hosts/database/collector views spanning every region), not
+# us-central1-specific — they are rooted in this state only because us-central1
+# was historically the primary region. The host and control plane here are being
+# decommissioned, but the dashboards must survive, so this module stays. The
+# per-host CPU alert that used to live here was removed with the host it watched.
 module "observability" {
   source = "../../../modules/observability"
 
   project_id               = local.project_id
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids
-  compute_instance_cpu_alerts = {
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
-    }
-  }
-  labels = local.common_labels
+  labels                   = local.common_labels
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Production Operations"

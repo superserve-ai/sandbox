@@ -1717,54 +1717,65 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			DeltaPath:         nil,
 		})
 	}
-	// insertWithBindings writes the sandbox row, and its secret bindings in the
-	// same transaction when any are attached, so a successful create never leaves
-	// a binding unrecorded. With no secrets it is a plain insert — no transaction.
+	// insertWithBindings writes the sandbox row and any secret bindings in one
+	// statement, so a successful create never leaves a binding unrecorded and
+	// the quota admission's uncommitted window stays statement-sized — a
+	// transaction spanning multiple round trips would widen it (see the query
+	// comments).
 	insertWithBindings := func() (db.Sandbox, error) {
 		if len(secretBindings) == 0 {
 			return runInsert(h.DB)
 		}
-		runBoth := func(q *db.Queries) (db.Sandbox, error) {
-			sb, err := runInsert(q)
-			if err != nil {
-				return db.Sandbox{}, err
-			}
-			secretIDs := make([]uuid.UUID, len(secretBindings))
-			envKeys := make([]string, len(secretBindings))
-			proxyTokens := make([]string, len(secretBindings))
-			for i := range secretBindings {
-				secretIDs[i] = secretBindings[i].SecretID
-				envKeys[i] = secretBindings[i].EnvKey
-				// secretMeta is index-aligned with secretBindings; persist its token.
-				proxyTokens[i] = secretMeta[i].ProxyToken
-			}
-			if err := q.AddSandboxSecrets(insertCtx, db.AddSandboxSecretsParams{
-				SandboxID:   sandboxID,
-				SecretIds:   secretIDs,
-				EnvKeys:     envKeys,
-				ProxyTokens: proxyTokens,
-			}); err != nil {
-				return db.Sandbox{}, fmt.Errorf("insert secret bindings: %w", err)
-			}
-			return sb, nil
+		secretIDs := make([]uuid.UUID, len(secretBindings))
+		envKeys := make([]string, len(secretBindings))
+		proxyTokens := make([]string, len(secretBindings))
+		for i := range secretBindings {
+			secretIDs[i] = secretBindings[i].SecretID
+			envKeys[i] = secretBindings[i].EnvKey
+			// secretMeta is index-aligned with secretBindings; persist its token.
+			proxyTokens[i] = secretMeta[i].ProxyToken
 		}
-		// No pool (DBTX-mocked unit tests): fall back to a direct insert.
-		if h.Pool == nil {
-			return runBoth(h.DB)
+		if templateID.Valid {
+			row, err := h.DB.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
+				TemplateID:        uuid.UUID(templateID.Bytes),
+				TeamID:            teamID,
+				SystemTeamID:      h.systemTeamID(),
+				ID:                sandboxID,
+				Name:              req.Name,
+				Status:            db.SandboxStatusStarting,
+				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
+				MemoryMib:         1,
+				HostID:            hostID,
+				TimeoutSeconds:    req.TimeoutSeconds,
+				AutoDeleteSeconds: req.AutoDeleteSeconds,
+				Metadata:          metadataJSON,
+				SnapshotPath:      nullableStr(snapshotPath),
+				MemPath:           nullableStr(snapshotMemPath),
+				BasePath:          nullableStr(basePath),
+				DeltaPath:         nullableStr(deltaPath),
+				SecretIds:         secretIDs,
+				EnvKeys:           envKeys,
+				ProxyTokens:       proxyTokens,
+			})
+			return db.Sandbox(row), err
 		}
-		tx, err := h.Pool.Begin(insertCtx)
-		if err != nil {
-			return db.Sandbox{}, err
-		}
-		defer tx.Rollback(insertCtx)
-		sb, err := runBoth(h.DB.WithTx(tx))
-		if err != nil {
-			return db.Sandbox{}, err
-		}
-		if err := tx.Commit(insertCtx); err != nil {
-			return db.Sandbox{}, err
-		}
-		return sb, nil
+		row, err := h.DB.CreateSandboxWithSecrets(insertCtx, db.CreateSandboxWithSecretsParams{
+			ID:                sandboxID,
+			TeamID:            teamID,
+			Name:              req.Name,
+			Status:            db.SandboxStatusStarting,
+			VcpuCount:         1,
+			MemoryMib:         1,
+			HostID:            hostID,
+			TimeoutSeconds:    req.TimeoutSeconds,
+			AutoDeleteSeconds: req.AutoDeleteSeconds,
+			Metadata:          metadataJSON,
+			TemplateID:        pgtype.UUID{Valid: false},
+			SecretIds:         secretIDs,
+			EnvKeys:           envKeys,
+			ProxyTokens:       proxyTokens,
+		})
+		return db.Sandbox(row), err
 	}
 
 	var tInsertStart, tInsertEnd time.Time

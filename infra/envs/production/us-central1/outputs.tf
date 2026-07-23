@@ -3,11 +3,6 @@ output "network_contract" {
   value       = module.network.contract
 }
 
-output "sandbox_host_contract" {
-  description = "Rendered new-region sandbox host contract."
-  value       = module.sandbox_host.contract
-}
-
 output "deployment_config" {
   description = "Deployment identity for this environment."
   value = {
