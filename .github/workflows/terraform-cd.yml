@@ -211,6 +211,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -329,6 +330,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -456,6 +458,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
     steps:
       - uses: actions/checkout@v4
 

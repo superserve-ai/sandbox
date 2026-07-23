@@ -14,6 +14,25 @@ variable "notification_email" {
   default     = null
 }
 
+variable "notification_channel_ids" {
+  description = "Existing Cloud Monitoring notification channel resource names. Channel credentials are owned by Monitoring and are never stored here."
+  type        = list(string)
+  default     = []
+}
+
+variable "compute_instance_cpu_alerts" {
+  description = "CPU saturation alerts keyed by a stable logical name."
+  type = map(object({
+    display_name        = string
+    instance_name       = string
+    instance_id         = string
+    threshold           = optional(number, 0.8)
+    evaluation_duration = optional(string, "900s")
+    documentation       = optional(string, null)
+  }))
+  default = {}
+}
+
 variable "log_buckets" {
   description = "Logging bucket definitions keyed by logical name."
   type = map(object({

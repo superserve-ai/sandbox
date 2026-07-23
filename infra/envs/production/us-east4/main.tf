@@ -121,9 +121,12 @@ module "api" {
   # and ignore_changes keeps terraform from reverting that.
   image = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:latest"
 
-  cpu_limit         = "2"
-  memory_limit      = "1Gi"
-  min_instances     = 2
+  cpu_limit    = "2"
+  memory_limit = "1Gi"
+  # 6 matches the live service (raised from 2 during burst tuning). scaling is
+  # in the module's ignore_changes, but that path is ineffective for the v2
+  # resource, so declaring the live value keeps the plan a no-op.
+  min_instances     = 6
   max_instances     = 100
   startup_cpu_boost = true
   cpu_idle          = true
@@ -137,6 +140,9 @@ module "api" {
     DB_MAX_CONNS           = "12"
     VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+    # OTEL_* is intentionally omitted here: the live service has no OTEL env, so
+    # adding it would be a production change, not adoption. It lands in a
+    # separate OTEL-parity PR (mirroring us-central1's collector export).
   }
 
   secrets = {
@@ -175,6 +181,34 @@ module "api" {
   labels = local.common_labels
 }
 
+# api.superserve.ai external HTTPS load balancer (global). Fronts the use-cell
+# control-plane Cloud Run service in this region via a serverless NEG and
+# terminates TLS with a Certificate-Manager managed cert + cert map. Every
+# resource here was created imperatively (gcloud) during the host migration and
+# is adopted via `terraform import` — see the PR notes for the import commands.
+module "api_cert_lb" {
+  source = "../../../modules/cloud-run-cert-lb"
+
+  project_id        = local.project_id
+  region            = local.region
+  cloud_run_service = module.api.service_name
+  domain            = "api.superserve.ai"
+
+  dns_authorization_name     = "api-superserve-dnsauth"
+  certificate_name           = "api-superserve-cert"
+  certificate_map_name       = "api-superserve-certmap"
+  certificate_map_entry_name = "api-superserve-entry"
+  address_name               = "api-superserve-use4-ip"
+  https_proxy_name           = "api-superserve-use4-proxy"
+  forwarding_rule_name       = "api-superserve-use4-fwd"
+  url_map_name               = "superserve-api-url-map"
+  backend_service_name       = "superserve-api-backend-use4"
+  # NB: verify against the live NEG name before importing — the migration
+  # created it imperatively and its exact name was not captured. Correct this
+  # value to match `gcloud compute network-endpoint-groups list` output first.
+  neg_name = "superserve-api-use4-neg"
+}
+
 module "sandbox_host" {
   source = "../../../modules/sandbox-host"
 
@@ -188,11 +222,18 @@ module "sandbox_host" {
   internal_ip   = var.host_internal_ip
   tags          = ["vmd-use4"]
 
-  # Keep the host out of production discovery until bring-up and pre-cutover
-  # validation are complete. CD and the scheduler use workload labels for
-  # host discovery, so those labels must be added through the cutover process.
+  # Declare the discovery labels CD and the scheduler key on (component=vmd,
+  # sandbox_role=vmd, ops-agent) — they were added out-of-band at cutover and
+  # `labels` is NOT in the module's ignore_changes, so declaring them keeps a
+  # later apply from stripping them. Values here match the LIVE host exactly so
+  # this stays a no-op adoption: sandbox_status is still "provisioning" live;
+  # flipping it to "ready" (to match the deployment-registry selector) is a
+  # separate, intentional change, not part of this import PR.
   labels = merge(local.common_labels, {
-    sandbox_status = "provisioning"
+    component               = "vmd"
+    sandbox_role            = "vmd"
+    sandbox_status          = "provisioning"
+    "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
   service_account_email = data.google_service_account.api_runner.email
@@ -213,8 +254,38 @@ module "sandbox_host" {
 
   reservation_name = var.reservation_name
 
+  # startup-script codifies the guest-DNS bootstrap (unbound + DoT to the
+  # Cloudflare Gateway). The live host was hand-staged, so this exists mainly
+  # for a clean rebuild — sandbox-host keeps `metadata` in ignore_changes, so
+  # adding it here does not perturb the running instance.
   metadata = {
     enable-osconfig = "TRUE"
     enable-oslogin  = "TRUE"
+    startup-script = templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
+      # Guest network range allowed to query the resolver.
+      guest_cidr     = "10.11.0.0/16"
+      local_dns_port = "19053"
+      # Cloudflare Zero Trust Gateway DoT location endpoint.
+      dot_hostname = "j0mqwd9sm7.cloudflare-gateway.com"
+      # Anycast IPs the location endpoint resolves to (unbound needs an IP here,
+      # not a hostname). Matches the live host's unbound config, verified 2026-07-22.
+      dot_upstream_addrs = ["162.159.36.5", "162.159.46.5"]
+    })
   }
+}
+
+module "observability" {
+  source = "../../../modules/observability"
+
+  project_id               = local.project_id
+  environment              = local.environment
+  notification_channel_ids = var.notification_channel_ids
+  compute_instance_cpu_alerts = {
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
+    }
+  }
+  labels = local.common_labels
 }

@@ -15,6 +15,26 @@ Env vars:
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
   SHA                  required — commit SHA (only first 8 chars used)
+  SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
+  CONTROL_PLANE_URL    optional — control-plane base URL (e.g.
+                       https://api.superserve.ai). Upserted into vmd.env when
+                       set. vmd reads it via os.Getenv("CONTROL_PLANE_URL").
+  INTERNAL_API_TOKEN   optional — shared control-plane/host auth token, sourced
+                       from CI secrets / Secret Manager (never hardcode). When
+                       set it is upserted into vmd.env as INTERNAL_API_TOKEN and
+                       into /etc/sandbox/secretsproxy.env as DAEMON_AUTH_TOKEN
+                       (secretsproxy authenticates callers with the same token
+                       the control plane presents). Hosts previously had these
+                       provisioned out-of-band via Packer/manual staging.
+  VMD_DNS_REDIRECT_PORT optional — local resolver port vmd REDIRECTs guest :53
+                       to via its SANDBOX_DNS_REDIRECT nat chain. Empty = skip
+                       (like CONTROL_PLANE_URL). Do NOT default this fleet-wide:
+                       this script deploys to every selected host, and a host
+                       without an unbound listener on the port would blackhole
+                       guest DNS. Set it per host/region to match that host's
+                       unbound local_dns_port; upserted into vmd.env so a rebuilt
+                       host wires the redirect (unbound answers there but vmd
+                       owns the redirect rules).
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
@@ -28,6 +48,7 @@ preserving vmd's template cache.
 """
 
 import os
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -78,6 +99,25 @@ def main() -> int:
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
+    internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
+    # Empty = skip, so a fleet-wide deploy never writes a redirect to a host
+    # whose resolver isn't on this port. Set per host/region to match unbound.
+    dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "")
+
+    # Pre-quote every value injected into the remote shell script. These come
+    # from CI secrets / Secret Manager and must be treated as arbitrary text:
+    # shlex.quote makes each safe both as a shell `[ -n ... ]` operand and, as a
+    # full "KEY=value" token, as a literal env-file line via `echo`.
+    q_sentry = shlex.quote(sentry_dsn)
+    q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
+    q_cpu = shlex.quote(control_plane_url)
+    q_cpu_line = shlex.quote(f"CONTROL_PLANE_URL={control_plane_url}")
+    q_dns = shlex.quote(dns_redirect_port)
+    q_dns_line = shlex.quote(f"VMD_DNS_REDIRECT_PORT={dns_redirect_port}")
+    q_token = shlex.quote(internal_api_token)
+    q_iat_line = shlex.quote(f"INTERNAL_API_TOKEN={internal_api_token}")
+    q_dat_line = shlex.quote(f"DAEMON_AUTH_TOKEN={internal_api_token}")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -233,9 +273,9 @@ def main() -> int:
 
             # Upsert SENTRY_DSN in the vmd env file without touching other vars.
             # Only update when a non-empty value is provided; skip silently otherwise.
-            if [ -n '{sentry_dsn}' ]; then
+            if [ -n {q_sentry} ]; then
                 sudo sed -i '/^SENTRY_DSN=/d' /etc/sandbox/vmd.env
-                echo 'SENTRY_DSN={sentry_dsn}' | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                echo {q_sentry_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
@@ -247,6 +287,53 @@ def main() -> int:
                     echo 'SECRETSPROXY_SOCKET=/run/secretsproxy/control.sock' | sudo tee -a "$env_file" > /dev/null
                 fi
             done
+
+            # Upsert the control-plane URL. Empty = skip. vmd.env is safe to
+            # create; secretsproxy.env is only UPSERTED when it ALREADY exists —
+            # never create it here, because a partial file (missing
+            # DAEMON_AUTH_TOKEN/DATABASE_URL) makes the daemon exit and fails the
+            # health check below. The host bootstrap owns creating that file.
+            if [ -n {q_cpu} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^CONTROL_PLANE_URL=/d' /etc/sandbox/vmd.env
+                echo {q_cpu_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                if [ -f /etc/sandbox/secretsproxy.env ]; then
+                    sudo sed -i '/^CONTROL_PLANE_URL=/d' /etc/sandbox/secretsproxy.env
+                    echo {q_cpu_line} | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
+                fi
+            fi
+
+            # Upsert the guest DNS redirect port so vmd rebuilds its
+            # SANDBOX_DNS_REDIRECT nat chain on a fresh host. unbound answers on
+            # this port; without the env var vmd never redirects guest :53 there
+            # and guests bypass the Cloudflare Gateway resolver.
+            if [ -n {q_dns} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_DNS_REDIRECT_PORT=/d' /etc/sandbox/vmd.env
+                echo {q_dns_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert the shared control-plane auth token. vmd reads it as
+            # INTERNAL_API_TOKEN; secretsproxy authenticates callers with the
+            # same value as DAEMON_AUTH_TOKEN. Sourced from CI secrets / Secret
+            # Manager — never hardcoded. Empty = leave existing values alone.
+            if [ -n {q_token} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                # vmd.env holds the bearer token — keep it root-only.
+                sudo chmod 0600 /etc/sandbox/vmd.env
+                sudo sed -i '/^INTERNAL_API_TOKEN=/d' /etc/sandbox/vmd.env
+                echo {q_iat_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                # Upsert DAEMON_AUTH_TOKEN only into an EXISTING secretsproxy.env;
+                # never create it here (same reason as CONTROL_PLANE_URL above).
+                if [ -f /etc/sandbox/secretsproxy.env ]; then
+                    sudo chmod 0600 /etc/sandbox/secretsproxy.env
+                    sudo sed -i '/^DAEMON_AUTH_TOKEN=/d' /etc/sandbox/secretsproxy.env
+                    echo {q_dat_line} | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
+                fi
+            fi
 
             # Stop before starting the socket unit: on the first deploy of
             # socket activation the old direct-bound vmd still holds the

@@ -32,3 +32,10 @@ import {
   to = module.sandbox_host.google_compute_instance.this
   id = "projects/rayai-dev/zones/us-central1-a/instances/superserve-vmd-staging"
 }
+
+# The api module now declares the public invoker binding that already exists on
+# this service; import so the apply is a no-op. iam_member is idempotent.
+import {
+  to = module.api.google_cloud_run_v2_service_iam_member.public_invoker[0]
+  id = "projects/rayai-dev/locations/us-central1/services/superserve-api roles/run.invoker allUsers"
+}

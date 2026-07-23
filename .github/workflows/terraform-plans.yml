@@ -6,6 +6,7 @@ on:
     paths:
       - "infra/**"
       - "scripts/terraform-*.sh"
+      - "scripts/sanitize-terraform-plan.sh"
       - ".github/workflows/terraform-*.yml"
 
 concurrency:
@@ -25,15 +26,23 @@ jobs:
         include:
           - name: staging-us-central1
             dir: infra/envs/staging/us-central1
+            environment: staging
           - name: production-us-central1
             dir: infra/envs/production/us-central1
+            environment: production
           - name: production-us-west2
             dir: infra/envs/production/us-west2
+            environment: production
           - name: production-us-east4
             dir: infra/envs/production/us-east4
+            environment: production
+    environment: ${{ matrix.environment }}
     env:
       TF_IN_AUTOMATION: "true"
       HAS_GCP_AUTH: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
+      # Existing Monitoring channel resource names are non-secret references;
+      # the channel's Slack credential remains owned by Cloud Monitoring.
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +81,37 @@ jobs:
             echo
           } > "$summary_file"
 
+          if [[ "${{ matrix.name }}" == production-* ]]; then
+            channel_ids="${TF_VAR_notification_channel_ids:-}"
+            case "$channel_ids" in
+              ""|"[]")
+                echo "::error title=Missing notification channels::Set the existing monitored channel resource names in the TF_VAR_NOTIFICATION_CHANNEL_IDS repository/environment variable."
+                echo "Plan stopped: monitored notification channels are required for production." >> "$summary_file"
+                exit 1
+                ;;
+              \[*\])
+                if [[ ! "$channel_ids" =~ ^\[[[:space:]]*\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\"([[:space:]]*,[[:space:]]*\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\")*[[:space:]]*\]$ ]]; then
+                  echo "::error title=Invalid notification channels::TF_VAR_NOTIFICATION_CHANNEL_IDS contains an invalid channel resource name."
+                  echo "Plan stopped: notification channels must use projects/PROJECT_ID/notificationChannels/NUMERIC_ID." >> "$summary_file"
+                  exit 1
+                fi
+                ;;
+              projects/*/notificationChannels/*)
+                if [[ ! "$channel_ids" =~ ^projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+$ ]]; then
+                  echo "::error title=Invalid notification channels::TF_VAR_NOTIFICATION_CHANNEL_IDS must name a valid Cloud Monitoring channel."
+                  echo "Plan stopped: notification channels must use projects/PROJECT_ID/notificationChannels/NUMERIC_ID." >> "$summary_file"
+                  exit 1
+                fi
+                export TF_VAR_notification_channel_ids="[\"$channel_ids\"]"
+                ;;
+              *)
+                echo "::error title=Invalid notification channels::TF_VAR_NOTIFICATION_CHANNEL_IDS must be a Terraform list literal."
+                echo "Plan stopped: TF_VAR_NOTIFICATION_CHANNEL_IDS is not a Terraform list literal." >> "$summary_file"
+                exit 1
+                ;;
+            esac
+          fi
+
           cd "${{ matrix.dir }}"
 
           terraform init -input=false
@@ -92,9 +132,9 @@ jobs:
             echo "Changes detected."
             echo "Changes detected." >> "$summary_file"
             echo >> "$summary_file"
-            echo "Plan output:" >> "$summary_file"
+            echo "Sanitized plan summary:" >> "$summary_file"
             echo '```' >> "$summary_file"
-            terraform show -no-color tfplan | head -n 200 >> "$summary_file" || true
+            "${GITHUB_WORKSPACE}/scripts/sanitize-terraform-plan.sh" tfplan >> "$summary_file"
             echo '```' >> "$summary_file"
             exit 0
           fi

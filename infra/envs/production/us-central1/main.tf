@@ -197,9 +197,12 @@ module "api" {
       secret = "posthog-project-key"
     }
   }
-  cpu_limit         = "2"
-  memory_limit      = "1Gi"
-  min_instances     = 6
+  cpu_limit    = "2"
+  memory_limit = "1Gi"
+  # 0 matches the live service: this cell was scaled to idle after the us-east4
+  # cutover and is pending decommission. Declaring the live value keeps the plan
+  # a no-op instead of re-inflating the idle cell to 6 on the next apply.
+  min_instances     = 0
   max_instances     = 10
   startup_cpu_boost = true
   cpu_idle          = true
@@ -241,9 +244,17 @@ module "sandbox_host" {
 module "observability" {
   source = "../../../modules/observability"
 
-  project_id  = local.project_id
-  environment = local.environment
-  labels      = local.common_labels
+  project_id               = local.project_id
+  environment              = local.environment
+  notification_channel_ids = var.notification_channel_ids
+  compute_instance_cpu_alerts = {
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
+    }
+  }
+  labels = local.common_labels
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Production Operations"
