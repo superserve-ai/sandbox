@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -79,8 +80,8 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	var (
 		upstreamStatus int
 		ttfbMs         int64 = -1
-		boxdSpawnMs          = ""
-		boxdRunMs            = ""
+		boxdSpawnMs    int64 = -1
+		boxdRunMs      int64 = -1
 	)
 
 	rp := &httputil.ReverseProxy{
@@ -104,8 +105,8 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		ModifyResponse: func(resp *http.Response) error {
 			ttfbMs = time.Since(tStart).Milliseconds()
 			upstreamStatus = resp.StatusCode
-			boxdSpawnMs = resp.Header.Get("X-Boxd-Spawn-Ms")
-			boxdRunMs = resp.Header.Get("X-Boxd-Run-Ms")
+			boxdSpawnMs = headerMs(resp, "X-Boxd-Spawn-Ms")
+			boxdRunMs = headerMs(resp, "X-Boxd-Run-Ms")
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
@@ -128,7 +129,22 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		Int64("auth_ms", tAuthDone.Sub(tStart).Milliseconds()).
 		Int64("upstream_ttfb_ms", ttfbMs).
 		Int64("total_ms", time.Since(tStart).Milliseconds()).
-		Str("boxd_spawn_ms", boxdSpawnMs).
-		Str("boxd_run_ms", boxdRunMs).
+		Int64("boxd_spawn_ms", boxdSpawnMs).
+		Int64("boxd_run_ms", boxdRunMs).
 		Msg("exec phases")
+}
+
+// headerMs parses a millisecond timing header; -1 means absent or unparseable
+// (an old boxd, or a non-exec error response), keeping the field numeric so
+// it aggregates with the other *_ms fields.
+func headerMs(resp *http.Response, name string) int64 {
+	v := resp.Header.Get(name)
+	if v == "" {
+		return -1
+	}
+	ms, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return ms
 }
