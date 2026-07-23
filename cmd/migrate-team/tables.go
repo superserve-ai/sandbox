@@ -121,6 +121,10 @@ var skippedTables = []struct{ name, reason string }{
 	{"feature_flag, pricing_plan, pricing_rate", "migration-seeded per cell"},
 	{"billing_rollup_scheduler_lease, billing_rollup_backfill_state", "global scheduler state, not team-scoped"},
 	{"early_access_request", "not team-scoped"},
+	// Copying shard rows would double-count against the admits the dest
+	// triggers record as sandboxes resume there; the source's rows cascade
+	// away when the team row is purged.
+	{"team_sandbox_counter", "dest quota triggers rebuild it as sandboxes resume; copying would double-count"},
 }
 
 // tableByName finds a migrated table's spec.

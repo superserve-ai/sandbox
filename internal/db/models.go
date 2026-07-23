@@ -458,6 +458,11 @@ type SandboxComputeBillingInterval struct {
 	EndReason *string            `json:"end_reason"`
 }
 
+type SandboxQuotaConfig struct {
+	SingleRow bool  `json:"single_row"`
+	Margin    int32 `json:"margin"`
+}
+
 type SandboxRevocation struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	RevokedAt time.Time `json:"revoked_at"`
@@ -510,21 +515,27 @@ type Snapshot struct {
 }
 
 type Team struct {
-	ID                    uuid.UUID `json:"id"`
-	Name                  string    `json:"name"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
-	BuildConcurrency      int32     `json:"build_concurrency"`
-	MaxTemplateVcpu       *int32    `json:"max_template_vcpu"`
-	MaxTemplateMemoryMib  *int32    `json:"max_template_memory_mib"`
-	MaxTemplateDiskMib    *int32    `json:"max_template_disk_mib"`
-	MaxTemplates          *int32    `json:"max_templates"`
-	MaxSandboxes          int32     `json:"max_sandboxes"`
-	ActiveSandboxCount    int32     `json:"active_sandbox_count"`
-	CredentialStoreKind   string    `json:"credential_store_kind"`
-	CredentialStoreConfig []byte    `json:"credential_store_config"`
-	UnmatchedHostPolicy   string    `json:"unmatched_host_policy"`
-	HomeRegion            string    `json:"home_region"`
+	ID                   uuid.UUID `json:"id"`
+	Name                 string    `json:"name"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	BuildConcurrency     int32     `json:"build_concurrency"`
+	MaxTemplateVcpu      *int32    `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib *int32    `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib   *int32    `json:"max_template_disk_mib"`
+	MaxTemplates         *int32    `json:"max_templates"`
+	MaxSandboxes         int32     `json:"max_sandboxes"`
+	// Frozen at the sharded-counter migration; read team_active_sandbox_counts instead.
+	ActiveSandboxCount    int32  `json:"active_sandbox_count"`
+	CredentialStoreKind   string `json:"credential_store_kind"`
+	CredentialStoreConfig []byte `json:"credential_store_config"`
+	UnmatchedHostPolicy   string `json:"unmatched_host_policy"`
+	HomeRegion            string `json:"home_region"`
+}
+
+type TeamActiveSandboxCount struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	ActiveSandboxCount int32     `json:"active_sandbox_count"`
 }
 
 type TeamBillingPeriod struct {
@@ -623,6 +634,12 @@ type TeamPricingPlan struct {
 	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
 	AssignedBy    pgtype.UUID        `json:"assigned_by"`
 	CreatedAt     time.Time          `json:"created_at"`
+}
+
+type TeamSandboxCounter struct {
+	TeamID uuid.UUID `json:"team_id"`
+	Shard  int16     `json:"shard"`
+	Cnt    int32     `json:"cnt"`
 }
 
 type Template struct {

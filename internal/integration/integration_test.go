@@ -1430,11 +1430,7 @@ func TestIntegration_PauseRevertExemptFromQuota(t *testing.T) {
 		t.Fatalf("pausing→active revert must be exempt from the cap, got: %v", err)
 	}
 
-	var count int
-	if err := testPool.QueryRow(ctx, `SELECT active_sandbox_count FROM team WHERE id = $1`, teamID).Scan(&count); err != nil {
-		t.Fatalf("read count: %v", err)
-	}
-	if count != 2 {
+	if count := activeCount(t, teamID); count != 2 {
 		t.Errorf("active_sandbox_count = %d, want 2 (transient overcommit recorded, not blocked)", count)
 	}
 }

@@ -488,8 +488,10 @@ func buildTransforms(ctx context.Context, src, dst querier, cfg config) (map[str
 			// Rehome on every write — upserts converge, so a retry
 			// re-asserts the dest region rather than trusting a stale row.
 			row["home_region"] = cfg.destRegion
-			// Dest quota triggers recount as sandbox rows land; starting
-			// from the source's counter would double-count.
+			// Quota state lives in team_sandbox_counter now (deliberately
+			// not copied — see skippedTables); the dest triggers rebuild it
+			// as sandboxes resume. This column is frozen; zeroing it just
+			// keeps the dest row from carrying a stale source snapshot.
 			row["active_sandbox_count"] = 0
 			return nil
 		},
