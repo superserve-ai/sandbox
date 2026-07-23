@@ -31,7 +31,7 @@ resource "google_compute_backend_service" "cloud_run" {
   # Match the live backend created imperatively during the migration (classic
   # external scheme, no connection draining) so the import plan is a no-op.
   # Moving to EXTERNAL_MANAGED / draining would be a separate, reviewed change.
-  load_balancing_scheme           = "EXTERNAL"
+  load_balancing_scheme           = "EXTERNAL_MANAGED"
   connection_draining_timeout_sec = 0
   timeout_sec                     = var.backend_timeout_sec
 
@@ -95,11 +95,13 @@ resource "google_compute_target_https_proxy" "this" {
 }
 
 resource "google_compute_global_forwarding_rule" "this" {
-  project               = var.project_id
-  name                  = var.forwarding_rule_name
-  ip_address            = google_compute_global_address.this.address
-  port_range            = "443"
-  load_balancing_scheme = "EXTERNAL_MANAGED"
+  project    = var.project_id
+  name       = var.forwarding_rule_name
+  ip_address = google_compute_global_address.this.address
+  port_range = "443"
+  # Live forwarding rule is EXTERNAL (the backend is EXTERNAL_MANAGED); match
+  # each resource's live scheme exactly so the import plan is a no-op.
+  load_balancing_scheme = "EXTERNAL"
   network_tier          = "PREMIUM"
   target                = google_compute_target_https_proxy.this.id
 }
