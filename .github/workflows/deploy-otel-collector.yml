@@ -71,28 +71,15 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # The use4 cell host is the primary production host (api.superserve.ai) —
-      # deploy its collector FIRST, before the idle us-central1 host, so a
-      # legacy-only failure can't stop the job and leave the public host without
-      # the collector update. Skipped until CLOUD_RUN_SERVICE_USE4 is set.
+      # The use4 cell host is the primary production host (api.superserve.ai).
+      # Skipped until CLOUD_RUN_SERVICE_USE4 is set. (usw remains uncovered here
+      # — pre-existing gap, tracked separately.)
       - name: Deploy OTEL Collector to use4 cell VMD instances
         if: vars.CLOUD_RUN_SERVICE_USE4 != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: us-east4
           VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-east4
-          OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
-        run: |
-          python3 .github/workflows/scripts/deploy-otel-collector.py
-
-      # Legacy us-central1 host, idle and pending decommission. Runs after the
-      # use4 primary so its failure can't block the real primary. (usw remains
-      # uncovered here — pre-existing gap, tracked separately.)
-      - name: Deploy OTEL Collector to production VMD instances
-        env:
-          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
-          GCP_REGION: us-central1
-          VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-central1
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
           python3 .github/workflows/scripts/deploy-otel-collector.py
