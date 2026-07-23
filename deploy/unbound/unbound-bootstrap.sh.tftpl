@@ -1,0 +1,57 @@
+#!/bin/bash
+# Host startup step: stand up unbound as the guest DNS resolver.
+#
+# WHY: sandbox guests must not talk to arbitrary DNS. vmd transparently
+# REDIRECTs all guest :53 traffic (TCP+UDP) to :${local_dns_port} via its
+# SANDBOX_DNS_REDIRECT nat chain (internal/network/hostfw.go) — this script only
+# installs the resolver that answers there and forwards every query over DoT
+# (DNS-over-TLS) to a Cloudflare Zero Trust Gateway location, which enforces the
+# fleet egress DNS policy. Do NOT add DNS redirect rules here: vmd owns them
+# (managing them from two places conflicts).
+#
+# Idempotent; safe to re-run on boot. Shape mirrors collector-bootstrap.sh.tftpl.
+set -euo pipefail
+
+exec >> /var/log/unbound-bootstrap.log 2>&1
+
+echo "=== Superserve unbound bootstrap $(date -Is) ==="
+
+if ! command -v unbound >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y unbound
+fi
+
+install -d -m 0755 /etc/unbound/unbound.conf.d
+cat <<'EOF' >/etc/unbound/unbound.conf.d/sandbox.conf
+# Managed by unbound-bootstrap.sh.tftpl — do not edit by hand.
+server:
+    # vmd REDIRECTs guest :53 to ${local_dns_port} on the inbound interface, so
+    # answer there on all interfaces; loopback covers host-local lookups.
+    interface: 127.0.0.1
+    interface: 0.0.0.0@${local_dns_port}
+    access-control: 0.0.0.0/0 refuse
+    access-control: 127.0.0.0/8 allow
+    access-control: ${guest_cidr} allow
+    tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
+    module-config: "iterator"
+    cache-min-ttl: 60
+    cache-max-ttl: 3600
+    prefetch: yes
+    use-syslog: yes
+    verbosity: 1
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    # Cloudflare Zero Trust Gateway (DoT). The @853#hostname pins the TLS SNI /
+    # cert name to the location endpoint so the DNS policy is applied.
+%{ for addr in dot_upstream_addrs ~}
+    forward-addr: ${addr}@853#${dot_hostname}
+%{ endfor ~}
+EOF
+
+systemctl enable --now unbound
+systemctl restart unbound
+
+echo "=== Superserve unbound bootstrap complete ==="

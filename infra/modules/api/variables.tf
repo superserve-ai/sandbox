@@ -113,3 +113,9 @@ variable "cpu_idle" {
   type    = bool
   default = false
 }
+
+variable "allow_public_invoker" {
+  description = "Grant allUsers roles/run.invoker on the service (public, unauthenticated ingress). Every prod cell fronts the API with a public HTTPS LB, so this defaults to true. The bindings already exist live across all cells — created imperatively — so enabling this and importing adopts them without a policy change."
+  type        = bool
+  default     = true
+}

@@ -144,3 +144,38 @@ environments:
         artifacts:
           docker_repository: us-west2-docker.pkg.dev/rayai-prod/superserve-usw2
           object_bucket: superserve-artifacts
+      - name: us-east4
+        # us-east4 is the "use" cell's new host home (a us-central1 host swap),
+        # not a fresh cell: it shares the use-cell Supabase, secrets, and the
+        # us-central1 Artifact Registry image repo. Only the Cloud Run service
+        # name, region, and vmd host are region-local.
+        #
+        # required=false until the CD deploy steps for this cell land (the use4
+        # API step in deploy-api.yml and the use4 host step in deploy-vmd.yml).
+        # Declaring it required before then would mark a target CD doesn't yet
+        # push to, letting releases skew this cell. Flip to true with that wiring.
+        required: false
+        api:
+          platform: cloud_run
+          service: superserve-api-use4
+          region: us-east4
+          image_repository: us-central1-docker.pkg.dev/rayai-prod/superserve/controlplane
+        host_deployments:
+          vmd:
+            enabled: true
+            selector:
+              environment: production
+              region: us-east4
+              sandbox_role: vmd
+              sandbox_status: ready
+          proxy:
+            enabled: true
+            selector:
+              environment: production
+              region: us-east4
+              sandbox_role: vmd
+              sandbox_status: ready
+            domain: use4-sandbox.superserve.ai
+        artifacts:
+          docker_repository: us-central1-docker.pkg.dev/rayai-prod/superserve
+          object_bucket: superserve-artifacts
