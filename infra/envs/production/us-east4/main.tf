@@ -230,11 +230,13 @@ module "sandbox_host" {
   # discovery labels CD and the scheduler key on. `labels` is NOT in the
   # module's ignore_changes, so these must be declared here or a `terraform
   # apply` would strip the ones added out-of-band at cutover and break host
-  # discovery (deploy-vmd / deploy-otel filter on component=vmd). Mirrors the
-  # us-central1 host.
+  # discovery (deploy-vmd / deploy-otel filter on component=vmd; the deployment
+  # registry selects sandbox_status=ready). Mirrors the us-central1 host's
+  # discovery labels; sandbox_status=ready because this host is serving.
   labels = merge(local.common_labels, {
     component               = "vmd"
     sandbox_role            = "vmd"
+    sandbox_status          = "ready"
     "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
