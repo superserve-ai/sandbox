@@ -72,10 +72,10 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	}
 
 	// Per-request phase fields, mirroring the create path's phase log:
-	// aggregate them for burst percentiles or read one line for a single
-	// create→exec flow. upstream_ttfb spans dial + request + boxd's whole
-	// run for the sync path (boxd buffers to completion), so the guest-side
-	// headers are what split it further.
+	// aggregate across requests or read one line for a single create→exec
+	// flow. upstream_ttfb spans dial + request + boxd's whole run for the
+	// sync path (boxd buffers to completion), so the guest-side headers
+	// are what split it further.
 	var (
 		upstreamStatus int
 		ttfbMs         int64 = -1
