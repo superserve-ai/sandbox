@@ -84,10 +84,10 @@ resource "google_compute_target_https_proxy" "this" {
   project = var.project_id
   name    = var.https_proxy_name
   url_map = google_compute_url_map.this.id
-  # A target HTTPS proxy needs the full Certificate Manager resource URI, not
-  # the bare `projects/.../certificateMaps/...` that `.id` returns — otherwise
-  # the post-import plan is not a no-op (the provider re-patches the proxy).
-  certificate_map = "//certificatemanager.googleapis.com/${google_certificate_manager_certificate_map.this.id}"
+  # A target HTTPS proxy stores certificate_map as the versioned Certificate
+  # Manager resource URL, not the bare `projects/.../certificateMaps/...` that
+  # `.id` returns. Match that exact form so the post-import plan is a no-op.
+  certificate_map = "https://certificatemanager.googleapis.com/v1/${google_certificate_manager_certificate_map.this.id}"
 }
 
 resource "google_compute_global_forwarding_rule" "this" {

@@ -121,9 +121,12 @@ module "api" {
   # and ignore_changes keeps terraform from reverting that.
   image = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:latest"
 
-  cpu_limit         = "2"
-  memory_limit      = "1Gi"
-  min_instances     = 2
+  cpu_limit    = "2"
+  memory_limit = "1Gi"
+  # 6 matches the live service (raised from 2 during burst tuning). scaling is
+  # in the module's ignore_changes, but that path is ineffective for the v2
+  # resource, so declaring the live value keeps the plan a no-op.
+  min_instances     = 6
   max_instances     = 100
   startup_cpu_boost = true
   cpu_idle          = true
@@ -137,16 +140,9 @@ module "api" {
     DB_MAX_CONNS           = "12"
     VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
-
-    # OTLP export to the host-local collector, mirroring us-central1. The
-    # allow_otel_ingress firewall rule already admits Cloud Run -> host on
-    # 4317/4318. These were set imperatively on the live service; keep them
-    # here so a later apply doesn't strip them.
-    OTEL_ENVIRONMENT            = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${module.sandbox_host.internal_ip}:4318"
-    OTEL_EXPORT_INTERVAL        = "15s"
-    OTEL_METRICS_ENABLED        = "true"
-    OTEL_SERVICE_NAME           = "sandbox-controlplane"
+    # OTEL_* is intentionally omitted here: the live service has no OTEL env, so
+    # adding it would be a production change, not adoption. It lands in a
+    # separate OTEL-parity PR (mirroring us-central1's collector export).
   }
 
   secrets = {
@@ -226,17 +222,17 @@ module "sandbox_host" {
   internal_ip   = var.host_internal_ip
   tags          = ["vmd-use4"]
 
-  # Cutover complete: this is the live primary host, so it must carry the prod
-  # discovery labels CD and the scheduler key on. `labels` is NOT in the
-  # module's ignore_changes, so these must be declared here or a `terraform
-  # apply` would strip the ones added out-of-band at cutover and break host
-  # discovery (deploy-vmd / deploy-otel filter on component=vmd; the deployment
-  # registry selects sandbox_status=ready). Mirrors the us-central1 host's
-  # discovery labels; sandbox_status=ready because this host is serving.
+  # Declare the discovery labels CD and the scheduler key on (component=vmd,
+  # sandbox_role=vmd, ops-agent) — they were added out-of-band at cutover and
+  # `labels` is NOT in the module's ignore_changes, so declaring them keeps a
+  # later apply from stripping them. Values here match the LIVE host exactly so
+  # this stays a no-op adoption: sandbox_status is still "provisioning" live;
+  # flipping it to "ready" (to match the deployment-registry selector) is a
+  # separate, intentional change, not part of this import PR.
   labels = merge(local.common_labels, {
     component               = "vmd"
     sandbox_role            = "vmd"
-    sandbox_status          = "ready"
+    sandbox_status          = "provisioning"
     "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 

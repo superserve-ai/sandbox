@@ -197,9 +197,12 @@ module "api" {
       secret = "posthog-project-key"
     }
   }
-  cpu_limit         = "2"
-  memory_limit      = "1Gi"
-  min_instances     = 6
+  cpu_limit    = "2"
+  memory_limit = "1Gi"
+  # 0 matches the live service: this cell was scaled to idle after the us-east4
+  # cutover and is pending decommission. Declaring the live value keeps the plan
+  # a no-op instead of re-inflating the idle cell to 6 on the next apply.
+  min_instances     = 0
   max_instances     = 10
   startup_cpu_boost = true
   cpu_idle          = true
