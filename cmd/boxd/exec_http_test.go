@@ -43,6 +43,11 @@ func TestHandleExec_Success(t *testing.T) {
 	if resp.ExitCode != 0 {
 		t.Errorf("exit_code = %d, want 0", resp.ExitCode)
 	}
+	for _, hdr := range []string{"X-Boxd-Spawn-Ms", "X-Boxd-Run-Ms"} {
+		if w.Header().Get(hdr) == "" {
+			t.Errorf("missing timing header %s", hdr)
+		}
+	}
 }
 
 func TestHandleExec_NonzeroExit(t *testing.T) {
