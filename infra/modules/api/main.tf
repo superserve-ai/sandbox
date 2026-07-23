@@ -90,6 +90,9 @@ resource "google_cloud_run_v2_service" "this" {
     ignore_changes = [
       client,
       client_version,
+      # Deploy tooling adds transient service labels (e.g. cachebust) the module
+      # does not declare; ignore label drift so an apply doesn't strip them.
+      labels,
       scaling,
       template[0].containers[0].image,
       traffic,

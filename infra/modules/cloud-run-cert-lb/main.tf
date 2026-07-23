@@ -25,11 +25,15 @@ resource "google_compute_region_network_endpoint_group" "cloud_run" {
 }
 
 resource "google_compute_backend_service" "cloud_run" {
-  project               = var.project_id
-  name                  = var.backend_service_name
-  protocol              = "HTTP"
-  load_balancing_scheme = "EXTERNAL_MANAGED"
-  timeout_sec           = var.backend_timeout_sec
+  project  = var.project_id
+  name     = var.backend_service_name
+  protocol = "HTTP"
+  # Match the live backend created imperatively during the migration (classic
+  # external scheme, no connection draining) so the import plan is a no-op.
+  # Moving to EXTERNAL_MANAGED / draining would be a separate, reviewed change.
+  load_balancing_scheme           = "EXTERNAL"
+  connection_draining_timeout_sec = 0
+  timeout_sec                     = var.backend_timeout_sec
 
   backend {
     group = google_compute_region_network_endpoint_group.cloud_run.id
