@@ -1717,12 +1717,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			DeltaPath:         nil,
 		})
 	}
-	// insertWithBindings writes the sandbox row and any secret bindings in ONE
-	// statement, so a successful create never leaves a binding unrecorded. The
-	// single statement (vs a transaction spanning two) also matters for quota
-	// exactness: the row's shard-counter admission is invisible to concurrent
-	// quota checks until commit, and a multi-statement transaction would hold
-	// that window open across client round trips.
+	// insertWithBindings writes the sandbox row and any secret bindings in one
+	// statement, so a successful create never leaves a binding unrecorded and
+	// the quota admission's uncommitted window stays statement-sized — a
+	// transaction spanning multiple round trips would widen it (see the query
+	// comments).
 	insertWithBindings := func() (db.Sandbox, error) {
 		if len(secretBindings) == 0 {
 			return runInsert(h.DB)
