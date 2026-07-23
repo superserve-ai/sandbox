@@ -16,12 +16,17 @@ import (
 
 // launcherPruneScript strips every /run/netns nsfs mount from a freshly cloned
 // namespace. A single `umount /run/netns` detaches only the parent layer; the
-// per-netns nsfs mounts remain stacked on /run/netns/ns-N, so we unmount each.
+// per-netns nsfs mounts remain stacked on /run/netns/ns-N, so each needs its
+// own unmount — batched through xargs, because one umount fork per mount makes
+// the build take minutes at fleet scale, and until the build finishes every
+// launch pays the legacy full-table path.
 // make-rprivate MUST run first (|| exit 1) to sever propagation from the host —
 // without it a umount could propagate back and detach the host's live pins.
+// Netns pin names contain no whitespace, so the newline-separated xargs feed
+// is unambiguous.
 const launcherPruneScript = `mount --make-rprivate / || exit 1
 umount -l /run/netns 2>/dev/null || true
-for m in $(grep ' /run/netns/' /proc/self/mounts | awk '{print $2}'); do umount -l "$m" 2>/dev/null || true; done`
+grep ' /run/netns/' /proc/self/mounts | awk '{print $2}' | xargs -r umount -l 2>/dev/null || true`
 
 // launcherBuildTimeout reaps a genuinely wedged mount syscall — it does not
 // pace the build, which runs async with legacy-path fallback until done, so a
