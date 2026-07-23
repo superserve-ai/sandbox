@@ -8,6 +8,11 @@ output "instance_name" {
   value       = google_compute_instance.this.name
 }
 
+output "instance_id" {
+  description = "Stable numeric Compute Engine instance ID for Monitoring resource filters."
+  value       = google_compute_instance.this.instance_id
+}
+
 output "instance_self_link" {
   description = "Instance self link."
   value       = google_compute_instance.this.self_link

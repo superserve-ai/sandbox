@@ -32,7 +32,9 @@ case "${ENVIRONMENT}/${REGION}" in
     API_BASE_URL="${API_BASE_URL:-https://superserve-api-eszjsyysqa-uc.a.run.app}"
     SANDBOX_BASE_URL="${SANDBOX_BASE_URL:-https://staging-sandbox.superserve.ai}"
     ;;
-  production/us-central1)
+  production/us-central1 | production/us-east4)
+    # The "use" cell — served by the shared api/sandbox domains regardless of
+    # which host (central or its us-east4 successor) is primary.
     API_BASE_URL="${API_BASE_URL:-https://api.superserve.ai}"
     SANDBOX_BASE_URL="${SANDBOX_BASE_URL:-https://sandbox.superserve.ai}"
     ;;

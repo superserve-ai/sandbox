@@ -94,6 +94,12 @@ variable "system_team_id_secret_name" {
   default     = null
 }
 
+variable "notification_channel_ids" {
+  description = "Existing monitored Cloud Monitoring notification channel resource names for infrastructure alerts."
+  type        = list(string)
+  default     = []
+}
+
 variable "create_network" {
   type    = bool
   default = false

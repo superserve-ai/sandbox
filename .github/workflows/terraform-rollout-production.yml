@@ -27,6 +27,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
       API_BASE_URL: https://usw-api.superserve.ai
       API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
       SANDBOX_BASE_URL: https://usw-sandbox.superserve.ai
@@ -83,6 +84,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
       API_BASE_URL: https://usc-api.superserve.ai
       API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
       SANDBOX_BASE_URL: https://usc-sandbox.superserve.ai
