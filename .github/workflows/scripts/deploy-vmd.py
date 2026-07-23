@@ -357,6 +357,16 @@ def main() -> int:
                 sudo chmod 0600 /etc/sandbox/vmd.env
                 sudo sed -i '/^DATABASE_URL=/d' /etc/sandbox/vmd.env
                 echo {q_db_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                # secretsproxy reads its own DATABASE_URL from its own env file
+                # (buildAuditSink fails startup without it, unless
+                # SECRETSPROXY_AUDIT_DISABLED=true) — only upsert into an
+                # EXISTING file, same reason as CONTROL_PLANE_URL/DAEMON_AUTH_TOKEN
+                # above: never create a partial secretsproxy.env here.
+                if [ -f /etc/sandbox/secretsproxy.env ]; then
+                    sudo chmod 0600 /etc/sandbox/secretsproxy.env
+                    sudo sed -i '/^DATABASE_URL=/d' /etc/sandbox/secretsproxy.env
+                    echo {q_db_line} | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
+                fi
             fi
 
             # Stop before starting the socket unit: on the first deploy of
