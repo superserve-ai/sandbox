@@ -117,6 +117,9 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 				Bool("streaming", streaming).
 				Msg("exec: upstream error")
 			h.resolver.Invalidate(instanceID)
+			// ModifyResponse never ran; record what the client actually got
+			// so unreachable-sandbox 502s show up in status-based queries.
+			upstreamStatus = http.StatusBadGateway
 			rw.Header().Set("Retry-After", "2")
 			http.Error(rw, "sandbox unreachable", http.StatusBadGateway)
 		},

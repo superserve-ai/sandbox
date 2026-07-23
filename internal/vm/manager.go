@@ -1133,6 +1133,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 	tRestore := time.Now()
 	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	tRestoreDone := time.Now()
 	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
@@ -1174,7 +1175,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		Int64("prep_ms", tSlot.Sub(tEntry).Milliseconds()).
 		Int64("ensure_slot_ms", tFcStart.Sub(tSlot).Milliseconds()).
 		Int64("fc_start_ms", tFcDone.Sub(tFcStart).Milliseconds()).
-		Int64("restore_ms", time.Since(tRestore).Milliseconds()).
+		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
 		Int64("total_ms", time.Since(tEntry).Milliseconds()).
 		Msg("VM resumed from snapshot")
 
