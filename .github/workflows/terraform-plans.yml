@@ -6,6 +6,7 @@ on:
     paths:
       - "infra/**"
       - "scripts/terraform-*.sh"
+      - "scripts/sanitize-terraform-plan.sh"
       - ".github/workflows/terraform-*.yml"
 
 concurrency:
@@ -89,7 +90,7 @@ jobs:
                 exit 1
                 ;;
               \[*\])
-                if [[ ! "$channel_ids" =~ ^\[\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\"(,\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\")*\]$ ]]; then
+                if [[ ! "$channel_ids" =~ ^\[[[:space:]]*\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\"([[:space:]]*,[[:space:]]*\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\")*[[:space:]]*\]$ ]]; then
                   echo "::error title=Invalid notification channels::TF_VAR_NOTIFICATION_CHANNEL_IDS contains an invalid channel resource name."
                   echo "Plan stopped: notification channels must use projects/PROJECT_ID/notificationChannels/NUMERIC_ID." >> "$summary_file"
                   exit 1

@@ -52,5 +52,6 @@ drain the host if saturation persists. Roll back by removing the alert policy
 configuration from the relevant environment and planning the deletion; do not
 apply that plan until the owner confirms the channel and policy are no longer
 needed. After deployment, recheck the Vanta control for every production host
-and retain the sanitized plan as evidence. Terraform plans are review-only;
-this repository does not apply production changes directly.
+and retain the sanitized plan as evidence. The plan command documented here is
+review-only; the repository's explicitly authorized production workflows can
+apply Terraform changes after their normal approval gates.
