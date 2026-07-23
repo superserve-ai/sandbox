@@ -241,9 +241,17 @@ module "sandbox_host" {
 module "observability" {
   source = "../../../modules/observability"
 
-  project_id  = local.project_id
-  environment = local.environment
-  labels      = local.common_labels
+  project_id               = local.project_id
+  environment              = local.environment
+  notification_channel_ids = var.notification_channel_ids
+  compute_instance_cpu_alerts = {
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
+    }
+  }
+  labels = local.common_labels
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Production Operations"
