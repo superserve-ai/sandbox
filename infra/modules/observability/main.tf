@@ -24,6 +24,15 @@ resource "google_monitoring_alert_policy" "compute_instance_cpu" {
       error_message = "notification_channel_ids must contain an existing monitored channel when CPU alerts are configured"
     }
     precondition {
+      condition = alltrue([
+        for channel_id in var.notification_channel_ids : can(regex(
+          "^projects/${var.project_id}/notificationChannels/[0-9]+$",
+          channel_id
+        ))
+      ])
+      error_message = "notification_channel_ids must reference monitored channels in the configured project using full resource names"
+    }
+    precondition {
       condition     = each.value.threshold > 0 && each.value.threshold <= 1
       error_message = "CPU alert thresholds must be greater than 0 and no greater than 1"
     }
