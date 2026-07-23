@@ -90,11 +90,17 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// tRecv..tSpawn covers decode + spawn queueing + fork; the Start event
+	// marks the moment the process exists. Returned as response headers so
+	// the data-plane proxy can log the guest-side split — boxd's own logs
+	// are not collected off the guest.
+	tRecv := time.Now()
 	var (
 		mu       sync.Mutex
 		stdout   []byte
 		stderr   []byte
 		exitCode int32
+		tSpawn   time.Time
 	)
 	emit := func(ev *pb.ProcessEvent) error {
 		mu.Lock()
@@ -109,6 +115,10 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 			case *pb.DataEvent_PtyData:
 				stdout = append(stdout, out.PtyData...)
 			}
+		case *pb.ProcessEvent_Start:
+			if tSpawn.IsZero() {
+				tSpawn = time.Now()
+			}
 		case *pb.ProcessEvent_End:
 			exitCode = x.End.ExitCode
 		}
@@ -120,6 +130,10 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !tSpawn.IsZero() {
+		w.Header().Set("X-Boxd-Spawn-Ms", fmt.Sprintf("%d", tSpawn.Sub(tRecv).Milliseconds()))
+		w.Header().Set("X-Boxd-Run-Ms", fmt.Sprintf("%d", time.Since(tSpawn).Milliseconds()))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(execResponse{
 		Stdout:   string(stdout),

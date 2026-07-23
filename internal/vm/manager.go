@@ -2858,6 +2858,7 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 // owns the process, not VMD. Non-empty basePath switches the start script to
 // the dual-symlink overlay layout.
 func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
+	tPrestart := time.Now()
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
 	}
@@ -2892,8 +2893,11 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// it needs a bigger socket budget. Decided up front: with Type=simple
 	// the restart job clears at fork, before the socket exists, so no
 	// at-timeout probe can tell a just-replaced unit from a stalled fresh
-	// one.
+	// one. Timed separately: it is a per-launch systemd round trip, and
+	// concurrent launches serialize on the shared D-Bus connection.
+	tLinger := time.Now()
 	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
+	lingerCheckMs := time.Since(tLinger).Milliseconds()
 
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
@@ -2928,6 +2932,8 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	m.log.Info().
 		Str("vm_id", vmID).
+		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
+		Int64("linger_check_ms", lingerCheckMs).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
 		Msg("fc startup phases")
