@@ -1005,6 +1005,7 @@ func fileExists(path string) bool {
 // ResumeVM restores a paused VM from its snapshot using a mount namespace.
 func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	tEntry := time.Now()
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
 	// waits, then is recognized as a retry rather than relaunching.
@@ -1091,6 +1092,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
+	tSlot := time.Now()
 	var netInfo *network.VMNetInfo
 	if inst.Namespace != "" {
 		var nsErr error
@@ -1100,10 +1102,12 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		}
 	}
 
+	tFcStart := time.Now()
 	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
+	tFcDone := time.Now()
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
@@ -1127,6 +1131,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
 		}
 	}
+	tRestore := time.Now()
 	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
 	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
@@ -1161,7 +1166,17 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.mu.Unlock()
 
 	m.persistState(inst)
-	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
+	// Resume-side phase parity with the create path's "restoring snapshot"
+	// line; wait_boxd_ms arrives async on the probe log below. prep spans
+	// the op-lock wait plus the precondition gates, so a duplicate-resume
+	// queue shows up here rather than hiding in the total.
+	log.Info().Int("pid", pid).
+		Int64("prep_ms", tSlot.Sub(tEntry).Milliseconds()).
+		Int64("ensure_slot_ms", tFcStart.Sub(tSlot).Milliseconds()).
+		Int64("fc_start_ms", tFcDone.Sub(tFcStart).Milliseconds()).
+		Int64("restore_ms", time.Since(tRestore).Milliseconds()).
+		Int64("total_ms", time.Since(tEntry).Milliseconds()).
+		Msg("VM resumed from snapshot")
 
 	// Telemetry only: measure how long boxd takes to become reachable after
 	// the vCPUs resume. Detached — status is already running and the probe
