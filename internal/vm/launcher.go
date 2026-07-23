@@ -135,9 +135,12 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 	if err := ensurePinFile(pinPath); err != nil {
 		return err
 	}
-	// /proc/self/exe, not os.Executable(): during a deploy the on-disk binary
-	// is replaced, and the proc link still execs the running inode.
-	cmd := exec.CommandContext(ctx, "unshare", "--mount="+pinPath, "--", "/proc/self/exe", launcherPruneArg)
+	// The daemon's pid-qualified exe link, resolved by unshare's exec: bare
+	// /proc/self/exe would name unshare's own binary at that point, and the
+	// on-disk vmd path can be a different (just-deployed) binary — this link
+	// execs the running daemon's inode either way.
+	pruner := fmt.Sprintf("/proc/%d/exe", os.Getpid())
+	cmd := exec.CommandContext(ctx, "unshare", "--mount="+pinPath, "--", pruner, launcherPruneArg)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("unshare --mount=%s: %v: %s", pinPath, err, strings.TrimSpace(string(out)))
 	}
