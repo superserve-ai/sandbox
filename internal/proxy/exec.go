@@ -82,6 +82,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		ttfbMs         int64 = -1
 		boxdSpawnMs    int64 = -1
 		boxdRunMs      int64 = -1
+		tProxy         time.Time
 	)
 
 	rp := &httputil.ReverseProxy{
@@ -103,7 +104,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		// -1: stream each chunk as it arrives — required for SSE.
 		FlushInterval: -1,
 		ModifyResponse: func(resp *http.Response) error {
-			ttfbMs = time.Since(tStart).Milliseconds()
+			ttfbMs = time.Since(tProxy).Milliseconds()
 			upstreamStatus = resp.StatusCode
 			boxdSpawnMs = headerMs(resp, "X-Boxd-Spawn-Ms")
 			boxdRunMs = headerMs(resp, "X-Boxd-Run-Ms")
@@ -120,6 +121,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 			http.Error(rw, "sandbox unreachable", http.StatusBadGateway)
 		},
 	}
+	tProxy = time.Now()
 	rp.ServeHTTP(w, r)
 
 	h.log.Info().
