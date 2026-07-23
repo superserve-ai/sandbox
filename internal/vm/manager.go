@@ -2882,10 +2882,9 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 			m.log.Warn().Str("path", pin).Msg("launcher pin not mounted at launch — using legacy path for this launch")
 		}
 	} else if m.launcherNSPath() != "" {
-		// Launcher mode is on but the pin isn't built yet (the post-boot build
-		// window). The legacy path this launch takes copies the full host mount
-		// table, so a burst landing in this window degrades with fleet size —
-		// it must be visible, not silent.
+		// Post-boot build window: the pin isn't built yet, and the legacy path
+		// this launch takes copies the full host mount table, so concurrent
+		// launches landing here degrade with fleet size.
 		m.log.Warn().Str("vm_id", vmID).Msg("launcher pin not built yet — using legacy path for this launch")
 	}
 	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
