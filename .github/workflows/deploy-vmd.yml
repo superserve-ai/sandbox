@@ -130,32 +130,17 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       # The use4 cell host is the primary production host — api.superserve.ai
-      # routes there — so it deploys FIRST, before the idle legacy primary and
-      # the usw secondary cell. A failure or zero-match in those must not stop
-      # the job and leave the public host on old vmd/boxd/secretsproxy binaries.
-      # Reuses the binaries built above; skipped until CLOUD_RUN_SERVICE_USE4 is
-      # set. Discovery is the VMD_LABEL filter scoped to GCP_REGION_USE4.
+      # routes there — so it deploys FIRST, before the usw secondary cell. A
+      # failure or zero-match in usw must not stop the job and leave the public
+      # host on old vmd/boxd/secretsproxy binaries. Reuses the binaries built
+      # above. Unguarded: use4 is the permanent primary, so a missing
+      # CLOUD_RUN_SERVICE_USE4/GCP_REGION_USE4 must fail the deploy rather than
+      # silently skip the only primary-host rollout. Discovery is the VMD_LABEL
+      # filter scoped to GCP_REGION_USE4 (deploy-vmd.py fails on zero matches).
       - name: Deploy to use4 cell VMD instances
-        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
-          VMD_LABEL: ${{ vars.VMD_LABEL }}
-          VMD_SERVICE: ${{ vars.VMD_SERVICE }}
-          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
-          SHA: ${{ github.sha }}
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
-        run: |
-          python3 .github/workflows/scripts/deploy-vmd.py
-
-      # Legacy primary-region fan-out (us-central1), now idle and pending
-      # decommission. GCP_REGION scopes it to that region's hosts only. It still
-      # deploys to stay in sync until removed, but runs AFTER the use4 primary so
-      # its failure can't block the real primary host.
-      - name: Discover and deploy to VMD instances
-        env:
-          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}

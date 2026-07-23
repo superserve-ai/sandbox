@@ -92,32 +92,10 @@ environments:
     terraform_dir: infra/envs/production
     project: rayai-prod
     regions:
-      - name: us-central1
-        required: true
-        api:
-          platform: cloud_run
-          service: superserve-api
-          region: us-central1
-          image_repository: us-central1-docker.pkg.dev/rayai-prod/superserve/controlplane
-        host_deployments:
-          vmd:
-            enabled: true
-            selector:
-              environment: production
-              region: us-central1
-              sandbox_role: vmd
-              sandbox_status: ready
-          proxy:
-            enabled: true
-            selector:
-              environment: production
-              region: us-central1
-              sandbox_role: vmd
-              sandbox_status: ready
-            domain: usc-sandbox.superserve.ai
-        artifacts:
-          docker_repository: us-central1-docker.pkg.dev/rayai-prod/superserve
-          object_bucket: superserve-artifacts
+      # The use cell's control plane and vmd host now live in us-east4 (below);
+      # the retired us-central1 primary was removed with the host decommission.
+      # us-central1 remains only the shared Artifact Registry image repo (see the
+      # image_repository fields), not a deploy target.
       - name: us-west2
         required: true
         api:
