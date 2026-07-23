@@ -124,9 +124,29 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # GCP_REGION keeps this fan-out on the primary region's hosts only;
-      # the usw cell host shares the project and label but deploys in the
-      # step below, after the primary succeeds.
+      # The use4 cell host is the primary production host — api.superserve.ai
+      # routes there — so it deploys FIRST, before the idle legacy primary and
+      # the usw secondary cell. A failure or zero-match in those must not stop
+      # the job and leave the public host on old vmd/boxd/secretsproxy binaries.
+      # Reuses the binaries built above; skipped until CLOUD_RUN_SERVICE_USE4 is
+      # set. Discovery is the VMD_LABEL filter scoped to GCP_REGION_USE4.
+      - name: Deploy to use4 cell VMD instances
+        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VMD_SERVICE: ${{ vars.VMD_SERVICE }}
+          VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SHA: ${{ github.sha }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python3 .github/workflows/scripts/deploy-vmd.py
+
+      # Legacy primary-region fan-out (us-central1), now idle and pending
+      # decommission. GCP_REGION scopes it to that region's hosts only. It still
+      # deploys to stay in sync until removed, but runs AFTER the use4 primary so
+      # its failure can't block the real primary host.
       - name: Discover and deploy to VMD instances
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
@@ -142,13 +162,10 @@ jobs:
       # The usw cell deploys as a step in this job — not a separate job —
       # for the same reason Deploy API / CD Migrate / Seed Templates do it
       # this way: a second job referencing the production environment would
-      # double any approval gate. Running after the primary step means a bad
-      # rollout stops at the primary, and the step reuses the binaries built
-      # above (build once, deploy per region). Skipped until
-      # CLOUD_RUN_SERVICE_USW (the repo-level cell-exists flag) is set.
-      # Discovery is the same VMD_LABEL filter scoped to GCP_REGION_USW, so
-      # the cell host must carry the label; zero matches fails the deploy
-      # rather than silently skipping the cell.
+      # double any approval gate. Reuses the binaries built above; skipped
+      # until CLOUD_RUN_SERVICE_USW is set. Discovery is the VMD_LABEL filter
+      # scoped to GCP_REGION_USW, so the cell host must carry the label; zero
+      # matches fails the deploy rather than silently skipping the cell.
       - name: Deploy to usw cell VMD instances
         if: vars.CLOUD_RUN_SERVICE_USW != ''
         env:
