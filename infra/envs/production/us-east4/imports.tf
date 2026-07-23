@@ -64,3 +64,11 @@ import {
   to = module.api.google_cloud_run_v2_service_iam_member.public_invoker[0]
   id = "projects/rayai-prod/locations/us-east4/services/superserve-api-use4 roles/run.invoker allUsers"
 }
+
+# IAP SSH allow rule (enable_iap_ssh = true). Created imperatively (gcloud) to
+# unblock the vmd deploy after manage_public_ssh_deny closed :22 with no IAP
+# allow; import so the apply adopts it instead of failing AlreadyExists.
+import {
+  to = module.network.google_compute_firewall.allow_iap_ssh[0]
+  id = "projects/rayai-prod/global/firewalls/superserve-production-vpc-us-east4-allow-iap-ssh"
+}

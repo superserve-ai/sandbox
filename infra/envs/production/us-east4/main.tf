@@ -47,8 +47,12 @@ module "network" {
   subnet_name            = "superserve-use4-subnet"
   subnet_cidr            = var.subnet_cidr
   manage_public_ssh_deny = true
-  enable_iap_ssh         = false
-  iap_ssh_target_tags    = ["vmd-use4"]
+  # true so CD (deploy-vmd/proxy/otel via `gcloud scp --tunnel-through-iap`) and
+  # operators can reach the host on :22 — matches us-central1/us-west2. With this
+  # false, manage_public_ssh_deny alone blocked ALL SSH to the host and broke the
+  # vmd deploy.
+  enable_iap_ssh      = true
+  iap_ssh_target_tags = ["vmd-use4"]
 
   # Cloud Run reaches the vmd host over direct VPC egress (no connector),
   # matching the usw2 cell. The dedicated egress subnet carries the Cloud Run
