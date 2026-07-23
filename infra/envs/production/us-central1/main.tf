@@ -47,60 +47,18 @@ module "network" {
   create_network = var.create_network
   network_name   = var.network_name
 
-  subnet_name            = "superserve-prod-subnet"
-  subnet_cidr            = var.subnet_cidr
-  manage_public_ssh_deny = true
-  enable_iap_ssh         = true
-  iap_ssh_target_tags    = ["superserve-vmd"]
+  # The us-central1 primary control plane and vmd host are decommissioned. This
+  # root now keeps only its subnet in the shared superserve-production-vpc; the
+  # host's firewall rules, IAP-SSH allow, public-SSH deny, and the Cloud Run VPC
+  # connector (used only by the removed control plane) are all removed. The
+  # us-east4 cell owns its own equivalents in the same VPC.
+  subnet_name = "superserve-prod-subnet"
+  subnet_cidr = var.subnet_cidr
 
-  create_vpc_connector        = true
-  create_vpc_connector_subnet = false
-  vpc_connector_name          = "superserve-prod-conn"
-  vpc_connector_mode          = "ip_cidr_range"
-  vpc_connector_ip_cidr_range = var.connector_subnet_cidr
-  vpc_connector_machine_type  = "e2-micro"
-  vpc_connector_min_instances = 2
-  vpc_connector_max_instances = 10
-
-  firewall_rules = {
-    allow_internal = {
-      name          = "superserve-prod-allow-internal"
-      direction     = "INGRESS"
-      source_ranges = [var.subnet_cidr]
-      target_tags   = ["superserve-vmd"]
-      allow = [
-        {
-          protocol = "tcp"
-          ports    = ["5007", "5008", "50051"]
-        }
-      ]
-      description = "Allow private host-to-host sandbox control traffic only."
-    }
-    allow_otel_ingress = {
-      name          = "superserve-prod-allow-cr-to-host-otel"
-      direction     = "INGRESS"
-      source_ranges = [var.connector_subnet_cidr]
-      target_tags   = ["superserve-vmd"]
-      allow = [
-        {
-          protocol = "tcp"
-          ports    = ["4317", "4318"]
-        }
-      ]
-      description = "Allow Cloud Run connector traffic to host-local OTLP endpoints."
-    }
-    allow_vmd_grpc = {
-      name          = "superserve-prod-allow-cr-to-host-vmd"
-      direction     = "INGRESS"
-      source_ranges = [var.connector_subnet_cidr]
-      target_tags   = ["superserve-vmd"]
-      allow = [{
-        protocol = "tcp"
-        ports    = ["50051"]
-      }]
-      description = "Allow Cloud Run connector traffic to the host VMD gRPC endpoint."
-    }
-  }
+  manage_public_ssh_deny = false
+  enable_iap_ssh         = false
+  create_vpc_connector   = false
+  firewall_rules         = {}
 
   labels = local.common_labels
 }
