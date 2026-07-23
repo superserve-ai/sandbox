@@ -26,6 +26,45 @@ INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id,
 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
 RETURNING *;
 
+-- name: CreateSandboxWithSecrets :one
+-- CreateSandbox plus its secret bindings in ONE statement. Atomicity aside,
+-- the single statement is load-bearing for quota enforcement: the insert's
+-- shard-counter admission is invisible to concurrent quota checks until it
+-- commits, and a multi-statement transaction would stretch that window
+-- across client round trips.
+WITH ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
+  VALUES (@id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, @template_id, @snapshot_path, @mem_path, @base_path, @delta_path, @auto_delete_seconds)
+  RETURNING *
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
+  FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
+)
+SELECT * FROM ins;
+
+-- name: CreateSandboxFromTemplateWithSecrets :one
+-- CreateSandboxFromTemplate plus secret bindings in one statement (see
+-- CreateSandboxWithSecrets for why the single statement matters). Returns
+-- 0 rows if the template is missing, deleted, or not visible — then no
+-- bindings are written either.
+WITH tpl AS (
+  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  WHERE t.id = @template_id
+    AND t.deleted_at IS NULL
+    AND (t.team_id = @team_id OR t.team_id = @system_team_id)
+  FOR KEY SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
+  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds FROM tpl
+  RETURNING *
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
+  FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
+)
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at FROM ins;
+
 -- name: GetSandbox :one
 SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;

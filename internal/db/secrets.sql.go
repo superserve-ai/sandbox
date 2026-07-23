@@ -35,31 +35,6 @@ func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretPara
 	return err
 }
 
-const addSandboxSecrets = `-- name: AddSandboxSecrets :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-SELECT $1::uuid, ($2::uuid[])[i], ($3::text[])[i], ($4::text[])[i]
-FROM generate_subscripts($2::uuid[], 1) AS g(i)
-`
-
-type AddSandboxSecretsParams struct {
-	SandboxID   uuid.UUID   `json:"sandbox_id"`
-	SecretIds   []uuid.UUID `json:"secret_ids"`
-	EnvKeys     []string    `json:"env_keys"`
-	ProxyTokens []string    `json:"proxy_tokens"`
-}
-
-// Bulk-insert every (env_key -> secret) binding for a sandbox in one round trip;
-// the secret_ids, env_keys, and proxy_tokens arrays are paired by position.
-func (q *Queries) AddSandboxSecrets(ctx context.Context, arg AddSandboxSecretsParams) error {
-	_, err := q.db.Exec(ctx, addSandboxSecrets,
-		arg.SandboxID,
-		arg.SecretIds,
-		arg.EnvKeys,
-		arg.ProxyTokens,
-	)
-	return err
-}
-
 const claimSandboxSecretProxyToken = `-- name: ClaimSandboxSecretProxyToken :one
 UPDATE sandbox_secret SET proxy_token = COALESCE(proxy_token, $3)
 WHERE sandbox_id = $1 AND env_key = $2
