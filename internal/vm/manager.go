@@ -1103,7 +1103,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	tFcStart := time.Now()
-	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
+	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
@@ -1298,7 +1298,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// way out. Safe because the VM is paused (no live FC to disrupt), but it must
 	// not run concurrently with a resume of the same sandbox — fine for the
 	// debug/staging use this endpoint is gated to.
-	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
+	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
 	defer func() { _ = stopUnitWithBudget(context.Background(), systemdUnitName(vmID)) }()
@@ -1628,6 +1628,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	}
 
+	// Sampled before this attempt creates the rundir: a pre-existing rundir
+	// means a prior attempt on this host reached start.sh (and possibly
+	// started the unit) even if it died before persisting any state, so the
+	// unit name is not provably fresh.
+	_, rdErr := os.Stat(filepath.Join(m.cfg.RunDir, vmID))
+	priorRunDir := rdErr == nil
+
 	m.mu.Lock()
 	_, inPlace := m.vms[vmID]
 	if inPlace {
@@ -1650,6 +1657,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
+
+	// A provably-fresh unit name — no known instance (lazyReattach already
+	// folded BoltDB into the map) and no prior rundir — cannot be lingering,
+	// so the launch may skip the systemd linger query. Retry attempts inside
+	// the loop keep the same answer: they only proceed after the unit is
+	// confirmed dead.
+	freshUnit := !inPlace && !priorRunDir
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
@@ -1740,7 +1754,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Unlock()
 
 		var startErr error
-		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
+		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, freshUnit)
 		if startErr != nil {
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
@@ -2873,7 +2887,7 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 // as a standalone systemd unit. The VM survives VMD restarts because systemd
 // owns the process, not VMD. Non-empty basePath switches the start script to
 // the dual-symlink overlay layout.
-func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
+func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, freshUnit bool) (int, error) {
 	tPrestart := time.Now()
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
@@ -2922,9 +2936,12 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// the restart job clears at fork, before the socket exists, so no
 	// at-timeout probe can tell a just-replaced unit from a stalled fresh
 	// one. Timed separately: it is a per-launch systemd round trip, and
-	// concurrent launches serialize on the shared D-Bus connection.
+	// concurrent launches serialize on the shared D-Bus connection — which
+	// is why a provably-fresh unit (freshUnit) skips the query: a unit that
+	// never existed reads NotLoaded, i.e. not lingering, so the answer is
+	// known without the round trip.
 	tLinger := time.Now()
-	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
+	replacingLive := !freshUnit && unitLingering(ctx, systemdUnitName(vmID))
 	lingerCheckMs := time.Since(tLinger).Milliseconds()
 
 	tStartUnit := time.Now()
