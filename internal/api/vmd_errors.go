@@ -54,6 +54,16 @@ func isVMDNotFound(err error) bool {
 // indicating a snapshot/mem file is missing on disk. The caller maps
 // this to a 503 with `host_state_missing` rather than a generic 500 so
 // users understand it's a service-side issue not a bad request.
+// isVMDDeadline returns true when a vmd call died on its deadline — either
+// the gRPC status or the local context error, both of which map to
+// codes.DeadlineExceeded through status.Code.
+func isVMDDeadline(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.DeadlineExceeded
+}
+
 func isVMDFileMissing(err error) bool {
 	if err == nil {
 		return false
