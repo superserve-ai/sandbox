@@ -47,8 +47,12 @@ module "network" {
   subnet_name            = "superserve-use4-subnet"
   subnet_cidr            = var.subnet_cidr
   manage_public_ssh_deny = true
-  enable_iap_ssh         = false
-  iap_ssh_target_tags    = ["vmd-use4"]
+  # true so CD (deploy-vmd/proxy/otel via `gcloud scp --tunnel-through-iap`) and
+  # operators can reach the host on :22 — matches us-central1/us-west2. With this
+  # false, manage_public_ssh_deny alone blocked ALL SSH to the host and broke the
+  # vmd deploy.
+  enable_iap_ssh      = true
+  iap_ssh_target_tags = ["vmd-use4"]
 
   # Cloud Run reaches the vmd host over direct VPC egress (no connector),
   # matching the usw2 cell. The dedicated egress subnet carries the Cloud Run
@@ -89,6 +93,17 @@ module "network" {
 data "google_service_account" "api_runner" {
   project    = local.project_id
   account_id = "superserve-api-runner"
+}
+
+# The CD service account needs Certificate Manager access to read/manage the
+# api.superserve.ai cert map + DNS authorization this cell owns (the plan's
+# import 403'd without it). Granted out-of-band to unblock; imported (see
+# imports.tf) so the apply adopts the existing binding instead of creating a
+# duplicate.
+resource "google_project_iam_member" "cd_certificatemanager" {
+  project = local.project_id
+  role    = "roles/certificatemanager.editor"
+  member  = "serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"
 }
 
 # A5: us-east4 control plane for the "use" cell.

@@ -16,18 +16,31 @@ import (
 
 // launcherPruneScript strips every /run/netns nsfs mount from a freshly cloned
 // namespace. A single `umount /run/netns` detaches only the parent layer; the
-// per-netns nsfs mounts remain stacked on /run/netns/ns-N, so we unmount each.
+// per-netns nsfs mounts remain stacked on /run/netns/ns-N, so each needs its
+// own unmount — batched, because one umount fork per mount takes minutes at
+// fleet scale, and every launch until the build finishes pays the legacy
+// full-table path.
 // make-rprivate MUST run first (|| exit 1) to sever propagation from the host —
 // without it a umount could propagate back and detach the host's live pins.
+// The pin list is captured before the first unmount so the /proc read cannot
+// race the table mutations it drives. xargs needs -d '\n': its default
+// tokenizer treats quotes and backslashes in the input specially, and vmd does
+// not own every netns name on the host — newline-delimited input passes the
+// kernel-escaped paths byte-for-byte, exactly what the old per-mount loop
+// passed. Exit 123 (some targets failed) is tolerated like that loop's
+// per-mount || true; any other xargs failure fails the build so the
+// diagnostics surface in its error.
 const launcherPruneScript = `mount --make-rprivate / || exit 1
 umount -l /run/netns 2>/dev/null || true
-for m in $(grep ' /run/netns/' /proc/self/mounts | awk '{print $2}'); do umount -l "$m" 2>/dev/null || true; done`
+pins=$(awk '$2 ~ "^/run/netns/" {print $2}' /proc/self/mounts)
+[ -z "$pins" ] && exit 0
+printf '%s\n' "$pins" | xargs -d '\n' umount -l || [ $? -eq 123 ]`
 
 // launcherBuildTimeout reaps a genuinely wedged mount syscall — it does not
-// pace the build, which runs async with legacy-path fallback until done, so a
-// slow build costs nothing. The prune is O(host mount table), so the bound
-// must stay comfortably ahead of fleet growth: a bound the prune catches up
-// to silently strands the host on the legacy launch path.
+// pace the build, which runs async with legacy-path fallback until done. With
+// the unmounts batched the build takes seconds even at fleet scale, so the
+// bound exists only to reap a wedge; do not raise it to accommodate growth,
+// as it also bounds how long a wedged build delays the boot-time error.
 const launcherBuildTimeout = 10 * time.Minute
 
 // EnsureLauncherNamespace builds and pins the pruned launcher mount namespace at
@@ -237,11 +250,15 @@ func (m *Manager) startSampler(ctx context.Context, name string, every time.Dura
 
 // StartMountCountSampler periodically logs the host mount-table size so the
 // O(1)-launch invariant — mount count should stay roughly flat, not grow with
-// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
+// the fleet — is observable in the log pipeline. launcher_ready rides along as
+// the alertable series for launches degrading to the legacy full-table path;
+// the per-launch warns carry the vm_id detail but make a poor time series.
+// One /proc/mounts read per tick.
 func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
 	m.startSampler(ctx, "mount-count sampler", every, func() {
 		total, nsfs := hostMountCounts()
 		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Bool("launcher_ready", m.launcherReady.Load()).
 			Msg("host mount table")
 		m.revalidateLauncher(ctx)
 	})

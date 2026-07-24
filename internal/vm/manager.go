@@ -2892,12 +2892,24 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// legacy for THIS launch only; launcherReady stays with the sampler, so one
 	// blip can't knock the whole fleet onto the O(fleet) legacy path for a tick.
 	launcherPath := ""
-	if m.launcherReady.Load() {
-		if pin := m.launcherNSPath(); pinIsMounted(pin) {
-			launcherPath = pin
+	pin := m.launcherNSPath()
+	switch {
+	case pin == "":
+		// Launcher mode disabled: legacy is the configured path.
+	case !m.launcherReady.Load():
+		// Every launch here copies the full host mount table, so concurrent
+		// launches degrade with fleet size. launcherBuilt splits the causes:
+		// a build still in progress resolves itself; a failed build or an
+		// invalidated pin does not.
+		if m.launcherBuilt.Load() {
+			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin invalidated — using legacy path for this launch")
 		} else {
-			m.log.Warn().Str("path", pin).Msg("launcher pin not mounted at launch — using legacy path for this launch")
+			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not built — using legacy path for this launch")
 		}
+	case pinIsMounted(pin):
+		launcherPath = pin
+	default:
+		m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not mounted at launch — using legacy path for this launch")
 	}
 	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
