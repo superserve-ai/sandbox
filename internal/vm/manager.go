@@ -1660,9 +1660,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	// A provably-fresh unit name — no known instance (lazyReattach already
 	// folded BoltDB into the map) and no prior rundir — cannot be lingering,
-	// so the launch may skip the systemd linger query. Retry attempts inside
-	// the loop keep the same answer: they only proceed after the unit is
-	// confirmed dead.
+	// so the launch may skip the systemd linger query. Cleared before any
+	// retry: once an attempt has started the unit, the name is no longer
+	// fresh.
 	freshUnit := !inPlace && !priorRunDir
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
@@ -1888,6 +1888,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		log.Warn().Err(restoreErr).Int("attempt", attempt).
 			Msg("restore failed with tap0 busy — retrying with a fresh slot")
+		// This attempt started the unit, so the name is no longer fresh: the
+		// dead-check above reads a deactivating unit as dead, and the next
+		// launch must budget for replacing a unit still in its stop phase.
+		freshUnit = false
 		// Full teardown, not recycle: a fast recycle could return this same busy
 		// slot to the pool and the next attempt could re-claim it.
 		m.netMgr.TeardownVM(vmID)
