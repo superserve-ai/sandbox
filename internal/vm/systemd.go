@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
@@ -62,57 +61,51 @@ const stopJobWaitCap = 35 * time.Second
 // otherwise queue every other stop on the host behind it indefinitely.
 const stopEnqueueCap = 5 * time.Second
 
-// recentUnitStops records every unit this process attempted to stop, keyed by
-// unit name. It lets the launch path tell "unit never existed" from "the
-// unit's other evidence was deleted while it may still be winding down":
-// cleanup paths remove a VM's rundir and records after a stop that can settle
-// while the unit is still deactivating (unitDefinitelyDead reads deactivating
-// as dead; lingeringState does not). Recorded on entry — even a failed
-// enqueue may have created a stop job.
-var recentUnitStops sync.Map // unit name -> time.Time of the stop attempt
+// recentUnitStops records units this process attempted to stop without yet
+// confirming them stopped. It lets the launch path tell "unit never existed"
+// from "the unit's other evidence was deleted while it may still be alive":
+// cleanup paths remove a VM's rundir and records after a stop that can fail
+// outright (unit keeps running indefinitely) or settle while the unit is
+// still deactivating (unitDefinitelyDead reads deactivating as dead;
+// lingeringState does not). Recorded on entry to stopUnit; cleared ONLY when
+// systemd confirms the unit down — never by clock, because an unaccepted
+// stop job bounds nothing.
+var recentUnitStops sync.Map // unit name -> struct{}
 
 // vmProcessStart anchors the young-process guard in unitMaybeWindingDown:
 // units outlive the daemon, so stops issued by a previous vmd process are
 // invisible to recentUnitStops. Variable for tests.
 var vmProcessStart = time.Now()
 
-// unitStopSettleWindow generously covers a unit's worst-case wind-down after
-// a stop attempt: the stop job's TimeoutStopSec, ExecStopPost, and the kill
-// escalation. A false "maybe winding down" only costs one linger query.
-const unitStopSettleWindow = 60 * time.Second
-
-var stopsSinceSweep atomic.Int64
+// processSettleWindow is how long after process start every unit reads as
+// maybe-winding-down. It must outlast the reconciler's first orphan-unit
+// sweep (interval + grace + one stop cycle): that sweep re-records any
+// still-live predecessor-era unit into recentUnitStops, after which the
+// registry carries the knowledge forward. A false "maybe" only costs one
+// linger query per launch.
+const processSettleWindow = 3 * time.Minute
 
 func recordUnitStop(unit string) {
-	recentUnitStops.Store(unit, time.Now())
-	// Amortized prune so the map stays bounded on a host that stops many
-	// distinct units between launches that would read (and prune) them.
-	if stopsSinceSweep.Add(1)%4096 == 0 {
-		now := time.Now()
-		recentUnitStops.Range(func(k, v any) bool {
-			if now.Sub(v.(time.Time)) > unitStopSettleWindow {
-				recentUnitStops.Delete(k)
-			}
-			return true
-		})
-	}
+	recentUnitStops.Store(unit, struct{}{})
 }
 
-// unitMaybeWindingDown reports whether a unit could still be in a stop phase
-// that this process's own bookkeeping cannot rule out: it was stopped
-// recently, or the process is too young to have observed a stop issued by
-// its predecessor.
+// confirmUnitStopped clears a unit's stop record on a systemd-confirmed
+// outcome: stop job done/skipped, unit not loaded, or a successful
+// synchronous systemctl stop.
+func confirmUnitStopped(unit string) {
+	recentUnitStops.Delete(unit)
+}
+
+// unitMaybeWindingDown reports whether a unit could still be alive from a
+// stop this process's own bookkeeping cannot rule out: an unconfirmed stop
+// attempt, or a process too young for the reconciler to have re-observed
+// stops issued by its predecessor.
 func unitMaybeWindingDown(unit string) bool {
-	if time.Since(vmProcessStart) < unitStopSettleWindow {
+	if time.Since(vmProcessStart) < processSettleWindow {
 		return true
 	}
-	if v, ok := recentUnitStops.Load(unit); ok {
-		if time.Since(v.(time.Time)) < unitStopSettleWindow {
-			return true
-		}
-		recentUnitStops.Delete(unit)
-	}
-	return false
+	_, ok := recentUnitStops.Load(unit)
+	return ok
 }
 
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
@@ -136,6 +129,7 @@ func stopUnit(ctx context.Context, unit string) error {
 	if enqueued {
 		if err != nil {
 			if sdbusNotLoaded(err) {
+				confirmUnitStopped(unit)
 				return nil // not loaded == already stopped
 			}
 			return fmt.Errorf("stop unit %s: %w", unit, err)
@@ -161,6 +155,7 @@ func stopUnit(ctx context.Context, unit string) error {
 	if err != nil {
 		return fmt.Errorf("systemctl stop %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
+	confirmUnitStopped(unit) // synchronous stop returned success
 	return nil
 }
 
@@ -168,6 +163,7 @@ func stopJobResult(unit, res string) error {
 	if res != "done" && res != "skipped" {
 		return fmt.Errorf("stop unit %s: job result %q", unit, res)
 	}
+	confirmUnitStopped(unit) // systemd reports the stop job completed
 	return nil
 }
 

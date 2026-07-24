@@ -1664,9 +1664,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// process could still be winding down from — cannot be lingering, so the
 	// launch may skip the systemd linger query. The winding-down term covers
 	// cleanup paths that delete the other evidence after an unconfirmed stop
-	// (destroy, reattach stale-cleanup, recording VMs). Only the first
-	// attempt qualifies: any retry follows a start of the same unit name.
-	freshUnit := !inPlace && !priorRunDir && !unitMaybeWindingDown(systemdUnitName(vmID))
+	// (destroy, reattach stale-cleanup). Build VMs never qualify: their
+	// deterministic reused IDs are exempt from persistence and invisible to
+	// the reconciler, so no bookkeeping can ever rule out a prior unit.
+	// Only the first attempt qualifies: any retry follows a start of the
+	// same unit name.
+	freshUnit := !inPlace && !priorRunDir && !isBuildVM(vmID) &&
+		!unitMaybeWindingDown(systemdUnitName(vmID))
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:

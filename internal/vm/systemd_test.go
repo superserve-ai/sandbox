@@ -48,22 +48,37 @@ func TestUnitMaybeWindingDown(t *testing.T) {
 		t.Error("young process should report maybe-winding-down for any unit")
 	}
 
-	vmProcessStart = time.Now().Add(-2 * unitStopSettleWindow)
+	vmProcessStart = time.Now().Add(-2 * processSettleWindow)
 	if unitMaybeWindingDown("never-stopped.service") {
 		t.Error("never-stopped unit on a settled process should be clear")
 	}
 
+	// An unconfirmed stop blocks freshness until systemd confirms — no
+	// clock-based expiry.
 	recordUnitStop("stopped.service")
 	if !unitMaybeWindingDown("stopped.service") {
-		t.Error("recently stopped unit should report maybe-winding-down")
+		t.Error("unconfirmed stop should report maybe-winding-down")
 	}
+	confirmUnitStopped("stopped.service")
+	if unitMaybeWindingDown("stopped.service") {
+		t.Error("confirmed stop should clear the record")
+	}
+}
 
-	// An expired entry reads clear and is pruned.
-	recentUnitStops.Store("old-stop.service", time.Now().Add(-2*unitStopSettleWindow))
-	if unitMaybeWindingDown("old-stop.service") {
-		t.Error("stop older than the settle window should be clear")
+// stopJobResult is a confirmation point: a completed job clears the stop
+// record, a failed one keeps it.
+func TestStopJobResultConfirmsStop(t *testing.T) {
+	recordUnitStop("job.service")
+	if err := stopJobResult("job.service", "failed"); err == nil {
+		t.Fatal("failed job result should error")
 	}
-	if _, ok := recentUnitStops.Load("old-stop.service"); ok {
-		t.Error("expired entry should be pruned on read")
+	if _, ok := recentUnitStops.Load("job.service"); !ok {
+		t.Error("failed job result must keep the stop record")
+	}
+	if err := stopJobResult("job.service", "done"); err != nil {
+		t.Fatalf("done job result should succeed: %v", err)
+	}
+	if _, ok := recentUnitStops.Load("job.service"); ok {
+		t.Error("done job result should clear the stop record")
 	}
 }
