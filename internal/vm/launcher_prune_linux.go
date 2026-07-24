@@ -17,8 +17,22 @@ import (
 // it a detach could propagate back and drop the host's live pins. The mounts
 // file is read in full before the first detach so the read cannot race the
 // table mutations it drives. Per-target detach failures are tolerated (the
-// validator gates the result); only the safety and read steps are fatal.
+// validator gates the result); only the guard, safety, and read steps are
+// fatal.
 func LauncherPruneMain() int {
+	// Refuse to run in the init mount namespace: the legitimate caller is
+	// always an `unshare --mount=<pin>` child, whose namespace differs from
+	// PID 1's by construction. A direct root invocation would detach the
+	// host's live netns pins — for VMs with no resident process the pin is
+	// the only thing keeping the namespace alive. Fail closed when the
+	// comparison itself is unreadable.
+	selfNS, serr := os.Readlink("/proc/self/ns/mnt")
+	initNS, ierr := os.Readlink("/proc/1/ns/mnt")
+	if serr != nil || ierr != nil || selfNS == initNS {
+		fmt.Fprintf(os.Stderr, "refusing to prune: not in a private mount namespace (self=%q err=%v, init=%q err=%v)\n",
+			selfNS, serr, initNS, ierr)
+		return 1
+	}
 	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "make-rprivate /: %v\n", err)
 		return 1
