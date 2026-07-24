@@ -2943,10 +2943,9 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// the restart job clears at fork, before the socket exists, so no
 	// at-timeout probe can tell a just-replaced unit from a stalled fresh
 	// one. Timed separately: it is a per-launch systemd round trip, and
-	// concurrent launches serialize on the shared D-Bus connection — which
-	// is why a provably-fresh unit (freshUnit) skips the query: a unit that
-	// never existed reads NotLoaded, i.e. not lingering, so the answer is
-	// known without the round trip.
+	// concurrent launches serialize on the shared D-Bus connection. A
+	// fresh unit skips it with the identical outcome: never-existed reads
+	// NotLoaded, i.e. not lingering.
 	tLinger := time.Now()
 	replacingLive := !freshUnit && unitLingering(ctx, systemdUnitName(vmID))
 	lingerCheckMs := time.Since(tLinger).Milliseconds()
