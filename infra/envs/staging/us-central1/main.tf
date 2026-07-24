@@ -106,6 +106,14 @@ module "iam" {
       role    = "roles/monitoring.metricWriter"
       members = ["serviceAccount:superserve-api@${local.project_id}.iam.gserviceaccount.com"]
     }
+    # The CD service account needs subnetworks.update to enable VPC flow logs
+    # (added in #257). Granted out-of-band to unblock the staging apply; imported
+    # (see imports.tf) so a rebuild adopts it instead of creating a duplicate.
+    # Prod's CD SA already carries networkAdmin.
+    cd_network_admin = {
+      role    = "roles/compute.networkAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
   }
   labels = local.common_labels
 }
