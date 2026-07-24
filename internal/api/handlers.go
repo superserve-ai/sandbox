@@ -624,12 +624,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			fcancel()
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
+				// Deliberately no destroy for a boot that may land late: the
+				// row reverts to paused, so a follow-up resume on this ID
+				// adopts the live VM (instant resume), and the reconciler
+				// reaps the paused-row/active-VM state if no retry comes.
 				revertToPaused()
 				respondError(c, ErrInternal)
 				return false
 			}
 		} else {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
+			// Same deliberate no-destroy as the fallback branch above.
 			revertToPaused()
 			respondError(c, ErrInternal)
 			return false

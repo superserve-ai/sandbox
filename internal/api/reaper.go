@@ -357,6 +357,14 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	})
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")
+		// failed is terminal — nothing will resume this ID again, so a boot
+		// that landed after the deadline would idle against the failed row
+		// until the reconciler sweeps it. Best-effort destroy now (mirrors
+		// the create path). Unlike the resume handler's error branches,
+		// there is no adopt-on-retry self-heal here to preserve.
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), vmdTimeout)
+		_ = vmd.DestroyInstance(dctx, sbx.ID.String(), true)
+		dcancel()
 		h.markSandboxFailed(ctx, sbx, "rollback resume failed after pause DB error", rl)
 		return
 	}
