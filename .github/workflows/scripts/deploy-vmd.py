@@ -237,7 +237,7 @@ def main() -> int:
                 ROOTFS=""
                 for env_file in /etc/sandbox/vmd.env; do
                     if [ -f "$env_file" ]; then
-                        candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
+                        candidate=$(sudo grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
                         if [ -n "$candidate" ]; then
                             ROOTFS="$candidate"
                             break
