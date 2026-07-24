@@ -20,12 +20,16 @@ import (
 // validator gates the result); only the guard, safety, and read steps are
 // fatal.
 func LauncherPruneMain() int {
-	// Refuse to run in the init mount namespace: the legitimate caller is
-	// always an `unshare --mount=<pin>` child, whose namespace differs from
-	// PID 1's by construction. A direct root invocation would detach the
-	// host's live netns pins — for VMs with no resident process the pin is
-	// the only thing keeping the namespace alive. Fail closed when the
-	// comparison itself is unreadable.
+	// Two independent guards, both required. The spawn marker proves this
+	// process was exec'd by the launcher build; the namespace comparison
+	// proves it is not in the init namespace even if the marker leaks. A
+	// direct root invocation would detach live netns pins — for VMs with no
+	// resident process the pin is the only thing keeping the namespace
+	// alive. Fail closed when the comparison itself is unreadable.
+	if os.Getenv(launcherPruneEnv) != "1" {
+		fmt.Fprintf(os.Stderr, "refusing to prune: not spawned by the launcher build (%s unset)\n", launcherPruneEnv)
+		return 1
+	}
 	selfNS, serr := os.Readlink("/proc/self/ns/mnt")
 	initNS, ierr := os.Readlink("/proc/1/ns/mnt")
 	if serr != nil || ierr != nil || selfNS == initNS {

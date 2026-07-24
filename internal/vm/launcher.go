@@ -21,6 +21,12 @@ import (
 // MNT_DETACH syscalls keep the build linear at any fleet size.
 const launcherPruneArg = "launcher-prune"
 
+// launcherPruneEnv is the spawn marker the build sets on the re-exec child;
+// LauncherPruneMain refuses to run without it. Together with the child's own
+// namespace check it keeps a direct invocation — in any mount namespace —
+// from detaching live netns pins.
+const launcherPruneEnv = "VMD_LAUNCHER_PRUNE_CHILD"
+
 // prunePaths returns every /run/netns pin mountpoint from /proc/self/mounts
 // content, in file order. Stacked pins list one line per layer and each
 // MNT_DETACH peels the topmost, so duplicates must be kept, not deduped.
@@ -141,6 +147,9 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 	// execs the running daemon's inode either way.
 	pruner := fmt.Sprintf("/proc/%d/exe", os.Getpid())
 	cmd := exec.CommandContext(ctx, "unshare", "--mount="+pinPath, "--", pruner, launcherPruneArg)
+	// Positive spawn marker required by LauncherPruneMain, so an accidental
+	// direct `vmd launcher-prune` refuses even outside the init namespace.
+	cmd.Env = append(os.Environ(), launcherPruneEnv+"=1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("unshare --mount=%s: %v: %s", pinPath, err, strings.TrimSpace(string(out)))
 	}
