@@ -192,30 +192,32 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
-// vmdRetryTimeout is the second-attempt budget in retryBootOnDeadline —
-// tighter than vmdTimeout so the combined worst case stays within the
-// client's patience.
-const vmdRetryTimeout = 20 * time.Second
-
 // retryBootOnDeadline runs one vmd boot call under vmdTimeout and, when the
-// attempt dies on DeadlineExceeded with the request still alive, runs exactly
-// one more under vmdRetryTimeout. A deadline here is transient host pressure
-// (typically a deploy-window restart); the daemon serializes same-ID boots
-// and recognizes a completed prior attempt, so the retry either adopts the
-// VM the first attempt brought up or boots cleanly — never a double boot.
-// A dead request skips the retry: a boot landing after the client gave up
-// would activate a sandbox the caller believes failed.
-func retryBootOnDeadline(parent context.Context, sandboxID string, boot func(context.Context) error) error {
-	ctx, cancel := context.WithTimeout(parent, vmdTimeout)
-	err := boot(ctx)
-	cancel()
+// attempt dies on DeadlineExceeded with the caller's context still alive,
+// runs exactly one more under a fresh vmdTimeout — worst case 2×vmdTimeout
+// for a caller that waits. This is the layer above the dial-site
+// Unavailable retry (retryUnavailableUnaryInterceptor absorbs a restarting
+// daemon; this absorbs the boot that then runs into its deadline). The
+// daemon serializes same-ID boots and recognizes a completed prior attempt,
+// so the retry either adopts the VM the first attempt brought up or boots
+// cleanly — never a double boot. A dead caller skips the retry: a boot
+// landing after the client gave up would activate a sandbox the caller
+// believes failed. (pauseWithRetry deliberately differs on both points —
+// any-error retry, detached context — because a late pause reconciles
+// state instead of surprising the caller.)
+func retryBootOnDeadline(parent context.Context, sandboxID string, boot func(context.Context) (string, uint32, uint32, error)) (ip string, vcpu, memMiB uint32, retried bool, err error) {
+	attempt := func() (string, uint32, uint32, error) {
+		ctx, cancel := context.WithTimeout(parent, vmdTimeout)
+		defer cancel()
+		return boot(ctx)
+	}
+	ip, vcpu, memMiB, err = attempt()
 	if err == nil || !isVMDDeadline(err) || parent.Err() != nil {
-		return err
+		return ip, vcpu, memMiB, false, err
 	}
 	log.Warn().Str("sandbox_id", sandboxID).Msg("vmd boot hit deadline — retrying once")
-	rctx, rcancel := context.WithTimeout(parent, vmdRetryTimeout)
-	defer rcancel()
-	return boot(rctx)
+	ip, vcpu, memMiB, err = attempt()
+	return ip, vcpu, memMiB, true, err
 }
 
 // asyncTimeout is the deadline for fire-and-forget DB writes.
@@ -597,12 +599,15 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
 	// tokens as they were at pause; the current binding set is re-applied below
 	// once the VM is up, so a mutation made while paused takes effect.
-	var ipAddress string
-	var actualVcpu, actualMemMiB uint32
-	err = retryBootOnDeadline(c.Request.Context(), sandboxID.String(), func(ctx context.Context) error {
-		var rerr error
-		ipAddress, actualVcpu, actualMemMiB, rerr = vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
-		return rerr
+	//
+	// One clock for the whole boot sequence: ResumeInstance, its deadline
+	// retry, and the stateless fallback all draw down the same 2×vmdTimeout
+	// budget, so a resume holds the row mid-transition for a bounded window
+	// no matter which path it walks.
+	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
+	defer bootCancel()
+	ipAddress, actualVcpu, actualMemMiB, _, err := retryBootOnDeadline(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
 	})
 	if err != nil {
 		if isVMDNotFound(err) {
@@ -611,11 +616,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			err = retryBootOnDeadline(c.Request.Context(), sandboxID.String(), func(ctx context.Context) error {
-				var rerr error
-				ipAddress, actualVcpu, actualMemMiB, rerr = vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
-				return rerr
-			})
+			// Single attempt under whatever remains of the sequence budget:
+			// the fallback is already the second recovery layer.
+			fctx, fcancel := context.WithTimeout(bootCtx, vmdTimeout)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
+			fcancel()
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -1832,12 +1837,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	var ipAddress string
-	var actualVcpu, actualMemMiB uint32
-	vmdErr := retryBootOnDeadline(c.Request.Context(), sandboxID.String(), func(ctx context.Context) error {
-		var err error
-		ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
-		return err
+	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryBootOnDeadline(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+		return vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	})
 	tVmdEnd := time.Now()
 
@@ -1892,6 +1893,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// records the create failure metric from the HTTP status, so avoid
 		// emitting a second request-scoped transition here.
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
+		// A cancelled attempt can still complete on the host just after the
+		// deadline; best-effort destroy so a booted VM can't idle against a
+		// failed row until the reconciler sweeps it.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+		cleanupCancel()
 		failCtx, failCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
 		defer failCancel()
 		if err := h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
@@ -2103,6 +2110,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
 		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
+		Bool("vmd_retried", vmdRetried).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
 		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
 		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).

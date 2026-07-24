@@ -347,11 +347,14 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		return
 	}
 
-	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
 	// Reaper rollback resume: brings the VM back up after a pause-DB-write
-	// failure, before the customer ever sees the transition.
-	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath)
-	vmdCancel()
+	// failure, before the customer ever sees the transition. Same deadline
+	// retry as the user-facing boots — the background ctx never reads dead,
+	// which is right: a rollback landing late still beats marking the
+	// sandbox failed.
+	_, _, _, _, err := retryBootOnDeadline(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, error) {
+		return vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath)
+	})
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")
 		h.markSandboxFailed(ctx, sbx, "rollback resume failed after pause DB error", rl)

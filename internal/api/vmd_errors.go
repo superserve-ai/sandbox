@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,20 +51,23 @@ func isVMDNotFound(err error) bool {
 	return status.Code(err) == codes.NotFound
 }
 
-// isVMDFileMissing returns true when vmd returned a FailedPrecondition
-// indicating a snapshot/mem file is missing on disk. The caller maps
-// this to a 503 with `host_state_missing` rather than a generic 500 so
-// users understand it's a service-side issue not a bad request.
-// isVMDDeadline returns true when a vmd call died on its deadline — either
-// the gRPC status or the local context error, both of which map to
-// codes.DeadlineExceeded through status.Code.
+// isVMDDeadline returns true when a vmd call died on its deadline. Two
+// distinct surfaces: a gRPC status (which status.Code resolves even through
+// fmt.Errorf wrapping), and a plain context.DeadlineExceeded — which
+// status.Code does NOT map (it reads as Unknown) and which the dial-site
+// Unavailable-retry interceptor returns when its window expires mid-backoff.
 func isVMDDeadline(err error) bool {
 	if err == nil {
 		return false
 	}
-	return status.Code(err) == codes.DeadlineExceeded
+	return status.Code(err) == codes.DeadlineExceeded ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
+// isVMDFileMissing returns true when vmd returned a FailedPrecondition
+// indicating a snapshot/mem file is missing on disk. The caller maps
+// this to a 503 with `host_state_missing` rather than a generic 500 so
+// users understand it's a service-side issue not a bad request.
 func isVMDFileMissing(err error) bool {
 	if err == nil {
 		return false
