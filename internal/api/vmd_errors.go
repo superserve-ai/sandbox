@@ -64,6 +64,16 @@ func isVMDDeadline(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
+// isVMDUnavailable returns true when the daemon was unreachable for the
+// whole of the dial-site interceptor's retry window — the shape a vmd
+// restart longer than that window surfaces as.
+func isVMDUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Unavailable
+}
+
 // isVMDFileMissing returns true when vmd returned a FailedPrecondition
 // indicating a snapshot/mem file is missing on disk. The caller maps
 // this to a 503 with `host_state_missing` rather than a generic 500 so

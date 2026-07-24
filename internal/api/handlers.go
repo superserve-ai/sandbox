@@ -192,30 +192,31 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
-// retryBootOnDeadline runs one vmd boot call under vmdTimeout and, when the
-// attempt dies on DeadlineExceeded with the caller's context still alive,
-// runs exactly one more under a fresh vmdTimeout — worst case 2×vmdTimeout
-// for a caller that waits. This is the layer above the dial-site
-// Unavailable retry (retryUnavailableUnaryInterceptor absorbs a restarting
-// daemon; this absorbs the boot that then runs into its deadline). The
-// daemon serializes same-ID boots and recognizes a completed prior attempt,
-// so the retry either adopts the VM the first attempt brought up or boots
-// cleanly — never a double boot. A dead caller skips the retry: a boot
-// landing after the client gave up would activate a sandbox the caller
-// believes failed. (pauseWithRetry deliberately differs on both points —
-// any-error retry, detached context — because a late pause reconciles
-// state instead of surprising the caller.)
-func retryBootOnDeadline(parent context.Context, sandboxID string, boot func(context.Context) (string, uint32, uint32, error)) (ip string, vcpu, memMiB uint32, retried bool, err error) {
+// retryTransientBoot runs one vmd boot call under vmdTimeout and, when the
+// attempt dies on a transient — DeadlineExceeded, or Unavailable that
+// outlived the dial-site interceptor's window — with the caller's context
+// still alive, runs exactly one more under a fresh vmdTimeout; worst case
+// 2×vmdTimeout for a caller that waits (the API LB's backend timeout is
+// sized above that envelope). The daemon serializes same-ID boots and
+// recognizes a completed prior attempt, so the retry either adopts the VM
+// the first attempt brought up or boots cleanly — never a double boot; at
+// most one retry per boot and the daemon's restore semaphore bound the
+// added load. A dead caller skips the retry: a boot landing after the
+// client gave up would activate a sandbox the caller believes failed.
+// (pauseWithRetry deliberately differs on both points — any-error retry,
+// detached context — because a late pause reconciles state instead of
+// surprising the caller.)
+func retryTransientBoot(parent context.Context, sandboxID string, boot func(context.Context) (string, uint32, uint32, error)) (ip string, vcpu, memMiB uint32, retried bool, err error) {
 	attempt := func() (string, uint32, uint32, error) {
 		ctx, cancel := context.WithTimeout(parent, vmdTimeout)
 		defer cancel()
 		return boot(ctx)
 	}
 	ip, vcpu, memMiB, err = attempt()
-	if err == nil || !isVMDDeadline(err) || parent.Err() != nil {
+	if err == nil || !(isVMDDeadline(err) || isVMDUnavailable(err)) || parent.Err() != nil {
 		return ip, vcpu, memMiB, false, err
 	}
-	log.Warn().Str("sandbox_id", sandboxID).Msg("vmd boot hit deadline — retrying once")
+	log.Warn().Str("sandbox_id", sandboxID).Msg("vmd boot hit a transient — retrying once")
 	ip, vcpu, memMiB, err = attempt()
 	return ip, vcpu, memMiB, true, err
 }
@@ -606,7 +607,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// no matter which path it walks.
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
 	defer bootCancel()
-	ipAddress, actualVcpu, actualMemMiB, _, err := retryBootOnDeadline(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
 		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
 	})
 	if err != nil {
@@ -1837,7 +1838,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryBootOnDeadline(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
 		return vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
 	})
 	tVmdEnd := time.Now()
