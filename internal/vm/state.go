@@ -51,7 +51,27 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// Supervision dispatches liveness/stop/reattach for this VM's current
+	// run. Empty (SupervisionUnit) is canonical for systemd-unit VMs so
+	// records written by this binary stay readable-and-correct under a
+	// rollback binary that predates the field; never write a non-empty
+	// value for unit mode.
+	Supervision string `json:"supervision,omitempty"`
 }
+
+// Supervision values for VMInstance/VMRecord.
+const (
+	// SupervisionUnit: the VM runs as firecracker@<id>.service. Canonically
+	// the empty string — legacy records predate the field.
+	SupervisionUnit = ""
+	// SupervisionCgroup: the VM was direct-spawned into a per-VM cgroup
+	// under vmd's delegated subtree; no systemd unit exists for it.
+	SupervisionCgroup = "cgroup"
+)
+
+// cgroupSupervised reports whether a supervision value means the VM has no
+// systemd unit and lives in a per-VM cgroup.
+func cgroupSupervised(s string) bool { return s == SupervisionCgroup }
 
 // StateStore wraps a BoltDB database for VM state persistence.
 type StateStore struct {
@@ -206,6 +226,7 @@ func toRecord(inst *VMInstance) VMRecord {
 		BasePath:     inst.Config.BasePath,
 		TeamID:       inst.TeamID,
 		OwnerID:      inst.OwnerID,
+		Supervision:  inst.Supervision,
 	}
 }
 
@@ -230,6 +251,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		Metadata:     rec.Metadata,
 		TeamID:       rec.TeamID,
 		OwnerID:      rec.OwnerID,
+		Supervision:  rec.Supervision,
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
 			MemoryMiB: rec.MemoryMiB,
