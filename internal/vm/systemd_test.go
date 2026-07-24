@@ -82,3 +82,16 @@ func TestStopJobResultConfirmsStop(t *testing.T) {
 		t.Error("done job result should clear the stop record")
 	}
 }
+
+// processSettleWindow backstops the deactivating units the startup orphan
+// scan cannot see (it lists active only). That holds only while the window
+// outlasts the reconciler's first orphan sweep plus one stop cycle; this
+// pins the inequality so a constant bump elsewhere fails here instead of
+// silently shrinking the guard.
+func TestProcessSettleWindowCoversOrphanSweep(t *testing.T) {
+	cfg := DefaultReconcilerConfig()
+	if min := cfg.Interval + cfg.GracePeriod + stopJobWaitCap; processSettleWindow <= min {
+		t.Fatalf("processSettleWindow %v must exceed reconciler interval+grace+stop cap %v",
+			processSettleWindow, min)
+	}
+}

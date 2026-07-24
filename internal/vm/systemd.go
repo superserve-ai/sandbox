@@ -311,7 +311,11 @@ func unitDefinitelyDead(ctx context.Context, unit string) bool {
 }
 
 // listActiveFirecrackerUnits returns the sandbox IDs of all running
-// firecracker@ units. Used during startup reattach.
+// firecracker@ units. Used during startup reattach. It lists
+// ActiveState=active only — a unit mid-deactivating is invisible here, which
+// is why processSettleWindow independently blankets the post-start period:
+// the scan catches indefinitely-alive orphans, the clock covers wind-downs
+// the scan can't see.
 func listActiveFirecrackerUnits(ctx context.Context) ([]string, error) {
 	var units []sddbus.UnitStatus
 	if err, ok := sdbusDo(func(c *sddbus.Conn) error {
