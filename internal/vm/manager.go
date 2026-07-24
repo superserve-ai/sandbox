@@ -1631,9 +1631,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// Sampled before this attempt creates the rundir: a pre-existing rundir
 	// means a prior attempt on this host reached start.sh (and possibly
 	// started the unit) even if it died before persisting any state, so the
-	// unit name is not provably fresh.
+	// unit name is not provably fresh. Only a definitive not-exist proves
+	// absence — any other stat error reads as prior.
 	_, rdErr := os.Stat(filepath.Join(m.cfg.RunDir, vmID))
-	priorRunDir := rdErr == nil
+	priorRunDir := !errors.Is(rdErr, os.ErrNotExist)
 
 	m.mu.Lock()
 	_, inPlace := m.vms[vmID]
@@ -1659,11 +1660,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.Unlock()
 
 	// A provably-fresh unit name — no known instance (lazyReattach already
-	// folded BoltDB into the map) and no prior rundir — cannot be lingering,
-	// so the launch may skip the systemd linger query. Cleared before any
-	// retry: once an attempt has started the unit, the name is no longer
-	// fresh.
-	freshUnit := !inPlace && !priorRunDir
+	// folded BoltDB into the map), no prior rundir, and no stop attempt this
+	// process could still be winding down from — cannot be lingering, so the
+	// launch may skip the systemd linger query. The winding-down term covers
+	// cleanup paths that delete the other evidence after an unconfirmed stop
+	// (destroy, reattach stale-cleanup, recording VMs). Only the first
+	// attempt qualifies: any retry follows a start of the same unit name.
+	freshUnit := !inPlace && !priorRunDir && !unitMaybeWindingDown(systemdUnitName(vmID))
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
@@ -1754,7 +1757,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Unlock()
 
 		var startErr error
-		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, freshUnit)
+		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, freshUnit && attempt == 1)
 		if startErr != nil {
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
@@ -1888,10 +1891,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		log.Warn().Err(restoreErr).Int("attempt", attempt).
 			Msg("restore failed with tap0 busy — retrying with a fresh slot")
-		// This attempt started the unit, so the name is no longer fresh: the
-		// dead-check above reads a deactivating unit as dead, and the next
-		// launch must budget for replacing a unit still in its stop phase.
-		freshUnit = false
 		// Full teardown, not recycle: a fast recycle could return this same busy
 		// slot to the pool and the next attempt could re-claim it.
 		m.netMgr.TeardownVM(vmID)
@@ -2983,6 +2982,7 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		Str("vm_id", vmID).
 		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
 		Int64("linger_check_ms", lingerCheckMs).
+		Bool("linger_skipped", freshUnit).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
 		Msg("fc startup phases")

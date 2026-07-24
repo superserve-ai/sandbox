@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
@@ -60,9 +62,63 @@ const stopJobWaitCap = 35 * time.Second
 // otherwise queue every other stop on the host behind it indefinitely.
 const stopEnqueueCap = 5 * time.Second
 
+// recentUnitStops records every unit this process attempted to stop, keyed by
+// unit name. It lets the launch path tell "unit never existed" from "the
+// unit's other evidence was deleted while it may still be winding down":
+// cleanup paths remove a VM's rundir and records after a stop that can settle
+// while the unit is still deactivating (unitDefinitelyDead reads deactivating
+// as dead; lingeringState does not). Recorded on entry — even a failed
+// enqueue may have created a stop job.
+var recentUnitStops sync.Map // unit name -> time.Time of the stop attempt
+
+// vmProcessStart anchors the young-process guard in unitMaybeWindingDown:
+// units outlive the daemon, so stops issued by a previous vmd process are
+// invisible to recentUnitStops. Variable for tests.
+var vmProcessStart = time.Now()
+
+// unitStopSettleWindow generously covers a unit's worst-case wind-down after
+// a stop attempt: the stop job's TimeoutStopSec, ExecStopPost, and the kill
+// escalation. A false "maybe winding down" only costs one linger query.
+const unitStopSettleWindow = 60 * time.Second
+
+var stopsSinceSweep atomic.Int64
+
+func recordUnitStop(unit string) {
+	recentUnitStops.Store(unit, time.Now())
+	// Amortized prune so the map stays bounded on a host that stops many
+	// distinct units between launches that would read (and prune) them.
+	if stopsSinceSweep.Add(1)%4096 == 0 {
+		now := time.Now()
+		recentUnitStops.Range(func(k, v any) bool {
+			if now.Sub(v.(time.Time)) > unitStopSettleWindow {
+				recentUnitStops.Delete(k)
+			}
+			return true
+		})
+	}
+}
+
+// unitMaybeWindingDown reports whether a unit could still be in a stop phase
+// that this process's own bookkeeping cannot rule out: it was stopped
+// recently, or the process is too young to have observed a stop issued by
+// its predecessor.
+func unitMaybeWindingDown(unit string) bool {
+	if time.Since(vmProcessStart) < unitStopSettleWindow {
+		return true
+	}
+	if v, ok := recentUnitStops.Load(unit); ok {
+		if time.Since(v.(time.Time)) < unitStopSettleWindow {
+			return true
+		}
+		recentUnitStops.Delete(unit)
+	}
+	return false
+}
+
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
 // unit is a no-op. Blocks until the stop job completes.
 func stopUnit(ctx context.Context, unit string) error {
+	recordUnitStop(unit)
 	// Buffered channel: the library's dispatcher does one blocking send;
 	// buffer 1 keeps an abandoned wait from wedging every job on the
 	// connection. Non-nil ch also serializes concurrent stops on the
