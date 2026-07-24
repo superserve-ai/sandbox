@@ -235,6 +235,13 @@ type Manager struct {
 	// the launcher path.
 	launcherBuilt atomic.Bool
 
+	// orphanScanDone gates the fresh-unit linger skip: it is set only after
+	// startup reattach successfully listed active units and registered the
+	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if
+	// the listing failed) a predecessor-era unit could be alive with no
+	// bookkeeping, so every launch must run the linger query.
+	orphanScanDone atomic.Bool
+
 	// presenceConverged mirrors the on-disk converged marker: every layered
 	// overlay on this host has a presence side-car, so strict enforcement can
 	// engage (in "auto" mode) without affecting anything that exists. Set at
@@ -1667,10 +1674,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// (destroy, reattach stale-cleanup). Build VMs never qualify: their
 	// deterministic reused IDs are exempt from persistence and invisible to
 	// the reconciler, so no bookkeeping can ever rule out a prior unit.
+	// orphanScanDone gates everything: until startup reattach has listed
+	// active units, a predecessor-era orphan may exist with no bookkeeping.
 	// Only the first attempt qualifies: any retry follows a start of the
 	// same unit name.
-	freshUnit := !inPlace && !priorRunDir && !isBuildVM(vmID) &&
-		!unitMaybeWindingDown(systemdUnitName(vmID))
+	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
+		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
@@ -2085,6 +2094,10 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 				m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
 			}
 		}
+		// Orphans are accounted for — fresh-unit launches may skip the
+		// linger query from here on. Stays unset on listing failure: an
+		// unobserved orphan can't be ruled out by anything else.
+		m.orphanScanDone.Store(true)
 	}
 
 	// No broad re-sweep here. Startup already swept once before StartPool filled
