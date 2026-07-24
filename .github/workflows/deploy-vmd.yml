@@ -146,11 +146,24 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # use4 is the "use" cell's Supabase + control plane.
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+          INTERNAL_API_TOKEN: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match. use4 is the permanent
           # primary, so a missing GCP_REGION_USE4 must abort, not run unscoped.
           : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary fan-out}"
+          # deploy-vmd.py treats an empty CONTROL_PLANE_URL/DATABASE_URL/
+          # INTERNAL_API_TOKEN as "skip, leave the host's existing value alone" —
+          # the right behavior for staging/unprovisioned hosts, but silently
+          # deploying-and-reporting-success while these are unset on a
+          # production host is exactly the failure mode this workflow exists
+          # to prevent. Fail closed rather than skip.
+          : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_PROD is unset — refusing to deploy without it}"
+          : "${DATABASE_URL:?DATABASE_URL_PROD is unset — refusing to deploy without it}"
+          : "${INTERNAL_API_TOKEN:?PROD_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
           python3 .github/workflows/scripts/deploy-vmd.py
 
       # The usw cell deploys as a step in this job — not a separate job —
@@ -170,5 +183,20 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # usw is its own cell — separate Supabase project + control plane
+          # from the "use" cell above.
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_USW }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
+          INTERNAL_API_TOKEN: ${{ secrets.PROD_USW_INTERNAL_API_TOKEN }}
         run: |
+          # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
+          # filter and fan out to every VMD_LABEL match — which would push
+          # usw's DATABASE_URL/CONTROL_PLANE_URL/INTERNAL_API_TOKEN onto the
+          # use4 primary host below instead of just skipping usw. This must
+          # abort before the fail-closed checks below, not run unscoped.
+          : "${GCP_REGION:?GCP_REGION_USW is unset — refusing an unscoped usw fan-out}"
+          # Same fail-closed reasoning as the use4 step above — see its comment.
+          : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_USW is unset — refusing to deploy without it}"
+          : "${DATABASE_URL:?DATABASE_URL_USWEST is unset — refusing to deploy without it}"
+          : "${INTERNAL_API_TOKEN:?PROD_USW_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
           python3 .github/workflows/scripts/deploy-vmd.py

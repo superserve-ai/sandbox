@@ -26,6 +26,14 @@ Env vars:
                        (secretsproxy authenticates callers with the same token
                        the control plane presents). Hosts previously had these
                        provisioned out-of-band via Packer/manual staging.
+  DATABASE_URL         optional — this host's Postgres connection string,
+                       sourced from CI secrets / Secret Manager (never
+                       hardcode). Upserted into vmd.env when set; empty = skip
+                       (same convention as CONTROL_PLANE_URL). Without it the
+                       reconciler silently falls back to BoltDB-only drift
+                       detection and never writes its audit trail — no error,
+                       just quiet degradation, so this is easy to miss if the
+                       value is ever lost from a host's env file.
   VMD_DNS_REDIRECT_PORT optional — local resolver port vmd REDIRECTs guest :53
                        to via its SANDBOX_DNS_REDIRECT nat chain. Empty = skip
                        (like CONTROL_PLANE_URL). Do NOT default this fleet-wide:
@@ -101,6 +109,7 @@ def main() -> int:
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
+    database_url = os.environ.get("DATABASE_URL", "")
     # Empty = skip, so a fleet-wide deploy never writes a redirect to a host
     # whose resolver isn't on this port. Set per host/region to match unbound.
     dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "")
@@ -118,6 +127,8 @@ def main() -> int:
     q_token = shlex.quote(internal_api_token)
     q_iat_line = shlex.quote(f"INTERNAL_API_TOKEN={internal_api_token}")
     q_dat_line = shlex.quote(f"DAEMON_AUTH_TOKEN={internal_api_token}")
+    q_db = shlex.quote(database_url)
+    q_db_line = shlex.quote(f"DATABASE_URL={database_url}")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -226,7 +237,7 @@ def main() -> int:
                 ROOTFS=""
                 for env_file in /etc/sandbox/vmd.env; do
                     if [ -f "$env_file" ]; then
-                        candidate=$(grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
+                        candidate=$(sudo grep "^BASE_ROOTFS_PATH=" "$env_file" | head -1 | cut -d= -f2) || true
                         if [ -n "$candidate" ]; then
                             ROOTFS="$candidate"
                             break
@@ -332,6 +343,29 @@ def main() -> int:
                     sudo chmod 0600 /etc/sandbox/secretsproxy.env
                     sudo sed -i '/^DAEMON_AUTH_TOKEN=/d' /etc/sandbox/secretsproxy.env
                     echo {q_dat_line} | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
+                fi
+            fi
+
+            # Upsert this host's DB connection string. Sourced from CI secrets /
+            # Secret Manager — never hardcoded. Empty = leave existing value
+            # alone: losing this silently degrades the reconciler to
+            # BoltDB-only mode (no error, just a quiet fallback), so an empty
+            # value here must never overwrite a working one.
+            if [ -n {q_db} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo chmod 0600 /etc/sandbox/vmd.env
+                sudo sed -i '/^DATABASE_URL=/d' /etc/sandbox/vmd.env
+                echo {q_db_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                # secretsproxy reads its own DATABASE_URL from its own env file
+                # (buildAuditSink fails startup without it, unless
+                # SECRETSPROXY_AUDIT_DISABLED=true) — only upsert into an
+                # EXISTING file, same reason as CONTROL_PLANE_URL/DAEMON_AUTH_TOKEN
+                # above: never create a partial secretsproxy.env here.
+                if [ -f /etc/sandbox/secretsproxy.env ]; then
+                    sudo chmod 0600 /etc/sandbox/secretsproxy.env
+                    sudo sed -i '/^DATABASE_URL=/d' /etc/sandbox/secretsproxy.env
+                    echo {q_db_line} | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
                 fi
             fi
 
