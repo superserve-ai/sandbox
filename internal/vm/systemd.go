@@ -67,9 +67,9 @@ const stopEnqueueCap = 5 * time.Second
 // cleanup paths remove a VM's rundir and records after a stop that can fail
 // outright (unit keeps running indefinitely) or settle while the unit is
 // still deactivating (unitDefinitelyDead reads deactivating as dead;
-// lingeringState does not). Recorded on entry to stopUnit; cleared ONLY when
-// systemd confirms the unit down — never by clock, because an unaccepted
-// stop job bounds nothing.
+// lingeringState does not). Recorded on entry to stopUnit and for orphan
+// units observed at startup reattach; cleared ONLY when systemd confirms the
+// unit down — never by clock, because an unaccepted stop job bounds nothing.
 var recentUnitStops sync.Map // unit name -> struct{}
 
 // vmProcessStart anchors the young-process guard in unitMaybeWindingDown:

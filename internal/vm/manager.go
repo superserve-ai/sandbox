@@ -2077,6 +2077,11 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	} else {
 		for _, id := range activeIDs {
 			if !knownIDs[id] {
+				// Registered as an unconfirmed stop so a same-ID launch never
+				// reads this orphan as fresh: without a control-plane DB the
+				// reconciler never stops BoltDB-missing units, so this
+				// observation may be the only bookkeeping the unit gets.
+				recordUnitStop(systemdUnitName(id))
 				m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
 			}
 		}
