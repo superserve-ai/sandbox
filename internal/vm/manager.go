@@ -1687,9 +1687,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	m.mu.Lock()
 	prevInst, inPlace := m.vms[vmID]
+	prevSupervision := SupervisionUnit
 	if inPlace {
 		prevInst.mu.RLock()
-		prevSupervision := prevInst.Supervision
+		prevSupervision = prevInst.Supervision
 		prevInst.mu.RUnlock()
 		delete(m.vms, vmID)
 		m.mu.Unlock()
@@ -1698,11 +1699,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	inst := &VMInstance{
-		ID:           vmID,
-		Status:       StatusCreating,
-		CreatedAt:    time.Now(),
-		RunDirID:     vmID,
-		Config:       resourceLimits,
+		ID:        vmID,
+		Status:    StatusCreating,
+		CreatedAt: time.Now(),
+		RunDirID:  vmID,
+		Config:    resourceLimits,
+		// Carry the replaced VM's supervision so the launch relaunches in the
+		// same mode and its preamble clears the stale process — an in-place
+		// replace whose stop above failed/timed out must not start a new
+		// process in a different mode alongside the surviving old one (same
+		// ID, disk, netns, tap). Fresh (non-inPlace) creates keep "" and the
+		// launch chooses by the armed flag.
+		Supervision:  prevSupervision,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 		TeamID:       teamID,

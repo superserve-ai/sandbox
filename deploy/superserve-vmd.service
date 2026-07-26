@@ -13,13 +13,20 @@ ExecStart=/usr/local/bin/vmd
 ExecReload=/bin/kill -HUP $MAINPID
 
 # DO NOT add ExecStartPre commands that kill Firecracker processes or
-# remove network namespaces. VMs are managed by systemd units
-# (firecracker@.service) and must survive VMD restarts.
+# remove network namespaces. VMs must survive VMD restarts — whether run as
+# firecracker@ units (unit mode) or in vmd's delegated cgroup subtree
+# (direct-spawn mode).
 
-# mixed: send SIGTERM to the main process only. Do NOT kill the cgroup
-# (which would include firecracker@ units if they were children — they
-# aren't in systemd mode, but this is defense-in-depth).
+# process: signal the main process only, never the cgroup. Load-bearing for
+# direct-spawn mode — VMs run in vmd's delegated subtree there, so killing
+# the cgroup on stop would take every VM with it. Harmless in unit mode
+# (firecracker@ units aren't in this cgroup). vmd verifies this at startup
+# before arming direct spawn and refuses to arm if it is anything else.
 KillMode=process
+# Delegate the cgroup subtree to vmd: systemd creates the service cgroup and
+# then leaves everything below it alone, so vmd can own per-VM sub-cgroups
+# for direct spawn. No effect in unit mode (vmd creates no sub-cgroups).
+Delegate=yes
 Restart=always
 RestartSec=2
 

@@ -76,7 +76,12 @@ func ownCgroupPath() (string, error) {
 // of existing cgroup VMs is always available once any exist.
 func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	wantArm := m.cfg.DirectSpawn
-	haveCgroupVMs := m.hasCgroupRecords()
+	// Manage the subtree if the flag is on, OR any cgroup-mode VM might still
+	// exist — from a BoltDB record OR a live per-VM cgroup with no record (a
+	// crash between spawn and persist). Detecting only records would strand
+	// that unrecorded survivor: m.cgroups nil, so reattach and the reconciler
+	// both skip it and it runs forever.
+	haveCgroupVMs := m.hasCgroupRecords() || delegatedTreeHasVMs()
 	if !wantArm && !haveCgroupVMs {
 		return false, nil // nothing to arm, nothing to manage
 	}
@@ -104,8 +109,56 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		// subtree on stop must not gate NEW launches onto it.
 		return false, fmt.Errorf("unit KillMode=%q, need \"process\" — direct spawn would die on the next vmd stop", km)
 	}
+	if !selfUnitDelegated(ctx) {
+		// setupCgroupTree may have written subtree_control as root without
+		// Delegate, but without the systemd guarantee PID 1 can reorganize
+		// the subtree on a daemon-reload and strand VMs. Refuse to arm.
+		return false, fmt.Errorf("unit is not Delegate=yes — direct spawn needs a delegated subtree")
+	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
+}
+
+// selfUnitDelegated reports whether this vmd unit has Delegate set, via
+// D-Bus (fallback systemctl). Unknown reads as NOT delegated — fail-closed,
+// so arming never proceeds on an unverified subtree.
+func selfUnitDelegated(ctx context.Context) bool {
+	const unit = "superserve-vmd.service"
+	if val, notLoaded, ok := sdbusUnitProperty(ctx, unit, "Service", "Delegate"); ok && !notLoaded {
+		if b, isBool := val.(bool); isBool {
+			return b
+		}
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "Delegate", "--value", unit).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "yes"
+}
+
+// delegatedTreeHasVMs reports whether a prior armed life left any per-VM
+// cgroup under vms/ — including crash-survivors with no BoltDB record. Cheap
+// and side-effect-free: resolve the path, ReadDir, tolerate not-exist (fresh
+// host, never armed). Complements hasCgroupRecords so a rollback still
+// manages an unrecorded survivor.
+func delegatedTreeHasVMs() bool {
+	root, err := ownCgroupPath()
+	if err != nil {
+		return false
+	}
+	if filepath.Base(root) == "daemon" {
+		root = filepath.Dir(root)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "vms"))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // hasCgroupRecords reports whether this host has any persisted cgroup-mode
