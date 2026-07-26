@@ -310,11 +310,11 @@ func hostIPForSlot(idx int) string {
 // Deterministic slot identity: everything about a slot derives from its index,
 // which is what makes namespaces left by a previous vmd lifetime adoptable —
 // the kernel objects carry all the state, nothing needs to be persisted.
-func nsNameForSlot(idx int) string    { return fmt.Sprintf("ns-%d", idx) }
-func vethNameForSlot(idx int) string  { return fmt.Sprintf("veth-%d", idx) }
-func vpeerIPForSlot(idx int) string   { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
-func vethIPForSlot(idx int) string    { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
-func macForSlot(idx int) string       { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
+func nsNameForSlot(idx int) string   { return fmt.Sprintf("ns-%d", idx) }
+func vethNameForSlot(idx int) string { return fmt.Sprintf("veth-%d", idx) }
+func vpeerIPForSlot(idx int) string  { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
+func vethIPForSlot(idx int) string   { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
+func macForSlot(idx int) string      { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
 
 // setupSlot runs the expensive network setup (namespace, veth, TAP,
 // nftables, routing) for a single slot index. Used by both SetupVM
@@ -1325,6 +1325,36 @@ func (m *Manager) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []s
 
 // netnsDir is overridden by tests.
 var netnsDir = "/run/netns"
+
+// NamespaceForPID returns the ns-N name of the network namespace that pid is
+// in, by matching /proc/<pid>/ns/net's inode against the named namespaces in
+// netnsDir. Empty when pid is 0, gone, or in no named namespace. Lets a
+// caller reclaim the slot of an untracked VM (no device record) whose only
+// remaining handle is its live process.
+func (m *Manager) NamespaceForPID(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	procNs, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", pid))
+	if err != nil {
+		return ""
+	}
+	target := procNs.Sys().(*syscall.Stat_t).Ino
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		st, err := os.Stat(netnsDir + "/" + e.Name())
+		if err != nil {
+			continue
+		}
+		if st.Sys().(*syscall.Stat_t).Ino == target {
+			return e.Name()
+		}
+	}
+	return ""
+}
 
 func nsExists(nsName string) bool {
 	_, err := os.Stat(netnsDir + "/" + nsName)

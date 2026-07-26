@@ -341,12 +341,16 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 		log.Warn().Str("vm_id", id).Str("drift", "cgroup_orphan_no_record").
 			Msg("recordless cgroup survivor — stopping")
+		// Recover the netns from the live process BEFORE the kill, or the
+		// slot/veth/ns leaks: an untracked VM has no device record, so
+		// CleanupVMOrNamespace can only reclaim it given the namespace name.
+		nsName := r.mgr.netMgr.NamespaceForPID(r.mgr.cgroups.firstPID(id))
 		if err := r.mgr.stopVM(ctx, id, SupervisionCgroup); err != nil {
 			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop recordless cgroup — leaving for retry")
 			unlockOp()
 			continue
 		}
-		r.mgr.netMgr.CleanupVMOrNamespace(id, "")
+		r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
 		unlockOp()
 		r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor", "cgroup_orphan_no_record")
 		r.clearDrift("cgrouporphan:" + id)

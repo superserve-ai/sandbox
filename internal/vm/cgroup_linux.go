@@ -319,6 +319,17 @@ func (t *cgroupTree) vmCgroupDir(vmID string) string {
 	return filepath.Join(t.vms, vmID)
 }
 
+// firstPID returns any one live PID in the VM's cgroup, or 0 if empty/missing.
+// Used to recover an untracked survivor's netns from its process before the
+// kill removes the last handle to it.
+func (t *cgroupTree) firstPID(vmID string) int {
+	pids, err := readCgroupProcs(t.vmCgroupDir(vmID))
+	if err != nil || len(pids) == 0 {
+		return 0
+	}
+	return pids[0]
+}
+
 // createVMCgroup makes the per-VM group and returns an open directory fd
 // for CLONE_INTO_CGROUP (SysProcAttr.CgroupFD): the child is created
 // directly inside the group, so there is no fork-to-move window at all.
