@@ -69,7 +69,14 @@ func (m *Manager) stopVM(ctx context.Context, vmID, supervision string) error {
 		if m.cgroups == nil {
 			return fmt.Errorf("stop cgroup VM %s: no delegated subtree (not armed)", vmID)
 		}
-		if err := m.cgroups.killVMCgroup(ctx, vmID, directCgroupStopBudget); err != nil {
+		// Detach from the caller's deadline and give the kill its full
+		// budget: freeing the tap MUST complete, and several callers pass a
+		// context shorter than directCgroupStopBudget (reattach 5s, restore
+		// cleanup 10s). A stop cut short would let a caller recycle the slot
+		// while a UFFD-blocked FC still holds the tap.
+		killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directCgroupStopBudget)
+		defer cancel()
+		if err := m.cgroups.killVMCgroup(killCtx, vmID, directCgroupStopBudget); err != nil {
 			return err
 		}
 		m.awaitReaper(vmID)

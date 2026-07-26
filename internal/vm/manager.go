@@ -2195,19 +2195,20 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// record with a live half-restored FC.
 	if m.cgroups != nil {
 		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr == nil && pop {
-			switch {
-			case rec.Status == StatusPaused:
+			// Stamp cgroup mode FIRST, unconditionally: even if the kill
+			// below fails (host contention), the published record must never
+			// say unit over a live cgroup, or a later destroy stops a
+			// nonexistent unit and a resume launches a unit alongside it.
+			rec.Supervision = SupervisionCgroup
+			if rec.Status == StatusPaused {
 				// A paused VM has no live process — this is a mid-resume
 				// orphan. Kill it and keep the record Paused so a fresh
-				// resume retries cleanly.
+				// resume retries cleanly. On kill failure the reconciler
+				// backstops (the record is now cgroup-mode).
 				log.Warn().Msg("live cgroup for a paused record — killing mid-resume orphan")
 				_ = m.stopVM(ctx, rec.ID, SupervisionCgroup)
-			case !cgroupSupervised(rec.Supervision):
-				// Non-paused record with a stale non-cgroup mode: the live
-				// cgroup is the truth. Correct it so reattach and every later
-				// oracle dispatch to cgroup.
-				log.Warn().Msg("live cgroup with a non-cgroup record — correcting supervision to cgroup")
-				rec.Supervision = SupervisionCgroup
+			} else {
+				log.Warn().Msg("live cgroup with a non-cgroup record — corrected supervision to cgroup")
 			}
 		}
 	}
@@ -2391,6 +2392,36 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	}
 	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
 	return true
+}
+
+// ReapRecordlessCgroupVMs kills direct-spawn VMs that have a live cgroup but
+// no BoltDB record — a crash between spawn and the first persist. It runs
+// synchronously at startup, BEFORE the request gate opens, so every recordless
+// cgroup is genuinely a previous-life survivor (no create has happened yet);
+// the racy post-gate case is left to the reconciler under its op lock. The
+// survivor's netns is freed for the sweep once its FC is dead. No-op unless
+// direct spawn is armed/managed and the state store is attached.
+func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) {
+	if m.cgroups == nil || m.state == nil {
+		return
+	}
+	cgIDs, err := m.cgroups.scanVMCgroups()
+	if err != nil {
+		m.log.Warn().Err(err).Msg("failed to scan vm cgroups for recordless reap")
+		return
+	}
+	for _, id := range cgIDs {
+		if isBuildVM(id) {
+			continue
+		}
+		if has, herr := m.state.Has(id); herr != nil || has {
+			continue // recorded (reattach owns it) or unreadable (conservative)
+		}
+		m.log.Warn().Str("vm_id", id).Msg("recordless cgroup survivor at startup — reaping")
+		if serr := m.stopVM(ctx, id, SupervisionCgroup); serr != nil {
+			m.log.Error().Err(serr).Str("vm_id", id).Msg("failed to reap recordless cgroup")
+		}
+	}
 }
 
 // collectStartupSlots returns vmID→namespace for every record that has one, so

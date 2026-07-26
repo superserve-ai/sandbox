@@ -578,6 +578,13 @@ func main() {
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
 	slotsReserved := mgr.ReserveStartupSlots(ctx)
+	// Reap direct-spawn VMs whose record never persisted (crash between spawn
+	// and first write). They have no record to reserve their slot, so the
+	// sweep/adoption below would tear their netns down under a live FC or
+	// treat it as pool inventory. Safe here — synchronous, before the request
+	// gate opens, so no in-flight create can be mistaken for a survivor
+	// (that racy post-gate case is the reconciler's job). No-op unless armed.
+	mgr.ReapRecordlessCgroupVMs(ctx)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
 	if !adoptNetPool {
 		// Under adoption, orphan namespaces are warm-pool candidates instead
