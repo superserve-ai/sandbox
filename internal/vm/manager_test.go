@@ -963,9 +963,9 @@ func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
 }
 
 func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
@@ -1030,9 +1030,9 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 }
 
 func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 
 	existing := &VMInstance{
 		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
@@ -1102,9 +1102,9 @@ func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
 	// A record can read Running while the firecracker process is gone. The
 	// retry guard must not hand back that corpse — it must fall through to
 	// a fresh restore.
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return true } // unit definitively dead
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return true } // unit definitively dead
+	defer func() { vmDeadForRetry = orig }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
