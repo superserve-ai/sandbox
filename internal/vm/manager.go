@@ -2097,7 +2097,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 
-	// Phase B: detect orphan systemd units not in BoltDB.
+	// Phase B: detect orphan units not in BoltDB, both supervision modes.
 	activeIDs, err := listActiveFirecrackerUnits(ctx)
 	if err != nil {
 		m.log.Warn().Err(err).Msg("failed to list active firecracker units — orphan detection skipped")
@@ -2106,6 +2106,24 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 			if !knownIDs[id] {
 				m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
 			}
+		}
+	}
+	// Phase B2: orphan per-VM cgroups not in BoltDB. A direct-spawned VM
+	// whose record was lost (crash before persist) is a live process with no
+	// bookkeeping — kill it, mirroring the unit orphan story. A record-backed
+	// cgroup VM is handled by Phase A's reattach, so skip those.
+	if m.cgroups != nil {
+		if cgIDs, cerr := m.cgroups.scanVMCgroups(); cerr == nil {
+			for _, id := range cgIDs {
+				if knownIDs[id] || isBuildVM(id) {
+					continue
+				}
+				m.log.Warn().Str("vm_id", id).Msg("orphan vm cgroup detected (not in BoltDB) — killing")
+				_ = m.stopVM(ctx, id, SupervisionCgroup)
+				m.netMgr.CleanupVMOrNamespace(id, "")
+			}
+		} else {
+			m.log.Warn().Err(cerr).Msg("failed to scan vm cgroups — cgroup orphan detection skipped")
 		}
 	}
 

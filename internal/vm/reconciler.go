@@ -184,18 +184,48 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// destroyed within, and dirs touched within, DiskGracePeriod are kept).
 	snapshotTime := time.Now()
 
-	// Source B: active systemd units.
-	ids, err := listActiveFirecrackerUnits(ctx)
+	// Source B: running VMs, as a fail-closed UNION of both supervision
+	// modes — active systemd units and populated per-VM cgroups. This set
+	// gates every destructive drift rule and the presence sweep, so a live
+	// VM missing from it would be marked failed and have its netns freed
+	// under a running Firecracker. If EITHER source errors, abort the whole
+	// pass: a partial set presents that source's VMs as dead. supervisionOf
+	// records which source listed each ID so the stop path can pick the
+	// right mechanism when the DB row (and its Supervision) is absent.
+	unitIDs, err := listActiveFirecrackerUnits(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list systemd units")
 		return
 	}
-	active := make(map[string]bool, len(ids))
-	for _, id := range ids {
+	active := make(map[string]bool)
+	supervisionOf := make(map[string]string)
+	for _, id := range unitIDs {
 		if isBuildVM(id) {
 			continue
 		}
 		active[id] = true
+		supervisionOf[id] = SupervisionUnit
+	}
+	if r.mgr.cgroups != nil {
+		cgIDs, cerr := r.mgr.cgroups.scanVMCgroups()
+		if cerr != nil {
+			log.Error().Err(cerr).Msg("failed to scan vm cgroups")
+			return
+		}
+		for _, id := range cgIDs {
+			if isBuildVM(id) {
+				continue
+			}
+			pop, perr := r.mgr.cgroups.vmCgroupPopulated(id)
+			if perr != nil {
+				log.Error().Err(perr).Str("vm_id", id).Msg("failed to read vm cgroup state")
+				return
+			}
+			if pop {
+				active[id] = true
+				supervisionOf[id] = SupervisionCgroup
+			}
+		}
 	}
 
 	// Presence convergence rides the reconcile tick: give every quiesced legacy
@@ -337,8 +367,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				kind = "systemd_active_db_failed"
 			}
 			log.Warn().Str("vm_id", id).Str("drift", kind).Msg("orphan systemd unit — stopping")
-			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
-				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit")
+			if err := r.mgr.stopVM(ctx, id, supervisionOf[id]); err != nil {
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan VM")
 				continue
 			}
 			removeUnitDropIn(id)
@@ -391,7 +421,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
 				Msg("live unit for paused sandbox — stopping")
-			err := stopUnit(ctx, systemdUnitName(id))
+			err := r.mgr.stopVM(ctx, id, supervisionOf[id])
 			unlockOp()
 			if err != nil {
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop paused sandbox's unit")
@@ -467,8 +497,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
 					Msg("live orphan systemd unit with no DB row — stopping")
-				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
-					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
+				if err := r.mgr.stopVM(ctx, id, supervisionOf[id]); err != nil {
+					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan VM from BoltDB — leaving for retry")
 					continue
 				}
 				removeUnitDropIn(id)
@@ -928,9 +958,15 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 func (r *Reconciler) markStale(vmID string) {
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
-	var namespace string
+	var namespace, supervision string
 	if rec, err := r.mgr.state.Get(vmID); err == nil && rec != nil {
 		namespace = rec.Namespace
+		supervision = rec.Supervision
+	}
+	// Remove a direct-spawned VM's cgroup dir too, or an emptied group lingers
+	// as an unbounded fleet-size artifact.
+	if cgroupSupervised(supervision) && r.mgr.cgroups != nil {
+		_ = r.mgr.cgroups.removeVMCgroup(vmID)
 	}
 
 	// Delete from BoltDB first. If this fails, keep the in-memory entry
