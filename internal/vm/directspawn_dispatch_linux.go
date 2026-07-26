@@ -39,11 +39,37 @@ func (m *Manager) cgroupLaunch(existing string) bool {
 // rollback drains rather than converts).
 func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string) (pid int, supervision string, err error) {
 	if m.cgroupLaunch(existing) {
+		// Unit→cgroup flip: a VM previously run as a systemd unit may still
+		// have a live legacy unit — a pause whose stop timed out persists
+		// Paused with the FC possibly still up. Spawning a cgroup FC then
+		// gives two processes the same ID, disk, netns, and tap, and once
+		// stamped cgroup only the new one is ever cleaned up. So on a flip
+		// (existing is not already cgroup) for a vmID that has a persisted
+		// record — i.e. a resume/verify, never a fresh create whose record
+		// lands only after launch — stop and confirm the legacy unit dead
+		// before forking. Gated on the record so fresh creates pay no D-Bus.
+		if !cgroupSupervised(existing) && m.hasStateRecord(vmID) {
+			_ = stopUnit(ctx, systemdUnitName(vmID))
+			if !unitDefinitelyDead(ctx, systemdUnitName(vmID)) {
+				return 0, existing, fmt.Errorf("legacy unit for %s not confirmed dead; refusing cgroup launch", vmID)
+			}
+		}
 		pid, err = m.startFirecrackerDirect(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
 		return pid, SupervisionCgroup, err
 	}
 	pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
 	return pid, SupervisionUnit, err
+}
+
+// hasStateRecord reports whether a persisted record exists for vmID — the
+// no-D-Bus signal that a vmID had a prior life (resume/verify) versus a
+// fresh create (record persisted only after launch).
+func (m *Manager) hasStateRecord(vmID string) bool {
+	if m.state == nil {
+		return false
+	}
+	has, err := m.state.Has(vmID)
+	return err == nil && has
 }
 
 // stopVM terminates a VM by its supervision mode. cgroup mode: kill the
@@ -116,8 +142,11 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 
 	// Replace preamble: a populated group means a stale FC (interrupted stop)
 	// still holds this vmID's socket. Kill-and-wait-empty before forking, or
-	// two FCs race one socket.
-	if pop, err := m.cgroups.vmCgroupPopulated(vmID); err == nil && pop {
+	// two FCs race one socket. An unreadable cgroup.events (err != nil) is
+	// inconclusive — treat it as maybe-populated and kill, matching the
+	// fail-safe (inconclusive == alive) rule the oracles use; only a
+	// definitive not-populated skips the kill.
+	if pop, perr := m.cgroups.vmCgroupPopulated(vmID); perr != nil || pop {
 		if kerr := m.cgroups.killVMCgroup(ctx, vmID, directCgroupStopBudget); kerr != nil {
 			return 0, fmt.Errorf("clear stale cgroup before launch: %w", kerr)
 		}
@@ -161,6 +190,11 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	go func() {
 		res := waitDirect(cmd)
 		close(exited)
+		// Drop our own entry so a VM that exits WITHOUT a stop (guest
+		// shutdown, crash, OOM) doesn't leak a map entry — the only other
+		// remover is awaitReaper, which runs on stop paths. CompareAndDelete
+		// so a same-ID relaunch's Store isn't clobbered.
+		m.reapers.CompareAndDelete(vmID, exited)
 		m.log.Info().Str("vm_id", vmID).Int("exit_code", res.ExitCode).
 			Msg("direct-spawned firecracker exited")
 	}()

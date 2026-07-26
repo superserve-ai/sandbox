@@ -415,14 +415,6 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
-	// Direct spawn arms only when the unit's configuration proves the
-	// survival property (Delegate + KillMode=process); a refusal degrades
-	// new launches to the systemd-unit path and the daemon keeps serving.
-	if arms, err := mgr.ArmDirectSpawn(ctx); err != nil {
-		log.Error().Err(err).Msg("direct spawn requested but not armed — launches use the unit path")
-	} else if arms {
-		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
-	}
 
 	// ---- TCP egress proxy ----
 	// Must be set before ReattachAll or any VM operations so domain
@@ -464,6 +456,18 @@ func main() {
 	}
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+
+	// Arm direct spawn AFTER the state store is attached (hasCgroupRecords
+	// reads it to decide rollback-management) and BEFORE ReattachAll (its
+	// cgroup-orphan scan needs the delegated subtree). Arms only when the
+	// unit's config proves the survival property (Delegate + KillMode=
+	// process); a refusal degrades new launches to the unit path but still
+	// initializes the subtree for managing any existing cgroup VMs.
+	if arms, err := mgr.ArmDirectSpawn(ctx); err != nil {
+		log.Error().Err(err).Msg("direct spawn not armed — launches use the unit path")
+	} else if arms {
+		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
+	}
 
 	// ---- gRPC server ----
 	// Bind and serve BEFORE the reattach so a restart doesn't refuse connections

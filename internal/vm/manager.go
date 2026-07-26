@@ -2127,19 +2127,20 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 			}
 		}
 	}
-	// Phase B2: orphan per-VM cgroups not in BoltDB. A direct-spawned VM
-	// whose record was lost (crash before persist) is a live process with no
-	// bookkeeping — kill it, mirroring the unit orphan story. A record-backed
-	// cgroup VM is handled by Phase A's reattach, so skip those.
+	// Phase B2: detect orphan per-VM cgroups not in BoltDB — LOG ONLY,
+	// symmetric with the unit-orphan path above. Killing here would race an
+	// in-flight restore: ReattachAll runs in a background goroutine and the
+	// startup gate opens before it finishes, so a create past the gate can
+	// have created its cgroup before persisting its record — it would look
+	// like an orphan. The reconciler owns destruction, with a grace period
+	// and the op lock; its active-set union already covers cgroup orphans.
 	if m.cgroups != nil {
 		if cgIDs, cerr := m.cgroups.scanVMCgroups(); cerr == nil {
 			for _, id := range cgIDs {
 				if knownIDs[id] || isBuildVM(id) {
 					continue
 				}
-				m.log.Warn().Str("vm_id", id).Msg("orphan vm cgroup detected (not in BoltDB) — killing")
-				_ = m.stopVM(ctx, id, SupervisionCgroup)
-				m.netMgr.CleanupVMOrNamespace(id, "")
+				m.log.Warn().Str("vm_id", id).Msg("orphan vm cgroup detected (not in BoltDB) — will be handled by reconciler")
 			}
 		} else {
 			m.log.Warn().Err(cerr).Msg("failed to scan vm cgroups — cgroup orphan detection skipped")
@@ -3005,32 +3006,12 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	setupCmds := fcSetupCmds(templateDir, basePath, perVMRootfs)
 
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	// Re-check the pin here, not just launcherReady: a pin unmounted since the
-	// last revalidation tick would otherwise bake a dead nsenter --mount into
-	// start.sh and hard-fail. pinIsMounted is one statfs — no fork on the hot
-	// path, no transient exec failure under burst load. On failure fall back to
-	// legacy for THIS launch only; launcherReady stays with the sampler, so one
-	// blip can't knock the whole fleet onto the O(fleet) legacy path for a tick.
-	launcherPath := ""
-	pin := m.launcherNSPath()
-	switch {
-	case pin == "":
-		// Launcher mode disabled: legacy is the configured path.
-	case !m.launcherReady.Load():
-		// Every launch here copies the full host mount table, so concurrent
-		// launches degrade with fleet size. launcherBuilt splits the causes:
-		// a build still in progress resolves itself; a failed build or an
-		// invalidated pin does not.
-		if m.launcherBuilt.Load() {
-			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin invalidated — using legacy path for this launch")
-		} else {
-			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not built — using legacy path for this launch")
-		}
-	case pinIsMounted(pin):
-		launcherPath = pin
-	default:
-		m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not mounted at launch — using legacy path for this launch")
-	}
+	// Re-check the pin here (shared with the direct path via launchLauncherPath):
+	// a pin unmounted since the last revalidation tick would otherwise bake a
+	// dead nsenter --mount into start.sh and hard-fail. On failure it falls back
+	// to legacy for THIS launch only; launcherReady stays with the sampler, so
+	// one blip can't knock the whole fleet onto the O(fleet) legacy path.
+	launcherPath := m.launchLauncherPath(vmID)
 	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
 		return 0, fmt.Errorf("write start script: %w", err)
