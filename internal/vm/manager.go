@@ -1147,7 +1147,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.mu.RLock()
 	resumeExisting := inst.Supervision
 	inst.mu.RUnlock()
-	pid, resumeSupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, resumeExisting)
+	pid, resumeSupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, resumeExisting, true)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
@@ -1350,7 +1350,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// debug/staging use this endpoint is gated to. The deferred stop uses the
 	// mode this launch ACTUALLY chose (arming can put a legacy VM's throwaway
 	// on the cgroup path), or the FC and its cgroup outlive the verify.
-	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, inst.Supervision)
+	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, inst.Supervision, true)
 	if err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
@@ -1812,7 +1812,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.RLock()
 		existingSupervision := inst.Supervision
 		inst.mu.RUnlock()
-		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision)
+		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace)
 		if startErr != nil {
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
@@ -2187,6 +2187,30 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	m.mu.RUnlock()
 
 	log := m.log.With().Str("vm_id", rec.ID).Logger()
+
+	// A live cgroup is ground truth for supervision, reconciled before we
+	// trust the record's mode or status. Two crash windows produce a
+	// disagreement: a crash mid unit→cgroup flip leaves the record still
+	// saying unit over a live cgroup; a crash mid-resume leaves a Paused
+	// record with a live half-restored FC.
+	if m.cgroups != nil {
+		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr == nil && pop {
+			switch {
+			case rec.Status == StatusPaused:
+				// A paused VM has no live process — this is a mid-resume
+				// orphan. Kill it and keep the record Paused so a fresh
+				// resume retries cleanly.
+				log.Warn().Msg("live cgroup for a paused record — killing mid-resume orphan")
+				_ = m.stopVM(ctx, rec.ID, SupervisionCgroup)
+			case !cgroupSupervised(rec.Supervision):
+				// Non-paused record with a stale non-cgroup mode: the live
+				// cgroup is the truth. Correct it so reattach and every later
+				// oracle dispatch to cgroup.
+				log.Warn().Msg("live cgroup with a non-cgroup record — correcting supervision to cgroup")
+				rec.Supervision = SupervisionCgroup
+			}
+		}
+	}
 
 	// Running VMs must have a live systemd unit and a reachable API socket; a
 	// dead one is a stale record. Paused VMs legitimately have no unit — they

@@ -287,6 +287,71 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 
 	now := time.Now()
 
+	// Drift 0: recordless cgroup survivor. A cgroup in the running-set with
+	// no BoltDB record and no in-memory instance is a VM vmd cannot service —
+	// a crash between direct-spawn and the first persist. Drift 1/3 miss it
+	// (the DB row may still read creating/running, and those rules key off
+	// the record or skip nonterminal rows). Stop it after grace, under the op
+	// lock, re-checking that it's still recordless so an in-flight launch
+	// that just made the cgroup is never killed.
+	for id := range active {
+		if supervisionOf[id] != SupervisionCgroup {
+			continue
+		}
+		inBolt := false
+		if dbSandboxes == nil {
+			_, inBolt = bolted[id]
+		} else {
+			_, inBolt = boltedIDs[id]
+		}
+		if inBolt {
+			continue
+		}
+		r.mgr.mu.RLock()
+		_, hasInst := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if hasInst {
+			continue
+		}
+		if !r.gracePeriodElapsed("cgrouporphan:"+id, now) {
+			continue
+		}
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue // a launch/op holds the lock; re-evaluate next tick
+		}
+		// Re-check under the lock: a launch may have persisted the record or
+		// published the instance since the snapshot at the top of the pass.
+		if has, _ := r.mgr.state.Has(id); has {
+			unlockOp()
+			r.clearDrift("cgrouporphan:" + id)
+			continue
+		}
+		r.mgr.mu.RLock()
+		_, hasInst = r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if hasInst {
+			unlockOp()
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "recordless cgroup stop suppressed by rate limit", "cgroup_orphan_no_record")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("drift", "cgroup_orphan_no_record").
+			Msg("recordless cgroup survivor — stopping")
+		if err := r.mgr.stopVM(ctx, id, SupervisionCgroup); err != nil {
+			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop recordless cgroup — leaving for retry")
+			unlockOp()
+			continue
+		}
+		r.mgr.netMgr.CleanupVMOrNamespace(id, "")
+		unlockOp()
+		r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor", "cgroup_orphan_no_record")
+		r.clearDrift("cgrouporphan:" + id)
+	}
+
 	// Drift 1: DB says active, systemd/socket says dead.
 	// Action: mark sandbox failed in DB + clean up BoltDB + in-memory.
 	if dbSandboxes != nil {

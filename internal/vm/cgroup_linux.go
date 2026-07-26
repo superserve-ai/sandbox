@@ -104,6 +104,14 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	if !wantArm {
 		return false, nil // manage-only (rollback / drain)
 	}
+	// cgroup.kill (kernel 5.14+) and cgroup.events are how stop and liveness
+	// work; a v2 host too old to have them would launch fine but never be
+	// able to stop or reap a VM. Verify on the real tree before arming.
+	for _, f := range []string{"cgroup.kill", "cgroup.events"} {
+		if _, err := os.Stat(filepath.Join(tree.vms, f)); err != nil {
+			return false, fmt.Errorf("delegated tree lacks %s (kernel too old?): %w", f, err)
+		}
+	}
 	if km := selfUnitKillMode(ctx); km != "process" {
 		// Managing existing VMs is fine, but a KillMode that would kill the
 		// subtree on stop must not gate NEW launches onto it.

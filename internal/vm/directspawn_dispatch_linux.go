@@ -37,14 +37,18 @@ func (m *Manager) cgroupLaunch(existing string) bool {
 // oracle would then check the wrong source. A record already in cgroup mode
 // always relaunches cgroup mode regardless of the flag (so a flag-off
 // rollback drains rather than converts).
-func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string) (pid int, supervision string, err error) {
+// hadPriorLife tells launchFirecracker the vmID may already have a systemd
+// unit (a resume/verify, or an in-place replace) versus a fresh create whose
+// unit never existed — so the fresh burst path skips the flip's stopUnit
+// entirely, no D-Bus and no BoltDB read.
+func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string, hadPriorLife bool) (pid int, supervision string, err error) {
 	if m.cgroupLaunch(existing) {
 		// Unit→cgroup flip: a legacy unit whose pause-stop timed out may
 		// still be live, and spawning a cgroup FC over it gives two
 		// processes one ID/tap with only the new one ever cleaned up. Stop
-		// and confirm the old unit dead first. Gated on an existing record
-		// (resume/verify), so fresh creates take no D-Bus.
-		if !cgroupSupervised(existing) && m.hasStateRecord(vmID) {
+		// and confirm the old unit dead first. Only for a VM with a prior
+		// life still on the unit path; fresh creates never had a unit.
+		if hadPriorLife && !cgroupSupervised(existing) {
 			_ = stopUnit(ctx, systemdUnitName(vmID))
 			if !unitDefinitelyDead(ctx, systemdUnitName(vmID)) {
 				return 0, existing, fmt.Errorf("legacy unit for %s not confirmed dead; refusing cgroup launch", vmID)
@@ -55,17 +59,6 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 	}
 	pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
 	return pid, SupervisionUnit, err
-}
-
-// hasStateRecord reports whether a persisted record exists for vmID — the
-// no-D-Bus signal that a vmID had a prior life (resume/verify) versus a
-// fresh create (record persisted only after launch).
-func (m *Manager) hasStateRecord(vmID string) bool {
-	if m.state == nil {
-		return false
-	}
-	has, err := m.state.Has(vmID)
-	return err == nil && has
 }
 
 // stopVM terminates a VM by its supervision mode. cgroup mode: kill the
