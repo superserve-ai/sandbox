@@ -196,8 +196,9 @@ const vmdTimeout = 30 * time.Second
 // attempt dies on a transient — DeadlineExceeded, or Unavailable that
 // outlived the dial-site interceptor's window — with the caller's context
 // still alive, runs exactly one more under a fresh vmdTimeout; worst case
-// 2×vmdTimeout for a caller that waits (the API LB's backend timeout is
-// sized above that envelope). The daemon serializes same-ID boots and
+// 2×vmdTimeout for a caller that waits, which stays under Cloud Run's 300s
+// request timeout (the real ceiling; a serverless backend has no LB-level
+// timeout). The daemon serializes same-ID boots and
 // recognizes a completed prior attempt, so the retry either adopts the VM
 // the first attempt brought up or boots cleanly — never a double boot; at
 // most one retry per boot and the daemon's restore semaphore bound the

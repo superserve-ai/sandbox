@@ -209,13 +209,6 @@ module "api_cert_lb" {
   cloud_run_service = module.api.service_name
   domain            = "api.superserve.ai"
 
-  # Must exceed the API's worst-case create/resume envelope — two vmd boot
-  # attempts plus one more vmd-timeout of synchronous post-boot work (env
-  # inject, secret rebinding, network rules) — or the LB 504s while the
-  # control plane is still working and a late success races the client's
-  # error. Cloud Run's own 300s service timeout remains the outer ceiling.
-  backend_timeout_sec = 120
-
   dns_authorization_name     = "api-superserve-dnsauth"
   certificate_name           = "api-superserve-cert"
   certificate_map_name       = "api-superserve-certmap"
