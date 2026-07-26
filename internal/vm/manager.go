@@ -2128,12 +2128,10 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 	// Phase B2: detect orphan per-VM cgroups not in BoltDB — LOG ONLY,
-	// symmetric with the unit-orphan path above. Killing here would race an
-	// in-flight restore: ReattachAll runs in a background goroutine and the
-	// startup gate opens before it finishes, so a create past the gate can
-	// have created its cgroup before persisting its record — it would look
-	// like an orphan. The reconciler owns destruction, with a grace period
-	// and the op lock; its active-set union already covers cgroup orphans.
+	// symmetric with the unit path. Killing here would race an in-flight
+	// restore (this runs in a background goroutine; a create past the
+	// startup gate can have its cgroup before its record). The reconciler
+	// owns destruction, with a grace period and the op lock.
 	if m.cgroups != nil {
 		if cgIDs, cerr := m.cgroups.scanVMCgroups(); cerr == nil {
 			for _, id := range cgIDs {

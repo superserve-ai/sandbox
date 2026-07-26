@@ -39,15 +39,11 @@ func (m *Manager) cgroupLaunch(existing string) bool {
 // rollback drains rather than converts).
 func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string) (pid int, supervision string, err error) {
 	if m.cgroupLaunch(existing) {
-		// Unit→cgroup flip: a VM previously run as a systemd unit may still
-		// have a live legacy unit — a pause whose stop timed out persists
-		// Paused with the FC possibly still up. Spawning a cgroup FC then
-		// gives two processes the same ID, disk, netns, and tap, and once
-		// stamped cgroup only the new one is ever cleaned up. So on a flip
-		// (existing is not already cgroup) for a vmID that has a persisted
-		// record — i.e. a resume/verify, never a fresh create whose record
-		// lands only after launch — stop and confirm the legacy unit dead
-		// before forking. Gated on the record so fresh creates pay no D-Bus.
+		// Unit→cgroup flip: a legacy unit whose pause-stop timed out may
+		// still be live, and spawning a cgroup FC over it gives two
+		// processes one ID/tap with only the new one ever cleaned up. Stop
+		// and confirm the old unit dead first. Gated on an existing record
+		// (resume/verify), so fresh creates take no D-Bus.
 		if !cgroupSupervised(existing) && m.hasStateRecord(vmID) {
 			_ = stopUnit(ctx, systemdUnitName(vmID))
 			if !unitDefinitelyDead(ctx, systemdUnitName(vmID)) {
