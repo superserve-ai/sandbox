@@ -67,23 +67,64 @@ func ownCgroupPath() (string, error) {
 // The KillMode check is the load-bearing guard: unlike unit mode, where a
 // misconfiguration is harmless, here it is a fleet-killing time bomb, so we
 // verify it at the source rather than trust the deployed file.
+//
+// The subtree is set up whenever the flag is on OR this host already owns
+// cgroup-mode VMs — otherwise a flag-off rollback would leave m.cgroups nil
+// while cgroup VMs still run, and their liveness would read inconclusive
+// forever, pause/reconcile could not touch them, and resume would loop on
+// "not armed". Only NEW launches are gated by directSpawnArmed; management
+// of existing cgroup VMs is always available once any exist.
 func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
-	if !m.cfg.DirectSpawn {
-		return false, nil
+	wantArm := m.cfg.DirectSpawn
+	haveCgroupVMs := m.hasCgroupRecords()
+	if !wantArm && !haveCgroupVMs {
+		return false, nil // nothing to arm, nothing to manage
 	}
 	if _, err := os.Stat(filepath.Join(cgroupMount, "cgroup.controllers")); err != nil {
-		return false, fmt.Errorf("cgroup v2 unified hierarchy required: %w", err)
-	}
-	if km := selfUnitKillMode(ctx); km != "process" {
-		return false, fmt.Errorf("unit KillMode=%q, need \"process\" — direct spawn would die on the next vmd stop", km)
+		if wantArm {
+			return false, fmt.Errorf("cgroup v2 unified hierarchy required: %w", err)
+		}
+		return false, fmt.Errorf("cgroup-mode VMs exist but cgroup v2 is unavailable: %w", err)
 	}
 	tree, err := setupCgroupTree()
 	if err != nil {
-		return false, fmt.Errorf("prepare delegated subtree (needs Delegate=yes): %w", err)
+		if wantArm {
+			return false, fmt.Errorf("prepare delegated subtree (needs Delegate=yes): %w", err)
+		}
+		return false, fmt.Errorf("cannot manage existing cgroup-mode VMs: %w", err)
 	}
+	// Tree is usable: existing cgroup VMs are now manageable regardless of
+	// the flag.
 	m.cgroups = tree
+	if !wantArm {
+		return false, nil // manage-only (rollback / drain)
+	}
+	if km := selfUnitKillMode(ctx); km != "process" {
+		// Managing existing VMs is fine, but a KillMode that would kill the
+		// subtree on stop must not gate NEW launches onto it.
+		return false, fmt.Errorf("unit KillMode=%q, need \"process\" — direct spawn would die on the next vmd stop", km)
+	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
+}
+
+// hasCgroupRecords reports whether this host has any persisted cgroup-mode
+// VM — the signal that the delegated subtree must be initialized for
+// management even when the direct-spawn flag is off (a rollback in progress).
+func (m *Manager) hasCgroupRecords() bool {
+	if m.state == nil {
+		return false
+	}
+	recs, err := m.state.All()
+	if err != nil {
+		return false
+	}
+	for _, r := range recs {
+		if cgroupSupervised(r.Supervision) {
+			return true
+		}
+	}
+	return false
 }
 
 // selfUnitKillMode reads this vmd unit's KillMode via D-Bus (falling back to

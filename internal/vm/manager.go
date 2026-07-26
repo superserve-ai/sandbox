@@ -1151,6 +1151,12 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
+	// Stamp the launched mode NOW, before any restore-failure cleanup below
+	// can run: a legacy record resumed into cgroup mode must not have its
+	// cleanup dispatch to the (nonexistent) unit path and leak the FC.
+	inst.mu.Lock()
+	inst.Supervision = resumeSupervision
+	inst.mu.Unlock()
 	tFcDone := time.Now()
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
@@ -1199,7 +1205,6 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 
 	inst.mu.Lock()
 	inst.PID = pid
-	inst.Supervision = resumeSupervision // resume may flip a legacy record to cgroup mode
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
 	inst.DirtyTracked = dirtyTracked
@@ -1342,14 +1347,16 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// Throwaway Firecracker in the sandbox's existing rundir, stopped on the
 	// way out. Safe because the VM is paused (no live FC to disrupt), but it must
 	// not run concurrently with a resume of the same sandbox — fine for the
-	// debug/staging use this endpoint is gated to. Launch in the sandbox's
-	// recorded mode so the deferred stop above matches.
-	if _, _, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, inst.Supervision); err != nil {
+	// debug/staging use this endpoint is gated to. The deferred stop uses the
+	// mode this launch ACTUALLY chose (arming can put a legacy VM's throwaway
+	// on the cgroup path), or the FC and its cgroup outlive the verify.
+	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, inst.Supervision)
+	if err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
 	defer func() {
 		sctx, scancel := context.WithTimeout(context.Background(), stopUnitBudget)
-		_ = m.stopVM(sctx, vmID, m.supervisionForVM(vmID))
+		_ = m.stopVM(sctx, vmID, verifySupervision)
 		scancel()
 	}()
 
