@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -48,6 +49,58 @@ func ownCgroupPath() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no cgroup v2 entry in /proc/self/cgroup")
+}
+
+// ArmDirectSpawn enables the cgroup launch path for NEW VMs when the flag is
+// set AND the host proves the survival property. Returns (armed, err):
+// (false, nil) flag off; (false, err) requested but a precondition failed —
+// the caller logs and continues on the unit path; (true, nil) armed.
+//
+// Preconditions, all fail-closed:
+//   - cgroup v2 unified hierarchy (cgroup.kill / cgroup.events exist);
+//   - the unit configured KillMode=process, or a vmd restart/deploy would
+//     SIGKILL every direct-spawned VM — the exact opposite of the property
+//     this whole design preserves;
+//   - the delegated subtree is usable (setupCgroupTree succeeds, which needs
+//     Delegate=yes to write cgroup.subtree_control).
+//
+// The KillMode check is the load-bearing guard: unlike unit mode, where a
+// misconfiguration is harmless, here it is a fleet-killing time bomb, so we
+// verify it at the source rather than trust the deployed file.
+func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
+	if !m.cfg.DirectSpawn {
+		return false, nil
+	}
+	if _, err := os.Stat(filepath.Join(cgroupMount, "cgroup.controllers")); err != nil {
+		return false, fmt.Errorf("cgroup v2 unified hierarchy required: %w", err)
+	}
+	if km := selfUnitKillMode(ctx); km != "process" {
+		return false, fmt.Errorf("unit KillMode=%q, need \"process\" — direct spawn would die on the next vmd stop", km)
+	}
+	tree, err := setupCgroupTree()
+	if err != nil {
+		return false, fmt.Errorf("prepare delegated subtree (needs Delegate=yes): %w", err)
+	}
+	m.cgroups = tree
+	m.directSpawnArmed.Store(true)
+	return true, nil
+}
+
+// selfUnitKillMode reads this vmd unit's KillMode via D-Bus (falling back to
+// systemctl show), returning "" when it cannot be determined — which the
+// caller treats as not-process, i.e. fail-closed.
+func selfUnitKillMode(ctx context.Context) string {
+	const unit = "superserve-vmd.service"
+	if val, notLoaded, ok := sdbusUnitProperty(ctx, unit, "Service", "KillMode"); ok && !notLoaded {
+		if s, isStr := val.(string); isStr {
+			return s
+		}
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "KillMode", "--value", unit).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // setupCgroupTree prepares the delegated subtree for direct spawn:

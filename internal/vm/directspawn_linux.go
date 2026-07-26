@@ -90,13 +90,12 @@ func spawnDirect(scriptPath string, cgroupDir *os.File, console *os.File) (*exec
 	return cmd, nil
 }
 
-// reapDirect waits for the chain to exit and reports the outcome. Run it in
-// a per-VM goroutine for every spawn: it is what keeps a killed child from
-// lingering as a zombie (kill paths wait on done, never on kill(pid,0)
-// polling — zombies answer those polls). VMs from a previous vmd life have
-// init as their reaper and no exit-code visibility; their liveness is the
-// cgroup, not this.
-func reapDirect(cmd *exec.Cmd, done chan<- directSpawnResult) {
+// waitDirect blocks until the chain exits and reports the outcome. It is
+// what keeps a killed child from lingering as a zombie — kill paths wait for
+// the reaper's completion signal, never on kill(pid,0) polling (zombies
+// answer those polls as alive). VMs from a previous vmd life have init as
+// their reaper and no exit-code visibility; their liveness is the cgroup.
+func waitDirect(cmd *exec.Cmd) directSpawnResult {
 	err := cmd.Wait()
 	res := directSpawnResult{Err: err, At: time.Now(), ExitCode: 0}
 	if err != nil {
@@ -105,5 +104,5 @@ func reapDirect(cmd *exec.Cmd, done chan<- directSpawnResult) {
 			res.ExitCode = ee.ExitCode()
 		}
 	}
-	done <- res
+	return res
 }

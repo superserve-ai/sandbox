@@ -410,9 +410,18 @@ func main() {
 		RequirePresenceSidecar:     requirePresenceSidecar,
 		LaunchViaLauncherNS:        launchViaLauncherNS,
 		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
+		DirectSpawn:                envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
+	}
+	// Direct spawn arms only when the unit's configuration proves the
+	// survival property (Delegate + KillMode=process); a refusal degrades
+	// new launches to the systemd-unit path and the daemon keeps serving.
+	if arms, err := mgr.ArmDirectSpawn(ctx); err != nil {
+		log.Error().Err(err).Msg("direct spawn requested but not armed — launches use the unit path")
+	} else if arms {
+		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
 	}
 
 	// ---- TCP egress proxy ----

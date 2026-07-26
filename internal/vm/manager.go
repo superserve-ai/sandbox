@@ -221,6 +221,15 @@ type ManagerConfig struct {
 	// via `unshare --mount`). Only used when LaunchViaLauncherNS is true.
 	// Empty → defaultLauncherNSPath.
 	LauncherNSPath string
+
+	// DirectSpawn requests the cgroup-supervised launch path for new VMs:
+	// vmd forks Firecracker into a per-VM cgroup instead of starting a
+	// systemd unit, removing PID 1's serial per-unit dispatch from launch.
+	// Arming additionally requires ArmDirectSpawn to succeed (delegated
+	// subtree present, unit configured KillMode=process) — a request
+	// without the preconditions degrades to the unit path with a loud
+	// error, never to a fleet that dies on the next vmd deploy.
+	DirectSpawn bool
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +252,17 @@ type Manager struct {
 	// revalidateLauncher's re-enable so a stale previous-boot pin can't resurrect
 	// the launcher path.
 	launcherBuilt atomic.Bool
+
+	// cgroups is the delegated subtree for direct-spawned VMs; nil until
+	// ArmDirectSpawn succeeds. directSpawnArmed gates NEW launches onto the
+	// cgroup path — existing VMs always follow their record's Supervision
+	// regardless of the flag, so both modes coexist through the migration.
+	cgroups          *cgroupTree
+	directSpawnArmed atomic.Bool
+	// reapers holds the per-VM exit channel for direct-spawned children this
+	// process owns (vmID → chan directSpawnResult, buffered 1). Kill paths
+	// wait on the channel, never on kill(0) polls — zombies answer polls.
+	reapers sync.Map
 
 	// presenceConverged mirrors the on-disk converged marker: every layered
 	// overlay on this host has a presence side-car, so strict enforcement can
