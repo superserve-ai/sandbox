@@ -64,10 +64,6 @@ func ownCgroupPath() (string, error) {
 //   - the delegated subtree is usable (setupCgroupTree succeeds, which needs
 //     Delegate=yes to write cgroup.subtree_control).
 //
-// The KillMode check is the load-bearing guard: unlike unit mode, where a
-// misconfiguration is harmless, here it is a fleet-killing time bomb, so we
-// verify it at the source rather than trust the deployed file.
-//
 // The subtree is set up whenever the flag is on OR this host already owns
 // cgroup-mode VMs — otherwise a flag-off rollback would leave m.cgroups nil
 // while cgroup VMs still run, and their liveness would read inconclusive
