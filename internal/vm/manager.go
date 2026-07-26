@@ -1144,7 +1144,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	tFcStart := time.Now()
-	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
+	inst.mu.RLock()
+	resumeExisting := inst.Supervision
+	inst.mu.RUnlock()
+	pid, resumeSupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, resumeExisting)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
@@ -1196,6 +1199,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 
 	inst.mu.Lock()
 	inst.PID = pid
+	inst.Supervision = resumeSupervision // resume may flip a legacy record to cgroup mode
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
 	inst.DirtyTracked = dirtyTracked
@@ -1335,11 +1339,12 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 		tapDevice = netInfo.TAPDevice
 	}
 
-	// Throwaway Firecracker in the sandbox's existing unit/rundir, stopped on the
+	// Throwaway Firecracker in the sandbox's existing rundir, stopped on the
 	// way out. Safe because the VM is paused (no live FC to disrupt), but it must
 	// not run concurrently with a resume of the same sandbox — fine for the
-	// debug/staging use this endpoint is gated to.
-	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
+	// debug/staging use this endpoint is gated to. Launch in the sandbox's
+	// recorded mode so the deferred stop above matches.
+	if _, _, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, inst.Supervision); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
 	defer func() {
@@ -1788,7 +1793,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Unlock()
 
 		var startErr error
-		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
+		var supervision string
+		inst.mu.RLock()
+		existingSupervision := inst.Supervision
+		inst.mu.RUnlock()
+		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision)
 		if startErr != nil {
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
@@ -1797,8 +1806,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
+		// Stamp the chosen mode before any persist so stop/liveness/reattach
+		// dispatch correctly for this run.
 		inst.mu.Lock()
 		inst.PID = pid
+		inst.Supervision = supervision
 		inst.mu.Unlock()
 		tFcReady := time.Now()
 

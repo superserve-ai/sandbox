@@ -30,6 +30,22 @@ func (m *Manager) cgroupLaunch(existing string) bool {
 	return m.directSpawnArmed.Load()
 }
 
+// launchFirecracker starts a VM by the mode chosen from its existing
+// supervision and the armed flag, and returns the mode actually used so the
+// caller can stamp it on the instance BEFORE persisting — a resume that
+// flips a legacy record to cgroup mode must record the new mode, or every
+// oracle would then check the wrong source. A record already in cgroup mode
+// always relaunches cgroup mode regardless of the flag (so a flag-off
+// rollback drains rather than converts).
+func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string) (pid int, supervision string, err error) {
+	if m.cgroupLaunch(existing) {
+		pid, err = m.startFirecrackerDirect(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
+		return pid, SupervisionCgroup, err
+	}
+	pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
+	return pid, SupervisionUnit, err
+}
+
 // stopVM terminates a VM by its supervision mode. cgroup mode: kill the
 // group and wait it empty, then rmdir; unit mode: the existing systemd stop.
 // Idempotent — a missing group or unit is a no-op.
