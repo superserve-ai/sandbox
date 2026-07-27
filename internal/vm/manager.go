@@ -1821,6 +1821,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		existingSupervision := inst.Supervision
 		inst.mu.RUnlock()
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace)
+		// Stamp the chosen mode NOW, before the error branch: a launch that
+		// forked a cgroup FC but failed socket-readiness (and whose own kill
+		// couldn't confirm the group empty) leaves a live process. The record
+		// must say cgroup so a later destroy dispatches the cgroup kill/rmdir
+		// instead of a no-op unit stop.
+		inst.mu.Lock()
+		inst.Supervision = supervision
+		inst.mu.Unlock()
 		if startErr != nil {
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
@@ -1829,8 +1837,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
-		// Stamp the chosen mode before any persist so stop/liveness/reattach
-		// dispatch correctly for this run.
 		inst.mu.Lock()
 		inst.PID = pid
 		inst.Supervision = supervision
