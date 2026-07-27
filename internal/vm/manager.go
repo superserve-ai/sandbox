@@ -2460,9 +2460,11 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) []string {
 	}
 	var protected []string
 	for _, id := range cgIDs {
-		if isBuildVM(id) {
-			continue
-		}
+		// Build VMs ARE reaped here: pre-gate every cgroup is a previous-life
+		// survivor, and a build's cgroup is recordless (persistState omits build
+		// IDs), so nothing else would ever kill it. The build-VM skip belongs
+		// only in the reconciler, which runs post-gate where a build may be
+		// in-flight.
 		if has, herr := m.state.Has(id); herr != nil || has {
 			continue // recorded (reattach owns it) or unreadable (conservative)
 		}
