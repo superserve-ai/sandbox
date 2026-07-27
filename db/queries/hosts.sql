@@ -88,11 +88,15 @@ LEFT JOIN sandbox s ON s.host_id = h.id
   AND s.status IN ('active', 'starting')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
-  AND EXISTS (
-    SELECT 1 FROM host_capability hc
-    WHERE hc.host_id = h.id
-      AND hc.capability = 'preview_ports_v1'
-      AND hc.heartbeat_at = h.last_heartbeat_at
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
   )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC;

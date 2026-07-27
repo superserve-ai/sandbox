@@ -16,27 +16,51 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 func validatePreviewAccess(value *string) error {
-	if value == nil || *value == preview.AccessPublic {
+	if value == nil || *value == preview.AccessPublic || *value == preview.AccessPrivate {
 		return nil
 	}
-	return fmt.Errorf("preview_access must be %q", preview.AccessPublic)
+	return fmt.Errorf("preview_access must be %q or %q", preview.AccessPublic, preview.AccessPrivate)
 }
 
-func (h *Handlers) loadPreviewPorts(ctx context.Context, sandboxID uuid.UUID) (map[int32]struct{}, error) {
+func validatePreviewPortAccess(value *string) error {
+	if value == nil || *value == preview.AccessPublic || *value == preview.AccessPrivate {
+		return nil
+	}
+	return fmt.Errorf("access must be %q or %q", preview.AccessPublic, preview.AccessPrivate)
+}
+
+func (h *Handlers) loadPreviewPorts(ctx context.Context, sandboxID uuid.UUID) (map[int32]vmdclient.PortPolicy, error) {
 	rows, err := h.DB.ListPublishedPorts(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}
-	return publishedPortSet(rows), nil
+	return publishedPortPolicies(rows), nil
 }
 
 type previewPolicySnapshot struct {
-	Access   string
-	Revision int64
-	Ports    map[int32]struct{}
+	Access     string
+	WireAccess string
+	Revision   int64
+	Ports      map[int32]vmdclient.PortPolicy
+}
+
+// vmdAccess is deliberately more restrictive than the DB default for a mixed
+// policy. Phase 1 readers ignore per-port access, so persisting public beside a
+// private bool-map entry would reopen that port after rollback.
+func (p previewPolicySnapshot) vmdAccess() string {
+	accesses := make([]string, 0, len(p.Ports))
+	for _, policy := range p.Ports {
+		accesses = append(accesses, policy.Access)
+	}
+	base := p.WireAccess
+	if base == "" {
+		base = p.Access
+	}
+	return preview.RestrictiveFallback(base, accesses...)
 }
 
 func (h *Handlers) loadPreviewPolicy(ctx context.Context, sandboxID, teamID uuid.UUID) (previewPolicySnapshot, error) {
@@ -44,7 +68,7 @@ func (h *Handlers) loadPreviewPolicy(ctx context.Context, sandboxID, teamID uuid
 	if err != nil {
 		return previewPolicySnapshot{}, err
 	}
-	return previewPolicySnapshot{Access: row.Access, Revision: row.Revision}, nil
+	return previewPolicySnapshot{Access: row.Access, WireAccess: row.WireAccess, Revision: row.Revision}, nil
 }
 
 func (h *Handlers) loadPreviewPolicySnapshot(ctx context.Context, sandboxID, teamID uuid.UUID) (previewPolicySnapshot, error) {
@@ -56,13 +80,13 @@ func (h *Handlers) loadPreviewPolicySnapshot(ctx context.Context, sandboxID, tea
 	return policy, err
 }
 
-func publishedPortSet(ports []int32) map[int32]struct{} {
+func publishedPortPolicies(ports []db.ListPublishedPortsRow) map[int32]vmdclient.PortPolicy {
 	if len(ports) == 0 {
 		return nil
 	}
-	out := make(map[int32]struct{}, len(ports))
+	out := make(map[int32]vmdclient.PortPolicy, len(ports))
 	for _, port := range ports {
-		out[port] = struct{}{}
+		out[port.Port] = vmdclient.PortPolicy{Access: port.Access}
 	}
 	return out
 }
@@ -95,7 +119,10 @@ func (h *Handlers) applyPreviewMutation(ctx context.Context, sandboxID, teamID u
 		if err != nil {
 			return previewPolicySnapshot{}, err
 		}
-		return previewPolicySnapshot{Access: policy.Access, Revision: policy.Revision, Ports: publishedPortSet(ports)}, nil
+		return previewPolicySnapshot{
+			Access: policy.Access, WireAccess: policy.WireAccess,
+			Revision: policy.Revision, Ports: publishedPortPolicies(ports),
+		}, nil
 	}
 
 	if h.Pool == nil {
@@ -123,29 +150,39 @@ func (h *Handlers) pushPreviewPolicy(ctx context.Context, sandbox db.Sandbox, po
 	}
 	vmdCtx, cancel := context.WithTimeout(ctx, vmdTimeout)
 	defer cancel()
-	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), policy.Access, policy.Ports, policy.Revision)
+	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), policy.vmdAccess(), policy.Ports, policy.Revision)
 	if status.Code(err) == codes.NotFound {
 		return nil
 	}
 	return err
 }
 
-func (h *Handlers) requireHostPreviewPorts(c *gin.Context, hostID string) bool {
-	hasCapability, err := h.DB.HostHasCapability(c.Request.Context(), db.HostHasCapabilityParams{
-		HostID: hostID, Capability: preview.HostCapabilityPorts,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Msg("DB HostHasCapability failed")
-		respondError(c, ErrInternal)
-		return false
-	}
-	if !hasCapability {
-		respondErrorMsg(c, "conflict",
-			fmt.Sprintf("The sandbox's host does not enforce %q; retry after the fleet is upgraded", preview.HostCapabilityPorts),
-			http.StatusConflict)
-		return false
+func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
+	for _, capability := range capabilities {
+		hasCapability, err := h.DB.HostHasCapability(c.Request.Context(), db.HostHasCapabilityParams{
+			HostID: hostID, Capability: capability,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("host_id", hostID).Str("capability", capability).Msg("DB HostHasCapability failed")
+			respondError(c, ErrInternal)
+			return false
+		}
+		if !hasCapability {
+			respondErrorMsg(c, "conflict",
+				fmt.Sprintf("The sandbox's host does not enforce %q; retry after the fleet is upgraded", capability),
+				http.StatusConflict)
+			return false
+		}
 	}
 	return true
+}
+
+func (h *Handlers) requireHostPreviewPorts(c *gin.Context, hostID string) bool {
+	return h.requireHostPreviewCapabilities(c, hostID, preview.HostCapabilityPorts)
+}
+
+func (h *Handlers) requireHostPreviewPortAccess(c *gin.Context, hostID string) bool {
+	return h.requireHostPreviewCapabilities(c, hostID, preview.HostCapabilityPorts, preview.HostCapabilityPortAccess)
 }
 
 func parsePreviewPort(c *gin.Context) (int32, bool) {
@@ -163,7 +200,8 @@ func parsePreviewPort(c *gin.Context) (int32, bool) {
 }
 
 type publishedPortResponse struct {
-	Port int32 `json:"port"`
+	Port   int32  `json:"port"`
+	Access string `json:"access"`
 }
 
 type listPreviewPortsResponse struct {
@@ -201,13 +239,14 @@ func (h *Handlers) ListSandboxPreviewPorts(c *gin.Context) {
 	}
 	ports := make([]publishedPortResponse, 0, len(rows))
 	for _, port := range rows {
-		ports = append(ports, publishedPortResponse{Port: port})
+		ports = append(ports, publishedPortResponse{Port: port.Port, Access: port.Access})
 	}
 	c.JSON(http.StatusOK, listPreviewPortsResponse{PreviewAccess: policy.Access, Ports: ports})
 }
 
 type publishPortRequest struct {
-	Port int32 `json:"port"`
+	Port   int32   `json:"port"`
+	Access *string `json:"access,omitempty"`
 }
 
 func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
@@ -231,25 +270,48 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validatePreviewPortAccess(body.Access); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 	sandbox, ok := h.getTeamSandbox(c, sandboxID, teamID)
-	if !ok || !h.requireHostPreviewPorts(c, sandbox.HostID) {
+	if !ok {
+		return
+	}
+	if body.Access != nil && *body.Access == preview.AccessPrivate {
+		current, err := h.loadPreviewPolicy(c.Request.Context(), sandboxID, teamID)
+		if err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("load preview policy before private publication failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if current.Access == preview.AccessLegacyPublic {
+			respondErrorMsg(c, "conflict", "legacy_public routes every port; PATCH preview_access to public or private before publishing a private port", http.StatusConflict)
+			return
+		}
+	}
+	if !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
 		return
 	}
 
-	var port int32
+	var published db.PublishPortRow
 	policy, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
 		var mutationErr error
-		port, mutationErr = q.PublishPort(c.Request.Context(), db.PublishPortParams{SandboxID: sandboxID, Port: body.Port})
+		published, mutationErr = q.PublishPort(c.Request.Context(), db.PublishPortParams{
+			SandboxID: sandboxID,
+			Port:      body.Port,
+			Access:    body.Access,
+		})
 		return mutationErr
 	})
 	if !h.handlePreviewMutationResult(c, sandboxID, "PublishPort", err) || !h.pushAfterPreviewMutation(c, sandbox, policy) {
 		return
 	}
 
-	detail, _ := json.Marshal(map[string]any{"port": body.Port})
+	detail, _ := json.Marshal(map[string]any{"port": body.Port, "access": published.Access})
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_port_published", "success", &sandbox.Name, nil, detail)
 	h.capture(c, "sandbox_preview_port_published", map[string]any{"sandbox_id": sandboxID.String(), "port": body.Port})
-	c.JSON(http.StatusOK, publishedPortResponse{Port: port})
+	c.JSON(http.StatusOK, publishedPortResponse{Port: published.Port, Access: published.Access})
 }
 
 // Unpublish is idempotent and retry-safe. Even when the row is already absent,

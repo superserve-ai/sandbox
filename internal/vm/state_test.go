@@ -13,29 +13,35 @@ import (
 
 func TestPreviewPolicyRecordRoundTrip(t *testing.T) {
 	inst := &VMInstance{
-		ID:                    "vm-preview",
-		PreviewAccess:         preview.AccessPublic,
-		PreviewPorts:          map[int32]struct{}{3000: {}, 8080: {}},
+		ID:            "vm-preview",
+		PreviewAccess: preview.AccessPublic,
+		PreviewPorts: map[int32]PreviewPortPolicy{
+			3000: {Access: preview.AccessPublic},
+			8080: {Access: preview.AccessPrivate},
+		},
 		PreviewPolicyRevision: 7,
 	}
 
 	rec := toRecord(inst)
-	if rec.PreviewAccess != preview.AccessPublic || rec.PreviewPolicyRevision != 7 {
-		t.Fatalf("record policy = (%q, %d), want (%q, 7)", rec.PreviewAccess, rec.PreviewPolicyRevision, preview.AccessPublic)
+	if rec.PreviewAccess != preview.AccessPrivate || rec.PreviewPolicyRevision != 7 {
+		t.Fatalf("record policy = (%q, %d), want restrictive fallback (%q, 7)", rec.PreviewAccess, rec.PreviewPolicyRevision, preview.AccessPrivate)
 	}
 	if !rec.PreviewPorts[3000] || !rec.PreviewPorts[8080] {
 		t.Fatalf("record ports = %#v, want 3000 and 8080", rec.PreviewPorts)
 	}
+	if rec.PreviewPortAccess[3000] != preview.AccessPublic || rec.PreviewPortAccess[8080] != preview.AccessPrivate {
+		t.Fatalf("record port access = %#v, want public/private", rec.PreviewPortAccess)
+	}
 
 	restored := toInstance(rec)
-	if restored.PreviewAccess != preview.AccessPublic || restored.PreviewPolicyRevision != 7 {
-		t.Fatalf("restored policy = (%q, %d), want (%q, 7)", restored.PreviewAccess, restored.PreviewPolicyRevision, preview.AccessPublic)
+	if restored.PreviewAccess != preview.AccessPrivate || restored.PreviewPolicyRevision != 7 {
+		t.Fatalf("restored policy = (%q, %d), want (%q, 7)", restored.PreviewAccess, restored.PreviewPolicyRevision, preview.AccessPrivate)
 	}
-	if _, ok := restored.PreviewPorts[3000]; !ok {
-		t.Fatalf("restored ports = %#v, want 3000", restored.PreviewPorts)
+	if got := restored.PreviewPorts[3000].Access; got != preview.AccessPublic {
+		t.Fatalf("restored port 3000 access = %q, want public", got)
 	}
-	if _, ok := restored.PreviewPorts[8080]; !ok {
-		t.Fatalf("restored ports = %#v, want 8080", restored.PreviewPorts)
+	if got := restored.PreviewPorts[8080].Access; got != preview.AccessPrivate {
+		t.Fatalf("restored port 8080 access = %q, want private", got)
 	}
 
 	// Conversion must not alias either mutable map. A later policy update in
@@ -43,6 +49,10 @@ func TestPreviewPolicyRecordRoundTrip(t *testing.T) {
 	delete(restored.PreviewPorts, 3000)
 	if !rec.PreviewPorts[3000] {
 		t.Fatal("restored preview ports alias the persisted record")
+	}
+	delete(rec.PreviewPortAccess, 8080)
+	if got := inst.PreviewPorts[8080].Access; got != preview.AccessPrivate {
+		t.Fatal("persisted port access aliases the in-memory policy")
 	}
 }
 
@@ -58,16 +68,56 @@ func TestLegacyVMRecordRetainsAllPortCompatibility(t *testing.T) {
 	}
 }
 
+func TestStateStorePrimaryRecordUsesRestrictiveRollbackFallback(t *testing.T) {
+	s, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	rec := VMRecord{
+		ID:            "vm-phase1-rollback",
+		PreviewAccess: preview.AccessLegacyPublic,
+		PreviewPorts:  map[int32]bool{3000: true, 8080: true},
+		PreviewPortAccess: map[int32]string{
+			3000: preview.AccessPublic,
+			8080: preview.AccessPrivate,
+		},
+		PreviewPolicyRevision: 9,
+	}
+	if err := s.Put(rec); err != nil {
+		t.Fatalf("Put mixed policy: %v", err)
+	}
+
+	// Decode only the fields understood by the Phase 1 binary. It ignores the
+	// additive parallel access map, so the top-level fallback is what prevents
+	// its bool-only reader from routing the private port after rollback.
+	var phaseOne struct {
+		PreviewAccess         string         `json:"preview_access"`
+		PreviewPorts          map[int32]bool `json:"preview_ports"`
+		PreviewPolicyRevision int64          `json:"preview_policy_revision"`
+	}
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return json.Unmarshal(tx.Bucket(bucketName).Get([]byte(rec.ID)), &phaseOne)
+	}); err != nil {
+		t.Fatalf("decode Phase 1 primary record: %v", err)
+	}
+	if phaseOne.PreviewAccess != preview.AccessPrivate || !phaseOne.PreviewPorts[3000] ||
+		!phaseOne.PreviewPorts[8080] || phaseOne.PreviewPolicyRevision != 9 {
+		t.Fatalf("Phase 1 record = %+v, want private fallback and both bool ports at revision 9", phaseOne)
+	}
+}
+
 func TestUpdateSandboxPreviewPolicyRejectsStaleRevision(t *testing.T) {
 	inst := &VMInstance{
 		ID:                    "vm-preview",
 		PreviewAccess:         preview.AccessPublic,
-		PreviewPorts:          map[int32]struct{}{3000: {}},
+		PreviewPorts:          map[int32]PreviewPortPolicy{3000: {}},
 		PreviewPolicyRevision: 2,
 	}
 	mgr := &Manager{vms: map[string]*VMInstance{inst.ID: inst}}
 
-	if err := mgr.UpdateSandboxPreviewPolicy(inst.ID, preview.AccessPublic, map[int32]struct{}{4000: {}}, 1); err != nil {
+	if err := mgr.UpdateSandboxPreviewPolicy(inst.ID, preview.AccessPublic, map[int32]PreviewPortPolicy{4000: {}}, 1); err != nil {
 		t.Fatalf("stale update: %v", err)
 	}
 	if _, ok := inst.PreviewPorts[3000]; !ok {
@@ -77,7 +127,7 @@ func TestUpdateSandboxPreviewPolicyRejectsStaleRevision(t *testing.T) {
 		t.Fatalf("stale revision opened port 4000: %#v", inst.PreviewPorts)
 	}
 
-	incoming := map[int32]struct{}{5000: {}}
+	incoming := map[int32]PreviewPortPolicy{5000: {}}
 	if err := mgr.UpdateSandboxPreviewPolicy(inst.ID, preview.AccessPublic, incoming, 3); err != nil {
 		t.Fatalf("new update: %v", err)
 	}
@@ -98,8 +148,8 @@ func TestUpdateSandboxPreviewPolicyEqualRevisionIsIdempotent(t *testing.T) {
 		name           string
 		storedAccess   string
 		incomingAccess string
-		storedPorts    map[int32]struct{}
-		incomingPorts  map[int32]struct{}
+		storedPorts    map[int32]PreviewPortPolicy
+		incomingPorts  map[int32]PreviewPortPolicy
 	}{
 		{
 			name:           "create revision zero attestation",
@@ -115,8 +165,14 @@ func TestUpdateSandboxPreviewPolicyEqualRevisionIsIdempotent(t *testing.T) {
 			name:           "full port set matches independent map",
 			storedAccess:   preview.AccessPublic,
 			incomingAccess: preview.AccessPublic,
-			storedPorts:    map[int32]struct{}{3000: {}, 8080: {}},
-			incomingPorts:  map[int32]struct{}{8080: {}, 3000: {}},
+			storedPorts: map[int32]PreviewPortPolicy{
+				3000: {Access: preview.AccessPublic},
+				8080: {Access: preview.AccessPrivate},
+			},
+			incomingPorts: map[int32]PreviewPortPolicy{
+				8080: {Access: preview.AccessPrivate},
+				3000: {Access: preview.AccessPublic},
+			},
 		},
 	}
 
@@ -145,8 +201,8 @@ func TestUpdateSandboxPreviewPolicyEqualRevisionMismatchFailsClosed(t *testing.T
 		name           string
 		storedAccess   string
 		incomingAccess string
-		storedPorts    map[int32]struct{}
-		incomingPorts  map[int32]struct{}
+		storedPorts    map[int32]PreviewPortPolicy
+		incomingPorts  map[int32]PreviewPortPolicy
 	}{
 		{
 			name:           "create revision zero cannot attest legacy instance",
@@ -157,8 +213,15 @@ func TestUpdateSandboxPreviewPolicyEqualRevisionMismatchFailsClosed(t *testing.T
 			name:           "different full port set",
 			storedAccess:   preview.AccessPublic,
 			incomingAccess: preview.AccessPublic,
-			storedPorts:    map[int32]struct{}{3000: {}},
-			incomingPorts:  map[int32]struct{}{8080: {}},
+			storedPorts:    map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPublic}},
+			incomingPorts:  map[int32]PreviewPortPolicy{8080: {Access: preview.AccessPublic}},
+		},
+		{
+			name:           "same port key with different access",
+			storedAccess:   preview.AccessPublic,
+			incomingAccess: preview.AccessPublic,
+			storedPorts:    map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPublic}},
+			incomingPorts:  map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivate}},
 		},
 	}
 
@@ -195,7 +258,7 @@ func TestUpdateSandboxPreviewPolicyPersistenceFailureLeavesRevisionRetryable(t *
 	inst := &VMInstance{
 		ID:                    "vm-preview",
 		PreviewAccess:         preview.AccessPublic,
-		PreviewPorts:          map[int32]struct{}{3000: {}},
+		PreviewPorts:          map[int32]PreviewPortPolicy{3000: {}},
 		PreviewPolicyRevision: 4,
 	}
 	mgr := &Manager{
@@ -203,7 +266,7 @@ func TestUpdateSandboxPreviewPolicyPersistenceFailureLeavesRevisionRetryable(t *
 		state: store,
 	}
 
-	err = mgr.UpdateSandboxPreviewPolicy(inst.ID, preview.AccessPublic, map[int32]struct{}{8080: {}}, 5)
+	err = mgr.UpdateSandboxPreviewPolicy(inst.ID, preview.AccessPublic, map[int32]PreviewPortPolicy{8080: {}}, 5)
 	if err == nil {
 		t.Fatal("update succeeded with a closed state store")
 	}
@@ -406,11 +469,15 @@ func TestStateStoreRecoversPolicyAfterOldWriterOverwritesPrimaryRecord(t *testin
 		t.Fatalf("open: %v", err)
 	}
 	policy := VMRecord{
-		ID:                    "vm-old-writer",
-		PID:                   70,
-		Status:                StatusRunning,
-		PreviewAccess:         preview.AccessPublic,
-		PreviewPorts:          map[int32]bool{3000: true, 8080: true},
+		ID:            "vm-old-writer",
+		PID:           70,
+		Status:        StatusRunning,
+		PreviewAccess: preview.AccessPrivate,
+		PreviewPorts:  map[int32]bool{3000: true, 8080: true},
+		PreviewPortAccess: map[int32]string{
+			3000: preview.AccessPublic,
+			8080: preview.AccessPrivate,
+		},
 		PreviewPolicyRevision: 15,
 	}
 	if err := s.Put(policy); err != nil {
@@ -569,6 +636,7 @@ func TestStateStorePutPreservesUnknownPreviewPolicyFields(t *testing.T) {
 		ID:                    "vm-future-sidecar-fields",
 		PreviewAccess:         preview.AccessPublic,
 		PreviewPorts:          map[int32]bool{3000: true},
+		PreviewPortAccess:     map[int32]string{3000: preview.AccessPrivate},
 		PreviewPolicyRevision: 7,
 	}
 	if err := s.Put(rec); err != nil {
@@ -581,8 +649,9 @@ func TestStateStorePutPreservesUnknownPreviewPolicyFields(t *testing.T) {
 		t.Fatalf("seed future sidecar fields: %v", err)
 	}
 
-	// Advance a known Phase 1 field so Put must rewrite, rather than simply
-	// retaining, the sidecar value.
+	// Advance a known field so Put must rewrite, rather than simply retaining,
+	// the sidecar value. port_access is now known; token_generations simulates a
+	// later VMD field that this binary must preserve byte-for-byte.
 	rec.PID = 99
 	rec.PreviewPolicyRevision = 8
 	if err := s.Put(rec); err != nil {
@@ -595,7 +664,7 @@ func TestStateStorePutPreservesUnknownPreviewPolicyFields(t *testing.T) {
 		t.Fatalf("unmarshal rewritten sidecar: %v", err)
 	}
 	if string(fields["port_access"]) != `{"3000":"private"}` {
-		t.Fatalf("port_access = %s, want preserved future field", fields["port_access"])
+		t.Fatalf("port_access = %s, want rewritten known field", fields["port_access"])
 	}
 	if string(fields["token_generations"]) != `{"3000":4}` {
 		t.Fatalf("token_generations = %s, want preserved future field", fields["token_generations"])
@@ -680,6 +749,14 @@ func assertLifecycleAppliedWithPreviewPolicyPreserved(t *testing.T, got *VMRecor
 	for port, published := range policy.PreviewPorts {
 		if got.PreviewPorts[port] != published {
 			t.Fatalf("preview ports = %#v, want %#v", got.PreviewPorts, policy.PreviewPorts)
+		}
+	}
+	if len(got.PreviewPortAccess) != len(policy.PreviewPortAccess) {
+		t.Fatalf("preview port access = %#v, want %#v", got.PreviewPortAccess, policy.PreviewPortAccess)
+	}
+	for port, access := range policy.PreviewPortAccess {
+		if got.PreviewPortAccess[port] != access {
+			t.Fatalf("preview port access = %#v, want %#v", got.PreviewPortAccess, policy.PreviewPortAccess)
 		}
 	}
 }

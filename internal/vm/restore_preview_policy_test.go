@@ -55,12 +55,12 @@ func TestPreviewPolicyForRestoreUsesHighestRevision(t *testing.T) {
 		state: store,
 		vms: map[string]*VMInstance{vmID: {
 			ID: vmID, PreviewAccess: preview.AccessPublic,
-			PreviewPorts: map[int32]struct{}{4000: {}}, PreviewPolicyRevision: 6,
+			PreviewPorts: map[int32]PreviewPortPolicy{4000: {}}, PreviewPolicyRevision: 6,
 		}},
 	}
 
 	access, ports, revision, err := mgr.previewPolicyForRestore(
-		vmID, preview.AccessPublic, map[int32]struct{}{5000: {}}, 5,
+		vmID, preview.AccessPublic, map[int32]PreviewPortPolicy{5000: {}}, 5,
 	)
 	if err != nil {
 		t.Fatalf("memory ordering: %v", err)
@@ -74,7 +74,7 @@ func TestPreviewPolicyForRestoreUsesHighestRevision(t *testing.T) {
 
 	delete(mgr.vms, vmID)
 	access, ports, revision, err = mgr.previewPolicyForRestore(
-		vmID, preview.AccessPublic, map[int32]struct{}{5000: {}}, 5,
+		vmID, preview.AccessPublic, map[int32]PreviewPortPolicy{5000: {}}, 5,
 	)
 	if err != nil {
 		t.Fatalf("wire ordering: %v", err)

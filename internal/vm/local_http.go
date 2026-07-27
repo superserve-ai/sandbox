@@ -91,13 +91,14 @@ func (s *LocalHTTPServer) Shutdown(ctx context.Context) error {
 
 // instanceResponse is the JSON shape returned by GET /instances/{id}.
 type instanceResponse struct {
-	VMIP          string          `json:"vm_ip"`
-	Status        string          `json:"status"`
-	StartedAt     int64           `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
-	TeamID        string          `json:"team_id,omitempty"`
-	OwnerID       string          `json:"owner_id,omitempty"`
-	PreviewAccess string          `json:"preview_access,omitempty"`
-	PreviewPorts  map[string]bool `json:"preview_ports,omitempty"`
+	VMIP              string            `json:"vm_ip"`
+	Status            string            `json:"status"`
+	StartedAt         int64             `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
+	TeamID            string            `json:"team_id,omitempty"`
+	OwnerID           string            `json:"owner_id,omitempty"`
+	PreviewAccess     string            `json:"preview_access,omitempty"`
+	PreviewPorts      map[string]bool   `json:"preview_ports,omitempty"`
+	PreviewPortAccess map[string]string `json:"preview_port_access,omitempty"`
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -125,6 +126,12 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "instance not found", http.StatusNotFound)
 		return
 	}
+	if previewPolicyNeedsPortAccess(info) && !headerHasCapability(r.Header.Get(preview.ProxyCapabilitiesHeader), preview.HostCapabilityPortAccess) {
+		// A Phase 1 proxy ignores the parallel access map. Withhold policies whose
+		// explicit-public exceptions require a Phase 2 proxy to interpret safely.
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
 
 	// This response attestation lets a new proxy distinguish an explicitly
 	// legacy sandbox served by a capable VMD from a response emitted by a VMD
@@ -132,13 +139,14 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 	w.Header().Set(preview.VMDProtocolHeader, preview.HostCapabilityPorts)
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(instanceResponse{
-		VMIP:          info.VMIP,
-		Status:        info.Status.String(),
-		StartedAt:     info.CreatedAt.UnixNano(),
-		TeamID:        info.TeamID,
-		OwnerID:       info.OwnerID,
-		PreviewAccess: info.PreviewAccess,
-		PreviewPorts:  previewPortsToJSON(info.PreviewPorts),
+		VMIP:              info.VMIP,
+		Status:            info.Status.String(),
+		StartedAt:         info.CreatedAt.UnixNano(),
+		TeamID:            info.TeamID,
+		OwnerID:           info.OwnerID,
+		PreviewAccess:     info.PreviewAccess,
+		PreviewPorts:      previewPortsToJSON(info.PreviewPorts),
+		PreviewPortAccess: previewPortAccessToJSON(info.PreviewPorts),
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
 	}
@@ -181,7 +189,7 @@ func (s *LocalHTTPServer) handleVerifySnapshot(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func previewPortsToJSON(in map[int32]struct{}) map[string]bool {
+func previewPortsToJSON(in map[int32]PreviewPortPolicy) map[string]bool {
 	if len(in) == 0 {
 		return nil
 	}
@@ -190,6 +198,41 @@ func previewPortsToJSON(in map[int32]struct{}) map[string]bool {
 		out[strconv.Itoa(int(port))] = true
 	}
 	return out
+}
+
+func previewPortAccessToJSON(in map[int32]PreviewPortPolicy) map[string]string {
+	out := make(map[string]string, len(in))
+	for port, policy := range in {
+		if policy.Access != "" {
+			out[strconv.Itoa(int(port))] = policy.Access
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func previewPolicyNeedsPortAccess(info InstanceInfo) bool {
+	if info.PreviewAccess == preview.AccessPrivate ||
+		(info.PreviewAccess != "" && info.PreviewAccess != preview.AccessLegacyPublic && info.PreviewAccess != preview.AccessPublic) {
+		return true
+	}
+	for _, policy := range info.PreviewPorts {
+		if policy.Access != "" && policy.Access != preview.AccessPublic {
+			return true
+		}
+	}
+	return false
+}
+
+func headerHasCapability(value, capability string) bool {
+	for _, item := range strings.Split(value, ",") {
+		if strings.TrimSpace(item) == capability {
+			return true
+		}
+	}
+	return false
 }
 
 // splitHostPort extracts the port from a host:port string.

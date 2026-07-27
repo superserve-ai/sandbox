@@ -83,12 +83,13 @@ const advanceSandboxPreviewPolicy = `-- name: AdvanceSandboxPreviewPolicy :one
 UPDATE sandbox_preview_policy
 SET revision = revision + 1, updated_at = now()
 WHERE sandbox_id = $1
-RETURNING access, revision
+RETURNING default_access AS access, access AS wire_access, revision
 `
 
 type AdvanceSandboxPreviewPolicyRow struct {
-	Access   string `json:"access"`
-	Revision int64  `json:"revision"`
+	Access     string `json:"access"`
+	WireAccess string `json:"wire_access"`
+	Revision   int64  `json:"revision"`
 }
 
 // Call after the mutation while holding LockSandboxForPreviewMutation. The
@@ -97,7 +98,7 @@ type AdvanceSandboxPreviewPolicyRow struct {
 func (q *Queries) AdvanceSandboxPreviewPolicy(ctx context.Context, sandboxID uuid.UUID) (AdvanceSandboxPreviewPolicyRow, error) {
 	row := q.db.QueryRow(ctx, advanceSandboxPreviewPolicy, sandboxID)
 	var i AdvanceSandboxPreviewPolicyRow
-	err := row.Scan(&i.Access, &i.Revision)
+	err := row.Scan(&i.Access, &i.WireAccess, &i.Revision)
 	return i, err
 }
 
@@ -1256,7 +1257,8 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 
 const getSandboxPreviewPolicy = `-- name: GetSandboxPreviewPolicy :one
 SELECT
-  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+  COALESCE(p.access, 'legacy_public')::text AS wire_access,
   COALESCE(p.revision, 0)::bigint AS revision
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -1269,8 +1271,9 @@ type GetSandboxPreviewPolicyParams struct {
 }
 
 type GetSandboxPreviewPolicyRow struct {
-	Access   string `json:"access"`
-	Revision int64  `json:"revision"`
+	Access     string `json:"access"`
+	WireAccess string `json:"wire_access"`
+	Revision   int64  `json:"revision"`
 }
 
 // An absent side-table row is the rolling-deploy-safe representation of a
@@ -1278,7 +1281,7 @@ type GetSandboxPreviewPolicyRow struct {
 func (q *Queries) GetSandboxPreviewPolicy(ctx context.Context, arg GetSandboxPreviewPolicyParams) (GetSandboxPreviewPolicyRow, error) {
 	row := q.db.QueryRow(ctx, getSandboxPreviewPolicy, arg.ID, arg.TeamID)
 	var i GetSandboxPreviewPolicyRow
-	err := row.Scan(&i.Access, &i.Revision)
+	err := row.Scan(&i.Access, &i.WireAccess, &i.Revision)
 	return i, err
 }
 
@@ -1310,24 +1313,29 @@ func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 }
 
 const listPublishedPorts = `-- name: ListPublishedPorts :many
-SELECT port FROM sandbox_published_port
+SELECT port, access FROM sandbox_published_port
 WHERE sandbox_id = $1
 ORDER BY port
 `
 
-func (q *Queries) ListPublishedPorts(ctx context.Context, sandboxID uuid.UUID) ([]int32, error) {
+type ListPublishedPortsRow struct {
+	Port   int32  `json:"port"`
+	Access string `json:"access"`
+}
+
+func (q *Queries) ListPublishedPorts(ctx context.Context, sandboxID uuid.UUID) ([]ListPublishedPortsRow, error) {
 	rows, err := q.db.Query(ctx, listPublishedPorts, sandboxID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []int32{}
+	items := []ListPublishedPortsRow{}
 	for rows.Next() {
-		var port int32
-		if err := rows.Scan(&port); err != nil {
+		var i ListPublishedPortsRow
+		if err := rows.Scan(&i.Port, &i.Access); err != nil {
 			return nil, err
 		}
-		items = append(items, port)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1374,7 +1382,7 @@ func (q *Queries) ListRecentlyDestroyedSandboxIDsByHost(ctx context.Context, arg
 const listSandboxPreviewPoliciesByTeam = `-- name: ListSandboxPreviewPoliciesByTeam :many
 SELECT
   s.id AS sandbox_id,
-  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
   COALESCE(p.revision, 0)::bigint AS revision
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -1648,23 +1656,40 @@ func (q *Queries) MarkSandboxFailedInTeam(ctx context.Context, arg MarkSandboxFa
 }
 
 const publishPort = `-- name: PublishPort :one
-INSERT INTO sandbox_published_port (sandbox_id, port)
-VALUES ($1, $2)
-ON CONFLICT (sandbox_id, port) DO UPDATE SET updated_at = now()
-RETURNING port
+INSERT INTO sandbox_published_port (sandbox_id, port, access)
+SELECT $1, $2,
+       COALESCE(
+           $3::text,
+           CASE WHEN p.default_access = 'private' THEN 'private' ELSE 'public' END
+       )
+FROM sandbox_preview_policy p
+WHERE p.sandbox_id = $1
+ON CONFLICT (sandbox_id, port) DO UPDATE
+SET access = COALESCE($3::text, sandbox_published_port.access),
+    updated_at = now()
+RETURNING port, access
 `
 
 type PublishPortParams struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	Port      int32     `json:"port"`
+	Access    *string   `json:"access"`
 }
 
-// Idempotent: re-publishing keeps the same resource and refreshes updated_at.
-func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (int32, error) {
-	row := q.db.QueryRow(ctx, publishPort, arg.SandboxID, arg.Port)
-	var port int32
-	err := row.Scan(&port)
-	return port, err
+type PublishPortRow struct {
+	Port   int32  `json:"port"`
+	Access string `json:"access"`
+}
+
+// The sandbox-level policy supplies the access mode only for a NEW row.
+// Re-publishing without access preserves the existing row's mode; only an
+// explicitly supplied access changes it. applyPreviewMutation takes the
+// sandbox row lock before this query, serializing concurrent publications.
+func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (PublishPortRow, error) {
+	row := q.db.QueryRow(ctx, publishPort, arg.SandboxID, arg.Port, arg.Access)
+	var i PublishPortRow
+	err := row.Scan(&i.Port, &i.Access)
+	return i, err
 }
 
 const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
@@ -1817,7 +1842,7 @@ func (q *Queries) UpdateSandboxNetworkConfig(ctx context.Context, arg UpdateSand
 
 const updateSandboxPreviewAccess = `-- name: UpdateSandboxPreviewAccess :execrows
 UPDATE sandbox_preview_policy p
-SET access = $2, updated_at = now()
+SET default_access = $2, updated_at = now()
 WHERE p.sandbox_id = $1
   AND EXISTS (
     SELECT 1 FROM sandbox s
@@ -1826,13 +1851,13 @@ WHERE p.sandbox_id = $1
 `
 
 type UpdateSandboxPreviewAccessParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Access    string    `json:"access"`
-	TeamID    uuid.UUID `json:"team_id"`
+	SandboxID     uuid.UUID `json:"sandbox_id"`
+	DefaultAccess string    `json:"default_access"`
+	TeamID        uuid.UUID `json:"team_id"`
 }
 
 func (q *Queries) UpdateSandboxPreviewAccess(ctx context.Context, arg UpdateSandboxPreviewAccessParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateSandboxPreviewAccess, arg.SandboxID, arg.Access, arg.TeamID)
+	result, err := q.db.Exec(ctx, updateSandboxPreviewAccess, arg.SandboxID, arg.DefaultAccess, arg.TeamID)
 	if err != nil {
 		return 0, err
 	}

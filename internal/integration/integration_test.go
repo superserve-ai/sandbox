@@ -261,7 +261,7 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string,
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]struct{}, _ int64, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
@@ -273,7 +273,7 @@ func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry,
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
-func (s *stubVMD) UpdateSandboxPreviewPolicy(_ context.Context, _, _ string, _ map[int32]struct{}, _ int64) error {
+func (s *stubVMD) UpdateSandboxPreviewPolicy(_ context.Context, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) error {
 	return nil
 }
 func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { return nil }
@@ -296,6 +296,87 @@ func (s *stubVMD) GetBuildStatus(_ context.Context, _ string) (vmdclient.BuildSt
 func (s *stubVMD) CancelBuild(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) StreamBuildLogs(_ context.Context, _ string, _ func(vmdclient.BuildLogEvent) error) error {
 	return nil
+}
+
+func TestIntegration_PreviewAccessRollbackTriggersKeepPhase1SnapshotsRestrictive(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostID := "preview-trigger-" + uuid.NewString()
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+
+	seed := func(defaultAccess string) uuid.UUID {
+		t.Helper()
+		sandboxID := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+			sandboxID, teamID, "preview-trigger", hostID,
+		); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox_preview_policy (sandbox_id, access, revision) VALUES ($1,$2,0)`,
+			sandboxID, defaultAccess,
+		); err != nil {
+			t.Fatalf("insert policy: %v", err)
+		}
+		return sandboxID
+	}
+	assertPolicy := func(sandboxID uuid.UUID, wantDefault, wantWire string) {
+		t.Helper()
+		var gotDefault, gotWire string
+		if err := testPool.QueryRow(ctx,
+			`SELECT default_access, access FROM sandbox_preview_policy WHERE sandbox_id=$1`, sandboxID,
+		).Scan(&gotDefault, &gotWire); err != nil {
+			t.Fatalf("read policy: %v", err)
+		}
+		if gotDefault != wantDefault || gotWire != wantWire {
+			t.Fatalf("policy = (default=%q wire=%q), want (%q,%q)", gotDefault, gotWire, wantDefault, wantWire)
+		}
+	}
+
+	mixedID := seed(preview.AccessPublic)
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_published_port (sandbox_id, port, access) VALUES ($1,3000,'public'),($1,3001,'private')`, mixedID,
+	); err != nil {
+		t.Fatalf("insert mixed ports: %v", err)
+	}
+	assertPolicy(mixedID, preview.AccessPublic, preview.AccessPrivate)
+
+	// Simulate Phase 1 operations: it can delete rows, insert without the new
+	// access column, and write only policy.access. Every resulting bool-only
+	// snapshot must retain the private fallback while a private row exists.
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_published_port WHERE sandbox_id=$1 AND port=3000`, mixedID); err != nil {
+		t.Fatalf("phase1 unpublish: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox_published_port (sandbox_id, port) VALUES ($1,3002)`, mixedID); err != nil {
+		t.Fatalf("phase1 publish: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_preview_policy SET access='public' WHERE sandbox_id=$1`, mixedID); err != nil {
+		t.Fatalf("phase1 patch: %v", err)
+	}
+	assertPolicy(mixedID, preview.AccessPublic, preview.AccessPrivate)
+	var stagedAccess string
+	if err := testPool.QueryRow(ctx,
+		`SELECT access FROM sandbox_published_port WHERE sandbox_id=$1 AND port=3002`, mixedID,
+	).Scan(&stagedAccess); err != nil || stagedAccess != preview.AccessPublic {
+		t.Fatalf("phase1 omitted publication access = %q, err=%v, want public", stagedAccess, err)
+	}
+
+	privateID := seed(preview.AccessPrivate)
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox_published_port (sandbox_id, port) VALUES ($1,4000)`, privateID); err != nil {
+		t.Fatalf("phase1 publish under private default: %v", err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT access FROM sandbox_published_port WHERE sandbox_id=$1 AND port=4000`, privateID,
+	).Scan(&stagedAccess); err != nil || stagedAccess != preview.AccessPrivate {
+		t.Fatalf("private-default omitted publication access = %q, err=%v, want private", stagedAccess, err)
+	}
+	assertPolicy(privateID, preview.AccessPrivate, preview.AccessPrivate)
 }
 
 // seedTeamAndKey inserts a team owner plus API key pair.

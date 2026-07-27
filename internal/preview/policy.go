@@ -11,10 +11,16 @@ const (
 	// AccessPublic requires explicit publication; published ports route without
 	// Superserve authentication.
 	AccessPublic = "public"
+	// AccessPrivate requires explicit publication and keeps the port closed
+	// until a later authentication phase authorizes the request.
+	AccessPrivate = "private"
 
 	// HostCapabilityPorts is advertised by a vmd/proxy build that persists and
 	// enforces the explicit published-port allowlist.
 	HostCapabilityPorts = "preview_ports_v1"
+	// HostCapabilityPortAccess is advertised only when the host persists and
+	// enforces the independent access mode on each published port.
+	HostCapabilityPortAccess = "preview_port_access_v1"
 
 	// Published preview ports exclude privileged ports and boxd's reserved
 	// service port. Keeping this vocabulary shared prevents the API, VMD,
@@ -28,6 +34,11 @@ const (
 	// instances from callers that omit the marker so rolling the proxy back
 	// cannot silently restore all-port routing.
 	ProxyProtocolHeader = "X-Superserve-Proxy-Protocol"
+
+	// ProxyCapabilitiesHeader additively identifies newer proxy enforcement
+	// capabilities. ProxyProtocolHeader deliberately remains the exact Phase 1
+	// value so a new proxy can still query an older VMD during a rolling deploy.
+	ProxyCapabilitiesHeader = "X-Superserve-Proxy-Capabilities"
 
 	// VMDProtocolHeader attests that a successful local instance response came
 	// from a VMD which understands preview publication. A new proxy requires this
@@ -46,4 +57,33 @@ func ValidatePublishedPort(port int32) error {
 		return fmt.Errorf("port %d is reserved for Superserve's sandbox service", ReservedBoxdPort)
 	}
 	return nil
+}
+
+// RestrictiveFallback returns the sandbox-level value safe to persist on the
+// Phase 1-compatible wire. A Phase 1 reader ignores per-port access, so any
+// effectively non-public port hardens a strict public fallback to private.
+// Empty per-port access is a Phase 1 record and inherits the sandbox default.
+// Unknown sandbox modes are preserved so every generation continues to treat
+// them as unsupported rather than accidentally recognizing them as private.
+func RestrictiveFallback(sandboxAccess string, portAccesses ...string) string {
+	for _, access := range portAccesses {
+		if access != "" && access != AccessPublic {
+			switch sandboxAccess {
+			case "", AccessLegacyPublic, AccessPublic, AccessPrivate:
+				return AccessPrivate
+			default:
+				return sandboxAccess
+			}
+		}
+	}
+	switch sandboxAccess {
+	case "", AccessLegacyPublic:
+		return sandboxAccess
+	case AccessPrivate:
+		return AccessPrivate
+	case AccessPublic:
+		return AccessPublic
+	default:
+		return sandboxAccess
+	}
 }

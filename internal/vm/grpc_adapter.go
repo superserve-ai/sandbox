@@ -116,8 +116,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		}
 	}
 
-	if access := req.GetPreviewAccess(); access != "" && access != preview.AccessLegacyPublic && access != preview.AccessPublic {
-		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, access)
+	if access := req.GetPreviewAccess(); access != "" && access != preview.AccessLegacyPublic && access != preview.AccessPublic && access != preview.AccessPrivate {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, %q, %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, preview.AccessPrivate, access)
 	}
 	previewPorts, err := previewPortsFromProto(req.GetPreviewPorts())
 	if err != nil {
@@ -359,8 +359,8 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(_ context.Context, req *vmdpb.U
 		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
 	}
 	access := req.GetPreviewAccess()
-	if access != preview.AccessLegacyPublic && access != preview.AccessPublic {
-		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, access)
+	if access != preview.AccessLegacyPublic && access != preview.AccessPublic && access != preview.AccessPrivate {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be %q, %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, preview.AccessPrivate, access)
 	}
 	ports, err := previewPortsFromProto(req.GetPreviewPorts())
 	if err != nil {
@@ -372,11 +372,11 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(_ context.Context, req *vmdpb.U
 	return &vmdpb.UpdateSandboxPreviewPolicyResponse{VmId: vmID}, nil
 }
 
-func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]struct{}, error) {
+func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]PreviewPortPolicy, error) {
 	if len(in) == 0 {
 		return nil, nil
 	}
-	out := make(map[int32]struct{}, len(in))
+	out := make(map[int32]PreviewPortPolicy, len(in))
 	for _, item := range in {
 		port := item.GetPort()
 		if err := preview.ValidatePublishedPort(port); err != nil {
@@ -385,7 +385,7 @@ func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]struct{}, error) 
 		if _, duplicate := out[port]; duplicate {
 			return nil, status.Errorf(codes.InvalidArgument, "duplicate preview port: %d", port)
 		}
-		out[port] = struct{}{}
+		out[port] = PreviewPortPolicy{Access: item.GetAccess()}
 	}
 	return out, nil
 }

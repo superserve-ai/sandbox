@@ -26,13 +26,14 @@ var ErrVMDPreviewProtocolUnsupported = errors.New("proxy: vmd does not attest pr
 
 // InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
-	VMIP          string
-	Status        string
-	StartedAt     int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
-	TeamID        string // owning team, for usage attribution
-	OwnerID       string // creating user, for usage attribution; empty when unknown
-	PreviewAccess string
-	PreviewPorts  map[int]struct{}
+	VMIP              string
+	Status            string
+	StartedAt         int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	TeamID            string // owning team, for usage attribution
+	OwnerID           string // creating user, for usage attribution; empty when unknown
+	PreviewAccess     string
+	PreviewPorts      map[int]struct{}
+	PreviewPortAccess map[int]string
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -143,13 +144,14 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP          string          `json:"vm_ip"`
-	Status        string          `json:"status"`
-	StartedAt     int64           `json:"started_at"`
-	TeamID        string          `json:"team_id"`
-	OwnerID       string          `json:"owner_id"`
-	PreviewAccess string          `json:"preview_access"`
-	PreviewPorts  map[string]bool `json:"preview_ports"`
+	VMIP              string            `json:"vm_ip"`
+	Status            string            `json:"status"`
+	StartedAt         int64             `json:"started_at"`
+	TeamID            string            `json:"team_id"`
+	OwnerID           string            `json:"owner_id"`
+	PreviewAccess     string            `json:"preview_access"`
+	PreviewPorts      map[string]bool   `json:"preview_ports"`
+	PreviewPortAccess map[string]string `json:"preview_port_access"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64) (InstanceInfo, error) {
@@ -159,6 +161,7 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 		return InstanceInfo{}, fmt.Errorf("resolver: build request: %w", err)
 	}
 	req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
+	req.Header.Set(preview.ProxyCapabilitiesHeader, preview.HostCapabilityPortAccess)
 
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -185,10 +188,29 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 	info := InstanceInfo{
 		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
 		TeamID: raw.TeamID, OwnerID: raw.OwnerID,
-		PreviewAccess: raw.PreviewAccess,
-		PreviewPorts:  decodePreviewPorts(raw.PreviewPorts),
+		PreviewAccess:     raw.PreviewAccess,
+		PreviewPorts:      decodePreviewPorts(raw.PreviewPorts),
+		PreviewPortAccess: decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),
 	}
 	return info, nil
+}
+
+func decodePreviewPortAccess(published map[string]bool, raw map[string]string) map[int]string {
+	if len(published) == 0 || len(raw) == 0 {
+		return nil
+	}
+	out := make(map[int]string, len(raw))
+	for key, access := range raw {
+		port, err := strconv.Atoi(key)
+		if err != nil || !published[key] || port < minProxiedPort || port > 65535 {
+			continue
+		}
+		out[port] = access
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func decodePreviewPorts(raw map[string]bool) map[int]struct{} {

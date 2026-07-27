@@ -484,9 +484,10 @@ paths:
         the sandbox is ready to use — you can run commands against it
         immediately.
 
-        New sandboxes use strict public preview routing: only ports explicitly
+        New sandboxes use strict preview routing: only ports explicitly
         published through `/sandboxes/{sandbox_id}/preview-ports` are reachable.
-        Until a port is published, every numeric preview-port URL returns 404.
+        `preview_access` defaults newly published ports to `public` or `private`;
+        each publication may override that default independently.
       security:
         - apiKey: []
       requestBody:
@@ -596,10 +597,10 @@ paths:
           sandbox it applies to the next active session. The timeout is
           evaluated against the current active session, so lowering it
           below already-elapsed time pauses the sandbox promptly.
-        - `preview_access` — moves an older `legacy_public` sandbox to strict
-          `public` preview routing. Only explicitly published ports remain
-          reachable. The published-port set is unchanged, and the policy
-          persists across pause/resume. `legacy_public` cannot be selected.
+        - `preview_access` — sets the default access mode for ports published
+          in the future. Existing per-port modes are unchanged. It also moves
+          an older `legacy_public` sandbox to strict routing. `legacy_public`
+          cannot be selected.
       security:
         - apiKey: []
       requestBody:
@@ -632,10 +633,12 @@ paths:
       summary: List published preview ports
       description: |
         Returns the sandbox's preview routing mode and its published ports.
-        For a strict `public` sandbox, only the ports listed here are reachable
-        at `https://{port}-{sandbox_id}.<sandbox-domain>`; every other numeric
-        port returns 404. An older `legacy_public` sandbox may still route all
-        listening ports until it is updated to `public`.
+        For a strict `public` or `private` sandbox, only the ports listed here
+        are published at `https://{port}-{sandbox_id}.<sandbox-domain>`; every
+        other numeric port returns 404. Each row reports its independent access
+        mode. In this phase private and unknown per-port modes return 401 because
+        token authentication lands later. An older `legacy_public` sandbox may
+        still route every listening port until it is updated to a strict mode.
       security:
         - apiKey: []
       responses:
@@ -657,11 +660,14 @@ paths:
     post:
       operationId: publishSandboxPreviewPort
       tags: [Sandboxes]
-      summary: Publish a public preview port
+      summary: Publish or update a preview port
       description: |
-        Adds a port to the sandbox's published set. Published ports are public
-        in this phase. Publishing is idempotent: publishing an existing port
-        again returns the same port and leaves the set unchanged.
+        Adds a port to the sandbox's published set, optionally with an explicit
+        `public` or `private` mode. On a new row, omitted `access` inherits the
+        sandbox's current `preview_access` default. On an existing row, omitted
+        `access` preserves that row's current mode; only an explicit value
+        changes it. An explicit private publication is rejected while the
+        sandbox remains `legacy_public`, because legacy routing exposes all ports.
       security:
         - apiKey: []
       requestBody:
@@ -700,8 +706,8 @@ paths:
       tags: [Sandboxes]
       summary: Unpublish a preview port
       description: |
-        Removes a port from the published set. On a strict `public` sandbox,
-        the port immediately returns 404 at the edge.
+        Removes a port from the published set. On a strict sandbox, the port
+        immediately returns 404 at the edge.
 
         The operation is idempotent and retry-safe. Repeating the request,
         including for a port that is already unpublished, re-synchronizes the
@@ -2221,12 +2227,13 @@ components:
             GITHUB_TOKEN: ghp-readonly
         preview_access:
           type: string
-          enum: [public]
+          enum: [public, private]
           default: public
           description: |
-            Preview routing mode. New sandboxes default to strict `public`,
-            where only ports explicitly published through
-            `POST /sandboxes/{sandbox_id}/preview-ports` are reachable.
+            Default access for newly published preview ports. New sandboxes
+            default to `public`; `private` ports stay closed with 401 until
+            preview-token authentication is introduced. Both modes are strict:
+            only explicitly published ports are reachable.
             `legacy_public` is reserved for sandboxes created before explicit
             publication and cannot be selected through the API.
 
@@ -2351,12 +2358,12 @@ components:
             owner: agent-7
         preview_access:
           type: string
-          enum: [legacy_public, public]
+          enum: [legacy_public, public, private]
           description: |
-            Preview routing mode. `public` routes only explicitly published
-            ports. `legacy_public` may be returned for a sandbox created before
-            explicit publication and preserves its previous all-port behavior
-            until updated to `public`.
+            Default access for newly published ports. `public` and `private`
+            are strict modes; existing published rows keep their own access.
+            `legacy_public` may be returned for an older sandbox and preserves
+            all-port behavior until updated to a strict mode.
 
     SandboxResponse:
       description: Single-sandbox shape — `SandboxListItem` plus `access_token` and bound secrets.
@@ -2581,11 +2588,10 @@ components:
             time pauses the sandbox promptly. Maximum 604800 (7 days).
         preview_access:
           type: string
-          enum: [public]
+          enum: [public, private]
           description: |
-            Move the sandbox to strict public preview routing. Only explicitly
-            published ports are reachable after this update. The published-port
-            set is unchanged, and the policy persists across pause/resume.
+            Set the default access for newly published ports and move a legacy
+            sandbox to strict routing. Existing per-port modes are unchanged.
             `legacy_public` cannot be selected through the API.
       example:
         metadata:
@@ -2603,11 +2609,18 @@ components:
           maximum: 65535
           not:
             enum: [49983]
-          description: Public port to publish. Port 49983 is reserved for Superserve's sandbox service.
+          description: Port to publish. Port 49983 is reserved for Superserve's sandbox service.
+        access:
+          type: string
+          enum: [public, private]
+          description: |
+            Explicit per-port mode. When omitted for a new row, inherits the
+            sandbox preview_access default. When omitted for an existing row,
+            preserves that row's current mode.
 
     PreviewPort:
       type: object
-      required: [port]
+      required: [port, access]
       properties:
         port:
           type: integer
@@ -2615,7 +2628,11 @@ components:
           maximum: 65535
           not:
             enum: [49983]
-          description: Published public port. Port 49983 is reserved for Superserve's sandbox service.
+          description: Published port. Port 49983 is reserved for Superserve's sandbox service.
+        access:
+          type: string
+          enum: [public, private]
+          description: Independent access mode for this published port.
 
     PreviewPortList:
       type: object
@@ -2623,11 +2640,11 @@ components:
       properties:
         preview_access:
           type: string
-          enum: [legacy_public, public]
+          enum: [legacy_public, public, private]
           description: |
-            Sandbox preview routing mode. `public` enforces the listed ports;
-            `legacy_public` preserves pre-publication routing for older
-            sandboxes until they are updated.
+            Sandbox default for newly published ports. `public` and `private`
+            enforce the listed set; `legacy_public` preserves pre-publication
+            all-port routing for older sandboxes until they are updated.
         ports:
           type: array
           items:

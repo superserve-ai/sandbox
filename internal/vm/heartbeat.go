@@ -87,12 +87,10 @@ type proxyHealthResponse struct {
 }
 
 func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHealthURL string, log zerolog.Logger) {
-	capabilities := make([]string, 0, 1)
-	verified, err := proxyEnforcesPreviewPorts(ctx, client, proxyHealthURL)
+	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
 	if err != nil {
 		log.Warn().Err(err).Msg("proxy capability probe failed; advertising no preview capabilities")
-	} else if verified {
-		capabilities = append(capabilities, preview.HostCapabilityPorts)
+		capabilities = nil
 	}
 
 	body, err := json.Marshal(heartbeatRequest{Capabilities: capabilities})
@@ -123,34 +121,40 @@ func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHe
 	}
 }
 
-func proxyEnforcesPreviewPorts(ctx context.Context, client *http.Client, healthURL string) (bool, error) {
+func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthURL string) ([]string, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		return false, fmt.Errorf("build proxy health request: %w", err)
+		return nil, fmt.Errorf("build proxy health request: %w", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("request proxy health: %w", err)
+		return nil, fmt.Errorf("request proxy health: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return false, fmt.Errorf("proxy health returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("proxy health returned %d", resp.StatusCode)
 	}
 	var health proxyHealthResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&health); err != nil {
 		if err == io.EOF {
 			// Pre-capability proxies returned an empty 200 health response.
-			return false, nil
+			return nil, nil
 		}
-		return false, fmt.Errorf("decode proxy health: %w", err)
+		return nil, fmt.Errorf("decode proxy health: %w", err)
 	}
+	advertised := make(map[string]bool, len(health.Capabilities))
 	for _, capability := range health.Capabilities {
-		if capability == preview.HostCapabilityPorts {
-			return true, nil
-		}
+		advertised[capability] = true
 	}
-	return false, nil
+	if !advertised[preview.HostCapabilityPorts] {
+		return nil, nil
+	}
+	out := []string{preview.HostCapabilityPorts}
+	if advertised[preview.HostCapabilityPortAccess] {
+		out = append(out, preview.HostCapabilityPortAccess)
+	}
+	return out, nil
 }

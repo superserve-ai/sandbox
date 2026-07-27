@@ -17,6 +17,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 func setupPreviewRouter(h *Handlers, teamID string) *gin.Engine {
@@ -29,12 +30,14 @@ func setupPreviewRouter(h *Handlers, teamID string) *gin.Engine {
 	r.GET("/sandboxes/:sandbox_id/preview-ports", h.ListSandboxPreviewPorts)
 	r.POST("/sandboxes/:sandbox_id/preview-ports", h.PublishSandboxPreviewPort)
 	r.DELETE("/sandboxes/:sandbox_id/preview-ports/:port", h.UnpublishSandboxPreviewPort)
+	r.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
 	return r
 }
 
-func scalarInt32Row(value int32) pgx.Row {
+func publishedPortRow(port int32, access string) pgx.Row {
 	return &mockRow{scanFn: func(dest ...any) error {
-		*dest[0].(*int32) = value
+		*dest[0].(*int32) = port
+		*dest[1].(*string) = access
 		return nil
 	}}
 }
@@ -54,19 +57,33 @@ func scalarUUIDRow(value uuid.UUID) pgx.Row {
 }
 
 func previewPolicyRow(access string, revision int64) pgx.Row {
+	return previewPolicyRowWithWire(access, access, revision)
+}
+
+func previewPolicyRowWithWire(access, wireAccess string, revision int64) pgx.Row {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*string) = access
-		*dest[1].(*int64) = revision
+		*dest[1].(*string) = wireAccess
+		*dest[2].(*int64) = revision
 		return nil
 	}}
 }
 
 func previewPortRows(ports ...int32) pgx.Rows {
+	policies := make([]publishedPortResponse, 0, len(ports))
+	for _, port := range ports {
+		policies = append(policies, publishedPortResponse{Port: port, Access: preview.AccessPublic})
+	}
+	return previewPortPolicyRows(policies...)
+}
+
+func previewPortPolicyRows(ports ...publishedPortResponse) pgx.Rows {
 	rows := make([]func(dest ...any) error, 0, len(ports))
 	for _, item := range ports {
 		port := item
 		rows = append(rows, func(dest ...any) error {
-			*dest[0].(*int32) = port
+			*dest[0].(*int32) = port.Port
+			*dest[1].(*string) = port.Access
 			return nil
 		})
 	}
@@ -84,13 +101,16 @@ func TestListSandboxPreviewPortsReturnsAuthoritativeAllowlist(t *testing.T) {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sandbox)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
-				return previewPolicyRow(preview.AccessPublic, 7)
+				return previewPolicyRowWithWire(preview.AccessPublic, preview.AccessPrivate, 7)
 			}
 			return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 		},
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
-				return previewPortRows(3000, 8080), nil
+				return previewPortPolicyRows(
+					publishedPortResponse{Port: 3000, Access: preview.AccessPublic},
+					publishedPortResponse{Port: 8080, Access: preview.AccessPrivate},
+				), nil
 			}
 			return nil, fmt.Errorf("unexpected Query: %s", sql)
 		},
@@ -116,6 +136,108 @@ func TestListSandboxPreviewPortsReturnsAuthoritativeAllowlist(t *testing.T) {
 	}
 	if len(got.Ports) != 2 || got.Ports[0].Port != 3000 || got.Ports[1].Port != 8080 {
 		t.Fatalf("ports = %#v, want [3000, 8080]", got.Ports)
+	}
+	if got.Ports[0].Access != preview.AccessPublic || got.Ports[1].Access != preview.AccessPrivate {
+		t.Fatalf("port access = %#v, want public/private while default remains public", got.Ports)
+	}
+}
+
+func TestPublishPrivatePreviewPortRejectsLegacySandboxBeforeMutation(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sandbox := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-new"}
+	mutated := false
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(sandbox)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessLegacyPublic, 0)
+			default:
+				mutated = true
+				return errorRow(fmt.Errorf("unexpected query after legacy guard: %s", sql))
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			mutated = true
+			return pgconn.CommandTag{}, fmt.Errorf("unexpected mutation: %s", sql)
+		},
+	}
+
+	h := &Handlers{DB: db.New(mock), VMD: &stubVMD{}}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/preview-ports", strings.NewReader(`{"port":3000,"access":"private"}`))
+	setupPreviewRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+	}
+	if mutated {
+		t.Fatal("legacy private publication reached capability or mutation queries")
+	}
+}
+
+func TestPatchPreviewAccessPersistsPrivateDefaultAndPreservesPortModes(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sandbox := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-new", Name: "preview"}
+	var updatedDefault string
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(sandbox)
+			case strings.Contains(sql, "-- name: HostHasCapability :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
+				return scalarUUIDRow(sandboxID)
+			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
+				return previewPolicyRowWithWire(preview.AccessPrivate, preview.AccessPrivate, 12)
+			case strings.Contains(sql, "-- name: CreateActivity :one"):
+				return activityRow()
+			default:
+				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
+				return previewPortPolicyRows(publishedPortResponse{Port: 3000, Access: preview.AccessPublic}), nil
+			}
+			return nil, fmt.Errorf("unexpected Query: %s", sql)
+		},
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(sql, "-- name: EnsureSandboxPreviewPolicy :exec"):
+				return pgconn.NewCommandTag("INSERT 0 0"), nil
+			case strings.Contains(sql, "-- name: UpdateSandboxPreviewAccess :execrows"):
+				updatedDefault = args[1].(string)
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			default:
+				return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
+			}
+		},
+	}
+
+	var pushed bool
+	h := &Handlers{
+		DB: db.New(mock),
+		VMD: &stubVMD{updatePreviewFn: func(_ context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+			pushed = true
+			if id != sandboxID.String() || access != preview.AccessPrivate || revision != 12 ||
+				len(ports) != 1 || ports[3000].Access != preview.AccessPublic {
+				t.Errorf("pushed policy = (%q, %q, %#v, %d)", id, access, ports, revision)
+			}
+			return nil
+		}},
+	}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/sandboxes/"+sandboxID.String(), strings.NewReader(`{"preview_access":"private"}`))
+	setupPreviewRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	if updatedDefault != preview.AccessPrivate || !pushed {
+		t.Fatalf("updated default = %q, pushed=%v", updatedDefault, pushed)
 	}
 }
 
@@ -147,7 +269,7 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 	vmdCalled := false
 	h := &Handlers{
 		DB: db.New(mock),
-		VMD: &stubVMD{updatePreviewFn: func(context.Context, string, string, map[int32]struct{}, int64) error {
+		VMD: &stubVMD{updatePreviewFn: func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
 			vmdCalled = true
 			return nil
 		}},
@@ -164,14 +286,14 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 	}
 }
 
-func TestPublishPreviewPortPushesAuthoritativePolicySnapshot(t *testing.T) {
+func TestPublishPreviewPortOmissionPreservesPrivateModeAndPushesRestrictiveSnapshot(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sandbox := db.Sandbox{
 		ID: sandboxID, TeamID: teamID, HostID: "host-new", Name: "preview",
 	}
 	activityFinished := make(chan struct{}, 1)
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sandbox)
@@ -180,9 +302,12 @@ func TestPublishPreviewPortPushesAuthoritativePolicySnapshot(t *testing.T) {
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
 				return scalarUUIDRow(sandboxID)
 			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
-				return previewPolicyRow(preview.AccessPublic, 11)
+				return previewPolicyRowWithWire(preview.AccessPublic, preview.AccessPrivate, 11)
 			case strings.Contains(sql, "-- name: PublishPort :one"):
-				return scalarInt32Row(3000)
+				if len(args) != 3 || args[2] != (*string)(nil) {
+					t.Errorf("PublishPort access arg = %#v, want nil omission", args)
+				}
+				return publishedPortRow(3000, preview.AccessPrivate)
 			case strings.Contains(sql, "-- name: CreateActivity :one"):
 				row := activityRow()
 				return &mockRow{scanFn: func(dest ...any) error {
@@ -196,7 +321,10 @@ func TestPublishPreviewPortPushesAuthoritativePolicySnapshot(t *testing.T) {
 		},
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
-				return previewPortRows(3000, 8080), nil
+				return previewPortPolicyRows(
+					publishedPortResponse{Port: 3000, Access: preview.AccessPrivate},
+					publishedPortResponse{Port: 8080, Access: preview.AccessPublic},
+				), nil
 			}
 			return nil, fmt.Errorf("unexpected Query: %s", sql)
 		},
@@ -211,10 +339,10 @@ func TestPublishPreviewPortPushesAuthoritativePolicySnapshot(t *testing.T) {
 	pushes := 0
 	h := &Handlers{
 		DB: db.New(mock),
-		VMD: &stubVMD{updatePreviewFn: func(_ context.Context, id, access string, ports map[int32]struct{}, revision int64) error {
+		VMD: &stubVMD{updatePreviewFn: func(_ context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
 			pushes++
-			if id != sandboxID.String() || access != preview.AccessPublic || revision != 11 {
-				t.Errorf("push = (%q, %q, %d), want (%q, %q, 11)", id, access, revision, sandboxID, preview.AccessPublic)
+			if id != sandboxID.String() || access != preview.AccessPrivate || revision != 11 {
+				t.Errorf("push = (%q, %q, %d), want (%q, %q, 11)", id, access, revision, sandboxID, preview.AccessPrivate)
 			}
 			if len(ports) != 2 {
 				t.Errorf("pushed ports = %#v, want 3000 and 8080", ports)
@@ -224,6 +352,9 @@ func TestPublishPreviewPortPushesAuthoritativePolicySnapshot(t *testing.T) {
 			}
 			if _, ok := ports[8080]; !ok {
 				t.Errorf("pushed ports = %#v, missing 8080", ports)
+			}
+			if ports[3000].Access != preview.AccessPrivate || ports[8080].Access != preview.AccessPublic {
+				t.Errorf("pushed modes = %#v, want private/public", ports)
 			}
 			return nil
 		}},
@@ -239,8 +370,8 @@ func TestPublishPreviewPortPushesAuthoritativePolicySnapshot(t *testing.T) {
 		t.Fatalf("policy pushes = %d, want 1", pushes)
 	}
 	var body publishedPortResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Port != 3000 {
-		t.Fatalf("response = (%+v, %v), want port 3000", body, err)
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Port != 3000 || body.Access != preview.AccessPrivate {
+		t.Fatalf("response = (%+v, %v), want private port 3000", body, err)
 	}
 	select {
 	case <-activityFinished:
@@ -360,7 +491,7 @@ func TestUnpublishPreviewPortRetryRepushesFullAllowlist(t *testing.T) {
 	var pushedRevisions []int64
 	h := &Handlers{
 		DB: db.New(mock),
-		VMD: &stubVMD{updatePreviewFn: func(_ context.Context, id, access string, ports map[int32]struct{}, gotRevision int64) error {
+		VMD: &stubVMD{updatePreviewFn: func(_ context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, gotRevision int64) error {
 			if id != sandboxID.String() || access != preview.AccessPublic {
 				t.Errorf("push target = (%q, %q), want (%q, %q)", id, access, sandboxID, preview.AccessPublic)
 			}

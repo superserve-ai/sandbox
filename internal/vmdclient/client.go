@@ -7,6 +7,13 @@ import (
 	"context"
 )
 
+// PortPolicy is the control-plane representation of one published preview
+// port. Phase 2 carries only its independent access mode; later phases may add
+// credential state without changing the surrounding map shape.
+type PortPolicy struct {
+	Access string
+}
+
 // Client defines the subset of the VM daemon gRPC interface used by the
 // control plane. Implementations: grpcVMDClient in cmd/controlplane,
 // stubVMD in tests.
@@ -21,7 +28,7 @@ type Client interface {
 	// deltaDir are populated for overlay-mode templates, empty for legacy.
 	// For sandboxes with secrets the caller passes envVars=nil here and uses
 	// InjectSandboxEnv below once the source IP is known and a JWT is minted.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -47,9 +54,9 @@ type Client interface {
 	// of boxd version.
 	ListDir(ctx context.Context, instanceID, path string) ([]DirEntry, error)
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
-	// UpdateSandboxPreviewPolicy atomically replaces the public preview-port
-	// allowlist on the host record. A NotFound record is seeded on next restore.
-	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]struct{}, policyRevision int64) error
+	// UpdateSandboxPreviewPolicy atomically replaces the per-port preview policy
+	// on the host record. A NotFound record is seeded on next restore.
+	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]PortPolicy, policyRevision int64) error
 
 	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the
 	// cached cleartext for secretID. Used by the control plane to push

@@ -172,11 +172,15 @@ LEFT JOIN sandbox s ON s.host_id = h.id
   AND s.status IN ('active', 'starting')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
-  AND EXISTS (
-    SELECT 1 FROM host_capability hc
-    WHERE hc.host_id = h.id
-      AND hc.capability = 'preview_ports_v1'
-      AND hc.heartbeat_at = h.last_heartbeat_at
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest($1::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
   )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC
@@ -199,8 +203,8 @@ type ListActiveHostsByLoadRow struct {
 // Returns active hosts sorted by current sandbox count (ascending).
 // The scheduler picks the first row (least loaded host). One query
 // replaces N per-host lookups.
-func (q *Queries) ListActiveHostsByLoad(ctx context.Context) ([]ListActiveHostsByLoadRow, error) {
-	rows, err := q.db.Query(ctx, listActiveHostsByLoad)
+func (q *Queries) ListActiveHostsByLoad(ctx context.Context, requiredCapabilities []string) ([]ListActiveHostsByLoadRow, error) {
+	rows, err := q.db.Query(ctx, listActiveHostsByLoad, requiredCapabilities)
 	if err != nil {
 		return nil, err
 	}

@@ -31,8 +31,9 @@ func TestProxyHealthAdvertisesPreviewPortProtocol(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &health); err != nil {
 		t.Fatalf("decode health response: %v", err)
 	}
-	if len(health.Capabilities) != 1 || health.Capabilities[0] != preview.HostCapabilityPorts {
-		t.Fatalf("capabilities = %#v, want [%q]", health.Capabilities, preview.HostCapabilityPorts)
+	want := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess}
+	if !reflect.DeepEqual(health.Capabilities, want) {
+		t.Fatalf("capabilities = %#v, want %#v", health.Capabilities, want)
 	}
 }
 

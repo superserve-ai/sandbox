@@ -466,21 +466,24 @@ type SandboxComputeBillingInterval struct {
 	EndReason *string            `json:"end_reason"`
 }
 
-// Preview routing policy. No row means legacy all-port routing; public rows route only explicitly published ports.
+// Preview routing policy. default_access is the API default for new ports; access is a restrictive Phase 1-compatible wire fallback.
 type SandboxPreviewPolicy struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Access    string    `json:"access"`
-	Revision  int64     `json:"revision"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	SandboxID     uuid.UUID `json:"sandbox_id"`
+	Access        string    `json:"access"`
+	Revision      int64     `json:"revision"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	DefaultAccess string    `json:"default_access"`
 }
 
-// Public preview ports explicitly routable for a strict sandbox.
+// Explicitly published preview ports with independent public/private modes.
 type SandboxPublishedPort struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	Port      int32     `json:"port"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Per-port preview mode. public routes directly; private stays closed until the later token-authentication phase can authorize requests.
+	Access string `json:"access"`
 }
 
 type SandboxQuotaConfig struct {

@@ -156,7 +156,7 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(proxyHealthResponse{
-			Capabilities: []string{preview.HostCapabilityPorts},
+			Capabilities: []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess},
 		})
 	})
 	mux.Handle("/", proxyHandler)

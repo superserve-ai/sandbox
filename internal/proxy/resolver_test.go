@@ -20,9 +20,10 @@ func attestPreviewProtocol(w http.ResponseWriter) {
 }
 
 func TestVMDResolverRejectsOldVMDResponseWithoutProtocolAttestation(t *testing.T) {
-	var gotHeader, gotPath string
+	var gotHeader, gotCapabilities, gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get(preview.ProxyProtocolHeader)
+		gotCapabilities = r.Header.Get(preview.ProxyCapabilitiesHeader)
 		gotPath = r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
 		// This is the response shape from a VMD predating preview publication.
@@ -43,6 +44,9 @@ func TestVMDResolverRejectsOldVMDResponseWithoutProtocolAttestation(t *testing.T
 	}
 	if gotHeader != preview.HostCapabilityPorts {
 		t.Fatalf("%s = %q, want %q", preview.ProxyProtocolHeader, gotHeader, preview.HostCapabilityPorts)
+	}
+	if gotCapabilities != preview.HostCapabilityPortAccess {
+		t.Fatalf("%s = %q, want %q", preview.ProxyCapabilitiesHeader, gotCapabilities, preview.HostCapabilityPortAccess)
 	}
 	if got := err.Error(); !strings.Contains(got, preview.VMDProtocolHeader) {
 		t.Fatalf("error %q does not identify missing protocol header", got)
@@ -67,6 +71,32 @@ func TestVMDResolverAcceptsAttestedLegacyResponse(t *testing.T) {
 	}
 	if info.VMIP != "10.0.0.2" || info.PreviewAccess != "" || info.PreviewPorts != nil {
 		t.Fatalf("legacy response decoded as %#v", info)
+	}
+}
+
+func TestVMDResolverDecodesParallelPortAccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attestPreviewProtocol(w)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"vm_ip":               "10.0.0.2",
+			"status":              "running",
+			"preview_access":      "private",
+			"preview_ports":       map[string]bool{"3000": true, "3001": true, "bad": true},
+			"preview_port_access": map[string]string{"3000": "public", "3001": "future", "9999": "private", "bad": "public"},
+		})
+	}))
+	defer server.Close()
+
+	info, err := NewVMDResolver(server.URL).Lookup(context.Background(), "vm-mixed")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if len(info.PreviewPorts) != 2 || info.PreviewPortAccess[3000] != preview.AccessPublic || info.PreviewPortAccess[3001] != "future" {
+		t.Fatalf("decoded policy = ports %#v access %#v", info.PreviewPorts, info.PreviewPortAccess)
+	}
+	if _, ok := info.PreviewPortAccess[9999]; ok {
+		t.Fatalf("access for unpublished port survived decode: %#v", info.PreviewPortAccess)
 	}
 }
 

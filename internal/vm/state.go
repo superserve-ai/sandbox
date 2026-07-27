@@ -25,15 +25,17 @@ var (
 type persistedPreviewPolicy struct {
 	Access        string
 	Ports         map[int32]bool
+	PortAccess    map[int32]string
 	Revision      int64
 	unknownFields map[string]json.RawMessage
 }
 
 func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 	var known struct {
-		Access   string         `json:"access,omitempty"`
-		Ports    map[int32]bool `json:"ports,omitempty"`
-		Revision int64          `json:"revision,omitempty"`
+		Access     string           `json:"access,omitempty"`
+		Ports      map[int32]bool   `json:"ports,omitempty"`
+		PortAccess map[int32]string `json:"port_access,omitempty"`
+		Revision   int64            `json:"revision,omitempty"`
 	}
 	if err := json.Unmarshal(data, &known); err != nil {
 		return err
@@ -44,6 +46,7 @@ func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 	}
 	delete(fields, "access")
 	delete(fields, "ports")
+	delete(fields, "port_access")
 	delete(fields, "revision")
 	if len(fields) == 0 {
 		fields = nil
@@ -51,6 +54,7 @@ func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 	*p = persistedPreviewPolicy{
 		Access:        known.Access,
 		Ports:         known.Ports,
+		PortAccess:    known.PortAccess,
 		Revision:      known.Revision,
 		unknownFields: fields,
 	}
@@ -58,7 +62,7 @@ func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 }
 
 func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
-	fields := make(map[string]json.RawMessage, len(p.unknownFields)+3)
+	fields := make(map[string]json.RawMessage, len(p.unknownFields)+4)
 	for key, value := range p.unknownFields {
 		fields[key] = value
 	}
@@ -75,6 +79,13 @@ func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
 			return nil, err
 		}
 		fields["ports"] = data
+	}
+	if len(p.PortAccess) != 0 {
+		data, err := json.Marshal(p.PortAccess)
+		if err != nil {
+			return nil, err
+		}
+		fields["port_access"] = data
 	}
 	if p.Revision != 0 {
 		data, err := json.Marshal(p.Revision)
@@ -123,9 +134,10 @@ type VMRecord struct {
 	OwnerID string `json:"owner_id,omitempty"`
 	// Preview publication policy must survive vmd restarts; old records decode
 	// to empty/legacy behavior for backward compatibility.
-	PreviewAccess         string         `json:"preview_access,omitempty"`
-	PreviewPorts          map[int32]bool `json:"preview_ports,omitempty"`
-	PreviewPolicyRevision int64          `json:"preview_policy_revision,omitempty"`
+	PreviewAccess         string           `json:"preview_access,omitempty"`
+	PreviewPorts          map[int32]bool   `json:"preview_ports,omitempty"`
+	PreviewPortAccess     map[int32]string `json:"preview_port_access,omitempty"`
+	PreviewPolicyRevision int64            `json:"preview_policy_revision,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -292,6 +304,10 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 			}
 		}
 	}
+	// Keep the Phase 1-visible primary JSON restrictive too. A rolled-back VMD
+	// does not know about the sidecar or its parallel access map; it must still
+	// read a private top-level fallback for every mixed/private snapshot.
+	incomingPolicy.applyTo(&incoming)
 
 	data, err := json.Marshal(incoming)
 	if err != nil {
@@ -311,20 +327,24 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 }
 
 func previewPolicyFromRecord(rec VMRecord) persistedPreviewPolicy {
+	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess)
 	return persistedPreviewPolicy{
-		Access:   rec.PreviewAccess,
-		Ports:    rec.PreviewPorts,
-		Revision: rec.PreviewPolicyRevision,
+		Access:     restrictivePreviewAccess(rec.PreviewAccess, ports),
+		Ports:      previewPortsToRecord(ports),
+		PortAccess: previewPortAccessToRecord(ports),
+		Revision:   rec.PreviewPolicyRevision,
 	}
 }
 
 func (p persistedPreviewPolicy) isSet() bool {
-	return p.Access != "" || len(p.Ports) != 0 || p.Revision != 0 || len(p.unknownFields) != 0
+	return p.Access != "" || len(p.Ports) != 0 || len(p.PortAccess) != 0 || p.Revision != 0 || len(p.unknownFields) != 0
 }
 
 func (p persistedPreviewPolicy) applyTo(rec *VMRecord) {
-	rec.PreviewAccess = p.Access
-	rec.PreviewPorts = p.Ports
+	ports := previewPortsFromRecord(p.Ports, p.PortAccess)
+	rec.PreviewAccess = restrictivePreviewAccess(p.Access, ports)
+	rec.PreviewPorts = previewPortsToRecord(ports)
+	rec.PreviewPortAccess = previewPortAccessToRecord(ports)
 	rec.PreviewPolicyRevision = p.Revision
 }
 
@@ -436,13 +456,14 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		BasePath:              inst.Config.BasePath,
 		TeamID:                inst.TeamID,
 		OwnerID:               inst.OwnerID,
-		PreviewAccess:         inst.PreviewAccess,
+		PreviewAccess:         restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
 		PreviewPorts:          previewPortsToRecord(inst.PreviewPorts),
+		PreviewPortAccess:     previewPortAccessToRecord(inst.PreviewPorts),
 		PreviewPolicyRevision: inst.PreviewPolicyRevision,
 	}
 }
 
-func previewPortsToRecord(in map[int32]struct{}) map[int32]bool {
+func previewPortsToRecord(in map[int32]PreviewPortPolicy) map[int32]bool {
 	if len(in) == 0 {
 		return nil
 	}
@@ -453,14 +474,27 @@ func previewPortsToRecord(in map[int32]struct{}) map[int32]bool {
 	return out
 }
 
-func previewPortsFromRecord(in map[int32]bool) map[int32]struct{} {
+func previewPortAccessToRecord(in map[int32]PreviewPortPolicy) map[int32]string {
+	out := make(map[int32]string, len(in))
+	for port, policy := range in {
+		if policy.Access != "" {
+			out[port] = policy.Access
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func previewPortsFromRecord(in map[int32]bool, access map[int32]string) map[int32]PreviewPortPolicy {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[int32]struct{}, len(in))
+	out := make(map[int32]PreviewPortPolicy, len(in))
 	for port, published := range in {
 		if published {
-			out[port] = struct{}{}
+			out[port] = PreviewPortPolicy{Access: access[port]}
 		}
 	}
 	return out
@@ -468,6 +502,7 @@ func previewPortsFromRecord(in map[int32]bool) map[int32]struct{} {
 
 // toInstance converts a VMRecord back to a VMInstance.
 func toInstance(rec VMRecord) *VMInstance {
+	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess)
 	return &VMInstance{
 		ID:                    rec.ID,
 		PID:                   rec.PID,
@@ -487,8 +522,8 @@ func toInstance(rec VMRecord) *VMInstance {
 		Metadata:              rec.Metadata,
 		TeamID:                rec.TeamID,
 		OwnerID:               rec.OwnerID,
-		PreviewAccess:         rec.PreviewAccess,
-		PreviewPorts:          previewPortsFromRecord(rec.PreviewPorts),
+		PreviewAccess:         restrictivePreviewAccess(rec.PreviewAccess, ports),
+		PreviewPorts:          ports,
 		PreviewPolicyRevision: rec.PreviewPolicyRevision,
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
