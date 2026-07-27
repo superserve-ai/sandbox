@@ -347,11 +347,19 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		nsName := r.mgr.netMgr.NamespaceForPID(r.mgr.cgroups.firstPID(id))
 		if err := r.mgr.stopVM(ctx, id, SupervisionCgroup); err != nil {
 			// If only the rmdir failed, the emptied group drops out of the
-			// populated active-set next pass and this drift never revisits it,
-			// stranding the netns/slot until restart. Reclaim once death is
-			// confirmed; skip on an inconclusive read so a live FC keeps its tap.
+			// populated active-set next pass and this drift never revisits it —
+			// stranding the netns/slot AND leaving the empty dir to block
+			// drain-check until restart. Once death is confirmed (empty), reclaim
+			// the netns and retry the rmdir; a clean removal fully reclaims the
+			// survivor. Skip on an inconclusive read so a live FC keeps its tap.
 			if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr == nil && !pop {
 				r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
+				if rerr := r.mgr.cgroups.removeVMCgroup(id); rerr == nil {
+					unlockOp()
+					r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor (rmdir retried)", "cgroup_orphan_no_record")
+					r.clearDrift("cgrouporphan:" + id)
+					continue
+				}
 			}
 			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop recordless cgroup — leaving for retry")
 			unlockOp()
