@@ -47,3 +47,10 @@ import {
   to = module.iam.google_project_iam_member.project_bindings["cd_network_admin"]
   id = "rayai-dev roles/compute.networkAdmin serviceAccount:superserve-github-actions@rayai-dev.iam.gserviceaccount.com"
 }
+
+# Existing Serverless VPC Access connector subnet. Import it so Terraform can
+# enable flow logs in place without replacing the connector or moving networks.
+import {
+  to = google_compute_subnetwork.staging_connector
+  id = "projects/rayai-dev/regions/us-central1/subnetworks/rayai-staging-connector-subnet"
+}
