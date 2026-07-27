@@ -16,6 +16,15 @@ import (
 // var, not const, so tests can shorten it.
 var sseKeepaliveInterval = 15 * time.Second
 
+// Combined stdout+stderr retained by the sync exec handler, which buffers the
+// whole result into one JSON reply — unbounded, a single chatty command can
+// exhaust the guest's RAM, and clients bound how much of a buffered reply they
+// read anyway. Output past the cap is still drained (a full pipe would block
+// the child) but dropped, and the reply is flagged truncated; streaming exec
+// forwards instead of holding, so it needs no cap.
+// var, not const, so tests can shrink it.
+var maxSyncExecOutputBytes = 8 << 20
+
 // CodeInvalidArgument → 400, everything else → 500.
 func writeRunError(w http.ResponseWriter, err error) {
 	var ce *connect.Error
@@ -48,6 +57,9 @@ type execResponse struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	ExitCode int32  `json:"exit_code"`
+	// Truncated reports that combined output exceeded the sync buffer cap
+	// and the tail was dropped; stream the command instead for full output.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 func (r *execRequest) toStartRequest() *pb.StartRequest {
@@ -96,12 +108,27 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 	// are not collected off the guest.
 	tRecv := time.Now()
 	var (
-		mu       sync.Mutex
-		stdout   []byte
-		stderr   []byte
-		exitCode int32
-		tSpawn   time.Time
+		mu        sync.Mutex
+		stdout    []byte
+		stderr    []byte
+		truncated bool
+		exitCode  int32
+		tSpawn    time.Time
 	)
+	// appendCapped retains at most maxSyncExecOutputBytes across both
+	// streams, dropping the rest. Callers hold mu.
+	appendCapped := func(dst, b []byte) []byte {
+		remaining := maxSyncExecOutputBytes - len(stdout) - len(stderr)
+		if remaining <= 0 {
+			truncated = true
+			return dst
+		}
+		if len(b) > remaining {
+			b = b[:remaining]
+			truncated = true
+		}
+		return append(dst, b...)
+	}
 	emit := func(ev *pb.ProcessEvent) error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -109,11 +136,11 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		case *pb.ProcessEvent_Data:
 			switch out := x.Data.Output.(type) {
 			case *pb.DataEvent_Stdout:
-				stdout = append(stdout, out.Stdout...)
+				stdout = appendCapped(stdout, out.Stdout)
 			case *pb.DataEvent_Stderr:
-				stderr = append(stderr, out.Stderr...)
+				stderr = appendCapped(stderr, out.Stderr)
 			case *pb.DataEvent_PtyData:
-				stdout = append(stdout, out.PtyData...)
+				stdout = appendCapped(stdout, out.PtyData)
 			}
 		case *pb.ProcessEvent_Start:
 			if tSpawn.IsZero() {
@@ -136,9 +163,10 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(execResponse{
-		Stdout:   string(stdout),
-		Stderr:   string(stderr),
-		ExitCode: exitCode,
+		Stdout:    string(stdout),
+		Stderr:    string(stderr),
+		ExitCode:  exitCode,
+		Truncated: truncated,
 	})
 }
 

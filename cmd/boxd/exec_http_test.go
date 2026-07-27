@@ -50,6 +50,38 @@ func TestHandleExec_Success(t *testing.T) {
 	}
 }
 
+func TestHandleExec_OutputCapped(t *testing.T) {
+	old := maxSyncExecOutputBytes
+	maxSyncExecOutputBytes = 16
+	defer func() { maxSyncExecOutputBytes = old }()
+
+	s := newProcessService()
+	// 64 bytes of stdout against a 16-byte cap; the command must still run
+	// to completion (drained, not blocked) and exit 0.
+	body := `{"command":"/bin/sh","args":["-c","printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"],"working_dir":"/tmp"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleExec(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp execResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v; body: %s", err, w.Body.String())
+	}
+	if len(resp.Stdout) != 16 {
+		t.Errorf("stdout length = %d, want 16 (capped)", len(resp.Stdout))
+	}
+	if !resp.Truncated {
+		t.Error("truncated = false, want true")
+	}
+	if resp.ExitCode != 0 {
+		t.Errorf("exit_code = %d, want 0", resp.ExitCode)
+	}
+}
+
 func TestHandleExec_NonzeroExit(t *testing.T) {
 	s := newProcessService()
 	body := `{"command":"/bin/sh","args":["-c","exit 7"],"working_dir":"/tmp"}`
