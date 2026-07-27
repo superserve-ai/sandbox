@@ -6,7 +6,18 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+const (
+	maxHostCapabilities     = 32
+	maxHostCapabilityLength = 64
+)
+
+type hostHeartbeatRequest struct {
+	Capabilities []string `json:"capabilities"`
+}
 
 // HostHeartbeat handles POST /internal/hosts/:host_id/heartbeat.
 // VMD calls this every 30s to prove liveness. The control plane updates
@@ -20,7 +31,60 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		return
 	}
 
-	host, err := h.DB.UpdateHostHeartbeat(c.Request.Context(), hostID)
+	var req hostHeartbeatRequest
+	if c.Request.ContentLength != 0 {
+		if err := bindJSONStrict(c, &req); err != nil {
+			respondErrorMsg(c, "bad_request", "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if len(req.Capabilities) > maxHostCapabilities {
+		respondErrorMsg(c, "bad_request", "too many capabilities", http.StatusBadRequest)
+		return
+	}
+	capabilities := make([]string, 0, len(req.Capabilities))
+	for _, capability := range req.Capabilities {
+		if capability == "" || len(capability) > maxHostCapabilityLength {
+			respondErrorMsg(c, "bad_request", "capability entries must be non-empty and short", http.StatusBadRequest)
+			return
+		}
+		capabilities = append(capabilities, capability)
+	}
+
+	ctx := c.Request.Context()
+	replace := func(q *db.Queries) (db.UpdateHostHeartbeatRow, error) {
+		host, err := q.UpdateHostHeartbeat(ctx, hostID)
+		if err != nil {
+			return db.UpdateHostHeartbeatRow{}, err
+		}
+		// Missing capabilities is an explicit empty replacement. This clears a
+		// stale attestation immediately when VMD can no longer verify its proxy.
+		if err := q.DeleteHostCapabilities(ctx, hostID); err != nil {
+			return db.UpdateHostHeartbeatRow{}, err
+		}
+		for _, capability := range capabilities {
+			if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
+				HostID: hostID, Capability: capability,
+			}); err != nil {
+				return db.UpdateHostHeartbeatRow{}, err
+			}
+		}
+		return host, nil
+	}
+
+	var host db.UpdateHostHeartbeatRow
+	var err error
+	if h.Pool == nil {
+		host, err = replace(h.DB)
+	} else {
+		var tx pgx.Tx
+		if tx, err = h.Pool.Begin(ctx); err == nil {
+			defer tx.Rollback(ctx)
+			if host, err = replace(h.DB.WithTx(tx)); err == nil {
+				err = tx.Commit(ctx)
+			}
+		}
+	}
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)

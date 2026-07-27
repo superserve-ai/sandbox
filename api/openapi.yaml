@@ -483,6 +483,10 @@ paths:
         `from_template` is omitted). When the request returns successfully,
         the sandbox is ready to use — you can run commands against it
         immediately.
+
+        New sandboxes use strict public preview routing: only ports explicitly
+        published through `/sandboxes/{sandbox_id}/preview-ports` are reachable.
+        Until a port is published, every numeric preview-port URL returns 404.
       security:
         - apiKey: []
       requestBody:
@@ -592,6 +596,10 @@ paths:
           sandbox it applies to the next active session. The timeout is
           evaluated against the current active session, so lowering it
           below already-elapsed time pauses the sandbox promptly.
+        - `preview_access` — moves an older `legacy_public` sandbox to strict
+          `public` preview routing. Only explicitly published ports remain
+          reachable. The published-port set is unchanged, and the policy
+          persists across pause/resume. `legacy_public` cannot be selected.
       security:
         - apiKey: []
       requestBody:
@@ -611,6 +619,108 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    get:
+      operationId: listSandboxPreviewPorts
+      tags: [Sandboxes]
+      summary: List published preview ports
+      description: |
+        Returns the sandbox's preview routing mode and its published ports.
+        For a strict `public` sandbox, only the ports listed here are reachable
+        at `https://{port}-{sandbox_id}.<sandbox-domain>`; every other numeric
+        port returns 404. An older `legacy_public` sandbox may still route all
+        listening ports until it is updated to `public`.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Preview routing mode and published-port set
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewPortList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: publishSandboxPreviewPort
+      tags: [Sandboxes]
+      summary: Publish a public preview port
+      description: |
+        Adds a port to the sandbox's published set. Published ports are public
+        in this phase. Publishing is idempotent: publishing an existing port
+        again returns the same port and leaves the set unchanged.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishPortRequest"
+      responses:
+        "200":
+          description: Published port
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewPort"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports/{port}:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
+
+    delete:
+      operationId: unpublishSandboxPreviewPort
+      tags: [Sandboxes]
+      summary: Unpublish a preview port
+      description: |
+        Removes a port from the published set. On a strict `public` sandbox,
+        the port immediately returns 404 at the edge.
+
+        The operation is idempotent and retry-safe. Repeating the request,
+        including for a port that is already unpublished, re-synchronizes the
+        host's authoritative published-port set and returns `204`. Retry a
+        `500` to converge after a transient host update failure. A `404`
+        means the sandbox itself does not exist.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Port unpublished or already unpublished
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1810,6 +1920,18 @@ components:
         $ref: "#/components/schemas/PublicSandboxId"
       description: The unique identifier of the sandbox.
 
+    PreviewPort:
+      name: port
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1024
+        maximum: 65535
+        not:
+          enum: [49983]
+      description: Published sandbox port. Port 49983 is reserved for Superserve's sandbox service.
+
     TemplateId:
       name: template_id
       in: path
@@ -2097,6 +2219,16 @@ components:
           example:
             ANTHROPIC_API_KEY: anthropic-prod
             GITHUB_TOKEN: ghp-readonly
+        preview_access:
+          type: string
+          enum: [public]
+          default: public
+          description: |
+            Preview routing mode. New sandboxes default to strict `public`,
+            where only ports explicitly published through
+            `POST /sandboxes/{sandbox_id}/preview-ports` are reachable.
+            `legacy_public` is reserved for sandboxes created before explicit
+            publication and cannot be selected through the API.
 
     ActivityResponse:
       description: One audit-log activity row returned by the activity list endpoint.
@@ -2217,6 +2349,14 @@ components:
           example:
             env: prod
             owner: agent-7
+        preview_access:
+          type: string
+          enum: [legacy_public, public]
+          description: |
+            Preview routing mode. `public` routes only explicitly published
+            ports. `legacy_public` may be returned for a sandbox created before
+            explicit publication and preserves its previous all-port behavior
+            until updated to `public`.
 
     SandboxResponse:
       description: Single-sandbox shape — `SandboxListItem` plus `access_token` and bound secrets.
@@ -2439,10 +2579,59 @@ components:
             create; `null` disables auto-pause. Evaluated against the
             current active session, so lowering it below already-elapsed
             time pauses the sandbox promptly. Maximum 604800 (7 days).
+        preview_access:
+          type: string
+          enum: [public]
+          description: |
+            Move the sandbox to strict public preview routing. Only explicitly
+            published ports are reachable after this update. The published-port
+            set is unchanged, and the policy persists across pause/resume.
+            `legacy_public` cannot be selected through the API.
       example:
         metadata:
           env: prod
           owner: agent-7
+
+    PublishPortRequest:
+      type: object
+      required: [port]
+      additionalProperties: false
+      properties:
+        port:
+          type: integer
+          minimum: 1024
+          maximum: 65535
+          not:
+            enum: [49983]
+          description: Public port to publish. Port 49983 is reserved for Superserve's sandbox service.
+
+    PreviewPort:
+      type: object
+      required: [port]
+      properties:
+        port:
+          type: integer
+          minimum: 1024
+          maximum: 65535
+          not:
+            enum: [49983]
+          description: Published public port. Port 49983 is reserved for Superserve's sandbox service.
+
+    PreviewPortList:
+      type: object
+      required: [preview_access, ports]
+      properties:
+        preview_access:
+          type: string
+          enum: [legacy_public, public]
+          description: |
+            Sandbox preview routing mode. `public` enforces the listed ports;
+            `legacy_public` preserves pre-publication routing for older
+            sandboxes until they are updated.
+        ports:
+          type: array
+          items:
+            $ref: "#/components/schemas/PreviewPort"
 
     BuildSpec:
       type: object

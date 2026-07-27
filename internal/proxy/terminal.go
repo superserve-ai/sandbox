@@ -19,6 +19,7 @@ import (
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
@@ -74,7 +75,7 @@ const (
 	// inside each VM. Terminal sessions target the same port as the
 	// regular proxy path for user apps at port 49983 — boxd is the
 	// single HTTP endpoint exposed by the VM.
-	boxdPort = 49983
+	boxdPort = int(preview.ReservedBoxdPort)
 
 	// terminalProtocol is the identifying WebSocket subprotocol echoed
 	// back on a successful upgrade. Bump the version if the wire format
@@ -519,4 +520,3 @@ func signalNameToNumber(name string) (int32, bool) {
 	}
 	return 0, false
 }
-

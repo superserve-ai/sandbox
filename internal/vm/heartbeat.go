@@ -1,13 +1,17 @@
 package vm
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
 // HeartbeatConfig controls the VMD → control plane heartbeat loop.
@@ -23,6 +27,11 @@ type HeartbeatConfig struct {
 	// Token is the shared secret for authenticating internal API calls.
 	// Sent as `Authorization: Bearer <token>`.
 	Token string
+
+	// ProxyHealthURL is the host-local edge proxy health endpoint. The default
+	// is http://127.0.0.1:5007/health. VMD advertises preview-port enforcement
+	// only when this endpoint confirms the matching proxy protocol.
+	ProxyHealthURL string
 
 	// Interval is how often the heartbeat fires. Default: 30s.
 	Interval time.Duration
@@ -40,10 +49,15 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 
 	url := fmt.Sprintf("%s/internal/hosts/%s/heartbeat", cfg.ControlPlaneURL, cfg.HostID)
 	token := cfg.Token
+	proxyHealthURL := cfg.ProxyHealthURL
+	if proxyHealthURL == "" {
+		proxyHealthURL = "http://127.0.0.1:5007/health"
+	}
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	log.Info().
 		Str("url", url).
+		Str("proxy_health_url", proxyHealthURL).
 		Dur("interval", interval).
 		Msg("heartbeat started")
 
@@ -51,7 +65,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	defer ticker.Stop()
 
 	// Fire once immediately so the host is marked alive on startup.
-	sendHeartbeat(ctx, client, url, token, log)
+	sendHeartbeat(ctx, client, url, token, proxyHealthURL, log)
 
 	for {
 		select {
@@ -59,17 +73,39 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			log.Info().Msg("heartbeat exiting")
 			return
 		case <-ticker.C:
-			sendHeartbeat(ctx, client, url, token, log)
+			sendHeartbeat(ctx, client, url, token, proxyHealthURL, log)
 		}
 	}
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, url, token string, log zerolog.Logger) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+type heartbeatRequest struct {
+	Capabilities []string `json:"capabilities"`
+}
+
+type proxyHealthResponse struct {
+	Capabilities []string `json:"capabilities"`
+}
+
+func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHealthURL string, log zerolog.Logger) {
+	capabilities := make([]string, 0, 1)
+	verified, err := proxyEnforcesPreviewPorts(ctx, client, proxyHealthURL)
+	if err != nil {
+		log.Warn().Err(err).Msg("proxy capability probe failed; advertising no preview capabilities")
+	} else if verified {
+		capabilities = append(capabilities, preview.HostCapabilityPorts)
+	}
+
+	body, err := json.Marshal(heartbeatRequest{Capabilities: capabilities})
+	if err != nil {
+		log.Error().Err(err).Msg("failed to encode heartbeat body")
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create heartbeat request")
 		return
 	}
+	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -85,4 +121,36 @@ func sendHeartbeat(ctx context.Context, client *http.Client, url, token string, 
 	if resp.StatusCode != http.StatusOK {
 		log.Warn().Int("status", resp.StatusCode).Msg("heartbeat got non-200 response")
 	}
+}
+
+func proxyEnforcesPreviewPorts(ctx context.Context, client *http.Client, healthURL string) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("build proxy health request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("request proxy health: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return false, fmt.Errorf("proxy health returned %d", resp.StatusCode)
+	}
+	var health proxyHealthResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&health); err != nil {
+		if err == io.EOF {
+			// Pre-capability proxies returned an empty 200 health response.
+			return false, nil
+		}
+		return false, fmt.Errorf("decode proxy health: %w", err)
+	}
+	for _, capability := range health.Capabilities {
+		if capability == preview.HostCapabilityPorts {
+			return true, nil
+		}
+	}
+	return false, nil
 }
