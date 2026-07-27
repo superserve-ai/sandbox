@@ -1148,15 +1148,15 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	resumeExisting := inst.Supervision
 	inst.mu.RUnlock()
 	pid, resumeSupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, resumeExisting, true)
-	if err != nil {
-		return nil, fmt.Errorf("start firecracker for restore: %w", err)
-	}
-	// Stamp the launched mode NOW, before any restore-failure cleanup below
-	// can run: a legacy record resumed into cgroup mode must not have its
-	// cleanup dispatch to the (nonexistent) unit path and leak the FC.
+	// Stamp before the error branch too: a cgroup launch that forked FC but
+	// failed socket-readiness (kill unconfirmed) leaves a live process, so the
+	// instance must say cgroup for a later destroy to kill it, not no-op a unit.
 	inst.mu.Lock()
 	inst.Supervision = resumeSupervision
 	inst.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("start firecracker for restore: %w", err)
+	}
 	tFcDone := time.Now()
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")

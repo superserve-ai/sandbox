@@ -346,6 +346,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// CleanupVMOrNamespace can only reclaim it given the namespace name.
 		nsName := r.mgr.netMgr.NamespaceForPID(r.mgr.cgroups.firstPID(id))
 		if err := r.mgr.stopVM(ctx, id, SupervisionCgroup); err != nil {
+			// If only the rmdir failed, the emptied group drops out of the
+			// populated active-set next pass and this drift never revisits it,
+			// stranding the netns/slot until restart. Reclaim once death is
+			// confirmed; skip on an inconclusive read so a live FC keeps its tap.
+			if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr == nil && !pop {
+				r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
+			}
 			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop recordless cgroup — leaving for retry")
 			unlockOp()
 			continue
