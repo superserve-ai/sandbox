@@ -251,7 +251,44 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 // main
 // ---------------------------------------------------------------------------
 
+// runDrainCheck reports whether this host still holds direct-spawn state,
+// gating a rollback to a pre-direct-spawn binary. Exit 0 = drained (safe to
+// downgrade); 3 = residual state remains; 2 = the check itself failed. Callers
+// treat any non-zero as "do not downgrade". Run with vmd stopped — the store
+// read lock and the cgroup scan both need the daemon quiescent.
+func runDrainCheck() int {
+	statePath := envOrDefault("VMD_STATE_PATH",
+		filepath.Join(filepath.Dir(envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir")), "vmd.db"))
+	rep, err := vm.CheckDrained(context.Background(), statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drain-check: %v\n", err)
+		return 2
+	}
+	fmt.Printf("drain-check: cgroup_records=%d per_vm_dirs=%d populated_groups=%d scope=%q\n",
+		rep.CgroupRecords, rep.PerVMDirs, rep.PopulatedGroups, rep.ScopePath)
+	if rep.Drained() {
+		fmt.Println("drain-check: DRAINED — safe to install a pre-direct-spawn binary")
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, "drain-check: NOT DRAINED — direct-spawn state remains; do not downgrade vmd")
+	return 3
+}
+
 func main() {
+	// Maintenance subcommands run before any daemon setup and exit. They must
+	// not open the state store in write mode or start services.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "capabilities":
+			// Advertised so rollback tooling can detect a downgrade to a binary
+			// that lacks cgroup supervision. Env-free by design.
+			fmt.Println("cgroup-supervision")
+			return
+		case "drain-check":
+			os.Exit(runDrainCheck())
+		}
+	}
+
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})

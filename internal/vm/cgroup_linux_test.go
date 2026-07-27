@@ -9,6 +9,44 @@ import (
 	"testing"
 )
 
+// The drain guard must count cgroup-supervised records (the paused-VM case has
+// no live process, so only the record catches it) and fail closed on a missing
+// store rather than read it as drained.
+func TestCheckDrainedCountsCgroupRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vmd.db")
+	store, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range []VMRecord{
+		{ID: "a", Supervision: SupervisionCgroup},
+		{ID: "b", Supervision: SupervisionCgroup}, // e.g. paused: record only, no process
+		{ID: "c", Supervision: SupervisionUnit},
+	} {
+		if err := store.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.Close()
+
+	rep, err := CheckDrained(context.Background(), path)
+	if err != nil {
+		t.Fatalf("CheckDrained: %v", err)
+	}
+	if rep.CgroupRecords != 2 {
+		t.Fatalf("cgroup records: got %d want 2", rep.CgroupRecords)
+	}
+	if rep.Drained() {
+		t.Fatal("must not report drained while cgroup records remain")
+	}
+
+	// Missing store must fail closed (error), never read as drained.
+	if _, err := CheckDrained(context.Background(), filepath.Join(dir, "nope.db")); err == nil {
+		t.Fatal("missing store must error, not report drained")
+	}
+}
+
 func TestParseCgroupPopulated(t *testing.T) {
 	for body, want := range map[string]bool{
 		"populated 1\nfrozen 0\n": true,

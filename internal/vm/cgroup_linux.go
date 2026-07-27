@@ -458,3 +458,68 @@ func (t *cgroupTree) scanVMCgroups() ([]string, error) {
 	}
 	return ids, nil
 }
+
+// DrainReport summarizes any residual direct-spawn state on a host, so rollback
+// tooling can refuse to install a pre-direct-spawn binary that would mishandle
+// it. All three counts must be zero to downgrade safely.
+type DrainReport struct {
+	ScopePath       string // resolved superserve-vms.service ControlGroup ("" if none)
+	CgroupRecords   int    // BoltDB records (incl. PAUSED) with Supervision=cgroup
+	PerVMDirs       int    // per-VM cgroup directories present (recordless or not)
+	PopulatedGroups int    // per-VM cgroups holding a live process
+}
+
+// Drained reports whether the host has no direct-spawn state at all.
+func (r DrainReport) Drained() bool {
+	return r.CgroupRecords == 0 && r.PerVMDirs == 0 && r.PopulatedGroups == 0
+}
+
+// CheckDrained inspects a host for residual direct-spawn state before a
+// rollback: cgroup-supervised records (including PAUSED ones — no live process,
+// invisible to a cgroup scan, yet still mishandled by an old binary on resume),
+// leftover per-VM cgroup directories, and populated groups. It reads the store
+// read-only, so it fails closed on a missing/locked DB (a running vmd holds the
+// lock) rather than falsely reporting drained — run it with vmd stopped. Never
+// mutates the store or the cgroup tree.
+func CheckDrained(ctx context.Context, statePath string) (DrainReport, error) {
+	var r DrainReport
+	store, err := OpenStateStoreReadOnly(statePath)
+	if err != nil {
+		return r, fmt.Errorf("read state (is vmd still running? stop it first): %w", err)
+	}
+	defer store.Close()
+	recs, err := store.All()
+	if err != nil {
+		return r, fmt.Errorf("read records: %w", err)
+	}
+	for _, rec := range recs {
+		if cgroupSupervised(rec.Supervision) {
+			r.CgroupRecords++
+		}
+	}
+	// An absent scope (unit never installed/started) means no per-VM dirs, so
+	// conditions 2 and 3 are trivially empty.
+	rel := unitControlGroup(ctx, vmsUnitName)
+	if rel == "" {
+		return r, nil
+	}
+	r.ScopePath = filepath.Join(cgroupMount, rel)
+	entries, err := os.ReadDir(r.ScopePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return r, nil
+		}
+		return r, fmt.Errorf("scan scope %s: %w", r.ScopePath, err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == keeperSubdir {
+			continue
+		}
+		r.PerVMDirs++
+		data, rerr := os.ReadFile(filepath.Join(r.ScopePath, e.Name(), "cgroup.events"))
+		if rerr == nil && parseCgroupPopulated(string(data)) {
+			r.PopulatedGroups++
+		}
+	}
+	return r, nil
+}

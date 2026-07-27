@@ -94,6 +94,19 @@ func OpenStateStore(path string) (*StateStore, error) {
 	return &StateStore{db: db}, nil
 }
 
+// OpenStateStoreReadOnly opens the BoltDB file for reading only. Unlike
+// OpenStateStore it neither creates the file nor writes a bucket, so a missing
+// DB or a store still locked by a running vmd fails here rather than reporting
+// an empty (falsely "drained") store — the drain guard depends on that
+// fail-closed behavior.
+func OpenStateStoreReadOnly(path string) (*StateStore, error) {
+	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("open state store read-only %s: %w", path, err)
+	}
+	return &StateStore{db: db}, nil
+}
+
 // Close flushes and closes the database.
 func (s *StateStore) Close() error {
 	return s.db.Close()

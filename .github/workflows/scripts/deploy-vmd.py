@@ -199,6 +199,29 @@ def main() -> int:
             mkdir -p {extract_dir}
             tar xzf {bundle_remote} -C {extract_dir}
 
+            # Rollback safety gate. If the incoming vmd lacks cgroup supervision
+            # (a downgrade past direct-spawn), an old binary would mishandle any
+            # live or PAUSED cgroup VMs on this host — deleting records/networking
+            # under them. Detect the downgrade by grepping the incoming binary for
+            # its capability marker (never execute an unknown old binary — it would
+            # start the daemon), then certify the host is drained USING THE CURRENT
+            # cgroup-aware binary before it is replaced. Skipped entirely for normal
+            # upgrades, so their path is unchanged.
+            if [ -x {install_dir}/vmd ] && ! grep -qa cgroup-supervision {extract_dir}/bin/vmd; then
+                echo "incoming vmd lacks cgroup-supervision — verifying host is drained before downgrade"
+                sudo systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+                set +e
+                sudo bash -c 'set -a; . /etc/sandbox/vmd.env 2>/dev/null; set +a; exec {install_dir}/vmd drain-check'
+                DRAIN_RC=$?
+                set -e
+                if [ "$DRAIN_RC" -ne 0 ]; then
+                    echo "ERROR: host is NOT drained of direct-spawn state (drain-check rc=$DRAIN_RC); refusing to downgrade vmd. Drain cgroup VMs first, then retry." >&2
+                    sudo systemctl start superserve-vmd.socket || true
+                    exit 1
+                fi
+                echo "host drained — proceeding with downgrade"
+            fi
+
             # Install vmd + template-builder binaries.
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
