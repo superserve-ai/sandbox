@@ -45,10 +45,9 @@ module "network" {
   subnet_name                 = "superserve-subnet-05cb005"
   subnet_cidr                 = "10.0.0.0/24"
   create_vpc_connector        = true
-  create_vpc_connector_subnet = false
   vpc_connector_name          = "ss-vpc-conn-f1b3552"
-  vpc_connector_mode          = "subnet"
-  vpc_connector_subnet        = "rayai-staging-connector-subnet"
+  vpc_connector_mode          = "ip_cidr_range"
+  vpc_connector_ip_cidr_range = "10.8.0.0/28"
   manage_public_ssh_deny      = true
   enable_iap_ssh              = true
   iap_ssh_target_tags         = ["superserve-vmd"]
@@ -83,20 +82,20 @@ module "network" {
   labels = local.common_labels
 }
 
-# Existing dedicated Serverless VPC Access subnet. It is not proxy-only and is
-# therefore in scope for VPC Flow Logs. The connector references this subnet by
-# name through module.network.
+# Existing subnet in the legacy staging VPC. Importing it allows Terraform to
+# verify and retain VPC Flow Logs without moving it to the Superserve VPC.
 resource "google_compute_subnetwork" "staging_connector" {
   project       = local.project_id
   name          = "rayai-staging-connector-subnet"
   region        = local.region
   ip_cidr_range = "10.8.0.0/28"
-  network       = module.network.network_self_link
+  network       = "projects/${local.project_id}/global/networks/rayai-staging-vpc"
 
   log_config {
-    aggregation_interval = "INTERVAL_10_MIN"
+    aggregation_interval = "INTERVAL_5_SEC"
     flow_sampling        = 0.5
     metadata             = "INCLUDE_ALL_METADATA"
+    metadata_fields      = []
   }
 }
 
