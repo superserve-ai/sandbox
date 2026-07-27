@@ -1351,14 +1351,19 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// mode this launch ACTUALLY chose (arming can put a legacy VM's throwaway
 	// on the cgroup path), or the FC and its cgroup outlive the verify.
 	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, inst.Supervision, true)
-	if err != nil {
-		return "", fmt.Errorf("start firecracker for verify: %w", err)
-	}
+	// Register the mode-aware stop BEFORE the error branch: a cgroup launch that
+	// forked FC but failed socket-readiness (kill unconfirmed) returns cgroup
+	// mode with an error and leaves a live throwaway, so the deferred stop must
+	// run to kill it — or the FC and its tap outlive the verify. A no-op when
+	// nothing spawned (stopVM is idempotent on a missing group or unit).
 	defer func() {
 		sctx, scancel := context.WithTimeout(context.Background(), stopUnitBudget)
 		_ = m.stopVM(sctx, vmID, verifySupervision)
 		scancel()
 	}()
+	if err != nil {
+		return "", fmt.Errorf("start firecracker for verify: %w", err)
+	}
 
 	if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
 		return "", err
@@ -2257,6 +2262,14 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				// we're about to delete out from under it.
 				if err := m.stopVM(ctx, rec.ID, rec.Supervision); err != nil {
 					log.Warn().Err(err).Msg("stop failed for socket-missing VM")
+					// A cgroup FC that survived the stop still holds its tap;
+					// deleting the record and reclaiming the slot now would recycle
+					// it under a live process and discard the only handle to retry.
+					// Keep both intact unless it's confirmed dead — the reconciler
+					// reclaims it once the group empties. Legacy unit path unchanged.
+					if cgroupSupervised(rec.Supervision) && !m.vmDefinitelyDead(ctx, rec.ID, rec.Supervision) {
+						return nil, false
+					}
 				}
 				m.state.Delete(rec.ID)
 				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
@@ -2421,10 +2434,13 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 // the racy post-gate case is left to the reconciler under its op lock. No-op
 // unless direct spawn is armed/managed and the state store is attached.
 //
-// Returns the namespaces of survivors it could NOT confirm dead. A SIGKILL-
-// immune FC (D-state, UFFD-wedged) survives the kill still holding its tap;
-// the caller must keep that namespace out of the orphan sweep or the slot
-// recycles under a live FC, breaking death-before-recycle.
+// A SIGKILL-immune FC (D-state, UFFD-wedged) survives the kill still holding
+// its tap. For each such survivor this reserves the slot under its id — the
+// same way a record protects its own, so the pool won't fresh-claim it and
+// adoption skips owned slots — and returns its namespace so the non-adoption
+// orphan sweep keeps it too. Either reclaim path recycling the slot under a
+// live FC would break death-before-recycle. Drift-0 releases the reservation
+// via CleanupVMOrNamespace once the FC is finally dead.
 func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) []string {
 	if m.cgroups == nil || m.state == nil {
 		return nil
@@ -2450,9 +2466,10 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) []string {
 			m.log.Error().Err(serr).Str("vm_id", id).Msg("failed to reap recordless cgroup")
 			// Only protect when the FC is not provably dead (still populated or
 			// unreadable). A confirmed-empty group whose rmdir merely failed is
-			// dead — its slot is genuinely free for the sweep.
+			// dead — its slot is genuinely free to reclaim.
 			if ns != "" {
 				if pop, perr := m.cgroups.vmCgroupPopulated(id); perr != nil || pop {
+					m.netMgr.ReserveSlotsAbove(map[string]string{id: ns})
 					protected = append(protected, ns)
 				}
 			}

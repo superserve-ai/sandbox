@@ -584,12 +584,14 @@ func main() {
 	// treat it as pool inventory. Safe here — synchronous, before the request
 	// gate opens, so no in-flight create can be mistaken for a survivor
 	// (that racy post-gate case is the reconciler's job). No-op unless armed.
+	// The reap reserves the slots of survivors it couldn't confirm dead, so
+	// both the pool and the adoption pass below skip them; protectedNs carries
+	// their namespaces so the non-adoption sweep keeps them too.
 	protectedNs := mgr.ReapRecordlessCgroupVMs(ctx)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
 	if !adoptNetPool {
 		// Under adoption, orphan namespaces are warm-pool candidates instead
 		// of garbage; the adoption pass below validates or sweeps each one.
-		// Survivors the reap couldn't confirm dead keep their tap.
 		mgr.SweepStartupOrphanNamespaces(protectedNs...)
 	}
 
