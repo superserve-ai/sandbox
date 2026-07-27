@@ -347,13 +347,24 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		return
 	}
 
-	vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
 	// Reaper rollback resume: brings the VM back up after a pause-DB-write
-	// failure, before the customer ever sees the transition.
-	_, _, _, err := vmd.ResumeInstance(vmdCtx, sbx.ID.String(), snapshotPath, memPath)
-	vmdCancel()
+	// failure, before the customer ever sees the transition. Same deadline
+	// retry as the user-facing boots — the background ctx never reads dead,
+	// which is right: a rollback landing late still beats marking the
+	// sandbox failed.
+	_, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, error) {
+		return vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath)
+	})
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")
+		// failed is terminal — nothing will resume this ID again, so a boot
+		// that landed after the deadline would idle against the failed row
+		// until the reconciler sweeps it. Best-effort destroy now (mirrors
+		// the create path). Unlike the resume handler's error branches,
+		// there is no adopt-on-retry self-heal here to preserve.
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), vmdTimeout)
+		_ = vmd.DestroyInstance(dctx, sbx.ID.String(), true)
+		dcancel()
 		h.markSandboxFailed(ctx, sbx, "rollback resume failed after pause DB error", rl)
 		return
 	}

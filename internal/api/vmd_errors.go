@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,29 @@ func isVMDNotFound(err error) bool {
 		return false
 	}
 	return status.Code(err) == codes.NotFound
+}
+
+// isVMDDeadline returns true when a vmd call died on its deadline. Two
+// distinct surfaces: a gRPC status (which status.Code resolves even through
+// fmt.Errorf wrapping), and a plain context.DeadlineExceeded — which
+// status.Code does NOT map (it reads as Unknown) and which the dial-site
+// Unavailable-retry interceptor returns when its window expires mid-backoff.
+func isVMDDeadline(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.DeadlineExceeded ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
+// isVMDUnavailable returns true when the daemon was unreachable for the
+// whole of the dial-site interceptor's retry window — the shape a vmd
+// restart longer than that window surfaces as.
+func isVMDUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Unavailable
 }
 
 // isVMDFileMissing returns true when vmd returned a FailedPrecondition
