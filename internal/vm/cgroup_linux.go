@@ -98,6 +98,10 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 			return false, fmt.Errorf("delegated scope lacks %s (kernel too old?): %w", f, err)
 		}
 	}
+	// A dead keeper leaves the unit "failed"; refuse to arm NEW launches. The
+	// scope was still adopted above (systemd keeps a failed-but-populated unit's
+	// ControlGroup), so m.cgroups is set and existing VMs stay managed — the
+	// keeper-death policy: block new launches, keep servicing the live ones.
 	if !unitIsActive(ctx, vmsUnitName) {
 		return false, fmt.Errorf("%s is not active — cannot arm direct spawn", vmsUnitName)
 	}
