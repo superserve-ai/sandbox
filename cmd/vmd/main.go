@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -501,6 +502,12 @@ func main() {
 	// process); a refusal degrades new launches to the unit path but still
 	// initializes the subtree for managing any existing cgroup VMs.
 	if arms, err := mgr.ArmDirectSpawn(ctx); err != nil {
+		if errors.Is(err, vm.ErrCgroupVMsUnmanageable) {
+			// Existing cgroup VMs can't be adopted — refuse to come up "ready"
+			// while they run unmanaged. Crashloop surfaces the broken scope for
+			// an operator to repair; the VMs themselves keep running meanwhile.
+			log.Fatal().Err(err).Msg("existing cgroup-mode VMs cannot be managed — refusing to start")
+		}
 		log.Error().Err(err).Msg("direct spawn not armed — launches use the unit path")
 	} else if arms {
 		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")

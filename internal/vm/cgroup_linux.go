@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,11 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 )
+
+// ErrCgroupVMsUnmanageable means the host holds cgroup-supervised VMs (records
+// or live groups) but the delegated scope could not be adopted, so those VMs
+// are unmanageable. Startup treats this as fatal — never a silent degrade.
+var ErrCgroupVMsUnmanageable = errors.New("existing cgroup-mode VMs cannot be managed")
 
 // Direct-spawn cgroup management. VMs live in the shipped, delegated
 // superserve-vms.service under sandboxes.slice — sharing the one aggregate
@@ -79,10 +85,12 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	}
 	tree, err := adoptVmsScope(ctx)
 	if err != nil {
-		if wantArm {
-			return false, fmt.Errorf("adopt delegated VM scope (%s): %w", vmsUnitName, err)
+		if haveCgroupVMs {
+			// Existing cgroup-mode VMs but the scope can't be adopted → they are
+			// unmanageable. Fatal at the caller, never a silent degrade to ready.
+			return false, fmt.Errorf("%w: adopt %s: %v", ErrCgroupVMsUnmanageable, vmsUnitName, err)
 		}
-		return false, fmt.Errorf("cannot manage existing cgroup-mode VMs: %w", err)
+		return false, fmt.Errorf("adopt delegated VM scope (%s): %w", vmsUnitName, err)
 	}
 	// Tree is usable: existing cgroup VMs are now manageable regardless of
 	// the flag.
@@ -109,6 +117,18 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		// Without the delegation guarantee, systemd could reorganize the
 		// subtree on a daemon-reload and strand VMs. Refuse to arm.
 		return false, fmt.Errorf("%s is not Delegate=yes — direct spawn needs a delegated subtree", vmsUnitName)
+	}
+	// KillMode=process on the vms service is load-bearing: a stop or restart of
+	// that unit must signal only the keeper, never cascade into the VM children.
+	// Refuse to arm if it drifted from the shipped config.
+	if km := unitStringProperty(ctx, vmsUnitName, "Service", "KillMode"); km != "process" {
+		return false, fmt.Errorf("%s KillMode=%q, need \"process\" — a scope stop would kill every VM", vmsUnitName, km)
+	}
+	// The aggregate memory ceiling lives on an ancestor of the scope
+	// (sandboxes.slice). If it drifted to unlimited, the reserve that protects
+	// the host from OOM is gone. Require a finite memory.max at or above it.
+	if !parentMemoryCapped(tree.vms) {
+		return false, fmt.Errorf("delegated scope %q has no effective memory ceiling — refusing to arm", tree.vms)
 	}
 	// The guest console is untrusted; the only bound on its file is the
 	// Firecracker serial cap. Refuse to arm on a binary that doesn't
@@ -264,6 +284,23 @@ func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
 		return nil, fmt.Errorf("enable controllers on scope root: %w", err)
 	}
 	return t, nil
+}
+
+// parentMemoryCapped reports whether any cgroup at or above scopePath sets a
+// finite memory.max — the effective ceiling that bounds the VM subtree (v2
+// enforces memory.max as the min over ancestors). All "max" up to the mount
+// root means the aggregate cap drifted away.
+func parentMemoryCapped(scopePath string) bool {
+	for dir := scopePath; strings.HasPrefix(dir, cgroupMount); dir = filepath.Dir(dir) {
+		data, err := os.ReadFile(filepath.Join(dir, "memory.max"))
+		if err == nil && strings.TrimSpace(string(data)) != "max" {
+			return true
+		}
+		if dir == cgroupMount {
+			break
+		}
+	}
+	return false
 }
 
 func readCgroupProcs(dir string) ([]int, error) {

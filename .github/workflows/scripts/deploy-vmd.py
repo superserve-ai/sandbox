@@ -254,7 +254,15 @@ def main() -> int:
             # re-adopts the existing scope; boot-time start is covered by WantedBy.
             sudo systemctl enable --quiet superserve-vms.service
             VMS_CG=$(systemctl show -p ControlGroup --value superserve-vms.service 2>/dev/null || true)
-            if [ -n "$VMS_CG" ] && sudo find "/sys/fs/cgroup$VMS_CG" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .; then
+            # -print -quit (find exits itself after the first hit) instead of
+            # piping to grep -q: under set -o pipefail, grep closing the pipe
+            # early SIGPIPEs find and the pipeline reads non-zero even on a
+            # match, which would wrongly try to start a populated keeper.
+            VMS_CHILD=""
+            if [ -n "$VMS_CG" ]; then
+                VMS_CHILD=$(sudo find "/sys/fs/cgroup$VMS_CG" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)
+            fi
+            if [ -n "$VMS_CHILD" ]; then
                 echo "delegated VM scope already established — not (re)starting the keeper; vmd will adopt it"
             else
                 sudo systemctl start superserve-vms.service
