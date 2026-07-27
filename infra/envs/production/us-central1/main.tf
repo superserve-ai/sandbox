@@ -21,14 +21,17 @@ provider "google" {
 }
 
 locals {
-  project_id                = var.project_id
-  environment               = var.environment
-  region                    = var.region
-  zone                      = var.zone
-  resource_suffix           = coalesce(var.resource_suffix, var.environment)
-  service_account_suffix    = coalesce(var.service_account_suffix, local.resource_suffix)
-  api_sa_key                = "superserve_api"
-  api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
+  project_id                 = var.project_id
+  environment                = var.environment
+  region                     = var.region
+  zone                       = var.zone
+  resource_suffix            = coalesce(var.resource_suffix, var.environment)
+  service_account_suffix     = coalesce(var.service_account_suffix, local.resource_suffix)
+  api_sa_key                 = "superserve_api"
+  api_runner_sa_key          = "superserve_api_runtime"
+  host_runner_sa_key         = "superserve_sandbox_runtime"
+  api_service_account_email  = "superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com"
+  host_service_account_email = "superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com"
 
   common_labels = {
     environment = local.environment
@@ -47,18 +50,60 @@ module "network" {
   create_network = var.create_network
   network_name   = var.network_name
 
-  # The us-central1 primary control plane and vmd host are decommissioned. This
-  # root now keeps only its subnet in the shared superserve-production-vpc; the
-  # host's firewall rules, IAP-SSH allow, public-SSH deny, and the Cloud Run VPC
-  # connector (used only by the removed control plane) are all removed. The
-  # us-east4 cell owns its own equivalents in the same VPC.
-  subnet_name = "superserve-prod-subnet"
-  subnet_cidr = var.subnet_cidr
+  subnet_name            = "superserve-prod-subnet"
+  subnet_cidr            = var.subnet_cidr
+  manage_public_ssh_deny = true
+  enable_iap_ssh         = true
+  iap_ssh_target_tags    = ["superserve-vmd"]
 
-  manage_public_ssh_deny = false
-  enable_iap_ssh         = false
-  create_vpc_connector   = false
-  firewall_rules         = {}
+  create_vpc_connector        = true
+  create_vpc_connector_subnet = false
+  vpc_connector_name          = "superserve-prod-conn"
+  vpc_connector_mode          = "ip_cidr_range"
+  vpc_connector_ip_cidr_range = var.connector_subnet_cidr
+  vpc_connector_machine_type  = "e2-micro"
+  vpc_connector_min_instances = 2
+  vpc_connector_max_instances = 10
+
+  firewall_rules = {
+    allow_internal = {
+      name          = "superserve-prod-allow-internal"
+      direction     = "INGRESS"
+      source_ranges = [var.subnet_cidr]
+      target_tags   = ["superserve-vmd"]
+      allow = [
+        {
+          protocol = "tcp"
+          ports    = ["5007", "5008", "50051"]
+        }
+      ]
+      description = "Allow private host-to-host sandbox control traffic only."
+    }
+    allow_otel_ingress = {
+      name          = "superserve-prod-allow-cr-to-host-otel"
+      direction     = "INGRESS"
+      source_ranges = [var.connector_subnet_cidr]
+      target_tags   = ["superserve-vmd"]
+      allow = [
+        {
+          protocol = "tcp"
+          ports    = ["4317", "4318"]
+        }
+      ]
+      description = "Allow Cloud Run connector traffic to host-local OTLP endpoints."
+    }
+    allow_vmd_grpc = {
+      name          = "superserve-prod-allow-cr-to-host-vmd"
+      direction     = "INGRESS"
+      source_ranges = [var.connector_subnet_cidr]
+      target_tags   = ["superserve-vmd"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["50051"]
+      }]
+      description = "Allow Cloud Run connector traffic to the host VMD gRPC endpoint."
+    }
+  }
 
   labels = local.common_labels
 }
@@ -71,21 +116,127 @@ module "iam" {
   service_accounts = {
     (local.api_sa_key) = {
       account_id   = "superserve-api-runner"
-      display_name = "Superserve API Cloud Run Service Account"
+      display_name = "Superserve API (legacy runtime)"
+      description  = "Retained during migration to the dedicated production runner account."
+    }
+    (local.api_runner_sa_key) = {
+      account_id   = "superserve-api-runtime"
+      display_name = "Superserve production API runtime"
+      description  = "Runtime identity for the production API service."
+    }
+    (local.host_runner_sa_key) = {
+      account_id   = "superserve-sandbox-runtime"
+      display_name = "Superserve production sandbox runtime"
+      description  = "Runtime identity for the production sandbox host."
+    }
+    superserve_runner = {
+      account_id   = "superserve-runner"
+      display_name = "Superserve production runtime (legacy)"
+      description  = "Retained during migration to separate API and sandbox runtime identities."
+    }
+    superserve_deployer = {
+      account_id   = "superserve-deployer"
+      display_name = "Superserve production infrastructure deployer"
+      description  = "Terraform and deployment identity; not used by running workloads."
     }
   }
   project_bindings = {
-    production_host_metric_writer = {
+    production_runtime_metric_writer = {
       role = "roles/monitoring.metricWriter"
       members = [
-        "serviceAccount:${local.api_service_account_email}"
+        "serviceAccount:${local.api_service_account_email}",
+        "serviceAccount:${local.host_service_account_email}",
       ]
+    }
+    production_runtime_log_writer = {
+      role = "roles/logging.logWriter"
+      members = [
+        "serviceAccount:${local.api_service_account_email}",
+        "serviceAccount:${local.host_service_account_email}",
+      ]
+    }
+    production_deployer_compute_instance_admin = {
+      role    = "roles/compute.instanceAdmin.v1"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_compute_network_admin = {
+      role    = "roles/compute.networkAdmin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_compute_security_admin = {
+      role    = "roles/compute.securityAdmin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_compute_load_balancer_admin = {
+      role    = "roles/compute.loadBalancerAdmin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_compute_os_admin_login = {
+      role    = "roles/compute.osAdminLogin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_iap_tunnel_accessor = {
+      role    = "roles/iap.tunnelResourceAccessor"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_run_admin = {
+      role    = "roles/run.admin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    # Account creation and project/secret IAM policy changes are bootstrap-only
+    # operations. Keeping those permissions off the routine deployer prevents
+    # it from escalating itself or changing unrelated identities and secrets.
+    production_deployer_service_account_viewer = {
+      role    = "roles/iam.serviceAccountViewer"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_project_viewer = {
+      role    = "roles/viewer"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_secret_viewer = {
+      role    = "roles/secretmanager.viewer"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_artifact_registry_writer = {
+      role    = "roles/artifactregistry.writer"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_vpc_access_admin = {
+      role    = "roles/vpcaccess.admin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_monitoring_editor = {
+      role    = "roles/monitoring.editor"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+  }
+  service_bindings = {
+    production_deployer_can_run_as_runtime = {
+      service_account = "projects/${local.project_id}/serviceAccounts/${local.api_service_account_email}"
+      role            = "roles/iam.serviceAccountUser"
+      members         = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    production_deployer_can_run_as_sandbox_runtime = {
+      service_account = "projects/${local.project_id}/serviceAccounts/${local.host_service_account_email}"
+      role            = "roles/iam.serviceAccountUser"
+      members         = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+  }
+  workload_identity = {
+    github_sandbox = {
+      service_account = "projects/${local.project_id}/serviceAccounts/superserve-deployer@${local.project_id}.iam.gserviceaccount.com"
+      principal       = "principalSet://iam.googleapis.com/projects/887554770957/locations/global/workloadIdentityPools/github-pool/attribute.repository/superserve-ai/sandbox"
     }
   }
   labels = local.common_labels
 }
 resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
   for_each = toset([
+    coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}"),
+    coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}"),
+    coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}"),
+    coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}"),
     "posthog-project-key",
     "slack-quota-alert-webhook",
     coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
@@ -98,25 +249,129 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
   member    = "serviceAccount:${local.api_service_account_email}"
 }
 
-# The api-runner SA's encrypt/decrypt grant on the credentials-kek KMS key is
-# managed out-of-band: the CD Terraform SA lacks KMS setIamPolicy on the key,
-# and the SA is shared across cells, so this follows the same out-of-band
-# pattern as the shared runtime secrets.
+resource "google_storage_bucket_iam_member" "deployer_terraform_state" {
+  bucket = "superserve-terraform-state-prod"
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${module.iam.service_account_emails["superserve_deployer"]}"
+}
 
+resource "google_storage_bucket_iam_member" "deployer_terraform_state_reader" {
+  bucket = "superserve-terraform-state-prod"
+  role   = "roles/storage.legacyBucketReader"
+  member = "serviceAccount:${module.iam.service_account_emails["superserve_deployer"]}"
+}
 
-# Production monitoring dashboards. These are fleet-wide (whole-fleet
-# operations/hosts/database/collector views spanning every region), not
-# us-central1-specific — they are rooted in this state only because us-central1
-# was historically the primary region. The host and control plane here are being
-# decommissioned, but the dashboards must survive, so this module stays. The
-# per-host CPU alert that used to live here was removed with the host it watched.
+module "api" {
+  source = "../../../modules/api"
+
+  project_id            = local.project_id
+  environment           = local.environment
+  region                = local.region
+  service_name          = "superserve-api"
+  service_account_email = module.iam.service_account_emails[local.api_runner_sa_key]
+  image                 = "${local.region}-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
+
+  env = {
+    API_PORT                    = "8080"
+    SUPABASE_URL                = var.supabase_url
+    SECRETS_SIGNING_KEY_ID      = "v1"
+    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
+    ALLOW_EPHEMERAL_SEED        = "0"
+    DB_MAX_CONNS                = "12"
+    EDGE_PROXY_DOMAIN           = "sandbox.superserve.ai"
+    KMS_KEY_RESOURCE            = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+    OTEL_ENVIRONMENT            = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${module.sandbox_host.internal_ip}:4318"
+    OTEL_EXPORT_INTERVAL        = "15s"
+    OTEL_METRICS_ENABLED        = "true"
+    OTEL_SERVICE_NAME           = "sandbox-controlplane"
+  }
+
+  secrets = {
+    DATABASE_URL = {
+      secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
+    }
+    INTERNAL_API_TOKEN = {
+      secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
+    }
+    SANDBOX_ACCESS_TOKEN_SEED = {
+      secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
+    }
+    SECRETS_SIGNING_KEY = {
+      secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
+    }
+    SENTRY_DSN = {
+      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
+    }
+    SYSTEM_TEAM_ID = {
+      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+    }
+    SLACK_QUOTA_ALERT_WEBHOOK = {
+      secret = "slack-quota-alert-webhook"
+    }
+    POSTHOG_KEY = {
+      secret = "posthog-project-key"
+    }
+  }
+  cpu_limit    = "2"
+  memory_limit = "1Gi"
+  # 0 matches the live service: this cell was scaled to idle after the us-east4
+  # cutover and is pending decommission. Declaring the live value keeps the plan
+  # a no-op instead of re-inflating the idle cell to 6 on the next apply.
+  min_instances     = 0
+  max_instances     = 10
+  startup_cpu_boost = true
+  cpu_idle          = true
+
+  vpc_connector = module.network.vpc_connector_id
+  vpc_egress    = "PRIVATE_RANGES_ONLY"
+  labels        = local.common_labels
+
+  depends_on = [
+    google_secret_manager_secret_iam_member.api_runtime_secrets,
+  ]
+}
+
+module "sandbox_host" {
+  source = "../../../modules/sandbox-host"
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-prod"
+  machine_type  = var.machine_type
+  subnet        = module.network.subnetwork_self_link
+  internal_ip   = "10.0.0.3"
+  tags          = ["superserve-vmd"]
+  labels = merge(local.common_labels, {
+    component               = "vmd"
+    sandbox_role            = "vmd"
+    "goog-ops-agent-policy" = "v2-template-1-7-0"
+  })
+
+  service_account_email     = module.iam.service_account_emails[local.host_runner_sa_key]
+  allow_stopping_for_update = true
+  boot_disk_image           = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts"
+  can_ip_forward            = false
+  on_host_maintenance       = "TERMINATE"
+  metadata                  = {}
+}
+
 module "observability" {
   source = "../../../modules/observability"
 
   project_id               = local.project_id
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids
-  labels                   = local.common_labels
+  compute_instance_cpu_alerts = {
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
+    }
+  }
+  labels = local.common_labels
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Production Operations"
