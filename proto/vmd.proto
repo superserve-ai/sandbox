@@ -69,6 +69,10 @@ service VMDaemon {
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
 
+  // UpdateSandboxPreviewPolicy replaces the explicit public-port allowlist on
+  // the instance record. The edge proxy reads that record for enforcement.
+  rpc UpdateSandboxPreviewPolicy(UpdateSandboxPreviewPolicyRequest) returns (UpdateSandboxPreviewPolicyResponse);
+
   // InvalidateSecret drops any cached cleartext for the given secret in the
   // local secretsproxy daemon. Idempotent.
   rpc InvalidateSecret(InvalidateSecretRequest) returns (InvalidateSecretResponse);
@@ -337,6 +341,17 @@ message RestoreSnapshotRequest {
   // attribute exec/file activity without a database. Both may be empty.
   string team_id = 10;
   string owner_id = 11;
+  // Numeric-port routing policy carried onto the vmd instance record. Empty
+  // and "legacy_public" preserve all-port routing; "public" requires a port
+  // to appear in preview_ports.
+  string preview_access = 12;
+  repeated PreviewPort preview_ports = 13;
+  // Monotonic generation used to reject stale full-allowlist pushes.
+  int64 preview_policy_revision = 14;
+}
+
+message PreviewPort {
+  int32 port = 1;
 }
 
 message RestoreSnapshotResponse {
@@ -504,6 +519,17 @@ message UpdateSandboxNetworkRequest {
 }
 
 message UpdateSandboxNetworkResponse {
+  string vm_id = 1;
+}
+
+message UpdateSandboxPreviewPolicyRequest {
+  string vm_id = 1;
+  string preview_access = 2;              // "legacy_public" | "public"
+  repeated PreviewPort preview_ports = 3; // full replacement allowlist
+  int64 policy_revision = 4;              // monotonic; equal must match exactly
+}
+
+message UpdateSandboxPreviewPolicyResponse {
   string vm_id = 1;
 }
 

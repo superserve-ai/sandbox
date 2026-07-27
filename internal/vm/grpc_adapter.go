@@ -9,6 +9,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -115,7 +116,15 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		}
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId())
+	if access := req.GetPreviewAccess(); access != "" && access != preview.AccessLegacyPublic && access != preview.AccessPublic {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, access)
+	}
+	previewPorts, err := previewPortsFromProto(req.GetPreviewPorts())
+	if err != nil {
+		return nil, err
+	}
+
+	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	if err != nil {
 		return nil, err
 	}
@@ -342,6 +351,43 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 	}
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
+}
+
+func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(_ context.Context, req *vmdpb.UpdateSandboxPreviewPolicyRequest) (*vmdpb.UpdateSandboxPreviewPolicyResponse, error) {
+	vmID := req.GetVmId()
+	if vmID == "" {
+		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+	access := req.GetPreviewAccess()
+	if access != preview.AccessLegacyPublic && access != preview.AccessPublic {
+		return nil, status.Errorf(codes.InvalidArgument, "preview_access must be %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, access)
+	}
+	ports, err := previewPortsFromProto(req.GetPreviewPorts())
+	if err != nil {
+		return nil, err
+	}
+	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, ports, req.GetPolicyRevision()); err != nil {
+		return nil, err
+	}
+	return &vmdpb.UpdateSandboxPreviewPolicyResponse{VmId: vmID}, nil
+}
+
+func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]struct{}, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[int32]struct{}, len(in))
+	for _, item := range in {
+		port := item.GetPort()
+		if err := preview.ValidatePublishedPort(port); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid preview port %d: %v", port, err)
+		}
+		if _, duplicate := out[port]; duplicate {
+			return nil, status.Errorf(codes.InvalidArgument, "duplicate preview port: %d", port)
+		}
+		out[port] = struct{}{}
+	}
+	return out, nil
 }
 
 // InvalidateSecret forwards the invalidate call to the local secretsproxy daemon.

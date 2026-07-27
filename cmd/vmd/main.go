@@ -691,6 +691,7 @@ func main() {
 				ControlPlaneURL: cfg.ControlPlaneURL,
 				HostID:          cfg.HostID,
 				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+				ProxyHealthURL:  os.Getenv("PROXY_HEALTH_URL"),
 			}, log)
 			return nil
 		})

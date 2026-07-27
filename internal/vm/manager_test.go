@@ -985,7 +985,7 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 		restoreSem: make(chan struct{}, 1),
 	}
 
-	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
 	if err != nil {
 		t.Fatalf("retried restore of a healthy running VM should succeed, got %v", err)
 	}
@@ -1023,7 +1023,7 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 		restoreSem: make(chan struct{}, 1),
 	}
 
-	inst, _ := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner")
+	inst, _ := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
 	if inst == existing {
 		t.Fatal("a restore for different artifacts must not return the old VM")
 	}

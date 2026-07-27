@@ -19,28 +19,29 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	VMDaemon_DestroyVM_FullMethodName               = "/superserve.vmd.v1.VMDaemon/DestroyVM"
-	VMDaemon_PauseVM_FullMethodName                 = "/superserve.vmd.v1.VMDaemon/PauseVM"
-	VMDaemon_ResumeVM_FullMethodName                = "/superserve.vmd.v1.VMDaemon/ResumeVM"
-	VMDaemon_CreateSnapshot_FullMethodName          = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
-	VMDaemon_RestoreSnapshot_FullMethodName         = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
-	VMDaemon_InjectSandboxEnv_FullMethodName        = "/superserve.vmd.v1.VMDaemon/InjectSandboxEnv"
-	VMDaemon_DeleteSnapshot_FullMethodName          = "/superserve.vmd.v1.VMDaemon/DeleteSnapshot"
-	VMDaemon_DeleteSandboxSnapshots_FullMethodName  = "/superserve.vmd.v1.VMDaemon/DeleteSandboxSnapshots"
-	VMDaemon_DeleteTemplateArtifacts_FullMethodName = "/superserve.vmd.v1.VMDaemon/DeleteTemplateArtifacts"
-	VMDaemon_DeleteBuildArtifacts_FullMethodName    = "/superserve.vmd.v1.VMDaemon/DeleteBuildArtifacts"
-	VMDaemon_ListBuildArtifacts_FullMethodName      = "/superserve.vmd.v1.VMDaemon/ListBuildArtifacts"
-	VMDaemon_ListDir_FullMethodName                 = "/superserve.vmd.v1.VMDaemon/ListDir"
-	VMDaemon_GetVMInfo_FullMethodName               = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
-	VMDaemon_SetupNetwork_FullMethodName            = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
-	VMDaemon_UpdateSandboxNetwork_FullMethodName    = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
-	VMDaemon_InvalidateSecret_FullMethodName        = "/superserve.vmd.v1.VMDaemon/InvalidateSecret"
-	VMDaemon_RevokeSandbox_FullMethodName           = "/superserve.vmd.v1.VMDaemon/RevokeSandbox"
-	VMDaemon_InvalidateSandboxRules_FullMethodName  = "/superserve.vmd.v1.VMDaemon/InvalidateSandboxRules"
-	VMDaemon_BuildTemplate_FullMethodName           = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
-	VMDaemon_GetBuildStatus_FullMethodName          = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
-	VMDaemon_CancelBuild_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CancelBuild"
-	VMDaemon_StreamBuildLogs_FullMethodName         = "/superserve.vmd.v1.VMDaemon/StreamBuildLogs"
+	VMDaemon_DestroyVM_FullMethodName                  = "/superserve.vmd.v1.VMDaemon/DestroyVM"
+	VMDaemon_PauseVM_FullMethodName                    = "/superserve.vmd.v1.VMDaemon/PauseVM"
+	VMDaemon_ResumeVM_FullMethodName                   = "/superserve.vmd.v1.VMDaemon/ResumeVM"
+	VMDaemon_CreateSnapshot_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
+	VMDaemon_RestoreSnapshot_FullMethodName            = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
+	VMDaemon_InjectSandboxEnv_FullMethodName           = "/superserve.vmd.v1.VMDaemon/InjectSandboxEnv"
+	VMDaemon_DeleteSnapshot_FullMethodName             = "/superserve.vmd.v1.VMDaemon/DeleteSnapshot"
+	VMDaemon_DeleteSandboxSnapshots_FullMethodName     = "/superserve.vmd.v1.VMDaemon/DeleteSandboxSnapshots"
+	VMDaemon_DeleteTemplateArtifacts_FullMethodName    = "/superserve.vmd.v1.VMDaemon/DeleteTemplateArtifacts"
+	VMDaemon_DeleteBuildArtifacts_FullMethodName       = "/superserve.vmd.v1.VMDaemon/DeleteBuildArtifacts"
+	VMDaemon_ListBuildArtifacts_FullMethodName         = "/superserve.vmd.v1.VMDaemon/ListBuildArtifacts"
+	VMDaemon_ListDir_FullMethodName                    = "/superserve.vmd.v1.VMDaemon/ListDir"
+	VMDaemon_GetVMInfo_FullMethodName                  = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
+	VMDaemon_SetupNetwork_FullMethodName               = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
+	VMDaemon_UpdateSandboxNetwork_FullMethodName       = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
+	VMDaemon_UpdateSandboxPreviewPolicy_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxPreviewPolicy"
+	VMDaemon_InvalidateSecret_FullMethodName           = "/superserve.vmd.v1.VMDaemon/InvalidateSecret"
+	VMDaemon_RevokeSandbox_FullMethodName              = "/superserve.vmd.v1.VMDaemon/RevokeSandbox"
+	VMDaemon_InvalidateSandboxRules_FullMethodName     = "/superserve.vmd.v1.VMDaemon/InvalidateSandboxRules"
+	VMDaemon_BuildTemplate_FullMethodName              = "/superserve.vmd.v1.VMDaemon/BuildTemplate"
+	VMDaemon_GetBuildStatus_FullMethodName             = "/superserve.vmd.v1.VMDaemon/GetBuildStatus"
+	VMDaemon_CancelBuild_FullMethodName                = "/superserve.vmd.v1.VMDaemon/CancelBuild"
+	VMDaemon_StreamBuildLogs_FullMethodName            = "/superserve.vmd.v1.VMDaemon/StreamBuildLogs"
 )
 
 // VMDaemonClient is the client API for VMDaemon service.
@@ -97,6 +98,9 @@ type VMDaemonClient interface {
 	SetupNetwork(ctx context.Context, in *SetupNetworkRequest, opts ...grpc.CallOption) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error)
+	// UpdateSandboxPreviewPolicy replaces the explicit public-port allowlist on
+	// the instance record. The edge proxy reads that record for enforcement.
+	UpdateSandboxPreviewPolicy(ctx context.Context, in *UpdateSandboxPreviewPolicyRequest, opts ...grpc.CallOption) (*UpdateSandboxPreviewPolicyResponse, error)
 	// InvalidateSecret drops any cached cleartext for the given secret in the
 	// local secretsproxy daemon. Idempotent.
 	InvalidateSecret(ctx context.Context, in *InvalidateSecretRequest, opts ...grpc.CallOption) (*InvalidateSecretResponse, error)
@@ -283,6 +287,16 @@ func (c *vMDaemonClient) UpdateSandboxNetwork(ctx context.Context, in *UpdateSan
 	return out, nil
 }
 
+func (c *vMDaemonClient) UpdateSandboxPreviewPolicy(ctx context.Context, in *UpdateSandboxPreviewPolicyRequest, opts ...grpc.CallOption) (*UpdateSandboxPreviewPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateSandboxPreviewPolicyResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_UpdateSandboxPreviewPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vMDaemonClient) InvalidateSecret(ctx context.Context, in *InvalidateSecretRequest, opts ...grpc.CallOption) (*InvalidateSecretResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(InvalidateSecretResponse)
@@ -416,6 +430,9 @@ type VMDaemonServer interface {
 	SetupNetwork(context.Context, *SetupNetworkRequest) (*SetupNetworkResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error)
+	// UpdateSandboxPreviewPolicy replaces the explicit public-port allowlist on
+	// the instance record. The edge proxy reads that record for enforcement.
+	UpdateSandboxPreviewPolicy(context.Context, *UpdateSandboxPreviewPolicyRequest) (*UpdateSandboxPreviewPolicyResponse, error)
 	// InvalidateSecret drops any cached cleartext for the given secret in the
 	// local secretsproxy daemon. Idempotent.
 	InvalidateSecret(context.Context, *InvalidateSecretRequest) (*InvalidateSecretResponse, error)
@@ -496,6 +513,9 @@ func (UnimplementedVMDaemonServer) SetupNetwork(context.Context, *SetupNetworkRe
 }
 func (UnimplementedVMDaemonServer) UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateSandboxNetwork not implemented")
+}
+func (UnimplementedVMDaemonServer) UpdateSandboxPreviewPolicy(context.Context, *UpdateSandboxPreviewPolicyRequest) (*UpdateSandboxPreviewPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateSandboxPreviewPolicy not implemented")
 }
 func (UnimplementedVMDaemonServer) InvalidateSecret(context.Context, *InvalidateSecretRequest) (*InvalidateSecretResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method InvalidateSecret not implemented")
@@ -809,6 +829,24 @@ func _VMDaemon_UpdateSandboxNetwork_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_UpdateSandboxPreviewPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateSandboxPreviewPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).UpdateSandboxPreviewPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_UpdateSandboxPreviewPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).UpdateSandboxPreviewPolicy(ctx, req.(*UpdateSandboxPreviewPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VMDaemon_InvalidateSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(InvalidateSecretRequest)
 	if err := dec(in); err != nil {
@@ -994,6 +1032,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateSandboxNetwork",
 			Handler:    _VMDaemon_UpdateSandboxNetwork_Handler,
+		},
+		{
+			MethodName: "UpdateSandboxPreviewPolicy",
+			Handler:    _VMDaemon_UpdateSandboxPreviewPolicy_Handler,
 		},
 		{
 			MethodName: "InvalidateSecret",

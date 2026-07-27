@@ -417,16 +417,19 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		BasePath:     basePath,
-		DeltaDir:     deltaDir,
-		TeamId:       teamID,
-		OwnerId:      ownerID,
-		EnvVars:      envVars,
+		VmId:                  vmID,
+		SnapshotPath:          snapshotPath,
+		MemFilePath:           memPath,
+		BasePath:              basePath,
+		DeltaDir:              deltaDir,
+		TeamId:                teamID,
+		OwnerId:               ownerID,
+		PreviewAccess:         previewAccess,
+		PreviewPorts:          previewPortsToProto(previewPorts),
+		PreviewPolicyRevision: previewPolicyRevision,
+		EnvVars:               envVars,
 	})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
@@ -437,6 +440,17 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		mem = rl.GetMemoryMib()
 	}
 	return resp.IpAddress, vcpu, mem, nil
+}
+
+func previewPortsToProto(ports map[int32]struct{}) []*vmdpb.PreviewPort {
+	if len(ports) == 0 {
+		return nil
+	}
+	out := make([]*vmdpb.PreviewPort, 0, len(ports))
+	for port := range ports {
+		out = append(out, &vmdpb.PreviewPort{Port: port})
+	}
+	return out
 }
 
 func (c *grpcVMDClient) InjectSandboxEnv(ctx context.Context, vmID string, envVars map[string]string, secretsJWT string) error {
@@ -541,6 +555,19 @@ func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, a
 	})
 	if err != nil {
 		return fmt.Errorf("gRPC UpdateSandboxNetwork: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, vmID, previewAccess string, previewPorts map[int32]struct{}, policyRevision int64) error {
+	_, err := c.client.UpdateSandboxPreviewPolicy(ctx, &vmdpb.UpdateSandboxPreviewPolicyRequest{
+		VmId:           vmID,
+		PreviewAccess:  previewAccess,
+		PreviewPorts:   previewPortsToProto(previewPorts),
+		PolicyRevision: policyRevision,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC UpdateSandboxPreviewPolicy: %w", err)
 	}
 	return nil
 }
