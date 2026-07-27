@@ -48,3 +48,10 @@ host or runtime service may run as it.
 Google-managed by default. The shared credentials KEK cannot be used: it lives
 in us-central1 and a bucket's default CMEK key must match the bucket's
 location. Pass a per-region key via `kms_key_name` to enable CMEK.
+
+CMEK prerequisite: before setting `kms_key_name`, grant the project's Cloud
+Storage service agent (`service-<project_number>@gs-project-accounts.iam.gserviceaccount.com`)
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` on the key, or bucket creation
+and object writes will be rejected. This module does not create that binding:
+KMS IAM grants are managed out-of-band in this repo because the CD Terraform
+SA cannot set KMS IAM policy (same pattern as the credentials-KEK grants).

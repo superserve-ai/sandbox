@@ -52,7 +52,7 @@ variable "noncurrent_version_retention_days" {
 }
 
 variable "kms_key_name" {
-  description = "Optional CMEK key resource name for bucket default encryption. Must be in the bucket's location; null uses Google-managed encryption."
+  description = "Optional CMEK key resource name for bucket default encryption. Must be in the bucket's location; null uses Google-managed encryption. Prerequisite: the project's Cloud Storage service agent must already hold roles/cloudkms.cryptoKeyEncrypterDecrypter on the key, or bucket creation and object writes fail. That grant is managed out-of-band, like the other KMS grants in this repo — the CD Terraform SA cannot set KMS IAM policy."
   type        = string
   default     = null
 }
