@@ -2832,11 +2832,23 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 	supervision := m.supervisionForVM(vmID)
 	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := m.stopVM(stopCtx, vmID, supervision); err != nil {
-		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("stop failed during restore error cleanup")
+	stopErr := m.stopVM(stopCtx, vmID, supervision)
+	if stopErr != nil {
+		m.log.Warn().Err(stopErr).Str("vm_id", vmID).Msg("stop failed during restore error cleanup")
 	}
 	if cgroupSupervised(supervision) {
-		return // kill+wait-empty already ensured the process is gone
+		// stopVM's cgroup path already sent cgroup.kill (SIGKILL to every
+		// process) and waited for the group to empty; a nil error means it
+		// is gone. On error the FC is wedged (e.g. uninterruptible I/O) —
+		// there is no stronger signal than SIGKILL — so do NOT claim clean:
+		// log it, and the slot stays safe because the pool recycles only
+		// after verifyAndRecycle confirms the netns empty, with the
+		// reconciler reaping the residual cgroup.
+		if stopErr != nil {
+			m.log.Error().Err(stopErr).Str("vm_id", vmID).
+				Msg("cgroup VM not confirmed stopped; slot recycle gated on pool verification")
+		}
+		return
 	}
 
 	// Unit path: slot is recycled right after this returns; if stopUnit timed
