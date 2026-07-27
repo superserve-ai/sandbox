@@ -47,18 +47,15 @@ func directSpawnScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID
 }
 
 // openVMConsole opens the per-VM console file the child's stdout/stderr
-// attach to. Firecracker's own log line plus panic/abort output land here —
-// including the UFFD handler-death message that precedes an exit(70). The
-// child holds this fd directly, so its console keeps flowing to the file even
-// across a vmd restart — the survival property.
+// attach to (Firecracker's logs plus panic/abort output, incl. the exit-70
+// handler-death message). The child holds the fd directly, so console output
+// survives a vmd restart. A file, not journald: journald rate-limits per unit
+// cgroup, so a shared stream would let one VM suppress others' output.
 //
-// O_TRUNC, not O_APPEND: a fresh file per launch bounds the on-disk total to
-// one boot's output. Firecracker caps that output at 1 MiB per boot in its
-// serial device (the hard, daemon-independent bound against an untrusted
-// guest flooding its console), so a truncate-per-launch keeps the file at
-// most 1 MiB regardless of how many resume/verify cycles reuse it. A file,
-// not a journald stream: journald rate-limits by unit cgroup, so shared
-// streams would let one spamming VM suppress vmd's own logs.
+// The untrusted guest console is size-bounded by the paired Firecracker
+// serial cap (1 MiB per boot) — a deploy prerequisite for arming direct
+// spawn. O_TRUNC resets the file each launch, so the on-disk total stays
+// within one boot's capped output even across resume cycles.
 func openVMConsole(runDir, vmID string) (*os.File, error) {
 	return os.OpenFile(filepath.Join(runDir, vmID, "console.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
