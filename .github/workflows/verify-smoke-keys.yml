@@ -1,0 +1,32 @@
+# Temporary — verifies the new smoke-test API key secrets authenticate,
+# using a read-only GET. Deleted before merge.
+name: Verify smoke-test API keys
+
+on:
+  push:
+    branches: [ci/smoke-test-api-key-secrets]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: usw2 key against api-usw
+        env:
+          API_KEY: ${{ secrets.SS_TEST_API_KEY_USW }}
+        run: |
+          set -euo pipefail
+          if [ -z "$API_KEY" ]; then echo "::error::SS_TEST_API_KEY_USW is empty (not visible to this workflow)"; exit 1; fi
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -H "X-API-Key: $API_KEY" https://api-usw.superserve.ai/sandboxes)
+          echo "usw2 GET /sandboxes -> HTTP $STATUS"
+          [ "$STATUS" = "200" ]
+
+      - name: east key against api
+        if: always()
+        env:
+          API_KEY: ${{ secrets.SS_TEST_API_KEY_USEAST }}
+        run: |
+          set -euo pipefail
+          if [ -z "$API_KEY" ]; then echo "::error::SS_TEST_API_KEY_USEAST is empty (not visible to this workflow)"; exit 1; fi
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -H "X-API-Key: $API_KEY" https://api.superserve.ai/sandboxes)
+          echo "east GET /sandboxes -> HTTP $STATUS"
+          [ "$STATUS" = "200" ]
