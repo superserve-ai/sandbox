@@ -87,12 +87,19 @@ func setupCgroupTree() (*cgroupTree, error) {
 			return nil, fmt.Errorf("move pid %d to daemon/: %w", pid, err)
 		}
 	}
-	// Controllers for the VM groups: memory (containment + accounting),
-	// pids (runaway-fork ceiling comes free). cpu/io accounting can join
-	// later without structural change.
+	// Enable controllers at BOTH levels. root's subtree_control gives its
+	// children (daemon/, vms/) their memory/pids files — so vms/memory.max
+	// works. vms's subtree_control is what gives the PER-VM groups
+	// (vms/<id>/) their files: without it vms/<id>/memory.oom.group does not
+	// exist and createVMCgroup fails on every launch. memory = containment +
+	// accounting; pids = a runaway-fork ceiling for free.
 	if err := os.WriteFile(filepath.Join(t.root, "cgroup.subtree_control"),
 		[]byte("+memory +pids"), 0o644); err != nil {
 		return nil, fmt.Errorf("enable controllers on root: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(t.vms, "cgroup.subtree_control"),
+		[]byte("+memory +pids"), 0o644); err != nil {
+		return nil, fmt.Errorf("enable controllers on vms: %w", err)
 	}
 	if max, err := vmMemoryMaxFromMeminfo(); err == nil {
 		if werr := os.WriteFile(filepath.Join(t.vms, "memory.max"),
