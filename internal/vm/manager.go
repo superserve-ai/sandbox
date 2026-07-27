@@ -1612,6 +1612,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
+	// A caller-supplied vmID becomes a filesystem path component (rundir and,
+	// under direct spawn, the per-VM cgroup dir). Reject a non-leaf or
+	// reserved name before it can escape those trees — e.g. "../daemon" would
+	// resolve a cgroup onto vmd's own group and a later kill would take the
+	// daemon down with the VM.
+	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
+		return nil, status.Errorf(codes.InvalidArgument, "vm_id %q must be a valid per-VM identifier", vmID)
+	}
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
 	// waits for the in-flight attempt, then retriedLaunchTarget recognizes

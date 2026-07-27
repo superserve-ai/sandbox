@@ -123,3 +123,17 @@ func TestFirecrackerAdvertisesCap(t *testing.T) {
 		t.Error("missing binary must read as absent (fail-closed)")
 	}
 }
+
+// A traversal vmID must never resolve a cgroup path outside vms/ — "../daemon"
+// would land on vmd's own group and a kill there would take the daemon down.
+func TestSafeVMCgroupDirRejectsTraversal(t *testing.T) {
+	tree := &cgroupTree{vms: "/sys/fs/cgroup/x/vms"}
+	for _, bad := range []string{"../daemon", "..", "a/b", `a\b`, "", "."} {
+		if _, err := tree.safeVMCgroupDir(bad); err == nil {
+			t.Errorf("safeVMCgroupDir(%q) must be rejected", bad)
+		}
+	}
+	if got, err := tree.safeVMCgroupDir("vm-123"); err != nil || got != "/sys/fs/cgroup/x/vms/vm-123" {
+		t.Fatalf("valid id: got %q err %v", got, err)
+	}
+}

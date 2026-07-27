@@ -355,8 +355,22 @@ func (t *cgroupTree) firstPID(vmID string) int {
 // directly inside the group, so there is no fork-to-move window at all.
 // memory.oom.group makes an OOM kill take the whole VM, never a lone
 // thread of it.
+// safeVMCgroupDir resolves the per-VM cgroup path, rejecting a vmID that
+// isn't a leaf name. A traversal like "../daemon" would otherwise escape the
+// vms/ subtree onto vmd's own group, and a kill there would take the daemon
+// down with the VM. Defense-in-depth behind the launch-entry check.
+func (t *cgroupTree) safeVMCgroupDir(vmID string) (string, error) {
+	if !isLeafName(vmID) {
+		return "", fmt.Errorf("invalid vm_id %q for cgroup path", vmID)
+	}
+	return t.vmCgroupDir(vmID), nil
+}
+
 func (t *cgroupTree) createVMCgroup(vmID string) (*os.File, error) {
-	dir := t.vmCgroupDir(vmID)
+	dir, err := t.safeVMCgroupDir(vmID)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("mkdir vm cgroup: %w", err)
 	}
@@ -404,7 +418,10 @@ func parseCgroupPopulated(events string) bool {
 // failure class the network pool's verify discipline exists to prevent.
 // The wait is event-driven (inotify on cgroup.events) with a poll floor.
 func (t *cgroupTree) killVMCgroup(ctx context.Context, vmID string, budget time.Duration) error {
-	dir := t.vmCgroupDir(vmID)
+	dir, derr := t.safeVMCgroupDir(vmID)
+	if derr != nil {
+		return derr
+	}
 	err := os.WriteFile(filepath.Join(dir, "cgroup.kill"), []byte("1"), 0o644)
 	if os.IsNotExist(err) {
 		return nil // group already gone == already dead
@@ -463,7 +480,10 @@ func (t *cgroupTree) killVMCgroup(ctx context.Context, vmID string, budget time.
 // after the last exit; bounded retries absorb that, and the reconciler
 // sweeps any straggler.
 func (t *cgroupTree) removeVMCgroup(vmID string) error {
-	dir := t.vmCgroupDir(vmID)
+	dir, derr := t.safeVMCgroupDir(vmID)
+	if derr != nil {
+		return derr
+	}
 	var err error
 	for i := 0; i < 20; i++ {
 		err = os.Remove(dir)
