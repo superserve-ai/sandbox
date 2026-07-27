@@ -119,8 +119,32 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		// the subtree on a daemon-reload and strand VMs. Refuse to arm.
 		return false, fmt.Errorf("unit is not Delegate=yes — direct spawn needs a delegated subtree")
 	}
+	// The guest console is untrusted; the only bound on its file is the
+	// Firecracker serial cap. Refuse to arm on a binary that doesn't
+	// advertise it, or a direct-spawned guest could fill the host disk.
+	if !firecrackerAdvertisesCap(ctx, m.cfg.FirecrackerBin, "serial-console-cap") {
+		return false, fmt.Errorf("firecracker %q lacks serial-console-cap — cannot arm direct spawn", m.cfg.FirecrackerBin)
+	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
+}
+
+// firecrackerAdvertisesCap reports whether the firecracker binary lists cap
+// among the "capability: <name>" lines of its --version output. Fail-closed:
+// any exec or read error reads as absent, so arming never proceeds on an
+// unverifiable binary. Runs once at arm time, not on the launch path.
+func firecrackerAdvertisesCap(ctx context.Context, fcBin, cap string) bool {
+	out, err := exec.CommandContext(ctx, fcBin, "--version").Output()
+	if err != nil {
+		return false
+	}
+	want := "capability: " + cap
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // selfUnitDelegated reports whether this vmd unit has Delegate set, via

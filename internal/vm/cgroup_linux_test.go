@@ -1,7 +1,10 @@
 package vm
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -93,5 +96,30 @@ func TestSupervisionRoundTrip(t *testing.T) {
 	}
 	if strings.Contains(string(out), "supervision") {
 		t.Fatalf("unit-mode record must omit the supervision key, got %s", out)
+	}
+}
+
+func TestFirecrackerAdvertisesCap(t *testing.T) {
+	// A fake fc binary whose --version prints the capability line.
+	dir := t.TempDir()
+	fc := filepath.Join(dir, "fc")
+	script := "#!/bin/sh\necho 'Firecracker v1.15.0'\necho 'capability: serial-console-cap'\n"
+	if err := os.WriteFile(fc, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !firecrackerAdvertisesCap(context.Background(), fc, "serial-console-cap") {
+		t.Error("should detect the advertised capability")
+	}
+	if firecrackerAdvertisesCap(context.Background(), fc, "some-other-cap") {
+		t.Error("must not match an unadvertised capability")
+	}
+	// A binary that doesn't print it, and a missing binary, both read absent.
+	bare := filepath.Join(dir, "bare")
+	_ = os.WriteFile(bare, []byte("#!/bin/sh\necho 'Firecracker v1.15.0'\n"), 0o755)
+	if firecrackerAdvertisesCap(context.Background(), bare, "serial-console-cap") {
+		t.Error("must not match when the capability is absent")
+	}
+	if firecrackerAdvertisesCap(context.Background(), filepath.Join(dir, "nope"), "serial-console-cap") {
+		t.Error("missing binary must read as absent (fail-closed)")
 	}
 }
