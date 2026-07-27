@@ -20,11 +20,6 @@ provider "google" {
   # impersonate_service_account = "terraform@rayai-dev.iam.gserviceaccount.com"
 }
 
-moved {
-  from = google_secret_manager_secret_iam_member.legacy_github_actions_sandbox_access_token_seed
-  to   = google_secret_manager_secret_iam_member.github_actions_sandbox_access_token_seed
-}
-
 locals {
   project_id             = var.project_id
   environment            = var.environment
@@ -40,8 +35,7 @@ locals {
     region      = local.region
   }
 
-  api_service_account_email  = "superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com"
-  host_service_account_email = "superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com"
+  api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
 module "network" {
   source = "../../../modules/network"
@@ -82,7 +76,18 @@ module "network" {
   labels = local.common_labels
 }
 
-# The production runner's encrypt/decrypt grant on the credentials-kek KMS key is
+data "google_service_account" "api_runner" {
+  project    = local.project_id
+  account_id = "superserve-api-runner"
+}
+
+
+data "google_service_account" "github_actions" {
+  project    = local.project_id
+  account_id = "superserve-github-actions"
+}
+
+# The api-runner SA's encrypt/decrypt grant on the credentials-kek KMS key is
 # managed out-of-band and owned centrally: the CD Terraform SA lacks KMS
 # setIamPolicy on the key, and the SA is shared across cells, so this follows
 # the same out-of-band pattern as the shared runtime secrets.
@@ -90,24 +95,18 @@ module "network" {
 # The runtime grant for the shared system-team-id-production secret is owned
 # solely by production/us-central1 (its api_runtime_secrets set), matching how
 # the other shared runtime secrets (posthog/slack/sentry) are granted to the
-# shared runner SA — so this root doesn't double-manage the same binding
+# shared api-runner SA — so this root doesn't double-manage the same binding
 # from a separate state.
 
-# deploy-proxy.yml still authenticates with the legacy GitHub-actions identity
-# and fetches this secret directly at deploy time. Keep that binding until the
-# workflow is migrated to the new deployer identity.
+# deploy-proxy.yml fetches this secret directly via `gcloud secrets versions
+# access` at deploy time for the usw cell step, instead of through a Cloud
+# Run secret binding — so the CI service account needs read access here too,
+# not just the Cloud Run runtime SA.
 resource "google_secret_manager_secret_iam_member" "github_actions_sandbox_access_token_seed" {
   project   = local.project_id
   secret_id = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"
-}
-
-resource "google_secret_manager_secret_iam_member" "api_runtime_database_url" {
-  project   = local.project_id
-  secret_id = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${local.api_service_account_email}"
+  member    = "serviceAccount:${data.google_service_account.github_actions.email}"
 }
 
 module "api" {
@@ -117,7 +116,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
-  service_account_email = local.api_service_account_email
+  service_account_email = data.google_service_account.api_runner.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   cpu_limit         = "2"
@@ -173,8 +172,6 @@ module "api" {
   vpc_tags       = ["cr-usw2"]
 
   labels = local.common_labels
-
-  depends_on = [google_secret_manager_secret_iam_member.api_runtime_database_url]
 }
 
 module "sandbox_host" {
@@ -194,12 +191,11 @@ module "sandbox_host" {
     sandbox_role = "vmd"
   })
 
-  service_account_email     = local.host_service_account_email
-  allow_stopping_for_update = true
-  boot_disk_image           = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts"
-  boot_disk_size_gb         = 250
-  can_ip_forward            = false
-  on_host_maintenance       = "TERMINATE"
+  service_account_email = data.google_service_account.api_runner.email
+  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts"
+  boot_disk_size_gb     = 250
+  can_ip_forward        = false
+  on_host_maintenance   = "TERMINATE"
 
   metadata = {
     enable-osconfig = "TRUE"

@@ -9,11 +9,6 @@ import {
 }
 
 import {
-  to = google_compute_subnetwork.staging_connector
-  id = "projects/rayai-dev/regions/us-central1/subnetworks/rayai-staging-connector-subnet"
-}
-
-import {
   to = module.network.google_vpc_access_connector.this[0]
   id = "projects/rayai-dev/locations/us-central1/connectors/ss-vpc-conn-f1b3552"
 }
@@ -43,4 +38,12 @@ import {
 import {
   to = module.api.google_cloud_run_v2_service_iam_member.public_invoker[0]
   id = "projects/rayai-dev/locations/us-central1/services/superserve-api roles/run.invoker allUsers"
+}
+
+# CD service account's compute.networkAdmin grant, added out-of-band during the
+# #257 incident to unblock the VPC flow-log subnet update. Import so the apply
+# adopts the existing binding instead of planning a create.
+import {
+  to = module.iam.google_project_iam_member.project_bindings["cd_network_admin"]
+  id = "rayai-dev roles/compute.networkAdmin serviceAccount:superserve-github-actions@rayai-dev.iam.gserviceaccount.com"
 }

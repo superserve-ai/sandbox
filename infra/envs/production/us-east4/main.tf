@@ -47,8 +47,12 @@ module "network" {
   subnet_name            = "superserve-use4-subnet"
   subnet_cidr            = var.subnet_cidr
   manage_public_ssh_deny = true
-  enable_iap_ssh         = false
-  iap_ssh_target_tags    = ["vmd-use4"]
+  # true so CD (deploy-vmd/proxy/otel via `gcloud scp --tunnel-through-iap`) and
+  # operators can reach the host on :22 — matches us-central1/us-west2. With this
+  # false, manage_public_ssh_deny alone blocked ALL SSH to the host and broke the
+  # vmd deploy.
+  enable_iap_ssh      = true
+  iap_ssh_target_tags = ["vmd-use4"]
 
   # Cloud Run reaches the vmd host over direct VPC egress (no connector),
   # matching the usw2 cell. The dedicated egress subnet carries the Cloud Run
@@ -86,20 +90,36 @@ module "network" {
   labels = local.common_labels
 }
 
+data "google_service_account" "api_runner" {
+  project    = local.project_id
+  account_id = "superserve-api-runner"
+}
+
+# The CD service account needs Certificate Manager access to read/manage the
+# api.superserve.ai cert map + DNS authorization this cell owns (the plan's
+# import 403'd without it). Granted out-of-band to unblock; imported (see
+# imports.tf) so the apply adopts the existing binding instead of creating a
+# duplicate.
+resource "google_project_iam_member" "cd_certificatemanager" {
+  project = local.project_id
+  role    = "roles/certificatemanager.editor"
+  member  = "serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"
+}
+
 # A5: us-east4 control plane for the "use" cell.
 #
 # This is a host swap, not a new cell: us-east4 shares the use-cell Supabase,
-# runtime secrets, runner service account, and KMS key with us-central1.
+# runtime secrets, api-runner service account, and KMS key with us-central1.
 # Only the service name, region, and VMD address are region-local — traffic
 # splits between this service and the us-central1 one during cutover, then
 # us-central1 drains. Secrets resolve to the shared (suffix-less) use-cell
 # names via the *_secret_name overrides in terraform.tfvars.
 #
-# No per-root secret IAM here: the API runtime already holds the shared
-# accessor grants (owned by us-central1's api_runtime_secrets), and its
-# credentials-kek encrypt/decrypt grant is owned out-of-band. Re-declaring
-# them from this state would double-manage the same bindings. The sandbox host
-# uses a separate runtime identity with no access to those API secrets.
+# No per-root secret IAM here: the shared api-runner SA already holds the
+# runtime accessor grants (owned by us-central1's api_runtime_secrets) and the
+# credentials-kek encrypt/decrypt grant (owned out-of-band). Re-declaring them
+# from this state would double-manage the same bindings — the same split we
+# settled for usw2 in #232/#233.
 module "api" {
   source = "../../../modules/api"
 
@@ -107,7 +127,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
-  service_account_email = "superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com"
+  service_account_email = data.google_service_account.api_runner.email
   # First create must reference a tag that actually exists, or the initial
   # revision never goes ready and the apply fails. The other regions can carry
   # a ":replace-me" placeholder only because their services already exist and
@@ -231,8 +251,7 @@ module "sandbox_host" {
     "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
-  service_account_email     = "superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com"
-  allow_stopping_for_update = true
+  service_account_email = data.google_service_account.api_runner.email
 
   # Matches the live us-central1 prod host (Ubuntu 22.04 LTS), NOT this
   # module's typical 24.04 default — the current prod host actually runs
