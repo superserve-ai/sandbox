@@ -244,12 +244,21 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/superserve-vms.service /etc/systemd/system/superserve-vms.service
             sudo systemctl daemon-reload
             sudo systemctl enable --quiet superserve-vmd.socket
-            # Delegated cgroup subtree for direct-spawn VMs. enable --now so the
-            # scope exists before vmd starts and ArmDirectSpawn adopts it.
-            # Idempotent on redeploy: an already-running keeper is left alone — a
-            # unit-file change applies only on the next clean restart (never
-            # restart the scope while VMs are live).
-            sudo systemctl enable --now --quiet superserve-vms.service
+            # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
+            # START only when the delegated root has no child cgroups yet (fresh /
+            # first deploy). Once vmd has bootstrapped it, the root is an inner
+            # cgroup (keeper/ + VM children, controllers enabled), so systemd
+            # cannot place ExecStart back there (cgroup v2 no-internal-process) —
+            # a start would either be a redundant no-op (keeper alive) or FAIL and
+            # abort the deploy (keeper died with VMs still live). In both cases vmd
+            # re-adopts the existing scope; boot-time start is covered by WantedBy.
+            sudo systemctl enable --quiet superserve-vms.service
+            VMS_CG=$(systemctl show -p ControlGroup --value superserve-vms.service 2>/dev/null || true)
+            if [ -n "$VMS_CG" ] && sudo find "/sys/fs/cgroup$VMS_CG" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .; then
+                echo "delegated VM scope already established — not (re)starting the keeper; vmd will adopt it"
+            else
+                sudo systemctl start superserve-vms.service
+            fi
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 
