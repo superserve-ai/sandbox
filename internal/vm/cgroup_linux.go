@@ -74,12 +74,25 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// crash between spawn and persist). Detecting only records would strand
 	// that unrecorded survivor: m.cgroups nil, so reattach and the reconciler
 	// both skip it and it runs forever.
-	haveCgroupVMs, detErr := m.hostHasCgroupVMs(ctx)
-	if detErr != nil {
-		// Fail closed: an unreadable store or scope can't rule out cgroup VMs.
-		// Assume they exist so management is set up (and a management-critical
-		// failure below is fatal) rather than silently skipping live VMs.
-		haveCgroupVMs = true
+	// A state-store read failure is FATAL: a corrupt/unreadable BoltDB means the
+	// daemon can't load any VM record (reattach and the reconciler both fail),
+	// so coming up "ready" would hide it and leave every cgroup VM unmanaged.
+	hasRecords, rerr := m.hasCgroupRecords()
+	if rerr != nil {
+		return false, fmt.Errorf("%w: cannot read state store: %v", ErrCgroupVMsUnmanageable, rerr)
+	}
+	haveCgroupVMs := hasRecords
+	if !haveCgroupVMs {
+		// A scope read error (transient systemctl/D-Bus) can't rule out a
+		// recordless survivor. Fail closed — assume present — so the management-
+		// critical checks below run; a persistent scope fault then becomes fatal
+		// via adoptVmsScope rather than crashlooping a healthy flag-off host here.
+		treeHas, terr := delegatedTreeHasVMs(ctx)
+		if terr != nil {
+			haveCgroupVMs = true
+		} else {
+			haveCgroupVMs = treeHas
+		}
 	}
 	if !wantArm && !haveCgroupVMs {
 		return false, nil // nothing to arm, nothing to manage
@@ -147,21 +160,6 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
-}
-
-// hostHasCgroupVMs reports whether this host has any cgroup-mode VM — a
-// persisted record OR a live per-VM cgroup with no record. It returns an error
-// when it cannot determine either (unreadable store or scope); ArmDirectSpawn
-// fails closed on that, treating "unknown" as "present".
-func (m *Manager) hostHasCgroupVMs(ctx context.Context) (bool, error) {
-	has, err := m.hasCgroupRecords()
-	if err != nil {
-		return false, err
-	}
-	if has {
-		return true, nil
-	}
-	return delegatedTreeHasVMs(ctx)
 }
 
 // firecrackerAdvertisesCap reports whether the firecracker binary lists cap

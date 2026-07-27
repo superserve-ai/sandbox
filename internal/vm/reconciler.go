@@ -382,9 +382,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	if r.mgr.cgroups != nil {
 		if cgDirs, cgErr := r.mgr.cgroups.scanVMCgroups(); cgErr == nil {
 			for _, id := range cgDirs {
-				if isBuildVM(id) || active[id] {
-					continue // build-owned, or populated (Drift 0 handles it)
+				if active[id] {
+					continue // populated (Drift 0 handles it)
 				}
+				// Build cgroups are NOT skipped here: the build-VM exclusion
+				// belongs on the liveness drifts (don't kill an in-flight build),
+				// not on janitorial removal of an already-empty dir. An in-flight
+				// build is populated (caught below) or holds the op-lock; only an
+				// empty leftover is reaped, and rmdir is non-destructive.
 				inBolt := false
 				if dbSandboxes == nil {
 					_, inBolt = bolted[id]
