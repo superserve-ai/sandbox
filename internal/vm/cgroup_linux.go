@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -73,71 +74,94 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// crash between spawn and persist). Detecting only records would strand
 	// that unrecorded survivor: m.cgroups nil, so reattach and the reconciler
 	// both skip it and it runs forever.
-	haveCgroupVMs := m.hasCgroupRecords() || delegatedTreeHasVMs(ctx)
+	haveCgroupVMs, detErr := m.hostHasCgroupVMs(ctx)
+	if detErr != nil {
+		// Fail closed: an unreadable store or scope can't rule out cgroup VMs.
+		// Assume they exist so management is set up (and a management-critical
+		// failure below is fatal) rather than silently skipping live VMs.
+		haveCgroupVMs = true
+	}
 	if !wantArm && !haveCgroupVMs {
 		return false, nil // nothing to arm, nothing to manage
 	}
-	if _, err := os.Stat(filepath.Join(cgroupMount, "cgroup.controllers")); err != nil {
-		if wantArm {
-			return false, fmt.Errorf("cgroup v2 unified hierarchy required: %w", err)
+
+	// A management-critical failure means existing cgroup VMs can't be stopped,
+	// reaped, or adopted. That is FATAL when this host has them (they would run
+	// unmanaged while the daemon reports ready); on a host with none it's an
+	// ordinary error that degrades NEW launches to the unit path.
+	fatalIfManaging := func(err error) error {
+		if haveCgroupVMs {
+			return fmt.Errorf("%w: %v", ErrCgroupVMsUnmanageable, err)
 		}
-		return false, fmt.Errorf("cgroup-mode VMs exist but cgroup v2 is unavailable: %w", err)
+		return err
+	}
+
+	// --- Management-critical: must hold BEFORE declaring existing cgroup VMs
+	// manageable, so manage-only mode never claims a VM it cannot stop. ---
+	if _, err := os.Stat(filepath.Join(cgroupMount, "cgroup.controllers")); err != nil {
+		return false, fatalIfManaging(fmt.Errorf("cgroup v2 unified hierarchy required: %w", err))
 	}
 	tree, err := adoptVmsScope(ctx)
 	if err != nil {
-		if haveCgroupVMs {
-			// Existing cgroup-mode VMs but the scope can't be adopted → they are
-			// unmanageable. Fatal at the caller, never a silent degrade to ready.
-			return false, fmt.Errorf("%w: adopt %s: %v", ErrCgroupVMsUnmanageable, vmsUnitName, err)
-		}
-		return false, fmt.Errorf("adopt delegated VM scope (%s): %w", vmsUnitName, err)
+		return false, fatalIfManaging(fmt.Errorf("adopt delegated VM scope (%s): %w", vmsUnitName, err))
 	}
-	// Tree is usable: existing cgroup VMs are now manageable regardless of
-	// the flag.
-	m.cgroups = tree
+	// cgroup.kill (kernel 5.14+) and cgroup.events are how stop and liveness
+	// work; a v2 host too old to have them could never stop or reap a VM.
+	for _, f := range []string{"cgroup.kill", "cgroup.events"} {
+		if _, err := os.Stat(filepath.Join(tree.vms, f)); err != nil {
+			return false, fatalIfManaging(fmt.Errorf("delegated scope lacks %s (kernel too old?): %w", f, err))
+		}
+	}
+	m.cgroups = tree // existing cgroup VMs are now manageable
 	if !wantArm {
 		return false, nil // manage-only (rollback / drain)
 	}
-	// cgroup.kill (kernel 5.14+) and cgroup.events are how stop and liveness
-	// work; a v2 host too old to have them would launch fine but never be
-	// able to stop or reap a VM. Verify on the real tree before arming.
-	for _, f := range []string{"cgroup.kill", "cgroup.events"} {
-		if _, err := os.Stat(filepath.Join(tree.vms, f)); err != nil {
-			return false, fmt.Errorf("delegated scope lacks %s (kernel too old?): %w", f, err)
-		}
-	}
+
+	// --- Arm-only: needed for NEW launches, not to manage existing VMs, so a
+	// failure gates arming without blocking manage-only. ---
+	//
 	// A dead keeper leaves the unit "failed"; refuse to arm NEW launches. The
 	// scope was still adopted above (systemd keeps a failed-but-populated unit's
-	// ControlGroup), so m.cgroups is set and existing VMs stay managed — the
-	// keeper-death policy: block new launches, keep servicing the live ones.
+	// ControlGroup), so existing VMs stay managed — block new, service the live.
 	if !unitIsActive(ctx, vmsUnitName) {
 		return false, fmt.Errorf("%s is not active — cannot arm direct spawn", vmsUnitName)
 	}
 	if !unitDelegated(ctx, vmsUnitName) {
-		// Without the delegation guarantee, systemd could reorganize the
-		// subtree on a daemon-reload and strand VMs. Refuse to arm.
 		return false, fmt.Errorf("%s is not Delegate=yes — direct spawn needs a delegated subtree", vmsUnitName)
 	}
-	// KillMode=process on the vms service is load-bearing: a stop or restart of
-	// that unit must signal only the keeper, never cascade into the VM children.
-	// Refuse to arm if it drifted from the shipped config.
+	// KillMode=process on the vms service is load-bearing: a stop/restart of it
+	// must signal only the keeper, never cascade into the VM children.
 	if km := unitStringProperty(ctx, vmsUnitName, "Service", "KillMode"); km != "process" {
 		return false, fmt.Errorf("%s KillMode=%q, need \"process\" — a scope stop would kill every VM", vmsUnitName, km)
 	}
-	// The aggregate memory ceiling lives on an ancestor of the scope
-	// (sandboxes.slice). If it drifted to unlimited, the reserve that protects
-	// the host from OOM is gone. Require a finite memory.max at or above it.
-	if !parentMemoryCapped(tree.vms) {
-		return false, fmt.Errorf("delegated scope %q has no effective memory ceiling — refusing to arm", tree.vms)
+	// sandboxes.slice is the single ceiling both legacy and direct VMs share; a
+	// drifted, missing, or ineffective cap removes the OOM reserve.
+	if !sandboxesSliceReserved() {
+		return false, fmt.Errorf("sandboxes.slice has no effective memory ceiling with a host reserve — refusing to arm")
 	}
 	// The guest console is untrusted; the only bound on its file is the
-	// Firecracker serial cap. Refuse to arm on a binary that doesn't
-	// advertise it, or a direct-spawned guest could fill the host disk.
+	// Firecracker serial cap. Refuse to arm on a binary that doesn't advertise
+	// it, or a direct-spawned guest could fill the host disk.
 	if !firecrackerAdvertisesCap(ctx, m.cfg.FirecrackerBin, "serial-console-cap") {
 		return false, fmt.Errorf("firecracker %q lacks serial-console-cap — cannot arm direct spawn", m.cfg.FirecrackerBin)
 	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
+}
+
+// hostHasCgroupVMs reports whether this host has any cgroup-mode VM — a
+// persisted record OR a live per-VM cgroup with no record. It returns an error
+// when it cannot determine either (unreadable store or scope); ArmDirectSpawn
+// fails closed on that, treating "unknown" as "present".
+func (m *Manager) hostHasCgroupVMs(ctx context.Context) (bool, error) {
+	has, err := m.hasCgroupRecords()
+	if err != nil {
+		return false, err
+	}
+	if has {
+		return true, nil
+	}
+	return delegatedTreeHasVMs(ctx)
 }
 
 // firecrackerAdvertisesCap reports whether the firecracker binary lists cap
@@ -203,40 +227,43 @@ func unitDelegated(ctx context.Context, unit string) bool {
 // side-effect-free: resolve the scope path via systemd, ReadDir, skip the
 // keeper, tolerate an absent scope (never armed). Complements hasCgroupRecords
 // so a rollback still manages an unrecorded survivor.
-func delegatedTreeHasVMs(ctx context.Context) bool {
+func delegatedTreeHasVMs(ctx context.Context) (bool, error) {
 	rel := unitControlGroup(ctx, vmsUnitName)
 	if rel == "" {
-		return false
+		return false, nil // no scope resolved → no cgroup VMs under it
 	}
 	entries, err := os.ReadDir(filepath.Join(cgroupMount, rel))
 	if err != nil {
-		return false
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err // scope exists but unreadable — caller fails closed
 	}
 	for _, e := range entries {
 		if e.IsDir() && e.Name() != keeperSubdir {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // hasCgroupRecords reports whether this host has any persisted cgroup-mode
 // VM — the signal that the delegated subtree must be initialized for
 // management even when the direct-spawn flag is off (a rollback in progress).
-func (m *Manager) hasCgroupRecords() bool {
+func (m *Manager) hasCgroupRecords() (bool, error) {
 	if m.state == nil {
-		return false
+		return false, nil
 	}
 	recs, err := m.state.All()
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, r := range recs {
 		if cgroupSupervised(r.Supervision) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // adoptVmsScope resolves and prepares the shipped superserve-vms.service
@@ -286,21 +313,61 @@ func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
 	return t, nil
 }
 
-// parentMemoryCapped reports whether any cgroup at or above scopePath sets a
-// finite memory.max — the effective ceiling that bounds the VM subtree (v2
-// enforces memory.max as the min over ancestors). All "max" up to the mount
-// root means the aggregate cap drifted away.
-func parentMemoryCapped(scopePath string) bool {
-	for dir := scopePath; strings.HasPrefix(dir, cgroupMount); dir = filepath.Dir(dir) {
-		data, err := os.ReadFile(filepath.Join(dir, "memory.max"))
-		if err == nil && strings.TrimSpace(string(data)) != "max" {
-			return true
+// sandboxesSliceReserved reports whether sandboxes.slice — the single ceiling
+// both legacy and direct VMs share — has a finite memory.max that leaves a host
+// reserve. It checks the slice SPECIFICALLY (a service-local cap under an
+// unlimited slice would not hold the two populations together) and rejects a
+// finite-but-ineffective cap that leaves almost no headroom (e.g. 100% of host).
+// Fail-closed: any unreadable value refuses arming. The exact reserve fraction
+// is an ops choice; this only proves a meaningful ceiling exists.
+func sandboxesSliceReserved() bool {
+	data, err := os.ReadFile(filepath.Join(cgroupMount, "sandboxes.slice", "memory.max"))
+	if err != nil {
+		return false
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "max" {
+		return false
+	}
+	max, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || max == 0 {
+		return false
+	}
+	total, err := hostMemTotalBytes()
+	if err != nil {
+		return false
+	}
+	return capLeavesReserve(max, total)
+}
+
+// capLeavesReserve reports whether a memory.max of max bytes leaves a host
+// reserve against total RAM — reject a cap sitting at (or within ~2% of) total,
+// which provides no effective reserve. The shipped 95% passes with margin.
+func capLeavesReserve(max, total uint64) bool {
+	return max > 0 && max <= total*98/100
+}
+
+// hostMemTotalBytes returns MemTotal from /proc/meminfo in bytes.
+func hostMemTotalBytes() (uint64, error) {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		rest, ok := strings.CutPrefix(sc.Text(), "MemTotal:")
+		if !ok {
+			continue
 		}
-		if dir == cgroupMount {
-			break
+		fields := strings.Fields(rest)
+		if len(fields) >= 1 {
+			if kb, perr := strconv.ParseUint(fields[0], 10, 64); perr == nil {
+				return kb * 1024, nil
+			}
 		}
 	}
-	return false
+	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
 }
 
 func readCgroupProcs(dir string) ([]int, error) {

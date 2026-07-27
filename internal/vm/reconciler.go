@@ -371,6 +371,72 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		r.clearDrift("cgrouporphan:" + id)
 	}
 
+	// Drift 0b: empty recordless cgroup directory. A per-VM group whose FC has
+	// exited but that was never removed (a recordless survivor whose process
+	// left on its own, or an rmdir that failed transiently) stays OUT of the
+	// populated active-set, so Drift 0 never revisits it — and it keeps counting
+	// against drain-check until a restart. Reap the leftover directory, after
+	// grace + op-lock, re-checking it is still empty and recordless so an
+	// in-flight launch's fresh group is never removed. Non-destructive (an empty
+	// group has no process to kill), so it doesn't consume the auto-fail budget.
+	if r.mgr.cgroups != nil {
+		if cgDirs, cgErr := r.mgr.cgroups.scanVMCgroups(); cgErr == nil {
+			for _, id := range cgDirs {
+				if isBuildVM(id) || active[id] {
+					continue // build-owned, or populated (Drift 0 handles it)
+				}
+				inBolt := false
+				if dbSandboxes == nil {
+					_, inBolt = bolted[id]
+				} else {
+					_, inBolt = boltedIDs[id]
+				}
+				if inBolt {
+					continue
+				}
+				r.mgr.mu.RLock()
+				_, hasInst := r.mgr.vms[id]
+				r.mgr.mu.RUnlock()
+				if hasInst {
+					continue
+				}
+				if !r.gracePeriodElapsed("cgroupempty:"+id, now) {
+					continue
+				}
+				unlockOp, ok := r.mgr.tryLockVMOp(id)
+				if !ok {
+					continue // a launch/op holds the lock
+				}
+				// Re-check under the lock: an in-flight launch may have persisted
+				// a record, published an instance, or forked FC into the group.
+				if has, _ := r.mgr.state.Has(id); has {
+					unlockOp()
+					r.clearDrift("cgroupempty:" + id)
+					continue
+				}
+				r.mgr.mu.RLock()
+				_, hasInst = r.mgr.vms[id]
+				r.mgr.mu.RUnlock()
+				if hasInst {
+					unlockOp()
+					continue
+				}
+				if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr != nil || pop {
+					unlockOp()
+					continue // became populated or unreadable — not ours to remove
+				}
+				if err := r.mgr.cgroups.removeVMCgroup(id); err != nil {
+					log.Warn().Err(err).Str("vm_id", id).Msg("failed to reap empty recordless cgroup — retrying next pass")
+					unlockOp()
+					continue
+				}
+				unlockOp()
+				r.writeAudit(ctx, id, "orphan_reap", "empty recordless cgroup directory", "cgroup_empty_no_record")
+				r.clearDrift("cgroupempty:" + id)
+			}
+		}
+	}
+
 	// Drift 1: DB says active, systemd/socket says dead.
 	// Action: mark sandbox failed in DB + clean up BoltDB + in-memory.
 	if dbSandboxes != nil {

@@ -47,6 +47,25 @@ func TestCheckDrainedCountsCgroupRecords(t *testing.T) {
 	}
 }
 
+// The memory-ceiling check must accept a real reserve (shipped 95%) and reject
+// an ineffective cap (100%) or a missing one, so drift can't silently remove
+// the OOM protection.
+func TestCapLeavesReserve(t *testing.T) {
+	const total = uint64(100_000_000_000)
+	if !capLeavesReserve(total*95/100, total) {
+		t.Fatal("95% cap must pass (leaves a reserve)")
+	}
+	if capLeavesReserve(total, total) {
+		t.Fatal("100% cap must fail (no reserve)")
+	}
+	if capLeavesReserve(total*99/100, total) {
+		t.Fatal("99% cap must fail (no meaningful reserve)")
+	}
+	if capLeavesReserve(0, total) {
+		t.Fatal("zero cap must fail")
+	}
+}
+
 func TestParseCgroupPopulated(t *testing.T) {
 	for body, want := range map[string]bool{
 		"populated 1\nfrozen 0\n": true,
