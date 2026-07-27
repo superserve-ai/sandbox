@@ -16,6 +16,8 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
+	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
@@ -143,6 +145,18 @@ func (h *Handler) ServesHost(host string) bool {
 	return matchesDomain(hostname, h.domains)
 }
 
+// PreviewCapabilities reports only policy layers this concrete handler can
+// enforce. Header-token auth is omitted until WithAuth has installed a valid
+// seed, preventing VMD from attesting a host whose proxy would fail every
+// tokenized request.
+func (h *Handler) PreviewCapabilities() []string {
+	capabilities := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess}
+	if auth.ValidateSeed(h.seedKey) == nil {
+		capabilities = append(capabilities, preview.HostCapabilityPortTokens)
+	}
+	return capabilities
+}
+
 // WithAnalytics enables data-plane usage events (exec/files).
 func (h *Handler) WithAnalytics(a *analytics.Client) *Handler {
 	h.analytics = a
@@ -216,7 +230,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !enforcePreviewPublication(w, port, info) {
+	if !enforcePreviewPublication(w, r, instanceID, port, info, h.seedKey) {
 		return
 	}
 
@@ -255,6 +269,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Preserve the original Host so boxd sees the sandbox URL, not the VM IP.
 			// This prevents the VM IP from leaking in redirects or cookies that echo Host.
 			req.Host = r.Host
+			// The preview credential authorizes this edge hop only. Never expose
+			// it to a public or private user application.
+			scrubHeader(req.Header, auth.PreviewTokenHeader)
 			// Strip all forwarding headers — a client could inject these to
 			// spoof origin info that boxd or user apps might trust.
 			// X-Forwarded-For needs an explicit nil assignment because

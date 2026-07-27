@@ -1177,6 +1177,41 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 	return snapshot_id, err
 }
 
+const getPublishedPreviewPort = `-- name: GetPublishedPreviewPort :one
+SELECT pp.port, pp.access, g.token_version
+FROM sandbox s
+JOIN sandbox_published_port pp ON pp.sandbox_id = s.id
+JOIN sandbox_preview_port_token_generation g
+  ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+WHERE s.id = $1
+  AND s.team_id = $2
+  AND s.destroyed_at IS NULL
+  AND pp.port = $3
+  AND g.token_version > 0
+`
+
+type GetPublishedPreviewPortParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	Port      int32     `json:"port"`
+}
+
+type GetPublishedPreviewPortRow struct {
+	Port         int32  `json:"port"`
+	Access       string `json:"access"`
+	TokenVersion int64  `json:"token_version"`
+}
+
+// Team-scoped credential lookup. Keeping ownership in the query avoids ever
+// treating a port row from another tenant as mintable, even if a caller
+// accidentally bypasses the preceding sandbox lookup.
+func (q *Queries) GetPublishedPreviewPort(ctx context.Context, arg GetPublishedPreviewPortParams) (GetPublishedPreviewPortRow, error) {
+	row := q.db.QueryRow(ctx, getPublishedPreviewPort, arg.SandboxID, arg.TeamID, arg.Port)
+	var i GetPublishedPreviewPortRow
+	err := row.Scan(&i.Port, &i.Access, &i.TokenVersion)
+	return i, err
+}
+
 const getSandbox = `-- name: GetSandbox :one
 SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
@@ -1285,6 +1320,25 @@ func (q *Queries) GetSandboxPreviewPolicy(ctx context.Context, arg GetSandboxPre
 	return i, err
 }
 
+const getSandboxStatusForPreviewMutation = `-- name: GetSandboxStatusForPreviewMutation :one
+SELECT status FROM sandbox
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+`
+
+type GetSandboxStatusForPreviewMutationParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Read after LockSandboxForPreviewMutation in the same transaction when host
+// delivery semantics depend on whether the serialized sandbox is paused.
+func (q *Queries) GetSandboxStatusForPreviewMutation(ctx context.Context, arg GetSandboxStatusForPreviewMutationParams) (SandboxStatus, error) {
+	row := q.db.QueryRow(ctx, getSandboxStatusForPreviewMutation, arg.ID, arg.TeamID)
+	var status SandboxStatus
+	err := row.Scan(&status)
+	return status, err
+}
+
 const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
 SELECT DISTINCT base_path FROM sandbox
 WHERE base_path IS NOT NULL AND destroyed_at IS NULL
@@ -1313,16 +1367,25 @@ func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 }
 
 const listPublishedPorts = `-- name: ListPublishedPorts :many
-SELECT port, access FROM sandbox_published_port
-WHERE sandbox_id = $1
-ORDER BY port
+SELECT pp.port, pp.access, g.token_version
+FROM sandbox_published_port pp
+JOIN sandbox_preview_port_token_generation g
+  ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+WHERE pp.sandbox_id = $1
+  AND g.token_version > 0
+ORDER BY pp.port
 `
 
 type ListPublishedPortsRow struct {
-	Port   int32  `json:"port"`
-	Access string `json:"access"`
+	Port         int32  `json:"port"`
+	Access       string `json:"access"`
+	TokenVersion int64  `json:"token_version"`
 }
 
+// A published row without a positive generation is not safe to activate at
+// the edge. The migration backfills every existing publication and the
+// publication triggers create future rows, so the inner join also fails
+// closed if that invariant is ever broken operationally.
 func (q *Queries) ListPublishedPorts(ctx context.Context, sandboxID uuid.UUID) ([]ListPublishedPortsRow, error) {
 	rows, err := q.db.Query(ctx, listPublishedPorts, sandboxID)
 	if err != nil {
@@ -1332,7 +1395,7 @@ func (q *Queries) ListPublishedPorts(ctx context.Context, sandboxID uuid.UUID) (
 	items := []ListPublishedPortsRow{}
 	for rows.Next() {
 		var i ListPublishedPortsRow
-		if err := rows.Scan(&i.Port, &i.Access); err != nil {
+		if err := rows.Scan(&i.Port, &i.Access, &i.TokenVersion); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -1713,6 +1776,39 @@ type RevertResumeToPausedParams struct {
 func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPausedParams) error {
 	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID)
 	return err
+}
+
+const rotatePublishedPreviewPortToken = `-- name: RotatePublishedPreviewPortToken :one
+UPDATE sandbox_preview_port_token_generation g
+SET token_version = next_sandbox_preview_port_token_version(g.token_version),
+    updated_at = now()
+FROM sandbox_published_port pp
+WHERE g.sandbox_id = $1
+  AND g.port = $2
+  AND pp.sandbox_id = g.sandbox_id
+  AND pp.port = g.port
+RETURNING pp.port, pp.access, g.token_version
+`
+
+type RotatePublishedPreviewPortTokenParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
+}
+
+type RotatePublishedPreviewPortTokenRow struct {
+	Port         int32  `json:"port"`
+	Access       string `json:"access"`
+	TokenVersion int64  `json:"token_version"`
+}
+
+// Called only while applyPreviewMutation holds the owning sandbox row lock.
+// The publication join makes rotation impossible for a retained tombstone;
+// next_sandbox_preview_port_token_version fails rather than wrapping bigint.
+func (q *Queries) RotatePublishedPreviewPortToken(ctx context.Context, arg RotatePublishedPreviewPortTokenParams) (RotatePublishedPreviewPortTokenRow, error) {
+	row := q.db.QueryRow(ctx, rotatePublishedPreviewPortToken, arg.SandboxID, arg.Port)
+	var i RotatePublishedPreviewPortTokenRow
+	err := row.Scan(&i.Port, &i.Access, &i.TokenVersion)
+	return i, err
 }
 
 const sandboxExists = `-- name: SandboxExists :one

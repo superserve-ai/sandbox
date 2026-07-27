@@ -8,10 +8,11 @@ import (
 )
 
 // PortPolicy is the control-plane representation of one published preview
-// port. Phase 2 carries only its independent access mode; later phases may add
-// credential state without changing the surrounding map shape.
+// port. AccessPrivateTokenV1 requires a positive TokenVersion; raw private and
+// public policies leave TokenVersion at zero.
 type PortPolicy struct {
-	Access string
+	Access       string
+	TokenVersion int64
 }
 
 // Client defines the subset of the VM daemon gRPC interface used by the

@@ -91,14 +91,15 @@ func (s *LocalHTTPServer) Shutdown(ctx context.Context) error {
 
 // instanceResponse is the JSON shape returned by GET /instances/{id}.
 type instanceResponse struct {
-	VMIP              string            `json:"vm_ip"`
-	Status            string            `json:"status"`
-	StartedAt         int64             `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
-	TeamID            string            `json:"team_id,omitempty"`
-	OwnerID           string            `json:"owner_id,omitempty"`
-	PreviewAccess     string            `json:"preview_access,omitempty"`
-	PreviewPorts      map[string]bool   `json:"preview_ports,omitempty"`
-	PreviewPortAccess map[string]string `json:"preview_port_access,omitempty"`
+	VMIP                     string            `json:"vm_ip"`
+	Status                   string            `json:"status"`
+	StartedAt                int64             `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
+	TeamID                   string            `json:"team_id,omitempty"`
+	OwnerID                  string            `json:"owner_id,omitempty"`
+	PreviewAccess            string            `json:"preview_access,omitempty"`
+	PreviewPorts             map[string]bool   `json:"preview_ports,omitempty"`
+	PreviewPortAccess        map[string]string `json:"preview_port_access,omitempty"`
+	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions,omitempty"`
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -132,6 +133,13 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "instance not found", http.StatusNotFound)
 		return
 	}
+	if previewPolicyNeedsPortTokens(info) && !headerHasCapability(r.Header.Get(preview.ProxyCapabilitiesHeader), preview.HostCapabilityPortTokens) {
+		// A Phase 2 proxy treats the token sentinel as an unknown closed mode,
+		// but withholding the whole instance is stronger: a rolling proxy
+		// downgrade cannot receive or accidentally forward credential state.
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
 
 	// This response attestation lets a new proxy distinguish an explicitly
 	// legacy sandbox served by a capable VMD from a response emitted by a VMD
@@ -139,14 +147,15 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 	w.Header().Set(preview.VMDProtocolHeader, preview.HostCapabilityPorts)
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(instanceResponse{
-		VMIP:              info.VMIP,
-		Status:            info.Status.String(),
-		StartedAt:         info.CreatedAt.UnixNano(),
-		TeamID:            info.TeamID,
-		OwnerID:           info.OwnerID,
-		PreviewAccess:     info.PreviewAccess,
-		PreviewPorts:      previewPortsToJSON(info.PreviewPorts),
-		PreviewPortAccess: previewPortAccessToJSON(info.PreviewPorts),
+		VMIP:                     info.VMIP,
+		Status:                   info.Status.String(),
+		StartedAt:                info.CreatedAt.UnixNano(),
+		TeamID:                   info.TeamID,
+		OwnerID:                  info.OwnerID,
+		PreviewAccess:            info.PreviewAccess,
+		PreviewPorts:             previewPortsToJSON(info.PreviewPorts),
+		PreviewPortAccess:        previewPortAccessToJSON(info.PreviewPorts),
+		PreviewPortTokenVersions: previewPortTokenVersionsToJSON(info.PreviewPorts),
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
 	}
@@ -213,6 +222,19 @@ func previewPortAccessToJSON(in map[int32]PreviewPortPolicy) map[string]string {
 	return out
 }
 
+func previewPortTokenVersionsToJSON(in map[int32]PreviewPortPolicy) map[string]int64 {
+	out := make(map[string]int64, len(in))
+	for port, policy := range in {
+		if policy.Access == preview.AccessPrivateTokenV1 && policy.TokenVersion > 0 {
+			out[strconv.Itoa(int(port))] = policy.TokenVersion
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func previewPolicyNeedsPortAccess(info InstanceInfo) bool {
 	if info.PreviewAccess == preview.AccessPrivate ||
 		(info.PreviewAccess != "" && info.PreviewAccess != preview.AccessLegacyPublic && info.PreviewAccess != preview.AccessPublic) {
@@ -220,6 +242,15 @@ func previewPolicyNeedsPortAccess(info InstanceInfo) bool {
 	}
 	for _, policy := range info.PreviewPorts {
 		if policy.Access != "" && policy.Access != preview.AccessPublic {
+			return true
+		}
+	}
+	return false
+}
+
+func previewPolicyNeedsPortTokens(info InstanceInfo) bool {
+	for _, policy := range info.PreviewPorts {
+		if policy.Access == preview.AccessPrivateTokenV1 {
 			return true
 		}
 	}

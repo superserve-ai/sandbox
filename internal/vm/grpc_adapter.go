@@ -123,6 +123,9 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	if err != nil {
 		return nil, err
 	}
+	if previewPortsContainTokenSentinel(previewPorts) && req.GetPreviewPolicyRevision() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
+	}
 
 	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	if err != nil {
@@ -366,6 +369,9 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(_ context.Context, req *vmdpb.U
 	if err != nil {
 		return nil, err
 	}
+	if previewPortsContainTokenSentinel(ports) && req.GetPolicyRevision() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive policy_revision")
+	}
 	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, ports, req.GetPolicyRevision()); err != nil {
 		return nil, err
 	}
@@ -385,9 +391,29 @@ func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]PreviewPortPolicy
 		if _, duplicate := out[port]; duplicate {
 			return nil, status.Errorf(codes.InvalidArgument, "duplicate preview port: %d", port)
 		}
-		out[port] = PreviewPortPolicy{Access: item.GetAccess()}
+		access := item.GetAccess()
+		tokenVersion := item.GetTokenVersion()
+		if access == preview.AccessPrivateTokenV1 {
+			if tokenVersion <= 0 {
+				return nil, status.Errorf(codes.InvalidArgument, "tokenized preview port %d requires a positive token_version", port)
+			}
+		} else {
+			// Phase 1/2 and future non-token modes do not activate credentials,
+			// even if a newer or malformed sender populated the additive field.
+			tokenVersion = 0
+		}
+		out[port] = PreviewPortPolicy{Access: access, TokenVersion: tokenVersion}
 	}
 	return out, nil
+}
+
+func previewPortsContainTokenSentinel(ports map[int32]PreviewPortPolicy) bool {
+	for _, policy := range ports {
+		if policy.Access == preview.AccessPrivateTokenV1 {
+			return true
+		}
+	}
+	return false
 }
 
 // InvalidateSecret forwards the invalidate call to the local secretsproxy daemon.

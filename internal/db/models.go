@@ -476,6 +476,16 @@ type SandboxPreviewPolicy struct {
 	DefaultAccess string    `json:"default_access"`
 }
 
+// Durable preview-token generation. Rows outlive publication deletion so re-publishing a port revokes credentials minted for an earlier publication.
+type SandboxPreviewPortTokenGeneration struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
+	// Positive monotonic generation embedded in per-port preview credentials.
+	TokenVersion int64     `json:"token_version"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 // Explicitly published preview ports with independent public/private modes.
 type SandboxPublishedPort struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`

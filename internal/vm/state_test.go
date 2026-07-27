@@ -3,6 +3,7 @@ package vm
 import (
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -189,7 +190,10 @@ func TestUpdateSandboxPreviewPolicyEqualRevisionIsIdempotent(t *testing.T) {
 			if err := mgr.UpdateSandboxPreviewPolicy(inst.ID, tt.incomingAccess, tt.incomingPorts, 0); err != nil {
 				t.Fatalf("idempotent update: %v", err)
 			}
-			if inst.PreviewAccess != tt.storedAccess || !previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, tt.storedAccess, tt.storedPorts) {
+			if inst.PreviewAccess != tt.storedAccess || !previewPolicyEqual(
+				inst.PreviewAccess, inst.PreviewPorts, 0, inst.PreviewTokenPolicyRevision,
+				tt.storedAccess, tt.storedPorts, 0, 0,
+			) {
 				t.Fatalf("idempotent update changed stored policy to (%q, %#v)", inst.PreviewAccess, inst.PreviewPorts)
 			}
 		})
@@ -239,8 +243,91 @@ func TestUpdateSandboxPreviewPolicyEqualRevisionMismatchFailsClosed(t *testing.T
 			if status.Code(err) != codes.FailedPrecondition {
 				t.Fatalf("mismatched equal revision error = %v, want FailedPrecondition", err)
 			}
-			if inst.PreviewAccess != tt.storedAccess || !previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, tt.storedAccess, tt.storedPorts) {
+			if inst.PreviewAccess != tt.storedAccess || !previewPolicyEqual(
+				inst.PreviewAccess, inst.PreviewPorts, 0, inst.PreviewTokenPolicyRevision,
+				tt.storedAccess, tt.storedPorts, 0, 0,
+			) {
 				t.Fatalf("rejected update changed stored policy to (%q, %#v)", inst.PreviewAccess, inst.PreviewPorts)
+			}
+		})
+	}
+}
+
+func TestUpdateSandboxPreviewPolicyEqualRevisionIncludesNormalizedTokenState(t *testing.T) {
+	const revision int64 = 9
+	tests := []struct {
+		name                string
+		storedAccess        string
+		storedPorts         map[int32]PreviewPortPolicy
+		storedTokenRevision int64
+		incomingAccess      string
+		incomingPorts       map[int32]PreviewPortPolicy
+		wantCode            codes.Code
+	}{
+		{
+			name:                "same live token snapshot normalizes top-level access",
+			storedAccess:        preview.AccessPrivate,
+			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 7}},
+			storedTokenRevision: revision,
+			incomingAccess:      preview.AccessPublic,
+			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 7}},
+			wantCode:            codes.OK,
+		},
+		{
+			name:                "live token generation disagreement",
+			storedAccess:        preview.AccessPrivate,
+			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 7}},
+			storedTokenRevision: revision,
+			incomingAccess:      preview.AccessPrivate,
+			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 8}},
+			wantCode:            codes.FailedPrecondition,
+		},
+		{
+			name:                "effective token watermark disagreement",
+			storedAccess:        preview.AccessPrivate,
+			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 7}},
+			storedTokenRevision: revision - 1,
+			incomingAccess:      preview.AccessPrivate,
+			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 7}},
+			wantCode:            codes.FailedPrecondition,
+		},
+		{
+			name:                "raw private stale generation is normalization equivalent",
+			storedAccess:        preview.AccessPrivate,
+			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivate, TokenVersion: 77}},
+			storedTokenRevision: revision,
+			incomingAccess:      preview.AccessPrivate,
+			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivate}},
+			wantCode:            codes.OK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inst := &VMInstance{
+				ID:                         "vm-preview",
+				PreviewAccess:              tt.storedAccess,
+				PreviewPorts:               tt.storedPorts,
+				PreviewPolicyRevision:      revision,
+				PreviewTokenPolicyRevision: tt.storedTokenRevision,
+			}
+			mgr := &Manager{vms: map[string]*VMInstance{inst.ID: inst}}
+			beforeAccess := inst.PreviewAccess
+			beforePorts := clonePreviewPorts(inst.PreviewPorts)
+			beforeRevision := inst.PreviewPolicyRevision
+			beforeTokenRevision := inst.PreviewTokenPolicyRevision
+
+			err := mgr.UpdateSandboxPreviewPolicy(inst.ID, tt.incomingAccess, tt.incomingPorts, revision)
+			if got := status.Code(err); got != tt.wantCode {
+				t.Fatalf("equal-revision update code = %s (%v), want %s", got, err, tt.wantCode)
+			}
+			if inst.PreviewAccess != beforeAccess ||
+				!reflect.DeepEqual(inst.PreviewPorts, beforePorts) ||
+				inst.PreviewPolicyRevision != beforeRevision ||
+				inst.PreviewTokenPolicyRevision != beforeTokenRevision {
+				t.Fatalf("equal-revision update mutated stored policy: got (%q, %#v, %d, %d), want (%q, %#v, %d, %d)",
+					inst.PreviewAccess, inst.PreviewPorts, inst.PreviewPolicyRevision, inst.PreviewTokenPolicyRevision,
+					beforeAccess, beforePorts, beforeRevision, beforeTokenRevision)
 			}
 		})
 	}
@@ -672,6 +759,113 @@ func TestStateStorePutPreservesUnknownPreviewPolicyFields(t *testing.T) {
 	var revision int64
 	if err := json.Unmarshal(fields["revision"], &revision); err != nil || revision != 8 {
 		t.Fatalf("revision = %d (%v), want advanced revision 8", revision, err)
+	}
+}
+
+func TestTokenizedPreviewPolicyRoundTripAndRollbackWatermark(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	const vmID = "vm-token-watermark"
+	tokenized := VMRecord{
+		ID:            vmID,
+		PreviewAccess: preview.AccessPrivate,
+		PreviewPorts:  map[int32]bool{3000: true},
+		PreviewPortAccess: map[int32]string{
+			3000: preview.AccessPrivateTokenV1,
+		},
+		PreviewPortTokenVersions: map[int32]int64{3000: 5},
+		PreviewPolicyRevision:    10, PreviewTokenPolicyRevision: 10,
+	}
+	if err := s.Put(tokenized); err != nil {
+		s.Close()
+		t.Fatalf("Put tokenized policy: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s, err = OpenStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s.Close()
+	got, err := s.Get(vmID)
+	if err != nil {
+		t.Fatalf("Get tokenized policy: %v", err)
+	}
+	if got.PreviewPortAccess[3000] != preview.AccessPrivateTokenV1 ||
+		got.PreviewPortTokenVersions[3000] != 5 || got.PreviewTokenPolicyRevision != 10 {
+		t.Fatalf("restored token policy = %+v", got)
+	}
+
+	// Simulate a Phase 2 binary advancing a raw-private policy. It does not
+	// understand the token fields, so it preserves them as unknown JSON with
+	// their old watermark while advancing the policy revision.
+	phaseTwoSidecar := []byte(`{"access":"private","ports":{"3000":true},"port_access":{"3000":"private"},"token_versions":{"3000":5},"revision":11,"token_policy_revision":10,"future_guard":{"mode":"closed"}}`)
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(previewPolicyBucketName).Put([]byte(vmID), phaseTwoSidecar)
+	}); err != nil {
+		t.Fatalf("simulate Phase 2 sidecar write: %v", err)
+	}
+
+	got, err = s.Get(vmID)
+	if err != nil {
+		t.Fatalf("Get after Phase 2 write: %v", err)
+	}
+	if got.PreviewPolicyRevision != 11 || got.PreviewPortAccess[3000] != preview.AccessPrivate ||
+		len(got.PreviewPortTokenVersions) != 0 || got.PreviewTokenPolicyRevision != 0 {
+		t.Fatalf("stale token watermark remained active: %+v", got)
+	}
+
+	inst := toInstance(*got)
+	mgr := &Manager{vms: map[string]*VMInstance{vmID: inst}}
+	if err := mgr.UpdateSandboxPreviewPolicy(vmID, preview.AccessPrivate, map[int32]PreviewPortPolicy{
+		3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 6},
+	}, 10); err != nil {
+		t.Fatalf("stale Phase 3 update: %v", err)
+	}
+	if inst.PreviewPolicyRevision != 11 || inst.PreviewPorts[3000].Access != preview.AccessPrivate ||
+		inst.PreviewPorts[3000].TokenVersion != 0 || inst.PreviewTokenPolicyRevision != 0 {
+		t.Fatalf("stale Phase 3 update revived credentials: %+v", inst)
+	}
+
+	// A current Phase 3 rewrite durably clears the stale known fields while
+	// preserving fields from a still-newer future VMD generation.
+	if err := s.Put(*got); err != nil {
+		t.Fatalf("rewrite normalized policy: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(readRawPreviewPolicySidecar(t, s, vmID), &fields); err != nil {
+		t.Fatalf("decode normalized sidecar: %v", err)
+	}
+	if _, ok := fields["token_versions"]; ok {
+		t.Fatalf("stale token_versions survived normalized rewrite: %s", fields["token_versions"])
+	}
+	if _, ok := fields["token_policy_revision"]; ok {
+		t.Fatalf("stale token_policy_revision survived normalized rewrite: %s", fields["token_policy_revision"])
+	}
+	if string(fields["future_guard"]) != `{"mode":"closed"}` {
+		t.Fatalf("future_guard = %s, want preserved unknown field", fields["future_guard"])
+	}
+}
+
+func TestTokenPolicyNormalizationFailsClosed(t *testing.T) {
+	ports, watermark := normalizePreviewTokenPolicy(map[int32]PreviewPortPolicy{
+		3000: {Access: preview.AccessPrivateTokenV1},
+		3001: {Access: preview.AccessPublic, TokenVersion: 8},
+	}, 7, 7)
+	if watermark != 0 || ports[3000].TokenVersion != 0 || ports[3001].TokenVersion != 0 {
+		t.Fatalf("malformed token snapshot normalized to (%#v, %d), want all generations closed", ports, watermark)
+	}
+
+	ports, watermark = normalizePreviewTokenPolicy(map[int32]PreviewPortPolicy{
+		3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 4},
+	}, 8, 7)
+	if watermark != 0 || ports[3000].TokenVersion != 0 {
+		t.Fatalf("stale watermark normalized to (%#v, %d), want closed", ports, watermark)
 	}
 }
 

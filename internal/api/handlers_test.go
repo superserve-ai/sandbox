@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1015,7 +1016,7 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 					return previewPolicyRow(preview.AccessPublic, 7)
 				}
 				return previewPolicyRow(preview.AccessPublic, 8)
-			case strings.Contains(sql, "-- name: HostHasCapability :one"):
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: BeginResume :one"):
 				return sandboxRow(sb)
@@ -1062,6 +1063,91 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 	}
 	if _, ok := reconciled.Ports[8080]; !ok || len(reconciled.Ports) != 1 {
 		t.Fatalf("reconciled ports = %#v, want {8080}", reconciled.Ports)
+	}
+}
+
+func TestResumeSandbox_PrivatePolicyAdvancesRevisionAndRestoresTokenizedPorts(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "token-host"
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	var restored, reconciled previewPolicySnapshot
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.NotFound, "vm absent after restart")
+		},
+		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
+			restored = previewPolicySnapshot{Access: access, Ports: ports, Revision: revision}
+		},
+		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+			reconciled = previewPolicySnapshot{Access: access, Ports: ports, Revision: revision}
+			return nil
+		},
+	}
+
+	var capabilityChecks, revisionBumps int
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPrivate, 8)
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+				capabilityChecks++
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
+				return scalarUUIDRow(sandboxID)
+			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
+				revisionBumps++
+				return previewPolicyRow(preview.AccessPrivate, 8)
+			case strings.Contains(sql, "-- name: BeginResume :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSnapshot :one"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			switch {
+			case strings.Contains(sql, "-- name: ListPublishedPorts :many"):
+				return previewPortPolicyRows(publishedPortResponse{
+					Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12,
+				}), nil
+			case strings.Contains(sql, "-- name: ListSandboxSecretBindingMeta :many"):
+				return emptyRows{}, nil
+			default:
+				return nil, fmt.Errorf("unexpected Query: %s", sql)
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200; body=%s", w.Code, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+	if capabilityChecks != 2 || revisionBumps != 1 {
+		t.Fatalf("capability checks=%d revision bumps=%d, want 2/1", capabilityChecks, revisionBumps)
+	}
+	for name, got := range map[string]previewPolicySnapshot{"restore": restored, "reconcile": reconciled} {
+		if got.Access != preview.AccessPrivate || got.Revision != 8 {
+			t.Fatalf("%s top-level policy=(%q,%d), want raw private revision 8", name, got.Access, got.Revision)
+		}
+		port := got.Ports[3000]
+		if len(got.Ports) != 1 || port.Access != preview.AccessPrivateTokenV1 || port.TokenVersion != 12 {
+			t.Fatalf("%s ports=%#v, want tokenized 3000 v12", name, got.Ports)
+		}
 	}
 }
 
@@ -1682,7 +1768,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -1750,7 +1836,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 	}
 }
 
-func TestCreateSandbox_PrivateUsesAccessCapablePlacementAndAttestation(t *testing.T) {
+func TestCreateSandbox_PrivateUsesTokenCapablePlacementAndAttestation(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 	scheduler := &stubScheduler{hostID: "private-host"}
@@ -1776,8 +1862,8 @@ func TestCreateSandbox_PrivateUsesAccessCapablePlacementAndAttestation(t *testin
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "-- name: HostHasCapability :one"):
-				checkedCapabilities = append(checkedCapabilities, args[1].(string))
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+				checkedCapabilities = append(checkedCapabilities, args[0].([]string)...)
 				return previewCapableHostRow()
 			case strings.Contains(sql, "INSERT INTO sandbox"):
 				if strings.Contains(sql, "INSERT INTO sandbox_preview_policy") {
@@ -1811,7 +1897,11 @@ func TestCreateSandbox_PrivateUsesAccessCapablePlacementAndAttestation(t *testin
 	if got := parseJSON(t, w)["preview_access"]; got != preview.AccessPrivate {
 		t.Fatalf("preview_access = %#v, want private", got)
 	}
-	wantCaps := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess}
+	wantCaps := []string{
+		preview.HostCapabilityPorts,
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+	}
 	if !reflect.DeepEqual(scheduler.required, wantCaps) {
 		t.Fatalf("scheduler requirements = %#v, want %#v", scheduler.required, wantCaps)
 	}
@@ -1833,10 +1923,9 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 			switch {
 			case strings.Contains(sql, "FROM template"):
 				return templateRow(defaultReadyTemplate())
-			case strings.Contains(sql, "-- name: HostHasCapability :one"):
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
 				checks++
-				capability := args[1].(string)
-				return scalarBoolRow(capability == preview.HostCapabilityPorts)
+				return scalarBoolRow(!slices.Contains(args[0].([]string), preview.HostCapabilityPortTokens))
 			case strings.Contains(sql, "INSERT INTO sandbox"):
 				inserted = true
 				return errorRow(fmt.Errorf("insert must not run after capability rollback"))
@@ -1861,7 +1950,7 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
-	if checks != 2 || inserted || restored {
+	if checks != 1 || inserted || restored {
 		t.Fatalf("post-selection result: checks=%d inserted=%v restored=%v", checks, inserted, restored)
 	}
 }
@@ -1897,7 +1986,7 @@ func TestCreateSandbox_PreviewAttestationFailureFailsClosed(t *testing.T) {
 			mock := &mockDBTX{
 				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 					switch {
-					case strings.Contains(sql, "-- name: HostHasCapability :one"):
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
 						return previewCapableHostRow()
 					case strings.Contains(sql, "INSERT INTO sandbox"):
 						return sandboxRow(db.Sandbox{
@@ -1948,7 +2037,7 @@ func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2002,7 +2091,7 @@ func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2068,7 +2157,7 @@ func newHostnameStampEnv(t *testing.T, stampErr error) *hostnameStampEnv {
 	}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2221,7 +2310,7 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2270,7 +2359,7 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2655,7 +2744,7 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2718,7 +2807,7 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {

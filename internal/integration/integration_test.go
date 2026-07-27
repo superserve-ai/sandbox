@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -15,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,10 +25,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -151,16 +155,20 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 	if _, err := q.UpdateHostHeartbeat(ctx, testDefaultHostID); err != nil {
 		return fmt.Errorf("heartbeat default host: %w", err)
 	}
-	if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
-		HostID:     testDefaultHostID,
-		Capability: preview.HostCapabilityPorts,
-	}); err != nil {
-		return fmt.Errorf("advertise preview capability: %w", err)
+	for _, capability := range []string{
+		preview.HostCapabilityPorts,
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+	} {
+		if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
+			HostID: testDefaultHostID, Capability: capability,
+		}); err != nil {
+			return fmt.Errorf("advertise %s: %w", capability, err)
+		}
 	}
 
-	capable, err := q.HostHasCapability(ctx, db.HostHasCapabilityParams{
-		HostID:     testDefaultHostID,
-		Capability: preview.HostCapabilityPorts,
+	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		HostID: testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 	})
 	if err != nil {
 		return fmt.Errorf("verify preview capability: %w", err)
@@ -173,6 +181,18 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 
 func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
 	ctx := context.Background()
+	missing, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		HostID: "missing-host-" + uuid.New().String()[:8],
+		RequiredCapabilities: []string{
+			preview.HostCapabilityPorts,
+		},
+	})
+	if err != nil {
+		t.Fatalf("check missing host: %v", err)
+	}
+	if missing {
+		t.Fatal("missing host passed the capability gate")
+	}
 	hostID := "capability-host-" + uuid.New().String()[:8]
 	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
 		ID:                hostID,
@@ -192,8 +212,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 		t.Fatalf("advertise capability: %v", err)
 	}
 	hasCapability := func() bool {
-		got, err := testQueries.HostHasCapability(ctx, db.HostHasCapabilityParams{
-			HostID: hostID, Capability: preview.HostCapabilityPorts,
+		got, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+			HostID: hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 		})
 		if err != nil {
 			t.Fatalf("check capability: %v", err)
@@ -203,11 +223,30 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	if !hasCapability() {
 		t.Fatal("current capability on active host was not recognized")
 	}
+	batch, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		HostID: hostID,
+		RequiredCapabilities: []string{
+			preview.HostCapabilityPorts,
+			preview.HostCapabilityPortAccess,
+		},
+	})
+	if err != nil {
+		t.Fatalf("check incomplete batch: %v", err)
+	}
+	if batch {
+		t.Fatal("host missing one required capability passed the all-capabilities gate")
+	}
 	if err := testQueries.MarkHostUnhealthy(ctx, hostID); err != nil {
 		t.Fatalf("mark host unhealthy: %v", err)
 	}
 	if hasCapability() {
 		t.Fatal("unhealthy host retained a usable capability attestation")
+	}
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("advance host heartbeat: %v", err)
+	}
+	if hasCapability() {
+		t.Fatal("capability from an older heartbeat was accepted")
 	}
 }
 
@@ -252,7 +291,9 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
 // values so that HTTP handlers can complete and write to the DB.
-type stubVMD struct{}
+type stubVMD struct {
+	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+}
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
 func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
@@ -273,7 +314,11 @@ func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry,
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
 	return nil
 }
-func (s *stubVMD) UpdateSandboxPreviewPolicy(_ context.Context, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) error {
+
+func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+	if s.updatePreviewFn != nil {
+		return s.updatePreviewFn(ctx, id, access, ports, revision)
+	}
 	return nil
 }
 func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { return nil }
@@ -377,6 +422,487 @@ func TestIntegration_PreviewAccessRollbackTriggersKeepPhase1SnapshotsRestrictive
 		t.Fatalf("private-default omitted publication access = %q, err=%v, want private", stagedAccess, err)
 	}
 	assertPolicy(privateID, preview.AccessPrivate, preview.AccessPrivate)
+}
+
+func TestIntegration_PreviewTokenGenerationLifecycleAndOverflow(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+		sandboxID, teamID, "preview-generation", testDefaultHostID,
+	); err != nil {
+		t.Fatalf("insert sandbox: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_preview_policy (sandbox_id, access, revision) VALUES ($1,'private',0)`, sandboxID,
+	); err != nil {
+		t.Fatalf("insert preview policy: %v", err)
+	}
+
+	readVersion := func() int64 {
+		t.Helper()
+		var version int64
+		if err := testPool.QueryRow(ctx,
+			`SELECT token_version FROM sandbox_preview_port_token_generation WHERE sandbox_id=$1 AND port=3000`,
+			sandboxID,
+		).Scan(&version); err != nil {
+			t.Fatalf("read token generation: %v", err)
+		}
+		return version
+	}
+
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_published_port (sandbox_id, port, access) VALUES ($1,3000,'private')`, sandboxID,
+	); err != nil {
+		t.Fatalf("first publication: %v", err)
+	}
+	if got := readVersion(); got != 1 {
+		t.Fatalf("first publication version=%d, want 1", got)
+	}
+
+	// A Phase 2 idempotent upsert fires UPDATE but does not change access, so
+	// the WHEN clause must preserve current credentials.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_published_port (sandbox_id, port, access) VALUES ($1,3000,'private')
+		ON CONFLICT (sandbox_id, port) DO UPDATE
+		SET access=EXCLUDED.access, updated_at=now()
+	`, sandboxID); err != nil {
+		t.Fatalf("idempotent publication: %v", err)
+	}
+	if got := readVersion(); got != 1 {
+		t.Fatalf("idempotent publication version=%d, want 1", got)
+	}
+
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox_published_port SET access='public' WHERE sandbox_id=$1 AND port=3000`, sandboxID,
+	); err != nil {
+		t.Fatalf("access change: %v", err)
+	}
+	if got := readVersion(); got != 2 {
+		t.Fatalf("access-change version=%d, want 2", got)
+	}
+
+	if _, err := testPool.Exec(ctx,
+		`DELETE FROM sandbox_published_port WHERE sandbox_id=$1 AND port=3000`, sandboxID,
+	); err != nil {
+		t.Fatalf("unpublish: %v", err)
+	}
+	if got := readVersion(); got != 2 {
+		t.Fatalf("unpublish removed or changed tombstone: version=%d, want 2", got)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_published_port (sandbox_id, port, access) VALUES ($1,3000,'public')`, sandboxID,
+	); err != nil {
+		t.Fatalf("republication: %v", err)
+	}
+	if got := readVersion(); got != 3 {
+		t.Fatalf("republication version=%d, want 3", got)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_preview_port_token_generation
+		SET token_version=9223372036854775807
+		WHERE sandbox_id=$1 AND port=3000
+	`, sandboxID); err != nil {
+		t.Fatalf("seed exhausted generation: %v", err)
+	}
+	_, overflowErr := testPool.Exec(ctx,
+		`UPDATE sandbox_published_port SET access='private' WHERE sandbox_id=$1 AND port=3000`, sandboxID,
+	)
+	var pgErr *pgconn.PgError
+	if !errors.As(overflowErr, &pgErr) || pgErr.Code != "22003" {
+		t.Fatalf("overflow error=%v, want PostgreSQL 22003", overflowErr)
+	}
+	var access string
+	if err := testPool.QueryRow(ctx,
+		`SELECT access FROM sandbox_published_port WHERE sandbox_id=$1 AND port=3000`, sandboxID,
+	).Scan(&access); err != nil {
+		t.Fatalf("read access after overflow: %v", err)
+	}
+	if access != preview.AccessPublic || readVersion() != int64(^uint64(0)>>1) {
+		t.Fatalf("overflow did not roll back atomically: access=%q version=%d", access, readVersion())
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_preview_port_token_generation (sandbox_id, port, token_version)
+		VALUES ($1,49983,1)
+	`, sandboxID); err == nil {
+		t.Fatal("reserved boxd port unexpectedly accepted by generation table")
+	}
+}
+
+func TestIntegration_PreviewTokenAPIRequiresWriteAndReturnsExactGeneration(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	sandboxID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+		sandboxID, teamID, "preview-token-api", testDefaultHostID,
+	); err != nil {
+		t.Fatalf("insert sandbox: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_preview_policy (sandbox_id, access, revision) VALUES ($1,'private',0)`, sandboxID,
+	); err != nil {
+		t.Fatalf("insert preview policy: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_published_port (sandbox_id, port, access) VALUES ($1,3000,'private')`, sandboxID,
+	); err != nil {
+		t.Fatalf("publish private port: %v", err)
+	}
+
+	seed := []byte("integration-preview-seed-32-bytes!!")
+	h := api.NewHandlers(&stubVMD{}, testQueries, &config.Config{
+		SandboxAccessTokenSeed: seed,
+		DefaultHostID:          testDefaultHostID,
+		SystemTeamID:           testSystemTeamID.String(),
+	})
+	h.Pool = testPool
+	registerTestHandlers(h)
+	r := api.SetupRouter(t.Context(), h, testPool)
+	base := "/sandboxes/" + sandboxID.String() + "/preview-ports/3000"
+
+	if w := do(r, http.MethodGet, "/sandboxes/"+sandboxID.String()+"/preview-ports", viewerKey, ""); w.Code != http.StatusOK {
+		t.Fatalf("viewer list status=%d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if w := do(r, http.MethodPost, base+"/token", viewerKey, `{}`); w.Code != http.StatusForbidden {
+		t.Fatalf("viewer mint status=%d, want 403; body=%s", w.Code, w.Body.String())
+	}
+
+	minted := do(r, http.MethodPost, base+"/token", ownerKey, `{"expires_in_seconds":60}`)
+	if minted.Code != http.StatusOK {
+		t.Fatalf("owner mint status=%d, want 200; body=%s", minted.Code, minted.Body.String())
+	}
+	if got := minted.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("mint Cache-Control=%q, want no-store", got)
+	}
+	mintBody := mustJSON(t, minted)
+	if _, ok := mintBody["query_param"]; ok {
+		t.Fatalf("Phase 3 mint response exposed browser carrier: %s", minted.Body.String())
+	}
+	if mintBody["token_version"] != float64(1) || mintBody["header"] != auth.PreviewTokenHeader {
+		t.Fatalf("mint response=%#v", mintBody)
+	}
+	if !auth.VerifyPreviewToken(seed, sandboxID.String(), 3000, 1, mintBody["token"].(string)) {
+		t.Fatal("minted token does not verify at generation 1")
+	}
+
+	rotated := do(r, http.MethodPost, base+"/token/rotate", ownerKey, "")
+	if rotated.Code != http.StatusOK {
+		t.Fatalf("rotate status=%d, want 200; body=%s", rotated.Code, rotated.Body.String())
+	}
+	rotateBody := mustJSON(t, rotated)
+	if rotateBody["token_version"] != float64(2) || !auth.VerifyPreviewToken(seed, sandboxID.String(), 3000, 2, rotateBody["token"].(string)) {
+		t.Fatalf("rotate response does not carry valid generation 2 token: %#v", rotateBody)
+	}
+	var version, revision int64
+	if err := testPool.QueryRow(ctx, `
+		SELECT g.token_version, p.revision
+		FROM sandbox_preview_port_token_generation g
+		JOIN sandbox_preview_policy p ON p.sandbox_id=g.sandbox_id
+		WHERE g.sandbox_id=$1 AND g.port=3000
+	`, sandboxID).Scan(&version, &revision); err != nil {
+		t.Fatalf("read post-credential state: %v", err)
+	}
+	if version != 2 || revision != 2 {
+		t.Fatalf("post-credential state version=%d revision=%d, want 2/2", version, revision)
+	}
+	var rotationActivities int
+	var rotationOutcome string
+	var auditedVersion int64
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*), max(metadata->>'delivery_outcome'), max((metadata->>'token_version')::bigint)
+		FROM activity
+		WHERE sandbox_id=$1 AND action='preview_token_rotated'
+	`, sandboxID).Scan(&rotationActivities, &rotationOutcome, &auditedVersion); err != nil {
+		t.Fatalf("read successful rotation audit: %v", err)
+	}
+	if rotationActivities != 1 || rotationOutcome != "delivered" || auditedVersion != 2 {
+		t.Fatalf("successful rotation audits=%d outcome=%q version=%d, want 1/delivered/2", rotationActivities, rotationOutcome, auditedVersion)
+	}
+}
+
+func seedPrivatePreviewSandbox(t *testing.T, teamID uuid.UUID, hostID, name string) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	sandboxID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+		sandboxID, teamID, name, hostID,
+	); err != nil {
+		t.Fatalf("insert private preview sandbox: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_preview_policy (sandbox_id, access, revision) VALUES ($1,'private',0)`, sandboxID,
+	); err != nil {
+		t.Fatalf("insert private preview policy: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_published_port (sandbox_id, port, access) VALUES ($1,3000,'private')`, sandboxID,
+	); err != nil {
+		t.Fatalf("insert private preview port: %v", err)
+	}
+	return sandboxID
+}
+
+func previewTokenIntegrationRouter(t *testing.T, vmd *stubVMD, seed []byte) *gin.Engine {
+	t.Helper()
+	h := api.NewHandlers(vmd, testQueries, &config.Config{
+		SandboxAccessTokenSeed: seed,
+		DefaultHostID:          testDefaultHostID,
+		SystemTeamID:           testSystemTeamID.String(),
+	})
+	h.Pool = testPool
+	registerTestHandlers(h)
+	return api.SetupRouter(t.Context(), h, testPool)
+}
+
+func readPreviewCredentialState(t *testing.T, sandboxID uuid.UUID) (version, revision int64) {
+	t.Helper()
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT g.token_version, p.revision
+		FROM sandbox_preview_port_token_generation g
+		JOIN sandbox_preview_policy p ON p.sandbox_id=g.sandbox_id
+		WHERE g.sandbox_id=$1 AND g.port=3000
+	`, sandboxID).Scan(&version, &revision); err != nil {
+		t.Fatalf("read preview credential state: %v", err)
+	}
+	return version, revision
+}
+
+func TestIntegration_MintDeliveryFailureRollsBackRevisionAndReturnsNoCredential(t *testing.T) {
+	teamID, ownerKey := seedTeamAndKey(t)
+	sandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "mint-delivery-rollback")
+	r := previewTokenIntegrationRouter(t, &stubVMD{updatePreviewFn: func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
+		return errors.New("forced mint delivery failure")
+	}}, []byte("integration-preview-seed-32-bytes!!"))
+
+	path := "/sandboxes/" + sandboxID.String() + "/preview-ports/3000/token"
+	w := do(r, http.MethodPost, path, ownerKey, "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("mint delivery failure status=%d, want 500; body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "spv1.") {
+		t.Fatalf("failed mint leaked a credential: %s", w.Body.String())
+	}
+	if version, revision := readPreviewCredentialState(t, sandboxID); version != 1 || revision != 0 {
+		t.Fatalf("failed mint state version=%d revision=%d, want 1/0", version, revision)
+	}
+	var mintedActivities int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT count(*) FROM activity WHERE sandbox_id=$1 AND action='preview_token_minted'
+	`, sandboxID).Scan(&mintedActivities); err != nil {
+		t.Fatalf("count failed mint activities: %v", err)
+	}
+	if mintedActivities != 0 {
+		t.Fatalf("failed pre-commit mint wrote %d success activities, want 0", mintedActivities)
+	}
+}
+
+func TestIntegration_RotationFailuresCommitRevocationAndAuditOutcome(t *testing.T) {
+	teamID, ownerKey := seedTeamAndKey(t)
+	validSeed := []byte("integration-preview-seed-32-bytes!!")
+
+	missingCapabilityHost := "rotation-capability-host-" + uuid.New().String()[:8]
+	if _, err := testQueries.CreateHost(context.Background(), db.CreateHostParams{
+		ID: missingCapabilityHost, VmdAddr: "localhost:0", ProxyAddr: "localhost:0", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create capability-test host: %v", err)
+	}
+	if _, err := testQueries.UpdateHostHeartbeat(context.Background(), missingCapabilityHost); err != nil {
+		t.Fatalf("heartbeat capability-test host: %v", err)
+	}
+	for _, capability := range []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess} {
+		if err := testQueries.InsertHostCapability(context.Background(), db.InsertHostCapabilityParams{
+			HostID: missingCapabilityHost, Capability: capability,
+		}); err != nil {
+			t.Fatalf("advertise capability-test host %s: %v", capability, err)
+		}
+	}
+
+	tests := []struct {
+		name        string
+		hostID      string
+		seed        []byte
+		deliveryErr error
+		wantStatus  int
+		wantOutcome string
+		wantVMD     bool
+	}{
+		{name: "seed unavailable", hostID: testDefaultHostID, wantStatus: http.StatusInternalServerError, wantOutcome: "seed_unavailable"},
+		{name: "capability unavailable", hostID: missingCapabilityHost, seed: validSeed, wantStatus: http.StatusConflict, wantOutcome: "capability_unavailable"},
+		{name: "delivery failed", hostID: testDefaultHostID, seed: validSeed, deliveryErr: errors.New("forced rotation delivery failure"), wantStatus: http.StatusInternalServerError, wantOutcome: "delivery_failed", wantVMD: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxID := seedPrivatePreviewSandbox(t, teamID, tt.hostID, "rotation-"+strings.ReplaceAll(tt.name, " ", "-"))
+			var vmdCalls int
+			r := previewTokenIntegrationRouter(t, &stubVMD{updatePreviewFn: func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
+				vmdCalls++
+				return tt.deliveryErr
+			}}, tt.seed)
+			path := "/sandboxes/" + sandboxID.String() + "/preview-ports/3000/token/rotate"
+			w := do(r, http.MethodPost, path, ownerKey, "")
+			if w.Code != tt.wantStatus {
+				t.Fatalf("rotation status=%d, want %d; body=%s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "spv1.") {
+				t.Fatalf("failed rotation leaked a credential: %s", w.Body.String())
+			}
+			if gotVMD := vmdCalls > 0; gotVMD != tt.wantVMD {
+				t.Fatalf("VMD called=%v, want %v", gotVMD, tt.wantVMD)
+			}
+			if version, revision := readPreviewCredentialState(t, sandboxID); version != 2 || revision != 1 {
+				t.Fatalf("failed rotation state version=%d revision=%d, want 2/1", version, revision)
+			}
+
+			var auditStatus string
+			var auditError *string
+			var metadata []byte
+			var auditCount int
+			if err := testPool.QueryRow(context.Background(), `
+				SELECT status, error, metadata, count(*) OVER ()
+				FROM activity
+				WHERE sandbox_id=$1 AND action='preview_token_rotated'
+			`, sandboxID).Scan(&auditStatus, &auditError, &metadata, &auditCount); err != nil {
+				t.Fatalf("read committed rotation audit: %v", err)
+			}
+			if auditCount != 1 {
+				t.Fatalf("committed rotation wrote %d audit records, want exactly 1", auditCount)
+			}
+			if auditStatus != "error" || auditError == nil || *auditError != tt.wantOutcome {
+				t.Fatalf("rotation audit status=%q error=%v, want error/%q", auditStatus, auditError, tt.wantOutcome)
+			}
+			var detail map[string]any
+			if err := json.Unmarshal(metadata, &detail); err != nil {
+				t.Fatalf("parse rotation audit metadata: %v", err)
+			}
+			if detail["token_version"] != float64(2) || detail["delivery_outcome"] != tt.wantOutcome {
+				t.Fatalf("rotation audit metadata=%#v", detail)
+			}
+			if strings.Contains(string(metadata), "spv1.") {
+				t.Fatalf("rotation audit leaked a token: %s", metadata)
+			}
+		})
+	}
+}
+
+func TestIntegration_MintDeliveryHoldsSandboxLockAheadOfRotation(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	sandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "ordered-preview-credentials")
+	seed := []byte("integration-preview-seed-32-bytes!!")
+
+	firstDeliveryEntered := make(chan struct{})
+	releaseFirstDelivery := make(chan struct{})
+	secondDeliveryEntered := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	defer releaseFirstOnce.Do(func() { close(releaseFirstDelivery) })
+	var pushesMu sync.Mutex
+	var pushedRevisions []int64
+	vmd := &stubVMD{updatePreviewFn: func(callCtx context.Context, _ string, _ string, _ map[int32]vmdclient.PortPolicy, revision int64) error {
+		pushesMu.Lock()
+		pushedRevisions = append(pushedRevisions, revision)
+		call := len(pushedRevisions)
+		pushesMu.Unlock()
+		switch call {
+		case 1:
+			close(firstDeliveryEntered)
+			select {
+			case <-releaseFirstDelivery:
+				return nil
+			case <-callCtx.Done():
+				return callCtx.Err()
+			}
+		case 2:
+			close(secondDeliveryEntered)
+		}
+		return nil
+	}}
+	r := previewTokenIntegrationRouter(t, vmd, seed)
+	base := "/sandboxes/" + sandboxID.String() + "/preview-ports/3000/token"
+	request := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Header.Set("X-API-Key", ownerKey)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	mintDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { mintDone <- request(base) }()
+	select {
+	case <-firstDeliveryEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mint did not reach blocked VMD delivery")
+	}
+
+	rotateDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { rotateDone <- request(base + "/rotate") }()
+
+	// Wait until PostgreSQL reports the newer request blocked on the sandbox
+	// mutation lock. On the old post-commit-delivery implementation it instead
+	// reaches the second VMD push, which this loop detects and fails.
+	lockDeadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case <-secondDeliveryEntered:
+			t.Fatal("rotation delivered revision 2 while older mint delivery was still blocked")
+		case w := <-rotateDone:
+			t.Fatalf("rotation returned before older mint delivery completed: status=%d body=%s", w.Code, w.Body.String())
+		default:
+		}
+		var waiting bool
+		err := testPool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE query LIKE '%LockSandboxForPreviewMutation%'
+				  AND wait_event_type = 'Lock'
+			)
+		`).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("observe sandbox lock waiter: %v", err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(lockDeadline) {
+			t.Fatal("rotation did not become a PostgreSQL sandbox-lock waiter")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if version, revision := readPreviewCredentialState(t, sandboxID); version != 1 || revision != 0 {
+		t.Fatalf("blocked requests exposed uncommitted state version=%d revision=%d, want 1/0", version, revision)
+	}
+
+	releaseFirstOnce.Do(func() { close(releaseFirstDelivery) })
+	var minted, rotated *httptest.ResponseRecorder
+	select {
+	case minted = <-mintDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mint did not finish after delivery release")
+	}
+	select {
+	case rotated = <-rotateDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not finish after mint commit")
+	}
+	if minted.Code != http.StatusOK || rotated.Code != http.StatusOK {
+		t.Fatalf("ordered credentials returned mint=%d (%s), rotate=%d (%s)", minted.Code, minted.Body.String(), rotated.Code, rotated.Body.String())
+	}
+	pushesMu.Lock()
+	gotRevisions := append([]int64(nil), pushedRevisions...)
+	pushesMu.Unlock()
+	if !slices.Equal(gotRevisions, []int64{1, 2}) {
+		t.Fatalf("VMD push revisions=%v, want [1 2]", gotRevisions)
+	}
+	if version, revision := readPreviewCredentialState(t, sandboxID); version != 2 || revision != 2 {
+		t.Fatalf("ordered final state version=%d revision=%d, want 2/2", version, revision)
+	}
 }
 
 // seedTeamAndKey inserts a team owner plus API key pair.

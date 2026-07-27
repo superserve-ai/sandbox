@@ -448,7 +448,11 @@ func previewPortsToProto(ports map[int32]vmdclient.PortPolicy) []*vmdpb.PreviewP
 	}
 	out := make([]*vmdpb.PreviewPort, 0, len(ports))
 	for port, policy := range ports {
-		out = append(out, &vmdpb.PreviewPort{Port: port, Access: policy.Access})
+		out = append(out, &vmdpb.PreviewPort{
+			Port:         port,
+			Access:       policy.Access,
+			TokenVersion: policy.TokenVersion,
+		})
 	}
 	return out
 }

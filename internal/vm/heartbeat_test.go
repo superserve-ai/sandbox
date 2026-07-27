@@ -21,7 +21,7 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 		case "/health":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(proxyHealthResponse{Capabilities: []string{
-				preview.HostCapabilityPorts, preview.HostCapabilityPortAccess,
+				preview.HostCapabilityPorts, preview.HostCapabilityPortAccess, preview.HostCapabilityPortTokens,
 			}})
 		case "/internal/hosts/host-a/heartbeat":
 			gotPath = r.URL.Path
@@ -44,9 +44,28 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 	if gotAuthorization != "Bearer shared" {
 		t.Fatalf("authorization = %q", gotAuthorization)
 	}
-	want := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess}
+	want := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess, preview.HostCapabilityPortTokens}
 	if !reflect.DeepEqual(got.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, want)
+	}
+}
+
+func TestProxyPreviewCapabilitiesRequiresAccessBeforeTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(proxyHealthResponse{Capabilities: []string{
+			preview.HostCapabilityPorts, preview.HostCapabilityPortTokens,
+		}})
+	}))
+	defer server.Close()
+
+	got, err := proxyPreviewCapabilities(context.Background(), server.Client(), server.URL)
+	if err != nil {
+		t.Fatalf("proxyPreviewCapabilities: %v", err)
+	}
+	want := []string{preview.HostCapabilityPorts}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("capabilities = %#v, want %#v", got, want)
 	}
 }
 

@@ -74,16 +74,39 @@ func TestVMDResolverAcceptsAttestedLegacyResponse(t *testing.T) {
 	}
 }
 
+func TestVMDResolverAttestsPreviewTokensOnlyWhenConfigured(t *testing.T) {
+	var gotCapabilities string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCapabilities = r.Header.Get(preview.ProxyCapabilitiesHeader)
+		attestPreviewProtocol(w)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"vm_ip": "10.0.0.2", "status": "running", "started_at": int64(123),
+		})
+	}))
+	defer server.Close()
+
+	resolver := NewVMDResolver(server.URL).WithPreviewTokens()
+	if _, err := resolver.Lookup(context.Background(), "vm-token-aware"); err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	want := preview.HostCapabilityPortAccess + ", " + preview.HostCapabilityPortTokens
+	if gotCapabilities != want {
+		t.Fatalf("%s = %q, want %q", preview.ProxyCapabilitiesHeader, gotCapabilities, want)
+	}
+}
+
 func TestVMDResolverDecodesParallelPortAccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attestPreviewProtocol(w)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"vm_ip":               "10.0.0.2",
-			"status":              "running",
-			"preview_access":      "private",
-			"preview_ports":       map[string]bool{"3000": true, "3001": true, "bad": true},
-			"preview_port_access": map[string]string{"3000": "public", "3001": "future", "9999": "private", "bad": "public"},
+			"vm_ip":                       "10.0.0.2",
+			"status":                      "running",
+			"preview_access":              "private",
+			"preview_ports":               map[string]bool{"3000": true, "3001": true, "bad": true},
+			"preview_port_access":         map[string]string{"3000": "public", "3001": "future", "9999": "private", "bad": "public"},
+			"preview_port_token_versions": map[string]int64{"3000": 0, "3001": 7, "9999": 8, "bad": 9},
 		})
 	}))
 	defer server.Close()
@@ -97,6 +120,9 @@ func TestVMDResolverDecodesParallelPortAccess(t *testing.T) {
 	}
 	if _, ok := info.PreviewPortAccess[9999]; ok {
 		t.Fatalf("access for unpublished port survived decode: %#v", info.PreviewPortAccess)
+	}
+	if len(info.PreviewPortTokenVersions) != 1 || info.PreviewPortTokenVersions[3001] != 7 {
+		t.Fatalf("decoded token versions = %#v, want only 3001:7", info.PreviewPortTokenVersions)
 	}
 }
 

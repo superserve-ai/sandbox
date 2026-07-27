@@ -26,14 +26,15 @@ var ErrVMDPreviewProtocolUnsupported = errors.New("proxy: vmd does not attest pr
 
 // InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
-	VMIP              string
-	Status            string
-	StartedAt         int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
-	TeamID            string // owning team, for usage attribution
-	OwnerID           string // creating user, for usage attribution; empty when unknown
-	PreviewAccess     string
-	PreviewPorts      map[int]struct{}
-	PreviewPortAccess map[int]string
+	VMIP                     string
+	Status                   string
+	StartedAt                int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	TeamID                   string // owning team, for usage attribution
+	OwnerID                  string // creating user, for usage attribution; empty when unknown
+	PreviewAccess            string
+	PreviewPorts             map[int]struct{}
+	PreviewPortAccess        map[int]string
+	PreviewPortTokenVersions map[int]int64
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -80,6 +81,10 @@ type cacheEntry struct {
 type VMDResolver struct {
 	vmdAddr string
 	client  *http.Client
+	// previewTokens is enabled only after cmd/proxy installs a valid seed.
+	// It keeps the local protocol attestation honest when token auth is not
+	// configured, causing VMD to withhold tokenized instances instead.
+	previewTokens bool
 
 	mu sync.Mutex
 	// epoch advances on any explicit invalidation. It is part of the
@@ -91,6 +96,13 @@ type VMDResolver struct {
 	epoch uint64
 	cache map[string]cacheEntry
 	group singleflight.Group
+}
+
+// WithPreviewTokens declares that the owning proxy handler has a valid seed
+// and can enforce HostCapabilityPortTokens. Configure it once at startup.
+func (r *VMDResolver) WithPreviewTokens() *VMDResolver {
+	r.previewTokens = true
+	return r
 }
 
 // NewVMDResolver creates a Resolver that queries VMD at vmdAddr.
@@ -144,14 +156,15 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP              string            `json:"vm_ip"`
-	Status            string            `json:"status"`
-	StartedAt         int64             `json:"started_at"`
-	TeamID            string            `json:"team_id"`
-	OwnerID           string            `json:"owner_id"`
-	PreviewAccess     string            `json:"preview_access"`
-	PreviewPorts      map[string]bool   `json:"preview_ports"`
-	PreviewPortAccess map[string]string `json:"preview_port_access"`
+	VMIP                     string            `json:"vm_ip"`
+	Status                   string            `json:"status"`
+	StartedAt                int64             `json:"started_at"`
+	TeamID                   string            `json:"team_id"`
+	OwnerID                  string            `json:"owner_id"`
+	PreviewAccess            string            `json:"preview_access"`
+	PreviewPorts             map[string]bool   `json:"preview_ports"`
+	PreviewPortAccess        map[string]string `json:"preview_port_access"`
+	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64) (InstanceInfo, error) {
@@ -161,7 +174,11 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 		return InstanceInfo{}, fmt.Errorf("resolver: build request: %w", err)
 	}
 	req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
-	req.Header.Set(preview.ProxyCapabilitiesHeader, preview.HostCapabilityPortAccess)
+	capabilities := preview.HostCapabilityPortAccess
+	if r.previewTokens {
+		capabilities += ", " + preview.HostCapabilityPortTokens
+	}
+	req.Header.Set(preview.ProxyCapabilitiesHeader, capabilities)
 
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -188,11 +205,30 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 	info := InstanceInfo{
 		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
 		TeamID: raw.TeamID, OwnerID: raw.OwnerID,
-		PreviewAccess:     raw.PreviewAccess,
-		PreviewPorts:      decodePreviewPorts(raw.PreviewPorts),
-		PreviewPortAccess: decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),
+		PreviewAccess:            raw.PreviewAccess,
+		PreviewPorts:             decodePreviewPorts(raw.PreviewPorts),
+		PreviewPortAccess:        decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),
+		PreviewPortTokenVersions: decodePreviewPortTokenVersions(raw.PreviewPorts, raw.PreviewPortTokenVersions),
 	}
 	return info, nil
+}
+
+func decodePreviewPortTokenVersions(published map[string]bool, raw map[string]int64) map[int]int64 {
+	if len(published) == 0 || len(raw) == 0 {
+		return nil
+	}
+	out := make(map[int]int64, len(raw))
+	for key, version := range raw {
+		port, err := strconv.Atoi(key)
+		if err != nil || !published[key] || port < minProxiedPort || port > 65535 || version <= 0 {
+			continue
+		}
+		out[port] = version
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func decodePreviewPortAccess(published map[string]bool, raw map[string]string) map[int]string {

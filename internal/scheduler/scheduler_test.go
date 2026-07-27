@@ -81,9 +81,10 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 	ctx := context.Background()
 
 	public := []string{preview.HostCapabilityPorts}
-	private := []string{preview.HostCapabilityPortAccess, preview.HostCapabilityPorts}
+	private := []string{preview.HostCapabilityPortTokens, preview.HostCapabilityPortAccess, preview.HostCapabilityPorts}
 	for _, required := range [][]string{public, public, private, {
-		preview.HostCapabilityPorts, preview.HostCapabilityPortAccess, preview.HostCapabilityPorts,
+		preview.HostCapabilityPorts, preview.HostCapabilityPortTokens, preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPorts, preview.HostCapabilityPortTokens,
 	}} {
 		if got, err := s.SelectHost(ctx, required); err != nil || got != "fallback" {
 			t.Fatalf("SelectHost(%v) = (%q, %v), want fallback", required, got, err)
@@ -93,7 +94,11 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 	if capture.calls != 2 {
 		t.Fatalf("query calls = %d, want 2 capability-specific cache fills", capture.calls)
 	}
-	wantPrivate := []string{preview.HostCapabilityPortAccess, preview.HostCapabilityPorts}
+	wantPrivate := []string{
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPorts,
+	}
 	if !reflect.DeepEqual(capture.args[1], wantPrivate) {
 		t.Fatalf("private requirements = %#v, want %#v", capture.args[1], wantPrivate)
 	}

@@ -151,3 +151,38 @@ func TestHostCapabilityAttestationIsBoundToCurrentHeartbeat(t *testing.T) {
 		t.Fatal("host capability gate accepts capabilities from an unhealthy host")
 	}
 }
+
+func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "hosts.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read host queries: %v", err)
+	}
+	queries := string(raw)
+	start := strings.Index(queries, "-- name: HostHasCapabilities :one")
+	if start < 0 {
+		t.Fatal("HostHasCapabilities query block is missing")
+	}
+	end := strings.Index(queries[start:], "-- name: MarkHostUnhealthy :exec")
+	if end < 0 {
+		t.Fatal("HostHasCapabilities query terminator is missing")
+	}
+	query := queries[start : start+end]
+	for _, required := range []string{
+		"WITH target_host AS MATERIALIZED",
+		"WHERE id = sqlc.arg('host_id')",
+		"status = 'active'",
+		"last_heartbeat_at IS NOT NULL",
+		"FOR SHARE",
+		"unnest(sqlc.arg('required_capabilities')::text[])",
+		"hc.host_id = h.id",
+		"hc.heartbeat_at = h.last_heartbeat_at",
+	} {
+		if !strings.Contains(query, required) {
+			t.Errorf("batch capability gate is missing %q", required)
+		}
+	}
+	if got := strings.Count(query, "WHERE NOT EXISTS"); got != 2 {
+		t.Fatalf("batch capability relational division has %d NOT EXISTS clauses, want 2", got)
+	}
+}

@@ -12,8 +12,14 @@ const (
 	// Superserve authentication.
 	AccessPublic = "public"
 	// AccessPrivate requires explicit publication and keeps the port closed
-	// until a later authentication phase authorizes the request.
+	// to Phase 2 proxies. The database and public API continue to use this
+	// literal value after token authentication is introduced.
 	AccessPrivate = "private"
+	// AccessPrivateTokenV1 is a wire-only per-port mode. It is emitted to VMD
+	// only after the host has attested token enforcement and must never be
+	// persisted as the database access value. Older VMD/proxy generations see
+	// an unknown mode and therefore fail closed.
+	AccessPrivateTokenV1 = "private_token_v1"
 
 	// HostCapabilityPorts is advertised by a vmd/proxy build that persists and
 	// enforces the explicit published-port allowlist.
@@ -21,6 +27,11 @@ const (
 	// HostCapabilityPortAccess is advertised only when the host persists and
 	// enforces the independent access mode on each published port.
 	HostCapabilityPortAccess = "preview_port_access_v1"
+	// HostCapabilityPortTokens is advertised only when VMD and the live proxy
+	// both enforce per-port token generations and the proxy has a valid HMAC
+	// seed. It is intentionally separate from per-port access so private policy
+	// cannot become active during a partial fleet rollout.
+	HostCapabilityPortTokens = "preview_port_tokens_v1"
 
 	// Published preview ports exclude privileged ports and boxd's reserved
 	// service port. Keeping this vocabulary shared prevents the API, VMD,

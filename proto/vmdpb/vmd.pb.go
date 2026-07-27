@@ -1743,7 +1743,10 @@ type PreviewPort struct {
 	Port  int32                  `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`
 	// Per-port access mode. Empty means a Phase 1 sender and falls back to the
 	// sandbox policy. Unknown non-empty values fail closed.
-	Access        string `protobuf:"bytes,2,opt,name=access,proto3" json:"access,omitempty"`
+	Access string `protobuf:"bytes,2,opt,name=access,proto3" json:"access,omitempty"`
+	// Positive generation for the wire-only "private_token_v1" mode. Other
+	// access modes ignore this field. Tokens are scoped to this exact value.
+	TokenVersion  int64 `protobuf:"varint,3,opt,name=token_version,json=tokenVersion,proto3" json:"token_version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1790,6 +1793,13 @@ func (x *PreviewPort) GetAccess() string {
 		return x.Access
 	}
 	return ""
+}
+
+func (x *PreviewPort) GetTokenVersion() int64 {
+	if x != nil {
+		return x.TokenVersion
+	}
+	return 0
 }
 
 type RestoreSnapshotResponse struct {
@@ -3537,10 +3547,11 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x17preview_policy_revision\x18\x0e \x01(\x03R\x15previewPolicyRevision\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"9\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"^\n" +
 	"\vPreviewPort\x12\x12\n" +
 	"\x04port\x18\x01 \x01(\x05R\x04port\x12\x16\n" +
-	"\x06access\x18\x02 \x01(\tR\x06access\"\xcc\x01\n" +
+	"\x06access\x18\x02 \x01(\tR\x06access\x12#\n" +
+	"\rtoken_version\x18\x03 \x01(\x03R\ftokenVersion\"\xcc\x01\n" +
 	"\x17RestoreSnapshotResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +

@@ -356,6 +356,9 @@ message PreviewPort {
   // Per-port access mode. Empty means a Phase 1 sender and falls back to the
   // sandbox policy. Unknown non-empty values fail closed.
   string access = 2;
+  // Positive generation for the wire-only "private_token_v1" mode. Other
+  // access modes ignore this field. Tokens are scoped to this exact value.
+  int64 token_version = 3;
 }
 
 message RestoreSnapshotResponse {

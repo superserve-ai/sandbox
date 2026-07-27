@@ -42,6 +42,14 @@ func TestLocalHTTPRequiresProxyProtocolForStrictInstance(t *testing.T) {
 				3000: {Access: preview.AccessPrivate},
 			},
 		},
+		"tokenized": {
+			ID: "tokenized", Status: StatusRunning, IP: "10.0.0.7", CreatedAt: time.Unix(6, 0),
+			PreviewAccess: preview.AccessPrivate,
+			PreviewPorts: map[int32]PreviewPortPolicy{
+				3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 9},
+			},
+			PreviewPolicyRevision: 12, PreviewTokenPolicyRevision: 12,
+		},
 	}}
 	srv := NewLocalHTTPServer(mgr, zerolog.Nop())
 
@@ -127,5 +135,32 @@ func TestLocalHTTPRequiresProxyProtocolForStrictInstance(t *testing.T) {
 	}
 	if got.PreviewAccess != preview.AccessPrivate {
 		t.Fatalf("inconsistent legacy fallback = %q, want private", got.PreviewAccess)
+	}
+
+	// A Phase 2 proxy cannot receive a tokenized snapshot or its generations.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/instances/tokenized", nil)
+	req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
+	req.Header.Set(preview.ProxyCapabilitiesHeader, preview.HostCapabilityPortAccess)
+	srv.handleInstance(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("phase2 tokenized lookup status = %d, want 404", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/instances/tokenized", nil)
+	req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
+	req.Header.Set(preview.ProxyCapabilitiesHeader,
+		preview.HostCapabilityPortAccess+", "+preview.HostCapabilityPortTokens)
+	srv.handleInstance(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("phase3 tokenized lookup status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode tokenized response: %v", err)
+	}
+	if got.PreviewPortAccess["3000"] != preview.AccessPrivateTokenV1 ||
+		got.PreviewPortTokenVersions["3000"] != 9 {
+		t.Fatalf("tokenized response = %#v", got)
 	}
 }

@@ -636,9 +636,10 @@ paths:
         For a strict `public` or `private` sandbox, only the ports listed here
         are published at `https://{port}-{sandbox_id}.<sandbox-domain>`; every
         other numeric port returns 404. Each row reports its independent access
-        mode. In this phase private and unknown per-port modes return 401 because
-        token authentication lands later. An older `legacy_public` sandbox may
-        still route every listening port until it is updated to a strict mode.
+        mode. Private ports require a port-scoped token in the response's
+        `X-Superserve-Preview-Token` header; unknown ports remain closed. An
+        older `legacy_public` sandbox may still route every listening port
+        until it is updated to a strict mode.
       security:
         - apiKey: []
       responses:
@@ -727,6 +728,103 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports/{port}/token:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
+
+    post:
+      operationId: mintSandboxPreviewToken
+      tags: [Sandboxes]
+      summary: Mint a header token for a private preview port
+      description: |
+        Activates token authentication for an already-published private port
+        and returns a credential scoped to exactly this sandbox, port, and
+        token generation. Send the response's `token` value in a request header
+        whose name is the response's `header` value. URL query parameters,
+        cookies, and browser signed links are not accepted in this phase.
+        Public or unpublished ports cannot mint credentials.
+
+        The request body is optional. Omit it (or send `{}`) for a token that
+        remains valid until rotation, access-mode change, or unpublication.
+        Minting requires sandbox write access because the result is a live
+        data-plane credential.
+      security:
+        - apiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PreviewTokenRequest"
+      responses:
+        "200":
+          description: Fresh header credential; never cache this response
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `no-store`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewTokenResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports/{port}/token/rotate:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
+
+    post:
+      operationId: rotateSandboxPreviewToken
+      tags: [Sandboxes]
+      summary: Rotate a private preview port's token generation
+      description: |
+        Advances only this published private port's token generation, revoking
+        every older token for it while leaving sibling ports unchanged. The
+        revocation is committed even if the current host cannot deliver or
+        enforce the replacement; in that case the request returns an error and
+        no credential. A successful response contains a fresh non-expiring
+        header token for the new generation.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Fresh header credential for the new generation; never cache this response
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `no-store`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewTokenResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2620,7 +2718,7 @@ components:
 
     PreviewPort:
       type: object
-      required: [port, access]
+      required: [port, access, token_version]
       properties:
         port:
           type: integer
@@ -2632,7 +2730,17 @@ components:
         access:
           type: string
           enum: [public, private]
-          description: Independent access mode for this published port.
+          description: |
+            Independent access mode for this published port. Requests to a
+            private port must send its preview token in the request header
+            named by the token-mint response's `header` field.
+        token_version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Durable generation used to scope credentials for this port.
+            Rotation, access changes, and unpublish/re-publish advance it.
 
     PreviewPortList:
       type: object
@@ -2649,6 +2757,57 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PreviewPort"
+
+    PreviewTokenRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Optional expiry for a header token. Omit the body (or send `{}`) for a
+        credential that remains valid until its generation changes.
+      properties:
+        expires_in_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 604800
+          description: Lifetime in whole seconds; omitted means no time expiry.
+
+    PreviewTokenResponse:
+      type: object
+      required: [token, port, header, access, preview_access, token_version]
+      properties:
+        token:
+          type: string
+          description: |
+            Secret token scoped to this sandbox, port, and generation. Send
+            this value in a request header named by `header`.
+        port:
+          type: integer
+          minimum: 1024
+          maximum: 65535
+          not:
+            enum: [49983]
+        header:
+          type: string
+          example: X-Superserve-Preview-Token
+          description: Request-header name to use when sending `token`.
+        access:
+          type: string
+          enum: [private]
+          description: The published port's access mode.
+        preview_access:
+          type: string
+          enum: [legacy_public, public, private]
+          description: Sandbox default for newly published ports.
+        token_version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Exact generation embedded in `token`.
+        expires_at:
+          type: string
+          format: date-time
+          description: Present only when `expires_in_seconds` was supplied.
 
     BuildSpec:
       type: object

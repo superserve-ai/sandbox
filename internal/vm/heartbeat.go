@@ -155,6 +155,9 @@ func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthUR
 	out := []string{preview.HostCapabilityPorts}
 	if advertised[preview.HostCapabilityPortAccess] {
 		out = append(out, preview.HostCapabilityPortAccess)
+		if advertised[preview.HostCapabilityPortTokens] {
+			out = append(out, preview.HostCapabilityPortTokens)
+		}
 	}
 	return out, nil
 }

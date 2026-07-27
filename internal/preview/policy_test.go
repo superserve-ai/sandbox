@@ -26,6 +26,7 @@ func TestRestrictiveFallback(t *testing.T) {
 		{name: "phase one empty mode inherits public", sandbox: AccessPublic, ports: []string{""}, want: AccessPublic},
 		{name: "private default", sandbox: AccessPrivate, ports: []string{AccessPublic}, want: AccessPrivate},
 		{name: "mixed private", sandbox: AccessPublic, ports: []string{AccessPublic, AccessPrivate}, want: AccessPrivate},
+		{name: "token sentinel is restrictive", sandbox: AccessPublic, ports: []string{AccessPrivateTokenV1}, want: AccessPrivate},
 		{name: "unknown port", sandbox: AccessPublic, ports: []string{"future"}, want: AccessPrivate},
 		{name: "legacy compatible public row", sandbox: AccessLegacyPublic, ports: []string{AccessPublic}, want: AccessLegacyPublic},
 		{name: "legacy inconsistent private row", sandbox: AccessLegacyPublic, ports: []string{AccessPrivate}, want: AccessPrivate},
