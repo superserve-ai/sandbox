@@ -2363,7 +2363,7 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 // that no live BoltDB record claims — leaked by crashed template builds or a
 // teardown that raced the kernel delete. Reads BoltDB directly, so it is safe
 // to run before the eager reattach and before the network pool fills.
-func (m *Manager) SweepStartupOrphanNamespaces() {
+func (m *Manager) SweepStartupOrphanNamespaces(extraKeep ...string) {
 	if m.state == nil {
 		return
 	}
@@ -2379,6 +2379,12 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 		if rec.Namespace != "" {
 			keepNs[rec.Namespace] = true
 		}
+	}
+	// Recordless cgroup survivors whose FC outlived the reap: keep their tap
+	// intact so the slot isn't recycled under a live process. The reconciler
+	// reclaims them once confirmed dead.
+	for _, ns := range extraKeep {
+		keepNs[ns] = true
 	}
 	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
 		m.log.Info().Int("swept", swept).Msg("sweep: removed orphan namespaces")
@@ -2412,18 +2418,23 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 // no BoltDB record — a crash between spawn and the first persist. It runs
 // synchronously at startup, BEFORE the request gate opens, so every recordless
 // cgroup is genuinely a previous-life survivor (no create has happened yet);
-// the racy post-gate case is left to the reconciler under its op lock. The
-// survivor's netns is freed for the sweep once its FC is dead. No-op unless
-// direct spawn is armed/managed and the state store is attached.
-func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) {
+// the racy post-gate case is left to the reconciler under its op lock. No-op
+// unless direct spawn is armed/managed and the state store is attached.
+//
+// Returns the namespaces of survivors it could NOT confirm dead. A SIGKILL-
+// immune FC (D-state, UFFD-wedged) survives the kill still holding its tap;
+// the caller must keep that namespace out of the orphan sweep or the slot
+// recycles under a live FC, breaking death-before-recycle.
+func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) []string {
 	if m.cgroups == nil || m.state == nil {
-		return
+		return nil
 	}
 	cgIDs, err := m.cgroups.scanVMCgroups()
 	if err != nil {
 		m.log.Warn().Err(err).Msg("failed to scan vm cgroups for recordless reap")
-		return
+		return nil
 	}
+	var protected []string
 	for _, id := range cgIDs {
 		if isBuildVM(id) {
 			continue
@@ -2432,10 +2443,22 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) {
 			continue // recorded (reattach owns it) or unreadable (conservative)
 		}
 		m.log.Warn().Str("vm_id", id).Msg("recordless cgroup survivor at startup — reaping")
+		// Capture the netns before the kill: an FC that survives it is still in
+		// the group, but a clean kill removes it and firstPID would read empty.
+		ns := m.netMgr.NamespaceForPID(m.cgroups.firstPID(id))
 		if serr := m.stopVM(ctx, id, SupervisionCgroup); serr != nil {
 			m.log.Error().Err(serr).Str("vm_id", id).Msg("failed to reap recordless cgroup")
+			// Only protect when the FC is not provably dead (still populated or
+			// unreadable). A confirmed-empty group whose rmdir merely failed is
+			// dead — its slot is genuinely free for the sweep.
+			if ns != "" {
+				if pop, perr := m.cgroups.vmCgroupPopulated(id); perr != nil || pop {
+					protected = append(protected, ns)
+				}
+			}
 		}
 	}
+	return protected
 }
 
 // collectStartupSlots returns vmID→namespace for every record that has one, so
