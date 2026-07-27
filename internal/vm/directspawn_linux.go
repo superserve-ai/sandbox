@@ -2,16 +2,12 @@ package vm
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
-
-	"github.com/rs/zerolog"
 )
 
 // Direct spawn: vmd forks the per-VM start.sh itself (into the VM's cgroup
@@ -53,60 +49,54 @@ func directSpawnScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID
 // maxConsoleBytes caps a VM's console file. The guest serial console is
 // UNTRUSTED output: without a bound, a guest that spams its console grows
 // console.log without limit and fills the host disk, taking down every VM on
-// the host. 1 MiB is far more than a boot log plus a panic dump, yet the
-// aggregate worst case (every VM malicious) stays bounded. Kept as the FIRST
-// bytes: boot output and the earliest fault are the forensic value; a guest
-// that spams megabytes before crashing is already the pathological case.
+// the host. The bound is enforced out-of-band by trimOversizedConsoles on
+// the reconcile tick (NOT by interposing vmd in the write path — the child
+// must own its file fd so its output survives a vmd restart). 1 MiB is far
+// more than a boot log plus a panic dump; the reconciler keeps the first
+// maxConsoleBytes (boot + earliest fault) and drops the overflow.
 const maxConsoleBytes = 1 << 20
 
-// openVMConsole opens the per-VM console file that the child's stdout/stderr
-// attach to (through cappedConsole). Firecracker's own log line plus
-// panic/abort output land here — including the UFFD handler-death message
-// that precedes an exit(70). A file, not a journald stream: journald
-// rate-limits by unit cgroup, so shared streams would let one spamming VM
-// suppress vmd's own logs; the per-VM cap below supplies the bound journald
-// would otherwise give.
+// openVMConsole opens the per-VM console file the child's stdout/stderr
+// attach to. Firecracker's own log line plus panic/abort output land here —
+// including the UFFD handler-death message that precedes an exit(70). The
+// child holds this fd directly (O_APPEND), so its console keeps flowing to
+// the file even across a vmd restart — the survival property. A file, not a
+// journald stream: journald rate-limits by unit cgroup, so shared streams
+// would let one spamming VM suppress vmd's own logs. The size bound journald
+// would otherwise give is supplied by trimOversizedConsoles.
 func openVMConsole(runDir, vmID string) (*os.File, error) {
 	return os.OpenFile(filepath.Join(runDir, vmID, "console.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 }
 
-// cappedConsole bounds how much a VM's console can write. Once the cap is
-// reached it drops further output, reporting success so the guest's writes
-// never block on a full pipe. os/exec routes both stdout and stderr through
-// one copier when they are the same writer value, so Write is not called
-// concurrently — the mutex is cheap insurance, not a hot path.
-type cappedConsole struct {
-	mu        sync.Mutex
-	w         io.Writer
-	remaining int64
-	capped    bool
-	vmID      string
-	log       zerolog.Logger
-}
-
-func newCappedConsole(w io.Writer, cap int64, vmID string, log zerolog.Logger) *cappedConsole {
-	return &cappedConsole{w: w, remaining: cap, vmID: vmID, log: log}
-}
-
-func (c *cappedConsole) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.remaining <= 0 {
-		if !c.capped {
-			c.capped = true
-			c.log.Warn().Str("vm_id", c.vmID).Msg("console output hit cap — dropping further output")
+// trimOversizedConsoles bounds every direct-spawn console file to
+// maxConsoleBytes by truncating the overflow, keeping the first
+// maxConsoleBytes (boot + earliest fault). Truncating to a size that a live
+// FC is appending to (O_APPEND) is safe: the file caps at maxConsoleBytes and
+// the next append lands just past it, trimmed again next tick. This is a
+// total-file-size bound, so it also caps growth across resume/verify cycles
+// that reuse the same file. No-op unless armed; runs on the reconcile tick.
+func (m *Manager) trimOversizedConsoles() {
+	if m.cgroups == nil {
+		return
+	}
+	ids, err := m.cgroups.scanVMCgroups()
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		path := filepath.Join(m.cfg.RunDir, id, "console.log")
+		fi, err := os.Stat(path)
+		if err != nil || fi.Size() <= maxConsoleBytes {
+			continue
 		}
-		return len(p), nil // drop; report consumed so the copier keeps draining
+		if terr := os.Truncate(path, maxConsoleBytes); terr != nil {
+			m.log.Warn().Err(terr).Str("vm_id", id).Msg("failed to trim oversized console")
+			continue
+		}
+		m.log.Warn().Str("vm_id", id).Int64("cap", maxConsoleBytes).
+			Msg("trimmed oversized vm console")
 	}
-	if int64(len(p)) > c.remaining {
-		n, err := c.w.Write(p[:c.remaining])
-		c.remaining -= int64(n)
-		return len(p), err // wrote up to the cap; the rest is dropped
-	}
-	n, err := c.w.Write(p)
-	c.remaining -= int64(n)
-	return n, err
 }
 
 // directSpawnResult is what the reaper records when the VM's process chain
@@ -121,14 +111,15 @@ type directSpawnResult struct {
 
 // spawnDirect launches script (already on disk, mode 0755) into the given
 // cgroup directory fd. Returns the started Cmd; the caller owns Wait (via
-// waitDirect). console is a cappedConsole (an io.Writer, not the raw file),
-// so os/exec pipes the child's output through the cap; the underlying file
-// is closed by the caller after Wait, when the copier has drained.
+// waitDirect). console is the raw per-VM file: os/exec passes its fd straight
+// to the child, so the child owns it and keeps writing even after vmd exits —
+// no vmd-owned pipe in the path. The caller closes vmd's copy after Start.
+// The file's size bound is enforced separately by trimOversizedConsoles.
 //
 // Setsid: the VM gets its own session — signals to vmd's process group
 // must never reach VMs (precedent: the cold-boot path). Deliberately NO
 // Pdeathsig: children must outlive vmd; that is the survival property.
-func spawnDirect(scriptPath string, cgroupDir *os.File, console io.Writer) (*exec.Cmd, error) {
+func spawnDirect(scriptPath string, cgroupDir, console *os.File) (*exec.Cmd, error) {
 	cmd := exec.Command(scriptPath)
 	cmd.Env = directSpawnEnv()
 	cmd.Stdout = console

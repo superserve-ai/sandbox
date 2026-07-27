@@ -2,7 +2,6 @@ package vm
 
 import (
 	"encoding/json"
-	"github.com/rs/zerolog"
 	"strings"
 	"testing"
 )
@@ -96,34 +95,3 @@ func TestSupervisionRoundTrip(t *testing.T) {
 		t.Fatalf("unit-mode record must omit the supervision key, got %s", out)
 	}
 }
-
-// A capped console must bound total bytes written and drop the rest,
-// reporting success so the guest never blocks — the DoS bound.
-func TestCappedConsole(t *testing.T) {
-	var sink bytesBuffer
-	c := newCappedConsole(&sink, 10, "vm-1", zerolog.Nop())
-
-	n, err := c.Write([]byte("hello"))
-	if n != 5 || err != nil {
-		t.Fatalf("first write n=%d err=%v", n, err)
-	}
-	// Second write straddles the cap: 5 already written, cap 10, this is 8.
-	n, err = c.Write([]byte("world!!!"))
-	if n != 8 || err != nil { // reports full length consumed
-		t.Fatalf("straddle write n=%d err=%v", n, err)
-	}
-	// Third write is entirely past the cap: dropped, still reports success.
-	n, err = c.Write([]byte("more"))
-	if n != 4 || err != nil {
-		t.Fatalf("post-cap write n=%d err=%v", n, err)
-	}
-	if got := sink.String(); got != "helloworld" { // exactly the cap
-		t.Fatalf("sink = %q, want the first 10 bytes only", got)
-	}
-}
-
-// bytesBuffer is a tiny io.Writer sink (avoids importing bytes just for this).
-type bytesBuffer struct{ b []byte }
-
-func (w *bytesBuffer) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
-func (w *bytesBuffer) String() string              { return string(w.b) }

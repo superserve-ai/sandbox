@@ -233,6 +233,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// atomic load) once the host has converged.
 	r.mgr.sweepPresenceSidecars(active)
 
+	// Bound direct-spawn console files: an untrusted guest can spam its serial
+	// console, and the child owns the file fd (so vmd can't cap it in the
+	// write path without breaking restart survival). Trim the overflow here.
+	r.mgr.trimOversizedConsoles()
+
 	// Source C: DB sandbox rows for this host (optional), with their
 	// linked snapshot path joined in so Drift 4 can stat the snapshot
 	// without a per-row lookup. A short per-query deadline keeps a slow

@@ -165,18 +165,15 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 		return 0, err
 	}
 	defer cgDir.Close()
-	consoleFile, err := openVMConsole(m.cfg.RunDir, vmID)
+	console, err := openVMConsole(m.cfg.RunDir, vmID)
 	if err != nil {
 		return 0, fmt.Errorf("open vm console: %w", err)
 	}
 
 	tStart := time.Now()
-	// The size-capped writer routes the child's output through a pipe, so the
-	// file must stay open until Wait drains the copier — closed in the reaper,
-	// not here.
-	cmd, err := spawnDirect(scriptPath, cgDir, newCappedConsole(consoleFile, maxConsoleBytes, vmID, m.log))
+	cmd, err := spawnDirect(scriptPath, cgDir, console)
+	console.Close() // the child holds its own dup; vmd's copy is done
 	if err != nil {
-		consoleFile.Close()
 		_ = m.cgroups.removeVMCgroup(vmID)
 		return 0, fmt.Errorf("spawn firecracker: %w", err)
 	}
@@ -188,7 +185,6 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	m.reapers.Store(vmID, exited)
 	go func() {
 		res := waitDirect(cmd)
-		consoleFile.Close() // Wait drained the copier; safe to close now
 		close(exited)
 		// Drop our own entry so a VM that exits WITHOUT a stop (guest
 		// shutdown, crash, OOM) doesn't leak a map entry — the only other
