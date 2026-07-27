@@ -32,6 +32,11 @@ variable "writer_members" {
 variable "gc_service_account_id" {
   description = "Account ID for the dedicated control-plane GC service account that owns object deletion."
   type        = string
+
+  validation {
+    condition     = length(var.gc_service_account_id) >= 6 && length(var.gc_service_account_id) <= 30
+    error_message = "Service account account_id must be 6-30 characters."
+  }
 }
 
 variable "soft_delete_retention_seconds" {
