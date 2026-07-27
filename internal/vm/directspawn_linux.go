@@ -46,57 +46,22 @@ func directSpawnScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID
 	return prefix + "prlimit --nofile=1024:524288 " + rest, nil
 }
 
-// maxConsoleBytes caps a VM's console file. The guest serial console is
-// UNTRUSTED output: without a bound, a guest that spams its console grows
-// console.log without limit and fills the host disk, taking down every VM on
-// the host. The bound is enforced out-of-band by trimOversizedConsoles on
-// the reconcile tick (NOT by interposing vmd in the write path — the child
-// must own its file fd so its output survives a vmd restart). 1 MiB is far
-// more than a boot log plus a panic dump; the reconciler keeps the first
-// maxConsoleBytes (boot + earliest fault) and drops the overflow.
-const maxConsoleBytes = 1 << 20
-
 // openVMConsole opens the per-VM console file the child's stdout/stderr
 // attach to. Firecracker's own log line plus panic/abort output land here —
 // including the UFFD handler-death message that precedes an exit(70). The
-// child holds this fd directly (O_APPEND), so its console keeps flowing to
-// the file even across a vmd restart — the survival property. A file, not a
-// journald stream: journald rate-limits by unit cgroup, so shared streams
-// would let one spamming VM suppress vmd's own logs. The size bound journald
-// would otherwise give is supplied by trimOversizedConsoles.
+// child holds this fd directly, so its console keeps flowing to the file even
+// across a vmd restart — the survival property.
+//
+// O_TRUNC, not O_APPEND: a fresh file per launch bounds the on-disk total to
+// one boot's output. Firecracker caps that output at 1 MiB per boot in its
+// serial device (the hard, daemon-independent bound against an untrusted
+// guest flooding its console), so a truncate-per-launch keeps the file at
+// most 1 MiB regardless of how many resume/verify cycles reuse it. A file,
+// not a journald stream: journald rate-limits by unit cgroup, so shared
+// streams would let one spamming VM suppress vmd's own logs.
 func openVMConsole(runDir, vmID string) (*os.File, error) {
 	return os.OpenFile(filepath.Join(runDir, vmID, "console.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-}
-
-// trimOversizedConsoles bounds every direct-spawn console file to
-// maxConsoleBytes by truncating the overflow, keeping the first
-// maxConsoleBytes (boot + earliest fault). Truncating to a size that a live
-// FC is appending to (O_APPEND) is safe: the file caps at maxConsoleBytes and
-// the next append lands just past it, trimmed again next tick. This is a
-// total-file-size bound, so it also caps growth across resume/verify cycles
-// that reuse the same file. No-op unless armed; runs on the reconcile tick.
-func (m *Manager) trimOversizedConsoles() {
-	if m.cgroups == nil {
-		return
-	}
-	ids, err := m.cgroups.scanVMCgroups()
-	if err != nil {
-		return
-	}
-	for _, id := range ids {
-		path := filepath.Join(m.cfg.RunDir, id, "console.log")
-		fi, err := os.Stat(path)
-		if err != nil || fi.Size() <= maxConsoleBytes {
-			continue
-		}
-		if terr := os.Truncate(path, maxConsoleBytes); terr != nil {
-			m.log.Warn().Err(terr).Str("vm_id", id).Msg("failed to trim oversized console")
-			continue
-		}
-		m.log.Warn().Str("vm_id", id).Int64("cap", maxConsoleBytes).
-			Msg("trimmed oversized vm console")
-	}
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 }
 
 // directSpawnResult is what the reaper records when the VM's process chain
@@ -114,7 +79,8 @@ type directSpawnResult struct {
 // waitDirect). console is the raw per-VM file: os/exec passes its fd straight
 // to the child, so the child owns it and keeps writing even after vmd exits —
 // no vmd-owned pipe in the path. The caller closes vmd's copy after Start.
-// The file's size bound is enforced separately by trimOversizedConsoles.
+// The file's size bound is enforced by Firecracker's serial cap plus the
+// O_TRUNC-per-launch in openVMConsole (see there).
 //
 // Setsid: the VM gets its own session — signals to vmd's process group
 // must never reach VMs (precedent: the cold-boot path). Deliberately NO
