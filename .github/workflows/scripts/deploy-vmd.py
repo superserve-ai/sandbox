@@ -91,6 +91,7 @@ BUNDLE_FILES = [
     "bin/secretsproxy",
     "deploy/superserve-vmd.service",
     "deploy/superserve-vmd.socket",
+    "deploy/superserve-vms.service",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
@@ -217,8 +218,15 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vms.service /etc/systemd/system/superserve-vms.service
             sudo systemctl daemon-reload
             sudo systemctl enable --quiet superserve-vmd.socket
+            # Delegated cgroup subtree for direct-spawn VMs. enable --now so the
+            # scope exists before vmd starts and ArmDirectSpawn adopts it.
+            # Idempotent on redeploy: an already-running keeper is left alone — a
+            # unit-file change applies only on the next clean restart (never
+            # restart the scope while VMs are live).
+            sudo systemctl enable --now --quiet superserve-vms.service
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 

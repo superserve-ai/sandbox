@@ -32,6 +32,7 @@ on:
       - 'internal/secretsproxy/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/superserve-vmd.socket'
+      - 'deploy/superserve-vms.service'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
