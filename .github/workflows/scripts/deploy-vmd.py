@@ -210,8 +210,15 @@ def main() -> int:
             if [ -x {install_dir}/vmd ] && ! grep -qa cgroup-supervision {extract_dir}/bin/vmd; then
                 echo "incoming vmd lacks cgroup-supervision — verifying host is drained before downgrade"
                 sudo systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+                # drain-check only needs VMD_STATE_PATH / RUN_DIR to find the DB.
+                # Extract them as LITERAL values (systemd env files are literal
+                # KEY=value; dot-sourcing would execute $()/backticks in secret
+                # values as root) and pass them explicitly. Empty = drain-check's
+                # own defaults apply.
+                DC_STATE=$(sudo sed -n 's/^VMD_STATE_PATH=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
+                DC_RUN=$(sudo sed -n 's/^RUN_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
                 set +e
-                sudo bash -c 'set -a; . /etc/sandbox/vmd.env 2>/dev/null; set +a; exec {install_dir}/vmd drain-check'
+                sudo env VMD_STATE_PATH="$DC_STATE" RUN_DIR="$DC_RUN" {install_dir}/vmd drain-check
                 DRAIN_RC=$?
                 set -e
                 if [ "$DRAIN_RC" -ne 0 ]; then
