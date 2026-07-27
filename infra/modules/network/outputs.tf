@@ -42,8 +42,3 @@ output "vpc_connector_subnetwork_self_link" {
   description = "Managed connector/direct-VPC subnetwork self link, when this module manages one."
   value       = try(google_compute_subnetwork.connector[0].self_link, null)
 }
-
-output "network_self_link" {
-  description = "Target VPC self link."
-  value       = local.network_self_link
-}
