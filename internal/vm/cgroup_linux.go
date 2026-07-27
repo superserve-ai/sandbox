@@ -199,9 +199,26 @@ func unitStringProperty(ctx context.Context, unit, iface, name string) string {
 }
 
 // unitControlGroup resolves a unit's cgroup path as systemd owns it — never
-// construct it from the unit name, which systemd escapes and may nest.
-func unitControlGroup(ctx context.Context, unit string) string {
-	return unitStringProperty(ctx, unit, "Unit", "ControlGroup")
+// construct it from the unit name, which systemd escapes and may nest. Returns
+// ("", nil) when the unit is definitively absent or has no cgroup, and ("", err)
+// when the lookup itself failed (D-Bus unavailable AND systemctl errored) so
+// safety callers can fail closed instead of mistaking a query failure for an
+// absent scope.
+func unitControlGroup(ctx context.Context, unit string) (string, error) {
+	if val, notLoaded, handled := sdbusUnitProperty(ctx, unit, "Unit", "ControlGroup"); handled {
+		if notLoaded {
+			return "", nil // definitively not loaded → no cgroup
+		}
+		if s, isStr := val.(string); isStr {
+			return s, nil
+		}
+		// handled but unexpected value type — fall through to systemctl.
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "ControlGroup", "--value", unit).Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve %s ControlGroup: %w", unit, err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // unitIsActive reports whether the unit's ActiveState is "active"; unknown
@@ -228,9 +245,12 @@ func unitDelegated(ctx context.Context, unit string) bool {
 // keeper, tolerate an absent scope (never armed). Complements hasCgroupRecords
 // so a rollback still manages an unrecorded survivor.
 func delegatedTreeHasVMs(ctx context.Context) (bool, error) {
-	rel := unitControlGroup(ctx, vmsUnitName)
+	rel, err := unitControlGroup(ctx, vmsUnitName)
+	if err != nil {
+		return false, err // query failed → caller fails closed
+	}
 	if rel == "" {
-		return false, nil // no scope resolved → no cgroup VMs under it
+		return false, nil // scope definitively absent → no cgroup VMs under it
 	}
 	entries, err := os.ReadDir(filepath.Join(cgroupMount, rel))
 	if err != nil {
@@ -275,7 +295,10 @@ func (m *Manager) hasCgroupRecords() (bool, error) {
 // 95% ceiling hierarchically. Idempotent across vmd restarts, where the keeper
 // already sits in keeper/ and controllers are already enabled.
 func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
-	rel := unitControlGroup(ctx, vmsUnitName)
+	rel, err := unitControlGroup(ctx, vmsUnitName)
+	if err != nil {
+		return nil, err
+	}
 	if rel == "" {
 		return nil, fmt.Errorf("%s has no ControlGroup (not loaded/active?)", vmsUnitName)
 	}
@@ -602,8 +625,12 @@ func CheckDrained(ctx context.Context, statePath string) (DrainReport, error) {
 		}
 	}
 	// An absent scope (unit never installed/started) means no per-VM dirs, so
-	// conditions 2 and 3 are trivially empty.
-	rel := unitControlGroup(ctx, vmsUnitName)
+	// conditions 2 and 3 are trivially empty. A lookup FAILURE, though, must not
+	// read as "drained" — propagate it so the guard blocks the downgrade.
+	rel, err := unitControlGroup(ctx, vmsUnitName)
+	if err != nil {
+		return r, err
+	}
 	if rel == "" {
 		return r, nil
 	}
