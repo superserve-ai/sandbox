@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -14,41 +13,33 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Direct-spawn cgroup management. vmd's unit is delegated (Delegate=yes), so
-// vmd owns everything below its unit cgroup: it moves itself into daemon/,
-// enables controllers on vms/, and gives every direct-spawned VM its own
-// vms/<vmID>/ group. PID 1 is never involved per VM — that per-unit
-// serialization is the cost this path exists to delete.
+// Direct-spawn cgroup management. VMs live in the shipped, delegated
+// superserve-vms.service under sandboxes.slice — sharing the one aggregate
+// memory ceiling with the legacy firecracker@ units, while vmd itself stays in
+// system.slice outside the VM memory and kill domains. vmd adopts that scope
+// (never creates it), moves its keeper into keeper/, enables controllers on the
+// root, and gives every direct-spawned VM its own <vmID>/ group. PID 1 is never
+// involved per VM — that per-unit serialization is the cost this path deletes.
 
 const (
 	cgroupMount = "/sys/fs/cgroup"
-	// vmMemoryMaxFraction of MemTotal caps the vms/ subtree, replacing
-	// sandboxes.slice's MemoryMax=95%. vmd itself lives in daemon/, outside
-	// the cap — the daemon must never compete with sandboxes for the
-	// ceiling that protects it.
-	vmMemoryMaxFraction = 0.95
+	// vmsUnitName is the shipped, delegated systemd service whose subtree holds
+	// every direct-spawn VM. It lives under sandboxes.slice, so VMs share the
+	// one aggregate memory ceiling with the legacy firecracker@ units, and its
+	// subtree is delegated (systemd will not reorganize it). vmd validates and
+	// adopts it — never creates it.
+	vmsUnitName = "superserve-vms.service"
+	// keeperSubdir holds the unit's keeper process, moved out of the delegated
+	// root so controllers can be enabled there (cgroup v2 no-internal-process
+	// rule). Reserved — never a vmID.
+	keeperSubdir = "keeper"
 )
 
-// cgroupTree holds the resolved paths of vmd's delegated subtree.
+// cgroupTree holds the resolved paths of the delegated VM subtree — the
+// superserve-vms.service ControlGroup and its keeper leaf.
 type cgroupTree struct {
-	root   string // vmd's own unit cgroup (delegated root)
-	daemon string // root/daemon — vmd's processes
-	vms    string // root/vms — parent of all per-VM groups
-}
-
-// ownCgroupPath resolves this process's cgroup v2 path from
-// /proc/self/cgroup ("0::<path>").
-func ownCgroupPath() (string, error) {
-	data, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		if rest, ok := strings.CutPrefix(line, "0::"); ok {
-			return filepath.Join(cgroupMount, rest), nil
-		}
-	}
-	return "", fmt.Errorf("no cgroup v2 entry in /proc/self/cgroup")
+	vms    string // the service ControlGroup; per-VM groups are vms/<id>
+	keeper string // vms/keeper — the keeper process's leaf
 }
 
 // ArmDirectSpawn enables the cgroup launch path for NEW VMs when the flag is
@@ -58,13 +49,12 @@ func ownCgroupPath() (string, error) {
 //
 // Preconditions, all fail-closed:
 //   - cgroup v2 unified hierarchy (cgroup.kill / cgroup.events exist);
-//   - the unit configured KillMode=process, or a vmd restart/deploy would
-//     SIGKILL every direct-spawned VM — the exact opposite of the property
-//     this whole design preserves;
-//   - the delegated subtree is usable (setupCgroupTree succeeds, which needs
-//     Delegate=yes to write cgroup.subtree_control).
+//   - the shipped superserve-vms.service is active, delegated, and rooted
+//     under sandboxes.slice — its subtree is where VMs live and share the one
+//     aggregate memory ceiling; vmd adopts it, never creates it;
+//   - firecracker advertises the serial-console-cap (console bound).
 //
-// The subtree is set up whenever the flag is on OR this host already owns
+// The subtree is adopted whenever the flag is on OR this host already owns
 // cgroup-mode VMs — otherwise a flag-off rollback would leave m.cgroups nil
 // while cgroup VMs still run, and their liveness would read inconclusive
 // forever, pause/reconcile could not touch them, and resume would loop on
@@ -77,7 +67,7 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// crash between spawn and persist). Detecting only records would strand
 	// that unrecorded survivor: m.cgroups nil, so reattach and the reconciler
 	// both skip it and it runs forever.
-	haveCgroupVMs := m.hasCgroupRecords() || delegatedTreeHasVMs()
+	haveCgroupVMs := m.hasCgroupRecords() || delegatedTreeHasVMs(ctx)
 	if !wantArm && !haveCgroupVMs {
 		return false, nil // nothing to arm, nothing to manage
 	}
@@ -87,10 +77,10 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		}
 		return false, fmt.Errorf("cgroup-mode VMs exist but cgroup v2 is unavailable: %w", err)
 	}
-	tree, err := setupCgroupTree()
+	tree, err := adoptVmsScope(ctx)
 	if err != nil {
 		if wantArm {
-			return false, fmt.Errorf("prepare delegated subtree (needs Delegate=yes): %w", err)
+			return false, fmt.Errorf("adopt delegated VM scope (%s): %w", vmsUnitName, err)
 		}
 		return false, fmt.Errorf("cannot manage existing cgroup-mode VMs: %w", err)
 	}
@@ -105,19 +95,16 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// able to stop or reap a VM. Verify on the real tree before arming.
 	for _, f := range []string{"cgroup.kill", "cgroup.events"} {
 		if _, err := os.Stat(filepath.Join(tree.vms, f)); err != nil {
-			return false, fmt.Errorf("delegated tree lacks %s (kernel too old?): %w", f, err)
+			return false, fmt.Errorf("delegated scope lacks %s (kernel too old?): %w", f, err)
 		}
 	}
-	if km := selfUnitKillMode(ctx); km != "process" {
-		// Managing existing VMs is fine, but a KillMode that would kill the
-		// subtree on stop must not gate NEW launches onto it.
-		return false, fmt.Errorf("unit KillMode=%q, need \"process\" — direct spawn would die on the next vmd stop", km)
+	if !unitIsActive(ctx, vmsUnitName) {
+		return false, fmt.Errorf("%s is not active — cannot arm direct spawn", vmsUnitName)
 	}
-	if !selfUnitDelegated(ctx) {
-		// setupCgroupTree may have written subtree_control as root without
-		// Delegate, but without the systemd guarantee PID 1 can reorganize
-		// the subtree on a daemon-reload and strand VMs. Refuse to arm.
-		return false, fmt.Errorf("unit is not Delegate=yes — direct spawn needs a delegated subtree")
+	if !unitDelegated(ctx, vmsUnitName) {
+		// Without the delegation guarantee, systemd could reorganize the
+		// subtree on a daemon-reload and strand VMs. Refuse to arm.
+		return false, fmt.Errorf("%s is not Delegate=yes — direct spawn needs a delegated subtree", vmsUnitName)
 	}
 	// The guest console is untrusted; the only bound on its file is the
 	// Firecracker serial cap. Refuse to arm on a binary that doesn't
@@ -147,42 +134,62 @@ func firecrackerAdvertisesCap(ctx context.Context, fcBin, cap string) bool {
 	return false
 }
 
-// selfUnitDelegated reports whether this vmd unit has Delegate set, via
-// D-Bus (fallback systemctl). Unknown reads as NOT delegated — fail-closed,
-// so arming never proceeds on an unverified subtree.
-func selfUnitDelegated(ctx context.Context) bool {
-	const unit = "superserve-vmd.service"
+// unitStringProperty reads a unit property via D-Bus (Unit interface unless
+// iface=="Service"), falling back to systemctl show. Empty on any failure —
+// callers treat that as absent/fail-closed.
+func unitStringProperty(ctx context.Context, unit, iface, name string) string {
+	if val, notLoaded, ok := sdbusUnitProperty(ctx, unit, iface, name); ok && !notLoaded {
+		if s, isStr := val.(string); isStr {
+			return s
+		}
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", name, "--value", unit).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// unitControlGroup resolves a unit's cgroup path as systemd owns it — never
+// construct it from the unit name, which systemd escapes and may nest.
+func unitControlGroup(ctx context.Context, unit string) string {
+	return unitStringProperty(ctx, unit, "Unit", "ControlGroup")
+}
+
+// unitIsActive reports whether the unit's ActiveState is "active"; unknown
+// reads as not-active (fail-closed).
+func unitIsActive(ctx context.Context, unit string) bool {
+	return unitStringProperty(ctx, unit, "Unit", "ActiveState") == "active"
+}
+
+// unitDelegated reports whether the unit has Delegate set, via D-Bus (fallback
+// systemctl). Unknown reads as NOT delegated — fail-closed, so arming never
+// proceeds on an unverified subtree.
+func unitDelegated(ctx context.Context, unit string) bool {
 	if val, notLoaded, ok := sdbusUnitProperty(ctx, unit, "Service", "Delegate"); ok && !notLoaded {
 		if b, isBool := val.(bool); isBool {
 			return b
 		}
 	}
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "Delegate", "--value", unit).Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) == "yes"
+	return unitStringProperty(ctx, unit, "Service", "Delegate") == "yes"
 }
 
-// delegatedTreeHasVMs reports whether a prior armed life left any per-VM
-// cgroup under vms/ — including crash-survivors with no BoltDB record. Cheap
-// and side-effect-free: resolve the path, ReadDir, tolerate not-exist (fresh
-// host, never armed). Complements hasCgroupRecords so a rollback still
-// manages an unrecorded survivor.
-func delegatedTreeHasVMs() bool {
-	root, err := ownCgroupPath()
-	if err != nil {
+// delegatedTreeHasVMs reports whether the delegated VM scope already holds a
+// per-VM cgroup — including crash-survivors with no BoltDB record. Cheap and
+// side-effect-free: resolve the scope path via systemd, ReadDir, skip the
+// keeper, tolerate an absent scope (never armed). Complements hasCgroupRecords
+// so a rollback still manages an unrecorded survivor.
+func delegatedTreeHasVMs(ctx context.Context) bool {
+	rel := unitControlGroup(ctx, vmsUnitName)
+	if rel == "" {
 		return false
 	}
-	if filepath.Base(root) == "daemon" {
-		root = filepath.Dir(root)
-	}
-	entries, err := os.ReadDir(filepath.Join(root, "vms"))
+	entries, err := os.ReadDir(filepath.Join(cgroupMount, rel))
 	if err != nil {
 		return false
 	}
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && e.Name() != keeperSubdir {
 			return true
 		}
 	}
@@ -208,116 +215,51 @@ func (m *Manager) hasCgroupRecords() bool {
 	return false
 }
 
-// selfUnitKillMode reads this vmd unit's KillMode via D-Bus (falling back to
-// systemctl show), returning "" when it cannot be determined — which the
-// caller treats as not-process, i.e. fail-closed.
-func selfUnitKillMode(ctx context.Context) string {
-	const unit = "superserve-vmd.service"
-	if val, notLoaded, ok := sdbusUnitProperty(ctx, unit, "Service", "KillMode"); ok && !notLoaded {
-		if s, isStr := val.(string); isStr {
-			return s
-		}
+// adoptVmsScope resolves and prepares the shipped superserve-vms.service
+// delegated subtree for direct spawn. It reads the unit's ControlGroup (never
+// constructs the path), moves the keeper process into keeper/ so the delegated
+// root is free of processes (cgroup v2 no-internal-process rule), and enables
+// the memory+pids controllers on that root so per-VM groups get their files.
+// No memory.max here: the subtree lives under sandboxes.slice and inherits its
+// 95% ceiling hierarchically. Idempotent across vmd restarts, where the keeper
+// already sits in keeper/ and controllers are already enabled.
+func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
+	rel := unitControlGroup(ctx, vmsUnitName)
+	if rel == "" {
+		return nil, fmt.Errorf("%s has no ControlGroup (not loaded/active?)", vmsUnitName)
 	}
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "KillMode", "--value", unit).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
-// setupCgroupTree prepares the delegated subtree for direct spawn:
-// daemon/ created and every process in the root moved into it (the v2
-// no-internal-process rule forbids enabling controllers on a group that
-// still holds processes), then vms/ created with memory+pids controllers
-// and the host memory cap. Idempotent — safe across vmd restarts, where
-// prior-life VM groups already populate vms/.
-func setupCgroupTree() (*cgroupTree, error) {
-	root, err := ownCgroupPath()
-	if err != nil {
-		return nil, fmt.Errorf("resolve own cgroup: %w", err)
-	}
-	// A previous life already moved us into daemon/ — normalize to the root.
-	if filepath.Base(root) == "daemon" {
-		root = filepath.Dir(root)
+	if !strings.Contains(rel, "/sandboxes.slice/") {
+		return nil, fmt.Errorf("%s ControlGroup %q is not under sandboxes.slice", vmsUnitName, rel)
 	}
 	t := &cgroupTree{
-		root:   root,
-		daemon: filepath.Join(root, "daemon"),
-		vms:    filepath.Join(root, "vms"),
+		vms:    filepath.Join(cgroupMount, rel),
+		keeper: filepath.Join(cgroupMount, rel, keeperSubdir),
 	}
-	for _, d := range []string{t.daemon, t.vms} {
-		if err := os.Mkdir(d, 0o755); err != nil && !os.IsExist(err) {
-			return nil, fmt.Errorf("mkdir %s: %w", d, err)
-		}
+	if err := os.Mkdir(t.keeper, 0o755); err != nil && !os.IsExist(err) {
+		return nil, fmt.Errorf("mkdir keeper: %w", err)
 	}
-	// Move every root-resident process (vmd + any helpers) into daemon/.
-	// Writing a PID to cgroup.procs moves all its threads.
-	pids, err := readCgroupProcs(t.root)
+	// Move any process still in the delegated root (the keeper on first
+	// bootstrap; none on a restart) into keeper/, so controllers can be enabled
+	// on the now-empty root. Per-VM groups live in vms/<id>, not here.
+	pids, err := readCgroupProcs(t.vms)
 	if err != nil {
-		return nil, fmt.Errorf("read root procs: %w", err)
+		return nil, fmt.Errorf("read scope root procs: %w", err)
 	}
 	for _, pid := range pids {
-		if err := os.WriteFile(filepath.Join(t.daemon, "cgroup.procs"),
+		if err := os.WriteFile(filepath.Join(t.keeper, "cgroup.procs"),
 			[]byte(strconv.Itoa(pid)), 0o644); err != nil {
-			return nil, fmt.Errorf("move pid %d to daemon/: %w", pid, err)
+			return nil, fmt.Errorf("move keeper pid %d: %w", pid, err)
 		}
 	}
-	// Enable controllers at BOTH levels. root's subtree_control gives its
-	// children (daemon/, vms/) their memory/pids files — so vms/memory.max
-	// works. vms's subtree_control is what gives the PER-VM groups
-	// (vms/<id>/) their files: without it vms/<id>/memory.oom.group does not
-	// exist and createVMCgroup fails on every launch. memory = containment +
-	// accounting; pids = a runaway-fork ceiling for free.
-	if err := os.WriteFile(filepath.Join(t.root, "cgroup.subtree_control"),
-		[]byte("+memory +pids"), 0o644); err != nil {
-		return nil, fmt.Errorf("enable controllers on root: %w", err)
-	}
+	// root's subtree_control gives its children (vms/<id>/) their memory/pids
+	// files — so per-VM memory.oom.group exists and createVMCgroup succeeds.
+	// The parent sandboxes.slice already exposes memory+pids to this scope; a
+	// failure here (it does not) is a fail-closed arm refusal.
 	if err := os.WriteFile(filepath.Join(t.vms, "cgroup.subtree_control"),
 		[]byte("+memory +pids"), 0o644); err != nil {
-		return nil, fmt.Errorf("enable controllers on vms: %w", err)
-	}
-	if max, err := vmMemoryMaxFromMeminfo(); err == nil {
-		if werr := os.WriteFile(filepath.Join(t.vms, "memory.max"),
-			[]byte(strconv.FormatUint(max, 10)), 0o644); werr != nil {
-			return nil, fmt.Errorf("write vms/memory.max: %w", werr)
-		}
-	} else {
-		return nil, fmt.Errorf("size vms/memory.max: %w", err)
+		return nil, fmt.Errorf("enable controllers on scope root: %w", err)
 	}
 	return t, nil
-}
-
-// vmMemoryMaxFromMeminfo returns vmMemoryMaxFraction of MemTotal in bytes.
-func vmMemoryMaxFromMeminfo() (uint64, error) {
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if kb, ok := parseMemTotalKB(sc.Text()); ok {
-			return uint64(float64(kb*1024) * vmMemoryMaxFraction), nil
-		}
-	}
-	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
-}
-
-// parseMemTotalKB parses a /proc/meminfo "MemTotal: N kB" line.
-func parseMemTotalKB(line string) (uint64, bool) {
-	rest, ok := strings.CutPrefix(line, "MemTotal:")
-	if !ok {
-		return 0, false
-	}
-	fields := strings.Fields(rest)
-	if len(fields) < 1 {
-		return 0, false
-	}
-	kb, err := strconv.ParseUint(fields[0], 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return kb, true
 }
 
 func readCgroupProcs(dir string) ([]int, error) {
@@ -360,7 +302,7 @@ func (t *cgroupTree) firstPID(vmID string) int {
 // vms/ subtree onto vmd's own group, and a kill there would take the daemon
 // down with the VM. Defense-in-depth behind the launch-entry check.
 func (t *cgroupTree) safeVMCgroupDir(vmID string) (string, error) {
-	if !isLeafName(vmID) {
+	if !isLeafName(vmID) || vmID == keeperSubdir {
 		return "", fmt.Errorf("invalid vm_id %q for cgroup path", vmID)
 	}
 	return t.vmCgroupDir(vmID), nil
@@ -506,7 +448,7 @@ func (t *cgroupTree) scanVMCgroups() ([]string, error) {
 	}
 	ids := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && e.Name() != keeperSubdir {
 			ids = append(ids, e.Name())
 		}
 	}

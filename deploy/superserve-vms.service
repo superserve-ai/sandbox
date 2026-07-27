@@ -1,0 +1,24 @@
+[Unit]
+Description=Delegated cgroup subtree for direct-spawn VMs
+# Ordered before vmd so the delegated subtree exists when vmd validates and
+# adopts it at startup. Placed under sandboxes.slice so direct-spawn VMs share
+# the one aggregate memory ceiling with the legacy firecracker@ units.
+Before=superserve-vmd.service
+
+[Service]
+# A minimal keeper process owns the delegated subtree: it holds the cgroup so
+# systemd does not GC it across zero-VM windows, and gives the subtree a stable
+# lifetime handle. vmd moves it into keeper/ at bootstrap, then enables
+# controllers on the freed root. Restart is disabled deliberately — a restart
+# would try to re-enter the controller-enabled inner root and fail (cgroup v2
+# no-internal-process rule); the keeper is not a VM-survival dependency, so
+# vmd handles its death (block new launches, existing VMs keep running).
+Type=exec
+ExecStart=/usr/bin/sleep infinity
+Slice=sandboxes.slice
+Delegate=yes
+KillMode=process
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

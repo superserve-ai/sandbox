@@ -23,16 +23,6 @@ func TestParseCgroupPopulated(t *testing.T) {
 	}
 }
 
-func TestParseMemTotalKB(t *testing.T) {
-	kb, ok := parseMemTotalKB("MemTotal:       528234424 kB")
-	if !ok || kb != 528234424 {
-		t.Fatalf("got %d/%v", kb, ok)
-	}
-	if _, ok := parseMemTotalKB("MemFree:  123 kB"); ok {
-		t.Fatal("MemFree must not parse as MemTotal")
-	}
-}
-
 // The environment allowlist IS the sandbox-boundary contract: nothing from
 // vmd's environ (secrets, flags) may reach the Firecracker chain.
 func TestDirectSpawnEnvAllowlist(t *testing.T) {
@@ -128,7 +118,7 @@ func TestFirecrackerAdvertisesCap(t *testing.T) {
 // would land on vmd's own group and a kill there would take the daemon down.
 func TestSafeVMCgroupDirRejectsTraversal(t *testing.T) {
 	tree := &cgroupTree{vms: "/sys/fs/cgroup/x/vms"}
-	for _, bad := range []string{"../daemon", "..", "a/b", `a\b`, "", "."} {
+	for _, bad := range []string{"../daemon", "..", "a/b", `a\b`, "", ".", keeperSubdir} {
 		if _, err := tree.safeVMCgroupDir(bad); err == nil {
 			t.Errorf("safeVMCgroupDir(%q) must be rejected", bad)
 		}
