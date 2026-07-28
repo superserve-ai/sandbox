@@ -373,9 +373,15 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell unit")
 				continue
 			}
-			r.markFailedInDB(ctx, id)
+			// The stop is committed; the DB transition must not be lost to
+			// the pass deadline expiring mid-rule (a stranded active row
+			// behind a dead unit costs another grace+budget cycle via the
+			// dead-VM rule). Detach from the pass context, bounded.
+			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			r.markFailedInDB(persistCtx, id)
 			r.markStale(id)
-			r.writeAudit(ctx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
+			r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
+			persistCancel()
 		}
 	}
 
