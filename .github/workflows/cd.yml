@@ -20,6 +20,11 @@ on:
         options:
           - staging
           - production
+      enable_snapshots:
+        description: 'Staging only: enable saved snapshots after the compatible API is live'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -54,6 +59,7 @@ jobs:
       # environment policy outside the shared migrations so production remains
       # gated until its rollout is explicitly approved.
       - name: Enable snapshots for the staging playground
+        if: github.event_name == 'workflow_dispatch' && inputs.enable_snapshots
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
         run: |

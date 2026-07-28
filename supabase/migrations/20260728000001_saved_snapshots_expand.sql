@@ -95,8 +95,10 @@ ALTER TABLE snapshot
         FOREIGN KEY (sandbox_id, team_id)
         REFERENCES sandbox(id, team_id);
 
-DROP INDEX IF EXISTS snapshot_sandbox_unique;
-
+-- Expand phase: retain the legacy global unique index while the pre-snapshot
+-- control plane is still live. The compatible control plane can use the
+-- partial runtime index below; a later contract migration removes the global
+-- index only after that binary has been deployed.
 CREATE UNIQUE INDEX snapshot_sandbox_runtime_unique
     ON snapshot (sandbox_id)
     WHERE kind = 'runtime_checkpoint';
