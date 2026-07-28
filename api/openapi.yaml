@@ -2458,18 +2458,28 @@ components:
 
     ExecResult:
       type: object
-      description: Full output of a command run to completion via `POST /exec`.
+      description: Output of a command run to completion via `POST /exec`.
       required: [stdout, stderr, exit_code]
       properties:
         stdout:
           type: string
-          description: Complete standard output.
+          description: >
+            Standard output. Combined stdout/stderr is retained up to a
+            server-side cap (currently 8 MiB); see `truncated`.
         stderr:
           type: string
-          description: Complete standard error.
+          description: >
+            Standard error. Combined stdout/stderr is retained up to a
+            server-side cap (currently 8 MiB); see `truncated`.
         exit_code:
           type: integer
           description: Process exit code. A non-zero value is returned, not raised.
+        truncated:
+          type: boolean
+          description: >
+            Present and true when combined output exceeded the retention cap
+            and the tail was dropped. Use `POST /exec/stream` to receive
+            unbounded output.
 
     ExecStreamEvent:
       type: object

@@ -82,6 +82,35 @@ func TestHandleExec_OutputCapped(t *testing.T) {
 	}
 }
 
+func TestHandleExec_OutputCapCountsEncodedSize(t *testing.T) {
+	old := maxSyncExecOutputBytes
+	maxSyncExecOutputBytes = 16
+	defer func() { maxSyncExecOutputBytes = old }()
+
+	s := newProcessService()
+	// NUL bytes encode as six-byte \u0000 escapes, so a 16-byte encoded
+	// budget retains only two of the four despite 4 < 16 raw bytes.
+	body := `{"command":"/bin/sh","args":["-c","head -c 4 /dev/zero"],"working_dir":"/tmp"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleExec(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp execResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v; body: %s", err, w.Body.String())
+	}
+	if len(resp.Stdout) != 2 {
+		t.Errorf("stdout length = %d, want 2 (two 6-byte escapes fit a 16-byte budget)", len(resp.Stdout))
+	}
+	if !resp.Truncated {
+		t.Error("truncated = false, want true")
+	}
+}
+
 func TestHandleExec_NonzeroExit(t *testing.T) {
 	s := newProcessService()
 	body := `{"command":"/bin/sh","args":["-c","exit 7"],"working_dir":"/tmp"}`

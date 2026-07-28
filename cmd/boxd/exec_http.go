@@ -16,14 +16,33 @@ import (
 // var, not const, so tests can shorten it.
 var sseKeepaliveInterval = 15 * time.Second
 
-// Combined stdout+stderr retained by the sync exec handler, which buffers the
-// whole result into one JSON reply — unbounded, a single chatty command can
-// exhaust the guest's RAM, and clients bound how much of a buffered reply they
-// read anyway. Output past the cap is still drained (a full pipe would block
-// the child) but dropped, and the reply is flagged truncated; streaming exec
-// forwards instead of holding, so it needs no cap.
+// Budget for the sync exec handler's buffered stdout+stderr, measured in
+// JSON-encoded bytes so the reply body stays bounded regardless of content —
+// unbounded, a single chatty command can exhaust the guest's RAM, and clients
+// bound how much of a buffered reply they read anyway. Output past the cap is
+// still drained (a full pipe would block the child) but dropped, and the
+// reply is flagged truncated; streaming exec forwards instead of holding, so
+// it needs no cap.
 // var, not const, so tests can shrink it.
 var maxSyncExecOutputBytes = 8 << 20
+
+// byteJSONCost is an upper bound on how many bytes one input byte occupies
+// inside an encoding/json string (HTML escaping on): quotes and backslashes
+// become two, control and HTML-significant bytes become \u00XX, and non-ASCII
+// bytes cost at most three (worst case invalid UTF-8 → U+FFFD). Overcounts
+// never undercounts, so the encoded body stays within budget.
+func byteJSONCost(c byte) int {
+	switch {
+	case c == '"' || c == '\\':
+		return 2
+	case c < 0x20 || c == '<' || c == '>' || c == '&':
+		return 6
+	case c >= 0x80:
+		return 3
+	default:
+		return 1
+	}
+}
 
 // CodeInvalidArgument → 400, everything else → 500.
 func writeRunError(w http.ResponseWriter, err error) {
@@ -115,19 +134,23 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		exitCode  int32
 		tSpawn    time.Time
 	)
-	// appendCapped retains at most maxSyncExecOutputBytes across both
-	// streams, dropping the rest. Callers hold mu.
+	// appendCapped retains the longest prefix whose encoded cost fits the
+	// shared budget, dropping the rest. Callers hold mu.
+	budget := maxSyncExecOutputBytes
 	appendCapped := func(dst, b []byte) []byte {
-		remaining := maxSyncExecOutputBytes - len(stdout) - len(stderr)
-		if remaining <= 0 {
-			truncated = true
-			return dst
+		i := 0
+		for i < len(b) {
+			cost := byteJSONCost(b[i])
+			if cost > budget {
+				break
+			}
+			budget -= cost
+			i++
 		}
-		if len(b) > remaining {
-			b = b[:remaining]
+		if i < len(b) {
 			truncated = true
 		}
-		return append(dst, b...)
+		return append(dst, b[:i]...)
 	}
 	emit := func(ev *pb.ProcessEvent) error {
 		mu.Lock()
