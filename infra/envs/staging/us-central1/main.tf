@@ -261,6 +261,23 @@ module "sandbox_host" {
       for ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do ip netns del $ns 2>/dev/null; done
       rm -rf /var/lib/superserve/snapshots/* /var/lib/superserve/rundir/*
 
+      # Host patching policy: no automatic OS upgrades, and library-upgrade
+      # tooling must never restart the VM or platform units. Mirrors the
+      # deploy assets that every vmd deploy re-asserts; staged here too so a
+      # freshly provisioned host is covered before its first deploy.
+      mkdir -p /etc/needrestart/conf.d
+      cat > /etc/needrestart/conf.d/50-superserve.conf <<'NRCONF'
+      $nrconf{override_rc}{qr(^firecracker)} = 0;
+      $nrconf{override_rc}{qr(^superserve-)} = 0;
+      $nrconf{override_rc}{qr(^proxy\.service$)} = 0;
+      $nrconf{override_rc}{qr(^unbound)} = 0;
+      NRCONF
+      cat > /etc/apt/apt.conf.d/99superserve-no-auto-upgrades <<'APTCONF'
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "0";
+      APTCONF
+      systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
+
       # Start VMD
       systemctl start superserve-vmd
 
