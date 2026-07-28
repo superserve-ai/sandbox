@@ -969,12 +969,14 @@ paths:
       tags: [Exec]
       summary: Run a command and wait for it to finish
       description: |
-        Runs a command to completion and returns its full output in a single
-        response. For live output use `POST /exec/stream` (Server-Sent Events)
-        or `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
-        the body, not as an HTTP error. The sandbox must be `running`; a paused
-        sandbox returns `503`. Activate it first with
-        `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this automatically).
+        Runs a command to completion and returns its output in a single
+        response, retained up to a server-side cap (see `truncated`). For live
+        or unbounded output use `POST /exec/stream` (Server-Sent Events) or
+        `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
+        the body, not as an HTTP error. The sandbox must be `running`; a
+        paused sandbox returns `503`. Activate it first with
+        `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this
+        automatically).
       security:
         - accessToken: []
       requestBody:
@@ -985,7 +987,7 @@ paths:
               $ref: "#/components/schemas/ExecRequest"
       responses:
         "200":
-          description: The command finished; full output and exit code.
+          description: The command finished; output and exit code.
           content:
             application/json:
               schema:
@@ -2458,18 +2460,25 @@ components:
 
     ExecResult:
       type: object
-      description: Full output of a command run to completion via `POST /exec`.
+      description: Output of a command run to completion via `POST /exec`.
       required: [stdout, stderr, exit_code]
       properties:
         stdout:
           type: string
-          description: Complete standard output.
+          description: Standard output; see `truncated`.
         stderr:
           type: string
-          description: Complete standard error.
+          description: Standard error; see `truncated`.
         exit_code:
           type: integer
           description: Process exit code. A non-zero value is returned, not raised.
+        truncated:
+          type: boolean
+          description: >
+            Present and true when combined stdout/stderr exceeded the
+            server-side retention cap (currently 8 MiB) and the tail was
+            dropped; a notice explaining the cut is also appended to `stderr`.
+            Use `POST /exec/stream` for unbounded output.
 
     ExecStreamEvent:
       type: object
