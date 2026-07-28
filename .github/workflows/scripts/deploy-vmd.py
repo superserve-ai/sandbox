@@ -95,6 +95,8 @@ BUNDLE_FILES = [
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
     "deploy/sandboxes.slice",
+    "deploy/needrestart-superserve.conf",
+    "deploy/apt-no-auto-upgrades.conf",
     "scripts/fc-cleanup",
 ]
 
@@ -221,6 +223,14 @@ def main() -> int:
             sudo systemctl enable --quiet superserve-vmd.socket
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
+
+            # Host patching policy: OS packages install only in deliberate
+            # maintenance windows, and library-upgrade tooling must never
+            # restart the VM or platform units. Re-asserted every deploy so a
+            # reimaged or hand-edited host converges back to the policy.
+            sudo install -D -m 0644 {extract_dir}/deploy/needrestart-superserve.conf /etc/needrestart/conf.d/50-superserve.conf
+            sudo install -D -m 0644 {extract_dir}/deploy/apt-no-auto-upgrades.conf /etc/apt/apt.conf.d/99superserve-no-auto-upgrades
+            sudo systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
 
             # Inject boxd + rebuild rootfs only when the new binary differs
             # from what's already installed. `-trimpath -ldflags '-s -w'`
