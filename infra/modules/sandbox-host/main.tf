@@ -27,7 +27,20 @@ resource "google_compute_instance" "this" {
     network_ip = var.internal_ip
   }
 
-  metadata = var.metadata
+  # Prepend the host patching policy to whatever startup script the
+  # environment provides (or install it alone when none is given), so every
+  # provisioned host is covered from first boot. `ignore_changes = [metadata]`
+  # below means this applies at instance creation only — running hosts pick
+  # the same policy up from the vmd deploy step instead.
+  metadata = merge(
+    var.metadata,
+    {
+      startup-script = trimspace(join("\n\n", compact([
+        local.host_patching_policy,
+        lookup(var.metadata, "startup-script", ""),
+      ])))
+    },
+  )
 
   service_account {
     email  = var.service_account_email
@@ -76,6 +89,27 @@ resource "google_compute_instance" "this" {
 }
 
 locals {
+  # Host patching policy: no automatic OS upgrades, and library-upgrade
+  # tooling must never restart the VM or platform units — a restarted
+  # firecracker unit is a destroyed customer VM. Mirrors the deploy assets
+  # (deploy/needrestart-superserve.conf, deploy/apt-no-auto-upgrades.conf)
+  # that every vmd deploy re-asserts.
+  host_patching_policy = <<-EOT
+    #!/bin/bash
+    mkdir -p /etc/needrestart/conf.d
+    cat > /etc/needrestart/conf.d/50-superserve.conf <<'NRCONF'
+    $nrconf{override_rc}{qr(^firecracker)} = 0;
+    $nrconf{override_rc}{qr(^superserve-)} = 0;
+    $nrconf{override_rc}{qr(^proxy\.service$)} = 0;
+    $nrconf{override_rc}{qr(^unbound)} = 0;
+    NRCONF
+    cat > /etc/apt/apt.conf.d/99superserve-no-auto-upgrades <<'APTCONF'
+    APT::Periodic::Update-Package-Lists "1";
+    APT::Periodic::Unattended-Upgrade "0";
+    APTCONF
+    systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
+  EOT
+
   instance_labels = merge(
     var.labels,
     {
