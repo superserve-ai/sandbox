@@ -216,6 +216,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !enforcePreviewPublication(w, port, info) {
+		return
+	}
+
 	if info.Status != "running" {
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, fmt.Sprintf("sandbox is %s", info.Status), http.StatusServiceUnavailable)

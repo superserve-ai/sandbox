@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
 // LocalHTTPServer serves a minimal HTTP API on localhost for the edge proxy
@@ -88,11 +91,13 @@ func (s *LocalHTTPServer) Shutdown(ctx context.Context) error {
 
 // instanceResponse is the JSON shape returned by GET /instances/{id}.
 type instanceResponse struct {
-	VMIP      string `json:"vm_ip"`
-	Status    string `json:"status"`
-	StartedAt int64  `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
-	TeamID    string `json:"team_id,omitempty"`
-	OwnerID   string `json:"owner_id,omitempty"`
+	VMIP          string          `json:"vm_ip"`
+	Status        string          `json:"status"`
+	StartedAt     int64           `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
+	TeamID        string          `json:"team_id,omitempty"`
+	OwnerID       string          `json:"owner_id,omitempty"`
+	PreviewAccess string          `json:"preview_access,omitempty"`
+	PreviewPorts  map[string]bool `json:"preview_ports,omitempty"`
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -113,14 +118,27 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "instance not found", http.StatusNotFound)
 		return
 	}
+	if info.PreviewAccess != "" && info.PreviewAccess != preview.AccessLegacyPublic &&
+		r.Header.Get(preview.ProxyProtocolHeader) != preview.HostCapabilityPorts {
+		// Older proxies do not enforce explicit publication. Hide strict (and any
+		// future non-legacy) policy records from them so rollback fails closed.
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
 
+	// This response attestation lets a new proxy distinguish an explicitly
+	// legacy sandbox served by a capable VMD from a response emitted by a VMD
+	// that predates publication policy fields entirely.
+	w.Header().Set(preview.VMDProtocolHeader, preview.HostCapabilityPorts)
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(instanceResponse{
-		VMIP:      info.VMIP,
-		Status:    info.Status.String(),
-		StartedAt: info.CreatedAt.UnixNano(),
-		TeamID:    info.TeamID,
-		OwnerID:   info.OwnerID,
+		VMIP:          info.VMIP,
+		Status:        info.Status.String(),
+		StartedAt:     info.CreatedAt.UnixNano(),
+		TeamID:        info.TeamID,
+		OwnerID:       info.OwnerID,
+		PreviewAccess: info.PreviewAccess,
+		PreviewPorts:  previewPortsToJSON(info.PreviewPorts),
 	}); err != nil {
 		s.log.Error().Err(err).Str("instance", instanceID).Msg("failed to encode instance response")
 	}
@@ -161,6 +179,17 @@ func (s *LocalHTTPServer) handleVerifySnapshot(w http.ResponseWriter, r *http.Re
 	if err := json.NewEncoder(w).Encode(verifySnapshotResponse{MemPath: memPath}); err != nil {
 		s.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to encode verify response")
 	}
+}
+
+func previewPortsToJSON(in map[int32]struct{}) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(in))
+	for port := range in {
+		out[strconv.Itoa(int(port))] = true
+	}
+	return out
 }
 
 // splitHostPort extracts the port from a host:port string.

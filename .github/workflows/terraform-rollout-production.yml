@@ -29,7 +29,7 @@ jobs:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
       API_BASE_URL: https://usw-api.superserve.ai
-      API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+      API_KEY: ${{ secrets.SS_TEST_API_KEY_USW }}
       SANDBOX_BASE_URL: https://usw-sandbox.superserve.ai
     steps:
       - name: Confirm rollout
@@ -86,7 +86,7 @@ jobs:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
       API_BASE_URL: https://usc-api.superserve.ai
-      API_KEY: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+      API_KEY: ${{ secrets.SS_TEST_API_KEY_USEAST }}
       SANDBOX_BASE_URL: https://usc-sandbox.superserve.ai
     steps:
       - name: Confirm rollout

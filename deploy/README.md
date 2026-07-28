@@ -25,6 +25,13 @@ On merge to `main`, deployment should follow this shape:
 
 Build once, deploy many, verify all.
 
+### Preview-publication rollback safety
+
+Deploy preview-publication-aware VMD before the matching proxy. Once a host has
+strict sandboxes, never roll both VMD and proxy back to pre-publication binaries:
+drain or move those sandboxes off the host first. A mixed rollback fails closed,
+but two old data-plane binaries cannot interpret the durable strict policy.
+
 ## Host selection
 
 Do not deploy to a host merely because it exists. Host deployment jobs should only target hosts that are explicitly marked ready for that environment/region.

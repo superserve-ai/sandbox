@@ -297,6 +297,14 @@ type Host struct {
 	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
+// Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.
+type HostCapability struct {
+	HostID      string    `json:"host_id"`
+	Capability  string    `json:"capability"`
+	HeartbeatAt time.Time `json:"heartbeat_at"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type NetFlow struct {
 	ID         int64      `json:"id"`
 	Ts         time.Time  `json:"ts"`
@@ -456,6 +464,23 @@ type SandboxComputeBillingInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+}
+
+// Preview routing policy. No row means legacy all-port routing; public rows route only explicitly published ports.
+type SandboxPreviewPolicy struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Access    string    `json:"access"`
+	Revision  int64     `json:"revision"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Public preview ports explicitly routable for a strict sandbox.
+type SandboxPublishedPort struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type SandboxQuotaConfig struct {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/proxy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
@@ -104,17 +106,10 @@ func main() {
 		}
 	}
 
-	// Health check for the GCP LB. Only responds on non-sandbox hosts
-	// so the boxd-label lockdown isn't bypassed.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if proxyHandler.ServesHost(r.Host) {
-			proxyHandler.ServeHTTP(w, r)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.Handle("/", proxyHandler)
+	// Health check for the GCP LB and VMD's end-to-end capability probe.
+	// It only responds on non-sandbox hosts so the boxd-label lockdown isn't
+	// bypassed.
+	mux := newProxyMux(proxyHandler)
 
 	// HTTP→HTTPS redirect listener with graceful shutdown.
 	redirectMux := http.NewServeMux()
@@ -146,6 +141,26 @@ func main() {
 	_ = redirectSrv.Shutdown(shutCtx)
 
 	log.Info().Msg("proxy stopped")
+}
+
+type proxyHealthResponse struct {
+	Capabilities []string `json:"capabilities"`
+}
+
+func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if proxyHandler.ServesHost(r.Host) {
+			proxyHandler.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(proxyHealthResponse{
+			Capabilities: []string{preview.HostCapabilityPorts},
+		})
+	})
+	mux.Handle("/", proxyHandler)
+	return mux
 }
 
 // proxyDomains resolves the set of sandbox domains the proxy accepts.
