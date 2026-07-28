@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
@@ -26,21 +27,24 @@ var sseKeepaliveInterval = 15 * time.Second
 // var, not const, so tests can shrink it.
 var maxSyncExecOutputBytes = 8 << 20
 
-// byteJSONCost is an upper bound on how many bytes one input byte occupies
-// inside an encoding/json string (HTML escaping on): quotes and backslashes
-// become two, control and HTML-significant bytes become \u00XX, and non-ASCII
-// bytes cost at most three (worst case invalid UTF-8 → U+FFFD). Overcounts
-// never undercounts, so the encoded body stays within budget.
-func byteJSONCost(c byte) int {
+// jsonRuneCost returns how many bytes the rune starting b occupies inside an
+// encoding/json string (HTML escaping on) and how many input bytes it spans:
+// backslash-escapable characters cost two, characters the encoder writes as
+// \uXXXX cost six — including each invalid UTF-8 byte, which encodes as
+// \ufffd — and everything else passes through at its own width. A rune split
+// across output chunks is charged as invalid bytes: an overcount, never an
+// undercount, so the encoded body stays within budget.
+func jsonRuneCost(b []byte) (cost, size int) {
+	r, size := utf8.DecodeRune(b)
 	switch {
-	case c == '"' || c == '\\':
-		return 2
-	case c < 0x20 || c == '<' || c == '>' || c == '&':
-		return 6
-	case c >= 0x80:
-		return 3
+	case r == utf8.RuneError && size <= 1:
+		return 6, 1
+	case r == '"' || r == '\\' || r == '\n' || r == '\r' || r == '\t':
+		return 2, size
+	case r < 0x20 || r == '<' || r == '>' || r == '&' || r == '\u2028' || r == '\u2029':
+		return 6, size
 	default:
-		return 1
+		return size, size
 	}
 }
 
@@ -140,12 +144,12 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 	appendCapped := func(dst, b []byte) []byte {
 		i := 0
 		for i < len(b) {
-			cost := byteJSONCost(b[i])
+			cost, size := jsonRuneCost(b[i:])
 			if cost > budget {
 				break
 			}
 			budget -= cost
-			i++
+			i += size
 		}
 		if i < len(b) {
 			truncated = true

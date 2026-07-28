@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func newProcessService() *processService {
@@ -105,6 +106,35 @@ func TestHandleExec_OutputCapCountsEncodedSize(t *testing.T) {
 	}
 	if len(resp.Stdout) != 2 {
 		t.Errorf("stdout length = %d, want 2 (two 6-byte escapes fit a 16-byte budget)", len(resp.Stdout))
+	}
+	if !resp.Truncated {
+		t.Error("truncated = false, want true")
+	}
+}
+
+func TestHandleExec_OutputCapChargesInvalidUTF8(t *testing.T) {
+	old := maxSyncExecOutputBytes
+	maxSyncExecOutputBytes = 16
+	defer func() { maxSyncExecOutputBytes = old }()
+
+	s := newProcessService()
+	// Each invalid byte encodes as a six-byte replacement-rune escape, so a
+	// 16-byte encoded budget retains only two of the four 0xff bytes.
+	body := `{"command":"/bin/sh","args":["-c","printf '\\377\\377\\377\\377'"],"working_dir":"/tmp"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleExec(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp execResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v; body: %s", err, w.Body.String())
+	}
+	if want := strings.Repeat(string(utf8.RuneError), 2); resp.Stdout != want {
+		t.Errorf("stdout = %q, want %q (two replacement runes)", resp.Stdout, want)
 	}
 	if !resp.Truncated {
 		t.Error("truncated = false, want true")

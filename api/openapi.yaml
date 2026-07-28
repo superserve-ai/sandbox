@@ -969,12 +969,14 @@ paths:
       tags: [Exec]
       summary: Run a command and wait for it to finish
       description: |
-        Runs a command to completion and returns its full output in a single
-        response. For live output use `POST /exec/stream` (Server-Sent Events)
-        or `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
-        the body, not as an HTTP error. The sandbox must be `running`; a paused
-        sandbox returns `503`. Activate it first with
-        `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this automatically).
+        Runs a command to completion and returns its output in a single
+        response, retained up to a server-side cap (currently 8 MiB combined;
+        see `truncated`). For live or unbounded output use `POST /exec/stream`
+        (Server-Sent Events) or `GET /exec/connect` (WebSocket). A non-zero
+        exit code is returned in the body, not as an HTTP error. The sandbox
+        must be `running`; a paused sandbox returns `503`. Activate it first
+        with `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this
+        automatically).
       security:
         - accessToken: []
       requestBody:
@@ -985,7 +987,9 @@ paths:
               $ref: "#/components/schemas/ExecRequest"
       responses:
         "200":
-          description: The command finished; full output and exit code.
+          description: >
+            The command finished; output (up to the retention cap) and exit
+            code.
           content:
             application/json:
               schema:
