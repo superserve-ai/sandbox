@@ -2477,7 +2477,8 @@ components:
           description: >
             Present and true when combined stdout/stderr exceeded the
             server-side retention cap (currently 8 MiB) and the tail was
-            dropped. Use `POST /exec/stream` for unbounded output.
+            dropped; a notice explaining the cut is also appended to `stderr`.
+            Use `POST /exec/stream` for unbounded output.
 
     ExecStreamEvent:
       type: object

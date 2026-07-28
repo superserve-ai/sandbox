@@ -184,6 +184,15 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The marker rides in stderr so every consumer sees why the output ends
+	// early, not only clients that read the structured flag. Appended past
+	// the budget; its fixed size keeps the reply bounded.
+	if truncated {
+		stderr = append(stderr, fmt.Sprintf(
+			"\n[superserve] output truncated: combined stdout/stderr exceeded the sync exec limit (%d bytes); use /exec/stream or redirect output to a file for full output\n",
+			maxSyncExecOutputBytes)...)
+	}
+
 	if !tSpawn.IsZero() {
 		w.Header().Set("X-Boxd-Spawn-Ms", fmt.Sprintf("%d", tSpawn.Sub(tRecv).Milliseconds()))
 		w.Header().Set("X-Boxd-Run-Ms", fmt.Sprintf("%d", time.Since(tSpawn).Milliseconds()))

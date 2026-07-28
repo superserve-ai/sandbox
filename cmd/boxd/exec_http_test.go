@@ -78,6 +78,9 @@ func TestHandleExec_OutputCapped(t *testing.T) {
 	if !resp.Truncated {
 		t.Error("truncated = false, want true")
 	}
+	if !strings.Contains(resp.Stderr, "output truncated") {
+		t.Errorf("stderr = %q, want the truncation marker", resp.Stderr)
+	}
 	if resp.ExitCode != 0 {
 		t.Errorf("exit_code = %d, want 0", resp.ExitCode)
 	}
