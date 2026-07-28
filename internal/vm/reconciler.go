@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	fcmodels "github.com/superserve-ai/sandbox/internal/vm/fc/models"
 )
 
 // trashDirName is the per-root quarantine directory. Orphan dirs are moved to
@@ -280,6 +281,64 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.markFailedInDB(ctx, id)
 			r.markStale(id)
 			r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
+		}
+	}
+
+	// Drift 1b: the unit is active but the Firecracker inside answers
+	// "Not started" — an empty shell holding no microVM (e.g. the unit was
+	// restarted outside vmd, which destroys the guest; the replacement
+	// process only becomes a VM again through vmd's own restore path).
+	// Unit-level liveness cannot see this: the process is healthy, the VM
+	// is gone. Only an explicit "Not started" answer from a working API
+	// counts as evidence — probe errors are a different failure class the
+	// socket/unit rules already cover. A mid-launch VM is briefly
+	// "Not started" between unit start and boot; the grace period (the
+	// drift must persist across passes) plus the op-lock check and a
+	// re-probe under the lock filter that window.
+	if dbSandboxes != nil {
+		for id, sb := range dbSandboxes {
+			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
+				r.clearDrift("fcempty:" + id)
+				continue
+			}
+			sock := filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock")
+			if !fcReportsEmptyShell(ctx, sock) {
+				r.clearDrift("fcempty:" + id)
+				continue
+			}
+			if !r.gracePeriodElapsed("fcempty:"+id, now) {
+				continue
+			}
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			// Re-probe under the lock: a restore may have loaded a microVM
+			// into this process since the pass began.
+			if !fcReportsEmptyShell(ctx, sock) {
+				unlockOp()
+				r.clearDrift("fcempty:" + id)
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "fc_empty_shell")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "fc_empty_shell").
+				Msg("unit active but Firecracker holds no microVM — stopping the shell and marking failed")
+			err := stopUnit(ctx, systemdUnitName(id))
+			unlockOp()
+			if err != nil {
+				// Leave the row untouched; the drift persists and the next
+				// pass retries. Marking failed with the shell still active
+				// would strand a live unit behind a failed row.
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell unit")
+				continue
+			}
+			r.markFailedInDB(ctx, id)
+			r.markStale(id)
+			r.writeAudit(ctx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
 		}
 	}
 
@@ -920,6 +979,17 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 
 	r.autoFailLog = append(r.autoFailLog, now)
 	return true
+}
+
+// fcReportsEmptyShell probes the Firecracker API on sock and reports whether
+// it explicitly answered "Not started". Anything else — a running or paused
+// VM, or any probe error — is false: only a healthy API affirmatively
+// declaring "no microVM here" is evidence of an empty shell.
+func fcReportsEmptyShell(ctx context.Context, sock string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	state, err := VMState(probeCtx, sock)
+	return err == nil && state == fcmodels.InstanceInfoStateNotStarted
 }
 
 // markStale deletes the stale BoltDB entry and drops the VM from the

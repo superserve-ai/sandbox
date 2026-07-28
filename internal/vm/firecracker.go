@@ -326,6 +326,25 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 //     dirty pages overwrite it and it stays a complete, standalone image.
 //   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
 //     changed pages — restored over a separate base, never loaded standalone.
+// VMState reports which state the Firecracker process on socketPath holds
+// its microVM in ("Not started", "Running", "Paused"). A healthy API
+// answering "Not started" is the signature of an empty shell — a live
+// process with no microVM inside — which unit-level liveness cannot
+// distinguish from a running VM: the process only becomes a VM again
+// through vmd's own restore path, so a unit restarted outside vmd stays
+// empty forever while looking active to systemd.
+func VMState(ctx context.Context, socketPath string) (string, error) {
+	fc := newFCClient(socketPath)
+	resp, err := fc.Operations.DescribeInstance(operations.NewDescribeInstanceParamsWithContext(ctx))
+	if err != nil {
+		return "", err
+	}
+	if resp.Payload == nil || resp.Payload.State == nil {
+		return "", fmt.Errorf("describe instance: empty response")
+	}
+	return *resp.Payload.State, nil
+}
+
 func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
