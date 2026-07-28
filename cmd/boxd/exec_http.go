@@ -39,7 +39,7 @@ func jsonRuneCost(b []byte) (cost, size int) {
 	switch {
 	case r == utf8.RuneError && size <= 1:
 		return 6, 1
-	case r == '"' || r == '\\' || r == '\n' || r == '\r' || r == '\t':
+	case r == '"' || r == '\\' || r == '\b' || r == '\f' || r == '\n' || r == '\r' || r == '\t':
 		return 2, size
 	case r < 0x20 || r == '<' || r == '>' || r == '&' || r == '\u2028' || r == '\u2029':
 		return 6, size
