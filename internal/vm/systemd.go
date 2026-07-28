@@ -183,6 +183,7 @@ func settleExpiredStopWait(ctx context.Context, unit string, ch <-chan string, w
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	if unitDefinitelyDead(cctx, unit) {
+		confirmUnitStopped(unit) // definitively dead == systemd confirms down
 		return nil
 	}
 	return waitErr
