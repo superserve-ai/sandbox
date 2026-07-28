@@ -144,6 +144,36 @@ func TestHandleExec_OutputCapChargesInvalidUTF8(t *testing.T) {
 	}
 }
 
+func TestHandleExec_NoRetentionAfterFirstDrop(t *testing.T) {
+	old := maxSyncExecOutputBytes
+	maxSyncExecOutputBytes = 2
+	defer func() { maxSyncExecOutputBytes = old }()
+
+	s := newProcessService()
+	// Three separate writes: 'a' fits (budget 1 left), the newline costs 2
+	// and is dropped, and the trailing 'x' would fit the leftover budget but
+	// must not — retained output stays a prefix, never a splice.
+	body := `{"command":"/bin/sh","args":["-c","printf a; sleep 0.3; printf '\\n'; sleep 0.3; printf x"],"working_dir":"/tmp"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleExec(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp execResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v; body: %s", err, w.Body.String())
+	}
+	if resp.Stdout != "a" {
+		t.Errorf("stdout = %q, want %q (no bytes retained past the first drop)", resp.Stdout, "a")
+	}
+	if !resp.Truncated {
+		t.Error("truncated = false, want true")
+	}
+}
+
 func TestHandleExec_NonzeroExit(t *testing.T) {
 	s := newProcessService()
 	body := `{"command":"/bin/sh","args":["-c","exit 7"],"working_dir":"/tmp"}`

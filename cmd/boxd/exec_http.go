@@ -139,9 +139,14 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		tSpawn    time.Time
 	)
 	// appendCapped retains the longest prefix whose encoded cost fits the
-	// shared budget, dropping the rest. Callers hold mu.
+	// shared budget. The first dropped rune ends retention for good — a
+	// cheaper rune in a later event must not splice past the gap, so each
+	// stream stays a prefix of what the command wrote. Callers hold mu.
 	budget := maxSyncExecOutputBytes
 	appendCapped := func(dst, b []byte) []byte {
+		if truncated {
+			return dst
+		}
 		i := 0
 		for i < len(b) {
 			cost, size := jsonRuneCost(b[i:])
