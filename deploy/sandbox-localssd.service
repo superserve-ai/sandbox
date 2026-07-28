@@ -1,0 +1,13 @@
+[Unit]
+Description=Local-SSD RAID + canonical bind-mounts for the sandbox data plane
+After=local-fs.target
+Before=superserve-vmd.service
+RequiredBy=superserve-vmd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/setup-localssd.sh
+
+[Install]
+WantedBy=multi-user.target
