@@ -21,6 +21,11 @@ on:
         required: false
         default: false
         type: boolean
+      saved_snapshot_canary:
+        description: 'Run the saved-snapshot functional canary after regional smoke'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   staging:
@@ -31,6 +36,20 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sandbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       TF_IN_AUTOMATION: 'true'
       API_BASE_URL: https://api-staging.superserve.ai
@@ -47,6 +66,47 @@ jobs:
           fi
 
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit tests
+        run: go test -v -short -count=1 -race ./...
+
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: go test -v -tags integration -count=1 -race -timeout 10m ./internal/integration/ ./cmd/migrate-team/
+
+      - name: Build all binaries
+        run: |
+          go build -ldflags "-s -w" -o /dev/null ./cmd/controlplane
+          go build -ldflags "-s -w" -o /dev/null ./cmd/vmd
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o /dev/null ./cmd/boxd
+
+      - uses: sqlc-dev/setup-sqlc@v4
+        with:
+          sqlc-version: '1.30.0'
+
+      - name: Verify sqlc generated code is up to date
+        run: |
+          sqlc generate
+          git diff --quiet --exit-code
+
+      - name: Verify migration order
+        run: |
+          git fetch origin main
+          highest_main=$(git ls-tree -r origin/main --name-only \
+            | grep '^supabase/migrations/' \
+            | grep -oE '[0-9]{14}' \
+            | sort -n | tail -n1)
+          new_migration=$(git diff --name-only --diff-filter=A origin/main...HEAD \
+            -- supabase/migrations/ \
+            | grep -oE '[0-9]{14}' \
+            | sort -n | head -n1)
+          test -n "$new_migration"
+          test "$new_migration" -gt "$highest_main"
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -96,3 +156,12 @@ jobs:
           set -euo pipefail
           scripts/smoke-test-region.sh staging us-central1
           echo "staging/us-central1 apply and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run saved-snapshot functional canary
+        if: inputs.saved_snapshot_canary
+        env:
+          RUN_SNAPSHOT_CANARY: '1'
+          REQUIRE_SNAPSHOT_RESTART_HOOK: '0'
+          SNAPSHOT_SHADOW_DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+          SNAPSHOT_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_STAGING }}
+        run: ./scripts/smoke-test-snapshots.sh
