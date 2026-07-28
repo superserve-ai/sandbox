@@ -292,13 +292,51 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// period (drift must persist across passes) plus the op-lock check and
 	// a re-probe under the lock filter that window.
 	if dbSandboxes != nil {
+		// Probe candidates concurrently under a stage budget: a healthy
+		// probe answers in microseconds, but a wedged API burns its full
+		// timeout, and probing sequentially would let a handful of wedged
+		// sockets starve the rest of the pass (the enclosing pass deadline
+		// is shared by every rule after this one). Probes cut off by the
+		// stage budget yield errors, which are non-evidence: those VMs are
+		// simply re-examined next pass.
+		var candidates []string
 		for id, sb := range dbSandboxes {
 			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
 				r.clearDrift("fcempty:" + id)
 				continue
 			}
-			sock := filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock")
-			if !fcReportsEmptyShell(ctx, sock) {
+			candidates = append(candidates, id)
+		}
+		probeCtx, probeCancel := context.WithTimeout(ctx, 6*time.Second)
+		type probeResult struct {
+			empty bool
+			err   error
+		}
+		probes := make(map[string]probeResult, len(candidates))
+		var probeMu sync.Mutex
+		var probeWG sync.WaitGroup
+		probeSem := make(chan struct{}, 16)
+		for _, id := range candidates {
+			probeWG.Add(1)
+			go func(id string) {
+				defer probeWG.Done()
+				probeSem <- struct{}{}
+				defer func() { <-probeSem }()
+				empty, perr := fcProbeShell(probeCtx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
+				probeMu.Lock()
+				probes[id] = probeResult{empty: empty, err: perr}
+				probeMu.Unlock()
+			}(id)
+		}
+		probeWG.Wait()
+		probeCancel()
+
+		for _, id := range candidates {
+			res := probes[id]
+			if res.err != nil {
+				continue // no evidence either way; drift state untouched
+			}
+			if !res.empty {
 				r.clearDrift("fcempty:" + id)
 				continue
 			}
@@ -311,9 +349,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			// Re-probe under the lock: a restore may have loaded a microVM
 			// into this process since the pass began.
-			if !fcReportsEmptyShell(ctx, sock) {
+			empty, perr := fcProbeShell(ctx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
+			if perr != nil || !empty {
 				unlockOp()
-				r.clearDrift("fcempty:" + id)
+				if perr == nil {
+					r.clearDrift("fcempty:" + id)
+				}
 				continue
 			}
 			if !r.consumeAutoFailBudget(id) {
@@ -977,15 +1018,20 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 	return true
 }
 
-// fcReportsEmptyShell probes the Firecracker API on sock and reports whether
-// it explicitly answered "Not started". Anything else — a running or paused
-// VM, or any probe error — is false: only a healthy API affirmatively
-// declaring "no microVM here" is evidence of an empty shell.
-func fcReportsEmptyShell(ctx context.Context, sock string) bool {
+// fcProbeShell probes the Firecracker API on sock. Only a healthy API
+// affirmatively answering counts either way: empty reports an explicit
+// "Not started" (a shell with no microVM), and a non-nil error means the
+// probe produced no evidence at all — callers must neither act on it nor
+// clear the drift, so a wedged or slow API can only delay this rule, never
+// steer it.
+func fcProbeShell(ctx context.Context, sock string) (empty bool, err error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	state, err := VMState(probeCtx, sock)
-	return err == nil && state == fcmodels.InstanceInfoStateNotStarted
+	if err != nil {
+		return false, err
+	}
+	return state == fcmodels.InstanceInfoStateNotStarted, nil
 }
 
 // markStale deletes the stale BoltDB entry and drops the VM from the

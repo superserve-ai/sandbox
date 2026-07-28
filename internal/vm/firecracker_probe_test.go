@@ -35,8 +35,8 @@ func TestVMState_DistinguishesShellFromRunning(t *testing.T) {
 	if err != nil || got != fcmodels.InstanceInfoStateNotStarted {
 		t.Fatalf("shell probe = %q, %v; want %q", got, err, fcmodels.InstanceInfoStateNotStarted)
 	}
-	if !fcReportsEmptyShell(context.Background(), shell) {
-		t.Error("fcReportsEmptyShell = false for a Not started FC, want true")
+	if empty, perr := fcProbeShell(context.Background(), shell); perr != nil || !empty {
+		t.Errorf("fcProbeShell(shell) = %v, %v; want true, nil", empty, perr)
 	}
 
 	running := fakeFC(t, fcmodels.InstanceInfoStateRunning)
@@ -44,15 +44,16 @@ func TestVMState_DistinguishesShellFromRunning(t *testing.T) {
 	if err != nil || got != fcmodels.InstanceInfoStateRunning {
 		t.Fatalf("running probe = %q, %v; want %q", got, err, fcmodels.InstanceInfoStateRunning)
 	}
-	if fcReportsEmptyShell(context.Background(), running) {
-		t.Error("fcReportsEmptyShell = true for a Running FC, want false")
+	if empty, perr := fcProbeShell(context.Background(), running); perr != nil || empty {
+		t.Errorf("fcProbeShell(running) = %v, %v; want false, nil", empty, perr)
 	}
 }
 
-func TestFcReportsEmptyShell_ProbeErrorIsNotEvidence(t *testing.T) {
-	// No listener at all — a dead socket must read as "not a shell", never
-	// as evidence for destructive action.
-	if fcReportsEmptyShell(context.Background(), filepath.Join(t.TempDir(), "absent.sock")) {
-		t.Error("fcReportsEmptyShell = true on probe error, want false")
+func TestFcProbeShell_ProbeErrorIsNotEvidence(t *testing.T) {
+	// No listener at all — a dead socket must yield an error (no evidence),
+	// never an affirmative shell verdict.
+	empty, perr := fcProbeShell(context.Background(), filepath.Join(t.TempDir(), "absent.sock"))
+	if perr == nil || empty {
+		t.Errorf("fcProbeShell(dead socket) = %v, %v; want false + error", empty, perr)
 	}
 }
