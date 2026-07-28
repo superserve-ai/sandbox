@@ -284,17 +284,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Drift 1b: the unit is active but the Firecracker inside answers
-	// "Not started" — an empty shell holding no microVM (e.g. the unit was
-	// restarted outside vmd, which destroys the guest; the replacement
-	// process only becomes a VM again through vmd's own restore path).
-	// Unit-level liveness cannot see this: the process is healthy, the VM
-	// is gone. Only an explicit "Not started" answer from a working API
-	// counts as evidence — probe errors are a different failure class the
-	// socket/unit rules already cover. A mid-launch VM is briefly
-	// "Not started" between unit start and boot; the grace period (the
-	// drift must persist across passes) plus the op-lock check and a
-	// re-probe under the lock filter that window.
+	// Drift 1b: the unit is active but the Firecracker inside is an empty
+	// shell holding no microVM (see fcReportsEmptyShell) — e.g. the unit
+	// was restarted outside vmd, which destroys the guest; the replacement
+	// only becomes a VM again through vmd's own restore path. A mid-launch
+	// VM is briefly "Not started" between unit start and boot; the grace
+	// period (drift must persist across passes) plus the op-lock check and
+	// a re-probe under the lock filter that window.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {
 			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
