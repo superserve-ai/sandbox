@@ -970,12 +970,12 @@ paths:
       summary: Run a command and wait for it to finish
       description: |
         Runs a command to completion and returns its output in a single
-        response, retained up to a server-side cap (currently 8 MiB combined;
-        see `truncated`). For live or unbounded output use `POST /exec/stream`
-        (Server-Sent Events) or `GET /exec/connect` (WebSocket). A non-zero
-        exit code is returned in the body, not as an HTTP error. The sandbox
-        must be `running`; a paused sandbox returns `503`. Activate it first
-        with `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this
+        response, retained up to a server-side cap (see `truncated`). For live
+        or unbounded output use `POST /exec/stream` (Server-Sent Events) or
+        `GET /exec/connect` (WebSocket). A non-zero exit code is returned in
+        the body, not as an HTTP error. The sandbox must be `running`; a
+        paused sandbox returns `503`. Activate it first with
+        `POST /sandboxes/{sandbox_id}/activate` (the SDKs do this
         automatically).
       security:
         - accessToken: []
@@ -987,9 +987,7 @@ paths:
               $ref: "#/components/schemas/ExecRequest"
       responses:
         "200":
-          description: >
-            The command finished; output (up to the retention cap) and exit
-            code.
+          description: The command finished; output and exit code.
           content:
             application/json:
               schema:
@@ -2467,23 +2465,19 @@ components:
       properties:
         stdout:
           type: string
-          description: >
-            Standard output. Combined stdout/stderr is retained up to a
-            server-side cap (currently 8 MiB); see `truncated`.
+          description: Standard output; see `truncated`.
         stderr:
           type: string
-          description: >
-            Standard error. Combined stdout/stderr is retained up to a
-            server-side cap (currently 8 MiB); see `truncated`.
+          description: Standard error; see `truncated`.
         exit_code:
           type: integer
           description: Process exit code. A non-zero value is returned, not raised.
         truncated:
           type: boolean
           description: >
-            Present and true when combined output exceeded the retention cap
-            and the tail was dropped. Use `POST /exec/stream` to receive
-            unbounded output.
+            Present and true when combined stdout/stderr exceeded the
+            server-side retention cap (currently 8 MiB) and the tail was
+            dropped. Use `POST /exec/stream` for unbounded output.
 
     ExecStreamEvent:
       type: object
