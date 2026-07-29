@@ -56,6 +56,17 @@ both VMD and proxy below the policy generation required by live strict
 sandboxes; drain or move those sandboxes first. The same rule applies to the
 earlier publication, per-port-access, and header-token capability boundaries.
 
+### Saved-snapshot rollback safety
+
+The saved-snapshot database expand migrations are leave-forward: do not run a
+destructive down migration when rolling application code back. Before routing
+API traffic to a revision from before the DB-first sandbox-create change, first
+return every `draining` host to `active` and verify that state has converged.
+Those older revisions can start VMD in parallel with the sandbox INSERT, so a
+database host-admission rejection could otherwise race a VM launch. If any
+draining host cannot be explicitly returned to `active`, do not roll the API
+back that far.
+
 ## Host selection
 
 Do not deploy to a host merely because it exists. Host deployment jobs should only target hosts that are explicitly marked ready for that environment/region.

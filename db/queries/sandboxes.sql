@@ -1,8 +1,8 @@
 -- name: CreateSandbox :one
 -- ID is supplied by the caller (generated in Go via uuid.New()) rather
--- than defaulted in SQL, so the caller can parallelize this INSERT with
--- the VMD CreateVM call — both need the same sandbox_id and generating
--- it client-side lets them run concurrently instead of strictly serially.
+-- than defaulted in SQL, so the committed row and later VMD operations
+-- share one stable sandbox_id. Callers must wait for this statement before
+-- starting VMD: its triggers own quota and final host admission.
 -- template_id is optional (NULL when sandbox is not derived from a template).
 -- snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
 -- specific build's artifacts so a later template rebuild can't corrupt it.

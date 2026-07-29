@@ -1833,18 +1833,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Generate the sandbox ID in Go so the DB INSERT and the VMD call
-	// can run in parallel — both need the same ID and neither needs to
-	// wait on the other. This hides the ~10-20ms INSERT roundtrip behind
-	// VMD's ~100-200ms create latency, shaving that much off the p50.
+	// Generate the sandbox ID in Go so the committed DB row and every later
+	// VMD operation share one stable identity. The INSERT must finish before
+	// RestoreSnapshot: besides quota enforcement, its database triggers own
+	// the final host-admission decision and must be able to reject a launch
+	// without causing any VMD side effect.
 	sandboxID := uuid.New()
 
 	insertCtx := context.WithoutCancel(c.Request.Context())
-	type insertResult struct {
-		sandbox db.Sandbox
-		err     error
-	}
-	insertCh := make(chan insertResult, 1)
 	// runInsert performs the quota-safe sandbox + preview-policy statement.
 	// Closure captures sandboxID/teamID/req/templateID/hostID/metadataJSON.
 	runInsert := func(q *db.Queries) (db.Sandbox, error) {
@@ -1958,14 +1954,34 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return db.Sandbox(row), err
 	}
 
-	var tInsertStart, tInsertEnd time.Time
-	go func() {
-		tInsertStart = time.Now()
-		// Quota is enforced by the sandbox_quota_on_insert trigger.
-		sb, err := insertWithBindings()
-		tInsertEnd = time.Now()
-		insertCh <- insertResult{sandbox: sb, err: err}
-	}()
+	tInsertStart := time.Now()
+	// Quota and cross-version host admission are enforced by INSERT triggers.
+	// Waiting for the statement to return also confirms that the autocommit
+	// transaction completed before a VM can start on the selected host.
+	sandbox, dbErr := insertWithBindings()
+	tInsertEnd := time.Now()
+
+	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
+	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
+
+	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
+	quotaExceeded := isSandboxQuotaErr(dbErr)
+
+	if dbErr != nil {
+		// No VMD RPC has run yet, so an admission, quota, or template-race
+		// rejection needs no orphan cleanup and cannot perturb the host.
+		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed before VMD restore")
+		if templateRace {
+			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			return
+		}
+		if quotaExceeded {
+			h.respondQuotaExceeded(c, teamID)
+			return
+		}
+		respondError(c, ErrInternal)
+		return
+	}
 
 	// Boot the VM synchronously — the client gets a response only after
 	// the sandbox is fully running and ready to use. The boot is still
@@ -1983,60 +1999,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	})
 	tVmdEnd := time.Now()
 
-	// Wait for the parallel INSERT to complete — its result determines
-	// how we handle a VMD failure (mark row failed vs. nothing to mark).
-	insertRes := <-insertCh
-	tInsertReceive := time.Now()
-	sandbox := insertRes.sandbox
-	dbErr := insertRes.err
-
-	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
-	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
-
-	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
-	quotaExceeded := isSandboxQuotaErr(dbErr)
-
-	switch {
-	case dbErr != nil && vmdErr != nil:
-		// Both failed — nothing persisted, nothing to clean up.
-		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
-		if templateRace {
-			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
-			return
-		}
-		if quotaExceeded {
-			h.respondQuotaExceeded(c, teamID)
-			return
-		}
-		respondError(c, ErrInternal)
-		return
-	case dbErr != nil:
-		// DB insert failed but VMD succeeded — destroy the orphan VM so
-		// it doesn't linger on the host. Use a detached context so client
-		// disconnect doesn't leak the VM.
-		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed, destroying orphan VM")
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
-		cleanupCancel()
-		if templateRace {
-			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
-			return
-		}
-		if quotaExceeded {
-			h.respondQuotaExceeded(c, teamID)
-			return
-		}
-		respondError(c, ErrInternal)
-		return
-	case vmdErr != nil:
-		// VMD failed but DB row exists — mark it failed so the reaper
-		// doesn't leave it stuck in "starting". The request middleware
-		// records the create failure metric from the HTTP status, so avoid
-		// emitting a second request-scoped transition here.
+	if vmdErr != nil {
+		// The DB row was committed before boot. Mark it failed so the reaper
+		// doesn't leave it stuck in "starting", and best-effort destroy in
+		// case a cancelled/timed-out attempt completed on the host just after
+		// the client returned. The request middleware records the create
+		// failure metric from the HTTP status, so avoid emitting a second
+		// request-scoped transition here.
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-		// A cancelled attempt can still complete on the host just after the
-		// deadline; best-effort destroy so a booted VM can't idle against a
-		// failed row until the reconciler sweeps it.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
 		cleanupCancel()
@@ -2263,12 +2233,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Str("sandbox_id", sandbox.ID.String()).
 		Int64("auth_ms", c.GetInt64("auth_ms")).
 		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
-		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
+		Int64("sched_ms", tInsertStart.Sub(tLookupDone).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
 		Bool("vmd_retried", vmdRetried).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
-		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
-		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
+		Int64("insert_wait_after_vmd_ms", 0).
+		Int64("post_ms", tPostDone.Sub(tVmdEnd).Milliseconds()).
 		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
 		Msg("CreateSandbox phases")
 	c.JSON(http.StatusCreated, resp)

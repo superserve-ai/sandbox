@@ -1757,10 +1757,14 @@ func TestCreateSandbox_Success(t *testing.T) {
 	var attested bool
 	var insertedSandboxID, policySandboxID uuid.UUID
 	var insertedPolicyAccess string
+	var insertCommitted atomic.Bool
 	scheduler := &stubScheduler{hostID: "public-host"}
 	var policyInsertedAtomically bool
 	vmd := &stubVMD{
 		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
+			if !insertCommitted.Load() {
+				t.Error("RestoreSnapshot ran before the sandbox INSERT completed")
+			}
 			restoredAccess, restoredPorts, restoredRevision = access, ports, revision
 		},
 		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
@@ -1786,11 +1790,20 @@ func TestCreateSandbox_Success(t *testing.T) {
 						insertedPolicyAccess = access
 					}
 				}
-				return sandboxRow(db.Sandbox{
+				row := sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "my-sandbox",
 					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
 					CreatedAt: time.Now(),
 				})
+				return &mockRow{scanFn: func(dest ...any) error {
+					if err := row.Scan(dest...); err != nil {
+						return err
+					}
+					// QueryRow.Scan returning is the point at which the handler
+					// has observed the successful autocommit statement.
+					insertCommitted.Store(true)
+					return nil
+				}}
 			}
 			if strings.Contains(sql, "FROM template") {
 				return templateRow(defaultReadyTemplate())
@@ -1826,6 +1839,9 @@ func TestCreateSandbox_Success(t *testing.T) {
 	}
 	if !attested {
 		t.Error("create did not attest the live VMD after restore")
+	}
+	if !insertCommitted.Load() {
+		t.Error("successful create did not commit its sandbox row")
 	}
 	if insertedSandboxID == uuid.Nil || !policyInsertedAtomically || policySandboxID != insertedSandboxID || insertedPolicyAccess != preview.AccessPublic {
 		t.Errorf("inserted policy = (sandbox=%s access=%q), want sandbox=%s access=%q", policySandboxID, insertedPolicyAccess, insertedSandboxID, preview.AccessPublic)
@@ -2304,15 +2320,19 @@ func TestCreateSandbox_MissingTeamID(t *testing.T) {
 
 func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 	teamID := uuid.New()
-	vmd := &stubVMD{}
-
-	// SS001 is what the sandbox_quota_on_insert trigger raises on over-quota.
-	var destroyCalled bool
-	vmd.destroyFn = func(_ context.Context, _ string, _ bool) error {
-		destroyCalled = true
-		return nil
+	var restoreCalls, destroyCalls atomic.Int32
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			restoreCalls.Add(1)
+			return "10.0.0.1", nil
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyCalls.Add(1)
+			return nil
+		},
 	}
 
+	// SS001 is what the sandbox_quota_on_insert trigger raises on over-quota.
 	quotaErr := &pgconn.PgError{Code: "SS001", Message: "sandbox quota exceeded"}
 
 	mock := &mockDBTX{
@@ -2347,8 +2367,61 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 	if errObj["code"] != "too_many_sandboxes" {
 		t.Errorf("error code = %v, want too_many_sandboxes", errObj["code"])
 	}
-	if !destroyCalled {
-		t.Error("orphan VM was not destroyed after quota rejection")
+	if got := restoreCalls.Load(); got != 0 {
+		t.Errorf("RestoreSnapshot calls = %d, want 0 after quota rejection", got)
+	}
+	if got := destroyCalls.Load(); got != 0 {
+		t.Errorf("DestroyInstance calls = %d, want 0 when no VM was started", got)
+	}
+}
+
+func TestCreateSandbox_HostAdmissionErrorHasNoVMDSideEffects(t *testing.T) {
+	teamID := uuid.New()
+	var restoreCalls, destroyCalls atomic.Int32
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			restoreCalls.Add(1)
+			return "10.0.0.1", nil
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyCalls.Add(1)
+			return nil
+		},
+	}
+	admissionErr := &pgconn.PgError{
+		Code:    "SS006",
+		Message: "host admission denied for sandbox on host draining-host",
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+				return previewCapableHostRow()
+			case strings.Contains(sql, "INSERT INTO sandbox"):
+				return errorRow(admissionErr)
+			case strings.Contains(sql, "FROM template"):
+				return templateRow(defaultReadyTemplate())
+			default:
+				return errorRow(fmt.Errorf("unexpected query after admission rejection: %s", sql))
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			return pgconn.CommandTag{}, fmt.Errorf("unexpected exec after admission rejection: %s", sql)
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"rejected"}`))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
+	}
+	if got := restoreCalls.Load(); got != 0 {
+		t.Errorf("RestoreSnapshot calls = %d, want 0 after host admission rejection", got)
+	}
+	if got := destroyCalls.Load(); got != 0 {
+		t.Errorf("DestroyInstance calls = %d, want 0 when no VM was started", got)
 	}
 }
 
@@ -2358,9 +2431,14 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 
 	// With the superserve/base default, CreateSandbox routes through
 	// RestoreSnapshot. Fail it to exercise the VMD-error branch.
+	var destroyed, markedFailed, clearedBindings atomic.Bool
 	vmd := &stubVMD{
 		restoreFn: func(context.Context, string, string, string) (string, error) {
 			return "", fmt.Errorf("vmd unreachable")
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
+			return nil
 		},
 	}
 
@@ -2380,7 +2458,16 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 			}
 			return activityRow()
 		},
-		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(sql, "SET status = $2"):
+				if got := args[1]; got != db.SandboxStatusFailed {
+					t.Errorf("compensating status = %v, want failed", got)
+				}
+				markedFailed.Store(true)
+			case strings.Contains(sql, "DELETE FROM sandbox_secret"):
+				clearedBindings.Store(true)
+			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
@@ -2392,6 +2479,10 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 	// Creation is synchronous — VMD error returns 500.
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+	if !destroyed.Load() || !markedFailed.Load() || !clearedBindings.Load() {
+		t.Errorf("VMD failure compensation: destroyed=%v marked_failed=%v cleared_bindings=%v, want all true",
+			destroyed.Load(), markedFailed.Load(), clearedBindings.Load())
 	}
 }
 
