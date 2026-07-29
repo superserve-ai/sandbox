@@ -23,7 +23,7 @@ const directCgroupStopBudget = 12 * time.Second
 // launchMode reports whether a launch for a VM in the given supervision mode
 // should take the cgroup path. A record already in cgroup mode always does;
 // a fresh launch does only when armed.
-func (m *Manager) cgroupLaunch(existing string) bool {
+func (m *Manager) cgroupLaunch(existing Supervision) bool {
 	if cgroupSupervised(existing) {
 		return true
 	}
@@ -44,7 +44,7 @@ func (m *Manager) cgroupLaunch(existing string) bool {
 // freshUnit is the linger-skip hint for the systemd path (a provably-fresh
 // launch skips the per-unit linger query); it is ignored on the cgroup path,
 // which never touches systemd.
-func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string, hadPriorLife, freshUnit bool) (pid int, supervision string, err error) {
+func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error) {
 	if m.cgroupLaunch(existing) {
 		// Unit→cgroup flip: a legacy unit whose pause-stop timed out may
 		// still be live, and spawning a cgroup FC over it gives two
@@ -67,7 +67,7 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 // stopVM terminates a VM by its supervision mode. cgroup mode: kill the
 // group and wait it empty, then rmdir; unit mode: the existing systemd stop.
 // Idempotent — a missing group or unit is a no-op.
-func (m *Manager) stopVM(ctx context.Context, vmID, supervision string) error {
+func (m *Manager) stopVM(ctx context.Context, vmID string, supervision Supervision) error {
 	if cgroupSupervised(supervision) {
 		if m.cgroups == nil {
 			return fmt.Errorf("stop cgroup VM %s: no delegated subtree (not armed)", vmID)
@@ -83,7 +83,7 @@ func (m *Manager) stopVM(ctx context.Context, vmID, supervision string) error {
 			return err
 		}
 		m.awaitReaper(vmID)
-		return m.cgroups.removeVMCgroup(vmID)
+		return m.cgroups.removeVMCgroup(context.WithoutCancel(ctx), vmID)
 	}
 	return stopUnit(ctx, systemdUnitName(vmID))
 }
@@ -109,18 +109,28 @@ func (m *Manager) awaitReaper(vmID string) {
 // supervision mode. Mirrors unitDefinitelyDead's contract on BOTH paths:
 // only a real answer says dead — an unreadable cgroup or an inconclusive
 // systemd probe reads as ALIVE, so an overloaded host never reaps a live VM.
-func (m *Manager) vmDefinitelyDead(ctx context.Context, vmID, supervision string) bool {
+func (m *Manager) vmDefinitelyDead(ctx context.Context, vmID string, supervision Supervision) bool {
 	if cgroupSupervised(supervision) {
-		if m.cgroups == nil {
-			return false // can't prove death without the subtree
-		}
-		populated, err := m.cgroups.vmCgroupPopulated(vmID)
-		if err != nil {
-			return false // unreadable == inconclusive == alive
-		}
-		return !populated
+		return m.cgroupDefinitelyDead(vmID)
 	}
 	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
+}
+
+// cgroupDefinitelyDead is the cgroup-mode twin of unitDefinitelyDead, kept a
+// named oracle beside it so the two supervision modes share ONE definition of
+// the fail-safe rather than re-deriving it per call site. Only a conclusively
+// empty group says dead; a missing subtree (not armed) or an unreadable
+// cgroup.events is inconclusive and reads as ALIVE — identical to the unit
+// oracle, so an overloaded host never reaps a live VM.
+func (m *Manager) cgroupDefinitelyDead(vmID string) bool {
+	if m.cgroups == nil {
+		return false // can't prove death without the subtree
+	}
+	populated, err := m.cgroups.vmCgroupPopulated(vmID)
+	if err != nil {
+		return false // unreadable == inconclusive == alive
+	}
+	return !populated
 }
 
 // startFirecrackerDirect launches Firecracker into the VM's own cgroup,
@@ -167,9 +177,11 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	if err != nil {
 		return 0, err
 	}
-	defer cgDir.Close()
+	// spawnDirect takes ownership of cgDir and closes it; until the hand-off
+	// this path still owns it, so close it on the openVMConsole error return.
 	console, err := openVMConsole(m.cfg.RunDir, vmID)
 	if err != nil {
+		cgDir.Close()
 		return 0, fmt.Errorf("open vm console: %w", err)
 	}
 
@@ -177,7 +189,7 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	cmd, err := spawnDirect(scriptPath, cgDir, console)
 	console.Close() // the child holds its own dup; vmd's copy is done
 	if err != nil {
-		_ = m.cgroups.removeVMCgroup(vmID)
+		_ = m.cgroups.removeVMCgroup(context.WithoutCancel(ctx), vmID)
 		return 0, fmt.Errorf("spawn firecracker: %w", err)
 	}
 	pid := cmd.Process.Pid
@@ -207,7 +219,7 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 		m.log.Warn().Str("vm_id", vmID).Err(err).Msg("firecracker socket missing after direct launch")
 		_ = m.cgroups.killVMCgroup(context.WithoutCancel(ctx), vmID, directCgroupStopBudget)
 		m.awaitReaper(vmID)
-		_ = m.cgroups.removeVMCgroup(vmID)
+		_ = m.cgroups.removeVMCgroup(context.WithoutCancel(ctx), vmID)
 		return 0, fmt.Errorf("wait for socket (direct %s): %w", vmID, err)
 	}
 	tSocketReady := time.Now()

@@ -58,7 +58,14 @@ func directSpawnScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID
 // spawn. O_TRUNC resets the file each launch, so the on-disk total stays
 // within one boot's capped output even across resume cycles.
 func openVMConsole(runDir, vmID string) (*os.File, error) {
-	return os.OpenFile(filepath.Join(runDir, vmID, "console.log"),
+	dir := filepath.Join(runDir, vmID)
+	// Defensive: the launch path MkdirAll's this dir (via the socket dir) before
+	// we run, but create it here too rather than depend on that ordering — the
+	// cold-boot and unit paths guard their target dir the same way.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir vm console dir: %w", err)
+	}
+	return os.OpenFile(filepath.Join(dir, "console.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 }
 

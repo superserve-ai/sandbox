@@ -550,7 +550,7 @@ func (t *cgroupTree) killVMCgroup(ctx context.Context, vmID string, budget time.
 // removeVMCgroup rmdirs the VM's group. The kernel can lag rmdir briefly
 // after the last exit; bounded retries absorb that, and the reconciler
 // sweeps any straggler.
-func (t *cgroupTree) removeVMCgroup(vmID string) error {
+func (t *cgroupTree) removeVMCgroup(ctx context.Context, vmID string) error {
 	dir, derr := t.safeVMCgroupDir(vmID)
 	if derr != nil {
 		return derr
@@ -561,7 +561,14 @@ func (t *cgroupTree) removeVMCgroup(vmID string) error {
 		if err == nil || os.IsNotExist(err) {
 			return nil
 		}
-		time.Sleep(25 * time.Millisecond)
+		// Interruptible so a shutdown-time reconciler sweep isn't stuck here;
+		// cleanup callers pass a detached ctx so an expired launch deadline
+		// can't abandon the rmdir and leak the group.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("rmdir vm cgroup %s: %w", vmID, err)
 }

@@ -8,7 +8,7 @@ import "testing"
 func TestCgroupLaunchDecision(t *testing.T) {
 	cases := []struct {
 		name     string
-		existing string
+		existing Supervision
 		armed    bool
 		want     bool
 	}{

@@ -136,7 +136,7 @@ type VMInstance struct {
 	// dispatch on it, and it must survive a vmd restart. A resume decides
 	// the mode for the NEW run and must set it before the post-launch
 	// persist.
-	Supervision string
+	Supervision Supervision
 
 	mu sync.RWMutex
 }
@@ -1902,7 +1902,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Unlock()
 
 		var startErr error
-		var supervision string
+		var supervision Supervision
 		inst.mu.RLock()
 		existingSupervision := inst.Supervision
 		inst.mu.RUnlock()
@@ -2983,7 +2983,7 @@ func (m *Manager) getInstance(vmID string) (*VMInstance, error) {
 // liveness site that lacks an instance in hand uses this so a cgroup VM is
 // never treated as a unit VM (which would leave its process unkilled and
 // read it as dead).
-func (m *Manager) supervisionForVM(vmID string) string {
+func (m *Manager) supervisionForVM(vmID string) Supervision {
 	m.mu.RLock()
 	inst, ok := m.vms[vmID]
 	m.mu.RUnlock()

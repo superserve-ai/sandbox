@@ -198,7 +198,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		return
 	}
 	active := make(map[string]bool)
-	supervisionOf := make(map[string]string)
+	supervisionOf := make(map[string]Supervision)
 	for _, id := range unitIDs {
 		if isBuildVM(id) {
 			continue
@@ -354,7 +354,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// survivor. Skip on an inconclusive read so a live FC keeps its tap.
 			if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr == nil && !pop {
 				r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
-				if rerr := r.mgr.cgroups.removeVMCgroup(id); rerr == nil {
+				if rerr := r.mgr.cgroups.removeVMCgroup(ctx, id); rerr == nil {
 					unlockOp()
 					r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor (rmdir retried)", "cgroup_orphan_no_record")
 					r.clearDrift("cgrouporphan:" + id)
@@ -430,7 +430,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 					unlockOp()
 					continue // became populated or unreadable — not ours to remove
 				}
-				if err := r.mgr.cgroups.removeVMCgroup(id); err != nil {
+				if err := r.mgr.cgroups.removeVMCgroup(ctx, id); err != nil {
 					log.Warn().Err(err).Str("vm_id", id).Msg("failed to reap empty recordless cgroup — retrying next pass")
 					unlockOp()
 					continue
@@ -1113,7 +1113,8 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 func (r *Reconciler) markStale(vmID string) {
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
-	var namespace, supervision string
+	var namespace string
+	var supervision Supervision
 	if rec, err := r.mgr.state.Get(vmID); err == nil && rec != nil {
 		namespace = rec.Namespace
 		supervision = rec.Supervision
@@ -1121,7 +1122,9 @@ func (r *Reconciler) markStale(vmID string) {
 	// Remove a direct-spawned VM's cgroup dir too, or an emptied group lingers
 	// as an unbounded fleet-size artifact.
 	if cgroupSupervised(supervision) && r.mgr.cgroups != nil {
-		_ = r.mgr.cgroups.removeVMCgroup(vmID)
+		// markStale has no ctx; the rmdir must complete (a lingering empty group
+		// is an unbounded artifact), so give it a background context.
+		_ = r.mgr.cgroups.removeVMCgroup(context.Background(), vmID)
 	}
 
 	// Delete from BoltDB first. If this fails, keep the in-memory entry

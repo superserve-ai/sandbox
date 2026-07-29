@@ -160,7 +160,7 @@ type VMRecord struct {
 	// records written by this binary stay readable-and-correct under a
 	// rollback binary that predates the field; never write a non-empty
 	// value for unit mode.
-	Supervision string `json:"supervision,omitempty"`
+	Supervision Supervision `json:"supervision,omitempty"`
 	// Preview publication policy must survive vmd restarts; old records decode
 	// to empty/legacy behavior for backward compatibility.
 	PreviewAccess            string           `json:"preview_access,omitempty"`
@@ -173,19 +173,33 @@ type VMRecord struct {
 	PreviewTokenPolicyRevision int64 `json:"preview_token_policy_revision,omitempty"`
 }
 
+// Supervision is how a VM's current Firecracker run is supervised. A named
+// type (like VMStatus) so the liveness/stop/reattach/reconcile paths switch on
+// a checked value, not a bare string a typo could silently break.
+type Supervision string
+
 // Supervision values for VMInstance/VMRecord.
 const (
 	// SupervisionUnit: the VM runs as firecracker@<id>.service. Canonically
 	// the empty string — legacy records predate the field.
-	SupervisionUnit = ""
+	SupervisionUnit Supervision = ""
 	// SupervisionCgroup: the VM was direct-spawned into a per-VM cgroup
 	// under vmd's delegated subtree; no systemd unit exists for it.
-	SupervisionCgroup = "cgroup"
+	SupervisionCgroup Supervision = "cgroup"
 )
+
+// String renders the mode for logs — the empty canonical value reads as "unit"
+// rather than blank.
+func (s Supervision) String() string {
+	if s == SupervisionUnit {
+		return "unit"
+	}
+	return string(s)
+}
 
 // cgroupSupervised reports whether a supervision value means the VM has no
 // systemd unit and lives in a per-VM cgroup.
-func cgroupSupervised(s string) bool { return s == SupervisionCgroup }
+func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }
 
 // StateStore wraps a BoltDB database for VM state persistence.
 type StateStore struct {
