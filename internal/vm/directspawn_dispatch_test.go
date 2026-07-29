@@ -1,6 +1,45 @@
 package vm
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// The destroy path frees a VM's tap only when cgroupStillLive says the group is
+// gone — the record's supervision mode can be stale, so a live cgroup must block
+// destroy regardless of it. No subtree (plain unit host) never blocks; a
+// populated OR unreadable group blocks; an empty or missing group does not.
+func TestCgroupStillLive(t *testing.T) {
+	if (&Manager{}).cgroupStillLive("vm-1") {
+		t.Fatal("no cgroup subtree must read as not-live (a unit VM must not block its own destroy)")
+	}
+
+	vms := t.TempDir()
+	m := &Manager{cgroups: &cgroupTree{vms: vms}}
+
+	if m.cgroupStillLive("gone") {
+		t.Fatal("a missing per-VM group must read as not-live")
+	}
+
+	write := func(id, body string) {
+		dir := filepath.Join(vms, id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("live", "populated 1\nfrozen 0\n")
+	if !m.cgroupStillLive("live") {
+		t.Fatal("a populated group must block destroy (still live)")
+	}
+	write("empty", "populated 0\nfrozen 0\n")
+	if m.cgroupStillLive("empty") {
+		t.Fatal("an empty group must not block destroy")
+	}
+}
 
 // cgroupLaunch decides direct vs unit for a launch. A record already in
 // cgroup mode always relaunches cgroup (so a flag-off rollback drains rather

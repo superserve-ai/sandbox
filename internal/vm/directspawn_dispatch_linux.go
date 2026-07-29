@@ -133,6 +133,22 @@ func (m *Manager) cgroupDefinitelyDead(vmID string) bool {
 	return !populated
 }
 
+// cgroupStillLive reports whether a per-VM cgroup for vmID is populated (or
+// unreadable — inconclusive reads live). It is the mode-AGNOSTIC guard the
+// destroy path checks before freeing a slot: unlike cgroupDefinitelyDead it
+// returns false when there is no delegated subtree (nothing to strand), so a
+// plain unit VM never blocks its own destroy. The point is that the record's
+// supervision mode can be stale — a verify throwaway can leak a cgroup FC onto
+// a unit record, and a no-op unit stop even succeeds — so freeing the tap must
+// consult reality (the cgroup) rather than trust the record's dispatch mode.
+func (m *Manager) cgroupStillLive(vmID string) bool {
+	if m.cgroups == nil {
+		return false
+	}
+	populated, err := m.cgroups.vmCgroupPopulated(vmID)
+	return err != nil || populated
+}
+
 // startFirecrackerDirect launches Firecracker into the VM's own cgroup,
 // forked by vmd (not PID 1). Returns the child PID synchronously — the exec
 // chain (nsenter→unshare→sh→exec fc) preserves a single PID end to end, so

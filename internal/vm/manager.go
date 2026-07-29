@@ -733,14 +733,19 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	}
 	if err := m.stopVM(ctx, vmID, destroySupervision); err != nil {
 		log.Warn().Err(err).Msg("stop failed (VM may not exist — trying PID-based kill)")
-		// For a cgroup VM the kill may be unconfirmed (FC wedged in uninterruptible
-		// I/O survives cgroup.kill). Recycling its slot/ns now would hand a live
-		// FC's tap to the next tenant, and the PID SIGKILL below doesn't establish
-		// death. Abort the destructive cleanup and keep the record+slot; the
-		// reconciler reclaims it once the group empties and a retry then completes.
-		if cgroupSupervised(destroySupervision) && !m.vmDefinitelyDead(ctx, vmID, destroySupervision) {
-			return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (process still live); retry after it exits", vmID)
-		}
+	}
+	// Mode-agnostic safety gate, BEFORE any destructive cleanup. Neither the stop
+	// error nor destroySupervision can be trusted to prove death here: the record's
+	// supervision can be stale (a verify throwaway can leak a cgroup FC onto a unit
+	// record), and a no-op unit stop returns nil — so a stale unit record would
+	// sail past a mode-conditioned check and free the tap under a live FC, handing
+	// it to the next tenant. Consult the cgroup directly instead: if this vmID's
+	// group is still live (populated, or unreadable == inconclusive == alive),
+	// keep the record+slot and let the reconciler reclaim once it empties; a retry
+	// then completes. cgroup.kill for a wedged FC (uninterruptible I/O) is exactly
+	// this case, but so is any record/reality drift.
+	if m.cgroupStillLive(vmID) {
+		return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (cgroup process still live); retry after it exits", vmID)
 	}
 	removeUnitDropIn(vmID)
 
