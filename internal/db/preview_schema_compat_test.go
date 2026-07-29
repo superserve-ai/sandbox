@@ -42,8 +42,57 @@ func TestMissingPreviewPolicyRowRemainsLegacyPublic(t *testing.T) {
 	}
 	queries := string(raw)
 	if !strings.Contains(queries, "LEFT JOIN sandbox_preview_policy") ||
-		!strings.Contains(queries, "COALESCE(p.access, 'legacy_public')") {
+		!strings.Contains(queries, "COALESCE(p.default_access, p.access, 'legacy_public')") {
 		t.Fatal("effective preview policy no longer maps an absent old-writer row to legacy_public")
+	}
+}
+
+func TestPreviewAccessMigrationKeepsRollbackStateInSideTables(t *testing.T) {
+	path := filepath.Join("..", "..", "supabase", "migrations", "20260727000002_preview_port_access_policy.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	sql := string(raw)
+	for _, existingTable := range []string{"sandbox", "host"} {
+		pattern := regexp.MustCompile(`(?is)ALTER\s+TABLE\s+(?:public\.)?` + existingTable + `\b`)
+		if pattern.MatchString(sql) {
+			t.Errorf("phase 2 alters existing %s row shape", existingTable)
+		}
+	}
+	for _, required := range []string{
+		"ALTER TABLE sandbox_preview_policy",
+		"ADD COLUMN default_access text",
+		"ALTER TABLE sandbox_published_port",
+		"sandbox_preview_policy_maintain_fallback",
+		"sandbox_published_port_default_access",
+		"sandbox_published_port_refresh_fallback",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Errorf("migration missing rollback guard %q", required)
+		}
+	}
+	if strings.Contains(sql, "ALTER COLUMN access SET DEFAULT") {
+		t.Fatal("published-port access has a SQL default; Phase 1 omitted inserts must use the true policy default trigger")
+	}
+}
+
+func TestPublishPortOmissionPreservesExistingModeAndUsesTrueDefaultOnlyOnInsert(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "sandboxes.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sandbox queries: %v", err)
+	}
+	queries := string(raw)
+	for _, required := range []string{
+		"CASE WHEN p.default_access = 'private' THEN 'private' ELSE 'public' END",
+		"COALESCE(sqlc.narg('access')::text, sandbox_published_port.access)",
+		"SET default_access = $2",
+		"RETURNING default_access AS access, access AS wire_access, revision",
+	} {
+		if !strings.Contains(queries, required) {
+			t.Errorf("sandbox queries missing %q", required)
+		}
 	}
 }
 
@@ -100,5 +149,40 @@ func TestHostCapabilityAttestationIsBoundToCurrentHeartbeat(t *testing.T) {
 	}
 	if !strings.Contains(queries, "h.status = 'active'") {
 		t.Fatal("host capability gate accepts capabilities from an unhealthy host")
+	}
+}
+
+func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "hosts.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read host queries: %v", err)
+	}
+	queries := string(raw)
+	start := strings.Index(queries, "-- name: HostHasCapabilities :one")
+	if start < 0 {
+		t.Fatal("HostHasCapabilities query block is missing")
+	}
+	end := strings.Index(queries[start:], "-- name: MarkHostUnhealthy :exec")
+	if end < 0 {
+		t.Fatal("HostHasCapabilities query terminator is missing")
+	}
+	query := queries[start : start+end]
+	for _, required := range []string{
+		"WITH target_host AS MATERIALIZED",
+		"WHERE id = sqlc.arg('host_id')",
+		"status = 'active'",
+		"last_heartbeat_at IS NOT NULL",
+		"FOR SHARE",
+		"unnest(sqlc.arg('required_capabilities')::text[])",
+		"hc.host_id = h.id",
+		"hc.heartbeat_at = h.last_heartbeat_at",
+	} {
+		if !strings.Contains(query, required) {
+			t.Errorf("batch capability gate is missing %q", required)
+		}
+	}
+	if got := strings.Count(query, "WHERE NOT EXISTS"); got != 2 {
+		t.Fatalf("batch capability relational division has %d NOT EXISTS clauses, want 2", got)
 	}
 }

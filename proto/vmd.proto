@@ -342,8 +342,9 @@ message RestoreSnapshotRequest {
   string team_id = 10;
   string owner_id = 11;
   // Numeric-port routing policy carried onto the vmd instance record. Empty
-  // and "legacy_public" preserve all-port routing; "public" requires a port
-  // to appear in preview_ports.
+  // and "legacy_public" preserve all-port routing; "public" and "private"
+  // require a port to appear in preview_ports. For a Phase 1 port with no
+  // per-port mode, this is also the compatibility fallback.
   string preview_access = 12;
   repeated PreviewPort preview_ports = 13;
   // Monotonic generation used to reject stale full-allowlist pushes.
@@ -352,6 +353,12 @@ message RestoreSnapshotRequest {
 
 message PreviewPort {
   int32 port = 1;
+  // Per-port access mode. Empty means a Phase 1 sender and falls back to the
+  // sandbox policy. Unknown non-empty values fail closed.
+  string access = 2;
+  // Positive generation for the wire-only "private_token_v1" mode. Other
+  // access modes ignore this field. Tokens are scoped to this exact value.
+  int64 token_version = 3;
 }
 
 message RestoreSnapshotResponse {
@@ -524,7 +531,7 @@ message UpdateSandboxNetworkResponse {
 
 message UpdateSandboxPreviewPolicyRequest {
   string vm_id = 1;
-  string preview_access = 2;              // "legacy_public" | "public"
+  string preview_access = 2;              // "legacy_public" | "public" | "private"
   repeated PreviewPort preview_ports = 3; // full replacement allowlist
   int64 policy_revision = 4;              // monotonic; equal must match exactly
 }

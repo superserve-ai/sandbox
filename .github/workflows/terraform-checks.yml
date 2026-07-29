@@ -47,16 +47,37 @@ jobs:
     permissions:
       actions: read
       contents: read
+      pull-requests: read
     steps:
       - name: Propagate prerequisite failures
         if: ${{ needs.terraform-fmt.result != 'success' || needs.terraform-validate.result != 'success' }}
         run: exit 1
 
       - name: Wait for Terraform Plans
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          changed_files=$(gh api \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100" \
+            --paginate --jq '.[].filename')
+          terraform_change=false
+          while IFS= read -r path; do
+            case "$path" in
+              infra/*|infra/scripts/*|scripts/terraform-*.sh|.github/workflows/terraform-*.yml)
+                terraform_change=true
+                break
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          # Forked Terraform PRs are not supported by the credentialed plan gate.
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ] && [ "$terraform_change" = true ]; then
+            echo "::error title=Terraform plan unavailable::Terraform PRs from forks are not supported by the plan gate."
+            exit 1
+          fi
 
           for i in $(seq 1 60); do
             run=$(gh api "repos/${{ github.repository }}/actions/workflows/terraform-plans.yml/runs?head_sha=${{ github.event.pull_request.head.sha }}&event=pull_request&per_page=1" \
@@ -73,7 +94,11 @@ jobs:
             fi
 
             if [ "$status" = "absent" ] && [ "$i" -ge 6 ]; then
-              echo "No Terraform plan workflow run appeared for this PR; treating it as a non-Terraform change."
+              if [ "$terraform_change" = true ]; then
+                echo "::error title=Terraform plan workflow missing::This PR changes Terraform-related files, but no Terraform Plans workflow run appeared."
+                exit 1
+              fi
+              echo "No Terraform plan workflow run appeared for this non-Terraform PR."
               exit 0
             fi
 

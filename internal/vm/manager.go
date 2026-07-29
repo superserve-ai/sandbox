@@ -106,11 +106,16 @@ type VMInstance struct {
 	OwnerID      string // creating user; empty when unknown
 
 	// PreviewAccess and PreviewPorts are the data-plane publication policy.
-	// Empty/legacy_public preserves historical all-port routing; public requires
-	// membership in the allowlist. The revision rejects stale full-set pushes.
+	// Empty/legacy_public preserves historical all-port routing; strict modes
+	// require membership in the allowlist. The revision rejects stale pushes.
 	PreviewAccess         string
-	PreviewPorts          map[int32]struct{}
+	PreviewPorts          map[int32]PreviewPortPolicy
 	PreviewPolicyRevision int64
+	// PreviewTokenPolicyRevision must exactly match PreviewPolicyRevision for
+	// any per-port token generation to be active. A mismatched watermark is a
+	// durable signal that an older writer advanced the policy without the
+	// current token-carrier semantics.
+	PreviewTokenPolicyRevision int64
 
 	// BaseMemPath is the immutable base (template) memory file for a layered
 	// snapshot. Set at create-from-template; non-empty ⇒ this VM's pauses write a
@@ -125,6 +130,14 @@ type VMInstance struct {
 	DirtyTracked bool
 
 	mu sync.RWMutex
+}
+
+// PreviewPortPolicy is the VMD representation of one published port. Access
+// is empty for a Phase 1 sender and then inherits PreviewAccess. TokenVersion
+// is meaningful only for a tokenized wire sentinel.
+type PreviewPortPolicy struct {
+	Access       string
+	TokenVersion int64
 }
 
 // VMConfig describes the desired configuration for a VM.
@@ -1499,7 +1512,7 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64,
 ) (*VMInstance, error) {
 	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, "")
 }
@@ -1564,7 +1577,7 @@ func psiSomeAvg10(path string) float64 {
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, recordToPath string,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -1685,9 +1698,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		TeamID:       teamID,
 		OwnerID:      ownerID,
 
-		PreviewAccess:         previewAccess,
-		PreviewPorts:          clonePreviewPorts(previewPorts),
-		PreviewPolicyRevision: previewPolicyRevision,
+		PreviewAccess:              previewAccess,
+		PreviewPorts:               clonePreviewPorts(previewPorts),
+		PreviewPolicyRevision:      previewPolicyRevision,
+		PreviewTokenPolicyRevision: inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision),
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -2484,7 +2498,7 @@ type InstanceInfo struct {
 	OwnerID   string
 
 	PreviewAccess string
-	PreviewPorts  map[int32]struct{}
+	PreviewPorts  map[int32]PreviewPortPolicy
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -2501,6 +2515,10 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		}
 	}
 	inst.mu.RLock()
+	previewPorts, _ := normalizePreviewTokenPolicy(
+		inst.PreviewPorts, inst.PreviewPolicyRevision, inst.PreviewTokenPolicyRevision,
+	)
+	previewAccess := restrictivePreviewAccess(inst.PreviewAccess, previewPorts)
 	info := InstanceInfo{
 		VMIP:      inst.IP,
 		Status:    inst.Status,
@@ -2508,20 +2526,20 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		TeamID:    inst.TeamID,
 		OwnerID:   inst.OwnerID,
 
-		PreviewAccess: inst.PreviewAccess,
-		PreviewPorts:  clonePreviewPorts(inst.PreviewPorts),
+		PreviewAccess: previewAccess,
+		PreviewPorts:  previewPorts,
 	}
 	inst.mu.RUnlock()
 	return info, true
 }
 
-func clonePreviewPorts(in map[int32]struct{}) map[int32]struct{} {
+func clonePreviewPorts(in map[int32]PreviewPortPolicy) map[int32]PreviewPortPolicy {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[int32]struct{}, len(in))
-	for port := range in {
-		out[port] = struct{}{}
+	out := make(map[int32]PreviewPortPolicy, len(in))
+	for port, policy := range in {
+		out[port] = policy
 	}
 	return out
 }
@@ -2533,12 +2551,82 @@ func normalizedPreviewAccess(access string) string {
 	return access
 }
 
-func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB string, portsB map[int32]struct{}) bool {
-	if normalizedPreviewAccess(accessA) != normalizedPreviewAccess(accessB) || len(portsA) != len(portsB) {
+// inferPreviewTokenPolicyRevision marks one incoming full snapshot as
+// tokenized only when every tokenized sentinel carries a positive generation.
+// The policy revision itself becomes the durable watermark; there is no
+// separate control-plane wire field that an older sender could accidentally
+// replay.
+func inferPreviewTokenPolicyRevision(ports map[int32]PreviewPortPolicy, revision int64) int64 {
+	if revision <= 0 {
+		return 0
+	}
+	foundTokenized := false
+	for _, policy := range ports {
+		if !preview.IsTokenizedAccess(policy.Access) {
+			continue
+		}
+		foundTokenized = true
+		if policy.TokenVersion <= 0 {
+			return 0
+		}
+	}
+	if !foundTokenized {
+		return 0
+	}
+	return revision
+}
+
+// normalizePreviewTokenPolicy returns a detached map whose token generations
+// are usable only for an exact, current tokenized snapshot. Raw private,
+// public, legacy, and unknown modes always clear their generation. If one
+// tokenized sentinel is malformed or the sidecar watermark is stale, all
+// generations are cleared so no credential from a prior revision can be
+// revived.
+func normalizePreviewTokenPolicy(in map[int32]PreviewPortPolicy, revision, tokenPolicyRevision int64) (map[int32]PreviewPortPolicy, int64) {
+	out := clonePreviewPorts(in)
+	foundTokenized := false
+	valid := revision > 0 && tokenPolicyRevision == revision
+	for port, policy := range out {
+		if preview.IsTokenizedAccess(policy.Access) {
+			foundTokenized = true
+			if policy.TokenVersion <= 0 {
+				valid = false
+			}
+		} else {
+			policy.TokenVersion = 0
+			out[port] = policy
+		}
+	}
+	if !foundTokenized || !valid {
+		for port, policy := range out {
+			policy.TokenVersion = 0
+			out[port] = policy
+		}
+		return out, 0
+	}
+	return out, tokenPolicyRevision
+}
+
+// previewPolicyEqual compares the complete effective snapshot represented by
+// one policy revision. Token state is normalized before comparison so stale
+// generations on raw-private/public records never make two closed policies
+// look different, while a live token watermark or generation disagreement is
+// always rejected. Exact port membership is part of the snapshot identity.
+func previewPolicyEqual(
+	accessA string, portsA map[int32]PreviewPortPolicy, revisionA, tokenPolicyRevisionA int64,
+	accessB string, portsB map[int32]PreviewPortPolicy, revisionB, tokenPolicyRevisionB int64,
+) bool {
+	portsA, tokenPolicyRevisionA = normalizePreviewTokenPolicy(portsA, revisionA, tokenPolicyRevisionA)
+	portsB, tokenPolicyRevisionB = normalizePreviewTokenPolicy(portsB, revisionB, tokenPolicyRevisionB)
+	accessA = normalizedPreviewAccess(restrictivePreviewAccess(accessA, portsA))
+	accessB = normalizedPreviewAccess(restrictivePreviewAccess(accessB, portsB))
+	if revisionA != revisionB || tokenPolicyRevisionA != tokenPolicyRevisionB ||
+		accessA != accessB || len(portsA) != len(portsB) {
 		return false
 	}
-	for port := range portsA {
-		if _, ok := portsB[port]; !ok {
+	for port, policyA := range portsA {
+		policyB, ok := portsB[port]
+		if !ok || policyA.Access != policyB.Access || policyA.TokenVersion != policyB.TokenVersion {
 			return false
 		}
 	}
@@ -2550,9 +2638,10 @@ func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB strin
 // wins equality. The durable sidecar is considered after memory and therefore
 // wins an equal-revision disagreement caused by an old VMD rewriting only the
 // primary lifecycle JSON.
-func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]struct{}, incomingRevision int64) (string, map[int32]struct{}, int64, error) {
-	access := incomingAccess
-	ports := clonePreviewPorts(incomingPorts)
+func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]PreviewPortPolicy, incomingRevision int64) (string, map[int32]PreviewPortPolicy, int64, error) {
+	incomingTokenRevision := inferPreviewTokenPolicyRevision(incomingPorts, incomingRevision)
+	ports, _ := normalizePreviewTokenPolicy(incomingPorts, incomingRevision, incomingTokenRevision)
+	access := restrictivePreviewAccess(incomingAccess, ports)
 	revision := incomingRevision
 
 	m.mu.RLock()
@@ -2560,8 +2649,10 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 	m.mu.RUnlock()
 	if inst != nil {
 		inst.mu.RLock()
-		existingAccess := inst.PreviewAccess
-		existingPorts := clonePreviewPorts(inst.PreviewPorts)
+		existingPorts, _ := normalizePreviewTokenPolicy(
+			inst.PreviewPorts, inst.PreviewPolicyRevision, inst.PreviewTokenPolicyRevision,
+		)
+		existingAccess := restrictivePreviewAccess(inst.PreviewAccess, existingPorts)
 		existingRevision := inst.PreviewPolicyRevision
 		inst.mu.RUnlock()
 		if existingRevision >= revision {
@@ -2575,8 +2666,9 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 			return "", nil, 0, err
 		}
 		if rec != nil && rec.PreviewPolicyRevision >= revision {
-			access = rec.PreviewAccess
-			ports = previewPortsFromRecord(rec.PreviewPorts)
+			ports = previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
+			ports, _ = normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
+			access = restrictivePreviewAccess(rec.PreviewAccess, ports)
 			revision = rec.PreviewPolicyRevision
 		}
 	}
@@ -2586,7 +2678,7 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 // UpdateSandboxPreviewPolicy replaces the policy persisted on the instance
 // record. Revisions are monotonic; older snapshots are harmlessly ignored, and
 // an equal revision is idempotent only when its complete policy is identical.
-func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]struct{}, revision int64) error {
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]PreviewPortPolicy, revision int64) error {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return err
@@ -2596,8 +2688,12 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 		inst.mu.Unlock()
 		return nil
 	}
+	tokenPolicyRevision := inferPreviewTokenPolicyRevision(previewPorts, revision)
 	if revision == inst.PreviewPolicyRevision {
-		equal := previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, previewAccess, previewPorts)
+		equal := previewPolicyEqual(
+			inst.PreviewAccess, inst.PreviewPorts, inst.PreviewPolicyRevision, inst.PreviewTokenPolicyRevision,
+			previewAccess, previewPorts, revision, tokenPolicyRevision,
+		)
 		inst.mu.Unlock()
 		if equal {
 			return nil
@@ -2605,7 +2701,8 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 		return status.Errorf(codes.FailedPrecondition,
 			"preview policy revision %d conflicts with the policy already stored for vm %s", revision, vmID)
 	}
-	nextPorts := clonePreviewPorts(previewPorts)
+	nextPorts, tokenPolicyRevision := normalizePreviewTokenPolicy(previewPorts, revision, tokenPolicyRevision)
+	previewAccess = restrictivePreviewAccess(previewAccess, nextPorts)
 	// Keep the instance lock through persistence. Otherwise two concurrent
 	// RPCs can apply revisions in order but race their BoltDB writes in reverse,
 	// resurrecting the stale policy after a vmd restart. Persist the intended
@@ -2615,7 +2712,10 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 		record := toRecordLocked(inst)
 		record.PreviewAccess = previewAccess
 		record.PreviewPorts = previewPortsToRecord(nextPorts)
+		record.PreviewPortAccess = previewPortAccessToRecord(nextPorts)
+		record.PreviewPortTokenVersions = previewPortTokenVersionsToRecord(nextPorts)
 		record.PreviewPolicyRevision = revision
+		record.PreviewTokenPolicyRevision = tokenPolicyRevision
 		if err := m.state.Put(record); err != nil {
 			inst.mu.Unlock()
 			return fmt.Errorf("persist preview policy: %w", err)
@@ -2624,8 +2724,17 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 	inst.PreviewAccess = previewAccess
 	inst.PreviewPorts = nextPorts
 	inst.PreviewPolicyRevision = revision
+	inst.PreviewTokenPolicyRevision = tokenPolicyRevision
 	inst.mu.Unlock()
 	return nil
+}
+
+func restrictivePreviewAccess(sandboxAccess string, ports map[int32]PreviewPortPolicy) string {
+	accesses := make([]string, 0, len(ports))
+	for _, policy := range ports {
+		accesses = append(accesses, policy.Access)
+	}
+	return preview.RestrictiveFallback(sandboxAccess, accesses...)
 }
 
 // ---------------------------------------------------------------------------

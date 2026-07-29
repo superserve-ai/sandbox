@@ -484,9 +484,10 @@ paths:
         the sandbox is ready to use — you can run commands against it
         immediately.
 
-        New sandboxes use strict public preview routing: only ports explicitly
+        New sandboxes use strict preview routing: only ports explicitly
         published through `/sandboxes/{sandbox_id}/preview-ports` are reachable.
-        Until a port is published, every numeric preview-port URL returns 404.
+        `preview_access` defaults newly published ports to `public` or `private`;
+        each publication may override that default independently.
       security:
         - apiKey: []
       requestBody:
@@ -596,10 +597,10 @@ paths:
           sandbox it applies to the next active session. The timeout is
           evaluated against the current active session, so lowering it
           below already-elapsed time pauses the sandbox promptly.
-        - `preview_access` — moves an older `legacy_public` sandbox to strict
-          `public` preview routing. Only explicitly published ports remain
-          reachable. The published-port set is unchanged, and the policy
-          persists across pause/resume. `legacy_public` cannot be selected.
+        - `preview_access` — sets the default access mode for ports published
+          in the future. Existing per-port modes are unchanged. It also moves
+          an older `legacy_public` sandbox to strict routing. `legacy_public`
+          cannot be selected.
       security:
         - apiKey: []
       requestBody:
@@ -632,10 +633,14 @@ paths:
       summary: List published preview ports
       description: |
         Returns the sandbox's preview routing mode and its published ports.
-        For a strict `public` sandbox, only the ports listed here are reachable
-        at `https://{port}-{sandbox_id}.<sandbox-domain>`; every other numeric
-        port returns 404. An older `legacy_public` sandbox may still route all
-        listening ports until it is updated to `public`.
+        For a strict `public` or `private` sandbox, only the ports listed here
+        are published at `https://{port}-{sandbox_id}.<sandbox-domain>`; every
+        other numeric port returns 404. Each row reports its independent access
+        mode. Private ports require a port-scoped token. Clients may send it in
+        a request header named `X-Superserve-Preview-Token`, or use the signed-link
+        query bootstrap described by `PreviewTokenResponse`; unknown ports
+        remain closed. An older `legacy_public` sandbox may still route every
+        listening port until it is updated to a strict mode.
       security:
         - apiKey: []
       responses:
@@ -657,11 +662,14 @@ paths:
     post:
       operationId: publishSandboxPreviewPort
       tags: [Sandboxes]
-      summary: Publish a public preview port
+      summary: Publish or update a preview port
       description: |
-        Adds a port to the sandbox's published set. Published ports are public
-        in this phase. Publishing is idempotent: publishing an existing port
-        again returns the same port and leaves the set unchanged.
+        Adds a port to the sandbox's published set, optionally with an explicit
+        `public` or `private` mode. On a new row, omitted `access` inherits the
+        sandbox's current `preview_access` default. On an existing row, omitted
+        `access` preserves that row's current mode; only an explicit value
+        changes it. An explicit private publication is rejected while the
+        sandbox remains `legacy_public`, because legacy routing exposes all ports.
       security:
         - apiKey: []
       requestBody:
@@ -700,8 +708,8 @@ paths:
       tags: [Sandboxes]
       summary: Unpublish a preview port
       description: |
-        Removes a port from the published set. On a strict `public` sandbox,
-        the port immediately returns 404 at the edge.
+        Removes a port from the published set. On a strict sandbox, the port
+        immediately returns 404 at the edge.
 
         The operation is idempotent and retry-safe. Repeating the request,
         including for a port that is already unpublished, re-synchronizes the
@@ -721,6 +729,119 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports/{port}/token:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
+
+    post:
+      operationId: mintSandboxPreviewToken
+      tags: [Sandboxes]
+      summary: Mint a token for a private preview port
+      description: |
+        Activates token authentication for an already-published private port
+        and returns a credential scoped to exactly this sandbox, port, and
+        token generation. A machine client sends the response's `token` value
+        in a request header whose name is the response's `header` value.
+
+        For browser navigation, construct a signed URL by adding the URL-encoded
+        `token` under the query-parameter name returned in `query_param`. An
+        ordinary `GET` exchanges a valid query token for a secure host-only
+        cookie and returns a `302` redirect to the same-origin HTTPS URL with
+        the credential removed. The bootstrap response is `Cache-Control:
+        no-store` and `Referrer-Policy: no-referrer`. Non-`GET` requests and
+        complete WebSocket upgrade handshakes authenticate a valid query token
+        directly because they cannot round-trip that redirect. The edge strips
+        all preview-token header, query, and cookie carriers before forwarding
+        any request to sandbox code.
+
+        Public or unpublished ports cannot mint credentials. Minting requires
+        sandbox write access; an incapable or stale host is rejected rather
+        than activating a policy it cannot enforce.
+
+        The request body is optional. Omit it (or send `{}`) for a token that
+        remains valid until rotation, access-mode change, or unpublication.
+        An explicit expiry is also enforced for a cookie bootstrapped from that
+        token, even if the browser still stores the cookie.
+      security:
+        - apiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PreviewTokenRequest"
+      responses:
+        "200":
+          description: Fresh header and signed-link credential; never cache this response
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `no-store`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewTokenResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/preview-ports/{port}/token/rotate:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/PreviewPort"
+
+    post:
+      operationId: rotateSandboxPreviewToken
+      tags: [Sandboxes]
+      summary: Rotate a private preview port's token generation
+      description: |
+        Advances only this published private port's token generation, revoking
+        every older token for it while leaving sibling ports unchanged. The
+        revocation is committed even if the current host cannot deliver or
+        enforce the replacement; in that case the request returns an error and
+        no credential. Rotation requires sandbox write access. A successful
+        response contains a fresh non-expiring token for the new generation and
+        identifies both its header and signed-link query carriers. Rotation
+        immediately makes older browser cookies unusable because every request
+        revalidates the cookie's embedded generation.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Fresh header and signed-link credential for the new generation; never cache this response
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `no-store`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewTokenResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2223,12 +2344,13 @@ components:
             GITHUB_TOKEN: ghp-readonly
         preview_access:
           type: string
-          enum: [public]
+          enum: [public, private]
           default: public
           description: |
-            Preview routing mode. New sandboxes default to strict `public`,
-            where only ports explicitly published through
-            `POST /sandboxes/{sandbox_id}/preview-ports` are reachable.
+            Default access for newly published preview ports. New sandboxes
+            default to `public`; `private` ports stay closed with 401 until
+            preview-token authentication is introduced. Both modes are strict:
+            only explicitly published ports are reachable.
             `legacy_public` is reserved for sandboxes created before explicit
             publication and cannot be selected through the API.
 
@@ -2353,12 +2475,12 @@ components:
             owner: agent-7
         preview_access:
           type: string
-          enum: [legacy_public, public]
+          enum: [legacy_public, public, private]
           description: |
-            Preview routing mode. `public` routes only explicitly published
-            ports. `legacy_public` may be returned for a sandbox created before
-            explicit publication and preserves its previous all-port behavior
-            until updated to `public`.
+            Default access for newly published ports. `public` and `private`
+            are strict modes; existing published rows keep their own access.
+            `legacy_public` may be returned for an older sandbox and preserves
+            all-port behavior until updated to a strict mode.
 
     SandboxResponse:
       description: Single-sandbox shape — `SandboxListItem` plus `access_token` and bound secrets.
@@ -2590,11 +2712,10 @@ components:
             time pauses the sandbox promptly. Maximum 604800 (7 days).
         preview_access:
           type: string
-          enum: [public]
+          enum: [public, private]
           description: |
-            Move the sandbox to strict public preview routing. Only explicitly
-            published ports are reachable after this update. The published-port
-            set is unchanged, and the policy persists across pause/resume.
+            Set the default access for newly published ports and move a legacy
+            sandbox to strict routing. Existing per-port modes are unchanged.
             `legacy_public` cannot be selected through the API.
       example:
         metadata:
@@ -2612,11 +2733,18 @@ components:
           maximum: 65535
           not:
             enum: [49983]
-          description: Public port to publish. Port 49983 is reserved for Superserve's sandbox service.
+          description: Port to publish. Port 49983 is reserved for Superserve's sandbox service.
+        access:
+          type: string
+          enum: [public, private]
+          description: |
+            Explicit per-port mode. When omitted for a new row, inherits the
+            sandbox preview_access default. When omitted for an existing row,
+            preserves that row's current mode.
 
     PreviewPort:
       type: object
-      required: [port]
+      required: [port, access, token_version]
       properties:
         port:
           type: integer
@@ -2624,7 +2752,23 @@ components:
           maximum: 65535
           not:
             enum: [49983]
-          description: Published public port. Port 49983 is reserved for Superserve's sandbox service.
+          description: Published port. Port 49983 is reserved for Superserve's sandbox service.
+        access:
+          type: string
+          enum: [public, private]
+          description: |
+            Independent access mode for this published port. Requests to a
+            private port must present its preview token using the header named
+            by the token-mint response's `header` field, the signed-link query
+            parameter named by `query_param`, or the cookie established by a
+            successful signed-link `GET` bootstrap.
+        token_version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Durable generation used to scope credentials for this port.
+            Rotation, access changes, and unpublish/re-publish advance it.
 
     PreviewPortList:
       type: object
@@ -2632,15 +2776,97 @@ components:
       properties:
         preview_access:
           type: string
-          enum: [legacy_public, public]
+          enum: [legacy_public, public, private]
           description: |
-            Sandbox preview routing mode. `public` enforces the listed ports;
-            `legacy_public` preserves pre-publication routing for older
-            sandboxes until they are updated.
+            Sandbox default for newly published ports. `public` and `private`
+            enforce the listed set; `legacy_public` preserves pre-publication
+            all-port routing for older sandboxes until they are updated.
         ports:
           type: array
           items:
             $ref: "#/components/schemas/PreviewPort"
+
+    PreviewTokenRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Optional expiry for a preview token, independent of whether it is sent
+        by header, used in a signed link, or stored by the edge in a browser
+        cookie. Omit the body (or send `{}`) for a credential that remains valid
+        until its generation changes.
+      properties:
+        expires_in_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 604800
+          description: Lifetime in whole seconds; omitted means no time expiry.
+
+    PreviewTokenResponse:
+      type: object
+      description: |
+        A single port-scoped credential with two explicit carriers. Machine
+        clients normally send `token` in the request header named by `header`.
+        For browser navigation, append the URL-encoded token under the parameter
+        named by `query_param`, for example
+        `https://{port}-{sandbox_id}.<sandbox-domain>/?{query_param}={token}`.
+
+        For an ordinary `GET`, the edge validates the signed link, sets the
+        host-only `__Host-superserve_preview_token` cookie with `Secure`,
+        `HttpOnly`, `SameSite=None`, `Partitioned`, `Path=/`, and no `Domain`,
+        then returns a `302` to a same-origin HTTPS URL with every reserved token
+        parameter removed. Unrelated query data is preserved. The redirect is
+        `Cache-Control: no-store` with `Referrer-Policy: no-referrer`.
+
+        Non-`GET` requests and genuine WebSocket upgrade handshakes accept the
+        query token directly without a redirect. In every case, the reserved
+        header, query parameter, and cookie are removed before the upstream
+        application receives the request. The edge revalidates cookie tokens on
+        every request, so token expiry, generation rotation, access-mode change,
+        or unpublication invalidates an existing browser session immediately;
+        the browser may retain the now-unusable cookie value.
+      required: [token, port, header, query_param, access, preview_access, token_version]
+      properties:
+        token:
+          type: string
+          description: |
+            Secret token scoped to this sandbox, port, and generation. Send it
+            using the request header named by `header`, or URL-encode it under
+            the signed-link query parameter named by `query_param`.
+        port:
+          type: integer
+          minimum: 1024
+          maximum: 65535
+          not:
+            enum: [49983]
+        header:
+          type: string
+          example: X-Superserve-Preview-Token
+          description: Request-header name to use when sending `token`.
+        query_param:
+          type: string
+          example: superserve_preview_token
+          description: Query-parameter name to use when constructing a signed link.
+        access:
+          type: string
+          enum: [private]
+          description: The published port's access mode.
+        preview_access:
+          type: string
+          enum: [legacy_public, public, private]
+          description: Sandbox default for newly published ports.
+        token_version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Exact generation embedded in `token`.
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Present only when `expires_in_seconds` was supplied. After this
+            instant the token is rejected in every carrier, including an
+            already-established browser cookie.
 
     BuildSpec:
       type: object
