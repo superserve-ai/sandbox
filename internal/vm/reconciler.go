@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"errors"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -365,10 +367,16 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			unlockOp()
 			if err != nil {
 				// Leave the row untouched (a failed row behind a live
-				// unit would strand it) and refund the budget slot:
-				// nothing destructive happened — see refundAutoFailSlot.
-				r.refundAutoFailSlot()
-				r.writeAudit(ctx, id, "stop_failed", "empty-shell stop failed; slot refunded, retrying next pass", "fc_empty_shell")
+				// unit would strand it). Refund the budget slot only when
+				// the stop provably never happened; an accepted-but-
+				// unconfirmed job may still terminate the unit, and
+				// refunding those would let slow stops evade the budget.
+				if errors.Is(err, errStopNotEnqueued) {
+					r.refundAutoFailSlot()
+					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop not enqueued; slot refunded, retrying next pass", "fc_empty_shell")
+				} else {
+					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop unconfirmed; slot retained, retrying next pass", "fc_empty_shell")
+				}
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell unit")
 				continue
 			}

@@ -328,6 +328,7 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 //     dirty pages overwrite it and it stays a complete, standalone image.
 //   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
 //     changed pages — restored over a separate base, never loaded standalone.
+//
 // VMState reports which state the Firecracker process on socketPath holds
 // its microVM in ("Not started", "Running", "Paused"). A healthy API
 // answering "Not started" is the signature of an empty shell — a live
