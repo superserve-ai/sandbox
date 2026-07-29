@@ -17,13 +17,14 @@ import (
 func insertSandboxAt(t *testing.T, teamID uuid.UUID, name, status string, createdAt time.Time) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	// host_id is NOT NULL (migration 20260410000001); supply a placeholder like
-	// the other integration sandbox inserts do. created_at is set explicitly so
-	// the sort assertions are deterministic.
+	// host_id is NOT NULL (migration 20260410000001). Use TestMain's active
+	// registered host so this fixture follows the same admission invariant as
+	// application-created sandboxes. created_at is explicit for deterministic
+	// sort assertions.
 	if _, err := testPool.Exec(context.Background(),
 		`INSERT INTO sandbox (id, team_id, name, status, host_id, created_at)
-		 VALUES ($1, $2, $3, $4::sandbox_status, 'test-host', $5)`,
-		id, teamID, name, status, createdAt,
+		 VALUES ($1, $2, $3, $4::sandbox_status, $5, $6)`,
+		id, teamID, name, status, testDefaultHostID, createdAt,
 	); err != nil {
 		t.Fatalf("insert sandbox %q: %v", name, err)
 	}

@@ -4398,8 +4398,8 @@ func TestIntegration_DeleteStaleTransitionalSandbox(t *testing.T) {
 	insert := func(updatedAt time.Time) uuid.UUID {
 		id := uuid.New()
 		if _, err := testPool.Exec(ctx,
-			`INSERT INTO sandbox (id, team_id, name, status, host_id, updated_at) VALUES ($1,$2,$3,'resuming','host-1',$4)`,
-			id, teamID, "wedged", updatedAt); err != nil {
+			`INSERT INTO sandbox (id, team_id, name, status, host_id, updated_at) VALUES ($1,$2,$3,'resuming',$4,$5)`,
+			id, teamID, "wedged", testDefaultHostID, updatedAt); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 		return id

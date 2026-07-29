@@ -19,8 +19,8 @@ func readSavedSnapshotExpandSQL(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("find expand migrations: %v", err)
 	}
-	if len(paths) != 8 {
-		t.Fatalf("found %d expand migrations, want 8", len(paths))
+	if len(paths) != 9 {
+		t.Fatalf("found %d expand migrations, want 9", len(paths))
 	}
 
 	var sql strings.Builder
@@ -79,6 +79,17 @@ func TestSavedSnapshotExpandPreservesLegacyPauseCompatibility(t *testing.T) {
 	}
 	if !strings.Contains(sql, "deleted saved snapshot cannot be resurrected") {
 		t.Fatal("expand migration does not enforce monotonic logical deletion")
+	}
+	if !strings.Contains(sql, "FOR SHARE") ||
+		!strings.Contains(sql, "trg_sandbox_host_admission_insert") ||
+		!strings.Contains(sql, "trg_template_build_host_admission") {
+		t.Fatal("expand migration does not enforce cross-version host admission")
+	}
+	if !strings.Contains(sql, "IF NOT EXISTS (SELECT 1 FROM public.host)") {
+		t.Fatal("expand migration does not constrain legacy host fallback to an empty registry")
+	}
+	if !strings.Contains(sql, "USING ERRCODE = 'SS006'") {
+		t.Fatal("expand migration does not expose unavailable hosts through the saved-host error contract")
 	}
 }
 
