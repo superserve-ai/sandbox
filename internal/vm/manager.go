@@ -2184,7 +2184,7 @@ func (m *Manager) ShutdownAll() {
 // For each VM in BoltDB that systemd confirms is alive AND whose Firecracker
 // API socket is reachable, VMD reattaches. Stale BoltDB entries (dead process)
 // are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
-// so the Phase 3 reconciler can handle them.
+// so the reconciler can handle them.
 func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if m.state == nil {
 		m.log.Warn().Msg("no state store configured — skipping reattach")
@@ -2209,7 +2209,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
 	}
 
-	// Phase A: reattach from BoltDB. Routed through reattachByID (singleflight)
+	// Reattach from BoltDB, routed through reattachByID (singleflight)
 	// so this eager pass and any concurrent lazy request serialize per VM — a
 	// lazy load can't run reattachRecord for a vmID while the eager pass is mid
 	// stale-cleanup for the same one. reattachByID re-reads the record inside the
@@ -2227,7 +2227,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 
-	// Phase B: detect orphan units not in BoltDB, both supervision modes.
+	// Detect orphan units not in BoltDB, both supervision modes.
 	activeIDs, err := listActiveFirecrackerUnits(ctx)
 	if err != nil {
 		m.log.Warn().Err(err).Msg("failed to list active firecracker units — orphan detection skipped")
@@ -2247,7 +2247,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		// unobserved orphan can't be ruled out by anything else.
 		m.orphanScanDone.Store(true)
 	}
-	// Phase B2: detect orphan per-VM cgroups not in BoltDB — LOG ONLY,
+	// Detect orphan per-VM cgroups not in BoltDB — LOG ONLY,
 	// symmetric with the unit path. Killing here would race an in-flight
 	// restore (this runs in a background goroutine; a create past the
 	// startup gate can have its cgroup before its record). The reconciler
@@ -2267,7 +2267,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 
 	// No broad re-sweep here. Startup already swept once before StartPool filled
 	// the pool; re-sweeping now would delete the pool's warm netns (which are not
-	// BoltDB records). Stale records deleted in Phase A free their own namespace
+	// BoltDB records). Stale records deleted above free their own namespace
 	// inline (see reattachRecord), so a re-sweep isn't needed.
 
 	return reattached, stale
