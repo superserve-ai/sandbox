@@ -17,6 +17,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // These tests cover the purely-functional helpers in handlers_template.go
@@ -449,5 +450,52 @@ func TestTemplateCache_MidFlightInvalidationVetoesStore(t *testing.T) {
 	}
 	if _, ok := templateCache.Load(key); !ok {
 		t.Fatal("expected the entry to be cached once no invalidation raced the flight")
+	}
+}
+
+func TestDeleteTemplate_SavedSnapshotDependencyConflict(t *testing.T) {
+	recorder := useSavedSnapshotOutcomeRecorder(t)
+	templateID := uuid.New()
+	teamID := uuid.New()
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		if strings.Contains(sql, "snapshot_count") && strings.Contains(sql, "SoftDeleteTemplateIfUnused") {
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*bool) = true
+				*dest[1].(*int64) = 0
+				*dest[2].(*int64) = 2
+				*dest[3].(*int64) = 0
+				*dest[4].(*bool) = false
+				return nil
+			}}
+		}
+		return notFoundRow()
+	}}
+
+	h := &Handlers{DB: db.New(mock), VMD: &stubVMD{}}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("team_id", teamID.String())
+		c.Next()
+	})
+	r.DELETE("/templates/:template_id", h.DeleteTemplate)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/templates/"+templateID.String(), nil))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	errorBody, _ := body["error"].(map[string]any)
+	if got := errorBody["code"]; got != "template_has_dependents" {
+		t.Fatalf("error code = %v, want template_has_dependents", got)
+	}
+	dependencies, _ := errorBody["dependencies"].(map[string]any)
+	if got := dependencies["snapshot_count"]; got != float64(2) {
+		t.Errorf("snapshot_count = %v, want 2", got)
+	}
+	if len(recorder.outcomes) != 1 || recorder.outcomes[0].Operation != telemetry.SavedSnapshotOperationDelete ||
+		recorder.outcomes[0].Outcome != telemetry.SavedSnapshotOutcomeDependencyBlocked {
+		t.Fatalf("dependency-block telemetry = %+v", recorder.outcomes)
 	}
 }

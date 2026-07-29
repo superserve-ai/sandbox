@@ -16,10 +16,12 @@ info:
 
     | Endpoint | What it does |
     |----------|-------------|
-    | `POST /sandboxes` | Create a new sandbox (optionally `from_template`) |
+    | `POST /sandboxes` | Create a new sandbox from a template or saved snapshot |
     | `PATCH /sandboxes/:id` | Partially update a running sandbox (e.g. network rules) |
     | `POST /sandboxes/:id/pause` | Snapshot full state, suspend the VM |
     | `POST /sandboxes/:id/resume` | Restore from snapshot, continue where it left off |
+    | `POST /sandboxes/:id/snapshots` | Create a named or unnamed immutable saved snapshot |
+    | `GET /snapshots` | List immutable saved snapshots |
     | `DELETE /sandboxes/:id` | Delete sandbox and all resources |
 
     ## Sandbox environment
@@ -28,7 +30,9 @@ info:
     1 vCPU, 1 GB RAM, 4 GB disk, with Python 3.12, Node.js 22, npm, git, curl,
     and build-essential pre-installed). Callers can override with any template
     name (e.g. `superserve/python-3.11`, `superserve/node-22`) or a team-owned template UUID
-    via the `from_template` field on `POST /sandboxes`.
+    via the `from_template` field on `POST /sandboxes`. A ready immutable
+    saved snapshot can instead be forked into any number of independent
+    sandboxes with `from_snapshot`.
 
     ## Files and commands
 
@@ -479,10 +483,33 @@ paths:
       tags: [Sandboxes]
       summary: Create a new sandbox
       description: |
-        Creates a sandbox from a template (defaults to `superserve/base` when
-        `from_template` is omitted). When the request returns successfully,
-        the sandbox is ready to use — you can run commands against it
-        immediately.
+        Creates a sandbox from either a template or an immutable saved
+        snapshot. When both source fields are omitted, the sandbox defaults to
+        `superserve/base`. `from_template` and `from_snapshot` cannot be sent
+        together.
+
+        `from_snapshot` accepts only a saved snapshot belonging to the
+        authenticated team whose status is `ready`. The replaceable runtime
+        checkpoint created by `POST /sandboxes/{sandbox_id}/pause` is not a
+        reusable saved snapshot and is never accepted here. A fork inherits the
+        saved VM resource shape and captured memory/disk state, but receives a
+        new sandbox identity, access token, network identity, and writable
+        layers.
+
+        Omitted `timeout_seconds` and `auto_delete_seconds` inherit the captured
+        values; explicit `null` clears them. Omitted `network` and `secrets`
+        inherit captured configuration, while an object is a full replacement
+        (`secrets: {}` clears all bindings). JSON `null` is invalid for
+        `from_template`, `from_snapshot`, `network`, and `secrets`.
+
+        Preview publication is intentionally child-local. A fork starts with
+        no published preview ports and never inherits source preview tokens or
+        publications. `preview_access` selects the child default. With
+        `private`, every port remains closed until it is explicitly published
+        and a new child-scoped token is minted.
+
+        When the request returns successfully, the sandbox is ready to use —
+        you can run commands against it immediately.
 
         New sandboxes use strict preview routing: only ports explicitly
         published through `/sandboxes/{sandbox_id}/preview-ports` are reachable.
@@ -498,17 +525,53 @@ paths:
               $ref: "#/components/schemas/CreateSandboxRequest"
       responses:
         "201":
-          description: Sandbox created
+          description: |
+            Sandbox created. When the request used `from_snapshot`, the
+            response includes `source_snapshot_id` equal to that saved
+            snapshot ID; template-rooted sandboxes omit the field.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SandboxResponse"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: |
+            Invalid request. Sending both `from_template` and `from_snapshot`,
+            sending JSON `null` for a non-nullable inheritance field, or using
+            an invalid snapshot ID returns `bad_request`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            The caller cannot create the requested sandbox. `error.code` is:
+            - `feature_disabled` when `from_snapshot` was used but saved
+              snapshots are not enabled for the team.
+            - `forbidden` when the caller lacks sandbox write permission.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: |
+            Requested source not found. A missing or cross-team saved snapshot
+            uses error code `snapshot_not_found`; a missing template uses the
+            template lookup's existing not-found code.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            A `from_snapshot` request uses `snapshot_not_ready` when the saved
+            snapshot is transitional or failed. Other create conflicts use the
+            existing conflict envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "429":
           description: |
             Rate-limited or quota reached. The `error.code` distinguishes:
@@ -516,6 +579,25 @@ paths:
             - `too_many_sandboxes` — team has reached its active sandbox count
               limit (paused sandboxes do not count; pause or delete a sandbox to
               free a slot, or contact support to raise the cap).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          $ref: "#/components/responses/SnapshotUnavailable"
+        "503":
+          description: |
+            Required host capacity is temporarily unavailable. A
+            `from_snapshot` request uses `snapshot_host_unavailable` and never
+            falls back to a host without the exact artifacts. Template-rooted
+            creation may use `service_unavailable` when no host can be
+            scheduled. Snapshot-host failures include `Retry-After`.
+          headers:
+            Retry-After:
+              description: Delay in seconds before retrying, when provided.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -551,6 +633,13 @@ paths:
       operationId: deleteSandbox
       tags: [Sandboxes]
       summary: Delete a sandbox
+      description: |
+        Deletes a sandbox that has no saved snapshots. The initial snapshot
+        canary has no cascade option: if saved snapshots originate from this
+        sandbox, the request returns `409 sandbox_has_snapshots` with dependency
+        counts and IDs. Delete the dependent leaf snapshots first. A sandbox
+        in a live lifecycle transition may instead return the existing generic
+        `409 conflict`; retry after the transition completes.
       security:
         - apiKey: []
       responses:
@@ -558,6 +647,18 @@ paths:
           description: Sandbox deleted
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The sandbox owns saved snapshots or is in a lifecycle transition.
+            Dependency blocks use `sandbox_has_snapshots` and include counts;
+            transitional-state blocks use the existing `conflict` code. No
+            resources are deleted.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DependencyConflictError"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -854,9 +955,11 @@ paths:
       tags: [Sandboxes]
       summary: Pause a running sandbox
       description: |
-        Snapshots the sandbox's full state (memory + disk), suspends the VM,
-        and transitions to `paused`. Resume it later to continue exactly where
-        it left off — same memory, same running processes, same files.
+        Creates or replaces the sandbox's internal runtime checkpoint (memory
+        and disk), suspends the VM, and transitions to `paused`. Resume it later
+        to continue exactly where it left off — same memory, same running
+        processes, same files. This checkpoint restores only this sandbox; it
+        is not an immutable saved snapshot and cannot be used to create forks.
       security:
         - apiKey: []
       responses:
@@ -880,8 +983,9 @@ paths:
       tags: [Sandboxes]
       summary: Resume a paused sandbox
       description: |
-        Restores the sandbox from its paused snapshot. Transitions back to
-        `active` with all state intact — same memory, same processes, same files.
+        Restores the sandbox from its replaceable runtime checkpoint. Transitions
+        back to `active` with all state intact — same memory, same processes,
+        same files. This does not read or mutate user-addressable saved snapshots.
       security:
         - apiKey: []
       responses:
@@ -903,6 +1007,243 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/SandboxResumeHostUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/snapshots:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+
+    post:
+      operationId: createSnapshot
+      tags: [Snapshots]
+      summary: Create an immutable saved snapshot
+      description: |
+        Captures the sandbox's memory, process state, and disk state as a
+        durable saved snapshot. The source may be `active` or `paused`. An
+        active source may be briefly frozen and is returned to its prior state
+        before this request completes; a paused source remains paused and its
+        runtime resume checkpoint is not consumed or replaced.
+
+        This operation is synchronous. A `201` response always contains a
+        durable snapshot with status `ready`; partial captures are never
+        exposed as ready. The snapshot is immutable and can be passed as
+        `from_snapshot` to multiple concurrent `POST /sandboxes` requests.
+
+        The optional `name` is a non-unique human-readable label. Omit the body
+        or send `{}` for an unnamed snapshot. Supplying the same
+        `Idempotency-Key` for the same team and operation returns the
+        originally created snapshot instead of capturing another one.
+      security:
+        - apiKey: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        description: Omit the body or send `{}` to create an unnamed snapshot.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotRequest"
+      responses:
+        "201":
+          description: Saved snapshot created and ready for use
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/SnapshotFeatureDisabled"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The capture cannot proceed. `error.code` is one of:
+            - `snapshot_source_state_invalid` — the sandbox cannot be captured
+              in its current lifecycle/VM state; wait for any pause, resume,
+              snapshot, or delete transition to finish before retrying.
+            - `snapshot_not_ready` — a prior request with the same idempotency
+              key is failed, deleting, or awaiting reconciliation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          description: |
+            Required artifacts are permanently unavailable. `error.code` is
+            one of:
+            - `snapshot_unavailable` — the saved snapshot associated with an
+              idempotency key can no longer be used.
+            - `snapshot_artifacts_missing` — the source VM's committed memory
+              or disk artifacts are missing or corrupt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: |
+            Rate-limited or snapshot quota reached. `error.code` is one of:
+            - `rate_limited` — request rate exceeded.
+            - `too_many_snapshots` — a per-sandbox or per-team snapshot-count
+              limit was reached.
+            - `snapshot_storage_quota_exceeded` — the team's exclusive saved
+              snapshot storage quota was reached.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/SnapshotQuotaError"
+        "503":
+          $ref: "#/components/responses/SnapshotHostUnavailable"
+        "500":
+          description: |
+            Internal capture failure. `error.code` is
+            `snapshot_source_failed` when VMD committed or attempted the
+            capture but could not return the source sandbox to its prior
+            running state; the source is reconciled to `failed`.
+            `snapshot_chain_invalid` means VMD returned a committed artifact
+            set that failed integrity validation. Other unexpected failures
+            use the normal internal error envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /snapshots:
+    get:
+      operationId: listSnapshots
+      tags: [Snapshots]
+      summary: List saved snapshots
+      description: |
+        Returns only immutable saved snapshots belonging to the authenticated
+        team, ordered newest first. Named and unnamed snapshots are both
+        included; runtime pause checkpoints are never included. Use
+        `sandbox_id` to restrict results to snapshots captured directly from
+        one source sandbox. Placement hosts, artifact paths, manifests, and
+        secret material are never returned.
+      security:
+        - apiKey: []
+      parameters:
+        - name: sandbox_id
+          in: query
+          required: false
+          description: Filter by the sandbox from which the snapshot was captured.
+          schema:
+            $ref: "#/components/schemas/PublicSandboxId"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: Saved snapshots belonging to the authenticated team
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/TotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /snapshots/{snapshot_id}:
+    parameters:
+      - $ref: "#/components/parameters/SnapshotId"
+
+    get:
+      operationId: getSnapshot
+      tags: [Snapshots]
+      summary: Get a saved snapshot
+      description: |
+        Returns public saved-snapshot metadata and dependency counts. The
+        `parent_snapshot_id` records direct lineage when the source sandbox was
+        itself forked from a saved snapshot. Host placement, filesystem paths,
+        manifests, layer addresses, and secret material are never exposed.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Saved snapshot metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/SnapshotNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      operationId: deleteSnapshot
+      tags: [Snapshots]
+      summary: Delete a leaf saved snapshot
+      description: |
+        Deletes a saved snapshot only when no live sandbox or saved snapshot
+        depends on it. The initial canary deliberately has no cascade option
+        and does not reparent descendants. Delete dependent resources
+        leaf-first before retrying an intermediate snapshot.
+
+        Host cleanup is attempted before returning `204`; a transient host
+        failure returns retryable `503` while retaining the durable deletion
+        claim. Shared ancestor layers remain until their final reference
+        disappears, so success does not imply that every physical byte in the
+        reconstructed snapshot was removed.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Saved snapshot deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/SnapshotNotFound"
+        "409":
+          description: |
+            The snapshot cannot currently be deleted. `error.code` is one of:
+            - `snapshot_has_dependents` — one or more sandboxes or saved
+              snapshots depend on it; the response includes dependency details.
+            - `snapshot_not_ready` — the snapshot cannot enter the deleting
+              state. A `creating` leaf is cancellable and enters the same
+              durable cleanup queue as any other deletion.
+            No resources are deleted for a dependency conflict.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DependencyConflictError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/SnapshotHostUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -939,6 +1280,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/SandboxResumeHostUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2043,6 +2386,28 @@ components:
         $ref: "#/components/schemas/PublicSandboxId"
       description: The unique identifier of the sandbox.
 
+    SnapshotId:
+      name: snapshot_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of an immutable saved snapshot.
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Caller-generated key used to safely retry a mutation without creating
+        another resource. Keys are scoped to the authenticated team and
+        operation.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+
     PreviewPort:
       name: port
       in: path
@@ -2247,6 +2612,11 @@ components:
     CreateSandboxRequest:
       type: object
       required: [name]
+      not:
+        properties:
+          from_template: {}
+          from_snapshot: {}
+        required: [from_template, from_snapshot]
       properties:
         name:
           type: string
@@ -2263,31 +2633,50 @@ components:
             (curated templates use the `superserve/` name prefix). The template's
             vCPU, memory, and disk values are inherited by the sandbox —
             they cannot be overridden per-sandbox because the snapshot
-            dictates VM shape. When omitted, defaults to `superserve/base`.
+            dictates VM shape. When both source fields are omitted, defaults
+            to `superserve/base`. Mutually exclusive with `from_snapshot`.
+            JSON `null` is invalid.
+        from_snapshot:
+          type: string
+          format: uuid
+          description: |
+            Create an independent sandbox from this immutable saved snapshot.
+            The snapshot must belong to the authenticated team and have status
+            `ready`; creating from a runtime pause checkpoint, a transitional
+            snapshot, or an unavailable snapshot is rejected. Resource shape,
+            memory, disk, network policy, secret bindings, and lifecycle
+            defaults are captured from the snapshot. The new sandbox receives
+            its own identity, writable layers, network identity, access token,
+            preview policy, and preview credentials. Mutually exclusive with
+            `from_template`; JSON `null` is invalid.
         timeout_seconds:
-          type: integer
+          type: [integer, "null"]
           format: int32
           minimum: 1
           maximum: 604800
-          description: >
+          description: |
             Optional auto-pause timeout in seconds. The sandbox is paused
             once its current active session has run this long; each resume
-            starts a fresh window. When unset, the sandbox stays active
-            until explicitly paused. Also settable later via
-            `PATCH /sandboxes/{sandbox_id}`. Maximum 604800 (7 days).
+            starts a fresh window. When omitted for `from_snapshot`, inherits
+            the snapshot-time value; explicit `null` disables the inherited
+            timeout. For template/default creation, omitted or `null` means the
+            sandbox stays active until explicitly paused. Also settable later
+            via `PATCH /sandboxes/{sandbox_id}`. Maximum 604800 (7 days).
         auto_delete_seconds:
-          type: integer
+          type: [integer, "null"]
           format: int32
           minimum: 0
           maximum: 2592000
-          description: >
+          description: |
             Optional garbage-collection window for paused sandboxes, in
             seconds. Once the sandbox has been continuously paused for this
             long it is deleted automatically. The window arms each time the
             sandbox pauses and is cancelled by resume, so a sandbox in use is
             never eligible. `0` deletes the sandbox as soon as it pauses.
-            When unset, paused sandboxes are kept until explicitly deleted.
-            Also settable later via `PATCH /sandboxes/{sandbox_id}`.
+            When omitted for `from_snapshot`, inherits the snapshot-time value;
+            explicit `null` disables the inherited window. For template/default
+            creation, omitted or `null` keeps paused sandboxes until explicitly
+            deleted. Also settable later via `PATCH /sandboxes/{sandbox_id}`.
             Maximum 2592000 (30 days).
         metadata:
           type: object
@@ -2310,7 +2699,8 @@ components:
 
             Metadata can be updated after creation via `PATCH /sandboxes/:id`.
             Filter sandboxes by metadata via the `metadata.{key}` query
-            parameter on `GET /sandboxes`.
+            parameter on `GET /sandboxes`. User metadata is never inherited
+            from a saved snapshot; omitted metadata starts as `{}`.
           example:
             env: prod
             owner: agent-7
@@ -2322,13 +2712,19 @@ components:
             Environment variables injected into every process inside the
             sandbox (terminal sessions, exec calls). Merged on top of any
             defaults set by the template's `env` build steps — caller keys
-            win on conflict. Survive pause/resume.
+            win on conflict. For `from_snapshot`, these values become defaults
+            for processes started after restore; already-running cloned
+            processes retain their captured environments. Survive pause/resume.
           example:
             OPENAI_API_KEY: sk-...
             DEBUG: "1"
             run_id: 7f3c-21
         network:
           $ref: "#/components/schemas/NetworkConfig"
+          description: |
+            Egress policy for the sandbox. When omitted for `from_snapshot`,
+            inherits the snapshot-time policy. When present, this object is a
+            full replacement rather than a merge. JSON `null` is invalid.
         secrets:
           type: object
           additionalProperties:
@@ -2338,7 +2734,13 @@ components:
             sandbox. Keys are env-var names; values are secret names from
             `POST /secrets`. The agent never sees the real value: it sees a
             proxy token in env, and the in-host enforcement daemon swaps the
-            token for the real credential at egress.
+            token for the real credential at egress. When omitted for
+            `from_snapshot`, the captured binding definitions are inherited
+            with fresh child-specific tokens. When present, the object is a
+            full replacement; `{}` removes every captured binding. JSON `null`
+            is invalid. Because a saved snapshot clones full process memory,
+            replacing bindings cannot scrub secret bytes that a captured
+            process had already read.
           example:
             ANTHROPIC_API_KEY: anthropic-prod
             GITHUB_TOKEN: ghp-readonly
@@ -2348,11 +2750,124 @@ components:
           default: public
           description: |
             Default access for newly published preview ports. New sandboxes
-            default to `public`; `private` ports stay closed with 401 until
-            preview-token authentication is introduced. Both modes are strict:
-            only explicitly published ports are reachable.
+            and saved-snapshot forks default to `public`. Both modes are strict:
+            only explicitly published ports are reachable. A fork never
+            inherits its source's published-port rows, token generations, or
+            credentials, so it starts with zero published ports. Choosing
+            `private` keeps each later-published private port closed with `401`
+            until a child-scoped preview token is minted.
             `legacy_public` is reserved for sandboxes created before explicit
             publication and cannot be selected through the API.
+
+    CreateSnapshotRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Optional human-readable label. Labels are not unique; use `id` as
+            the stable identity of a saved snapshot. Omit `name` for an unnamed
+            snapshot; JSON `null` is invalid.
+
+    SnapshotResponse:
+      type: object
+      description: |
+        Public metadata for an immutable saved snapshot. This resource is
+        distinct from a sandbox's replaceable runtime pause checkpoint. Host
+        identity, filesystem paths, manifests, layer addresses, captured
+        environment values, and secret material are intentionally opaque.
+      required:
+        - id
+        - status
+        - sandbox_id
+        - vcpu_count
+        - memory_mib
+        - disk_mib
+        - logical_size_bytes
+        - exclusive_size_bytes
+        - child_sandbox_count
+        - child_snapshot_count
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Stable ID accepted by `CreateSandboxRequest.from_snapshot`.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Optional, non-unique human-readable label.
+        status:
+          type: string
+          enum: [creating, ready, unavailable, failed, deleting]
+          description: |
+            Saved-snapshot lifecycle state. Only `ready` snapshots can create
+            sandboxes. `unavailable` means committed host artifacts are
+            permanently missing or corrupt; metadata and deletion remain
+            available, but fork attempts return `410 snapshot_unavailable`.
+        sandbox_id:
+          $ref: "#/components/schemas/PublicSandboxId"
+          description: Sandbox from which this saved snapshot was captured.
+        parent_snapshot_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Direct lineage edge: the saved snapshot from which the source
+            sandbox was originally created. Absent or null for a
+            template-rooted source sandbox.
+        vcpu_count:
+          type: integer
+          format: int32
+          minimum: 1
+          description: vCPU count inherited by sandboxes created from this snapshot.
+        memory_mib:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Memory size inherited by sandboxes created from this snapshot.
+        disk_mib:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Disk capacity inherited by sandboxes created from this snapshot.
+        logical_size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Logical bytes represented by the reconstructable memory and disk
+            state, including shared ancestor layers.
+        exclusive_size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Allocated bytes introduced by this saved snapshot after excluding
+            shared ancestor layers. Shared bytes are attributed to the team
+            once rather than once per fork.
+        child_sandbox_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of live sandboxes created directly from this snapshot.
+        child_snapshot_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of direct descendant saved snapshots.
+        created_at:
+          type: string
+          format: date-time
+          description: Time the saved-snapshot record was created.
+        updated_at:
+          type: string
+          format: date-time
+          description: Time the saved-snapshot status or metadata last changed.
 
     ActivityResponse:
       description: One audit-log activity row returned by the activity list endpoint.
@@ -2433,7 +2948,20 @@ components:
         snapshot_id:
           type: string
           format: uuid
-          description: ID of the latest snapshot (present after a pause).
+          deprecated: true
+          description: |
+            Deprecated ID of the replaceable runtime checkpoint used only to
+            resume this same paused sandbox. It is not a saved snapshot, is not
+            returned by `/snapshots`, and must not be passed as
+            `from_snapshot`. Clients should not persist or otherwise use it.
+        source_snapshot_id:
+          type: string
+          format: uuid
+          description: |
+            Immutable saved snapshot from which this sandbox was created.
+            Absent when the sandbox was created from a template. Unlike the
+            deprecated `snapshot_id`, this is a reusable saved-snapshot ID and
+            records the fork's direct lineage edge.
         created_at:
           type: string
           format: date-time
@@ -3680,12 +4208,125 @@ components:
           items:
             $ref: "#/components/schemas/TeamRoleAssignment"
 
+    DependencyConflictDetails:
+      type: object
+      description: |
+        Team-scoped resources that currently block a non-cascading delete.
+        Counts cover all known blockers. ID arrays contain stable public IDs
+        when returned; clients must use the counts rather than assuming an
+        omitted or truncated array means zero dependencies.
+      required: [sandbox_count, snapshot_count]
+      properties:
+        sandbox_count:
+          type: integer
+          format: int64
+          minimum: 0
+        snapshot_count:
+          type: integer
+          format: int64
+          minimum: 0
+        sandbox_ids:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicSandboxId"
+          description: Stable IDs of blocking sandboxes included in this response.
+        snapshot_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Stable IDs of blocking saved snapshots included in this response.
+
+    DependencyConflictError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, dependencies]
+          properties:
+            code:
+              type: string
+              enum:
+                [snapshot_has_dependents, sandbox_has_snapshots, template_has_dependents]
+            message:
+              type: string
+            dependencies:
+              $ref: "#/components/schemas/DependencyConflictDetails"
+
+    SnapshotQuotaDetails:
+      type: object
+      description: Team and source usage at the point snapshot admission failed.
+      required:
+        - snapshot_count
+        - max_snapshots
+        - source_snapshot_count
+        - max_snapshots_per_sandbox
+        - storage_bytes
+        - storage_quota_bytes
+      properties:
+        snapshot_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Current saved-snapshot count for the team.
+        max_snapshots:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Maximum saved-snapshot count for the team.
+        source_snapshot_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Current saved-snapshot count for the source sandbox.
+        max_snapshots_per_sandbox:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Maximum saved-snapshot count for one source sandbox.
+        storage_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Current team-attributed exclusive saved-snapshot bytes.
+        storage_quota_bytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+          description: |
+            Team exclusive-storage limit. Null means no pilot quota has been
+            provisioned, so saved-snapshot capture remains unavailable.
+
+    SnapshotQuotaError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, quota]
+          properties:
+            code:
+              type: string
+              enum: [too_many_snapshots, snapshot_storage_quota_exceeded]
+            message:
+              type: string
+            quota:
+              $ref: "#/components/schemas/SnapshotQuotaDetails"
+
     Error:
       type: object
       description: |
         Error envelope. `error.code` is a stable, machine-readable identifier
         (e.g. `bad_request`, `not_found`, `conflict`, `rate_limited`,
         `too_many_builds`, `too_many_templates`, `too_many_sandboxes`,
+        `feature_disabled`, `snapshot_not_found`, `snapshot_not_ready`,
+        `too_many_snapshots`, `snapshot_storage_quota_exceeded`,
+        `snapshot_source_state_invalid`, `snapshot_source_failed`,
+        `snapshot_secret_unavailable`, `snapshot_host_unavailable`,
+        `snapshot_unavailable`, `snapshot_artifacts_missing`,
+        `snapshot_chain_invalid`, `snapshot_has_dependents`,
+        `sandbox_has_snapshots`,
         `image_pull_failed`, `step_failed`, `snapshot_failed`,
         `start_cmd_failed`, `ready_cmd_failed`, `build_failed`).
         `error.message` is human-readable and may change between releases;
@@ -3718,12 +4359,40 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    SnapshotFeatureDisabled:
+      description: |
+        The caller cannot create the saved snapshot. The response uses
+        `feature_disabled` when saved snapshots are not enabled for the team,
+        or `forbidden` when the caller lacks sandbox write permission. Normal
+        template sandbox creation and runtime pause/resume are unaffected by
+        the saved-snapshot feature gate.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: feature_disabled
+              message: Saved snapshots are not enabled for this team.
     NotFound:
       description: Resource not found
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    SnapshotNotFound:
+      description: |
+        Saved snapshot not found. The response uses error code
+        `snapshot_not_found`; unknown and cross-team IDs are deliberately
+        indistinguishable.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: snapshot_not_found
+              message: Snapshot not found.
     Conflict:
       description: Operation conflicts with the resource's current state
       content:
@@ -3745,6 +4414,75 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    SnapshotHostUnavailable:
+      description: |
+        The host holding the exact source or saved-snapshot artifacts is
+        temporarily unreachable, unhealthy, or at operation capacity. The
+        response uses error code `snapshot_host_unavailable`; durable capture
+        or deletion state is retained so the operation can be retried after the
+        indicated delay. A ready snapshot stays ready on a fork failure. The
+        platform never silently schedules the request on a host without the
+        artifacts.
+      headers:
+        Retry-After:
+          description: Delay in seconds before retrying the request.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: snapshot_host_unavailable
+              message: The saved snapshot host is temporarily unavailable.
+    SandboxResumeHostUnavailable:
+      description: |
+        The sandbox's assigned host is temporarily unavailable, or a
+        snapshot-derived sandbox cannot currently reacquire capacity on the
+        host holding its exact saved-snapshot artifacts. `error.code` is
+        `sandbox_host_unavailable` for assigned-host admission failures and
+        `snapshot_host_unavailable` for saved-snapshot capacity failures.
+        Both conditions are retryable; the platform never silently schedules
+        the sandbox on a host without its required runtime or snapshot state.
+      headers:
+        Retry-After:
+          description: Delay in seconds before retrying the request.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            assignedHost:
+              summary: Assigned sandbox host is unavailable
+              value:
+                error:
+                  code: sandbox_host_unavailable
+                  message: The sandbox host is temporarily unavailable.
+            snapshotCapacity:
+              summary: Saved-snapshot host lacks operation capacity
+              value:
+                error:
+                  code: snapshot_host_unavailable
+                  message: The snapshot host has insufficient capacity.
+    SnapshotUnavailable:
+      description: |
+        The committed artifacts needed to restore this saved snapshot are
+        permanently missing, corrupt, or otherwise unusable. The response uses
+        error code `snapshot_unavailable`. The snapshot remains inspectable and
+        deletable, but cannot create new sandboxes.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: snapshot_unavailable
+              message: Snapshot artifacts are missing or corrupt.
     StorageFull:
       description: >
         The sandbox has run out of disk space. Response body uses error code

@@ -30,6 +30,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -1225,6 +1226,7 @@ func (h *Handlers) respondSandboxSnapshotDependencyConflict(c *gin.Context, sand
 	if count == 0 {
 		return false
 	}
+	RecordSavedSnapshotOutcome(c.Request.Context(), telemetry.SavedSnapshotOperationDelete, telemetry.SavedSnapshotOutcomeDependencyBlocked, telemetryHostID(c))
 	h.capture(c, "sandbox_delete_blocked", map[string]any{
 		"sandbox_id":     sandboxID.String(),
 		"snapshot_count": count,

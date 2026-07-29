@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -585,6 +586,7 @@ func (h *Handlers) CreateSnapshot(c *gin.Context) {
 	}
 	if err := validateSavedSnapshotArtifacts(saved, artifacts); err != nil {
 		log.Error().Err(err).Str("snapshot_id", saved.ID.String()).Msg("VMD returned invalid saved snapshot manifest")
+		RecordSavedSnapshotOutcome(c.Request.Context(), telemetry.SavedSnapshotOperationCapture, telemetry.SavedSnapshotOutcomeArtifactCorrupt, savedSnapshotHostID(saved))
 		h.capture(c, "snapshot_artifact_corrupt", map[string]any{
 			"snapshot_id": saved.ID.String(),
 			"sandbox_id":  saved.SandboxID.String(),
@@ -813,6 +815,7 @@ func (h *Handlers) respondSavedSnapshotCaptureError(c *gin.Context, saved db.Sna
 	}
 	grpcCode := status.Code(err)
 	if grpcCode == codes.NotFound || grpcCode == codes.DataLoss {
+		RecordSavedSnapshotOutcome(c.Request.Context(), telemetry.SavedSnapshotOperationCapture, telemetry.SavedSnapshotOutcomeArtifactCorrupt, savedSnapshotHostID(saved))
 		h.capture(c, "snapshot_artifact_corrupt", map[string]any{
 			"snapshot_id": saved.ID.String(),
 			"sandbox_id":  saved.SandboxID.String(),
@@ -939,8 +942,14 @@ func (h *Handlers) deleteCapturedSnapshotBestEffort(reqCtx context.Context, vmd 
 	defer cancel()
 	if err := vmd.DeleteSavedSnapshot(ctx, saved.SandboxID.String(), saved.ID.String()); err != nil && !isVMDNotFound(err) {
 		log.Warn().Err(vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationDelete, err)).Str("snapshot_id", saved.ID.String()).Msg("cleanup captured saved snapshot")
+		outcome := telemetry.SavedSnapshotOutcomeError
+		if transientSavedSnapshotAPIError(err) {
+			outcome = telemetry.SavedSnapshotOutcomeRetry
+		}
+		RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, outcome, savedSnapshotHostID(saved))
 		return err
 	}
+	RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeSuccess, savedSnapshotHostID(saved))
 	return nil
 }
 
@@ -966,7 +975,21 @@ func (h *Handlers) queueSavedSnapshotCleanup(reqCtx context.Context, saved db.Sn
 		ExclusiveSizeBytes: exclusiveSize,
 		FailureReason:      &reason,
 	})
+	if err == nil {
+		RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeQueued, savedSnapshotHostID(saved))
+	} else {
+		RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeError, savedSnapshotHostID(saved))
+	}
 	return err
+}
+
+func transientSavedSnapshotAPIError(err error) bool {
+	switch status.Code(err) {
+	case codes.Canceled, codes.DeadlineExceeded, codes.Unavailable, codes.Aborted, codes.ResourceExhausted, codes.Unimplemented:
+		return true
+	default:
+		return false
+	}
 }
 
 func savedSnapshotQuotaCode(err error) string {
@@ -1193,12 +1216,14 @@ func (h *Handlers) DeleteSavedSnapshot(c *gin.Context) {
 	}
 	if snapshot.HostID == nil || *snapshot.HostID == "" {
 		log.Error().Str("snapshot_id", snapshotID.String()).Msg("saved snapshot has no host")
+		RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeError, "")
 		respondError(c, ErrInternal)
 		return
 	}
 	SetTelemetryHostID(c, *snapshot.HostID)
 	vmd, ok := h.snapshotVMDForHost(c, *snapshot.HostID, false)
 	if !ok {
+		RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeRetry, *snapshot.HostID)
 		return
 	}
 	vmdCtx, cancel := context.WithTimeout(ctx, vmdTimeout)
@@ -1207,10 +1232,12 @@ func (h *Handlers) DeleteSavedSnapshot(c *gin.Context) {
 	if err != nil && !isVMDNotFound(err) {
 		switch status.Code(err) {
 		case codes.Canceled, codes.DeadlineExceeded, codes.Unavailable, codes.Aborted, codes.ResourceExhausted, codes.Unimplemented:
+			RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeRetry, *snapshot.HostID)
 			c.Header("Retry-After", "5")
 			respondErrorMsg(c, "snapshot_host_unavailable", "The snapshot host is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeError, *snapshot.HostID)
 		log.Error().Err(vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationDelete, err)).Str("snapshot_id", snapshotID.String()).Msg("VMD DeleteSavedSnapshot")
 		respondError(c, ErrInternal)
 		return
@@ -1220,25 +1247,31 @@ func (h *Handlers) DeleteSavedSnapshot(c *gin.Context) {
 			current, getErr := h.DB.GetSavedSnapshotForDelete(ctx, db.GetSavedSnapshotForDeleteParams{SnapshotID: snapshotID, TeamID: teamID})
 			switch {
 			case errors.Is(getErr, pgx.ErrNoRows):
+				RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeSuccess, *snapshot.HostID)
 				snapshotNotFound(c, getErr)
 				return
 			case getErr != nil:
 				log.Error().Err(getErr).Str("snapshot_id", snapshotID.String()).Msg("DB re-read saved snapshot after delete finalize race")
+				RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeRetry, *snapshot.HostID)
 				respondError(c, ErrInternal)
 				return
 			case current.DeletedAt.Valid:
+				RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeSuccess, *snapshot.HostID)
 				c.Status(http.StatusNoContent)
 				return
 			default:
 				log.Error().Str("snapshot_id", snapshotID.String()).Str("status", string(current.Status)).Msg("saved snapshot delete finalize returned no row without a tombstone")
+				RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeError, *snapshot.HostID)
 				respondError(c, ErrInternal)
 				return
 			}
 		}
 		log.Error().Err(err).Str("snapshot_id", snapshotID.String()).Msg("DB FinalizeSavedSnapshotDelete")
+		RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeRetry, *snapshot.HostID)
 		respondError(c, ErrInternal)
 		return
 	}
+	RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeSuccess, *snapshot.HostID)
 	h.capture(c, "snapshot_deleted", map[string]any{"snapshot_id": snapshotID.String()})
 	c.Status(http.StatusNoContent)
 }
@@ -1256,6 +1289,7 @@ func (h *Handlers) respondSnapshotDependencyConflict(c *gin.Context, snapshotID,
 		respondErrorMsg(c, "snapshot_not_ready", "Snapshot cannot be deleted in its current state", http.StatusConflict)
 		return
 	}
+	RecordSavedSnapshotOutcome(c.Request.Context(), telemetry.SavedSnapshotOperationDelete, telemetry.SavedSnapshotOutcomeDependencyBlocked, telemetryHostID(c))
 	h.capture(c, "snapshot_delete_blocked", map[string]any{
 		"snapshot_id":    snapshotID.String(),
 		"sandbox_count":  deps.ChildSandboxCount,

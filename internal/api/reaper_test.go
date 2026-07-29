@@ -356,3 +356,40 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 	}
 	t.Fatal("reaper did not run immediately on startup")
 }
+
+func TestReaper_MeasuresShadowUsageBeforeFinalizingPause(t *testing.T) {
+	row := expiredRow("sbx-accounted")
+	var events []string
+	dbtx := &reaperMockDBTX{
+		queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+			return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+		},
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "upserted AS") {
+				events = append(events, "finalize")
+				return finalizePauseRow(uuid.New())
+			}
+			return activityRow()
+		},
+	}
+	base := &stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
+		return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+	}}
+	vmd := &stubSavedSnapshotVMD{
+		stubVMD: base,
+		measureSavedFn: func(_ context.Context, instanceID string) (int64, int64, error) {
+			events = append(events, "measure")
+			if instanceID != row.ID.String() {
+				t.Fatalf("measured sandbox = %s, want %s", instanceID, row.ID)
+			}
+			return 2048, 1024, nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(dbtx)}
+
+	h.reapOnce(context.Background(), 10, 1)
+
+	if got, want := strings.Join(events, ","), "measure,finalize"; got != want {
+		t.Fatalf("pause accounting order = %q, want %q", got, want)
+	}
+}

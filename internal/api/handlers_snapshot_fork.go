@@ -22,6 +22,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -620,6 +621,7 @@ func (h *Handlers) cleanupFailedSavedSnapshotForkWithTimeouts(
 		}
 		revokeCancel()
 		markFailed()
+		RecordSavedSnapshotOutcome(detachedCtx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeError, sandbox.HostID)
 		return
 	}
 
@@ -639,6 +641,11 @@ func (h *Handlers) cleanupFailedSavedSnapshotForkWithTimeouts(
 		// user-deletable; soft-deleting it here would let the parent snapshot be
 		// reclaimed underneath a VM whose teardown outcome is unknown.
 		markFailed()
+		outcome := telemetry.SavedSnapshotOutcomeError
+		if transientSavedSnapshotAPIError(destroyErr) {
+			outcome = telemetry.SavedSnapshotOutcomeRetry
+		}
+		RecordSavedSnapshotOutcome(detachedCtx, telemetry.SavedSnapshotOperationCleanup, outcome, sandbox.HostID)
 		return
 	}
 
@@ -657,10 +664,12 @@ func (h *Handlers) cleanupFailedSavedSnapshotForkWithTimeouts(
 		if errors.Is(err, pgx.ErrNoRows) {
 			// A concurrent lifecycle owner won the claim. Its cleanup path owns
 			// bindings and the pin; both remain protected by durable revocation.
+			RecordSavedSnapshotOutcome(detachedCtx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeRetry, sandbox.HostID)
 			return
 		}
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("soft-delete failed saved-snapshot fork")
 		markFailed()
+		RecordSavedSnapshotOutcome(detachedCtx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeRetry, sandbox.HostID)
 		return
 	}
 
@@ -682,6 +691,7 @@ func (h *Handlers) cleanupFailedSavedSnapshotForkWithTimeouts(
 			log.Warn().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("release compensated fork snapshot pin")
 		}
 	}
+	RecordSavedSnapshotOutcome(detachedCtx, telemetry.SavedSnapshotOperationCleanup, telemetry.SavedSnapshotOutcomeSuccess, sandbox.HostID)
 }
 
 func (h *Handlers) markFailedSnapshotFork(ctx context.Context, sandbox db.Sandbox) {
@@ -720,6 +730,7 @@ func (h *Handlers) markSavedSnapshotUnavailable(c *gin.Context, saved db.Snapsho
 		}
 		return
 	}
+	RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOperationRestore, telemetry.SavedSnapshotOutcomeUnavailable, savedSnapshotHostID(saved))
 	h.capture(c, "snapshot_unavailable", map[string]any{
 		"snapshot_id": saved.ID.String(),
 		"reason":      reason,
