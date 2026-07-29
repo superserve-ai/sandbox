@@ -369,7 +369,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if err != nil {
 				// Leave the row untouched; the drift persists and the next
 				// pass retries. Marking failed with the shell still active
-				// would strand a live unit behind a failed row.
+				// would strand a live unit behind a failed row. Refund the
+				// budget slot: nothing destructive happened, and transient
+				// stop failures must not be able to exhaust the budget
+				// without ever performing the transition.
+				r.refundAutoFailSlot()
+				r.writeAudit(ctx, id, "stop_failed", "empty-shell stop failed; slot refunded, retrying next pass", "fc_empty_shell")
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell unit")
 				continue
 			}
@@ -1038,6 +1043,20 @@ func fcProbeShell(ctx context.Context, sock string) (empty bool, err error) {
 		return false, err
 	}
 	return state == fcmodels.InstanceInfoStateNotStarted, nil
+}
+
+// refundAutoFailSlot returns the most recently consumed auto-fail slot.
+// Used when the destructive action the slot was reserved for did not
+// happen (a failed unit stop): the budget bounds performed destructive
+// actions, so a run of transient failures must not exhaust it without a
+// single transition occurring. Drift rules run sequentially in the single
+// reconcile pass, so the newest entry is the caller's own reservation.
+func (r *Reconciler) refundAutoFailSlot() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n := len(r.autoFailLog); n > 0 {
+		r.autoFailLog = r.autoFailLog[:n-1]
+	}
 }
 
 // markStale deletes the stale BoltDB entry and drops the VM from the
