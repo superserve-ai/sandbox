@@ -8,6 +8,10 @@
 
 name: Deploy VMD
 
+concurrency:
+  group: deploy-vmd-hosts
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +22,15 @@ on:
         options:
           - staging
           - production
+      activate_staging_snapshot_storage:
+        description: 'Manually migrate staging runtime/snapshots to the attached XFS disk'
+        required: false
+        default: false
+        type: boolean
+      staging_snapshot_storage_device:
+        description: 'Required with activation: /dev/disk/by-id/google-superserve-sandbox-data'
+        required: false
+        type: string
   push:
     branches: [main]
     paths:
@@ -26,22 +39,28 @@ on:
       - 'cmd/template-builder/**'
       - 'cmd/secretsproxy/**'
       - 'internal/vm/**'
+      - 'internal/vmdclient/**'
       - 'internal/network/**'
       - 'internal/builder/**'
       - 'internal/db/**'
       - 'internal/secretsproxy/**'
+      - 'proto/vmd.proto'
+      - 'proto/vmdpb/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/superserve-vmd.socket'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
+      - 'deploy/sandbox-data-disk.service'
       - 'scripts/fc-cleanup'
+      - 'scripts/setup-sandbox-data-disk.sh'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
       # asset changes — leaving that host on stale binaries.
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
+      - '.github/workflows/scripts/test_deploy_vmd.py'
 
 jobs:
   deploy-staging:
@@ -89,8 +108,23 @@ jobs:
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
+          SNAPSHOT_STORAGE_ACTIVATION: ${{ github.event_name == 'workflow_dispatch' && inputs.activate_staging_snapshot_storage && 'true' || 'false' }}
+          SANDBOX_DATA_DISK_DEVICE: ${{ inputs.staging_snapshot_storage_device || '' }}
           SHA: ${{ github.sha }}
         run: |
+          if [[ "$SNAPSHOT_STORAGE_ACTIVATION" == "true" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+              echo "Snapshot storage activation is manual-only." >&2
+              exit 1
+            fi
+            : "${SANDBOX_DATA_DISK_DEVICE:?staging_snapshot_storage_device is required when activation is enabled}"
+            if [[ "$SANDBOX_DATA_DISK_DEVICE" != "/dev/disk/by-id/google-superserve-sandbox-data" ]]; then
+              echo "Refusing any staging snapshot device except /dev/disk/by-id/google-superserve-sandbox-data." >&2
+              exit 1
+            fi
+          else
+            unset SANDBOX_DATA_DISK_DEVICE
+          fi
           python3 .github/workflows/scripts/deploy-vmd.py
 
   deploy-production:

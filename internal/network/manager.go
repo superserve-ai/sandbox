@@ -623,7 +623,7 @@ func (m *Manager) Forget(vmID string) {
 // and the in-namespace nftables Firewall handle is reattached so the
 // customer's subsequent UpdateFirewallRules calls apply to the existing
 // kernel state.
-func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
+func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string, egress *EgressRules) error {
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return fmt.Errorf("reattach %s: cannot parse slot from namespace %q", vmID, namespace)
@@ -676,6 +676,14 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		_ = prev.Firewall.Close()
 	}
 	m.registerEgress(vmID, info)
+	if m.egressProxy != nil && egress != nil {
+		applied := *egress
+		applied.AllowedCIDRs = append([]string(nil), egress.AllowedCIDRs...)
+		applied.DeniedCIDRs = append([]string(nil), egress.DeniedCIDRs...)
+		applied.AllowedDomains = append([]string(nil), egress.AllowedDomains...)
+		applied.SandboxID = vmID
+		m.egressProxy.SetRules(hostIP, &applied)
+	}
 
 	m.log.Info().Str("vm_id", vmID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
 	return nil

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -448,6 +449,7 @@ func TestDeleteSnapshotFiles_BothEmpty_Rejected(t *testing.T) {
 // TestDestroyVM_AbsentInstance_CleansRundir: destroying a VM that's absent from
 // m.vms (e.g. a paused sandbox) must still remove its rundir, not leak it.
 func TestDestroyVM_AbsentInstance_CleansRundir(t *testing.T) {
+	installInactiveSystemctl(t)
 	runDir := t.TempDir()
 	vmID := "11111111-1111-1111-1111-111111111111"
 	dir := filepath.Join(runDir, vmID)
@@ -479,6 +481,7 @@ func TestDestroyVM_AbsentInstance_CleansRundir(t *testing.T) {
 // TestDestroyVM_UnsafeVMID_Rejected: a non-path-safe or reserved vmID is
 // rejected before cleanup, so it can't escape RunDir or wipe shared dirs.
 func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
+	installInactiveSystemctl(t)
 	runDir := t.TempDir()
 	shared := []string{"keep", templateDirName, TemplatesDirName}
 	for _, name := range shared {
@@ -516,6 +519,73 @@ func TestDestroyVM_UnsafeVMID_Rejected(t *testing.T) {
 		if err != nil {
 			t.Errorf("DestroyVM(%q): want nil, got %v", vmID, err)
 		}
+	}
+}
+
+func installInactiveSystemctl(t *testing.T) {
+	t.Helper()
+	binDir := t.TempDir()
+	script := filepath.Join(binDir, "systemctl")
+	contents := []byte("#!/bin/sh\ncase \"$1\" in\n  stop) exit 0 ;;\n  is-active) echo inactive; exit 3 ;;\n  *) exit 0 ;;\nesac\n")
+	if err := os.WriteFile(script, contents, 0o755); err != nil {
+		t.Fatalf("write fake systemctl: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestUnitConfirmedInactiveRequiresAuthoritativeSystemdState(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		exit    int
+		wantErr bool
+	}{
+		{name: "inactive", output: "inactive", exit: 3},
+		{name: "failed", output: "failed", exit: 3},
+		{name: "unknown unit", output: "unknown", exit: 4},
+		{name: "active", output: "active", exit: 0, wantErr: true},
+		{name: "blank transport failure", exit: 1, wantErr: true},
+		{name: "bus failure", output: "Failed to connect to bus", exit: 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			script := filepath.Join(binDir, "systemctl")
+			contents := "#!/bin/sh\nprintf '%s\\n' '" + tt.output + "'\nexit " + strconv.Itoa(tt.exit) + "\n"
+			if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			err := unitConfirmedInactive(context.Background(), "firecracker@test.service")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("unitConfirmedInactive error = %v, wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestFirecrackerCmdlineMatchesExactProcessIdentity(t *testing.T) {
+	vmID := "vm-123"
+	tests := []struct {
+		name    string
+		cmdline string
+		want    bool
+	}{
+		{name: "bare binary", cmdline: "firecracker\x00--id\x00vm-123\x00", want: true},
+		{name: "absolute binary", cmdline: "/usr/bin/firecracker\x00--id\x00vm-123\x00", want: true},
+		{name: "different program", cmdline: "sh\x00-c\x00firecracker --id vm-123\x00"},
+		{name: "prefixed binary", cmdline: "firecracker-wrapper\x00--id\x00vm-123\x00"},
+		{name: "prefixed absolute binary", cmdline: "/tmp/firecracker-malicious\x00--id\x00vm-123\x00"},
+		{name: "id substring", cmdline: "firecracker\x00--id\x00vm-1234\x00"},
+		{name: "combined id option", cmdline: "firecracker\x00--id=vm-123\x00"},
+		{name: "missing id flag", cmdline: "firecracker\x00vm-123\x00"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firecrackerCmdlineMatches([]byte(tt.cmdline), vmID); got != tt.want {
+				t.Fatalf("firecrackerCmdlineMatches = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

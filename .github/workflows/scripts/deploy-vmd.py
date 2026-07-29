@@ -14,6 +14,12 @@ Env vars:
   VMD_LABEL            required — gcloud instances list label filter (e.g. component=vmd)
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
+  SANDBOX_DATA_DISK_DEVICE
+                       optional exact staging path
+                       /dev/disk/by-id/google-superserve-sandbox-data. When
+                       supplied, perform the manual first activation. Omit it
+                       for ordinary deploys; authoritative hosts are still
+                       refreshed and verified automatically.
   SHA                  required — commit SHA (only first 8 chars used)
   SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
   CONTROL_PLANE_URL    optional — control-plane base URL (e.g.
@@ -95,8 +101,28 @@ BUNDLE_FILES = [
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
     "deploy/sandboxes.slice",
+    "deploy/sandbox-data-disk.service",
     "scripts/fc-cleanup",
+    "scripts/setup-sandbox-data-disk.sh",
 ]
+
+STAGING_DATA_DISK_DEVICE = (
+    "/dev/disk/by-id/google-superserve-sandbox-data"
+)
+
+
+def optional_data_disk_device(environ=None):
+    """Return the one allowlisted staging data device when configured."""
+    environ = os.environ if environ is None else environ
+    value = environ.get("SANDBOX_DATA_DISK_DEVICE", "").strip()
+    if not value:
+        return ""
+    if value != STAGING_DATA_DISK_DEVICE:
+        raise ValueError(
+            "SANDBOX_DATA_DISK_DEVICE must be exactly "
+            f"{STAGING_DATA_DISK_DEVICE!r}, got {value!r}"
+        )
+    return value
 
 
 def main() -> int:
@@ -113,6 +139,7 @@ def main() -> int:
     # Empty = skip, so a fleet-wide deploy never writes a redirect to a host
     # whose resolver isn't on this port. Set per host/region to match unbound.
     dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "")
+    data_disk_device = optional_data_disk_device()
 
     # Pre-quote every value injected into the remote shell script. These come
     # from CI secrets / Secret Manager and must be treated as arbitrary text:
@@ -129,6 +156,7 @@ def main() -> int:
     q_dat_line = shlex.quote(f"DAEMON_AUTH_TOKEN={internal_api_token}")
     q_db = shlex.quote(database_url)
     q_db_line = shlex.quote(f"DATABASE_URL={database_url}")
+    q_data_disk_device = shlex.quote(data_disk_device)
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -173,6 +201,156 @@ def main() -> int:
 
     bundle_remote = f"/tmp/deploy-bundle-{sha}.tar.gz"
     extract_dir = f"/tmp/deploy-{sha}"
+    data_disk_setup_call = textwrap.dedent(f"""
+        DATA_DISK_AUTHORITY_MARKER=/etc/sandbox/data-disk-authoritative
+        DATA_DISK_CONFIG_FILE=/etc/sandbox/data-disk.env
+        DATA_DISK_EXPECTED_DEVICE={shlex.quote(STAGING_DATA_DISK_DEVICE)}
+        DATA_DISK_REQUESTED_DEVICE={q_data_disk_device}
+        DATA_DISK_HAD_AUTHORITY=0
+        DATA_DISK_HAD_CONFIG=0
+        DATA_DISK_SETUP_ATTEMPTED=0
+        DATA_DISK_SETUP_RC=0
+        DATA_DISK_VMD_WAS_ACTIVE=0
+
+        sudo test -f "$DATA_DISK_AUTHORITY_MARKER" && DATA_DISK_HAD_AUTHORITY=1
+        sudo test -f "$DATA_DISK_CONFIG_FILE" && DATA_DISK_HAD_CONFIG=1
+        if sudo systemctl is-active --quiet {service}; then
+            DATA_DISK_VMD_WAS_ACTIVE=1
+        fi
+
+        install_data_disk_assets() {{
+            sudo install -m 0755 {extract_dir}/scripts/setup-sandbox-data-disk.sh /usr/local/bin/setup-sandbox-data-disk.sh
+            sudo install -m 0644 {extract_dir}/deploy/sandbox-data-disk.service /etc/systemd/system/sandbox-data-disk.service
+            sudo systemctl daemon-reload
+        }}
+
+        show_data_disk_diagnostics() {{
+            echo "sandbox-data-disk.service diagnostics:" >&2
+            sudo systemctl status --no-pager sandbox-data-disk.service >&2 || true
+            sudo journalctl -u sandbox-data-disk.service --no-pager -n 160 >&2 || true
+        }}
+
+        if [ -n "$DATA_DISK_REQUESTED_DEVICE" ]; then
+            if [ "$DATA_DISK_REQUESTED_DEVICE" != "$DATA_DISK_EXPECTED_DEVICE" ]; then
+                echo "ERROR: refusing non-allowlisted snapshot storage device: $DATA_DISK_REQUESTED_DEVICE" >&2
+                exit 1
+            fi
+
+            if [ "$DATA_DISK_HAD_AUTHORITY" != 1 ]; then
+                # Do this before installing either asset: every possible
+                # pre-authority exit must leave boot-time retries disabled.
+                sudo systemctl disable --quiet sandbox-data-disk.service || true
+            fi
+            install_data_disk_assets
+            if [ "$DATA_DISK_HAD_AUTHORITY" = 1 ]; then
+                # The host is already authoritative. Never restart its required
+                # oneshot; refresh the assets and verify the live bind mounts.
+                DATA_DISK_SETUP_ATTEMPTED=1
+                sudo /usr/local/bin/setup-sandbox-data-disk.sh --verify-only || DATA_DISK_SETUP_RC=$?
+            else
+                # A first activation is manual-only. Clear any stale enablement
+                # left by an older failed rollout before writing configuration,
+                # so a pre-authority failure cannot retry automatically at boot.
+                sudo install -d -m 0755 /etc/sandbox
+                DATA_DISK_CONFIG_TMP=$(sudo mktemp /etc/sandbox/.data-disk.env.XXXXXX)
+                trap 'sudo rm -f "$DATA_DISK_CONFIG_TMP"' EXIT
+                printf '%s\\n' "SANDBOX_DATA_DISK_DEVICE=$DATA_DISK_EXPECTED_DEVICE" | sudo tee "$DATA_DISK_CONFIG_TMP" > /dev/null
+                sudo chown root:root "$DATA_DISK_CONFIG_TMP"
+                sudo chmod 0644 "$DATA_DISK_CONFIG_TMP"
+                sudo mv -f "$DATA_DISK_CONFIG_TMP" "$DATA_DISK_CONFIG_FILE"
+                DATA_DISK_CONFIG_TMP=
+                trap - EXIT
+
+                if ! command -v mkfs.xfs >/dev/null 2>&1 || ! command -v xfs_info >/dev/null 2>&1; then
+                    if ! command -v apt-get >/dev/null 2>&1; then
+                        echo "ERROR: xfsprogs is required for staging snapshot storage" >&2
+                        DATA_DISK_SETUP_RC=1
+                    else
+                        sudo apt-get update -qq || DATA_DISK_SETUP_RC=$?
+                        if [ "$DATA_DISK_SETUP_RC" = 0 ]; then
+                            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfsprogs || DATA_DISK_SETUP_RC=$?
+                        fi
+                    fi
+                fi
+
+                DATA_DISK_SETUP_ATTEMPTED=1
+                if [ "$DATA_DISK_SETUP_RC" = 0 ]; then
+                    sudo systemctl start sandbox-data-disk.service || DATA_DISK_SETUP_RC=$?
+                fi
+            fi
+        elif [ "$DATA_DISK_HAD_AUTHORITY" = 1 ]; then
+            # Ordinary push deploy: authoritative storage must receive the
+            # updated verifier/unit before VMD is restarted.
+            install_data_disk_assets
+            DATA_DISK_SETUP_ATTEMPTED=1
+            sudo /usr/local/bin/setup-sandbox-data-disk.sh --verify-only || DATA_DISK_SETUP_RC=$?
+        elif [ "$DATA_DISK_HAD_CONFIG" = 1 ]; then
+            # Configuration without authority is residue from an interrupted
+            # or failed first activation. Do not turn a push into an implicit
+            # retry; clear the boot trigger and require another explicit input.
+            echo "Removing pre-authority snapshot storage configuration; activation remains manual-only" >&2
+            sudo systemctl disable --quiet sandbox-data-disk.service || true
+            sudo rm -f "$DATA_DISK_CONFIG_FILE"
+            sudo systemctl daemon-reload
+        else
+            # Defensive cleanup for a legacy pre-authority rollout that left
+            # only an enablement symlink behind.
+            sudo systemctl disable --quiet sandbox-data-disk.service || true
+        fi
+
+        if [ "$DATA_DISK_SETUP_ATTEMPTED" = 1 ] && [ "$DATA_DISK_SETUP_RC" = 0 ]; then
+            if ! sudo test -f "$DATA_DISK_AUTHORITY_MARKER" || ! sudo test -f "$DATA_DISK_CONFIG_FILE"; then
+                echo "ERROR: snapshot storage setup returned success without durable authority and configuration" >&2
+                DATA_DISK_SETUP_RC=1
+            else
+                # Enable boot-time execution only after the first activation
+                # has succeeded. Authoritative mid-commit failures are still
+                # protected by the Requires= drop-ins written by the setup
+                # script before it records the authority marker.
+                sudo systemctl enable --quiet sandbox-data-disk.service || DATA_DISK_SETUP_RC=$?
+            fi
+        fi
+
+        if [ "$DATA_DISK_SETUP_RC" != 0 ]; then
+            show_data_disk_diagnostics
+            if sudo test -f "$DATA_DISK_AUTHORITY_MARKER"; then
+                # Defense in depth: verify-only and authoritative setup errors
+                # also stop these listeners internally.
+                sudo systemctl stop superserve-vmd.socket {service} || true
+                echo "Data-disk verification failed after authority; the VMD control plane remains stopped" >&2
+            else
+                # No authority was recorded, so the original filesystem remains
+                # canonical. Remove both automatic retry mechanisms.
+                sudo systemctl disable --quiet sandbox-data-disk.service || true
+                sudo rm -f "$DATA_DISK_CONFIG_FILE"
+                sudo systemctl daemon-reload
+                if [ "$DATA_DISK_VMD_WAS_ACTIVE" = 1 ]; then
+                    for attempt in $(seq 1 30); do
+                        sudo systemctl is-active --quiet {service} && break
+                        sleep 1
+                    done
+                    if sudo systemctl is-active --quiet {service}; then
+                        echo "Data-disk setup failed before authority; {service} recovered on the original storage" >&2
+                    else
+                        echo "ERROR: {service} did not recover after the pre-authority setup failure" >&2
+                    fi
+                fi
+            fi
+            exit "$DATA_DISK_SETUP_RC"
+        fi
+
+        if [ "$DATA_DISK_SETUP_ATTEMPTED" = 1 ] && [ "$DATA_DISK_VMD_WAS_ACTIVE" = 1 ]; then
+            for attempt in $(seq 1 60); do
+                sudo systemctl is-active --quiet {service} && break
+                sleep 1
+            done
+            sudo systemctl is-active --quiet {service} || (
+                echo "ERROR: {service} did not recover after the data-disk operation" >&2
+                sudo systemctl status --no-pager {service} >&2 || true
+                exit 1
+            )
+        fi
+    """).strip()
 
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
@@ -197,6 +375,11 @@ def main() -> int:
             sudo rm -rf {extract_dir}
             mkdir -p {extract_dir}
             tar xzf {bundle_remote} -C {extract_dir}
+
+            # First activation is explicit and manual. Once the authority
+            # marker exists, every deploy refreshes and verifies the storage
+            # gate before replacing any VMD runtime assets.
+            {data_disk_setup_call}
 
             # Install vmd + template-builder binaries.
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd

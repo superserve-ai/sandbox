@@ -6,6 +6,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/superserve-ai/sandbox/internal/network"
 )
 
 // State provides durable local persistence for VM instance metadata.
@@ -19,9 +21,10 @@ var (
 	previewPolicyBucketName = []byte("vm_preview_policies")
 )
 
-// persistedPreviewPolicy is stored separately from VMRecord so a rollback to
-// a VMD binary that predates preview policy fields can keep writing lifecycle
-// records without erasing the last policy enforced by newer binaries.
+// persistedPreviewPolicy is stored separately from VMRecord so a rollback can
+// keep writing lifecycle records without erasing fields introduced by newer
+// binaries. DiskSizeMiB and EgressPolicy intentionally share the established
+// sidecar: the current main binary preserves unknown JSON fields in it.
 type persistedPreviewPolicy struct {
 	Access              string
 	Ports               map[int32]bool
@@ -29,17 +32,21 @@ type persistedPreviewPolicy struct {
 	TokenVersions       map[int32]int64
 	Revision            int64
 	TokenPolicyRevision int64
+	DiskSizeMiB         uint32
+	EgressPolicy        *network.EgressRules
 	unknownFields       map[string]json.RawMessage
 }
 
 func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 	var known struct {
-		Access              string           `json:"access,omitempty"`
-		Ports               map[int32]bool   `json:"ports,omitempty"`
-		PortAccess          map[int32]string `json:"port_access,omitempty"`
-		TokenVersions       map[int32]int64  `json:"token_versions,omitempty"`
-		Revision            int64            `json:"revision,omitempty"`
-		TokenPolicyRevision int64            `json:"token_policy_revision,omitempty"`
+		Access              string               `json:"access,omitempty"`
+		Ports               map[int32]bool       `json:"ports,omitempty"`
+		PortAccess          map[int32]string     `json:"port_access,omitempty"`
+		TokenVersions       map[int32]int64      `json:"token_versions,omitempty"`
+		Revision            int64                `json:"revision,omitempty"`
+		TokenPolicyRevision int64                `json:"token_policy_revision,omitempty"`
+		DiskSizeMiB         uint32               `json:"disk_size_mib,omitempty"`
+		EgressPolicy        *network.EgressRules `json:"egress_policy,omitempty"`
 	}
 	if err := json.Unmarshal(data, &known); err != nil {
 		return err
@@ -54,6 +61,8 @@ func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 	delete(fields, "token_versions")
 	delete(fields, "revision")
 	delete(fields, "token_policy_revision")
+	delete(fields, "disk_size_mib")
+	delete(fields, "egress_policy")
 	if len(fields) == 0 {
 		fields = nil
 	}
@@ -64,6 +73,8 @@ func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 		TokenVersions:       known.TokenVersions,
 		Revision:            known.Revision,
 		TokenPolicyRevision: known.TokenPolicyRevision,
+		DiskSizeMiB:         known.DiskSizeMiB,
+		EgressPolicy:        known.EgressPolicy,
 		unknownFields:       fields,
 	}
 	return nil
@@ -71,7 +82,7 @@ func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 
 func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
 	p = p.normalizedTokenState()
-	fields := make(map[string]json.RawMessage, len(p.unknownFields)+6)
+	fields := make(map[string]json.RawMessage, len(p.unknownFields)+8)
 	for key, value := range p.unknownFields {
 		fields[key] = value
 	}
@@ -117,6 +128,20 @@ func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
 		}
 		fields["token_policy_revision"] = data
 	}
+	if p.DiskSizeMiB != 0 {
+		data, err := json.Marshal(p.DiskSizeMiB)
+		if err != nil {
+			return nil, err
+		}
+		fields["disk_size_mib"] = data
+	}
+	if p.EgressPolicy != nil {
+		data, err := json.Marshal(p.EgressPolicy)
+		if err != nil {
+			return nil, err
+		}
+		fields["egress_policy"] = data
+	}
 	return json.Marshal(fields)
 }
 
@@ -146,12 +171,18 @@ type VMRecord struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	VCPU        uint32            `json:"vcpu"`
 	MemoryMiB   uint32            `json:"memory_mib"`
+	DiskSizeMiB uint32            `json:"disk_size_mib,omitempty"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
 	// persisted — it's only relevant at create-from-template; a resumed
 	// sandbox reuses its existing overlay file in place.
 	BasePath string `json:"base_path,omitempty"`
+	// EgressPolicy is the effective sandbox policy installed before boot. It
+	// must survive a VMD restart: nftables keeps CIDR rules in the namespace,
+	// but the in-process domain proxy otherwise comes back with an allow-all
+	// default until the control plane happens to issue another update.
+	EgressPolicy *network.EgressRules `json:"egress_policy,omitempty"`
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
@@ -237,7 +268,7 @@ func (s *StateStore) Close() error {
 
 // Put persists a VM record. Batched; the callback is idempotent so Batch's
 // retry-on-failure semantics are safe. The lifecycle record and authoritative
-// preview-policy sidecar are updated in the same transaction.
+// rollback-stable sidecar are updated in the same transaction.
 func (s *StateStore) Put(rec VMRecord) error {
 	return s.db.Batch(func(tx *bolt.Tx) error {
 		_, err := putRecord(tx, rec, false)
@@ -322,12 +353,27 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 			// Preserve fields introduced by later VMD versions even when this
 			// binary legitimately advances the fields it understands.
 			incomingPolicy.unknownFields = persistedPolicy.unknownFields
+			// A zero disk size and nil egress pointer mean an older lifecycle
+			// writer omitted these fields. Preserve the sidecar. A new writer
+			// can intentionally persist the default egress policy as a non-nil
+			// empty ruleset.
+			if incomingPolicy.DiskSizeMiB == 0 {
+				incomingPolicy.DiskSizeMiB = persistedPolicy.DiskSizeMiB
+			}
+			if incomingPolicy.EgressPolicy == nil && persistedPolicy.EgressPolicy != nil {
+				copy := cloneEgressRules(persistedPolicy.EgressPolicy)
+				incomingPolicy.EgressPolicy = &copy
+			}
 			// A policy revision identifies one immutable policy snapshot. Keeping
 			// the sidecar on equality also protects an initial strict revision-zero
 			// policy from an old lifecycle record with legacy zero values.
 			if persistedPolicy.Revision >= incomingPolicy.Revision {
-				persistedPolicy.applyTo(&incoming)
-				incomingPolicy = persistedPolicy
+				incomingPolicy.Access = persistedPolicy.Access
+				incomingPolicy.Ports = persistedPolicy.Ports
+				incomingPolicy.PortAccess = persistedPolicy.PortAccess
+				incomingPolicy.TokenVersions = persistedPolicy.TokenVersions
+				incomingPolicy.Revision = persistedPolicy.Revision
+				incomingPolicy.TokenPolicyRevision = persistedPolicy.TokenPolicyRevision
 			}
 		}
 	}
@@ -355,6 +401,11 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 
 func previewPolicyFromRecord(rec VMRecord) persistedPreviewPolicy {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
+	var egressPolicy *network.EgressRules
+	if rec.EgressPolicy != nil {
+		copy := cloneEgressRules(rec.EgressPolicy)
+		egressPolicy = &copy
+	}
 	return persistedPreviewPolicy{
 		Access:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		Ports:               previewPortsToRecord(ports),
@@ -362,12 +413,15 @@ func previewPolicyFromRecord(rec VMRecord) persistedPreviewPolicy {
 		TokenVersions:       previewPortTokenVersionsToRecord(ports),
 		Revision:            rec.PreviewPolicyRevision,
 		TokenPolicyRevision: rec.PreviewTokenPolicyRevision,
+		DiskSizeMiB:         rec.DiskSizeMiB,
+		EgressPolicy:        egressPolicy,
 	}.normalizedTokenState()
 }
 
 func (p persistedPreviewPolicy) isSet() bool {
 	return p.Access != "" || len(p.Ports) != 0 || len(p.PortAccess) != 0 ||
 		len(p.TokenVersions) != 0 || p.Revision != 0 || p.TokenPolicyRevision != 0 ||
+		p.DiskSizeMiB != 0 || p.EgressPolicy != nil ||
 		len(p.unknownFields) != 0
 }
 
@@ -380,6 +434,13 @@ func (p persistedPreviewPolicy) applyTo(rec *VMRecord) {
 	rec.PreviewPortTokenVersions = previewPortTokenVersionsToRecord(ports)
 	rec.PreviewPolicyRevision = p.Revision
 	rec.PreviewTokenPolicyRevision = p.TokenPolicyRevision
+	rec.DiskSizeMiB = p.DiskSizeMiB
+	if p.EgressPolicy == nil {
+		rec.EgressPolicy = nil
+	} else {
+		copy := cloneEgressRules(p.EgressPolicy)
+		rec.EgressPolicy = &copy
+	}
 }
 
 // normalizedTokenState makes the token sidecar self-invalidating across a
@@ -484,6 +545,11 @@ func toRecord(inst *VMInstance) VMRecord {
 // toRecordLocked snapshots an instance while its caller holds inst.mu. It is
 // used when a state write must be serialized with the in-memory mutation.
 func toRecordLocked(inst *VMInstance) VMRecord {
+	var egressPolicy *network.EgressRules
+	if inst.Config.EgressPolicy != nil {
+		copy := cloneEgressRules(inst.Config.EgressPolicy)
+		egressPolicy = &copy
+	}
 	return VMRecord{
 		ID:                         inst.ID,
 		PID:                        inst.PID,
@@ -503,7 +569,9 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
 		MemoryMiB:                  inst.Config.MemoryMiB,
+		DiskSizeMiB:                inst.Config.DiskSizeMiB,
 		BasePath:                   inst.Config.BasePath,
+		EgressPolicy:               egressPolicy,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
@@ -569,6 +637,11 @@ func previewPortsFromRecord(in map[int32]bool, access map[int32]string, tokenVer
 func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
+	var egressPolicy *network.EgressRules
+	if rec.EgressPolicy != nil {
+		copy := cloneEgressRules(rec.EgressPolicy)
+		egressPolicy = &copy
+	}
 	return &VMInstance{
 		ID:                         rec.ID,
 		PID:                        rec.PID,
@@ -593,9 +666,23 @@ func toInstance(rec VMRecord) *VMInstance {
 		PreviewPolicyRevision:      rec.PreviewPolicyRevision,
 		PreviewTokenPolicyRevision: tokenPolicyRevision,
 		Config: VMConfig{
-			VCPU:      rec.VCPU,
-			MemoryMiB: rec.MemoryMiB,
-			BasePath:  rec.BasePath,
+			VCPU:         rec.VCPU,
+			MemoryMiB:    rec.MemoryMiB,
+			DiskSizeMiB:  rec.DiskSizeMiB,
+			BasePath:     rec.BasePath,
+			EgressPolicy: egressPolicy,
 		},
+	}
+}
+
+func cloneEgressRules(in *network.EgressRules) network.EgressRules {
+	if in == nil {
+		return network.EgressRules{}
+	}
+	return network.EgressRules{
+		AllowedCIDRs:   append([]string(nil), in.AllowedCIDRs...),
+		DeniedCIDRs:    append([]string(nil), in.DeniedCIDRs...),
+		AllowedDomains: append([]string(nil), in.AllowedDomains...),
+		SandboxID:      in.SandboxID,
 	}
 }

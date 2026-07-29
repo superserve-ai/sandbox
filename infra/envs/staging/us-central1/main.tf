@@ -256,10 +256,10 @@ module "sandbox_host" {
       # Ensure IP forwarding
       sysctl -w net.ipv4.ip_forward=1
 
-      # Clean stale state from previous run
+      # Clean stale process and network state from the previous run. Runtime
+      # and snapshot trees are persistent data and must survive host restarts.
       pkill -9 firecracker 2>/dev/null || true
       for ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do ip netns del $ns 2>/dev/null; done
-      rm -rf /var/lib/superserve/snapshots/* /var/lib/superserve/rundir/*
 
       # Start VMD
       systemctl start superserve-vmd

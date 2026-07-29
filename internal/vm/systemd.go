@@ -362,6 +362,24 @@ func unitDefinitelyDead(ctx context.Context, unit string) bool {
 	return errors.As(err, &exitErr)
 }
 
+// unitConfirmedInactive is the stronger destroy-time proof. It accepts only
+// systemctl's explicit terminal states; transport/bus errors are inconclusive
+// even when systemctl exits non-zero.
+func unitConfirmedInactive(ctx context.Context, unit string) error {
+	out, err := exec.CommandContext(ctx, "systemctl", "is-active", unit).CombinedOutput()
+	state := strings.TrimSpace(string(out))
+	switch state {
+	case "inactive", "failed", "unknown":
+		return nil
+	case "active", "activating", "deactivating", "reloading":
+		return fmt.Errorf("systemd unit %s is still %s", unit, state)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("could not confirm systemd unit %s inactive (state=%q): %w", unit, state, err)
+}
+
 // listActiveFirecrackerUnits returns the sandbox IDs of all running
 // firecracker@ units. Used during startup reattach. It lists
 // ActiveState=active only — a unit mid-deactivating is invisible here, which

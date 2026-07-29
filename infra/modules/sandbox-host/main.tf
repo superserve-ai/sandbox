@@ -66,6 +66,9 @@ resource "google_compute_instance" "this" {
 
     ignore_changes = [
       advanced_machine_features,
+      # Standalone google_compute_attached_disk resources own this block;
+      # the provider requires the instance resource to ignore it.
+      attached_disk,
       boot_disk,
       metadata,
       network_interface[0].access_config,

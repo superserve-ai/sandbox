@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/preview"
 	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
@@ -987,6 +988,64 @@ func TestTokenPolicyNormalizationFailsClosed(t *testing.T) {
 	}, 10, 10)
 	if watermark != 0 || ports[3000].TokenVersion != 0 || ports[3001].TokenVersion != 0 {
 		t.Fatalf("malformed browser snapshot normalized to (%#v, %d), want all generations closed", ports, watermark)
+	}
+}
+
+func TestStateStorePreservesSavedRestoreFieldsAcrossOldLifecycleWrites(t *testing.T) {
+	s, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	rec := VMRecord{
+		ID:                    "vm-saved-restore-sidecar",
+		PID:                   10,
+		DiskSizeMiB:           4096,
+		EgressPolicy:          &network.EgressRules{DeniedCIDRs: []string{"0.0.0.0/0"}, SandboxID: "vm-saved-restore-sidecar"},
+		PreviewAccess:         preview.AccessPublic,
+		PreviewPolicyRevision: 3,
+	}
+	if err := s.Put(rec); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	// Model a rollback binary that knows neither disk_size_mib nor
+	// egress_policy: it rewrites only the primary lifecycle record and leaves
+	// the established sidecar bucket untouched.
+	overwritePrimaryVMRecord(t, s, VMRecord{ID: rec.ID, PID: 99})
+	got, err := s.Get(rec.ID)
+	if err != nil {
+		t.Fatalf("Get after old write: %v", err)
+	}
+	if got.PID != 99 {
+		t.Fatalf("lifecycle PID = %d, want old-writer update 99", got.PID)
+	}
+	if got.DiskSizeMiB != rec.DiskSizeMiB {
+		t.Fatalf("disk size = %d, want %d", got.DiskSizeMiB, rec.DiskSizeMiB)
+	}
+	if got.EgressPolicy == nil || len(got.EgressPolicy.DeniedCIDRs) != 1 ||
+		got.EgressPolicy.DeniedCIDRs[0] != "0.0.0.0/0" {
+		t.Fatalf("egress policy = %#v, want restrictive sidecar policy", got.EgressPolicy)
+	}
+
+	// A newer writer may legitimately advance preview policy while carrying an
+	// old lifecycle snapshot that omits the saved-restore fields. Those fields
+	// remain independently authoritative.
+	if err := s.Put(VMRecord{
+		ID:                    rec.ID,
+		PID:                   100,
+		PreviewAccess:         preview.AccessPublic,
+		PreviewPolicyRevision: 4,
+	}); err != nil {
+		t.Fatalf("Put after old lifecycle snapshot: %v", err)
+	}
+	got, err = s.Get(rec.ID)
+	if err != nil {
+		t.Fatalf("Get after rewritten sidecar: %v", err)
+	}
+	if got.PID != 100 || got.DiskSizeMiB != rec.DiskSizeMiB || got.EgressPolicy == nil {
+		t.Fatalf("record after rewrite = %#v, want lifecycle update plus saved fields", got)
 	}
 }
 

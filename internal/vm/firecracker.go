@@ -38,6 +38,13 @@ func isTornSnapshotErr(err error) bool {
 // zero holes), so the caller must use a Full/previous snapshot instead.
 var ErrLayeredInvalidSnapshot = errors.New("layered restore overlay/base pairing is invalid")
 
+// ErrSnapshotLoadRejected marks a Firecracker 400 from /snapshot/load. For a
+// saved snapshot this is a deterministic artifact rejection (for example an
+// unreadable/corrupt vmstate or memory image), rather than a transport failure
+// talking to the local daemon. The saved-snapshot boundary maps it to DataLoss;
+// connection and server failures remain retryable host errors.
+var ErrSnapshotLoadRejected = errors.New("firecracker rejected snapshot load")
+
 // layeredInvalidMarker is the exact substring the forked Firecracker embeds in its
 // error for an invalid layered restore (the GuestMemoryFromUffdError::LayeredInvalid
 // display text). Named so a fork message change is updated here, not missed at runtime.
@@ -45,6 +52,20 @@ const layeredInvalidMarker = "overlay/base pairing is invalid"
 
 func isLayeredInvalidErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), layeredInvalidMarker)
+}
+
+func wrapSnapshotLoadError(operation string, err error) error {
+	if isTornSnapshotErr(err) {
+		return fmt.Errorf("%s: %w: %v", operation, ErrTornSnapshot, err)
+	}
+	if isLayeredInvalidErr(err) {
+		return fmt.Errorf("%s: %w: %v", operation, ErrLayeredInvalidSnapshot, err)
+	}
+	var rejected *operations.LoadSnapshotBadRequest
+	if errors.As(err, &rejected) {
+		return fmt.Errorf("%s: %w: %v", operation, ErrSnapshotLoadRejected, err)
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 // Firecracker's tap-attach failure when a previous owner still holds the
@@ -99,12 +120,16 @@ type FirecrackerConfig struct {
 func newFCClient(socketPath string) *fcclient.Firecracker {
 	transport := httptransport.New(fcclient.DefaultHost, fcclient.DefaultBasePath, fcclient.DefaultSchemes)
 	transport.Transport = &http.Transport{
-		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-			addr, err := net.ResolveUnixAddr("unix", socketPath)
-			if err != nil {
-				return nil, err
-			}
-			return net.DialUnix("unix", nil, addr)
+		// A Firecracker process accepts only a small, fixed number of API
+		// connections. Each helper in this file creates a short-lived client;
+		// retaining its HTTP/1.1 idle connection therefore exhausts that limit
+		// after enough lifecycle operations and makes every later request fail
+		// with "Too many open connections". Unix-socket dials are local and
+		// cheap, so close every connection when its request completes.
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
 		},
 	}
 	c := fcclient.NewHTTPClient(strfmt.NewFormats())
@@ -286,11 +311,21 @@ const (
 // containing dirty blocks — required to create sandboxes from this template.
 // mode=SnapshotFlatten bakes those deltas into base.ext4 (see SnapshotMode).
 func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
+	return CreateSnapshotContext(context.Background(), socketPath, snapshotPath, memPath, blockDeltaDir, mode)
+}
+
+// CreateSnapshotContext is CreateSnapshot with a caller-owned deadline. Saved
+// snapshot capture uses it so a wedged Firecracker API cannot hold the per-VM
+// operation lock forever. Legacy callers retain the background-context wrapper
+// above until their lifecycle contracts grow explicit deadlines.
+func CreateSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
 	if mode == SnapshotFlatten && blockDeltaDir == "" {
 		return fmt.Errorf("SnapshotFlatten requires non-empty blockDeltaDir")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fc := newFCClient(socketPath)
-	ctx := context.Background()
 
 	// Pause the VM.
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
@@ -327,8 +362,14 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 //   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
 //     changed pages — restored over a separate base, never loaded standalone.
 func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
+	return CreateDiffSnapshotContext(context.Background(), socketPath, snapshotPath, memPath)
+}
+
+func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath string) error {
 	fc := newFCClient(socketPath)
-	ctx := context.Background()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
 		Context: ctx,
@@ -353,14 +394,43 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 // UnpauseVM resumes a paused VM's vCPUs. Used after CreateSnapshot to make
 // snapshot creation non-destructive.
 func UnpauseVM(socketPath string) error {
+	return UnpauseVMContext(context.Background(), socketPath)
+}
+
+// UnpauseVMContext resumes vCPUs with a caller-owned deadline. In particular,
+// saved capture invokes this with a fresh recovery context even when its main
+// capture context has expired, so cancellation never skips the source cleanup.
+func UnpauseVMContext(ctx context.Context, socketPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
-		Context: context.Background(),
+		Context: ctx,
 		Body:    &models.VM{State: strPtr(models.VMStateResumed)},
 	}); err != nil {
 		return fmt.Errorf("unpause VM: %w", err)
 	}
 	return nil
+}
+
+// FirecrackerVMStateContext reads the authoritative VMM state. It is used to
+// resolve an ambiguous PATCH /vm outcome: the daemon may have resumed vCPUs
+// and then lost the HTTP response, in which case retrying or failing the source
+// based on the transport error alone would be incorrect.
+func FirecrackerVMStateContext(ctx context.Context, socketPath string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	fc := newFCClient(socketPath)
+	resp, err := fc.Operations.DescribeInstance(&operations.DescribeInstanceParams{Context: ctx})
+	if err != nil {
+		return "", fmt.Errorf("describe VM state: %w", err)
+	}
+	if resp == nil || resp.Payload == nil || resp.Payload.State == nil || *resp.Payload.State == "" {
+		return "", errors.New("describe VM state returned no state")
+	}
+	return *resp.Payload.State, nil
 }
 
 // LoadSnapshotNoResume loads a snapshot but leaves the vCPUs paused — used to
@@ -387,10 +457,7 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 			BlockDeltaDir:    blockDeltaDir,
 		},
 	}); err != nil {
-		if isTornSnapshotErr(err) {
-			return fmt.Errorf("load snapshot (no-resume): %w: %v", ErrTornSnapshot, err)
-		}
-		return fmt.Errorf("load snapshot (no-resume): %w", err)
+		return wrapSnapshotLoadError("load snapshot (no-resume)", err)
 	}
 	return nil
 }
@@ -430,10 +497,7 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) er
 			BlockDeltaDir:    blockDeltaDir,
 		},
 	}); err != nil {
-		if isTornSnapshotErr(err) {
-			return fmt.Errorf("load snapshot: %w: %v", ErrTornSnapshot, err)
-		}
-		return fmt.Errorf("load snapshot: %w", err)
+		return wrapSnapshotLoadError("load snapshot", err)
 	}
 	return nil
 }
@@ -457,10 +521,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 			BlockDeltaDir: blockDeltaDir,
 		},
 	}); err != nil {
-		if isTornSnapshotErr(err) {
-			return fmt.Errorf("load snapshot: %w: %v", ErrTornSnapshot, err)
-		}
-		return fmt.Errorf("load snapshot: %w", err)
+		return wrapSnapshotLoadError("load snapshot", err)
 	}
 	return nil
 }
@@ -506,13 +567,7 @@ func RestoreSnapshotUffdInternalWithOverrides(
 			BlockDeltaDir: blockDeltaDir,
 		},
 	}); err != nil {
-		if isTornSnapshotErr(err) {
-			return fmt.Errorf("load snapshot (uffd-internal): %w: %v", ErrTornSnapshot, err)
-		}
-		if isLayeredInvalidErr(err) {
-			return fmt.Errorf("load snapshot (uffd-internal): %w: %v", ErrLayeredInvalidSnapshot, err)
-		}
-		return fmt.Errorf("load snapshot (uffd-internal): %w", err)
+		return wrapSnapshotLoadError("load snapshot (uffd-internal)", err)
 	}
 	return nil
 }

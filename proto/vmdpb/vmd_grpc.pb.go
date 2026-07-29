@@ -19,10 +19,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	VMDaemon_GetCapabilities_FullMethodName            = "/superserve.vmd.v1.VMDaemon/GetCapabilities"
 	VMDaemon_DestroyVM_FullMethodName                  = "/superserve.vmd.v1.VMDaemon/DestroyVM"
 	VMDaemon_PauseVM_FullMethodName                    = "/superserve.vmd.v1.VMDaemon/PauseVM"
 	VMDaemon_ResumeVM_FullMethodName                   = "/superserve.vmd.v1.VMDaemon/ResumeVM"
 	VMDaemon_CreateSnapshot_FullMethodName             = "/superserve.vmd.v1.VMDaemon/CreateSnapshot"
+	VMDaemon_RestoreSavedSnapshot_FullMethodName       = "/superserve.vmd.v1.VMDaemon/RestoreSavedSnapshot"
+	VMDaemon_DeleteSavedSnapshot_FullMethodName        = "/superserve.vmd.v1.VMDaemon/DeleteSavedSnapshot"
+	VMDaemon_GetWritableLayerUsage_FullMethodName      = "/superserve.vmd.v1.VMDaemon/GetWritableLayerUsage"
 	VMDaemon_RestoreSnapshot_FullMethodName            = "/superserve.vmd.v1.VMDaemon/RestoreSnapshot"
 	VMDaemon_InjectSandboxEnv_FullMethodName           = "/superserve.vmd.v1.VMDaemon/InjectSandboxEnv"
 	VMDaemon_DeleteSnapshot_FullMethodName             = "/superserve.vmd.v1.VMDaemon/DeleteSnapshot"
@@ -50,14 +54,31 @@ const (
 //
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 type VMDaemonClient interface {
+	// GetCapabilities reports optional data-plane features. Control planes must
+	// check the corresponding bit before using an optional RPC or overloaded
+	// request shape so a rolling deploy fails closed against an older VMD.
+	GetCapabilities(ctx context.Context, in *GetCapabilitiesRequest, opts ...grpc.CallOption) (*GetCapabilitiesResponse, error)
 	// DestroyVM terminates a running microVM and cleans up all associated resources.
 	DestroyVM(ctx context.Context, in *DestroyVMRequest, opts ...grpc.CallOption) (*DestroyVMResponse, error)
 	// PauseVM snapshots a running VM's state and suspends it (sleep).
 	PauseVM(ctx context.Context, in *PauseVMRequest, opts ...grpc.CallOption) (*PauseVMResponse, error)
 	// ResumeVM restores a paused VM from its snapshot, optionally into a pre-warmed slot.
 	ResumeVM(ctx context.Context, in *ResumeVMRequest, opts ...grpc.CallOption) (*ResumeVMResponse, error)
-	// CreateSnapshot captures a point-in-time snapshot of a running VM.
+	// CreateSnapshot captures a point-in-time snapshot. A non-empty snapshot_id
+	// selects immutable saved-snapshot semantics for a running or paused VM;
+	// otherwise the legacy caller-selected-directory behavior is retained.
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
+	// RestoreSavedSnapshot boots a new VM from an immutable saved-snapshot
+	// manifest. VMD resolves and validates every artifact locally and always
+	// creates a fresh writable disk layer for the new VM.
+	RestoreSavedSnapshot(ctx context.Context, in *RestoreSavedSnapshotRequest, opts ...grpc.CallOption) (*RestoreSavedSnapshotResponse, error)
+	// DeleteSavedSnapshot removes one committed saved-snapshot artifact
+	// directory. The control plane must first prove the snapshot is a leaf.
+	// Path construction is local to VMD and the operation is idempotent.
+	DeleteSavedSnapshot(ctx context.Context, in *DeleteSavedSnapshotRequest, opts ...grpc.CallOption) (*DeleteSavedSnapshotResponse, error)
+	// GetWritableLayerUsage measures the sandbox-owned persisted disk/memory
+	// generation with CoW-shared extents excluded. It is shadow accounting only.
+	GetWritableLayerUsage(ctx context.Context, in *GetWritableLayerUsageRequest, opts ...grpc.CallOption) (*GetWritableLayerUsageResponse, error)
 	// RestoreSnapshot boots a VM from a previously captured snapshot and
 	// returns its source IP. The caller must follow with InjectSandboxEnv to
 	// push env vars (and the optional secrets JWT) into the running boxd.
@@ -137,6 +158,16 @@ func NewVMDaemonClient(cc grpc.ClientConnInterface) VMDaemonClient {
 	return &vMDaemonClient{cc}
 }
 
+func (c *vMDaemonClient) GetCapabilities(ctx context.Context, in *GetCapabilitiesRequest, opts ...grpc.CallOption) (*GetCapabilitiesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetCapabilitiesResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_GetCapabilities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vMDaemonClient) DestroyVM(ctx context.Context, in *DestroyVMRequest, opts ...grpc.CallOption) (*DestroyVMResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DestroyVMResponse)
@@ -171,6 +202,36 @@ func (c *vMDaemonClient) CreateSnapshot(ctx context.Context, in *CreateSnapshotR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateSnapshotResponse)
 	err := c.cc.Invoke(ctx, VMDaemon_CreateSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) RestoreSavedSnapshot(ctx context.Context, in *RestoreSavedSnapshotRequest, opts ...grpc.CallOption) (*RestoreSavedSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RestoreSavedSnapshotResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_RestoreSavedSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) DeleteSavedSnapshot(ctx context.Context, in *DeleteSavedSnapshotRequest, opts ...grpc.CallOption) (*DeleteSavedSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSavedSnapshotResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_DeleteSavedSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMDaemonClient) GetWritableLayerUsage(ctx context.Context, in *GetWritableLayerUsageRequest, opts ...grpc.CallOption) (*GetWritableLayerUsageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetWritableLayerUsageResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_GetWritableLayerUsage_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -382,14 +443,31 @@ type VMDaemon_StreamBuildLogsClient = grpc.ServerStreamingClient[BuildLogEvent]
 //
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 type VMDaemonServer interface {
+	// GetCapabilities reports optional data-plane features. Control planes must
+	// check the corresponding bit before using an optional RPC or overloaded
+	// request shape so a rolling deploy fails closed against an older VMD.
+	GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error)
 	// DestroyVM terminates a running microVM and cleans up all associated resources.
 	DestroyVM(context.Context, *DestroyVMRequest) (*DestroyVMResponse, error)
 	// PauseVM snapshots a running VM's state and suspends it (sleep).
 	PauseVM(context.Context, *PauseVMRequest) (*PauseVMResponse, error)
 	// ResumeVM restores a paused VM from its snapshot, optionally into a pre-warmed slot.
 	ResumeVM(context.Context, *ResumeVMRequest) (*ResumeVMResponse, error)
-	// CreateSnapshot captures a point-in-time snapshot of a running VM.
+	// CreateSnapshot captures a point-in-time snapshot. A non-empty snapshot_id
+	// selects immutable saved-snapshot semantics for a running or paused VM;
+	// otherwise the legacy caller-selected-directory behavior is retained.
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
+	// RestoreSavedSnapshot boots a new VM from an immutable saved-snapshot
+	// manifest. VMD resolves and validates every artifact locally and always
+	// creates a fresh writable disk layer for the new VM.
+	RestoreSavedSnapshot(context.Context, *RestoreSavedSnapshotRequest) (*RestoreSavedSnapshotResponse, error)
+	// DeleteSavedSnapshot removes one committed saved-snapshot artifact
+	// directory. The control plane must first prove the snapshot is a leaf.
+	// Path construction is local to VMD and the operation is idempotent.
+	DeleteSavedSnapshot(context.Context, *DeleteSavedSnapshotRequest) (*DeleteSavedSnapshotResponse, error)
+	// GetWritableLayerUsage measures the sandbox-owned persisted disk/memory
+	// generation with CoW-shared extents excluded. It is shadow accounting only.
+	GetWritableLayerUsage(context.Context, *GetWritableLayerUsageRequest) (*GetWritableLayerUsageResponse, error)
 	// RestoreSnapshot boots a VM from a previously captured snapshot and
 	// returns its source IP. The caller must follow with InjectSandboxEnv to
 	// push env vars (and the optional secrets JWT) into the running boxd.
@@ -469,6 +547,9 @@ type VMDaemonServer interface {
 // pointer dereference when methods are called.
 type UnimplementedVMDaemonServer struct{}
 
+func (UnimplementedVMDaemonServer) GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCapabilities not implemented")
+}
 func (UnimplementedVMDaemonServer) DestroyVM(context.Context, *DestroyVMRequest) (*DestroyVMResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DestroyVM not implemented")
 }
@@ -480,6 +561,15 @@ func (UnimplementedVMDaemonServer) ResumeVM(context.Context, *ResumeVMRequest) (
 }
 func (UnimplementedVMDaemonServer) CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSnapshot not implemented")
+}
+func (UnimplementedVMDaemonServer) RestoreSavedSnapshot(context.Context, *RestoreSavedSnapshotRequest) (*RestoreSavedSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreSavedSnapshot not implemented")
+}
+func (UnimplementedVMDaemonServer) DeleteSavedSnapshot(context.Context, *DeleteSavedSnapshotRequest) (*DeleteSavedSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSavedSnapshot not implemented")
+}
+func (UnimplementedVMDaemonServer) GetWritableLayerUsage(context.Context, *GetWritableLayerUsageRequest) (*GetWritableLayerUsageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetWritableLayerUsage not implemented")
 }
 func (UnimplementedVMDaemonServer) RestoreSnapshot(context.Context, *RestoreSnapshotRequest) (*RestoreSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
@@ -559,6 +649,24 @@ func RegisterVMDaemonServer(s grpc.ServiceRegistrar, srv VMDaemonServer) {
 	s.RegisterService(&VMDaemon_ServiceDesc, srv)
 }
 
+func _VMDaemon_GetCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCapabilitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).GetCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_GetCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).GetCapabilities(ctx, req.(*GetCapabilitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VMDaemon_DestroyVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DestroyVMRequest)
 	if err := dec(in); err != nil {
@@ -627,6 +735,60 @@ func _VMDaemon_CreateSnapshot_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VMDaemonServer).CreateSnapshot(ctx, req.(*CreateSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_RestoreSavedSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreSavedSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).RestoreSavedSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_RestoreSavedSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).RestoreSavedSnapshot(ctx, req.(*RestoreSavedSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_DeleteSavedSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSavedSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).DeleteSavedSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_DeleteSavedSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).DeleteSavedSnapshot(ctx, req.(*DeleteSavedSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMDaemon_GetWritableLayerUsage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetWritableLayerUsageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).GetWritableLayerUsage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_GetWritableLayerUsage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).GetWritableLayerUsage(ctx, req.(*GetWritableLayerUsageRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -974,6 +1136,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*VMDaemonServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
+			MethodName: "GetCapabilities",
+			Handler:    _VMDaemon_GetCapabilities_Handler,
+		},
+		{
 			MethodName: "DestroyVM",
 			Handler:    _VMDaemon_DestroyVM_Handler,
 		},
@@ -988,6 +1154,18 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateSnapshot",
 			Handler:    _VMDaemon_CreateSnapshot_Handler,
+		},
+		{
+			MethodName: "RestoreSavedSnapshot",
+			Handler:    _VMDaemon_RestoreSavedSnapshot_Handler,
+		},
+		{
+			MethodName: "DeleteSavedSnapshot",
+			Handler:    _VMDaemon_DeleteSavedSnapshot_Handler,
+		},
+		{
+			MethodName: "GetWritableLayerUsage",
+			Handler:    _VMDaemon_GetWritableLayerUsage_Handler,
 		},
 		{
 			MethodName: "RestoreSnapshot",
