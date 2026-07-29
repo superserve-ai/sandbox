@@ -658,6 +658,15 @@ type SandboxStorageInterval struct {
 	EndReason *string            `json:"end_reason"`
 }
 
+type SavedSnapshotExpectedIndex struct {
+	IndexName  string   `json:"index_name"`
+	TableName  string   `json:"table_name"`
+	IsUnique   bool     `json:"is_unique"`
+	KeyColumns []string `json:"key_columns"`
+	Predicate  string   `json:"predicate"`
+	Definition string   `json:"definition"`
+}
+
 type Secret struct {
 	ID               uuid.UUID          `json:"id"`
 	TeamID           uuid.UUID          `json:"team_id"`
