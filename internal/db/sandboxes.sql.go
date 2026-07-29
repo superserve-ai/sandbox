@@ -14,6 +14,60 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const activateDrainedHost = `-- name: ActivateDrainedHost :one
+WITH target_host AS MATERIALIZED (
+  SELECT h.id, h.status
+  FROM host h
+  WHERE h.id = $1 AND h.status IN ('draining', 'active')
+  FOR UPDATE
+),
+activated AS (
+  UPDATE host h
+  SET status = 'active', updated_at = now()
+  FROM target_host target
+  WHERE h.id = target.id
+    AND target.status = 'draining'
+    AND NOT EXISTS (
+      SELECT 1 FROM sandbox s
+      WHERE s.host_id = target.id
+        AND s.destroyed_at IS NULL
+        AND (
+          s.status IN ('starting', 'active', 'pausing', 'resuming')
+          OR s.snapshot_operation_id IS NOT NULL
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM snapshot saved
+      WHERE saved.host_id = target.id
+        AND saved.kind = 'saved'
+        AND saved.deleted_at IS NULL
+        AND saved.status IN ('creating', 'deleting')
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM template_build build
+      WHERE build.vmd_host_id = target.id
+        AND build.status IN ('building', 'snapshotting')
+    )
+  RETURNING h.status
+)
+SELECT status FROM activated
+UNION ALL
+SELECT status FROM target_host WHERE status = 'active'
+LIMIT 1
+`
+
+// Re-admission is an explicit internal operation. Heartbeats deliberately do
+// not turn a draining host active, so only this endpoint can complete a
+// maintenance workflow's drain/deploy/verify/activate sequence. Returning an
+// already-active host is intentionally idempotent: deployment automation may
+// need to retry after activation committed but its own pending marker did not.
+func (q *Queries) ActivateDrainedHost(ctx context.Context, hostID string) (string, error) {
+	row := q.db.QueryRow(ctx, activateDrainedHost, hostID)
+	var status string
+	err := row.Scan(&status)
+	return status, err
+}
+
 const activateSandbox = `-- name: ActivateSandbox :exec
 WITH activated AS (
   UPDATE sandbox
@@ -23,7 +77,8 @@ WITH activated AS (
       ip_address = $4,
       updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
-  RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
+  RETURNING id, team_id, vcpu_count, memory_mib, disk_mib,
+            source_snapshot_id
 ),
 opened_compute AS (
   INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
@@ -45,7 +100,8 @@ opened_billing_compute AS (
 INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
-WHERE feature_enabled('billing_metrics_write', a.team_id)
+WHERE a.source_snapshot_id IS NULL
+  AND feature_enabled('billing_metrics_write', a.team_id)
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
 `
 
@@ -102,6 +158,41 @@ func (q *Queries) AdvanceSandboxPreviewPolicy(ctx context.Context, sandboxID uui
 	return i, err
 }
 
+const beginHostDrain = `-- name: BeginHostDrain :one
+WITH draining AS (
+  UPDATE host AS draining_host
+  SET status = 'draining',
+      updated_at = CASE WHEN status = 'draining' THEN updated_at ELSE now() END
+  WHERE draining_host.id = $1
+  RETURNING draining_host.id, draining_host.status
+),
+preserved AS (
+  -- Close the race with a user/timeout pause that finalized immediately before
+  -- the drain: maintenance must never inherit an armed auto-delete deadline.
+  -- FinalizePause's host-status check covers the opposite ordering.
+  UPDATE sandbox
+  SET auto_delete_at = NULL
+  WHERE sandbox.host_id IN (SELECT id FROM draining)
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.auto_delete_at IS NOT NULL
+  RETURNING sandbox.id
+)
+SELECT draining.status
+FROM draining
+LEFT JOIN (SELECT count(*) FROM preserved) preserved_count ON true
+`
+
+// Remove a host from scheduling before any sandbox is claimed. Repeating a
+// drain is intentionally idempotent: an existing draining host remains
+// draining, while unhealthy hosts are explicitly moved into draining so a
+// maintenance workflow cannot accidentally leave them schedulable later.
+func (q *Queries) BeginHostDrain(ctx context.Context, hostID string) (string, error) {
+	row := q.db.QueryRow(ctx, beginHostDrain, hostID)
+	var status string
+	err := row.Scan(&status)
+	return status, err
+}
+
 const beginPause = `-- name: BeginPause :one
 WITH paused AS (
   UPDATE sandbox
@@ -110,6 +201,7 @@ WITH paused AS (
     AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
+    AND sandbox.snapshot_operation_id IS NULL
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, source_snapshot_id, snapshot_operation_id, snapshot_operation_started_at, secret_env_keys
 ),
 closed_interval AS (
@@ -214,10 +306,47 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 }
 
 const beginResume = `-- name: BeginResume :one
+WITH sandbox_host AS MATERIALIZED (
+  SELECT s.host_id
+  FROM sandbox s
+  WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL
+),
+active_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  JOIN sandbox_host sh ON sh.host_id = h.id
+  WHERE h.status = 'active'
+  FOR UPDATE OF h
+),
+admitted_host AS MATERIALIZED (
+  SELECT id FROM active_host
+  UNION ALL
+  SELECT sh.host_id
+  FROM sandbox_host sh
+  WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+candidate AS (
+  SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.source_snapshot_id, s.snapshot_operation_id, s.snapshot_operation_started_at, s.secret_env_keys
+  FROM sandbox s
+  JOIN admitted_host ah ON ah.id = s.host_id
+  WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL
+    AND s.status = 'paused'
+    AND s.snapshot_operation_id IS NULL
+  FOR UPDATE OF s
+),
+admitted AS (
+  SELECT candidate.id
+  FROM candidate
+  WHERE candidate.source_snapshot_id IS NULL
+     OR admit_saved_snapshot_host(
+          candidate.host_id, candidate.vcpu_count, candidate.memory_mib
+        )
+)
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, source_snapshot_id, snapshot_operation_id, snapshot_operation_started_at, secret_env_keys
+FROM admitted
+WHERE sandbox.id = admitted.id
+RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.source_snapshot_id, sandbox.snapshot_operation_id, sandbox.snapshot_operation_started_at, sandbox.secret_env_keys
 `
 
 type BeginResumeParams struct {
@@ -228,7 +357,12 @@ type BeginResumeParams struct {
 // Atomic claim for resume: transitions 'paused' to 'resuming' in one
 // statement. A 0-row result means another resume (explicit or auto) has
 // already claimed the sandbox, or it's not in paused state. Used to
-// serialize concurrent /exec and /resume requests.
+// serialize concurrent /exec and /resume requests. Snapshot-derived sandboxes
+// additionally lock and re-check their pinned host capacity; this is the same
+// host-row admission boundary used by initial fan-out. Resolve and lock the
+// active host before locking/mutating the sandbox so a drain and a resume have
+// a single deadlock-free admission order. The fallback is limited to legacy
+// installations whose host table is completely empty.
 func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, beginResume, arg.ID, arg.TeamID)
 	var i Sandbox
@@ -266,13 +400,48 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 }
 
 const claimAutoDeleteSandboxes = `-- name: ClaimAutoDeleteSandboxes :many
-WITH due AS (
-  SELECT s.id
+WITH candidate_hosts AS MATERIALIZED (
+  -- Discover hosts without taking sandbox locks. The later due CTE re-checks
+  -- every deletion predicate while locking the selected sandbox rows.
+  SELECT DISTINCT s.host_id
   FROM sandbox s
   WHERE s.destroyed_at IS NULL
     AND s.status = 'paused'
+    AND s.snapshot_operation_id IS NULL
     AND s.auto_delete_at IS NOT NULL
     AND s.auto_delete_at < now()
+),
+locked_hosts AS MATERIALIZED (
+  SELECT h.id, h.status
+  FROM host h
+  JOIN candidate_hosts candidates ON candidates.host_id = h.id
+  ORDER BY h.id
+  FOR SHARE OF h
+),
+admitted_hosts AS MATERIALIZED (
+  SELECT id FROM locked_hosts WHERE status <> 'draining'
+  UNION ALL
+  -- Compatibility for pre-host-registry installations only. Once any host
+  -- row exists, an unregistered sandbox host fails closed.
+  SELECT candidates.host_id
+  FROM candidate_hosts candidates
+  WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+due AS (
+  SELECT s.id
+  FROM sandbox s
+  JOIN admitted_hosts admitted ON admitted.id = s.host_id
+  WHERE s.destroyed_at IS NULL
+    AND s.status = 'paused'
+    AND s.snapshot_operation_id IS NULL
+    AND s.auto_delete_at IS NOT NULL
+    AND s.auto_delete_at < now()
+    AND NOT EXISTS (
+      SELECT 1 FROM snapshot saved
+      WHERE saved.sandbox_id = s.id
+        AND saved.kind = 'saved'
+        AND saved.deleted_at IS NULL
+    )
   ORDER BY s.auto_delete_at ASC
   LIMIT $1
   FOR UPDATE OF s SKIP LOCKED
@@ -283,7 +452,8 @@ destroyed AS (
   FROM due
   WHERE sandbox.id = due.id
   RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
-            sandbox.base_path, sandbox.template_id
+            sandbox.base_path, sandbox.template_id,
+            sandbox.source_snapshot_id
 ),
 revoked AS (
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
@@ -311,7 +481,8 @@ closed_storage AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT d.id, d.team_id, d.name, d.host_id, d.base_path, d.template_id
+SELECT d.id, d.team_id, d.name, d.host_id, d.base_path, d.template_id,
+       d.source_snapshot_id
 FROM destroyed d
 `
 
@@ -321,20 +492,24 @@ type ClaimAutoDeleteSandboxesParams struct {
 }
 
 type ClaimAutoDeleteSandboxesRow struct {
-	ID         uuid.UUID   `json:"id"`
-	TeamID     uuid.UUID   `json:"team_id"`
-	Name       string      `json:"name"`
-	HostID     string      `json:"host_id"`
-	BasePath   *string     `json:"base_path"`
-	TemplateID pgtype.UUID `json:"template_id"`
+	ID               uuid.UUID   `json:"id"`
+	TeamID           uuid.UUID   `json:"team_id"`
+	Name             string      `json:"name"`
+	HostID           string      `json:"host_id"`
+	BasePath         *string     `json:"base_path"`
+	TemplateID       pgtype.UUID `json:"template_id"`
+	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
 }
 
 // Atomically soft-deletes paused sandboxes whose auto-delete deadline has
 // passed. Deliberately narrower than DestroySandbox: it claims from 'paused'
 // only, with the deadline re-checked under the row lock, so a concurrent
 // BeginResume (also guarded on 'paused') and this claim can never both win
-// the same row. FOR UPDATE SKIP LOCKED lets concurrent reaper replicas skip
-// in-flight rows.
+// the same row. Host rows are share-locked before any sandbox row is locked,
+// serializing with BeginHostDrain: a drain that wins first makes every row on
+// that host ineligible even if its deadline was visible in this statement's
+// original snapshot. FOR UPDATE SKIP LOCKED lets concurrent reaper replicas
+// skip in-flight rows.
 //
 // Mirrors DestroySandbox's side effects: writes the revocation row and closes
 // any open active/billing/storage intervals in the same statement, so a crash
@@ -356,6 +531,7 @@ func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDel
 			&i.HostID,
 			&i.BasePath,
 			&i.TemplateID,
+			&i.SourceSnapshotID,
 		); err != nil {
 			return nil, err
 		}
@@ -382,6 +558,7 @@ expired AS (
   WHERE s.destroyed_at IS NULL
     AND s.timeout_seconds IS NOT NULL
     AND s.status = 'active'
+    AND s.snapshot_operation_id IS NULL
     AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
     AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
   ORDER BY s.created_at ASC
@@ -467,15 +644,160 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 	return items, nil
 }
 
-const countActiveSandboxesAtBasePath = `-- name: CountActiveSandboxesAtBasePath :one
-SELECT COUNT(*)::bigint FROM sandbox
-WHERE base_path = $1 AND destroyed_at IS NULL
+const claimHostDrainSandboxes = `-- name: ClaimHostDrainSandboxes :many
+WITH draining_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  WHERE h.id = $1 AND h.status = 'draining'
+  FOR SHARE
+),
+candidates AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  JOIN draining_host h ON h.id = s.host_id
+  WHERE s.host_id = $1
+    AND s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND s.snapshot_operation_id IS NULL
+  ORDER BY s.created_at ASC
+  LIMIT $2
+  FOR UPDATE OF s SKIP LOCKED
+),
+paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM candidates
+  WHERE sandbox.id = candidates.id
+  RETURNING candidates.id, candidates.team_id, candidates.name,
+            candidates.snapshot_id, candidates.host_id
+),
+closed_intervals AS (
+  -- Both interval schemas constrain end_reason to the generic lifecycle
+  -- value 'paused'; host-drain detail remains available on snapshot.trigger
+  -- and the activity/telemetry event emitted by the shared pause saga.
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
 
-// Count of non-destroyed sandboxes still referencing this base_path. Used at
-// destroy time to decide whether the per-build artifact dir is safe to GC.
+type ClaimHostDrainSandboxesParams struct {
+	HostID    string `json:"host_id"`
+	BatchSize int32  `json:"batch_size"`
+}
+
+type ClaimHostDrainSandboxesRow struct {
+	ID         uuid.UUID   `json:"id"`
+	TeamID     uuid.UUID   `json:"team_id"`
+	Name       string      `json:"name"`
+	SnapshotID pgtype.UUID `json:"snapshot_id"`
+	HostID     string      `json:"host_id"`
+}
+
+// Atomically claim a batch of running sandboxes on one draining host. Saved
+// snapshot capture owns the sandbox row through snapshot_operation_id; those
+// rows are skipped until their operation finalizes or fails, then a later
+// drain pass claims them. SKIP LOCKED lets concurrent/idempotent drain calls
+// cooperate without double-pausing a VM. The shared draining-host lock also
+// serializes with guarded activation, so no worker can claim after re-admission.
+func (q *Queries) ClaimHostDrainSandboxes(ctx context.Context, arg ClaimHostDrainSandboxesParams) ([]ClaimHostDrainSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, claimHostDrainSandboxes, arg.HostID, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimHostDrainSandboxesRow{}
+	for rows.Next() {
+		var i ClaimHostDrainSandboxesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.SnapshotID,
+			&i.HostID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const countActiveSandboxesAtBasePath = `-- name: CountActiveSandboxesAtBasePath :one
+SELECT (
+  (SELECT count(*) FROM sandbox
+   WHERE sandbox.base_path = $1 AND sandbox.destroyed_at IS NULL)
+  +
+  (SELECT count(*) FROM snapshot
+   WHERE snapshot.base_path = $1
+     AND snapshot.kind = 'saved'
+     AND snapshot.deleted_at IS NULL)
+)::bigint
+`
+
+// Count all live references to this build path. Saved snapshots pin their
+// exact template base even after their source sandbox stops using it.
 func (q *Queries) CountActiveSandboxesAtBasePath(ctx context.Context, basePath *string) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveSandboxesAtBasePath, basePath)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countHostLifecycleActiveSandboxes = `-- name: CountHostLifecycleActiveSandboxes :one
+SELECT (
+  (SELECT count(*)
+   FROM sandbox
+   WHERE sandbox.host_id = $1
+     AND sandbox.destroyed_at IS NULL
+     AND (
+       sandbox.status IN ('starting', 'active', 'pausing', 'resuming')
+       OR sandbox.snapshot_operation_id IS NOT NULL
+     ))
+  +
+  (SELECT count(*)
+   FROM snapshot
+   WHERE snapshot.host_id = $1
+     AND snapshot.kind = 'saved'
+     AND snapshot.deleted_at IS NULL
+     AND snapshot.status IN ('creating', 'deleting'))
+  +
+  (SELECT count(*)
+   FROM template_build
+   WHERE template_build.vmd_host_id = $1
+     AND template_build.status IN ('building', 'snapshotting'))
+)::bigint
+`
+
+// A drain is complete only after both claimable active rows and lifecycle
+// transitions that may still produce an active VM have converged. Every active
+// saved-snapshot operation is included, including captures whose source is
+// paused, because those workers still write host-local snapshot storage. The
+// handler waits for operation release before declaring the host drained.
+// Creating/deleting saved-snapshot rows are counted directly as well: delete
+// releases the source sandbox claim before host-local artifact cleanup ends.
+// Building/snapshotting template builds are host-local Firecracker work and
+// remain part of convergence until their supervisor records a terminal state.
+// Failed rows are deliberately not lifecycle-active and cannot be safely
+// pause-claimed here; the maintenance workflow's host-process fence remains
+// the fail-closed backstop for any failed row that leaked a live process.
+func (q *Queries) CountHostLifecycleActiveSandboxes(ctx context.Context, hostID string) (int64, error) {
+	row := q.db.QueryRow(ctx, countHostLifecycleActiveSandboxes, hostID)
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
@@ -513,9 +835,39 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 }
 
 const createSandbox = `-- name: CreateSandbox :one
-WITH ins AS (
+WITH input_order AS MATERIALIZED (
+  -- Keep the generated sqlc call order stable for existing mocks and binaries.
+  SELECT $1::uuid, $2::uuid, $3::text,
+         $4::sandbox_status, $5::int,
+         $6::int, $7::text,
+         $8::inet, $9::int,
+         $10::uuid, $11::int,
+         $12::jsonb, $13::uuid,
+         $14::text, $15::text,
+         $16::text, $17::text,
+         $18::int,
+         $19::text
+),
+active_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  WHERE h.id = $7 AND h.status = 'active'
+  FOR SHARE
+),
+admitted_host AS MATERIALIZED (
+  SELECT id FROM active_host
+  UNION ALL
+  SELECT $7::text WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  SELECT $1, $2, $3, $4,
+         $5, $6, admitted_host.id,
+         $8, $9, $10,
+         $11, $12, $13,
+         $14, $15, $16,
+         $17, $18
+  FROM admitted_host
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, source_snapshot_id, snapshot_operation_id, snapshot_operation_started_at, secret_env_keys
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -589,6 +941,9 @@ type CreateSandboxRow struct {
 // The strict preview-policy row is created in this same statement: no caller
 // can observe a new sandbox through the rolling-deploy legacy fallback, and
 // quota admission remains statement-sized.
+// Lock the active host in the same statement so a concurrent drain either
+// wins first (0 rows) or waits and then observes this starting sandbox. The
+// fallback is only for legacy installations where the host table is empty.
 func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (CreateSandboxRow, error) {
 	row := q.db.QueryRow(ctx, createSandbox,
 		arg.ID,
@@ -645,20 +1000,205 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (C
 	return i, err
 }
 
+const createSandboxFromSnapshot = `-- name: CreateSandboxFromSnapshot :one
+WITH snap AS MATERIALIZED (
+  SELECT s.id, s.sandbox_id, s.team_id, s.path, s.size_bytes, s.trigger, s.created_at, s.mem_path, s.kind, s.status, s.name, s.idempotency_key, s.parent_snapshot_id, s.source_status, s.template_id, s.template_snapshot_path, s.template_mem_path, s.base_path, s.delta_path, s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.manifest_path, s.manifest_digest, s.artifact_metadata, s.logical_size_bytes, s.exclusive_size_bytes, s.network_config, s.timeout_seconds, s.auto_delete_seconds, s.secret_bindings, s.secret_env_keys, s.failure_reason, s.updated_at, s.finalized_at, s.deleted_at
+  FROM snapshot s
+  WHERE s.id = $1
+    AND s.team_id = $2
+    AND s.kind = 'saved'
+    AND s.status = 'ready'
+    AND s.deleted_at IS NULL
+    AND feature_enabled('sandbox_snapshots_v1', s.team_id)
+    AND admit_saved_snapshot_host(s.host_id, s.vcpu_count, s.memory_mib)
+  FOR KEY SHARE
+),
+ins AS (
+  INSERT INTO sandbox (
+  id, team_id, name, status, vcpu_count, memory_mib, disk_mib, host_id,
+  ip_address, pid, timeout_seconds, metadata, template_id, snapshot_path,
+  mem_path, base_path, delta_path, auto_delete_seconds, network_config,
+  source_snapshot_id, secret_env_keys
+  )
+  SELECT
+    $3, $2, $4, $5,
+    snap.vcpu_count, snap.memory_mib, snap.disk_mib, snap.host_id,
+    $6, $7,
+    CASE WHEN $8::boolean
+         THEN snap.timeout_seconds ELSE $9::int END,
+    $10, snap.template_id, snap.template_snapshot_path,
+    snap.template_mem_path, snap.base_path, snap.delta_path,
+    CASE WHEN $11::boolean
+         THEN snap.auto_delete_seconds ELSE $12::int END,
+    CASE WHEN $13::boolean
+         THEN snap.network_config ELSE $14::jsonb END,
+    snap.id, snap.secret_env_keys
+  FROM snap
+  RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.source_snapshot_id, sandbox.snapshot_operation_id, sandbox.snapshot_operation_started_at, sandbox.secret_env_keys
+),
+preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, $15::text, 0 FROM ins
+  RETURNING sandbox_id
+)
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.source_snapshot_id, ins.snapshot_operation_id, ins.snapshot_operation_started_at, ins.secret_env_keys FROM ins
+`
+
+type CreateSandboxFromSnapshotParams struct {
+	SourceSnapshotID         uuid.UUID     `json:"source_snapshot_id"`
+	TeamID                   uuid.UUID     `json:"team_id"`
+	ID                       uuid.UUID     `json:"id"`
+	Name                     string        `json:"name"`
+	Status                   SandboxStatus `json:"status"`
+	IpAddress                *netip.Addr   `json:"ip_address"`
+	Pid                      *int32        `json:"pid"`
+	InheritTimeoutSeconds    bool          `json:"inherit_timeout_seconds"`
+	TimeoutSeconds           *int32        `json:"timeout_seconds"`
+	Metadata                 []byte        `json:"metadata"`
+	InheritAutoDeleteSeconds bool          `json:"inherit_auto_delete_seconds"`
+	AutoDeleteSeconds        *int32        `json:"auto_delete_seconds"`
+	InheritNetworkConfig     bool          `json:"inherit_network_config"`
+	NetworkConfig            []byte        `json:"network_config"`
+	PreviewAccess            string        `json:"preview_access"`
+}
+
+type CreateSandboxFromSnapshotRow struct {
+	ID                         uuid.UUID          `json:"id"`
+	TeamID                     uuid.UUID          `json:"team_id"`
+	Name                       string             `json:"name"`
+	Status                     SandboxStatus      `json:"status"`
+	VcpuCount                  int32              `json:"vcpu_count"`
+	MemoryMib                  int32              `json:"memory_mib"`
+	HostID                     string             `json:"host_id"`
+	IpAddress                  *netip.Addr        `json:"ip_address"`
+	Pid                        *int32             `json:"pid"`
+	SnapshotID                 pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt                  time.Time          `json:"created_at"`
+	UpdatedAt                  time.Time          `json:"updated_at"`
+	DestroyedAt                pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig              []byte             `json:"network_config"`
+	TimeoutSeconds             *int32             `json:"timeout_seconds"`
+	Metadata                   []byte             `json:"metadata"`
+	TemplateID                 pgtype.UUID        `json:"template_id"`
+	SnapshotPath               *string            `json:"snapshot_path"`
+	MemPath                    *string            `json:"mem_path"`
+	BasePath                   *string            `json:"base_path"`
+	DeltaPath                  *string            `json:"delta_path"`
+	DiskMib                    int32              `json:"disk_mib"`
+	AutoDeleteSeconds          *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt               pgtype.Timestamptz `json:"auto_delete_at"`
+	SourceSnapshotID           pgtype.UUID        `json:"source_snapshot_id"`
+	SnapshotOperationID        pgtype.UUID        `json:"snapshot_operation_id"`
+	SnapshotOperationStartedAt pgtype.Timestamptz `json:"snapshot_operation_started_at"`
+	SecretEnvKeys              []byte             `json:"secret_env_keys"`
+}
+
+// Fork insert. The saved snapshot row is locked against leaf deletion and is
+// re-validated as ready/team-owned/feature-enabled in the same statement that
+// creates the durable child reference. Immutable resource shape and pinned
+// template-build paths always come from the snapshot. Policy fields use an
+// explicit inherit bit so NULL can remain a meaningful full replacement.
+func (q *Queries) CreateSandboxFromSnapshot(ctx context.Context, arg CreateSandboxFromSnapshotParams) (CreateSandboxFromSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, createSandboxFromSnapshot,
+		arg.SourceSnapshotID,
+		arg.TeamID,
+		arg.ID,
+		arg.Name,
+		arg.Status,
+		arg.IpAddress,
+		arg.Pid,
+		arg.InheritTimeoutSeconds,
+		arg.TimeoutSeconds,
+		arg.Metadata,
+		arg.InheritAutoDeleteSeconds,
+		arg.AutoDeleteSeconds,
+		arg.InheritNetworkConfig,
+		arg.NetworkConfig,
+		arg.PreviewAccess,
+	)
+	var i CreateSandboxFromSnapshotRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.DiskMib,
+		&i.AutoDeleteSeconds,
+		&i.AutoDeleteAt,
+		&i.SourceSnapshotID,
+		&i.SnapshotOperationID,
+		&i.SnapshotOperationStartedAt,
+		&i.SecretEnvKeys,
+	)
+	return i, err
+}
+
 const createSandboxFromTemplate = `-- name: CreateSandboxFromTemplate :one
-WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+WITH input_order AS MATERIALIZED (
+  -- The owner-team parameter is reused rather than duplicated; otherwise keep
+  -- the legacy create argument order so SQL-mocking callers stay stable.
+  SELECT $1::uuid, $2::uuid, $3::text,
+         $4::sandbox_status, $5::int,
+         $6::int, $7::text,
+         $8::inet, $9::int,
+         $10::uuid, $11::int,
+         $12::jsonb, $13::uuid,
+         $14::uuid, $15::text,
+         $16::text, $17::text,
+         $18::text, $19::int,
+         $20::text
+),
+active_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  WHERE h.id = $7 AND h.status = 'active'
+  FOR SHARE
+),
+admitted_host AS MATERIALIZED (
+  SELECT id FROM active_host
+  UNION ALL
+  SELECT $7::text WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+tpl AS MATERIALIZED (
+  SELECT t.id AS tpl_id, t.disk_mib, admitted_host.id AS host_id
+  FROM template t
+  CROSS JOIN admitted_host
   WHERE t.id = $13
     AND t.deleted_at IS NULL
-    AND (t.team_id = $14 OR t.team_id = $15)
-  FOR KEY SHARE
+    AND (t.team_id = $2
+         OR t.team_id = $14)
+  FOR KEY SHARE OF t
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  SELECT $1, $2, $3, $4,
+         $5, $6, tpl.host_id,
+         $8, $9, $10,
+         $11, $12, tpl.tpl_id,
+         $15, $16, $17,
+         $18, tpl.disk_mib,
+         $19
+  FROM tpl
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, source_snapshot_id, snapshot_operation_id, snapshot_operation_started_at, secret_env_keys
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
-  SELECT ins.id, $21::text, 0 FROM ins
+  SELECT ins.id, $20::text, 0 FROM ins
   RETURNING sandbox_id
 )
 SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.source_snapshot_id, ins.snapshot_operation_id, ins.snapshot_operation_started_at, ins.secret_env_keys FROM ins
@@ -678,9 +1218,8 @@ type CreateSandboxFromTemplateParams struct {
 	SnapshotID        pgtype.UUID   `json:"snapshot_id"`
 	TimeoutSeconds    *int32        `json:"timeout_seconds"`
 	Metadata          []byte        `json:"metadata"`
-	ID_2              uuid.UUID     `json:"id_2"`
-	TeamID_2          uuid.UUID     `json:"team_id_2"`
-	TeamID_3          uuid.UUID     `json:"team_id_3"`
+	TemplateID        uuid.UUID     `json:"template_id"`
+	SystemTeamID      uuid.UUID     `json:"system_team_id"`
 	SnapshotPath      *string       `json:"snapshot_path"`
 	MemPath           *string       `json:"mem_path"`
 	BasePath          *string       `json:"base_path"`
@@ -738,9 +1277,8 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		arg.SnapshotID,
 		arg.TimeoutSeconds,
 		arg.Metadata,
-		arg.ID_2,
-		arg.TeamID_2,
-		arg.TeamID_3,
+		arg.TemplateID,
+		arg.SystemTeamID,
 		arg.SnapshotPath,
 		arg.MemPath,
 		arg.BasePath,
@@ -783,15 +1321,47 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 }
 
 const createSandboxFromTemplateWithSecrets = `-- name: CreateSandboxFromTemplateWithSecrets :one
-WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+WITH input_order AS MATERIALIZED (
+  -- Preserve this variant's pre-existing template/owner-first call order.
+  SELECT $1::uuid, $2::uuid,
+         $3::uuid, $4::uuid,
+         $5::text, $6::sandbox_status,
+         $7::int, $8::int,
+         $9::text, $10::inet,
+         $11::int, $12::uuid,
+         $13::int, $14::jsonb,
+         $15::text, $16::text,
+         $17::text, $18::text,
+         $19::int,
+         $20::text, $21::uuid[],
+         $22::text[], $23::text[]
+),
+active_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  WHERE h.id = $9 AND h.status = 'active'
+  FOR SHARE
+),
+admitted_host AS MATERIALIZED (
+  SELECT id FROM active_host
+  UNION ALL
+  SELECT $9::text WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+tpl AS MATERIALIZED (
+  SELECT t.id AS tpl_id, t.disk_mib, admitted_host.id AS host_id
+  FROM template t
+  CROSS JOIN admitted_host
   WHERE t.id = $1
     AND t.deleted_at IS NULL
     AND (t.team_id = $2 OR t.team_id = $3)
-  FOR KEY SHARE
+  FOR KEY SHARE OF t
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $4, $2, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, tpl_id, $15, $16, $17, $18, disk_mib, $19 FROM tpl
+  SELECT $4, $2, $5, $6, $7, $8,
+         tpl.host_id, $10, $11, $12, $13,
+         $14, tpl.tpl_id, $15, $16, $17,
+         $18, tpl.disk_mib, $19
+  FROM tpl
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, source_snapshot_id, snapshot_operation_id, snapshot_operation_started_at, secret_env_keys
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -929,9 +1499,37 @@ func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg 
 }
 
 const createSandboxWithSecrets = `-- name: CreateSandboxWithSecrets :one
-WITH ins AS (
+WITH input_order AS MATERIALIZED (
+  SELECT $1::uuid, $2::uuid, $3::text,
+         $4::sandbox_status, $5::int,
+         $6::int, $7::text,
+         $8::inet, $9::int,
+         $10::uuid, $11::int,
+         $12::jsonb, $13::uuid,
+         $14::text, $15::text,
+         $16::text, $17::text,
+         $18::int,
+         $19::text, $20::uuid[],
+         $21::text[], $22::text[]
+),
+active_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  WHERE h.id = $7 AND h.status = 'active'
+  FOR SHARE
+),
+admitted_host AS MATERIALIZED (
+  SELECT id FROM active_host
+  UNION ALL
+  SELECT $7::text WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  SELECT $1, $2, $3, $4, $5, $6,
+         admitted_host.id, $8, $9, $10, $11,
+         $12, $13, $14, $15, $16,
+         $17, $18
+  FROM admitted_host
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, source_snapshot_id, snapshot_operation_id, snapshot_operation_started_at, secret_env_keys
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -1072,6 +1670,13 @@ WITH destroyed AS (
   SET destroyed_at = now(), status = 'deleted', updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL
+    AND sandbox.snapshot_operation_id IS NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM snapshot saved
+      WHERE saved.sandbox_id = sandbox.id
+        AND saved.kind = 'saved'
+        AND saved.deleted_at IS NULL
+    )
     AND (
       sandbox.status IN ('active', 'paused', 'failed')
       OR (sandbox.status IN ('starting', 'resuming', 'pausing')
@@ -1160,39 +1765,80 @@ func (q *Queries) EnsureSandboxPreviewPolicy(ctx context.Context, arg EnsureSand
 }
 
 const finalizePause = `-- name: FinalizePause :one
-WITH target AS (
-  SELECT id, team_id FROM sandbox
-  WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-    AND status IN ('pausing', 'resuming')
+WITH sandbox_host AS MATERIALIZED (
+  SELECT s.host_id
+  FROM sandbox s
+  WHERE s.id = $2::uuid
+    AND s.team_id = $1::uuid
+    AND s.destroyed_at IS NULL
+),
+locked_host AS MATERIALIZED (
+  SELECT h.id, h.status
+  FROM host h
+  JOIN sandbox_host sh ON sh.host_id = h.id
+  FOR SHARE OF h
+),
+host_state AS MATERIALIZED (
+  SELECT id, status FROM locked_host
+  UNION ALL
+  SELECT sh.host_id, 'active'::text
+  FROM sandbox_host sh
+  WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+target AS MATERIALIZED (
+  SELECT s.id, s.team_id, hs.status AS host_status
+  FROM sandbox s
+  JOIN host_state hs ON hs.id = s.host_id
+  WHERE s.id = $2::uuid
+    AND s.team_id = $1::uuid
+    AND s.destroyed_at IS NULL
+    AND s.status IN ('pausing', 'resuming')
+  FOR UPDATE OF s
 ),
 upserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6 FROM target
-  ON CONFLICT (sandbox_id)
+  INSERT INTO snapshot (
+    sandbox_id, team_id, path, mem_path, size_bytes, trigger, kind, status
+  )
+  SELECT target.id, target.team_id,
+         $3::text,
+         $4::text,
+         $5::bigint,
+         $6::text,
+         'runtime_checkpoint', 'ready'
+  FROM target
+  ON CONFLICT (sandbox_id) WHERE kind = 'runtime_checkpoint'
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
     size_bytes = EXCLUDED.size_bytes,
     trigger = EXCLUDED.trigger
-  RETURNING snapshot.id AS snap_id
+  RETURNING snapshot.id AS snap_id, snapshot.trigger AS snapshot_trigger
 )
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM upserted),
     status = 'paused',
-    -- Arm the auto-delete deadline as the sandbox lands in 'paused'.
+    -- Maintenance drains must preserve sandboxes throughout deploy/verify:
+    -- unlike user/timeout pauses, they deliberately do not arm auto-delete.
     -- make_interval(NULL) propagates NULL, so an unset auto_delete_seconds
-    -- leaves the deadline NULL (never deleted).
-    auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
+    -- also leaves the ordinary pause deadline NULL (never deleted).
+    auto_delete_at = CASE
+      WHEN upserted.snapshot_trigger = 'host_drain'
+        OR target.host_status = 'draining'
+      THEN NULL
+      ELSE now() + make_interval(secs => sandbox.auto_delete_seconds)
+    END,
     updated_at = now()
-FROM upserted
-WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+FROM upserted, target
+WHERE sandbox.id = target.id
+  AND sandbox.team_id = $1::uuid
+  AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
 RETURNING upserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseParams struct {
-	ID        uuid.UUID `json:"id"`
 	TeamID    uuid.UUID `json:"team_id"`
+	ID        uuid.UUID `json:"id"`
 	Path      string    `json:"path"`
 	MemPath   *string   `json:"mem_path"`
 	SizeBytes int64     `json:"size_bytes"`
@@ -1207,10 +1853,15 @@ type FinalizePauseParams struct {
 // arm its auto-delete deadline.
 // One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
 // the UPSERT.
+// Lock order is host then sandbox. This gives maintenance a real serialization
+// boundary instead of relying on a host-status read from the statement's old
+// MVCC snapshot: whichever operation gets the host lock first determines
+// whether BeginHostDrain clears an ordinary deadline or FinalizePause leaves it
+// NULL directly.
 func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, finalizePause,
-		arg.ID,
 		arg.TeamID,
+		arg.ID,
 		arg.Path,
 		arg.MemPath,
 		arg.SizeBytes,
@@ -1368,6 +2019,32 @@ func (q *Queries) GetSandboxPreviewPolicy(ctx context.Context, arg GetSandboxPre
 	return i, err
 }
 
+const getSandboxSnapshotDependencyCounts = `-- name: GetSandboxSnapshotDependencyCounts :one
+SELECT count(*)::bigint AS saved_snapshot_count
+FROM sandbox source
+JOIN snapshot saved ON saved.sandbox_id = source.id
+WHERE source.id = $1
+  AND source.team_id = $2
+  AND source.destroyed_at IS NULL
+  AND saved.kind = 'saved'
+  AND saved.deleted_at IS NULL
+`
+
+type GetSandboxSnapshotDependencyCountsParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+}
+
+// Saved snapshots owned by this sandbox block ordinary sandbox deletion. Child
+// sandboxes created from one of those snapshots are reported separately by the
+// snapshot dependency methods.
+func (q *Queries) GetSandboxSnapshotDependencyCounts(ctx context.Context, arg GetSandboxSnapshotDependencyCountsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getSandboxSnapshotDependencyCounts, arg.SandboxID, arg.TeamID)
+	var saved_snapshot_count int64
+	err := row.Scan(&saved_snapshot_count)
+	return saved_snapshot_count, err
+}
+
 const getSandboxStatusForPreviewMutation = `-- name: GetSandboxStatusForPreviewMutation :one
 SELECT status FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
@@ -1387,13 +2064,69 @@ func (q *Queries) GetSandboxStatusForPreviewMutation(ctx context.Context, arg Ge
 	return status, err
 }
 
-const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
-SELECT DISTINCT base_path FROM sandbox
-WHERE base_path IS NOT NULL AND destroyed_at IS NULL
+const listDestroyedSnapshotForksPendingPinRelease = `-- name: ListDestroyedSnapshotForksPendingPinRelease :many
+SELECT id, team_id, host_id, base_path, template_id, source_snapshot_id
+FROM sandbox
+WHERE destroyed_at IS NOT NULL
+  AND source_snapshot_id IS NOT NULL
+ORDER BY destroyed_at ASC, id ASC
+LIMIT $1
 `
 
-// Reconciler input: distinct base_path values held by non-destroyed
-// sandboxes. Their builds must survive even if the template moved on.
+type ListDestroyedSnapshotForksPendingPinReleaseRow struct {
+	ID               uuid.UUID   `json:"id"`
+	TeamID           uuid.UUID   `json:"team_id"`
+	HostID           string      `json:"host_id"`
+	BasePath         *string     `json:"base_path"`
+	TemplateID       pgtype.UUID `json:"template_id"`
+	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
+}
+
+// A destroyed fork keeps its saved-snapshot dependency until exact-host VM
+// teardown succeeds. Reconciliation consumes this bounded queue and releases
+// the pin only after that host-side outcome is known.
+func (q *Queries) ListDestroyedSnapshotForksPendingPinRelease(ctx context.Context, batchSize int32) ([]ListDestroyedSnapshotForksPendingPinReleaseRow, error) {
+	rows, err := q.db.Query(ctx, listDestroyedSnapshotForksPendingPinRelease, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDestroyedSnapshotForksPendingPinReleaseRow{}
+	for rows.Next() {
+		var i ListDestroyedSnapshotForksPendingPinReleaseRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.HostID,
+			&i.BasePath,
+			&i.TemplateID,
+			&i.SourceSnapshotID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
+SELECT DISTINCT pins.base_path
+FROM (
+  SELECT base_path FROM sandbox
+  WHERE base_path IS NOT NULL AND destroyed_at IS NULL
+  UNION
+  SELECT base_path FROM snapshot
+  WHERE base_path IS NOT NULL
+    AND kind = 'saved'
+    AND deleted_at IS NULL
+) pins
+`
+
+// Reconciler input: every build path pinned by a live sandbox or saved
+// snapshot. Their builds must survive even if the template moves on.
 func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 	rows, err := q.db.Query(ctx, listPinnedBuildPaths)
 	if err != nil {
@@ -1529,7 +2262,8 @@ func (q *Queries) ListSandboxPreviewPoliciesByTeam(ctx context.Context, teamID u
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
 SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.source_snapshot_id, s.snapshot_operation_id, s.snapshot_operation_started_at, s.secret_env_keys, snap.path AS snapshot_path
 FROM sandbox s
-LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
+LEFT JOIN snapshot snap
+  ON snap.id = s.snapshot_id AND snap.kind = 'runtime_checkpoint'
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL
 `
 
@@ -1688,6 +2422,59 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 	return items, nil
 }
 
+const lockSandboxForCapturedMutation = `-- name: LockSandboxForCapturedMutation :one
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, source_snapshot_id, snapshot_operation_id, snapshot_operation_started_at, secret_env_keys FROM sandbox
+WHERE id = $1
+  AND team_id = $2
+  AND destroyed_at IS NULL
+FOR UPDATE
+`
+
+type LockSandboxForCapturedMutationParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+// Call after LockSandboxForSecretWrites in the same transaction. The advisory
+// lock serializes with secret binding changes and saved-snapshot admission;
+// this row lock additionally excludes pause/resume/delete while a live policy
+// is applied and persisted.
+func (q *Queries) LockSandboxForCapturedMutation(ctx context.Context, arg LockSandboxForCapturedMutationParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, lockSandboxForCapturedMutation, arg.ID, arg.TeamID)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.DiskMib,
+		&i.AutoDeleteSeconds,
+		&i.AutoDeleteAt,
+		&i.SourceSnapshotID,
+		&i.SnapshotOperationID,
+		&i.SnapshotOperationStartedAt,
+		&i.SecretEnvKeys,
+	)
+	return i, err
+}
+
 const lockSandboxForPreviewMutation = `-- name: LockSandboxForPreviewMutation :one
 SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
@@ -1716,6 +2503,7 @@ WITH failed AS (
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+    AND sandbox.snapshot_operation_id IS NULL
   RETURNING id
 ),
 closed_active AS (
@@ -1746,6 +2534,7 @@ WITH failed AS (
   UPDATE sandbox
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+    AND sandbox.snapshot_operation_id IS NULL
   RETURNING id
 ),
 closed_active AS (
@@ -1811,26 +2600,92 @@ func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (Publi
 	return i, err
 }
 
+const releaseDestroyedSandboxSnapshotPin = `-- name: ReleaseDestroyedSandboxSnapshotPin :one
+UPDATE sandbox
+SET source_snapshot_id = NULL,
+    updated_at = now()
+WHERE id = $1
+  AND team_id = $2
+  AND source_snapshot_id = $3
+  AND destroyed_at IS NOT NULL
+RETURNING id
+`
+
+type ReleaseDestroyedSandboxSnapshotPinParams struct {
+	SandboxID        uuid.UUID   `json:"sandbox_id"`
+	TeamID           uuid.UUID   `json:"team_id"`
+	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
+}
+
+// The expected snapshot guards a stale reconciliation result. A live sandbox
+// can never lose its lineage through this cleanup path.
+func (q *Queries) ReleaseDestroyedSandboxSnapshotPin(ctx context.Context, arg ReleaseDestroyedSandboxSnapshotPinParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, releaseDestroyedSandboxSnapshotPin, arg.SandboxID, arg.TeamID, arg.SourceSnapshotID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
+WITH sandbox_host AS MATERIALIZED (
+  SELECT s.host_id
+  FROM sandbox s
+  WHERE s.id = $2::uuid
+    AND s.team_id = $1::uuid
+    AND s.destroyed_at IS NULL
+),
+locked_host AS MATERIALIZED (
+  SELECT h.id, h.status
+  FROM host h
+  JOIN sandbox_host sh ON sh.host_id = h.id
+  FOR SHARE OF h
+),
+host_state AS MATERIALIZED (
+  SELECT id, status FROM locked_host
+  UNION ALL
+  SELECT sh.host_id, 'active'::text
+  FROM sandbox_host sh
+  WHERE NOT EXISTS (SELECT 1 FROM host)
+),
+target AS MATERIALIZED (
+  SELECT s.id, hs.status AS host_status
+  FROM sandbox s
+  JOIN host_state hs ON hs.id = s.host_id
+  WHERE s.id = $2::uuid
+    AND s.team_id = $1::uuid
+    AND s.destroyed_at IS NULL
+    AND s.status = 'resuming'
+  FOR UPDATE OF s
+)
 UPDATE sandbox
 SET status = 'paused',
     -- Re-arm the auto-delete deadline cleared by BeginResume; the sandbox is
-    -- paused again, so it gets a fresh window.
-    auto_delete_at = now() + make_interval(secs => auto_delete_seconds),
+    -- paused again, so it gets a fresh window unless its host is draining.
+    auto_delete_at = CASE WHEN target.host_status = 'draining'
+      THEN NULL
+      ELSE now() + make_interval(secs => sandbox.auto_delete_seconds)
+    END,
     updated_at = now()
-WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming'
+FROM target
+WHERE sandbox.id = target.id
+  AND sandbox.team_id = $1::uuid
+  AND sandbox.destroyed_at IS NULL
+  AND sandbox.status = 'resuming'
 `
 
 type RevertResumeToPausedParams struct {
-	ID     uuid.UUID `json:"id"`
 	TeamID uuid.UUID `json:"team_id"`
+	ID     uuid.UUID `json:"id"`
 }
 
 // Compensate a failed resume attempt by flipping status back to 'paused'.
 // Guarded on status = 'resuming' so we never clobber a concurrent transition
 // (e.g., ActivateSandbox has already flipped to 'active').
+// Resolve and share-lock the host before locking the sandbox. If maintenance
+// won the host lock first, compensation restores paused state without arming a
+// deadline; if compensation won first, BeginHostDrain waits and then clears it.
 func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPausedParams) error {
-	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID)
+	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.TeamID, arg.ID)
 	return err
 }
 
@@ -1902,19 +2757,45 @@ func (q *Queries) UnpublishPort(ctx context.Context, arg UnpublishPortParams) (i
 }
 
 const updateSandboxAutoDelete = `-- name: UpdateSandboxAutoDelete :execrows
+WITH sandbox_host AS MATERIALIZED (
+  SELECT s.host_id
+  FROM sandbox s
+  WHERE s.id = $2
+    AND s.team_id = $3
+    AND s.destroyed_at IS NULL
+),
+locked_host AS MATERIALIZED (
+  SELECT h.id, h.status
+  FROM host h
+  JOIN sandbox_host sh ON sh.host_id = h.id
+  FOR SHARE OF h
+),
+host_state AS MATERIALIZED (
+  SELECT id, status FROM locked_host
+  UNION ALL
+  SELECT sh.host_id, 'active'::text
+  FROM sandbox_host sh
+  WHERE NOT EXISTS (SELECT 1 FROM host)
+)
 UPDATE sandbox
-SET auto_delete_seconds = $2,
-    auto_delete_at = CASE WHEN status = 'paused'
-      THEN now() + make_interval(secs => $2::int::double precision)
+SET auto_delete_seconds = $1,
+    auto_delete_at = CASE WHEN sandbox.status = 'paused'
+      AND host_state.status <> 'draining'
+      THEN now() + make_interval(secs => $1::int::double precision)
       ELSE NULL
     END,
     updated_at = now()
-WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+FROM host_state
+WHERE sandbox.id = $2
+  AND sandbox.team_id = $3
+  AND sandbox.host_id = host_state.id
+  AND sandbox.destroyed_at IS NULL
+  AND sandbox.snapshot_operation_id IS NULL
 `
 
 type UpdateSandboxAutoDeleteParams struct {
-	ID                uuid.UUID `json:"id"`
 	AutoDeleteSeconds *int32    `json:"auto_delete_seconds"`
+	ID                uuid.UUID `json:"id"`
 	TeamID            uuid.UUID `json:"team_id"`
 }
 
@@ -1926,7 +2807,7 @@ type UpdateSandboxAutoDeleteParams struct {
 // Keep the ::int::double precision cast: the param is used as both the integer
 // column and make_interval's double arg; without it Postgres errors 42P08.
 func (q *Queries) UpdateSandboxAutoDelete(ctx context.Context, arg UpdateSandboxAutoDeleteParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateSandboxAutoDelete, arg.ID, arg.AutoDeleteSeconds, arg.TeamID)
+	result, err := q.db.Exec(ctx, updateSandboxAutoDelete, arg.AutoDeleteSeconds, arg.ID, arg.TeamID)
 	if err != nil {
 		return 0, err
 	}
@@ -1975,10 +2856,11 @@ func (q *Queries) UpdateSandboxMetadata(ctx context.Context, arg UpdateSandboxMe
 	return err
 }
 
-const updateSandboxNetworkConfig = `-- name: UpdateSandboxNetworkConfig :exec
+const updateSandboxNetworkConfig = `-- name: UpdateSandboxNetworkConfig :execrows
 UPDATE sandbox
 SET network_config = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+  AND snapshot_operation_id IS NULL
 `
 
 type UpdateSandboxNetworkConfigParams struct {
@@ -1987,9 +2869,12 @@ type UpdateSandboxNetworkConfigParams struct {
 	TeamID        uuid.UUID `json:"team_id"`
 }
 
-func (q *Queries) UpdateSandboxNetworkConfig(ctx context.Context, arg UpdateSandboxNetworkConfigParams) error {
-	_, err := q.db.Exec(ctx, updateSandboxNetworkConfig, arg.ID, arg.NetworkConfig, arg.TeamID)
-	return err
+func (q *Queries) UpdateSandboxNetworkConfig(ctx context.Context, arg UpdateSandboxNetworkConfigParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateSandboxNetworkConfig, arg.ID, arg.NetworkConfig, arg.TeamID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateSandboxPreviewAccess = `-- name: UpdateSandboxPreviewAccess :execrows
@@ -2038,6 +2923,7 @@ UPDATE sandbox
 SET timeout_seconds = $2,
     updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+  AND snapshot_operation_id IS NULL
 `
 
 type UpdateSandboxTimeoutParams struct {

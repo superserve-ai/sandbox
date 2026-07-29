@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -223,7 +225,8 @@ func run() error {
 		}
 		return telemetry.WrapVMDClient(newGRPCVMDClient(conn), recorder, api.SandboxIDRegion(), hostID), nil
 	}
-	handlers.Hosts = hostreg.New(queries, dialVMD)
+	hostRegistry := hostreg.New(queries, dialVMD)
+	handlers.Hosts = hostRegistry
 	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 	handlers.Scheduler = sched
 
@@ -241,18 +244,65 @@ func run() error {
 		if hostID == "" || handlers.Hosts == nil {
 			return vmdClient, nil
 		}
-		c, err := handlers.Hosts.ClientFor(rctx, hostID)
+		// Poll/cancel/reconcile must remain able to reach work admitted before a
+		// host began draining. Only BuildTemplate is new admission; the wrapper
+		// rechecks active status at that exact side-effect boundary.
+		c, err := hostRegistry.ClientFor(rctx, hostID)
 		if err != nil {
-			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: host lookup failed, using default client")
-			return vmdClient, nil
+			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: build host lookup failed")
+			return nil, err
 		}
-		return c, nil
+		return &buildAdmissionClient{
+			Client: c,
+			active: func(ctx context.Context) (vmdclient.Client, error) {
+				return hostRegistry.ActiveClientFor(ctx, hostID)
+			},
+		}, nil
 	}
 	supervisor.NewBuildSupervisor(
 		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
 		queries,
 		buildResolver,
 	).WithAnalytics(analyticsClient).WithFinalizeHook(api.InvalidateTemplateCache).Start(ctx)
+
+	// Repair saved-snapshot captures and deletes interrupted by a control-plane
+	// restart or transient DB/VMD outage. V1 artifacts are host-local, so these
+	// resolvers deliberately have no default-host fallback. Reconciliation uses
+	// status-agnostic exact-host lookup because it repairs work admitted before
+	// a host entered draining; new capture/fork admission uses ActiveClientFor.
+	savedSnapshotResolver := func(rctx context.Context, hostID string) (vmdclient.SavedSnapshotClient, error) {
+		if hostID == "" || handlers.Hosts == nil {
+			return nil, fmt.Errorf("saved snapshot has no resolvable host")
+		}
+		client, err := hostRegistry.ClientFor(rctx, hostID)
+		if err != nil {
+			return nil, err
+		}
+		savedClient, ok := client.(vmdclient.SavedSnapshotClient)
+		if !ok {
+			return nil, fmt.Errorf("VMD host %q does not support saved snapshots", hostID)
+		}
+		return savedClient, nil
+	}
+	savedSnapshotCleanupResolver := func(rctx context.Context, hostID string) (vmdclient.SavedSnapshotClient, error) {
+		if hostID == "" {
+			return nil, fmt.Errorf("saved snapshot has no resolvable host")
+		}
+		client, err := hostRegistry.ClientFor(rctx, hostID)
+		if err != nil {
+			return nil, err
+		}
+		savedClient, ok := client.(vmdclient.SavedSnapshotClient)
+		if !ok {
+			return nil, fmt.Errorf("VMD host %q does not support saved snapshots", hostID)
+		}
+		return savedClient, nil
+	}
+	supervisor.NewSavedSnapshotSupervisor(
+		supervisor.DefaultSavedSnapshotSupervisorConfig(),
+		queries,
+		savedSnapshotResolver,
+	).WithCleanupResolver(savedSnapshotCleanupResolver).WithTelemetry(recorder).Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
@@ -367,6 +417,22 @@ type grpcVMDClient struct {
 	client vmdpb.VMDaemonClient
 }
 
+// buildAdmissionClient keeps status/poll/cancel calls available for an
+// already-running template build while applying the active-host fence only to
+// the RPC that can launch a new Firecracker process.
+type buildAdmissionClient struct {
+	vmdclient.Client
+	active func(context.Context) (vmdclient.Client, error)
+}
+
+func (c *buildAdmissionClient) BuildTemplate(ctx context.Context, req vmdclient.BuildTemplateInput) (string, error) {
+	active, err := c.active(ctx)
+	if err != nil {
+		return "", err
+	}
+	return active.BuildTemplate(ctx, req)
+}
+
 func newGRPCVMDClient(conn *grpc.ClientConn) *grpcVMDClient {
 	return &grpcVMDClient{
 		conn:   conn,
@@ -394,6 +460,112 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 		return "", "", fmt.Errorf("gRPC PauseVM: %w", err)
 	}
 	return resp.SnapshotPath, resp.MemFilePath, nil
+}
+
+func (c *grpcVMDClient) CheckSavedSnapshotSupport(ctx context.Context) error {
+	resp, err := c.client.GetCapabilities(ctx, &vmdpb.GetCapabilitiesRequest{})
+	if err != nil {
+		return fmt.Errorf("gRPC GetCapabilities: %w", vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationCapabilityCheck, err))
+	}
+	if resp == nil || !resp.GetSavedSnapshotsV1() {
+		return grpcstatus.Error(grpccodes.Unimplemented, "VMD does not advertise saved_snapshots_v1")
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) CreateSavedSnapshot(ctx context.Context, sourceInstanceID, snapshotID string) (vmdclient.SavedSnapshotArtifacts, error) {
+	resp, err := c.client.CreateSnapshot(ctx, &vmdpb.CreateSnapshotRequest{
+		VmId:       sourceInstanceID,
+		SnapshotId: snapshotID,
+	})
+	if err != nil {
+		return vmdclient.SavedSnapshotArtifacts{}, fmt.Errorf("gRPC CreateSnapshot(saved): %w", vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationCapture, err))
+	}
+	artifacts := resp.GetArtifacts()
+	if artifacts == nil || artifacts.GetSchemaVersion() == 0 || artifacts.GetManifestPath() == "" ||
+		len(artifacts.GetManifestDigest()) != 64 ||
+		artifacts.GetSnapshotPath() == "" || artifacts.GetMemFilePath() == "" ||
+		(artifacts.GetDiskDeltaPath() == "" && artifacts.GetDiskOverlayPath() == "" && artifacts.GetDiskFullPath() == "") ||
+		resp.GetResourceLimits() == nil || resp.GetSourceState() == "" ||
+		resp.GetLogicalSizeBytes() < 0 || resp.GetExclusiveSizeBytes() < 0 ||
+		resp.GetSourceLogicalSizeBytes() < 0 || resp.GetSourceExclusiveSizeBytes() < 0 {
+		return vmdclient.SavedSnapshotArtifacts{}, grpcstatus.Error(grpccodes.Unavailable, "VMD saved snapshot response is missing committed artifacts")
+	}
+	if digest := artifacts.GetManifestDigest(); digest != strings.ToLower(digest) {
+		return vmdclient.SavedSnapshotArtifacts{}, grpcstatus.Error(grpccodes.Unavailable, "VMD saved snapshot response has a non-canonical manifest digest")
+	} else if _, err := hex.DecodeString(digest); err != nil {
+		return vmdclient.SavedSnapshotArtifacts{}, grpcstatus.Error(grpccodes.Unavailable, "VMD saved snapshot response has an invalid manifest digest")
+	}
+	out := vmdclient.SavedSnapshotArtifacts{
+		SchemaVersion:            artifacts.GetSchemaVersion(),
+		ManifestPath:             artifacts.GetManifestPath(),
+		ManifestDigest:           artifacts.GetManifestDigest(),
+		SnapshotPath:             artifacts.GetSnapshotPath(),
+		MemPath:                  artifacts.GetMemFilePath(),
+		MemoryBasePath:           artifacts.GetMemoryBasePath(),
+		DiskBasePath:             artifacts.GetDiskBasePath(),
+		DiskDeltaPath:            artifacts.GetDiskDeltaPath(),
+		DiskOverlayPath:          artifacts.GetDiskOverlayPath(),
+		DiskFullPath:             artifacts.GetDiskFullPath(),
+		LogicalSizeBytes:         resp.GetLogicalSizeBytes(),
+		ExclusiveSizeBytes:       resp.GetExclusiveSizeBytes(),
+		SourceLogicalSizeBytes:   resp.GetSourceLogicalSizeBytes(),
+		SourceExclusiveSizeBytes: resp.GetSourceExclusiveSizeBytes(),
+		SourceState:              resp.GetSourceState(),
+	}
+	if limits := resp.GetResourceLimits(); limits != nil {
+		out.VCPU = limits.GetVcpuCount()
+		out.MemoryMiB = limits.GetMemoryMib()
+		out.DiskMiB = limits.GetDiskSizeMib()
+	}
+	return out, nil
+}
+
+func (c *grpcVMDClient) RestoreSavedSnapshot(ctx context.Context, vmID, manifestPath, manifestDigest, teamID, ownerID string, network vmdclient.SavedSnapshotNetwork, clearEnvKeys []string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64) (string, uint32, uint32, error) {
+	resp, err := c.client.RestoreSavedSnapshot(ctx, &vmdpb.RestoreSavedSnapshotRequest{
+		VmId:                   vmID,
+		ManifestPath:           manifestPath,
+		ExpectedManifestDigest: manifestDigest,
+		TeamId:                 teamID,
+		OwnerId:                ownerID,
+		ClearEnvKeys:           clearEnvKeys,
+		PreviewAccess:          previewAccess,
+		PreviewPorts:           previewPortsToProto(previewPorts),
+		PreviewPolicyRevision:  previewPolicyRevision,
+		SandboxNetwork: &vmdpb.SandboxNetworkConfig{Egress: &vmdpb.SandboxNetworkEgressConfig{
+			AllowedCidrs:   network.AllowedCIDRs,
+			DeniedCidrs:    network.DeniedCIDRs,
+			AllowedDomains: network.AllowedDomains,
+		}},
+	})
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("gRPC RestoreSavedSnapshot: %w", vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationRestore, err))
+	}
+	var vcpu, mem uint32
+	if limits := resp.GetResourceLimits(); limits != nil {
+		vcpu = limits.GetVcpuCount()
+		mem = limits.GetMemoryMib()
+	}
+	return resp.GetIpAddress(), vcpu, mem, nil
+}
+
+func (c *grpcVMDClient) DeleteSavedSnapshot(ctx context.Context, sourceInstanceID, snapshotID string) error {
+	_, err := c.client.DeleteSavedSnapshot(ctx, &vmdpb.DeleteSavedSnapshotRequest{
+		SourceVmId: sourceInstanceID,
+		SnapshotId: snapshotID,
+	})
+	if err != nil {
+		return fmt.Errorf("gRPC DeleteSavedSnapshot: %w", vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationDelete, err))
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) MeasureSandboxWritableLayer(ctx context.Context, instanceID string) (int64, int64, error) {
+	resp, err := c.client.GetWritableLayerUsage(ctx, &vmdpb.GetWritableLayerUsageRequest{VmId: instanceID})
+	if err != nil {
+		return 0, 0, fmt.Errorf("gRPC GetWritableLayerUsage: %w", vmdclient.SanitizeSavedSnapshotError(vmdclient.SavedSnapshotOperationWritableLayerMeasurement, err))
+	}
+	return resp.GetLogicalSizeBytes(), resp.GetExclusiveSizeBytes(), nil
 }
 
 func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {

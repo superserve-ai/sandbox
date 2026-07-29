@@ -10,6 +10,19 @@ const (
 	ResultError    = "error"
 	ResultConflict = "conflict"
 	ResultTimeout  = "timeout"
+
+	SavedSnapshotOperationCapture = "capture"
+	SavedSnapshotOperationRestore = "restore"
+	SavedSnapshotOperationDelete  = "delete"
+	SavedSnapshotOperationCleanup = "cleanup"
+
+	SavedSnapshotOutcomeSuccess           = ResultSuccess
+	SavedSnapshotOutcomeError             = ResultError
+	SavedSnapshotOutcomeRetry             = "retry"
+	SavedSnapshotOutcomeQueued            = "queued"
+	SavedSnapshotOutcomeDependencyBlocked = "dependency_blocked"
+	SavedSnapshotOutcomeArtifactCorrupt   = "artifact_corrupt"
+	SavedSnapshotOutcomeUnavailable       = "artifact_unavailable"
 )
 
 // SandboxTransition records low-cardinality operational lifecycle metrics.
@@ -31,6 +44,17 @@ type VMDCall struct {
 	Region   string
 	HostID   string
 	Duration time.Duration
+}
+
+// SavedSnapshotOutcome records snapshot-specific state and reconciliation
+// outcomes that a generic RPC result cannot describe. Operation and Outcome
+// are closed enums; identifiers, paths, failure reasons, and raw errors must
+// remain in logs or audit events rather than metric labels.
+type SavedSnapshotOutcome struct {
+	Operation string
+	Outcome   string
+	Region    string
+	HostID    string
 }
 
 // HostCapacity records aggregate host capacity. This is intentionally
@@ -62,6 +86,7 @@ type DBPoolStats struct {
 type Recorder interface {
 	RecordSandboxTransition(context.Context, SandboxTransition)
 	RecordVMDCall(context.Context, VMDCall)
+	RecordSavedSnapshotOutcome(context.Context, SavedSnapshotOutcome)
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordDBPoolStats(context.Context, DBPoolStats)
 }
@@ -71,5 +96,7 @@ type noopRecorder struct{}
 func NewNoopRecorder() Recorder                                                 { return noopRecorder{} }
 func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition) {}
 func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                     {}
-func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)           {}
-func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)             {}
+func (noopRecorder) RecordSavedSnapshotOutcome(context.Context, SavedSnapshotOutcome) {
+}
+func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity) {}
+func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)   {}

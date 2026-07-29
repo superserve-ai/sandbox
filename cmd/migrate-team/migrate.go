@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -29,6 +30,12 @@ const (
 	phaseReleaseRollups = "release-rollups"
 
 	copyBatchSize = 500
+
+	// This exact namespace is also used by BeginSavedSnapshot. Keep the
+	// namespace in the hashed value so it does not intentionally share the
+	// existing per-team build-admission advisory-lock key space.
+	teamMigrationFenceNamespace               = "superserve:migrate-team:"
+	savedSnapshotGlobalMigrationFenceLockName = "superserve:migrate-team:saved-snapshot-global"
 )
 
 type config struct {
@@ -40,6 +47,184 @@ type config struct {
 	phase           string
 	confirmTeamName string
 	pathsOut        string
+}
+
+// savedSnapshotMigrationState is every database-visible sign that a team has
+// host-local saved-snapshot artifacts or dependencies. Deleted snapshot rows
+// remain relevant: their lineage FKs are history, not proof that every host
+// artifact and dependency can be reconstructed in another cell.
+type savedSnapshotMigrationState struct {
+	snapshotRows       int64
+	forkedSandboxes    int64
+	captureOperations  int64
+	templateDependents int64
+	storageBytes       int64
+}
+
+func (s savedSnapshotMigrationState) empty() bool {
+	return s.snapshotRows == 0 &&
+		s.forkedSandboxes == 0 &&
+		s.captureOperations == 0 &&
+		s.templateDependents == 0 &&
+		s.storageBytes == 0
+}
+
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+type savedSnapshotMigrationFence struct {
+	conn      *pgxpool.Conn
+	lockNames []string
+}
+
+func teamMigrationFenceLockName(teamID uuid.UUID) string {
+	return teamMigrationFenceNamespace + teamID.String()
+}
+
+// acquireSavedSnapshotMigrationFence pins one source connection and takes two
+// session-level exclusive advisory locks in deterministic global -> team
+// order. A transaction-level lock would be too short: migrate-team
+// intentionally spans several transactions and read-only passes. Snapshot
+// admission takes the shared forms in the same order before any sandbox, host,
+// or team lock, so this acquisition either:
+//
+//   - waits for an already-admitted capture to commit, after which the guard
+//     sees its durable snapshot state (including another team's snapshot that
+//     pins this team's template) and refuses the migration; or
+//   - wins first and makes every new capture fail closed until the whole phase
+//     has finished.
+//
+// Both fences are acquired before the saved-snapshot guard and before every
+// phase-specific lock. Global first is mandatory on both sides: taking the
+// team lock first would reintroduce a cross-team deadlock when a capture pins a
+// system template owned by the team being migrated.
+func acquireSavedSnapshotMigrationFence(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	teamID uuid.UUID,
+) (*savedSnapshotMigrationFence, error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire source connection for saved-snapshot migration fence: %w", err)
+	}
+	lockNames := []string{
+		savedSnapshotGlobalMigrationFenceLockName,
+		teamMigrationFenceLockName(teamID),
+	}
+	for i, lockName := range lockNames {
+		if _, err := conn.Exec(ctx,
+			`SELECT pg_advisory_lock(hashtextextended($1::text, 0))`,
+			lockName,
+		); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			closeErr := conn.Hijack().Close(cleanupCtx)
+			cancel()
+			return nil, errors.Join(
+				fmt.Errorf("lock saved-snapshot migration fence %d: %w", i, err),
+				closeErr,
+			)
+		}
+	}
+	return &savedSnapshotMigrationFence{conn: conn, lockNames: lockNames}, nil
+}
+
+// release unlocks in reverse order on the same physical connection that
+// acquired both session-level locks. If either explicit unlock cannot be
+// confirmed, the connection is removed from the pool and closed; returning a
+// possibly locked session to the pool would make later migrations fail
+// unpredictably.
+func (f *savedSnapshotMigrationFence) release() error {
+	if f == nil || f.conn == nil {
+		return nil
+	}
+	conn := f.conn
+	f.conn = nil
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for i := len(f.lockNames) - 1; i >= 0; i-- {
+		var unlocked bool
+		err := conn.QueryRow(cleanupCtx,
+			`SELECT pg_advisory_unlock(hashtextextended($1::text, 0))`,
+			f.lockNames[i],
+		).Scan(&unlocked)
+		if err == nil && unlocked {
+			continue
+		}
+
+		// Closing a PostgreSQL session releases every advisory lock it still
+		// owns, including the global lock when the team unlock failed first.
+		raw := conn.Hijack()
+		closeErr := raw.Close(cleanupCtx)
+		if err != nil {
+			return errors.Join(fmt.Errorf("unlock saved-snapshot migration fence %d: %w", i, err), closeErr)
+		}
+		return errors.Join(
+			fmt.Errorf("unlock saved-snapshot migration fence %d: lock was not held by the pinned session", i),
+			closeErr,
+		)
+	}
+	conn.Release()
+	return nil
+}
+
+// rejectSavedSnapshotMigration refuses every migrate-team phase when the
+// source contains saved-snapshot state. Saved snapshots are pinned to one VMD
+// host in V1; copying their rows without their manifests and sparse extents
+// would create a destination that validates in SQL but cannot restore them.
+func rejectSavedSnapshotMigration(ctx context.Context, src rowQuerier, teamID uuid.UUID, phase string) error {
+	var state savedSnapshotMigrationState
+	err := src.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM snapshot
+			 WHERE team_id = $1 AND kind = 'saved'),
+			(SELECT count(*) FROM sandbox
+			 WHERE team_id = $1 AND source_snapshot_id IS NOT NULL),
+			(SELECT count(*) FROM sandbox
+			 WHERE team_id = $1 AND snapshot_operation_id IS NOT NULL),
+			(SELECT count(*)
+			 FROM snapshot sn
+			 JOIN template t ON t.id = sn.template_id
+			 WHERE t.team_id = $1
+			   AND sn.team_id <> $1
+			   AND sn.kind = 'saved'),
+			COALESCE((SELECT snapshot_storage_bytes FROM team WHERE id = $1), 0)`,
+		teamID).Scan(
+		&state.snapshotRows,
+		&state.forkedSandboxes,
+		&state.captureOperations,
+		&state.templateDependents,
+		&state.storageBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("check saved-snapshot migration state: %w", err)
+	}
+	if state.empty() {
+		return nil
+	}
+
+	var found []string
+	if state.snapshotRows > 0 {
+		found = append(found, fmt.Sprintf("saved snapshot rows=%d (including deleted history)", state.snapshotRows))
+	}
+	if state.forkedSandboxes > 0 {
+		found = append(found, fmt.Sprintf("sandboxes forked from saved snapshots=%d", state.forkedSandboxes))
+	}
+	if state.captureOperations > 0 {
+		found = append(found, fmt.Sprintf("snapshot capture operations=%d", state.captureOperations))
+	}
+	if state.templateDependents > 0 {
+		found = append(found, fmt.Sprintf("other teams' saved snapshots pinning this team's templates=%d", state.templateDependents))
+	}
+	if state.storageBytes > 0 {
+		found = append(found, fmt.Sprintf("snapshot storage bytes=%d", state.storageBytes))
+	}
+
+	return fmt.Errorf(
+		"refusing %s: migrate-team cannot replicate V1 host-local saved snapshots (%s); use a snapshot-aware migration path",
+		phase, strings.Join(found, ", "))
 }
 
 // dbIdentity fingerprints the database a pool is connected to by cluster
@@ -65,7 +250,7 @@ func dbIdentity(ctx context.Context, pool *pgxpool.Pool) (string, error) {
 	return id, err
 }
 
-func run(ctx context.Context, cfg config) error {
+func run(ctx context.Context, cfg config) (runErr error) {
 	src, err := pgxpool.New(ctx, cfg.sourceURL)
 	if err != nil {
 		return fmt.Errorf("connect to source: %w", err)
@@ -99,12 +284,35 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 
+	// Hold one exclusive, session-level fence for the complete phase. This
+	// happens before the saved-snapshot guard and before any phase-specific
+	// source/destination reads or writes. New saved-snapshot admissions use the
+	// matching shared transaction lock and therefore cannot slip between the
+	// guard and the phase.
+	fence, err := acquireSavedSnapshotMigrationFence(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if releaseErr := fence.release(); releaseErr != nil {
+			log.Error().Err(releaseErr).Str("team_id", cfg.teamID.String()).Msg("release team migration fence")
+			runErr = errors.Join(runErr, releaseErr)
+		}
+	}()
+
 	var teamName string
 	if err := src.QueryRow(ctx, `SELECT name FROM team WHERE id = $1`, cfg.teamID).Scan(&teamName); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("team %s not found in source", cfg.teamID)
 		}
 		return fmt.Errorf("look up team: %w", err)
+	}
+	// This check precedes every phase dispatch. In particular, plan cannot
+	// emit an incomplete --paths-out file, copy cannot write unrestorable DB
+	// rows into the destination, and purge cannot destroy the only artifact
+	// lineage that still names the source hosts.
+	if err := rejectSavedSnapshotMigration(ctx, src, cfg.teamID, cfg.phase); err != nil {
+		return err
 	}
 	log.Info().Str("phase", cfg.phase).Str("team", teamName).Str("team_id", cfg.teamID.String()).Msg("migrate-team")
 

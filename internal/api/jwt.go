@@ -11,6 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/securitypolicy"
 )
 
 // SecretsJWTIssuer is the fixed `iss` claim on every secrets JWT.
@@ -18,7 +20,7 @@ const SecretsJWTIssuer = "superserve-controlplane"
 
 // SecretsJWTLifetime is the safety-net upper bound on a leaked JWT's blast
 // radius. Revocation on sandbox destroy is the primary kill switch.
-const SecretsJWTLifetime = 90 * 24 * time.Hour
+const SecretsJWTLifetime = securitypolicy.SandboxCredentialLifetime
 
 // SecretsBindingsCap bounds the number of bindings allowed per sandbox so the
 // resulting JWT stays within practical HTTPS_PROXY userinfo lengths

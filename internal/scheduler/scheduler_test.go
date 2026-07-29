@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -27,9 +28,11 @@ func (c *queryCapture) Exec(context.Context, string, ...any) (pgconn.CommandTag,
 }
 
 func (c *queryCapture) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
-	c.sql = sql
-	c.calls++
-	c.args = append(c.args, append([]string(nil), args[0].([]string)...))
+	if strings.Contains(sql, "-- name: ListActiveHostsByLoad") {
+		c.sql = sql
+		c.calls++
+		c.args = append(c.args, append([]string(nil), args[0].([]string)...))
+	}
 	return schedulerEmptyRows{}, nil
 }
 
@@ -102,6 +105,80 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 	}
 	if !reflect.DeepEqual(capture.args[1], wantPrivate) {
 		t.Fatalf("private requirements = %#v, want %#v", capture.args[1], wantPrivate)
+	}
+}
+
+type fakeLifecycleHostStore struct {
+	active    []db.ListActiveHostsByLoadRow
+	hosts     []db.Host
+	activeErr error
+	hostsErr  error
+}
+
+func (f *fakeLifecycleHostStore) ListActiveHostsByLoad(context.Context, []string) ([]db.ListActiveHostsByLoadRow, error) {
+	return f.active, f.activeErr
+}
+
+func (f *fakeLifecycleHostStore) ListHosts(context.Context) ([]db.Host, error) {
+	return f.hosts, f.hostsErr
+}
+
+func TestSelectHostLegacyFallbackRequiresEmptyHostTable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		store   *fakeLifecycleHostStore
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "legacy database without host rows",
+			store: &fakeLifecycleHostStore{},
+			want:  "default",
+		},
+		{
+			name:    "provisioned but draining fleet",
+			store:   &fakeLifecycleHostStore{hosts: []db.Host{{ID: "default", Status: "draining"}}},
+			wantErr: true,
+		},
+		{
+			name:    "provisioned but unhealthy fleet",
+			store:   &fakeLifecycleHostStore{hosts: []db.Host{{ID: "default", Status: "unhealthy"}}},
+			wantErr: true,
+		},
+		{
+			name: "active host",
+			store: &fakeLifecycleHostStore{
+				active: []db.ListActiveHostsByLoadRow{{ID: "host-a"}},
+				hosts:  []db.Host{{ID: "host-a", Status: "active"}},
+			},
+			want: "host-a",
+		},
+		{
+			name:    "fallback decision query fails closed",
+			store:   &fakeLifecycleHostStore{hostsErr: errors.New("database unavailable")},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &LeastLoaded{DB: tt.store, DefaultHostID: "default"}
+			got, err := s.SelectHost(context.Background(), nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("SelectHost() = %q, nil; want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SelectHost() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("SelectHost() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

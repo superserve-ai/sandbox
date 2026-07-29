@@ -110,3 +110,23 @@ func (q *Queries) ListActiveSandboxRevocations(ctx context.Context) ([]uuid.UUID
 	}
 	return items, nil
 }
+
+const upsertSandboxRevocation = `-- name: UpsertSandboxRevocation :exec
+INSERT INTO sandbox_revocation (sandbox_id, expires_at)
+VALUES ($1, $2)
+ON CONFLICT (sandbox_id) DO UPDATE
+SET expires_at = GREATEST(sandbox_revocation.expires_at, EXCLUDED.expires_at)
+`
+
+type UpsertSandboxRevocationParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// Failed-create compensation can race a delete retry. Preserve whichever
+// caller supplies the longer token lifetime so an older retry cannot shorten
+// an already-persisted revocation.
+func (q *Queries) UpsertSandboxRevocation(ctx context.Context, arg UpsertSandboxRevocationParams) error {
+	_, err := q.db.Exec(ctx, upsertSandboxRevocation, arg.SandboxID, arg.ExpiresAt)
+	return err
+}

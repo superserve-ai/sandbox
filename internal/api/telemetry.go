@@ -76,6 +76,18 @@ func RecordSandboxTransition(ctx context.Context, operation, result, hostID stri
 	})
 }
 
+// RecordSavedSnapshotOutcome emits snapshot-specific outcomes whose meaning is
+// lost in generic HTTP or VMD call metrics. Callers provide only closed enums
+// from telemetry; IDs, paths, and raw errors belong in logs/audit events.
+func RecordSavedSnapshotOutcome(ctx context.Context, operation, outcome, hostID string) {
+	currentTelemetryRecorder().RecordSavedSnapshotOutcome(ctx, telemetry.SavedSnapshotOutcome{
+		Operation: operation,
+		Outcome:   outcome,
+		Region:    SandboxIDRegion(),
+		HostID:    hostID,
+	})
+}
+
 // SandboxLifecycleTelemetry records coarse user-visible sandbox lifecycle
 // transitions from the routed API surface. It intentionally emits only bounded
 // labels; sandbox IDs, team IDs, user IDs, request IDs, URLs, and raw errors are

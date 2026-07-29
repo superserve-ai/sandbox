@@ -718,10 +718,20 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 	}
 	if !res.Deleted {
 		switch {
-		case res.LiveCount > 0:
-			respondErrorMsg(c, "conflict",
-				fmt.Sprintf("template has %d sandbox(es) (active, paused, or failed) still referencing it; destroy them first", res.LiveCount),
-				http.StatusConflict)
+		case res.LiveCount > 0 || res.SnapshotCount > 0:
+			h.capture(c, "template_delete_blocked", map[string]any{
+				"template_id":    tplID.String(),
+				"sandbox_count":  res.LiveCount,
+				"snapshot_count": res.SnapshotCount,
+			})
+			c.JSON(http.StatusConflict, gin.H{"error": gin.H{
+				"code":    "template_has_dependents",
+				"message": "Delete dependent sandboxes and saved snapshots before deleting this template",
+				"dependencies": gin.H{
+					"sandbox_count":  res.LiveCount,
+					"snapshot_count": res.SnapshotCount,
+				},
+			}})
 		case res.InflightBuildCount > 0:
 			respondErrorMsg(c, "conflict",
 				fmt.Sprintf("template has %d in-flight build(s); cancel them first", res.InflightBuildCount),

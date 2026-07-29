@@ -1044,6 +1044,10 @@ counted AS (
   SELECT
     (SELECT COUNT(*)::bigint FROM sandbox
      WHERE template_id = $1 AND destroyed_at IS NULL) AS live_count,
+    (SELECT COUNT(*)::bigint FROM snapshot
+     WHERE template_id = $1
+       AND kind = 'saved'
+       AND deleted_at IS NULL) AS snapshot_count,
     (SELECT COUNT(*)::bigint FROM template_build
      WHERE template_id = $1
        AND status IN ('pending', 'building', 'snapshotting')) AS inflight_build_count
@@ -1053,12 +1057,14 @@ deleted AS (
   SET deleted_at = now(), updated_at = now()
   WHERE t.id IN (SELECT tpl_id FROM locked)
     AND (SELECT live_count FROM counted) = 0
+    AND (SELECT snapshot_count FROM counted) = 0
     AND (SELECT inflight_build_count FROM counted) = 0
   RETURNING t.id
 )
 SELECT
   EXISTS(SELECT 1 FROM locked)  AS found,
   (SELECT live_count FROM counted) AS live_count,
+  (SELECT snapshot_count FROM counted) AS snapshot_count,
   (SELECT inflight_build_count FROM counted) AS inflight_build_count,
   EXISTS(SELECT 1 FROM deleted) AS deleted
 `
@@ -1071,12 +1077,13 @@ type SoftDeleteTemplateIfUnusedParams struct {
 type SoftDeleteTemplateIfUnusedRow struct {
 	Found              bool  `json:"found"`
 	LiveCount          int64 `json:"live_count"`
+	SnapshotCount      int64 `json:"snapshot_count"`
 	InflightBuildCount int64 `json:"inflight_build_count"`
 	Deleted            bool  `json:"deleted"`
 }
 
-// Soft-deletes a template only if no live sandbox references it AND no
-// build is in flight. Blocking on builds prevents the vmd-side artifact
+// Soft-deletes a template only if no live sandbox or saved snapshot pins it
+// and no build is in flight. Blocking on builds prevents the vmd-side artifact
 // cleanup from racing with template-builder still writing to the same dirs.
 func (q *Queries) SoftDeleteTemplateIfUnused(ctx context.Context, arg SoftDeleteTemplateIfUnusedParams) (SoftDeleteTemplateIfUnusedRow, error) {
 	row := q.db.QueryRow(ctx, softDeleteTemplateIfUnused, arg.ID, arg.TeamID)
@@ -1084,6 +1091,7 @@ func (q *Queries) SoftDeleteTemplateIfUnused(ctx context.Context, arg SoftDelete
 	err := row.Scan(
 		&i.Found,
 		&i.LiveCount,
+		&i.SnapshotCount,
 		&i.InflightBuildCount,
 		&i.Deleted,
 	)
@@ -1091,26 +1099,41 @@ func (q *Queries) SoftDeleteTemplateIfUnused(ctx context.Context, arg SoftDelete
 }
 
 const tryDispatchBuild = `-- name: TryDispatchBuild :execrows
+WITH active_host AS MATERIALIZED (
+  SELECT h.id
+  FROM host h
+  WHERE h.id = $3 AND h.status = 'active'
+  FOR SHARE
+),
+admitted_host AS MATERIALIZED (
+  SELECT id FROM active_host
+  UNION ALL
+  SELECT $3::text WHERE NOT EXISTS (SELECT 1 FROM host)
+)
 UPDATE template_build
 SET status = 'building',
     started_at = now(),
     updated_at = now(),
-    vmd_host_id = $2,
-    vmd_build_vm_id = $3
-WHERE id = $1 AND status = 'pending'
+    vmd_host_id = admitted_host.id,
+    vmd_build_vm_id = $1
+FROM admitted_host
+WHERE template_build.id = $2 AND template_build.status = 'pending'
 `
 
 type TryDispatchBuildParams struct {
+	VmdBuildVmID *string   `json:"vmd_build_vm_id"`
 	ID           uuid.UUID `json:"id"`
 	VmdHostID    *string   `json:"vmd_host_id"`
-	VmdBuildVmID *string   `json:"vmd_build_vm_id"`
 }
 
 // Claims a pending row for dispatch. Stamps host + caller-generated
 // build_vm_id up front so a timed-out BuildTemplate RPC can still be
-// reconciled by GetBuildStatus on the next tick.
+// reconciled by GetBuildStatus on the next tick. Host admission is part of
+// the same statement: either this shared lock commits a visible building row
+// before drain proceeds, or a host already marked draining admits no build.
+// The fallback is only for legacy installations with an empty host table.
 func (q *Queries) TryDispatchBuild(ctx context.Context, arg TryDispatchBuildParams) (int64, error) {
-	result, err := q.db.Exec(ctx, tryDispatchBuild, arg.ID, arg.VmdHostID, arg.VmdBuildVmID)
+	result, err := q.db.Exec(ctx, tryDispatchBuild, arg.VmdBuildVmID, arg.ID, arg.VmdHostID)
 	if err != nil {
 		return 0, err
 	}

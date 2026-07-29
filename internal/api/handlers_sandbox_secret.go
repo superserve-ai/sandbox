@@ -33,9 +33,10 @@ func lockSandboxSecrets(sandboxID uuid.UUID) func() {
 // Sentinels so the attach insert (run inside a transaction) can map validation
 // outcomes back to HTTP statuses after the transaction closes.
 var (
-	errBindingExists        = errors.New("env key already bound on sandbox")
-	errBindingCapReached    = errors.New("sandbox binding cap reached")
-	errSandboxMidTransition = errors.New("sandbox not in a mutable state")
+	errBindingExists           = errors.New("env key already bound on sandbox")
+	errBindingCapReached       = errors.New("sandbox binding cap reached")
+	errSandboxMidTransition    = errors.New("sandbox not in a mutable state")
+	errSandboxSnapshotInFlight = errors.New("sandbox snapshot operation in progress")
 )
 
 type attachSecretRequest struct {
@@ -99,6 +100,10 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "sandbox is not in a state that accepts secret changes", http.StatusConflict)
 		return
 	}
+	if sandbox.SnapshotOperationID.Valid {
+		respondErrorMsg(c, "conflict", "sandbox has a snapshot operation in progress", http.StatusConflict)
+		return
+	}
 
 	secret, err := h.DB.GetSecretByName(ctx, db.GetSecretByNameParams{TeamID: teamID, Name: req.SecretName})
 	if err != nil {
@@ -139,6 +144,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		case db.SandboxStatusActive, db.SandboxStatusPaused:
 		default:
 			return errSandboxMidTransition
+		}
+		if sb.SnapshotOperationID.Valid {
+			return errSandboxSnapshotInFlight
 		}
 		liveSandbox = sb
 		existing, lerr := q.ListSandboxSecretBindings(ctx, sandboxID)
@@ -181,6 +189,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		return
 	case errors.Is(err, errSandboxMidTransition):
 		respondErrorMsg(c, "conflict", "sandbox is not in a state that accepts secret changes", http.StatusConflict)
+		return
+	case errors.Is(err, errSandboxSnapshotInFlight):
+		respondErrorMsg(c, "conflict", "sandbox has a snapshot operation in progress", http.StatusConflict)
 		return
 	case err != nil:
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("insert sandbox secret binding")
@@ -262,6 +273,10 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "sandbox is not in a state that accepts secret changes", http.StatusConflict)
 		return
 	}
+	if sandbox.SnapshotOperationID.Valid {
+		respondErrorMsg(c, "conflict", "sandbox has a snapshot operation in progress", http.StatusConflict)
+		return
+	}
 
 	// Delete the binding and revoke its token in one transaction, on a detached
 	// context so a client disconnect can't half-commit. A 204 therefore guarantees
@@ -269,7 +284,30 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	mutCtx, mutCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer mutCancel()
 
+	liveSandbox := sandbox
 	deleteAndRevoke := func(q *db.Queries) error {
+		if h.Pool != nil {
+			if lerr := q.LockSandboxForSecretWrites(mutCtx, sandboxID.String()); lerr != nil {
+				return lerr
+			}
+		}
+		// Re-read after taking the cross-instance lock. Capture takes the same
+		// lock before recording its bindings, so either this delete commits
+		// first and is captured, or it observes the capture claim and rejects.
+		sb, derr := q.GetSandbox(mutCtx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+		if derr != nil {
+			return derr
+		}
+		switch sb.Status {
+		case db.SandboxStatusActive, db.SandboxStatusPaused:
+		default:
+			return errSandboxMidTransition
+		}
+		if sb.SnapshotOperationID.Valid {
+			return errSandboxSnapshotInFlight
+		}
+		liveSandbox = sb
+
 		deleted, derr := q.DeleteSandboxSecretBinding(mutCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
 		if derr != nil {
 			return derr
@@ -299,6 +337,14 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		}
 	}
 	if err != nil {
+		if errors.Is(err, errSandboxMidTransition) {
+			respondErrorMsg(c, "conflict", "sandbox is not in a state that accepts secret changes", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, errSandboxSnapshotInFlight) {
+			respondErrorMsg(c, "conflict", "sandbox has a snapshot operation in progress", http.StatusConflict)
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			respondErrorMsg(c, "not_found", fmt.Sprintf("no secret bound under env-var key %q on this sandbox", envKey), http.StatusNotFound)
 			return
@@ -311,6 +357,7 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	// Re-mint the reduced set for a running sandbox; a paused one re-mints on
 	// resume. Best-effort — the revocation above already enforces the detach, so a
 	// re-mint failure is not fatal.
+	sandbox = liveSandbox
 	if sandbox.Status == db.SandboxStatusActive {
 		if meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID); lerr != nil {
 			log.Warn().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings after detach")

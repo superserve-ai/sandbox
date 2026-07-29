@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -452,6 +453,94 @@ func (f *fixture) cfg(phase string) config {
 		destRegion: destRegion,
 		phase:      phase,
 	}
+}
+
+func TestSavedSnapshotStateBlocksMigration(t *testing.T) {
+	ctx := context.Background()
+	teamID := uuid.New()
+	sourceSandboxID := uuid.New()
+	forkSandboxID := uuid.New()
+	snapshotID := uuid.New()
+
+	mustExec(t, srcPool, `
+		INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+		VALUES ($1, '10.0.0.1:50051', '10.0.0.1:8080', 'use', 65536, 32)
+		ON CONFLICT (id) DO NOTHING`, sourceHostID)
+	mustExec(t, srcPool, `
+		INSERT INTO team (id, name, snapshot_storage_quota_bytes, snapshot_storage_bytes)
+		VALUES ($1, 'saved-snapshot-guard', 1048576, 4096)`, teamID)
+	mustExec(t, srcPool, `
+		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id)
+		VALUES ($1, $2, 'snapshot-source', 'paused', 1, 1024, $3)`,
+		sourceSandboxID, teamID, sourceHostID)
+	// This is deliberately deleted history. It must still block migration:
+	// lineage FKs remain and this tool has no way to prove the host artifacts
+	// were replicated or fully collected.
+	mustExec(t, srcPool, `
+		INSERT INTO snapshot (
+			id, sandbox_id, team_id, path, trigger, kind, status, deleted_at,
+			source_status, host_id, vcpu_count, memory_mib, disk_mib)
+		VALUES (
+			$1, $2, $3, '/srv/saved/history/disk.ext4', 'manual', 'saved', 'deleting', now(),
+			'paused', $4, 1, 1024, 4096)`,
+		snapshotID, sourceSandboxID, teamID, sourceHostID)
+	mustExec(t, srcPool, `
+		INSERT INTO sandbox (
+			id, team_id, name, status, vcpu_count, memory_mib, host_id, source_snapshot_id)
+		VALUES ($1, $2, 'snapshot-fork', 'paused', 1, 1024, $3, $4)`,
+		forkSandboxID, teamID, sourceHostID, snapshotID)
+	mustExec(t, srcPool, `
+		UPDATE sandbox
+		SET snapshot_operation_id = $2, snapshot_operation_started_at = now()
+		WHERE id = $1`, sourceSandboxID, snapshotID)
+
+	assertRefused := func(t *testing.T, cfg config) {
+		t.Helper()
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), "cannot replicate V1 host-local saved snapshots") {
+			t.Fatalf("%s must reject saved-snapshot state, got: %v", cfg.phase, err)
+		}
+	}
+
+	t.Run("plan refuses before paths-out", func(t *testing.T) {
+		pathsFile := filepath.Join(t.TempDir(), "dirs.txt")
+		cfg := config{teamID: teamID, sourceURL: srcURL, phase: phasePlan, pathsOut: pathsFile}
+		assertRefused(t, cfg)
+		if _, err := os.Stat(pathsFile); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("refused plan wrote --paths-out (stat error=%v)", err)
+		}
+	})
+
+	t.Run("copy refuses before destination writes", func(t *testing.T) {
+		cfg := config{
+			teamID: teamID, sourceURL: srcURL, destURL: dstURL,
+			destHostID: destHostID, destRegion: destRegion, phase: phaseCopy,
+		}
+		assertRefused(t, cfg)
+		var count int64
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE id = $1`, teamID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatal("refused copy wrote the team to the destination")
+		}
+	})
+
+	t.Run("purge refuses before source writes", func(t *testing.T) {
+		cfg := config{
+			teamID: teamID, sourceURL: srcURL, destURL: dstURL,
+			destHostID: destHostID, destRegion: destRegion, phase: phasePurge,
+			confirmTeamName: "saved-snapshot-guard",
+		}
+		assertRefused(t, cfg)
+		var count int64
+		if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE id = $1`, teamID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatal("refused purge deleted the source team")
+		}
+	})
 }
 
 func TestTeamMigration(t *testing.T) {

@@ -229,6 +229,12 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[21].(*int32) = s.DiskMib
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
+		if len(dest) > 24 {
+			*dest[24].(*pgtype.UUID) = s.SourceSnapshotID
+			*dest[25].(*pgtype.UUID) = s.SnapshotOperationID
+			*dest[26].(*pgtype.Timestamptz) = s.SnapshotOperationStartedAt
+			*dest[27].(*[]byte) = s.SecretEnvKeys
+		}
 		return nil
 	}}
 }

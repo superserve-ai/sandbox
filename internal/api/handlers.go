@@ -36,12 +36,20 @@ import (
 // VMDClient is the interface for talking to a VM daemon.
 type VMDClient = vmdclient.Client
 
-// SQLSTATE raised by the sandbox_quota_on_insert trigger.
-const sandboxQuotaErrCode = "SS001"
+// SQLSTATEs raised by resource-admission triggers/functions.
+const (
+	sandboxQuotaErrCode              = "SS001"
+	savedSnapshotHostCapacityErrCode = "SS006"
+)
 
 func isSandboxQuotaErr(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == sandboxQuotaErrCode
+}
+
+func isSavedSnapshotHostCapacityErr(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == savedSnapshotHostCapacityErrCode
 }
 
 // respondQuotaExceeded best-effort fetches the team's cap for the message;
@@ -65,6 +73,14 @@ type Scheduler interface {
 // HostRegistry resolves a host ID to a VMD client.
 type HostRegistry interface {
 	ClientFor(ctx context.Context, hostID string) (vmdclient.Client, error)
+}
+
+// activeHostRegistry is the optional scheduling-strength resolver used for
+// host-local saved-snapshot capture and restore. Production's registry
+// implements it; the narrow base interface keeps lightweight test registries
+// and legacy lifecycle cleanup compatible.
+type activeHostRegistry interface {
+	ActiveClientFor(ctx context.Context, hostID string) (vmdclient.Client, error)
 }
 
 // Handlers holds shared dependencies for all route handlers.
@@ -92,6 +108,12 @@ type Handlers struct {
 	// across requests. Built lazily from Pool on first use.
 	authzOnce sync.Once
 	authzSvc  *authz.Service
+
+	// hostDrainMu serializes the process-local worker registry and scan latch.
+	// The map is initialized lazily when the first draining host is observed.
+	hostDrainMu      sync.Mutex
+	hostDrainScan    bool
+	hostDrainWorkers map[string]struct{}
 }
 
 // asyncBookkeeping runs fire-and-forget post-VMD work in a background
@@ -188,6 +210,41 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 		return h.VMD, nil
 	}
 	return nil, err
+}
+
+// activeVMDForHost is the admission-strength resolver for operations that can
+// start a Firecracker process. Draining hosts remain reachable through
+// vmdForHost for pause and cleanup, but reject create/resume admission.
+func (h *Handlers) activeVMDForHost(ctx context.Context, hostID string) (VMDClient, error) {
+	if h.Hosts == nil {
+		return h.VMD, nil
+	}
+	activeHosts, ok := h.Hosts.(activeHostRegistry)
+	if !ok {
+		return h.vmdForHost(ctx, hostID)
+	}
+	c, err := activeHosts.ActiveClientFor(ctx, hostID)
+	if err == nil {
+		return c, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) && h.VMD != nil {
+		log.Warn().Err(err).Str("host_id", hostID).Msg("unknown host row; falling back to default VMD client")
+		return h.VMD, nil
+	}
+	return nil, err
+}
+
+// exactVMDForHost never falls back to the default host. Saved snapshot
+// artifacts are host-local, so a successful response from any other host
+// cannot prove that an artifact or child VM was removed.
+func (h *Handlers) exactVMDForHost(ctx context.Context, hostID string) (VMDClient, error) {
+	if h.Hosts == nil {
+		if h.VMD == nil {
+			return nil, fmt.Errorf("no VMD client configured for host %q", hostID)
+		}
+		return h.VMD, nil
+	}
+	return h.Hosts.ClientFor(ctx, hostID)
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -535,6 +592,19 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 	resumeVMDAccess := resumePolicy.vmdAccess()
+	// Check host lifecycle state before claiming paused -> resuming. Cleanup
+	// must still reach a draining host, but a customer resume would start a new
+	// Firecracker process and defeat the drain.
+	vmd, vmdLookupErr := h.activeVMDForHost(c.Request.Context(), sandbox.HostID)
+	if vmdLookupErr != nil {
+		log.Warn().Err(vmdLookupErr).
+			Str("sandbox_id", sandboxID.String()).
+			Str("host_id", sandbox.HostID).
+			Msg("resume host is not accepting lifecycle work")
+		c.Header("Retry-After", "5")
+		respondErrorMsg(c, "sandbox_host_unavailable", "The sandbox host is temporarily unavailable", http.StatusServiceUnavailable)
+		return false
+	}
 
 	// Serialize the paused→resuming claim with attach/detach via a DB advisory
 	// lock (held only for the claim). Both take the same lock and re-read status
@@ -573,6 +643,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		if isSandboxQuotaErr(err) {
 			// Resuming re-enters the active set; the team is already at its limit.
 			h.respondQuotaExceeded(c, teamID)
+			return false
+		}
+		if isSavedSnapshotHostCapacityErr(err) {
+			c.Header("Retry-After", "5")
+			respondErrorMsg(c, "snapshot_host_unavailable", "The snapshot host has insufficient capacity", http.StatusServiceUnavailable)
 			return false
 		}
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginResume failed")
@@ -621,14 +696,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		if tplErr == nil && tpl.BasePath != nil {
 			resumeBasePath = *tpl.BasePath
 		}
-	}
-
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if vmdLookupErr != nil {
-		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
-		revertToPaused()
-		respondError(c, ErrInternal)
-		return false
 	}
 
 	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
@@ -713,8 +780,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID, sandbox.HostID)
 			return
 		}
-		// Fresh deadline so a slow snapshot above can't starve the DB write.
-		// Overlay preserved; flip resuming → paused via FinalizePause.
+		// Measure while the VM is still unambiguously paused, then use a fresh
+		// deadline for the lifecycle write. Shadow accounting is best-effort and
+		// cannot consume FinalizePause's commit budget.
+		h.recordSandboxWritableLayerUsage(revertCtx, vmd, sandboxID, teamID)
 		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
 		defer fcancel()
 		if _, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
@@ -1077,6 +1146,10 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	SetTelemetryHostID(c, sandbox.HostID)
+	if sandbox.SnapshotOperationID.Valid {
+		respondErrorMsg(c, "conflict", "Sandbox has a snapshot operation in progress", http.StatusConflict)
+		return
+	}
 	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
 	// from a quiescent state (active/paused/failed) or a transitional state whose
 	// worker is provably gone (stale), so it serializes against a live resume/pause
@@ -1101,6 +1174,18 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 				log.Error().Err(gerr).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox re-read failed")
 				respondError(c, ErrInternal)
 			default:
+				if cur.SnapshotOperationID.Valid {
+					respondErrorMsg(c, "conflict", "Sandbox has a snapshot operation in progress", http.StatusConflict)
+					return
+				}
+				// A quiescent row can lose the delete claim only when a saved
+				// snapshot now pins it (including one committed after the first
+				// read). Query after the guarded claim so this remains race-safe.
+				if cur.Status == db.SandboxStatusActive || cur.Status == db.SandboxStatusPaused || cur.Status == db.SandboxStatusFailed {
+					if h.respondSandboxSnapshotDependencyConflict(c, sandboxID, teamID) {
+						return
+					}
+				}
 				log.Warn().Str("sandbox_id", sandboxID.String()).Str("status", string(cur.Status)).Msg("delete deferred: sandbox is mid-transition")
 				respondError(c, ErrInvalidState)
 			}
@@ -1111,13 +1196,66 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	h.teardownDestroyedSandbox(c.Request.Context(), sandboxID, sandbox.HostID, sandbox.BasePath, sandbox.TemplateID)
+	h.teardownDestroyedSandboxWithSnapshotPin(
+		c.Request.Context(), sandboxID, teamID, sandbox.HostID,
+		sandbox.BasePath, sandbox.TemplateID, sandbox.SourceSnapshotID,
+	)
 
 	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_deleted", map[string]any{"sandbox_id": sandboxID.String()})
 
 	c.Status(http.StatusNoContent)
+}
+
+// respondSandboxSnapshotDependencyConflict reports saved snapshots that pin a
+// source sandbox. It returns true when it wrote a response; false means no
+// dependency was present by the time the count ran and the caller should map
+// the failed delete claim as a generic state conflict.
+func (h *Handlers) respondSandboxSnapshotDependencyConflict(c *gin.Context, sandboxID, teamID uuid.UUID) bool {
+	count, err := h.DB.GetSandboxSnapshotDependencyCounts(c.Request.Context(), db.GetSandboxSnapshotDependencyCountsParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxSnapshotDependencyCounts failed")
+		respondError(c, ErrInternal)
+		return true
+	}
+	if count == 0 {
+		return false
+	}
+	h.capture(c, "sandbox_delete_blocked", map[string]any{
+		"sandbox_id":     sandboxID.String(),
+		"snapshot_count": count,
+	})
+
+	dependencies := gin.H{
+		"sandbox_count":  int64(0),
+		"snapshot_count": count,
+	}
+	if snapshots, listErr := h.DB.ListSavedSnapshotsBySandbox(c.Request.Context(), db.ListSavedSnapshotsBySandboxParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	}); listErr != nil {
+		log.Warn().Err(listErr).Str("sandbox_id", sandboxID.String()).Msg("DB ListSavedSnapshotsBySandbox failed while reporting delete dependencies")
+	} else if len(snapshots) > 0 {
+		ids := make([]uuid.UUID, len(snapshots))
+		for i := range snapshots {
+			ids[i] = snapshots[i].ID
+		}
+		if len(ids) > 100 {
+			ids = ids[:100]
+		}
+		dependencies["snapshot_ids"] = ids
+	}
+
+	c.JSON(http.StatusConflict, gin.H{"error": gin.H{
+		"code":         "sandbox_has_snapshots",
+		"message":      "Delete saved snapshots from this sandbox before deleting it",
+		"dependencies": dependencies,
+	}})
+	return true
 }
 
 // teardownDestroyedSandbox reclaims host-side state for a sandbox whose
@@ -1127,6 +1265,20 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 // user-initiated deletes and the auto-delete reaper so the two paths cannot
 // diverge.
 func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.UUID, hostID string, basePath *string, templateID pgtype.UUID) {
+	h.teardownDestroyedSandboxWithSnapshotPin(ctx, sandboxID, uuid.Nil, hostID, basePath, templateID, pgtype.UUID{})
+}
+
+// teardownDestroyedSandboxWithSnapshotPin additionally releases a fork's
+// parent pin, but only after exact-host teardown is known to have succeeded.
+// The revocation row was committed by DestroySandbox before this function is
+// entered, so credentials are revoked before any VM, bindings, or pin cleanup.
+func (h *Handlers) teardownDestroyedSandboxWithSnapshotPin(
+	ctx context.Context,
+	sandboxID, teamID uuid.UUID,
+	hostID string,
+	basePath *string,
+	templateID, sourceSnapshotID pgtype.UUID,
+) {
 	// The revocation row is committed with the delete claim; fan it out to the
 	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
 	// from the persisted row on restart.
@@ -1137,14 +1289,36 @@ func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.
 	// that only DestroyInstance reclaims (an absent VM is an idempotent no-op). A
 	// failure here is reconciled by the vm reconciler, so a vmd hiccup must not fail
 	// an already-committed delete.
-	if vmd, lookupErr := h.vmdForHost(ctx, hostID); lookupErr != nil {
+	destroyConfirmed := false
+	hostCtx, hostCancel := context.WithTimeout(context.WithoutCancel(ctx), vmdTimeout)
+	if vmd, lookupErr := h.exactVMDForHost(hostCtx, hostID); lookupErr != nil {
 		log.Warn().Err(lookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for delete teardown; reconciler will reclaim")
 	} else {
-		vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-		if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
+		if derr := vmd.DestroyInstance(hostCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
 			log.Warn().Err(derr).Str("sandbox_id", sandboxID.String()).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
+		} else {
+			destroyConfirmed = true
 		}
-		vmdCancel()
+	}
+	hostCancel()
+	if !destroyConfirmed {
+		// Runtime checkpoints, build bases, and the source snapshot may still be
+		// serving an orphan process. Leave every pin/artifact intact for retry.
+		return
+	}
+
+	if sourceSnapshotID.Valid {
+		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
+		_, releaseErr := h.DB.ReleaseDestroyedSandboxSnapshotPin(releaseCtx, db.ReleaseDestroyedSandboxSnapshotPinParams{
+			SandboxID: sandboxID, TeamID: teamID, SourceSnapshotID: sourceSnapshotID,
+		})
+		releaseCancel()
+		if releaseErr != nil && !errors.Is(releaseErr, pgx.ErrNoRows) {
+			log.Warn().Err(releaseErr).
+				Str("sandbox_id", sandboxID.String()).
+				Str("snapshot_id", uuid.UUID(sourceSnapshotID.Bytes).String()).
+				Msg("release destroyed fork snapshot pin")
+		}
 	}
 
 	// Best-effort cleanup of pause snapshots. Failures are logged but
@@ -1257,21 +1431,25 @@ type networkConfigRequest struct {
 }
 
 type createSandboxRequest struct {
-	Name         string                `json:"name" binding:"required,min=1,max=64"`
-	FromTemplate *string               `json:"from_template,omitempty"`
+	Name         string  `json:"name" binding:"required,min=1,max=64"`
+	FromTemplate *string `json:"from_template,omitempty"`
+	// FromSnapshot creates a fresh sandbox from an immutable saved snapshot.
+	// It is mutually exclusive with FromTemplate; runtime pause checkpoints
+	// are deliberately not accepted by this field.
+	FromSnapshot *string               `json:"from_snapshot,omitempty"`
 	Network      *networkConfigRequest `json:"network,omitempty"`
 
 	// TimeoutSeconds auto-pauses the sandbox after it has been active this
 	// long. The window tracks the current active session (re-armed on each
 	// resume), not creation time. Nil means no timeout — the sandbox lives
 	// until explicitly paused or deleted. Settable at create and via PATCH.
-	TimeoutSeconds *int32 `json:"timeout_seconds,omitempty"`
+	TimeoutSeconds optionalInt32 `json:"timeout_seconds,omitempty"`
 
 	// AutoDeleteSeconds deletes the sandbox once it has been continuously
 	// paused this long. Re-arms on every pause, cancelled by resume; 0 means
 	// delete as soon as it pauses; nil (default) keeps paused sandboxes
 	// forever. Also settable after creation via PATCH /sandboxes/:id.
-	AutoDeleteSeconds *int32 `json:"auto_delete_seconds,omitempty"`
+	AutoDeleteSeconds optionalInt32 `json:"auto_delete_seconds,omitempty"`
 
 	// Metadata is a flat string→string map of user-supplied tags that get
 	// attached to the sandbox at creation. Updatable after creation via
@@ -1303,6 +1481,31 @@ type createSandboxRequest struct {
 	PreviewAccess *string `json:"preview_access,omitempty"`
 }
 
+// UnmarshalJSON preserves the distinction between omission and JSON null for
+// saved-snapshot inheritance fields. A null source/configuration value is not
+// a second spelling for inherit or clear.
+func (r *createSandboxRequest) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for _, field := range []string{"from_template", "from_snapshot", "network", "secrets"} {
+		if value, present := raw[field]; present && strings.TrimSpace(string(value)) == "null" {
+			return fmt.Errorf("%s must not be null", field)
+		}
+	}
+
+	type wire createSandboxRequest
+	var decoded wire
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&decoded); err != nil {
+		return err
+	}
+	*r = createSandboxRequest(decoded)
+	return nil
+}
+
 type sandboxResponse struct {
 	// ID is the public sandbox ID: a bare UUID today, sb-<region>-<uuid>
 	// once SANDBOX_ID_REGION is set on the cell (see publicid.go).
@@ -1313,6 +1516,7 @@ type sandboxResponse struct {
 	MemoryMib         int32      `json:"memory_mib"`
 	AccessToken       string     `json:"access_token,omitempty"`
 	SnapshotID        *uuid.UUID `json:"snapshot_id,omitempty"`
+	SourceSnapshotID  *uuid.UUID `json:"source_snapshot_id,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 	TimeoutSeconds    *int32     `json:"timeout_seconds,omitempty"`
 	AutoDeleteSeconds *int32     `json:"auto_delete_seconds,omitempty"`
@@ -1351,6 +1555,10 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
 		resp.SnapshotID = &id
+	}
+	if s.SourceSnapshotID.Valid {
+		id := uuid.UUID(s.SourceSnapshotID.Bytes)
+		resp.SourceSnapshotID = &id
 	}
 	if s.TimeoutSeconds != nil {
 		resp.TimeoutSeconds = s.TimeoutSeconds
@@ -1660,12 +1868,20 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "name is required and must be 1-64 characters", http.StatusBadRequest)
 		return
 	}
+	if req.FromTemplate != nil && req.FromSnapshot != nil {
+		respondErrorMsg(c, "bad_request", "from_template and from_snapshot are mutually exclusive", http.StatusBadRequest)
+		return
+	}
+	if req.FromSnapshot != nil && strings.TrimSpace(*req.FromSnapshot) == "" {
+		respondErrorMsg(c, "bad_request", "from_snapshot must not be empty", http.StatusBadRequest)
+		return
+	}
 
-	if err := validateTimeoutSeconds(req.TimeoutSeconds); err != nil {
+	if err := validateTimeoutSeconds(req.TimeoutSeconds.Value); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := validateAutoDeleteSeconds(req.AutoDeleteSeconds); err != nil {
+	if err := validateAutoDeleteSeconds(req.AutoDeleteSeconds.Value); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1729,6 +1945,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+	if req.FromSnapshot != nil {
+		h.createSandboxFromSavedSnapshot(c, req, teamID, metadataJSON, previewAccess)
 		return
 	}
 
@@ -1826,10 +2046,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Resolve the VMD client up front so we don't waste a DB INSERT on
 	// a host we can't reach.
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), hostID)
+	vmd, vmdLookupErr := h.activeVMDForHost(c.Request.Context(), hostID)
 	if vmdLookupErr != nil {
-		log.Error().Err(vmdLookupErr).Msg("resolve VMD for create failed")
-		respondError(c, ErrInternal)
+		log.Warn().Err(vmdLookupErr).Str("host_id", hostID).Msg("create host is not accepting lifecycle work")
+		c.Header("Retry-After", "5")
+		respondErrorMsg(c, "sandbox_host_unavailable", "The sandbox host is temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -1858,12 +2079,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
 				MemoryMib:         1,
 				HostID:            hostID,
-				TimeoutSeconds:    req.TimeoutSeconds,
-				AutoDeleteSeconds: req.AutoDeleteSeconds,
+				TimeoutSeconds:    req.TimeoutSeconds.Value,
+				AutoDeleteSeconds: req.AutoDeleteSeconds.Value,
 				Metadata:          metadataJSON,
-				ID_2:              uuid.UUID(templateID.Bytes),
-				TeamID_2:          teamID,
-				TeamID_3:          h.systemTeamID(),
+				TemplateID:        uuid.UUID(templateID.Bytes),
+				SystemTeamID:      h.systemTeamID(),
 				SnapshotPath:      nullableStr(snapshotPath),
 				MemPath:           nullableStr(snapshotMemPath),
 				BasePath:          nullableStr(basePath),
@@ -1880,8 +2100,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			VcpuCount:         1,
 			MemoryMib:         1,
 			HostID:            hostID,
-			TimeoutSeconds:    req.TimeoutSeconds,
-			AutoDeleteSeconds: req.AutoDeleteSeconds,
+			TimeoutSeconds:    req.TimeoutSeconds.Value,
+			AutoDeleteSeconds: req.AutoDeleteSeconds.Value,
 			Metadata:          metadataJSON,
 			TemplateID:        pgtype.UUID{Valid: false},
 			SnapshotPath:      nil,
@@ -1920,8 +2140,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
 				MemoryMib:         1,
 				HostID:            hostID,
-				TimeoutSeconds:    req.TimeoutSeconds,
-				AutoDeleteSeconds: req.AutoDeleteSeconds,
+				TimeoutSeconds:    req.TimeoutSeconds.Value,
+				AutoDeleteSeconds: req.AutoDeleteSeconds.Value,
 				Metadata:          metadataJSON,
 				SnapshotPath:      nullableStr(snapshotPath),
 				MemPath:           nullableStr(snapshotMemPath),
@@ -1942,8 +2162,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			VcpuCount:         1,
 			MemoryMib:         1,
 			HostID:            hostID,
-			TimeoutSeconds:    req.TimeoutSeconds,
-			AutoDeleteSeconds: req.AutoDeleteSeconds,
+			TimeoutSeconds:    req.TimeoutSeconds.Value,
+			AutoDeleteSeconds: req.AutoDeleteSeconds.Value,
 			Metadata:          metadataJSON,
 			TemplateID:        pgtype.UUID{Valid: false},
 			PreviewAccess:     previewAccess,
@@ -1961,9 +2181,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandbox, dbErr := insertWithBindings()
 	tInsertEnd := time.Now()
 
-	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
-	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
-
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
 	quotaExceeded := isSandboxQuotaErr(dbErr)
 
@@ -1971,13 +2188,24 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// No VMD RPC has run yet, so an admission, quota, or template-race
 		// rejection needs no orphan cleanup and cannot perturb the host.
 		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed before VMD restore")
-		if templateRace {
-			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
-			return
-		}
 		if quotaExceeded {
 			h.respondQuotaExceeded(c, teamID)
 			return
+		}
+		if errors.Is(dbErr, pgx.ErrNoRows) {
+			// Host admission and a template deletion race intentionally return
+			// no row. Re-read the host only to preserve the useful 503 vs 404
+			// distinction; the locked INSERT remains the admission boundary.
+			host, hostErr := h.DB.GetHost(c.Request.Context(), hostID)
+			if errors.Is(hostErr, pgx.ErrNoRows) || (hostErr == nil && host.Status != "active") {
+				c.Header("Retry-After", "5")
+				respondErrorMsg(c, "sandbox_host_unavailable", "The sandbox host is temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if templateID.Valid && hostErr == nil {
+				respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+				return
+			}
 		}
 		respondError(c, ErrInternal)
 		return
@@ -2059,7 +2287,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// nftables push happens later (it needs the booted VM); the DB write does not.
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		_, _, networkConfig := egressConfigJSON(req.Network)
-		if err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
+		if _, err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
 			ID:            sandbox.ID,
 			NetworkConfig: networkConfig,
 			TeamID:        teamID,
@@ -2388,6 +2616,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// cleanup to schedule here.
 	finalizeCtx := context.WithoutCancel(c.Request.Context())
 	h.asyncBookkeeping("finalize-pause", func() {
+		// Keep the row transitional until the pause-time measurement attempt is
+		// complete so a resume cannot race VMD's view of the persisted layer.
+		// recordSandboxWritableLayerUsage has its own bounded deadline.
+		h.recordSandboxWritableLayerUsage(finalizeCtx, vmd, sandboxID, teamID)
 		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
 		defer fcancel()
 		if _, err := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
@@ -2650,16 +2882,9 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 			return
 		}
 
-		// Apply rules to the running VM via VMD.
-		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-		defer vmdCancel()
-		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD UpdateSandboxNetwork failed")
-			respondError(c, ErrInternal)
-			return
-		}
-
-		// Persist config to DB so it survives pause/resume.
+		// Apply and persist under the saved-snapshot capture lock. This makes
+		// the live firewall and the policy captured in the database one ordered
+		// mutation instead of allowing capture to land between the two.
 		networkConfig, _ := json.Marshal(map[string]any{
 			"egress": map[string]any{
 				"allowed_cidrs":   allowedCIDRs,
@@ -2667,13 +2892,26 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 				"allowed_domains": allowedDomains,
 			},
 		})
-		if err := h.DB.UpdateSandboxNetworkConfig(c.Request.Context(), db.UpdateSandboxNetworkConfigParams{
-			ID:            sandboxID,
-			NetworkConfig: networkConfig,
-			TeamID:        teamID,
-		}); err != nil {
-			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB UpdateSandboxNetworkConfig failed (rules applied, persistence failed)")
+		liveSandbox, err := h.applyCapturedNetworkPatch(
+			c.Request.Context(), vmd, sandboxID, teamID,
+			allowedCIDRs, body.Network.DenyOut, allowedDomains, networkConfig,
+		)
+		switch {
+		case errors.Is(err, errSandboxSnapshotInFlight):
+			respondErrorMsg(c, "conflict", "Sandbox has a snapshot operation in progress", http.StatusConflict)
+			return
+		case errors.Is(err, errSandboxMidTransition):
+			respondErrorMsg(c, "conflict", "Sandbox must be active to update network config", http.StatusConflict)
+			return
+		case errors.Is(err, pgx.ErrNoRows):
+			respondError(c, ErrSandboxNotFound)
+			return
+		case err != nil:
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("apply captured sandbox network policy")
+			respondError(c, ErrInternal)
+			return
 		}
+		sandbox = liveSandbox
 
 		h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "network", "updated", "success", &sandbox.Name, nil, networkConfig)
 		h.capture(c, "sandbox_network_updated", map[string]any{"sandbox_id": sandboxID.String()})
@@ -2798,7 +3036,21 @@ func (h *Handlers) applyRowsAffectedPatch(c *gin.Context, sandbox db.Sandbox, te
 		return false
 	}
 	if rows == 0 {
-		respondError(c, ErrSandboxNotFound)
+		cur, readErr := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{ID: sandbox.ID, TeamID: teamID})
+		switch {
+		case errors.Is(readErr, pgx.ErrNoRows):
+			respondError(c, ErrSandboxNotFound)
+		case readErr != nil:
+			log.Error().Err(readErr).Str("sandbox_id", sandbox.ID.String()).Str("patch", action).Msg("DB sandbox patch re-read failed")
+			respondError(c, ErrInternal)
+		case cur.SnapshotOperationID.Valid:
+			respondErrorMsg(c, "conflict", "Sandbox has a snapshot operation in progress", http.StatusConflict)
+		default:
+			// A capture may have completed between the guarded update and this
+			// re-read. The mutation still did not land, so ask the caller to
+			// retry rather than misreporting success or not-found.
+			respondError(c, ErrInvalidState)
+		}
 		return false
 	}
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", action, "success", &sandbox.Name, nil, nil)

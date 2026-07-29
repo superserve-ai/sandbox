@@ -7,13 +7,360 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const beginSavedSnapshot = `-- name: BeginSavedSnapshot :one
+WITH global_migration_fence AS MATERIALIZED (
+  SELECT pg_try_advisory_xact_lock_shared(
+    hashtextextended(
+      'superserve:migrate-team:saved-snapshot-global',
+      0
+    )
+  ) AS acquired
+),
+team_migration_fence AS MATERIALIZED (
+  SELECT CASE
+    WHEN global_fence.acquired THEN pg_try_advisory_xact_lock_shared(
+      hashtextextended(
+        'superserve:migrate-team:' || $5::uuid::text,
+        0
+      )
+    )
+    ELSE false
+  END AS acquired
+  FROM global_migration_fence global_fence
+),
+host_admitted AS MATERIALIZED (
+  SELECT h.id
+  FROM sandbox source
+  JOIN host h ON h.id = source.host_id
+  CROSS JOIN team_migration_fence fence
+  WHERE source.id = $6
+    AND source.team_id = $5
+    AND source.destroyed_at IS NULL
+    AND h.status = 'active'
+    AND fence.acquired
+  FOR SHARE OF h
+),
+parent_locked AS MATERIALIZED (
+  SELECT p.id
+  FROM sandbox source
+  JOIN snapshot p ON p.id = source.source_snapshot_id
+  JOIN host_admitted admitted ON admitted.id = source.host_id
+  WHERE source.id = $6
+    AND source.team_id = $5
+    AND p.team_id = $5
+    AND p.kind = 'saved'
+    AND p.status = 'ready'
+    AND p.deleted_at IS NULL
+  FOR KEY SHARE OF p
+),
+claimed AS (
+  UPDATE sandbox s
+  SET snapshot_operation_id = $1,
+      snapshot_operation_started_at = now(),
+      updated_at = now()
+  WHERE s.id = $6
+    AND s.team_id = $5
+    AND s.destroyed_at IS NULL
+    AND s.status IN ('active', 'paused')
+    AND s.snapshot_operation_id IS NULL
+    AND feature_enabled('sandbox_snapshots_v1', s.team_id)
+    AND EXISTS (SELECT 1 FROM host_admitted)
+    AND (s.source_snapshot_id IS NULL
+         OR EXISTS (SELECT 1 FROM parent_locked))
+  RETURNING s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.source_snapshot_id, s.snapshot_operation_id, s.snapshot_operation_started_at, s.secret_env_keys
+)
+INSERT INTO snapshot (
+  id, sandbox_id, team_id, path, mem_path, size_bytes, trigger,
+  kind, status, name, idempotency_key, parent_snapshot_id, source_status,
+  template_id, template_snapshot_path, template_mem_path, base_path, delta_path,
+  host_id, vcpu_count, memory_mib, disk_mib, network_config, timeout_seconds,
+  auto_delete_seconds, secret_bindings, secret_env_keys
+)
+SELECT
+  $1, c.id, c.team_id, '', NULL, 0, $2,
+  'saved', 'creating', $3, $4,
+  c.source_snapshot_id, c.status, c.template_id, c.snapshot_path, c.mem_path,
+  c.base_path, c.delta_path, c.host_id, c.vcpu_count, c.memory_mib, c.disk_mib,
+  c.network_config, c.timeout_seconds, c.auto_delete_seconds,
+  COALESCE((
+    SELECT jsonb_agg(
+      jsonb_build_object(
+        'env_key', ss.env_key,
+        'secret_id', ss.secret_id,
+        'secret_name', sec.name
+      ) ORDER BY ss.env_key
+    )
+    FROM sandbox_secret ss
+    JOIN secret sec ON sec.id = ss.secret_id
+    WHERE ss.sandbox_id = c.id
+  ), '[]'::jsonb), c.secret_env_keys
+FROM claimed c
+RETURNING snapshot.id, snapshot.sandbox_id, snapshot.team_id, snapshot.path, snapshot.size_bytes, snapshot.trigger, snapshot.created_at, snapshot.mem_path, snapshot.kind, snapshot.status, snapshot.name, snapshot.idempotency_key, snapshot.parent_snapshot_id, snapshot.source_status, snapshot.template_id, snapshot.template_snapshot_path, snapshot.template_mem_path, snapshot.base_path, snapshot.delta_path, snapshot.host_id, snapshot.vcpu_count, snapshot.memory_mib, snapshot.disk_mib, snapshot.manifest_path, snapshot.manifest_digest, snapshot.artifact_metadata, snapshot.logical_size_bytes, snapshot.exclusive_size_bytes, snapshot.network_config, snapshot.timeout_seconds, snapshot.auto_delete_seconds, snapshot.secret_bindings, snapshot.secret_env_keys, snapshot.failure_reason, snapshot.updated_at, snapshot.finalized_at, snapshot.deleted_at
+`
+
+type BeginSavedSnapshotParams struct {
+	SnapshotID     uuid.UUID `json:"snapshot_id"`
+	Trigger        string    `json:"trigger"`
+	Name           *string   `json:"name"`
+	IdempotencyKey *string   `json:"idempotency_key"`
+	TeamID         uuid.UUID `json:"team_id"`
+	SandboxID      uuid.UUID `json:"sandbox_id"`
+}
+
+// Claim an active/paused source without changing its public lifecycle status,
+// then persist the creating intent and snapshot-time policy in one statement.
+// snapshot_operation_id excludes pause/resume/delete until finalize/fail clears
+// the claim. Callers that allow secret binding writes must first take
+// LockSandboxForSecretWrites in the same transaction so secret_bindings is an
+// exact snapshot of the source configuration.
+//
+// Lock the host before claiming the source. This is the durable admission
+// boundary for a host drain: either capture owns the active-host lease first
+// (and drain waits, then observes snapshot_operation_id), or drain flips the
+// host first and this statement returns no row without touching host storage.
+// A fork's parent snapshot is then locked FOR KEY SHARE. Leaf deletion locks
+// the same row FOR UPDATE, so a child snapshot and parent deletion cannot both
+// win.
+//
+// Both migration fences are repeated inside this statement so direct
+// db.Queries users that do not provide Handlers.Pool also fail closed.
+// MATERIALIZED dependencies enforce global -> team -> host/sandbox lock order.
+func (q *Queries) BeginSavedSnapshot(ctx context.Context, arg BeginSavedSnapshotParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, beginSavedSnapshot,
+		arg.SnapshotID,
+		arg.Trigger,
+		arg.Name,
+		arg.IdempotencyKey,
+		arg.TeamID,
+		arg.SandboxID,
+	)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const claimDeleteSavedSnapshotIfLeaf = `-- name: ClaimDeleteSavedSnapshotIfLeaf :one
+WITH host_admitted AS MATERIALIZED (
+  SELECT h.id
+  FROM snapshot target
+  JOIN host h ON h.id = target.host_id
+  WHERE target.id = $1
+    AND target.team_id = $2
+    AND target.kind = 'saved'
+    AND target.deleted_at IS NULL
+    AND h.status = 'active'
+  FOR SHARE OF h
+),
+source_locked AS MATERIALIZED (
+  SELECT source.id
+  FROM snapshot target
+  JOIN sandbox source
+    ON source.id = target.sandbox_id AND source.team_id = target.team_id
+  JOIN host_admitted admitted ON admitted.id = target.host_id
+  WHERE target.id = $1
+    AND target.team_id = $2
+    AND target.kind = 'saved'
+    AND target.deleted_at IS NULL
+  FOR UPDATE OF source
+),
+locked AS MATERIALIZED (
+  SELECT target.id
+  FROM snapshot target
+  JOIN source_locked source ON source.id = target.sandbox_id
+  WHERE target.id = $1
+    AND target.team_id = $2
+    AND target.kind = 'saved'
+    AND target.deleted_at IS NULL
+  FOR UPDATE OF target
+),
+claimable AS MATERIALIZED (
+  SELECT target.id, target.sandbox_id, target.team_id
+  FROM snapshot target
+  JOIN locked ON locked.id = target.id
+  WHERE target.status IN ('creating', 'ready', 'unavailable', 'failed')
+    AND NOT EXISTS (
+      SELECT 1 FROM sandbox child
+      WHERE child.source_snapshot_id = target.id
+        AND child.team_id = target.team_id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM snapshot child
+      WHERE child.parent_snapshot_id = target.id
+        AND child.team_id = target.team_id
+        AND child.kind = 'saved'
+        AND child.deleted_at IS NULL
+    )
+),
+released AS (
+  UPDATE sandbox source
+  SET snapshot_operation_id = NULL,
+      snapshot_operation_started_at = NULL,
+      updated_at = now()
+  FROM claimable c
+  WHERE source.id = c.sandbox_id
+    AND source.team_id = c.team_id
+    AND source.snapshot_operation_id = c.id
+  RETURNING source.id
+)
+UPDATE snapshot s
+SET status = 'deleting', updated_at = now()
+WHERE s.id IN (SELECT id FROM claimable)
+RETURNING s.id, s.sandbox_id, s.team_id, s.path, s.size_bytes, s.trigger, s.created_at, s.mem_path, s.kind, s.status, s.name, s.idempotency_key, s.parent_snapshot_id, s.source_status, s.template_id, s.template_snapshot_path, s.template_mem_path, s.base_path, s.delta_path, s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.manifest_path, s.manifest_digest, s.artifact_metadata, s.logical_size_bytes, s.exclusive_size_bytes, s.network_config, s.timeout_seconds, s.auto_delete_seconds, s.secret_bindings, s.secret_env_keys, s.failure_reason, s.updated_at, s.finalized_at, s.deleted_at
+`
+
+type ClaimDeleteSavedSnapshotIfLeafParams struct {
+	SnapshotID uuid.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+}
+
+// Host admission is locked before the source/snapshot rows. A drain that wins
+// first rejects a new delete before it can mutate host-local artifacts; a
+// delete that wins first makes drain wait and then exposes status='deleting'
+// to the drain convergence check.
+// Child creation holds FOR KEY SHARE on this row. This FOR UPDATE claim waits
+// for those inserts, then re-checks dependencies before making the snapshot
+// unavailable to new forks. The source is locked first to match capture
+// finalize/failure lock ordering. Cancelling a creating capture also releases
+// only its matching source operation claim in the same statement. Zero rows
+// means not found, non-leaf, or already deleting.
+func (q *Queries) ClaimDeleteSavedSnapshotIfLeaf(ctx context.Context, arg ClaimDeleteSavedSnapshotIfLeafParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, claimDeleteSavedSnapshotIfLeaf, arg.SnapshotID, arg.TeamID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const countSavedSnapshotsBySource = `-- name: CountSavedSnapshotsBySource :one
+SELECT count(*)::bigint FROM snapshot
+WHERE sandbox_id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+  AND status <> 'failed'
+`
+
+type CountSavedSnapshotsBySourceParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) CountSavedSnapshotsBySource(ctx context.Context, arg CountSavedSnapshotsBySourceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countSavedSnapshotsBySource, arg.SandboxID, arg.TeamID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countSavedSnapshotsByTeam = `-- name: CountSavedSnapshotsByTeam :one
+SELECT count(*)::bigint FROM snapshot
+WHERE team_id = $1
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+  AND ($2::uuid IS NULL
+       OR sandbox_id = $2)
+  AND ($3::text IS NULL
+       OR status::text = $3::text)
+`
+
+type CountSavedSnapshotsByTeamParams struct {
+	TeamID          uuid.UUID   `json:"team_id"`
+	SourceSandboxID pgtype.UUID `json:"source_sandbox_id"`
+	Status          *string     `json:"status"`
+}
+
+func (q *Queries) CountSavedSnapshotsByTeam(ctx context.Context, arg CountSavedSnapshotsByTeamParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countSavedSnapshotsByTeam, arg.TeamID, arg.SourceSandboxID, arg.Status)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const createSnapshot = `-- name: CreateSnapshot :one
-INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-VALUES ($1, $2, $3, $4, $5, $6)
+
+INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, kind, status)
+VALUES ($1, $2, $3, $4, $5, $6, 'runtime_checkpoint', 'ready')
 RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at
 `
 
@@ -26,6 +373,10 @@ type CreateSnapshotParams struct {
 	Trigger   string    `json:"trigger"`
 }
 
+// Runtime checkpoints -------------------------------------------------------
+// Legacy/internal runtime-checkpoint insert. Saved snapshots are admitted
+// through BeginSavedSnapshot so count, policy, lineage, and source ownership
+// are captured atomically.
 func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) (Snapshot, error) {
 	row := q.db.QueryRow(ctx, createSnapshot,
 		arg.SandboxID,
@@ -78,14 +429,48 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 	return i, err
 }
 
-const deleteSnapshot = `-- name: DeleteSnapshot :exec
-DELETE FROM snapshot
+const deferSavedSnapshotReconciliation = `-- name: DeferSavedSnapshotReconciliation :execrows
+UPDATE snapshot
+SET updated_at = GREATEST(now(), updated_at + interval '1 microsecond')
 WHERE id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+  AND status = $3::snapshot_status
+  AND deleted_at IS NULL
+  AND updated_at = $4
 `
 
-// Invariant: only delete snapshots of destroyed sandboxes. fk_sandbox_snapshot
-// is ON DELETE SET NULL, so deleting a live/paused sandbox's snapshot silently
-// nulls its restore pointer (unrestorable) instead of erroring.
+type DeferSavedSnapshotReconciliationParams struct {
+	SnapshotID        uuid.UUID      `json:"snapshot_id"`
+	TeamID            uuid.UUID      `json:"team_id"`
+	ExpectedStatus    SnapshotStatus `json:"expected_status"`
+	ObservedUpdatedAt time.Time      `json:"observed_updated_at"`
+}
+
+// Move a failed reconciliation attempt to the back of its status queue. The
+// observed timestamp guard prevents a stale worker from extending a newer
+// worker's retry window, while the identity/status guards make this a no-op
+// after any concurrent lifecycle transition.
+func (q *Queries) DeferSavedSnapshotReconciliation(ctx context.Context, arg DeferSavedSnapshotReconciliationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferSavedSnapshotReconciliation,
+		arg.SnapshotID,
+		arg.TeamID,
+		arg.ExpectedStatus,
+		arg.ObservedUpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteSnapshot = `-- name: DeleteSnapshot :exec
+DELETE FROM snapshot
+WHERE id = $1 AND kind = 'runtime_checkpoint'
+`
+
+// Runtime checkpoints are replaceable and may be hard-deleted. Saved rows use
+// the claim/finalize soft-delete flow below.
 func (q *Queries) DeleteSnapshot(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteSnapshot, id)
 	return err
@@ -95,14 +480,13 @@ const deleteSnapshotsOfDestroyedSandboxes = `-- name: DeleteSnapshotsOfDestroyed
 DELETE FROM snapshot s
 USING sandbox sb
 WHERE s.sandbox_id = sb.id
+  AND s.kind = 'runtime_checkpoint'
   AND sb.destroyed_at IS NOT NULL
   AND sb.destroyed_at < now() - interval '1 hour'
 `
 
-// Backstop for destroy teardown that never ran (crash/shutdown before
-// cleanupSandboxSnapshots). Driven from snapshot (joined to sandbox by PK) so
-// it scans only un-cleaned rows, not every accumulating soft-deleted sandbox.
-// Files fall to the vm reconciler's disk scan.
+// Backstop for destroy teardown that never ran. Never collect saved snapshots:
+// they have their own lineage-aware deletion/GC lifecycle.
 func (q *Queries) DeleteSnapshotsOfDestroyedSandboxes(ctx context.Context) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteSnapshotsOfDestroyedSandboxes)
 	if err != nil {
@@ -111,9 +495,983 @@ func (q *Queries) DeleteSnapshotsOfDestroyedSandboxes(ctx context.Context) (int6
 	return result.RowsAffected(), nil
 }
 
+const failSavedSnapshot = `-- name: FailSavedSnapshot :one
+WITH source_locked AS MATERIALIZED (
+  SELECT source.id
+  FROM snapshot intent
+  JOIN sandbox source
+    ON source.id = intent.sandbox_id AND source.team_id = intent.team_id
+  WHERE intent.id = $1
+    AND intent.team_id = $2
+    AND intent.kind = 'saved'
+    AND intent.status = 'creating'
+    AND intent.deleted_at IS NULL
+  FOR UPDATE OF source
+),
+failed AS (
+  UPDATE snapshot s
+  SET status = 'failed',
+      failure_reason = $3,
+      finalized_at = now(),
+      updated_at = now()
+  WHERE s.id = $1
+    AND s.team_id = $2
+    AND s.kind = 'saved'
+    AND s.status = 'creating'
+    AND s.deleted_at IS NULL
+    AND EXISTS (SELECT 1 FROM source_locked)
+  RETURNING s.id, s.sandbox_id, s.team_id, s.path, s.size_bytes, s.trigger, s.created_at, s.mem_path, s.kind, s.status, s.name, s.idempotency_key, s.parent_snapshot_id, s.source_status, s.template_id, s.template_snapshot_path, s.template_mem_path, s.base_path, s.delta_path, s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.manifest_path, s.manifest_digest, s.artifact_metadata, s.logical_size_bytes, s.exclusive_size_bytes, s.network_config, s.timeout_seconds, s.auto_delete_seconds, s.secret_bindings, s.secret_env_keys, s.failure_reason, s.updated_at, s.finalized_at, s.deleted_at
+),
+released AS (
+  UPDATE sandbox source
+  SET snapshot_operation_id = NULL,
+      snapshot_operation_started_at = NULL,
+      updated_at = now()
+  FROM failed f
+  WHERE source.id = f.sandbox_id
+    AND source.team_id = f.team_id
+    AND source.snapshot_operation_id = f.id
+  RETURNING source.id
+)
+SELECT failed.id, failed.sandbox_id, failed.team_id, failed.path, failed.size_bytes, failed.trigger, failed.created_at, failed.mem_path, failed.kind, failed.status, failed.name, failed.idempotency_key, failed.parent_snapshot_id, failed.source_status, failed.template_id, failed.template_snapshot_path, failed.template_mem_path, failed.base_path, failed.delta_path, failed.host_id, failed.vcpu_count, failed.memory_mib, failed.disk_mib, failed.manifest_path, failed.manifest_digest, failed.artifact_metadata, failed.logical_size_bytes, failed.exclusive_size_bytes, failed.network_config, failed.timeout_seconds, failed.auto_delete_seconds, failed.secret_bindings, failed.secret_env_keys, failed.failure_reason, failed.updated_at, failed.finalized_at, failed.deleted_at FROM failed
+`
+
+type FailSavedSnapshotParams struct {
+	SnapshotID    uuid.UUID `json:"snapshot_id"`
+	TeamID        uuid.UUID `json:"team_id"`
+	FailureReason *string   `json:"failure_reason"`
+}
+
+type FailSavedSnapshotRow struct {
+	ID                   uuid.UUID          `json:"id"`
+	SandboxID            uuid.UUID          `json:"sandbox_id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	Path                 string             `json:"path"`
+	SizeBytes            int64              `json:"size_bytes"`
+	Trigger              string             `json:"trigger"`
+	CreatedAt            time.Time          `json:"created_at"`
+	MemPath              *string            `json:"mem_path"`
+	Kind                 SnapshotKind       `json:"kind"`
+	Status               SnapshotStatus     `json:"status"`
+	Name                 *string            `json:"name"`
+	IdempotencyKey       *string            `json:"idempotency_key"`
+	ParentSnapshotID     pgtype.UUID        `json:"parent_snapshot_id"`
+	SourceStatus         NullSandboxStatus  `json:"source_status"`
+	TemplateID           pgtype.UUID        `json:"template_id"`
+	TemplateSnapshotPath *string            `json:"template_snapshot_path"`
+	TemplateMemPath      *string            `json:"template_mem_path"`
+	BasePath             *string            `json:"base_path"`
+	DeltaPath            *string            `json:"delta_path"`
+	HostID               *string            `json:"host_id"`
+	VcpuCount            *int32             `json:"vcpu_count"`
+	MemoryMib            *int32             `json:"memory_mib"`
+	DiskMib              *int32             `json:"disk_mib"`
+	ManifestPath         *string            `json:"manifest_path"`
+	ManifestDigest       *string            `json:"manifest_digest"`
+	ArtifactMetadata     []byte             `json:"artifact_metadata"`
+	LogicalSizeBytes     int64              `json:"logical_size_bytes"`
+	ExclusiveSizeBytes   int64              `json:"exclusive_size_bytes"`
+	NetworkConfig        []byte             `json:"network_config"`
+	TimeoutSeconds       *int32             `json:"timeout_seconds"`
+	AutoDeleteSeconds    *int32             `json:"auto_delete_seconds"`
+	SecretBindings       []byte             `json:"secret_bindings"`
+	SecretEnvKeys        []byte             `json:"secret_env_keys"`
+	FailureReason        *string            `json:"failure_reason"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	FinalizedAt          pgtype.Timestamptz `json:"finalized_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+}
+
+// Terminalize a failed capture and release only the matching source claim; a
+// stale worker therefore cannot clear a newer operation. Lock the source
+// before the snapshot so failure, finalization, cleanup, and cancellation all
+// use the same lifecycle lock order.
+func (q *Queries) FailSavedSnapshot(ctx context.Context, arg FailSavedSnapshotParams) (FailSavedSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, failSavedSnapshot, arg.SnapshotID, arg.TeamID, arg.FailureReason)
+	var i FailSavedSnapshotRow
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const failSavedSnapshotAndSource = `-- name: FailSavedSnapshotAndSource :one
+WITH source_locked AS MATERIALIZED (
+  SELECT source.id, source.team_id
+  FROM snapshot intent
+  JOIN sandbox source
+    ON source.id = intent.sandbox_id AND source.team_id = intent.team_id
+  WHERE intent.id = $1
+    AND intent.team_id = $2
+    AND intent.kind = 'saved'
+    AND intent.status = 'creating'
+    AND intent.deleted_at IS NULL
+    AND source.snapshot_operation_id = intent.id
+    AND source.destroyed_at IS NULL
+  FOR UPDATE OF source
+),
+failed_source AS (
+  UPDATE sandbox source
+  SET status = 'failed',
+      auto_delete_at = NULL,
+      snapshot_operation_id = NULL,
+      snapshot_operation_started_at = NULL,
+      updated_at = now()
+  FROM source_locked locked
+  WHERE source.id = locked.id
+    AND source.team_id = locked.team_id
+    AND source.snapshot_operation_id = $1
+    AND source.destroyed_at IS NULL
+  RETURNING source.id, source.team_id
+),
+revoked_source AS (
+  INSERT INTO sandbox_revocation (sandbox_id, expires_at)
+  SELECT source.id, $3
+  FROM failed_source source
+  ON CONFLICT (sandbox_id) DO UPDATE
+  SET expires_at = GREATEST(sandbox_revocation.expires_at, EXCLUDED.expires_at)
+  RETURNING sandbox_id
+),
+failed_snapshot AS (
+  UPDATE snapshot intent
+  SET status = 'failed',
+      failure_reason = $4,
+      finalized_at = now(),
+      updated_at = now()
+  WHERE intent.id = $1
+    AND intent.team_id = $2
+    AND intent.kind = 'saved'
+    AND intent.status = 'creating'
+    AND intent.deleted_at IS NULL
+    AND EXISTS (
+      SELECT 1 FROM failed_source source
+      WHERE source.id = intent.sandbox_id
+        AND source.team_id = intent.team_id
+    )
+  RETURNING intent.id, intent.sandbox_id, intent.team_id, intent.path, intent.size_bytes, intent.trigger, intent.created_at, intent.mem_path, intent.kind, intent.status, intent.name, intent.idempotency_key, intent.parent_snapshot_id, intent.source_status, intent.template_id, intent.template_snapshot_path, intent.template_mem_path, intent.base_path, intent.delta_path, intent.host_id, intent.vcpu_count, intent.memory_mib, intent.disk_mib, intent.manifest_path, intent.manifest_digest, intent.artifact_metadata, intent.logical_size_bytes, intent.exclusive_size_bytes, intent.network_config, intent.timeout_seconds, intent.auto_delete_seconds, intent.secret_bindings, intent.secret_env_keys, intent.failure_reason, intent.updated_at, intent.finalized_at, intent.deleted_at
+),
+closed_active AS (
+  UPDATE sandbox_active_interval interval
+  SET ended_at = GREATEST(now(), interval.started_at),
+      end_reason = 'failed'
+  FROM failed_source source
+  WHERE interval.sandbox_id = source.id
+    AND interval.team_id = source.team_id
+    AND interval.ended_at IS NULL
+  RETURNING interval.sandbox_id
+),
+closed_compute AS (
+  UPDATE sandbox_compute_billing_interval interval
+  SET ended_at = GREATEST(now(), interval.started_at),
+      end_reason = 'failed'
+  FROM failed_source source
+  WHERE interval.sandbox_id = source.id
+    AND interval.team_id = source.team_id
+    AND interval.ended_at IS NULL
+  RETURNING interval.sandbox_id
+)
+SELECT failed_snapshot.id, failed_snapshot.sandbox_id, failed_snapshot.team_id, failed_snapshot.path, failed_snapshot.size_bytes, failed_snapshot.trigger, failed_snapshot.created_at, failed_snapshot.mem_path, failed_snapshot.kind, failed_snapshot.status, failed_snapshot.name, failed_snapshot.idempotency_key, failed_snapshot.parent_snapshot_id, failed_snapshot.source_status, failed_snapshot.template_id, failed_snapshot.template_snapshot_path, failed_snapshot.template_mem_path, failed_snapshot.base_path, failed_snapshot.delta_path, failed_snapshot.host_id, failed_snapshot.vcpu_count, failed_snapshot.memory_mib, failed_snapshot.disk_mib, failed_snapshot.manifest_path, failed_snapshot.manifest_digest, failed_snapshot.artifact_metadata, failed_snapshot.logical_size_bytes, failed_snapshot.exclusive_size_bytes, failed_snapshot.network_config, failed_snapshot.timeout_seconds, failed_snapshot.auto_delete_seconds, failed_snapshot.secret_bindings, failed_snapshot.secret_env_keys, failed_snapshot.failure_reason, failed_snapshot.updated_at, failed_snapshot.finalized_at, failed_snapshot.deleted_at FROM failed_snapshot
+`
+
+type FailSavedSnapshotAndSourceParams struct {
+	SnapshotID          uuid.UUID `json:"snapshot_id"`
+	TeamID              uuid.UUID `json:"team_id"`
+	RevocationExpiresAt time.Time `json:"revocation_expires_at"`
+	FailureReason       *string   `json:"failure_reason"`
+}
+
+type FailSavedSnapshotAndSourceRow struct {
+	ID                   uuid.UUID          `json:"id"`
+	SandboxID            uuid.UUID          `json:"sandbox_id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	Path                 string             `json:"path"`
+	SizeBytes            int64              `json:"size_bytes"`
+	Trigger              string             `json:"trigger"`
+	CreatedAt            time.Time          `json:"created_at"`
+	MemPath              *string            `json:"mem_path"`
+	Kind                 SnapshotKind       `json:"kind"`
+	Status               SnapshotStatus     `json:"status"`
+	Name                 *string            `json:"name"`
+	IdempotencyKey       *string            `json:"idempotency_key"`
+	ParentSnapshotID     pgtype.UUID        `json:"parent_snapshot_id"`
+	SourceStatus         NullSandboxStatus  `json:"source_status"`
+	TemplateID           pgtype.UUID        `json:"template_id"`
+	TemplateSnapshotPath *string            `json:"template_snapshot_path"`
+	TemplateMemPath      *string            `json:"template_mem_path"`
+	BasePath             *string            `json:"base_path"`
+	DeltaPath            *string            `json:"delta_path"`
+	HostID               *string            `json:"host_id"`
+	VcpuCount            *int32             `json:"vcpu_count"`
+	MemoryMib            *int32             `json:"memory_mib"`
+	DiskMib              *int32             `json:"disk_mib"`
+	ManifestPath         *string            `json:"manifest_path"`
+	ManifestDigest       *string            `json:"manifest_digest"`
+	ArtifactMetadata     []byte             `json:"artifact_metadata"`
+	LogicalSizeBytes     int64              `json:"logical_size_bytes"`
+	ExclusiveSizeBytes   int64              `json:"exclusive_size_bytes"`
+	NetworkConfig        []byte             `json:"network_config"`
+	TimeoutSeconds       *int32             `json:"timeout_seconds"`
+	AutoDeleteSeconds    *int32             `json:"auto_delete_seconds"`
+	SecretBindings       []byte             `json:"secret_bindings"`
+	SecretEnvKeys        []byte             `json:"secret_env_keys"`
+	FailureReason        *string            `json:"failure_reason"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	FinalizedAt          pgtype.Timestamptz `json:"finalized_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+}
+
+// A running capture that cannot resume its source leaves both resources in a
+// terminal state. Lock and update the source first, clear only the matching
+// operation claim, then fail the creating intent and close both usage interval
+// types in the same statement. Zero rows means the capture no longer owns the
+// source or is no longer creating.
+func (q *Queries) FailSavedSnapshotAndSource(ctx context.Context, arg FailSavedSnapshotAndSourceParams) (FailSavedSnapshotAndSourceRow, error) {
+	row := q.db.QueryRow(ctx, failSavedSnapshotAndSource,
+		arg.SnapshotID,
+		arg.TeamID,
+		arg.RevocationExpiresAt,
+		arg.FailureReason,
+	)
+	var i FailSavedSnapshotAndSourceRow
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const failSavedSnapshotSourceAfterRevocation = `-- name: FailSavedSnapshotSourceAfterRevocation :one
+WITH source_locked AS MATERIALIZED (
+  SELECT source.id, source.team_id, intent.source_status,
+         intent.created_at AS intent_created_at
+  FROM snapshot intent
+  JOIN sandbox source
+    ON source.id = intent.sandbox_id AND source.team_id = intent.team_id
+  JOIN sandbox_revocation revocation
+    ON revocation.sandbox_id = source.id AND revocation.expires_at > now()
+  WHERE intent.id = $1
+    AND intent.team_id = $2
+    AND intent.kind = 'saved'
+    AND source.destroyed_at IS NULL
+    AND (source.status = 'failed' OR source.status = intent.source_status)
+    AND (source.snapshot_operation_id IS NULL
+         OR source.snapshot_operation_id = intent.id)
+    AND (source.status = 'failed'
+         OR source.snapshot_operation_id = intent.id
+         OR source.updated_at <= intent.created_at)
+  FOR UPDATE OF source
+),
+failed_source AS (
+  UPDATE sandbox source
+  SET status = 'failed',
+      auto_delete_at = NULL,
+      snapshot_operation_id = NULL,
+      snapshot_operation_started_at = NULL,
+      updated_at = now()
+  FROM source_locked locked
+  WHERE source.id = locked.id
+    AND source.team_id = locked.team_id
+    AND source.destroyed_at IS NULL
+    AND (source.status = 'failed' OR source.status = locked.source_status)
+    AND (source.snapshot_operation_id IS NULL
+         OR source.snapshot_operation_id = $1)
+    AND (source.status = 'failed'
+         OR source.snapshot_operation_id = $1
+         OR source.updated_at <= locked.intent_created_at)
+  RETURNING source.id, source.team_id
+),
+failed_snapshot AS (
+  UPDATE snapshot intent
+  SET status = 'failed',
+      failure_reason = $3,
+      finalized_at = now(),
+      updated_at = now()
+  WHERE intent.id = $1
+    AND intent.team_id = $2
+    AND intent.kind = 'saved'
+    AND intent.status = 'creating'
+    AND intent.deleted_at IS NULL
+    AND EXISTS (
+      SELECT 1 FROM failed_source source
+      WHERE source.id = intent.sandbox_id
+        AND source.team_id = intent.team_id
+    )
+  RETURNING intent.id
+),
+closed_active AS (
+  UPDATE sandbox_active_interval interval
+  SET ended_at = GREATEST(now(), interval.started_at),
+      end_reason = 'failed'
+  FROM failed_source source
+  WHERE interval.sandbox_id = source.id
+    AND interval.team_id = source.team_id
+    AND interval.ended_at IS NULL
+  RETURNING interval.sandbox_id
+),
+closed_compute AS (
+  UPDATE sandbox_compute_billing_interval interval
+  SET ended_at = GREATEST(now(), interval.started_at),
+      end_reason = 'failed'
+  FROM failed_source source
+  WHERE interval.sandbox_id = source.id
+    AND interval.team_id = source.team_id
+    AND interval.ended_at IS NULL
+  RETURNING interval.sandbox_id
+)
+SELECT source.id FROM failed_source source
+`
+
+type FailSavedSnapshotSourceAfterRevocationParams struct {
+	SnapshotID    uuid.UUID `json:"snapshot_id"`
+	TeamID        uuid.UUID `json:"team_id"`
+	FailureReason *string   `json:"failure_reason"`
+}
+
+// Fallback for a source-resume failure when the compound transition above did
+// not return. A separately persisted, unexpired revocation is a prerequisite.
+// The source may still hold this capture's claim or a concurrent cancellation
+// may already have cleared it; the immutable capture timestamp rejects an
+// intervening source lifecycle change even when reconciliation retry metadata
+// advances, and a newer capture claim is never overwritten.
+// Returning the source ID proves that the failed state, claim release, and
+// usage-interval closures committed before callers tear down the host VM.
+func (q *Queries) FailSavedSnapshotSourceAfterRevocation(ctx context.Context, arg FailSavedSnapshotSourceAfterRevocationParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, failSavedSnapshotSourceAfterRevocation, arg.SnapshotID, arg.TeamID, arg.FailureReason)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const finalizeSavedSnapshot = `-- name: FinalizeSavedSnapshot :one
+WITH source_locked AS MATERIALIZED (
+  -- Keep lifecycle and quota-trigger lock ordering sandbox -> team. Without
+  -- this explicit source lock, the storage trigger could lock team first and
+  -- deadlock with DestroySandbox, whose quota trigger takes the reverse path.
+  SELECT source.id
+  FROM snapshot intent
+  JOIN sandbox source
+    ON source.id = intent.sandbox_id AND source.team_id = intent.team_id
+  WHERE intent.id = $1
+    AND intent.team_id = $2
+    AND intent.kind = 'saved'
+    AND intent.status = 'creating'
+    AND intent.deleted_at IS NULL
+    AND source.snapshot_operation_id = intent.id
+    AND source.destroyed_at IS NULL
+    AND source.status = intent.source_status
+  FOR UPDATE OF source
+),
+finalized AS (
+  UPDATE snapshot s
+  SET status = 'ready',
+      path = $3,
+      mem_path = $4::text,
+      size_bytes = $5,
+      manifest_path = $6::text,
+      manifest_digest = $7,
+      artifact_metadata = $8,
+      logical_size_bytes = $5,
+      exclusive_size_bytes = $9,
+      failure_reason = NULL,
+      finalized_at = now(),
+      updated_at = now()
+  WHERE s.id = $1
+    AND s.team_id = $2
+    AND s.kind = 'saved'
+    AND s.status = 'creating'
+    AND s.deleted_at IS NULL
+    AND EXISTS (SELECT 1 FROM source_locked)
+  RETURNING s.id, s.sandbox_id, s.team_id, s.path, s.size_bytes, s.trigger, s.created_at, s.mem_path, s.kind, s.status, s.name, s.idempotency_key, s.parent_snapshot_id, s.source_status, s.template_id, s.template_snapshot_path, s.template_mem_path, s.base_path, s.delta_path, s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.manifest_path, s.manifest_digest, s.artifact_metadata, s.logical_size_bytes, s.exclusive_size_bytes, s.network_config, s.timeout_seconds, s.auto_delete_seconds, s.secret_bindings, s.secret_env_keys, s.failure_reason, s.updated_at, s.finalized_at, s.deleted_at
+),
+released AS (
+  UPDATE sandbox source
+  SET snapshot_operation_id = NULL,
+      snapshot_operation_started_at = NULL,
+      updated_at = now()
+  FROM finalized f
+  WHERE source.id = f.sandbox_id
+    AND source.team_id = f.team_id
+    AND source.snapshot_operation_id = f.id
+  RETURNING source.id
+)
+SELECT finalized.id, finalized.sandbox_id, finalized.team_id, finalized.path, finalized.size_bytes, finalized.trigger, finalized.created_at, finalized.mem_path, finalized.kind, finalized.status, finalized.name, finalized.idempotency_key, finalized.parent_snapshot_id, finalized.source_status, finalized.template_id, finalized.template_snapshot_path, finalized.template_mem_path, finalized.base_path, finalized.delta_path, finalized.host_id, finalized.vcpu_count, finalized.memory_mib, finalized.disk_mib, finalized.manifest_path, finalized.manifest_digest, finalized.artifact_metadata, finalized.logical_size_bytes, finalized.exclusive_size_bytes, finalized.network_config, finalized.timeout_seconds, finalized.auto_delete_seconds, finalized.secret_bindings, finalized.secret_env_keys, finalized.failure_reason, finalized.updated_at, finalized.finalized_at, finalized.deleted_at FROM finalized
+`
+
+type FinalizeSavedSnapshotParams struct {
+	SnapshotID         uuid.UUID `json:"snapshot_id"`
+	TeamID             uuid.UUID `json:"team_id"`
+	Path               string    `json:"path"`
+	MemPath            string    `json:"mem_path"`
+	LogicalSizeBytes   int64     `json:"logical_size_bytes"`
+	ManifestPath       string    `json:"manifest_path"`
+	ManifestDigest     *string   `json:"manifest_digest"`
+	ArtifactMetadata   []byte    `json:"artifact_metadata"`
+	ExclusiveSizeBytes int64     `json:"exclusive_size_bytes"`
+}
+
+type FinalizeSavedSnapshotRow struct {
+	ID                   uuid.UUID          `json:"id"`
+	SandboxID            uuid.UUID          `json:"sandbox_id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	Path                 string             `json:"path"`
+	SizeBytes            int64              `json:"size_bytes"`
+	Trigger              string             `json:"trigger"`
+	CreatedAt            time.Time          `json:"created_at"`
+	MemPath              *string            `json:"mem_path"`
+	Kind                 SnapshotKind       `json:"kind"`
+	Status               SnapshotStatus     `json:"status"`
+	Name                 *string            `json:"name"`
+	IdempotencyKey       *string            `json:"idempotency_key"`
+	ParentSnapshotID     pgtype.UUID        `json:"parent_snapshot_id"`
+	SourceStatus         NullSandboxStatus  `json:"source_status"`
+	TemplateID           pgtype.UUID        `json:"template_id"`
+	TemplateSnapshotPath *string            `json:"template_snapshot_path"`
+	TemplateMemPath      *string            `json:"template_mem_path"`
+	BasePath             *string            `json:"base_path"`
+	DeltaPath            *string            `json:"delta_path"`
+	HostID               *string            `json:"host_id"`
+	VcpuCount            *int32             `json:"vcpu_count"`
+	MemoryMib            *int32             `json:"memory_mib"`
+	DiskMib              *int32             `json:"disk_mib"`
+	ManifestPath         *string            `json:"manifest_path"`
+	ManifestDigest       *string            `json:"manifest_digest"`
+	ArtifactMetadata     []byte             `json:"artifact_metadata"`
+	LogicalSizeBytes     int64              `json:"logical_size_bytes"`
+	ExclusiveSizeBytes   int64              `json:"exclusive_size_bytes"`
+	NetworkConfig        []byte             `json:"network_config"`
+	TimeoutSeconds       *int32             `json:"timeout_seconds"`
+	AutoDeleteSeconds    *int32             `json:"auto_delete_seconds"`
+	SecretBindings       []byte             `json:"secret_bindings"`
+	SecretEnvKeys        []byte             `json:"secret_env_keys"`
+	FailureReason        *string            `json:"failure_reason"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	FinalizedAt          pgtype.Timestamptz `json:"finalized_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+}
+
+// Artifact commit and source-claim release become visible atomically. The
+// storage trigger serializes on the team row and raises SS004/SS005 if the
+// explicit storage quota is absent/exceeded; in that case neither update lands.
+func (q *Queries) FinalizeSavedSnapshot(ctx context.Context, arg FinalizeSavedSnapshotParams) (FinalizeSavedSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, finalizeSavedSnapshot,
+		arg.SnapshotID,
+		arg.TeamID,
+		arg.Path,
+		arg.MemPath,
+		arg.LogicalSizeBytes,
+		arg.ManifestPath,
+		arg.ManifestDigest,
+		arg.ArtifactMetadata,
+		arg.ExclusiveSizeBytes,
+	)
+	var i FinalizeSavedSnapshotRow
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const finalizeSavedSnapshotDelete = `-- name: FinalizeSavedSnapshotDelete :one
+UPDATE snapshot
+SET deleted_at = now(), updated_at = now()
+WHERE id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+  AND status = 'deleting'
+  AND deleted_at IS NULL
+RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at
+`
+
+type FinalizeSavedSnapshotDeleteParams struct {
+	SnapshotID uuid.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+}
+
+// Logical deletion is the storage-usage end point. Artifact cleanup may happen
+// before this call or be retried by the reconciler while status is deleting.
+func (q *Queries) FinalizeSavedSnapshotDelete(ctx context.Context, arg FinalizeSavedSnapshotDeleteParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, finalizeSavedSnapshotDelete, arg.SnapshotID, arg.TeamID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const getSavedSnapshot = `-- name: GetSavedSnapshot :one
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+`
+
+type GetSavedSnapshotParams struct {
+	SnapshotID uuid.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) GetSavedSnapshot(ctx context.Context, arg GetSavedSnapshotParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSavedSnapshot, arg.SnapshotID, arg.TeamID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const getSavedSnapshotByID = `-- name: GetSavedSnapshotByID :one
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE id = $1
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+`
+
+// Unscoped internal lookup for host reconciliation only.
+func (q *Queries) GetSavedSnapshotByID(ctx context.Context, snapshotID uuid.UUID) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSavedSnapshotByID, snapshotID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const getSavedSnapshotByIdempotencyKey = `-- name: GetSavedSnapshotByIdempotencyKey :one
+
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE team_id = $1
+  AND sandbox_id = $2
+  AND idempotency_key = $3::text
+  AND kind = 'saved'
+`
+
+type GetSavedSnapshotByIdempotencyKeyParams struct {
+	TeamID         uuid.UUID `json:"team_id"`
+	SandboxID      uuid.UUID `json:"sandbox_id"`
+	IdempotencyKey string    `json:"idempotency_key"`
+}
+
+// Saved snapshots -----------------------------------------------------------
+// Idempotency keys are scoped to the team + source endpoint and retained
+// across soft deletion.
+// Call this under the same transaction/advisory lock as BeginSavedSnapshot;
+// after a unique-violation it is also the authoritative adopt lookup.
+func (q *Queries) GetSavedSnapshotByIdempotencyKey(ctx context.Context, arg GetSavedSnapshotByIdempotencyKeyParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSavedSnapshotByIdempotencyKey, arg.TeamID, arg.SandboxID, arg.IdempotencyKey)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const getSavedSnapshotDependencyCounts = `-- name: GetSavedSnapshotDependencyCounts :one
+SELECT
+  (SELECT count(*)::bigint
+   FROM sandbox child
+   WHERE child.source_snapshot_id = s.id
+     AND child.team_id = s.team_id) AS child_sandbox_count,
+  (SELECT count(*)::bigint
+   FROM snapshot child
+   WHERE child.parent_snapshot_id = s.id
+     AND child.team_id = s.team_id
+     AND child.kind = 'saved'
+     AND child.deleted_at IS NULL) AS child_snapshot_count
+FROM snapshot s
+WHERE s.id = $1
+  AND s.team_id = $2
+  AND s.kind = 'saved'
+  AND s.deleted_at IS NULL
+`
+
+type GetSavedSnapshotDependencyCountsParams struct {
+	SnapshotID uuid.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+}
+
+type GetSavedSnapshotDependencyCountsRow struct {
+	ChildSandboxCount  int64 `json:"child_sandbox_count"`
+	ChildSnapshotCount int64 `json:"child_snapshot_count"`
+}
+
+func (q *Queries) GetSavedSnapshotDependencyCounts(ctx context.Context, arg GetSavedSnapshotDependencyCountsParams) (GetSavedSnapshotDependencyCountsRow, error) {
+	row := q.db.QueryRow(ctx, getSavedSnapshotDependencyCounts, arg.SnapshotID, arg.TeamID)
+	var i GetSavedSnapshotDependencyCountsRow
+	err := row.Scan(&i.ChildSandboxCount, &i.ChildSnapshotCount)
+	return i, err
+}
+
+const getSavedSnapshotForDelete = `-- name: GetSavedSnapshotForDelete :one
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+`
+
+type GetSavedSnapshotForDeleteParams struct {
+	SnapshotID uuid.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+}
+
+// Team-scoped tombstone-aware lookup for idempotent DELETE. Retaining the team
+// predicate prevents an already-deleted snapshot from becoming an existence
+// oracle across tenants.
+func (q *Queries) GetSavedSnapshotForDelete(ctx context.Context, arg GetSavedSnapshotForDeleteParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, getSavedSnapshotForDelete, arg.SnapshotID, arg.TeamID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const getSavedSnapshotQuotaUsage = `-- name: GetSavedSnapshotQuotaUsage :one
+SELECT
+  t.max_snapshots,
+  t.max_snapshots_per_sandbox,
+  t.snapshot_storage_quota_bytes,
+  t.snapshot_storage_bytes,
+  (SELECT count(*)::bigint FROM snapshot s
+   WHERE s.team_id = t.id
+     AND s.kind = 'saved'
+     AND s.deleted_at IS NULL
+     AND s.status <> 'failed') AS snapshot_count
+FROM team t
+WHERE t.id = $1
+`
+
+type GetSavedSnapshotQuotaUsageRow struct {
+	MaxSnapshots              int32  `json:"max_snapshots"`
+	MaxSnapshotsPerSandbox    int32  `json:"max_snapshots_per_sandbox"`
+	SnapshotStorageQuotaBytes *int64 `json:"snapshot_storage_quota_bytes"`
+	SnapshotStorageBytes      int64  `json:"snapshot_storage_bytes"`
+	SnapshotCount             int64  `json:"snapshot_count"`
+}
+
+func (q *Queries) GetSavedSnapshotQuotaUsage(ctx context.Context, teamID uuid.UUID) (GetSavedSnapshotQuotaUsageRow, error) {
+	row := q.db.QueryRow(ctx, getSavedSnapshotQuotaUsage, teamID)
+	var i GetSavedSnapshotQuotaUsageRow
+	err := row.Scan(
+		&i.MaxSnapshots,
+		&i.MaxSnapshotsPerSandbox,
+		&i.SnapshotStorageQuotaBytes,
+		&i.SnapshotStorageBytes,
+		&i.SnapshotCount,
+	)
+	return i, err
+}
+
+const getSavedSnapshotStorageUsage = `-- name: GetSavedSnapshotStorageUsage :one
+SELECT COALESCE(sum(
+  retained_exclusive_size_bytes + current_exclusive_size_bytes
+), 0)::bigint
+FROM snapshot_storage_layer
+WHERE team_id = $1
+  AND ended_at IS NULL
+`
+
+// Reconciliation source for shadow metering. This deliberately does not feed
+// team_billing_usage or invoice export.
+func (q *Queries) GetSavedSnapshotStorageUsage(ctx context.Context, teamID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, getSavedSnapshotStorageUsage, teamID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const getSnapshot = `-- name: GetSnapshot :one
 SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
-WHERE id = $1 AND team_id = $2
+WHERE id = $1
+  AND team_id = $2
+  AND kind = 'runtime_checkpoint'
 `
 
 type GetSnapshotParams struct {
@@ -121,10 +1479,9 @@ type GetSnapshotParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
-// Team-scoped snapshot lookup for user-facing handlers. The join on
-// team_id enforces tenant isolation at the SQL layer so callers cannot
-// accidentally leak another team's snapshot metadata by forgetting the
-// in-Go team check.
+// Team-scoped runtime-checkpoint lookup used by pause/resume handlers. Saved
+// snapshots have separate methods so a reusable snapshot can never be passed
+// accidentally to the same-sandbox resume path.
 func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snapshot, error) {
 	row := q.db.QueryRow(ctx, getSnapshot, arg.ID, arg.TeamID)
 	var i Snapshot
@@ -172,11 +1529,10 @@ func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snaps
 
 const getSnapshotByID = `-- name: GetSnapshotByID :one
 SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
-WHERE id = $1
+WHERE id = $1 AND kind = 'runtime_checkpoint'
 `
 
-// Unscoped snapshot lookup for internal (host-scoped) code paths such as
-// the VMD reconciler. DO NOT call from user-facing handlers.
+// Unscoped runtime-checkpoint lookup for internal host/reconciler paths.
 func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, error) {
 	row := q.db.QueryRow(ctx, getSnapshotByID, id)
 	var i Snapshot
@@ -222,12 +1578,380 @@ func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, 
 	return i, err
 }
 
-const listSnapshotsBySandbox = `-- name: ListSnapshotsBySandbox :many
+const listDeletingSavedSnapshots = `-- name: ListDeletingSavedSnapshots :many
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE kind = 'saved'
+  AND status = 'deleting'
+  AND deleted_at IS NULL
+  AND updated_at < $1
+ORDER BY updated_at ASC, id ASC
+LIMIT $2
+`
+
+type ListDeletingSavedSnapshotsParams struct {
+	StaleBefore time.Time `json:"stale_before"`
+	RowLimit    int32     `json:"row_limit"`
+}
+
+// Retry queue for logical deletes whose host artifact cleanup did not finish.
+func (q *Queries) ListDeletingSavedSnapshots(ctx context.Context, arg ListDeletingSavedSnapshotsParams) ([]Snapshot, error) {
+	rows, err := q.db.Query(ctx, listDeletingSavedSnapshots, arg.StaleBefore, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Snapshot{}
+	for rows.Next() {
+		var i Snapshot
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.TeamID,
+			&i.Path,
+			&i.SizeBytes,
+			&i.Trigger,
+			&i.CreatedAt,
+			&i.MemPath,
+			&i.Kind,
+			&i.Status,
+			&i.Name,
+			&i.IdempotencyKey,
+			&i.ParentSnapshotID,
+			&i.SourceStatus,
+			&i.TemplateID,
+			&i.TemplateSnapshotPath,
+			&i.TemplateMemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.HostID,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.DiskMib,
+			&i.ManifestPath,
+			&i.ManifestDigest,
+			&i.ArtifactMetadata,
+			&i.LogicalSizeBytes,
+			&i.ExclusiveSizeBytes,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.AutoDeleteSeconds,
+			&i.SecretBindings,
+			&i.SecretEnvKeys,
+			&i.FailureReason,
+			&i.UpdatedAt,
+			&i.FinalizedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSavedSnapshotChildSandboxIDs = `-- name: ListSavedSnapshotChildSandboxIDs :many
+SELECT id FROM sandbox
+WHERE source_snapshot_id = $1
+  AND team_id = $2
+ORDER BY created_at ASC, id ASC
+`
+
+type ListSavedSnapshotChildSandboxIDsParams struct {
+	SnapshotID pgtype.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID   `json:"team_id"`
+}
+
+func (q *Queries) ListSavedSnapshotChildSandboxIDs(ctx context.Context, arg ListSavedSnapshotChildSandboxIDsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listSavedSnapshotChildSandboxIDs, arg.SnapshotID, arg.TeamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSavedSnapshotChildSnapshotIDs = `-- name: ListSavedSnapshotChildSnapshotIDs :many
+SELECT id FROM snapshot
+WHERE parent_snapshot_id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+ORDER BY created_at ASC, id ASC
+`
+
+type ListSavedSnapshotChildSnapshotIDsParams struct {
+	SnapshotID pgtype.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID   `json:"team_id"`
+}
+
+func (q *Queries) ListSavedSnapshotChildSnapshotIDs(ctx context.Context, arg ListSavedSnapshotChildSnapshotIDsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listSavedSnapshotChildSnapshotIDs, arg.SnapshotID, arg.TeamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSavedSnapshotsByHost = `-- name: ListSavedSnapshotsByHost :many
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE host_id = $1
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+ORDER BY created_at ASC, id ASC
+`
+
+// Authoritative host-local manifest/artifact pin set for VMD reconciliation.
+// Creating and deleting rows are included because their files may need commit
+// recovery or retryable cleanup even though they cannot launch forks.
+func (q *Queries) ListSavedSnapshotsByHost(ctx context.Context, hostID *string) ([]Snapshot, error) {
+	rows, err := q.db.Query(ctx, listSavedSnapshotsByHost, hostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Snapshot{}
+	for rows.Next() {
+		var i Snapshot
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.TeamID,
+			&i.Path,
+			&i.SizeBytes,
+			&i.Trigger,
+			&i.CreatedAt,
+			&i.MemPath,
+			&i.Kind,
+			&i.Status,
+			&i.Name,
+			&i.IdempotencyKey,
+			&i.ParentSnapshotID,
+			&i.SourceStatus,
+			&i.TemplateID,
+			&i.TemplateSnapshotPath,
+			&i.TemplateMemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.HostID,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.DiskMib,
+			&i.ManifestPath,
+			&i.ManifestDigest,
+			&i.ArtifactMetadata,
+			&i.LogicalSizeBytes,
+			&i.ExclusiveSizeBytes,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.AutoDeleteSeconds,
+			&i.SecretBindings,
+			&i.SecretEnvKeys,
+			&i.FailureReason,
+			&i.UpdatedAt,
+			&i.FinalizedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSavedSnapshotsBySandbox = `-- name: ListSavedSnapshotsBySandbox :many
 SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
 WHERE sandbox_id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+ORDER BY created_at DESC, id DESC
+`
+
+type ListSavedSnapshotsBySandboxParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) ListSavedSnapshotsBySandbox(ctx context.Context, arg ListSavedSnapshotsBySandboxParams) ([]Snapshot, error) {
+	rows, err := q.db.Query(ctx, listSavedSnapshotsBySandbox, arg.SandboxID, arg.TeamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Snapshot{}
+	for rows.Next() {
+		var i Snapshot
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.TeamID,
+			&i.Path,
+			&i.SizeBytes,
+			&i.Trigger,
+			&i.CreatedAt,
+			&i.MemPath,
+			&i.Kind,
+			&i.Status,
+			&i.Name,
+			&i.IdempotencyKey,
+			&i.ParentSnapshotID,
+			&i.SourceStatus,
+			&i.TemplateID,
+			&i.TemplateSnapshotPath,
+			&i.TemplateMemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.HostID,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.DiskMib,
+			&i.ManifestPath,
+			&i.ManifestDigest,
+			&i.ArtifactMetadata,
+			&i.LogicalSizeBytes,
+			&i.ExclusiveSizeBytes,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.AutoDeleteSeconds,
+			&i.SecretBindings,
+			&i.SecretEnvKeys,
+			&i.FailureReason,
+			&i.UpdatedAt,
+			&i.FinalizedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSavedSnapshotsByTeam = `-- name: ListSavedSnapshotsByTeam :many
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE team_id = $1
+  AND kind = 'saved'
+  AND deleted_at IS NULL
+  AND ($2::uuid IS NULL
+       OR sandbox_id = $2)
+  AND ($3::text IS NULL
+       OR status::text = $3::text)
+ORDER BY created_at DESC, id DESC
+LIMIT $5::bigint
+OFFSET COALESCE($4::bigint, 0)
+`
+
+type ListSavedSnapshotsByTeamParams struct {
+	TeamID          uuid.UUID   `json:"team_id"`
+	SourceSandboxID pgtype.UUID `json:"source_sandbox_id"`
+	Status          *string     `json:"status"`
+	RowOffset       *int64      `json:"row_offset"`
+	RowLimit        *int64      `json:"row_limit"`
+}
+
+func (q *Queries) ListSavedSnapshotsByTeam(ctx context.Context, arg ListSavedSnapshotsByTeamParams) ([]Snapshot, error) {
+	rows, err := q.db.Query(ctx, listSavedSnapshotsByTeam,
+		arg.TeamID,
+		arg.SourceSandboxID,
+		arg.Status,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Snapshot{}
+	for rows.Next() {
+		var i Snapshot
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.TeamID,
+			&i.Path,
+			&i.SizeBytes,
+			&i.Trigger,
+			&i.CreatedAt,
+			&i.MemPath,
+			&i.Kind,
+			&i.Status,
+			&i.Name,
+			&i.IdempotencyKey,
+			&i.ParentSnapshotID,
+			&i.SourceStatus,
+			&i.TemplateID,
+			&i.TemplateSnapshotPath,
+			&i.TemplateMemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.HostID,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.DiskMib,
+			&i.ManifestPath,
+			&i.ManifestDigest,
+			&i.ArtifactMetadata,
+			&i.LogicalSizeBytes,
+			&i.ExclusiveSizeBytes,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.AutoDeleteSeconds,
+			&i.SecretBindings,
+			&i.SecretEnvKeys,
+			&i.FailureReason,
+			&i.UpdatedAt,
+			&i.FinalizedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSnapshotsBySandbox = `-- name: ListSnapshotsBySandbox :many
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE sandbox_id = $1 AND kind = 'runtime_checkpoint'
 ORDER BY created_at DESC
 `
 
+// Runtime-only compatibility method used by sandbox teardown.
 func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUID) ([]Snapshot, error) {
 	rows, err := q.db.Query(ctx, listSnapshotsBySandbox, sandboxID)
 	if err != nil {
@@ -288,7 +2012,7 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 
 const listSnapshotsByTeam = `-- name: ListSnapshotsByTeam :many
 SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
-WHERE team_id = $1
+WHERE team_id = $1 AND kind = 'runtime_checkpoint'
 ORDER BY created_at DESC
 `
 
@@ -348,4 +2072,407 @@ func (q *Queries) ListSnapshotsByTeam(ctx context.Context, teamID uuid.UUID) ([]
 		return nil, err
 	}
 	return items, nil
+}
+
+const listStaleCreatingSavedSnapshots = `-- name: ListStaleCreatingSavedSnapshots :many
+SELECT s.id, s.sandbox_id, s.team_id, s.path, s.size_bytes, s.trigger, s.created_at, s.mem_path, s.kind, s.status, s.name, s.idempotency_key, s.parent_snapshot_id, s.source_status, s.template_id, s.template_snapshot_path, s.template_mem_path, s.base_path, s.delta_path, s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.manifest_path, s.manifest_digest, s.artifact_metadata, s.logical_size_bytes, s.exclusive_size_bytes, s.network_config, s.timeout_seconds, s.auto_delete_seconds, s.secret_bindings, s.secret_env_keys, s.failure_reason, s.updated_at, s.finalized_at, s.deleted_at FROM snapshot s
+WHERE s.kind = 'saved'
+  AND s.status = 'creating'
+  AND s.deleted_at IS NULL
+  AND s.updated_at < $1
+ORDER BY s.updated_at ASC, s.id ASC
+LIMIT $2
+`
+
+type ListStaleCreatingSavedSnapshotsParams struct {
+	StaleBefore time.Time `json:"stale_before"`
+	RowLimit    int32     `json:"row_limit"`
+}
+
+func (q *Queries) ListStaleCreatingSavedSnapshots(ctx context.Context, arg ListStaleCreatingSavedSnapshotsParams) ([]Snapshot, error) {
+	rows, err := q.db.Query(ctx, listStaleCreatingSavedSnapshots, arg.StaleBefore, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Snapshot{}
+	for rows.Next() {
+		var i Snapshot
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.TeamID,
+			&i.Path,
+			&i.SizeBytes,
+			&i.Trigger,
+			&i.CreatedAt,
+			&i.MemPath,
+			&i.Kind,
+			&i.Status,
+			&i.Name,
+			&i.IdempotencyKey,
+			&i.ParentSnapshotID,
+			&i.SourceStatus,
+			&i.TemplateID,
+			&i.TemplateSnapshotPath,
+			&i.TemplateMemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.HostID,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.DiskMib,
+			&i.ManifestPath,
+			&i.ManifestDigest,
+			&i.ArtifactMetadata,
+			&i.LogicalSizeBytes,
+			&i.ExclusiveSizeBytes,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.AutoDeleteSeconds,
+			&i.SecretBindings,
+			&i.SecretEnvKeys,
+			&i.FailureReason,
+			&i.UpdatedAt,
+			&i.FinalizedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockSavedSnapshotForFork = `-- name: LockSavedSnapshotForFork :one
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
+WHERE id = $1
+  AND team_id = $2
+  AND kind = 'saved'
+  AND status = 'ready'
+  AND deleted_at IS NULL
+  AND feature_enabled('sandbox_snapshots_v1', team_id)
+FOR KEY SHARE
+`
+
+type LockSavedSnapshotForForkParams struct {
+	SnapshotID uuid.UUID `json:"snapshot_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+}
+
+// Hold this lock in the transaction that restores/inserts a fork. It conflicts
+// with ClaimDeleteSavedSnapshotIfLeaf and makes status='ready' stable until the
+// new sandbox reference commits.
+func (q *Queries) LockSavedSnapshotForFork(ctx context.Context, arg LockSavedSnapshotForForkParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, lockSavedSnapshotForFork, arg.SnapshotID, arg.TeamID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const markSavedSnapshotUnavailable = `-- name: MarkSavedSnapshotUnavailable :one
+UPDATE snapshot
+SET status = 'unavailable',
+    failure_reason = $1,
+    updated_at = now()
+WHERE id = $2
+  AND team_id = $3
+  AND kind = 'saved'
+  AND status = 'ready'
+  AND deleted_at IS NULL
+RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at
+`
+
+type MarkSavedSnapshotUnavailableParams struct {
+	FailureReason *string   `json:"failure_reason"`
+	SnapshotID    uuid.UUID `json:"snapshot_id"`
+	TeamID        uuid.UUID `json:"team_id"`
+}
+
+func (q *Queries) MarkSavedSnapshotUnavailable(ctx context.Context, arg MarkSavedSnapshotUnavailableParams) (Snapshot, error) {
+	row := q.db.QueryRow(ctx, markSavedSnapshotUnavailable, arg.FailureReason, arg.SnapshotID, arg.TeamID)
+	var i Snapshot
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const queueSavedSnapshotCleanup = `-- name: QueueSavedSnapshotCleanup :one
+WITH source_locked AS MATERIALIZED (
+  SELECT source.id
+  FROM snapshot intent
+  JOIN sandbox source
+    ON source.id = intent.sandbox_id AND source.team_id = intent.team_id
+  WHERE intent.id = $1
+    AND intent.team_id = $2
+    AND intent.kind = 'saved'
+    AND intent.status = 'creating'
+    AND intent.deleted_at IS NULL
+    AND source.snapshot_operation_id = intent.id
+  FOR UPDATE OF source
+),
+queued AS (
+  UPDATE snapshot s
+  SET status = 'deleting',
+      path = $3,
+      mem_path = $4::text,
+      size_bytes = $5,
+      manifest_path = $6::text,
+      manifest_digest = $7,
+      artifact_metadata = $8,
+      logical_size_bytes = $5,
+      exclusive_size_bytes = $9,
+      failure_reason = $10,
+      finalized_at = now(),
+      updated_at = now()
+  WHERE s.id = $1
+    AND s.team_id = $2
+    AND s.kind = 'saved'
+    AND s.status = 'creating'
+    AND s.deleted_at IS NULL
+    AND EXISTS (SELECT 1 FROM source_locked)
+  RETURNING s.id, s.sandbox_id, s.team_id, s.path, s.size_bytes, s.trigger, s.created_at, s.mem_path, s.kind, s.status, s.name, s.idempotency_key, s.parent_snapshot_id, s.source_status, s.template_id, s.template_snapshot_path, s.template_mem_path, s.base_path, s.delta_path, s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.manifest_path, s.manifest_digest, s.artifact_metadata, s.logical_size_bytes, s.exclusive_size_bytes, s.network_config, s.timeout_seconds, s.auto_delete_seconds, s.secret_bindings, s.secret_env_keys, s.failure_reason, s.updated_at, s.finalized_at, s.deleted_at
+),
+released AS (
+  UPDATE sandbox source
+  SET snapshot_operation_id = NULL,
+      snapshot_operation_started_at = NULL,
+      updated_at = now()
+  FROM queued q
+  WHERE source.id = q.sandbox_id
+    AND source.team_id = q.team_id
+    AND source.snapshot_operation_id = q.id
+  RETURNING source.id
+)
+SELECT queued.id, queued.sandbox_id, queued.team_id, queued.path, queued.size_bytes, queued.trigger, queued.created_at, queued.mem_path, queued.kind, queued.status, queued.name, queued.idempotency_key, queued.parent_snapshot_id, queued.source_status, queued.template_id, queued.template_snapshot_path, queued.template_mem_path, queued.base_path, queued.delta_path, queued.host_id, queued.vcpu_count, queued.memory_mib, queued.disk_mib, queued.manifest_path, queued.manifest_digest, queued.artifact_metadata, queued.logical_size_bytes, queued.exclusive_size_bytes, queued.network_config, queued.timeout_seconds, queued.auto_delete_seconds, queued.secret_bindings, queued.secret_env_keys, queued.failure_reason, queued.updated_at, queued.finalized_at, queued.deleted_at FROM queued
+`
+
+type QueueSavedSnapshotCleanupParams struct {
+	SnapshotID         uuid.UUID `json:"snapshot_id"`
+	TeamID             uuid.UUID `json:"team_id"`
+	Path               string    `json:"path"`
+	MemPath            string    `json:"mem_path"`
+	LogicalSizeBytes   int64     `json:"logical_size_bytes"`
+	ManifestPath       string    `json:"manifest_path"`
+	ManifestDigest     *string   `json:"manifest_digest"`
+	ArtifactMetadata   []byte    `json:"artifact_metadata"`
+	ExclusiveSizeBytes int64     `json:"exclusive_size_bytes"`
+	FailureReason      *string   `json:"failure_reason"`
+}
+
+type QueueSavedSnapshotCleanupRow struct {
+	ID                   uuid.UUID          `json:"id"`
+	SandboxID            uuid.UUID          `json:"sandbox_id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	Path                 string             `json:"path"`
+	SizeBytes            int64              `json:"size_bytes"`
+	Trigger              string             `json:"trigger"`
+	CreatedAt            time.Time          `json:"created_at"`
+	MemPath              *string            `json:"mem_path"`
+	Kind                 SnapshotKind       `json:"kind"`
+	Status               SnapshotStatus     `json:"status"`
+	Name                 *string            `json:"name"`
+	IdempotencyKey       *string            `json:"idempotency_key"`
+	ParentSnapshotID     pgtype.UUID        `json:"parent_snapshot_id"`
+	SourceStatus         NullSandboxStatus  `json:"source_status"`
+	TemplateID           pgtype.UUID        `json:"template_id"`
+	TemplateSnapshotPath *string            `json:"template_snapshot_path"`
+	TemplateMemPath      *string            `json:"template_mem_path"`
+	BasePath             *string            `json:"base_path"`
+	DeltaPath            *string            `json:"delta_path"`
+	HostID               *string            `json:"host_id"`
+	VcpuCount            *int32             `json:"vcpu_count"`
+	MemoryMib            *int32             `json:"memory_mib"`
+	DiskMib              *int32             `json:"disk_mib"`
+	ManifestPath         *string            `json:"manifest_path"`
+	ManifestDigest       *string            `json:"manifest_digest"`
+	ArtifactMetadata     []byte             `json:"artifact_metadata"`
+	LogicalSizeBytes     int64              `json:"logical_size_bytes"`
+	ExclusiveSizeBytes   int64              `json:"exclusive_size_bytes"`
+	NetworkConfig        []byte             `json:"network_config"`
+	TimeoutSeconds       *int32             `json:"timeout_seconds"`
+	AutoDeleteSeconds    *int32             `json:"auto_delete_seconds"`
+	SecretBindings       []byte             `json:"secret_bindings"`
+	SecretEnvKeys        []byte             `json:"secret_env_keys"`
+	FailureReason        *string            `json:"failure_reason"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	FinalizedAt          pgtype.Timestamptz `json:"finalized_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+}
+
+// Preserve and meter a committed artifact set when it cannot be admitted
+// (for example, storage quota was exceeded) and immediate VMD cleanup failed.
+// The deleting supervisor retries host cleanup, while releasing the source
+// capture claim immediately keeps the source usable.
+func (q *Queries) QueueSavedSnapshotCleanup(ctx context.Context, arg QueueSavedSnapshotCleanupParams) (QueueSavedSnapshotCleanupRow, error) {
+	row := q.db.QueryRow(ctx, queueSavedSnapshotCleanup,
+		arg.SnapshotID,
+		arg.TeamID,
+		arg.Path,
+		arg.MemPath,
+		arg.LogicalSizeBytes,
+		arg.ManifestPath,
+		arg.ManifestDigest,
+		arg.ArtifactMetadata,
+		arg.ExclusiveSizeBytes,
+		arg.FailureReason,
+	)
+	var i QueueSavedSnapshotCleanupRow
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const tryAcquireSavedSnapshotGlobalMigrationFence = `-- name: TryAcquireSavedSnapshotGlobalMigrationFence :one
+SELECT pg_try_advisory_xact_lock_shared(
+  hashtextextended(
+    'superserve:migrate-team:saved-snapshot-global',
+    0
+  )
+)::boolean
+`
+
+// Acquire this global shared lock before the team-scoped lock. It serializes
+// capture with migration of a different team that owns the capture's system
+// template.
+func (q *Queries) TryAcquireSavedSnapshotGlobalMigrationFence(ctx context.Context) (bool, error) {
+	row := q.db.QueryRow(ctx, tryAcquireSavedSnapshotGlobalMigrationFence)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const tryAcquireSavedSnapshotTeamMigrationFence = `-- name: TryAcquireSavedSnapshotTeamMigrationFence :one
+SELECT pg_try_advisory_xact_lock_shared(
+  hashtextextended(
+    'superserve:migrate-team:' || $1::uuid::text,
+    0
+  )
+)::boolean
+`
+
+// The matching exclusive session locks are held by migrate-team across its
+// complete phase. Snapshot admission takes global shared, then team shared,
+// before the sandbox-secret advisory lock and every host/sandbox/team row lock.
+// A false result means the team is currently fenced for migration.
+func (q *Queries) TryAcquireSavedSnapshotTeamMigrationFence(ctx context.Context, teamID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, tryAcquireSavedSnapshotTeamMigrationFence, teamID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }

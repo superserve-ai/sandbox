@@ -39,6 +39,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/resume", h.ResumeSandbox)
 		api.POST("/sandboxes/:sandbox_id/activate", h.ActivateSandbox)
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
+		api.POST("/sandboxes/:sandbox_id/snapshots", h.CreateSnapshot)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
 		api.GET("/sandboxes/:sandbox_id/preview-ports", h.ListSandboxPreviewPorts)
@@ -53,6 +54,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		// boxd's FilesystemService.ListDir, so it works on every sandbox
 		// regardless of boxd version. Paused sandboxes are resumed transparently.
 		api.GET("/sandboxes/:sandbox_id/files", h.ListSandboxFiles)
+
+		// Immutable, reusable sandbox snapshots. Runtime pause checkpoints remain
+		// an internal lifecycle detail and are never accepted here.
+		api.GET("/snapshots", h.ListSnapshots)
+		api.GET("/snapshots/:snapshot_id", h.GetSnapshot)
+		api.DELETE("/snapshots/:snapshot_id", h.DeleteSavedSnapshot)
 
 		// Template lifecycle. Builds run async via the build supervisor;
 		// the POST /templates/:id/builds endpoint just enqueues a row.
@@ -110,6 +117,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	internal.Use(InternalAuth(), InternalActorFromHeader())
 	{
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
+		internal.POST("/hosts/:host_id/drain", h.DrainHost)
+		internal.POST("/hosts/:host_id/activate", h.ActivateHost)
 		internal.POST("/secrets/decrypt", h.DecryptSecret)
 		internal.GET("/jwks", h.JWKS)
 		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)

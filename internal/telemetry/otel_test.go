@@ -21,7 +21,7 @@ func TestSafeResultBoundsValues(t *testing.T) {
 }
 
 func TestSafeOperationBoundsValues(t *testing.T) {
-	for _, op := range []string{"create", "pause", "resume", "delete", "fail", "timeout_pause"} {
+	for _, op := range []string{"create", "pause", "resume", "delete", "fail", "timeout_pause", "host_drain_pause"} {
 		if got := safeOperation(op); got != op {
 			t.Fatalf("safeOperation(%q) = %q", op, got)
 		}
@@ -32,7 +32,7 @@ func TestSafeOperationBoundsValues(t *testing.T) {
 }
 
 func TestSafeMethodBoundsValues(t *testing.T) {
-	for _, method := range []string{"CreateVM", "PauseVM", "ResumeVM", "DeleteVM", "BuildTemplate", "GetBuildStatus", "CancelBuild"} {
+	for _, method := range []string{"CreateVM", "PauseVM", "ResumeVM", "DeleteVM", "BuildTemplate", "GetBuildStatus", "CancelBuild", "GetCapabilities", "CreateSavedSnapshot", "RestoreSavedSnapshot", "DeleteSavedSnapshot", "GetWritableLayerUsage"} {
 		if got := safeMethod(method); got != method {
 			t.Fatalf("safeMethod(%q) = %q", method, got)
 		}
@@ -42,6 +42,39 @@ func TestSafeMethodBoundsValues(t *testing.T) {
 	}
 	if got := safeMethod("RestoreSnapshot"); got != "CreateVM" {
 		t.Fatalf("safeMethod(%q) = %q", "RestoreSnapshot", got)
+	}
+}
+
+func TestSafeSavedSnapshotDimensionsBoundValues(t *testing.T) {
+	for _, operation := range []string{
+		SavedSnapshotOperationCapture,
+		SavedSnapshotOperationRestore,
+		SavedSnapshotOperationDelete,
+		SavedSnapshotOperationCleanup,
+	} {
+		if got := safeSavedSnapshotOperation(operation); got != operation {
+			t.Fatalf("safeSavedSnapshotOperation(%q) = %q", operation, got)
+		}
+	}
+	if got := safeSavedSnapshotOperation("snapshot_id=secret"); got != "unknown" {
+		t.Fatalf("unexpected operation fallback: %q", got)
+	}
+
+	for _, outcome := range []string{
+		SavedSnapshotOutcomeSuccess,
+		SavedSnapshotOutcomeError,
+		SavedSnapshotOutcomeRetry,
+		SavedSnapshotOutcomeQueued,
+		SavedSnapshotOutcomeDependencyBlocked,
+		SavedSnapshotOutcomeArtifactCorrupt,
+		SavedSnapshotOutcomeUnavailable,
+	} {
+		if got := safeSavedSnapshotOutcome(outcome); got != outcome {
+			t.Fatalf("safeSavedSnapshotOutcome(%q) = %q", outcome, got)
+		}
+	}
+	if got := safeSavedSnapshotOutcome("/var/lib/snapshots/private"); got != SavedSnapshotOutcomeError {
+		t.Fatalf("unexpected outcome fallback: %q", got)
 	}
 }
 
