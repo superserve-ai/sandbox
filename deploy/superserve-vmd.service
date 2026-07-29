@@ -1,8 +1,16 @@
 [Unit]
 Description=Superserve VM Daemon
-After=network-online.target superserve-vmd.socket
+After=network-online.target superserve-vmd.socket superserve-vms.service
 Wants=network-online.target
 Requires=superserve-vmd.socket
+# Pull in the delegated-subtree keeper on EVERY vmd start, including a
+# socket-activated one. Before= on the keeper only orders units already queued;
+# without this Wants= a socket connection under sockets.target can start vmd
+# before multi-user.target starts the keeper, and ArmDirectSpawn would find no
+# delegated scope (permanent unit-path fallback, or fatal if cgroup VMs exist).
+# Wants= not Requires=: a genuinely-failed keeper should let vmd degrade to the
+# unit path, not refuse to start.
+Wants=superserve-vms.service
 
 [Service]
 Type=simple

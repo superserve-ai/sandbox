@@ -1911,10 +1911,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.RLock()
 		existingSupervision := inst.Supervision
 		inst.mu.RUnlock()
+		// hadPriorLife = inPlace || priorRunDir: a leftover rundir means a
+		// crashed prior life whose recordless systemd unit may still be running
+		// (record never persisted, so inPlace is false). The cgroup path must run
+		// its legacy-unit stop before spawning, or an armed retry starts a second
+		// Firecracker over the live unit on the same id/disk/tap. Matches the same
+		// !inPlace && !priorRunDir the freshUnit gate above uses.
 		// freshUnit && attempt == 1: only a first-attempt fresh unit may skip
 		// the linger query; a retry replaces the prior attempt's unit. The
 		// dispatcher threads it to the systemd path (irrelevant to cgroup).
-		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace, freshUnit && attempt == 1)
+		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
 		// Stamp the chosen mode NOW, before the error branch: a launch that
 		// forked a cgroup FC but failed socket-readiness (and whose own kill
 		// couldn't confirm the group empty) leaves a live process. The record
