@@ -30,8 +30,11 @@ import (
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
+
+const testDefaultHostID = "default"
 
 var (
 	testPool         *pgxpool.Pool
@@ -77,6 +80,10 @@ func TestMain(m *testing.M) {
 
 	if err := seedSystemTemplate(ctx, testQueries); err != nil {
 		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
+		os.Exit(1)
+	}
+	if err := seedPreviewCapableHost(ctx, testQueries); err != nil {
+		fmt.Fprintf(os.Stderr, "seed preview-capable host: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -125,6 +132,83 @@ func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
 		return fmt.Errorf("mark superserve/base ready: %w", err)
 	}
 	return nil
+}
+
+// seedPreviewCapableHost creates the fallback host selected by integration
+// routers and binds its preview capability to the current heartbeat. Strict
+// sandbox creation intentionally rejects hosts without this live attestation.
+func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
+	if _, err := q.CreateHost(ctx, db.CreateHostParams{
+		ID:                testDefaultHostID,
+		VmdAddr:           "localhost:0",
+		ProxyAddr:         "localhost:0",
+		Region:            "test",
+		CapacityMemoryMib: 1024,
+		CapacityVcpus:     1,
+	}); err != nil {
+		return fmt.Errorf("create default host: %w", err)
+	}
+	if _, err := q.UpdateHostHeartbeat(ctx, testDefaultHostID); err != nil {
+		return fmt.Errorf("heartbeat default host: %w", err)
+	}
+	if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
+		HostID:     testDefaultHostID,
+		Capability: preview.HostCapabilityPorts,
+	}); err != nil {
+		return fmt.Errorf("advertise preview capability: %w", err)
+	}
+
+	capable, err := q.HostHasCapability(ctx, db.HostHasCapabilityParams{
+		HostID:     testDefaultHostID,
+		Capability: preview.HostCapabilityPorts,
+	})
+	if err != nil {
+		return fmt.Errorf("verify preview capability: %w", err)
+	}
+	if !capable {
+		return fmt.Errorf("preview capability is not bound to the current heartbeat")
+	}
+	return nil
+}
+
+func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	hostID := "capability-host-" + uuid.New().String()[:8]
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID:                hostID,
+		VmdAddr:           "localhost:0",
+		ProxyAddr:         "localhost:0",
+		Region:            "test",
+		CapacityMemoryMib: 1024,
+		CapacityVcpus:     1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("heartbeat host: %v", err)
+	}
+	params := db.InsertHostCapabilityParams{HostID: hostID, Capability: preview.HostCapabilityPorts}
+	if err := testQueries.InsertHostCapability(ctx, params); err != nil {
+		t.Fatalf("advertise capability: %v", err)
+	}
+	hasCapability := func() bool {
+		got, err := testQueries.HostHasCapability(ctx, db.HostHasCapabilityParams{
+			HostID: hostID, Capability: preview.HostCapabilityPorts,
+		})
+		if err != nil {
+			t.Fatalf("check capability: %v", err)
+		}
+		return got
+	}
+	if !hasCapability() {
+		t.Fatal("current capability on active host was not recognized")
+	}
+	if err := testQueries.MarkHostUnhealthy(ctx, hostID); err != nil {
+		t.Fatalf("mark host unhealthy: %v", err)
+	}
+	if hasCapability() {
+		t.Fatal("unhealthy host retained a usable capability attestation")
+	}
 }
 
 // applyMigrations reads SQL files from supabase/migrations/ and executes them
@@ -177,7 +261,7 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string,
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]struct{}, _ int64, _ map[string]string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
@@ -187,6 +271,9 @@ func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry,
 	return nil, nil
 }
 func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+	return nil
+}
+func (s *stubVMD) UpdateSandboxPreviewPolicy(_ context.Context, _, _ string, _ map[int32]struct{}, _ int64) error {
 	return nil
 }
 func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { return nil }
@@ -468,9 +555,10 @@ func waitBookkeeping() {
 func newRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	cfg := &config.Config{
-		Port:         "0",
-		VMDAddress:   "localhost:0",
-		SystemTeamID: testSystemTeamID.String(),
+		Port:          "0",
+		VMDAddress:    "localhost:0",
+		SystemTeamID:  testSystemTeamID.String(),
+		DefaultHostID: testDefaultHostID,
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool

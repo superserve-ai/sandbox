@@ -6,9 +6,20 @@
 -- template_id is optional (NULL when sandbox is not derived from a template).
 -- snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
 -- specific build's artifacts so a later template rebuild can't corrupt it.
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-RETURNING *;
+-- The strict preview-policy row is created in this same statement: no caller
+-- can observe a new sandbox through the rolling-deploy legacy fallback, and
+-- quota admission remains statement-sized.
+WITH ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
+  RETURNING sandbox_id
+)
+SELECT ins.* FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplate :one
 -- CreateSandbox variant that holds FOR KEY SHARE on the template row
@@ -21,27 +32,39 @@ WITH tpl AS (
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
+  RETURNING sandbox_id
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
-RETURNING *;
+SELECT ins.* FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxWithSecrets :one
--- CreateSandbox plus its secret bindings in ONE statement. Atomicity aside,
--- the single statement is load-bearing for quota enforcement: the insert's
--- shard-counter admission is invisible to concurrent quota checks until it
--- commits, and a multi-statement transaction would stretch that window
--- across client round trips.
+-- CreateSandbox plus its strict preview policy and secret bindings in ONE
+-- statement. Atomicity aside, the single statement is load-bearing for quota
+-- enforcement: the insert's shard-counter admission is invisible to
+-- concurrent quota checks until it commits, and a multi-statement transaction
+-- would stretch that window across client round trips.
 WITH ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
   VALUES (@id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, @template_id, @snapshot_path, @mem_path, @base_path, @delta_path, @auto_delete_seconds)
   RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, @preview_access::text, 0 FROM ins
+  RETURNING sandbox_id
 ), bindings AS (
   INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT * FROM ins;
+SELECT ins.* FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplateWithSecrets :one
 -- CreateSandboxFromTemplate plus secret bindings in one statement (see
@@ -58,12 +81,18 @@ WITH tpl AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
   SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds FROM tpl
   RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, @preview_access::text, 0 FROM ins
+  RETURNING sandbox_id
 ), bindings AS (
   INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at FROM ins;
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at
+FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: GetSandbox :one
 SELECT * FROM sandbox
@@ -404,6 +433,74 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 UPDATE sandbox
 SET metadata = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
+
+-- name: GetSandboxPreviewPolicy :one
+-- An absent side-table row is the rolling-deploy-safe representation of a
+-- sandbox created by an older control plane.
+SELECT
+  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.revision, 0)::bigint AS revision
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
+
+-- name: ListSandboxPreviewPoliciesByTeam :many
+SELECT
+  s.id AS sandbox_id,
+  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.revision, 0)::bigint AS revision
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1 AND s.destroyed_at IS NULL;
+
+-- name: LockSandboxForPreviewMutation :one
+-- The sandbox row exists for both legacy (no policy row) and strict sandboxes,
+-- so it is the stable per-sandbox serialization point across the transition.
+SELECT id FROM sandbox
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+FOR UPDATE;
+
+-- name: EnsureSandboxPreviewPolicy :exec
+-- Publication may be staged on a legacy sandbox before it is switched to
+-- strict mode. Materialize its legacy access so the revision can still order
+-- full-set pushes without changing reachability.
+INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+VALUES ($1, $2, 0)
+ON CONFLICT (sandbox_id) DO NOTHING;
+
+-- name: UpdateSandboxPreviewAccess :execrows
+UPDATE sandbox_preview_policy p
+SET access = $2, updated_at = now()
+WHERE p.sandbox_id = $1
+  AND EXISTS (
+    SELECT 1 FROM sandbox s
+    WHERE s.id = p.sandbox_id AND s.team_id = $3 AND s.destroyed_at IS NULL
+  );
+
+-- name: AdvanceSandboxPreviewPolicy :one
+-- Call after the mutation while holding LockSandboxForPreviewMutation. The
+-- returned access and revision belong to the same authoritative snapshot as
+-- the allowlist read that follows.
+UPDATE sandbox_preview_policy
+SET revision = revision + 1, updated_at = now()
+WHERE sandbox_id = $1
+RETURNING access, revision;
+
+-- name: ListPublishedPorts :many
+SELECT port FROM sandbox_published_port
+WHERE sandbox_id = $1
+ORDER BY port;
+
+-- name: PublishPort :one
+-- Idempotent: re-publishing keeps the same resource and refreshes updated_at.
+INSERT INTO sandbox_published_port (sandbox_id, port)
+VALUES ($1, $2)
+ON CONFLICT (sandbox_id, port) DO UPDATE SET updated_at = now()
+RETURNING port;
+
+-- name: UnpublishPort :execrows
+DELETE FROM sandbox_published_port
+WHERE sandbox_id = $1 AND port = $2;
 
 -- name: GetSandboxNetworkConfig :one
 SELECT network_config FROM sandbox

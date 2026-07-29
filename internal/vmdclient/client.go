@@ -21,7 +21,7 @@ type Client interface {
 	// deltaDir are populated for overlay-mode templates, empty for legacy.
 	// For sandboxes with secrets the caller passes envVars=nil here and uses
 	// InjectSandboxEnv below once the source IP is known and a JWT is minted.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -47,6 +47,9 @@ type Client interface {
 	// of boxd version.
 	ListDir(ctx context.Context, instanceID, path string) ([]DirEntry, error)
 	UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	// UpdateSandboxPreviewPolicy atomically replaces the public preview-port
+	// allowlist on the host record. A NotFound record is seeded on next restore.
+	UpdateSandboxPreviewPolicy(ctx context.Context, instanceID, previewAccess string, previewPorts map[int32]struct{}, policyRevision int64) error
 
 	// InvalidateSecret asks vmd's local secretsproxy daemon to drop the
 	// cached cleartext for secretID. Used by the control plane to push

@@ -41,6 +41,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
+		api.GET("/sandboxes/:sandbox_id/preview-ports", h.ListSandboxPreviewPorts)
+		api.POST("/sandboxes/:sandbox_id/preview-ports", h.PublishSandboxPreviewPort)
+		api.DELETE("/sandboxes/:sandbox_id/preview-ports/:port", h.UnpublishSandboxPreviewPort)
 		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
 		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 

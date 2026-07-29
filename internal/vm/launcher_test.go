@@ -195,3 +195,30 @@ func TestLauncherNSPath(t *testing.T) {
 		})
 	}
 }
+
+func TestPrunePaths(t *testing.T) {
+	mounts := []byte(`sysfs /sys sysfs rw 0 0
+tmpfs /run/netns tmpfs rw 0 0
+nsfs /run/netns/ns-1 nsfs rw 0 0
+nsfs /run/netns/ns-1 nsfs rw 0 0
+nsfs /run/netns/ns-27 nsfs rw 0 0
+nsfs /run/netns/odd\040name nsfs rw 0 0
+tmpfs /run/netnsx tmpfs rw 0 0
+malformed
+`)
+	got := prunePaths(mounts)
+	want := []string{
+		"/run/netns/ns-1",
+		"/run/netns/ns-1", // stacked layers: one entry per layer, never deduped
+		"/run/netns/ns-27",
+		"/run/netns/odd name", // kernel octal escape decoded
+	}
+	if len(got) != len(want) {
+		t.Fatalf("prunePaths = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("prunePaths[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
