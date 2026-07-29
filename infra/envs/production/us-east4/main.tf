@@ -90,11 +90,6 @@ module "network" {
   labels = local.common_labels
 }
 
-data "google_service_account" "api_runner" {
-  project    = local.project_id
-  account_id = "superserve-api-runner"
-}
-
 # The CD service account needs Certificate Manager access to read/manage the
 # api.superserve.ai cert map + DNS authorization this cell owns (the plan's
 # import 403'd without it). Granted out-of-band to unblock; imported (see
@@ -109,17 +104,17 @@ resource "google_project_iam_member" "cd_certificatemanager" {
 # A5: us-east4 control plane for the "use" cell.
 #
 # This is a host swap, not a new cell: us-east4 shares the use-cell Supabase,
-# runtime secrets, api-runner service account, and KMS key with us-central1.
+# runtime secrets, runner service account, and KMS key with us-central1.
 # Only the service name, region, and VMD address are region-local — traffic
 # splits between this service and the us-central1 one during cutover, then
 # us-central1 drains. Secrets resolve to the shared (suffix-less) use-cell
 # names via the *_secret_name overrides in terraform.tfvars.
 #
-# No per-root secret IAM here: the shared api-runner SA already holds the
-# runtime accessor grants (owned by us-central1's api_runtime_secrets) and the
-# credentials-kek encrypt/decrypt grant (owned out-of-band). Re-declaring them
-# from this state would double-manage the same bindings — the same split we
-# settled for usw2 in #232/#233.
+# No per-root secret IAM here: the API runtime already holds the shared
+# accessor grants (owned by us-central1's new_api_runtime_secrets), and its
+# credentials-kek encrypt/decrypt grant is owned out-of-band. Re-declaring
+# them from this state would double-manage the same bindings. The sandbox host
+# uses a separate runtime identity with no access to those API secrets.
 module "api" {
   source = "../../../modules/api"
 
@@ -127,7 +122,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
-  service_account_email = data.google_service_account.api_runner.email
+  service_account_email = "superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com"
   # First create must reference a tag that actually exists, or the initial
   # revision never goes ready and the apply fails. The other regions can carry
   # a ":replace-me" placeholder only because their services already exist and
@@ -251,7 +246,8 @@ module "sandbox_host" {
     "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
-  service_account_email = data.google_service_account.api_runner.email
+  service_account_email     = "superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com"
+  allow_stopping_for_update = true
 
   # Matches the live us-central1 prod host (Ubuntu 22.04 LTS), NOT this
   # module's typical 24.04 default — the current prod host actually runs

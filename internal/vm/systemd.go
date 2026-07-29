@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	sddbus "github.com/coreos/go-systemd/v22/dbus"
@@ -60,9 +61,57 @@ const stopJobWaitCap = 35 * time.Second
 // otherwise queue every other stop on the host behind it indefinitely.
 const stopEnqueueCap = 5 * time.Second
 
+// recentUnitStops records units this process attempted to stop without yet
+// confirming them stopped. It lets the launch path tell "unit never existed"
+// from "the unit's other evidence was deleted while it may still be alive":
+// cleanup paths remove a VM's rundir and records after a stop that can fail
+// outright (unit keeps running indefinitely) or settle while the unit is
+// still deactivating (unitDefinitelyDead reads deactivating as dead;
+// lingeringState does not). Recorded on entry to stopUnit and for orphan
+// units observed at startup reattach; cleared ONLY when systemd confirms the
+// unit down — never by clock, because an unaccepted stop job bounds nothing.
+var recentUnitStops sync.Map // unit name -> struct{}
+
+// vmProcessStart anchors the young-process guard in unitMaybeWindingDown:
+// units outlive the daemon, so stops issued by a previous vmd process are
+// invisible to recentUnitStops. Variable for tests.
+var vmProcessStart = time.Now()
+
+// processSettleWindow is how long after process start every unit reads as
+// maybe-winding-down. It must outlast the reconciler's first orphan-unit
+// sweep (interval + grace + one stop cycle): that sweep re-records any
+// still-live predecessor-era unit into recentUnitStops, after which the
+// registry carries the knowledge forward. A false "maybe" only costs one
+// linger query per launch.
+const processSettleWindow = 3 * time.Minute
+
+func recordUnitStop(unit string) {
+	recentUnitStops.Store(unit, struct{}{})
+}
+
+// confirmUnitStopped clears a unit's stop record on a systemd-confirmed
+// outcome: stop job done/skipped, unit not loaded, or a successful
+// synchronous systemctl stop.
+func confirmUnitStopped(unit string) {
+	recentUnitStops.Delete(unit)
+}
+
+// unitMaybeWindingDown reports whether a unit could still be alive from a
+// stop this process's own bookkeeping cannot rule out: an unconfirmed stop
+// attempt, or a process too young for the reconciler to have re-observed
+// stops issued by its predecessor.
+func unitMaybeWindingDown(unit string) bool {
+	if time.Since(vmProcessStart) < processSettleWindow {
+		return true
+	}
+	_, ok := recentUnitStops.Load(unit)
+	return ok
+}
+
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
 // unit is a no-op. Blocks until the stop job completes.
 func stopUnit(ctx context.Context, unit string) error {
+	recordUnitStop(unit)
 	// Buffered channel: the library's dispatcher does one blocking send;
 	// buffer 1 keeps an abandoned wait from wedging every job on the
 	// connection. Non-nil ch also serializes concurrent stops on the
@@ -80,6 +129,7 @@ func stopUnit(ctx context.Context, unit string) error {
 	if enqueued {
 		if err != nil {
 			if sdbusNotLoaded(err) {
+				confirmUnitStopped(unit)
 				return nil // not loaded == already stopped
 			}
 			return fmt.Errorf("stop unit %s: %w", unit, err)
@@ -105,6 +155,7 @@ func stopUnit(ctx context.Context, unit string) error {
 	if err != nil {
 		return fmt.Errorf("systemctl stop %s: %s: %w", unit, strings.TrimSpace(string(out)), err)
 	}
+	confirmUnitStopped(unit) // synchronous stop returned success
 	return nil
 }
 
@@ -112,6 +163,7 @@ func stopJobResult(unit, res string) error {
 	if res != "done" && res != "skipped" {
 		return fmt.Errorf("stop unit %s: job result %q", unit, res)
 	}
+	confirmUnitStopped(unit) // systemd reports the stop job completed
 	return nil
 }
 
@@ -130,10 +182,62 @@ func settleExpiredStopWait(ctx context.Context, unit string, ch <-chan string, w
 	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	if unitDefinitelyDead(cctx, unit) {
+	// One authoritative ActiveState read decides both the reported outcome and
+	// whether the stop marker may be cleared. A unit still "deactivating" is
+	// dead to unitDefinitelyDead but its socket can still be held, so its stop
+	// is reported complete YET the marker is retained — otherwise a same-ID
+	// relaunch after the settle window would read as fresh, skip the linger
+	// query, and race the winding-down unit's socket. Only a conclusively-down
+	// state clears the marker; an inconclusive read confirms nothing.
+	state, notLoaded, ok := unitActiveStateRaw(cctx, unit)
+	stopConfirmed, clearMarker := classifyStopSettle(state, notLoaded, ok)
+	if clearMarker {
+		confirmUnitStopped(unit)
+	}
+	if stopConfirmed {
 		return nil
 	}
 	return waitErr
+}
+
+// unitActiveStateRaw returns a unit's ActiveState string (e.g. "active",
+// "deactivating", "inactive", "failed") via D-Bus, falling back to systemctl.
+// notLoaded is true for a unit systemd does not know; ok is false only when the
+// state cannot be determined at all (inconclusive — the caller must fail safe).
+func unitActiveStateRaw(ctx context.Context, unit string) (state string, notLoaded, ok bool) {
+	if val, nl, handled := sdbusUnitProperty(ctx, unit, "", "ActiveState"); handled {
+		if nl {
+			return "", true, true
+		}
+		if s, isStr := val.(string); isStr && s != "" {
+			return s, false, true
+		}
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", unit).Output()
+	if err != nil {
+		return "", false, false
+	}
+	return strings.TrimSpace(string(out)), false, true
+}
+
+// classifyStopSettle maps a post-stop ActiveState read to the settle outcome.
+// stopConfirmed reports the stop as complete (report success rather than the
+// wait error); clearMarker allows clearing the recentUnitStops entry. Only a
+// fully-down unit (inactive/failed/not-loaded) clears the marker — a unit still
+// deactivating or activating counts as stop-complete but KEEPS the marker
+// because its socket may still linger, and an inconclusive read (ok=false) or a
+// still-up unit confirms nothing.
+func classifyStopSettle(state string, notLoaded, ok bool) (stopConfirmed, clearMarker bool) {
+	if !ok {
+		return false, false
+	}
+	if notLoaded || state == "inactive" || state == "failed" {
+		return true, true
+	}
+	if state == "deactivating" || state == "activating" {
+		return true, false
+	}
+	return false, false // active, reloading, or any other still-up state
 }
 
 // unitFailureSummary returns a one-line summary of a unit's
@@ -259,7 +363,11 @@ func unitDefinitelyDead(ctx context.Context, unit string) bool {
 }
 
 // listActiveFirecrackerUnits returns the sandbox IDs of all running
-// firecracker@ units. Used during startup reattach.
+// firecracker@ units. Used during startup reattach. It lists
+// ActiveState=active only — a unit mid-deactivating is invisible here, which
+// is why processSettleWindow independently blankets the post-start period:
+// the scan catches indefinitely-alive orphans, the clock covers wind-downs
+// the scan can't see.
 func listActiveFirecrackerUnits(ctx context.Context) ([]string, error) {
 	var units []sddbus.UnitStatus
 	if err, ok := sdbusDo(func(c *sddbus.Conn) error {

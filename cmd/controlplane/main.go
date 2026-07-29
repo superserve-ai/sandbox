@@ -417,7 +417,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -442,13 +442,17 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 	return resp.IpAddress, vcpu, mem, nil
 }
 
-func previewPortsToProto(ports map[int32]struct{}) []*vmdpb.PreviewPort {
+func previewPortsToProto(ports map[int32]vmdclient.PortPolicy) []*vmdpb.PreviewPort {
 	if len(ports) == 0 {
 		return nil
 	}
 	out := make([]*vmdpb.PreviewPort, 0, len(ports))
-	for port := range ports {
-		out = append(out, &vmdpb.PreviewPort{Port: port})
+	for port, policy := range ports {
+		out = append(out, &vmdpb.PreviewPort{
+			Port:         port,
+			Access:       policy.Access,
+			TokenVersion: policy.TokenVersion,
+		})
 	}
 	return out
 }
@@ -559,7 +563,7 @@ func (c *grpcVMDClient) UpdateSandboxNetwork(ctx context.Context, vmID string, a
 	return nil
 }
 
-func (c *grpcVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, vmID, previewAccess string, previewPorts map[int32]struct{}, policyRevision int64) error {
+func (c *grpcVMDClient) UpdateSandboxPreviewPolicy(ctx context.Context, vmID, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, policyRevision int64) error {
 	_, err := c.client.UpdateSandboxPreviewPolicy(ctx, &vmdpb.UpdateSandboxPreviewPolicyRequest{
 		VmId:           vmID,
 		PreviewAccess:  previewAccess,

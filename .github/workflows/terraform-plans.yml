@@ -1,12 +1,14 @@
 name: Terraform Plans
+run-name: >-
+  Terraform Plans PR #${{ github.event.pull_request.number }} ${{ github.event.pull_request.head.sha }}
 
 on:
   pull_request:
     branches: [main]
     paths:
       - "infra/**"
+      - "infra/scripts/*.sh"
       - "scripts/terraform-*.sh"
-      - "scripts/sanitize-terraform-plan.sh"
       - ".github/workflows/terraform-*.yml"
 
 concurrency:
@@ -17,6 +19,7 @@ jobs:
   terraform-plan:
     name: terraform-plan (${{ matrix.name }})
     runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.fork != true
     permissions:
       contents: read
       id-token: write
@@ -40,11 +43,12 @@ jobs:
     env:
       TF_IN_AUTOMATION: "true"
       HAS_GCP_AUTH: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
-      # Existing Monitoring channel resource names are non-secret references;
-      # the channel's Slack credential remains owned by Cloud Monitoring.
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out pull request head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -57,24 +61,17 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Skip plan when GCP auth is unavailable
+      - name: Require GCP authentication
         if: env.HAS_GCP_AUTH != 'true'
         run: |
-          summary_file="${GITHUB_WORKSPACE}/terraform-plan-summary-${{ matrix.name }}.txt"
-          echo "::notice title=Terraform plan skipped::GCP auth secrets are not configured."
-          echo "Terraform plan skipped because GCP auth secrets are not configured for this workflow." >> "$GITHUB_STEP_SUMMARY"
-          {
-            echo "## Terraform plan: ${{ matrix.name }}"
-            echo
-            echo "Skipped because GCP auth secrets are not configured."
-          } > "$summary_file"
+          echo "::error title=Terraform plan unavailable::Configure GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT for the ${{ matrix.environment }} environment."
+          exit 1
 
       - name: Validate and plan
         if: env.HAS_GCP_AUTH == 'true'
         shell: bash
         run: |
           set -euo pipefail
-
           summary_file="${GITHUB_WORKSPACE}/terraform-plan-summary-${{ matrix.name }}.txt"
           {
             echo "## Terraform plan: ${{ matrix.name }}"
@@ -85,66 +82,37 @@ jobs:
             channel_ids="${TF_VAR_notification_channel_ids:-}"
             case "$channel_ids" in
               ""|"[]")
-                echo "::error title=Missing notification channels::Set the existing monitored channel resource names in the TF_VAR_NOTIFICATION_CHANNEL_IDS repository/environment variable."
-                echo "Plan stopped: monitored notification channels are required for production." >> "$summary_file"
+                echo "::error title=Missing notification channels::Set TF_VAR_NOTIFICATION_CHANNEL_IDS."
                 exit 1
-                ;;
-              \[*\])
-                if [[ ! "$channel_ids" =~ ^\[[[:space:]]*\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\"([[:space:]]*,[[:space:]]*\"projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+\")*[[:space:]]*\]$ ]]; then
-                  echo "::error title=Invalid notification channels::TF_VAR_NOTIFICATION_CHANNEL_IDS contains an invalid channel resource name."
-                  echo "Plan stopped: notification channels must use projects/PROJECT_ID/notificationChannels/NUMERIC_ID." >> "$summary_file"
-                  exit 1
-                fi
                 ;;
               projects/*/notificationChannels/*)
-                if [[ ! "$channel_ids" =~ ^projects/[a-z][a-z0-9-]*/notificationChannels/[0-9]+$ ]]; then
-                  echo "::error title=Invalid notification channels::TF_VAR_NOTIFICATION_CHANNEL_IDS must name a valid Cloud Monitoring channel."
-                  echo "Plan stopped: notification channels must use projects/PROJECT_ID/notificationChannels/NUMERIC_ID." >> "$summary_file"
-                  exit 1
-                fi
                 export TF_VAR_notification_channel_ids="[\"$channel_ids\"]"
-                ;;
-              *)
-                echo "::error title=Invalid notification channels::TF_VAR_NOTIFICATION_CHANNEL_IDS must be a Terraform list literal."
-                echo "Plan stopped: TF_VAR_NOTIFICATION_CHANNEL_IDS is not a Terraform list literal." >> "$summary_file"
-                exit 1
                 ;;
             esac
           fi
 
           cd "${{ matrix.dir }}"
-
           terraform init -input=false
           terraform validate
-
           set +e
           terraform plan -input=false -no-color -detailed-exitcode -out=tfplan
           plan_status=$?
           set -e
 
           if [[ $plan_status -eq 0 ]]; then
-            echo "No changes."
             echo "No changes." >> "$summary_file"
             exit 0
           fi
-
           if [[ $plan_status -eq 2 ]]; then
-            echo "Changes detected."
             echo "Changes detected." >> "$summary_file"
             echo >> "$summary_file"
             echo "Sanitized plan summary:" >> "$summary_file"
-            echo '```' >> "$summary_file"
-            "${GITHUB_WORKSPACE}/scripts/sanitize-terraform-plan.sh" tfplan >> "$summary_file"
+            echo '```json' >> "$summary_file"
+            "${GITHUB_WORKSPACE}/infra/scripts/sanitize-terraform-plan.sh" tfplan >> "$summary_file"
             echo '```' >> "$summary_file"
             exit 0
           fi
-
           echo "::error title=Terraform plan failed::${{ matrix.name }} terraform plan failed."
-          {
-            echo "Terraform plan failed."
-            echo
-            echo "See the job logs for details."
-          } > "$summary_file"
           exit "$plan_status"
 
       - name: Upload Terraform plan summary
@@ -164,28 +132,32 @@ jobs:
       contents: read
     steps:
       - name: Download plan summaries
-        if: always()
+        if: github.event.pull_request.head.repo.fork != true
         uses: actions/download-artifact@v4
         with:
           pattern: terraform-plan-summary-*
           path: terraform-plan-summaries
 
-      - name: Publish consolidated summary
-        if: always()
+      - name: Note fork validation-only runs
+        if: github.event.pull_request.head.repo.fork == true
         shell: bash
         run: |
           set -euo pipefail
+          {
+            echo "## Terraform Plan Summary"
+            echo
+            echo "This PR is from a fork, so the credentialed Terraform plan job is skipped."
+            echo "Terraform fmt and validate still run in the separate checks workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Publish consolidated summary
+        if: github.event.pull_request.head.repo.fork != true
+        shell: bash
+        run: |
+          set -euo pipefail
           echo "## Terraform Plan Summary" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
-
           mapfile -t summaries < <(find terraform-plan-summaries -type f -name 'terraform-plan-summary-*.txt' | sort)
-
-          if [[ ${#summaries[@]} -eq 0 ]]; then
-            echo "No Terraform plan summaries were produced." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
           for summary in "${summaries[@]}"; do
             cat "$summary" >> "$GITHUB_STEP_SUMMARY"
             echo >> "$GITHUB_STEP_SUMMARY"
@@ -194,7 +166,7 @@ jobs:
           done
 
       - name: Propagate plan failures
-        if: ${{ needs.terraform-plan.result != 'success' }}
+        if: ${{ github.event.pull_request.head.repo.fork != true && needs.terraform-plan.result != 'success' }}
         run: |
           echo "::error title=Terraform plan failed::One or more regional Terraform plans failed."
           exit 1

@@ -106,11 +106,16 @@ type VMInstance struct {
 	OwnerID      string // creating user; empty when unknown
 
 	// PreviewAccess and PreviewPorts are the data-plane publication policy.
-	// Empty/legacy_public preserves historical all-port routing; public requires
-	// membership in the allowlist. The revision rejects stale full-set pushes.
+	// Empty/legacy_public preserves historical all-port routing; strict modes
+	// require membership in the allowlist. The revision rejects stale pushes.
 	PreviewAccess         string
-	PreviewPorts          map[int32]struct{}
+	PreviewPorts          map[int32]PreviewPortPolicy
 	PreviewPolicyRevision int64
+	// PreviewTokenPolicyRevision must exactly match PreviewPolicyRevision for
+	// any per-port token generation to be active. A mismatched watermark is a
+	// durable signal that an older writer advanced the policy without the
+	// current token-carrier semantics.
+	PreviewTokenPolicyRevision int64
 
 	// BaseMemPath is the immutable base (template) memory file for a layered
 	// snapshot. Set at create-from-template; non-empty ⇒ this VM's pauses write a
@@ -125,6 +130,14 @@ type VMInstance struct {
 	DirtyTracked bool
 
 	mu sync.RWMutex
+}
+
+// PreviewPortPolicy is the VMD representation of one published port. Access
+// is empty for a Phase 1 sender and then inherits PreviewAccess. TokenVersion
+// is meaningful only for a tokenized wire sentinel.
+type PreviewPortPolicy struct {
+	Access       string
+	TokenVersion int64
 }
 
 // VMConfig describes the desired configuration for a VM.
@@ -242,6 +255,13 @@ type Manager struct {
 	// revalidateLauncher's re-enable so a stale previous-boot pin can't resurrect
 	// the launcher path.
 	launcherBuilt atomic.Bool
+
+	// orphanScanDone gates the fresh-unit linger skip: it is set only after
+	// startup reattach successfully listed active units and registered the
+	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if
+	// the listing failed) a predecessor-era unit could be alive with no
+	// bookkeeping, so every launch must run the linger query.
+	orphanScanDone atomic.Bool
 
 	// presenceConverged mirrors the on-disk converged marker: every layered
 	// overlay on this host has a presence side-car, so strict enforcement can
@@ -1111,7 +1131,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	tFcStart := time.Now()
-	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
+	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
@@ -1306,7 +1326,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// way out. Safe because the VM is paused (no live FC to disrupt), but it must
 	// not run concurrently with a resume of the same sandbox — fine for the
 	// debug/staging use this endpoint is gated to.
-	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
+	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
 	defer func() { _ = stopUnitWithBudget(context.Background(), systemdUnitName(vmID)) }()
@@ -1492,7 +1512,7 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64,
 ) (*VMInstance, error) {
 	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, "")
 }
@@ -1557,7 +1577,7 @@ func psiSomeAvg10(path string) float64 {
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, recordToPath string,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -1650,6 +1670,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	}
 
+	// Sampled before this attempt creates the rundir: a pre-existing rundir
+	// means a prior attempt on this host reached start.sh (and possibly
+	// started the unit) even if it died before persisting any state, so the
+	// unit name is not provably fresh. Only a definitive not-exist proves
+	// absence — any other stat error reads as prior.
+	_, rdErr := os.Stat(filepath.Join(m.cfg.RunDir, vmID))
+	priorRunDir := !errors.Is(rdErr, os.ErrNotExist)
+
 	m.mu.Lock()
 	_, inPlace := m.vms[vmID]
 	if inPlace {
@@ -1670,12 +1698,28 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		TeamID:       teamID,
 		OwnerID:      ownerID,
 
-		PreviewAccess:         previewAccess,
-		PreviewPorts:          clonePreviewPorts(previewPorts),
-		PreviewPolicyRevision: previewPolicyRevision,
+		PreviewAccess:              previewAccess,
+		PreviewPorts:               clonePreviewPorts(previewPorts),
+		PreviewPolicyRevision:      previewPolicyRevision,
+		PreviewTokenPolicyRevision: inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision),
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
+
+	// A provably-fresh unit name — no known instance (lazyReattach already
+	// folded BoltDB into the map), no prior rundir, and no stop attempt this
+	// process could still be winding down from — cannot be lingering, so the
+	// launch may skip the systemd linger query. The winding-down term covers
+	// cleanup paths that delete the other evidence after an unconfirmed stop
+	// (destroy, reattach stale-cleanup). Build VMs never qualify: their
+	// deterministic reused IDs are exempt from persistence and invisible to
+	// the reconciler, so no bookkeeping can ever rule out a prior unit.
+	// orphanScanDone gates everything: until startup reattach has listed
+	// active units, a predecessor-era orphan may exist with no bookkeeping.
+	// Only the first attempt qualifies: any retry follows a start of the
+	// same unit name.
+	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
+		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
@@ -1766,7 +1810,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Unlock()
 
 		var startErr error
-		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
+		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, freshUnit && attempt == 1)
 		if startErr != nil {
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
@@ -2082,9 +2126,18 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	} else {
 		for _, id := range activeIDs {
 			if !knownIDs[id] {
+				// Registered as an unconfirmed stop so a same-ID launch never
+				// reads this orphan as fresh: without a control-plane DB the
+				// reconciler never stops BoltDB-missing units, so this
+				// observation may be the only bookkeeping the unit gets.
+				recordUnitStop(systemdUnitName(id))
 				m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
 			}
 		}
+		// Orphans are accounted for — fresh-unit launches may skip the
+		// linger query from here on. Stays unset on listing failure: an
+		// unobserved orphan can't be ruled out by anything else.
+		m.orphanScanDone.Store(true)
 	}
 
 	// No broad re-sweep here. Startup already swept once before StartPool filled
@@ -2445,7 +2498,7 @@ type InstanceInfo struct {
 	OwnerID   string
 
 	PreviewAccess string
-	PreviewPorts  map[int32]struct{}
+	PreviewPorts  map[int32]PreviewPortPolicy
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -2462,6 +2515,10 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		}
 	}
 	inst.mu.RLock()
+	previewPorts, _ := normalizePreviewTokenPolicy(
+		inst.PreviewPorts, inst.PreviewPolicyRevision, inst.PreviewTokenPolicyRevision,
+	)
+	previewAccess := restrictivePreviewAccess(inst.PreviewAccess, previewPorts)
 	info := InstanceInfo{
 		VMIP:      inst.IP,
 		Status:    inst.Status,
@@ -2469,20 +2526,20 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		TeamID:    inst.TeamID,
 		OwnerID:   inst.OwnerID,
 
-		PreviewAccess: inst.PreviewAccess,
-		PreviewPorts:  clonePreviewPorts(inst.PreviewPorts),
+		PreviewAccess: previewAccess,
+		PreviewPorts:  previewPorts,
 	}
 	inst.mu.RUnlock()
 	return info, true
 }
 
-func clonePreviewPorts(in map[int32]struct{}) map[int32]struct{} {
+func clonePreviewPorts(in map[int32]PreviewPortPolicy) map[int32]PreviewPortPolicy {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[int32]struct{}, len(in))
-	for port := range in {
-		out[port] = struct{}{}
+	out := make(map[int32]PreviewPortPolicy, len(in))
+	for port, policy := range in {
+		out[port] = policy
 	}
 	return out
 }
@@ -2494,12 +2551,82 @@ func normalizedPreviewAccess(access string) string {
 	return access
 }
 
-func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB string, portsB map[int32]struct{}) bool {
-	if normalizedPreviewAccess(accessA) != normalizedPreviewAccess(accessB) || len(portsA) != len(portsB) {
+// inferPreviewTokenPolicyRevision marks one incoming full snapshot as
+// tokenized only when every tokenized sentinel carries a positive generation.
+// The policy revision itself becomes the durable watermark; there is no
+// separate control-plane wire field that an older sender could accidentally
+// replay.
+func inferPreviewTokenPolicyRevision(ports map[int32]PreviewPortPolicy, revision int64) int64 {
+	if revision <= 0 {
+		return 0
+	}
+	foundTokenized := false
+	for _, policy := range ports {
+		if !preview.IsTokenizedAccess(policy.Access) {
+			continue
+		}
+		foundTokenized = true
+		if policy.TokenVersion <= 0 {
+			return 0
+		}
+	}
+	if !foundTokenized {
+		return 0
+	}
+	return revision
+}
+
+// normalizePreviewTokenPolicy returns a detached map whose token generations
+// are usable only for an exact, current tokenized snapshot. Raw private,
+// public, legacy, and unknown modes always clear their generation. If one
+// tokenized sentinel is malformed or the sidecar watermark is stale, all
+// generations are cleared so no credential from a prior revision can be
+// revived.
+func normalizePreviewTokenPolicy(in map[int32]PreviewPortPolicy, revision, tokenPolicyRevision int64) (map[int32]PreviewPortPolicy, int64) {
+	out := clonePreviewPorts(in)
+	foundTokenized := false
+	valid := revision > 0 && tokenPolicyRevision == revision
+	for port, policy := range out {
+		if preview.IsTokenizedAccess(policy.Access) {
+			foundTokenized = true
+			if policy.TokenVersion <= 0 {
+				valid = false
+			}
+		} else {
+			policy.TokenVersion = 0
+			out[port] = policy
+		}
+	}
+	if !foundTokenized || !valid {
+		for port, policy := range out {
+			policy.TokenVersion = 0
+			out[port] = policy
+		}
+		return out, 0
+	}
+	return out, tokenPolicyRevision
+}
+
+// previewPolicyEqual compares the complete effective snapshot represented by
+// one policy revision. Token state is normalized before comparison so stale
+// generations on raw-private/public records never make two closed policies
+// look different, while a live token watermark or generation disagreement is
+// always rejected. Exact port membership is part of the snapshot identity.
+func previewPolicyEqual(
+	accessA string, portsA map[int32]PreviewPortPolicy, revisionA, tokenPolicyRevisionA int64,
+	accessB string, portsB map[int32]PreviewPortPolicy, revisionB, tokenPolicyRevisionB int64,
+) bool {
+	portsA, tokenPolicyRevisionA = normalizePreviewTokenPolicy(portsA, revisionA, tokenPolicyRevisionA)
+	portsB, tokenPolicyRevisionB = normalizePreviewTokenPolicy(portsB, revisionB, tokenPolicyRevisionB)
+	accessA = normalizedPreviewAccess(restrictivePreviewAccess(accessA, portsA))
+	accessB = normalizedPreviewAccess(restrictivePreviewAccess(accessB, portsB))
+	if revisionA != revisionB || tokenPolicyRevisionA != tokenPolicyRevisionB ||
+		accessA != accessB || len(portsA) != len(portsB) {
 		return false
 	}
-	for port := range portsA {
-		if _, ok := portsB[port]; !ok {
+	for port, policyA := range portsA {
+		policyB, ok := portsB[port]
+		if !ok || policyA.Access != policyB.Access || policyA.TokenVersion != policyB.TokenVersion {
 			return false
 		}
 	}
@@ -2511,9 +2638,10 @@ func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB strin
 // wins equality. The durable sidecar is considered after memory and therefore
 // wins an equal-revision disagreement caused by an old VMD rewriting only the
 // primary lifecycle JSON.
-func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]struct{}, incomingRevision int64) (string, map[int32]struct{}, int64, error) {
-	access := incomingAccess
-	ports := clonePreviewPorts(incomingPorts)
+func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]PreviewPortPolicy, incomingRevision int64) (string, map[int32]PreviewPortPolicy, int64, error) {
+	incomingTokenRevision := inferPreviewTokenPolicyRevision(incomingPorts, incomingRevision)
+	ports, _ := normalizePreviewTokenPolicy(incomingPorts, incomingRevision, incomingTokenRevision)
+	access := restrictivePreviewAccess(incomingAccess, ports)
 	revision := incomingRevision
 
 	m.mu.RLock()
@@ -2521,8 +2649,10 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 	m.mu.RUnlock()
 	if inst != nil {
 		inst.mu.RLock()
-		existingAccess := inst.PreviewAccess
-		existingPorts := clonePreviewPorts(inst.PreviewPorts)
+		existingPorts, _ := normalizePreviewTokenPolicy(
+			inst.PreviewPorts, inst.PreviewPolicyRevision, inst.PreviewTokenPolicyRevision,
+		)
+		existingAccess := restrictivePreviewAccess(inst.PreviewAccess, existingPorts)
 		existingRevision := inst.PreviewPolicyRevision
 		inst.mu.RUnlock()
 		if existingRevision >= revision {
@@ -2536,8 +2666,9 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 			return "", nil, 0, err
 		}
 		if rec != nil && rec.PreviewPolicyRevision >= revision {
-			access = rec.PreviewAccess
-			ports = previewPortsFromRecord(rec.PreviewPorts)
+			ports = previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
+			ports, _ = normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
+			access = restrictivePreviewAccess(rec.PreviewAccess, ports)
 			revision = rec.PreviewPolicyRevision
 		}
 	}
@@ -2547,7 +2678,7 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 // UpdateSandboxPreviewPolicy replaces the policy persisted on the instance
 // record. Revisions are monotonic; older snapshots are harmlessly ignored, and
 // an equal revision is idempotent only when its complete policy is identical.
-func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]struct{}, revision int64) error {
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]PreviewPortPolicy, revision int64) error {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return err
@@ -2557,8 +2688,12 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 		inst.mu.Unlock()
 		return nil
 	}
+	tokenPolicyRevision := inferPreviewTokenPolicyRevision(previewPorts, revision)
 	if revision == inst.PreviewPolicyRevision {
-		equal := previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, previewAccess, previewPorts)
+		equal := previewPolicyEqual(
+			inst.PreviewAccess, inst.PreviewPorts, inst.PreviewPolicyRevision, inst.PreviewTokenPolicyRevision,
+			previewAccess, previewPorts, revision, tokenPolicyRevision,
+		)
 		inst.mu.Unlock()
 		if equal {
 			return nil
@@ -2566,7 +2701,8 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 		return status.Errorf(codes.FailedPrecondition,
 			"preview policy revision %d conflicts with the policy already stored for vm %s", revision, vmID)
 	}
-	nextPorts := clonePreviewPorts(previewPorts)
+	nextPorts, tokenPolicyRevision := normalizePreviewTokenPolicy(previewPorts, revision, tokenPolicyRevision)
+	previewAccess = restrictivePreviewAccess(previewAccess, nextPorts)
 	// Keep the instance lock through persistence. Otherwise two concurrent
 	// RPCs can apply revisions in order but race their BoltDB writes in reverse,
 	// resurrecting the stale policy after a vmd restart. Persist the intended
@@ -2576,7 +2712,10 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 		record := toRecordLocked(inst)
 		record.PreviewAccess = previewAccess
 		record.PreviewPorts = previewPortsToRecord(nextPorts)
+		record.PreviewPortAccess = previewPortAccessToRecord(nextPorts)
+		record.PreviewPortTokenVersions = previewPortTokenVersionsToRecord(nextPorts)
 		record.PreviewPolicyRevision = revision
+		record.PreviewTokenPolicyRevision = tokenPolicyRevision
 		if err := m.state.Put(record); err != nil {
 			inst.mu.Unlock()
 			return fmt.Errorf("persist preview policy: %w", err)
@@ -2585,8 +2724,17 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 	inst.PreviewAccess = previewAccess
 	inst.PreviewPorts = nextPorts
 	inst.PreviewPolicyRevision = revision
+	inst.PreviewTokenPolicyRevision = tokenPolicyRevision
 	inst.mu.Unlock()
 	return nil
+}
+
+func restrictivePreviewAccess(sandboxAccess string, ports map[int32]PreviewPortPolicy) string {
+	accesses := make([]string, 0, len(ports))
+	for _, policy := range ports {
+		accesses = append(accesses, policy.Access)
+	}
+	return preview.RestrictiveFallback(sandboxAccess, accesses...)
 }
 
 // ---------------------------------------------------------------------------
@@ -3018,7 +3166,7 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 // as a standalone systemd unit. The VM survives VMD restarts because systemd
 // owns the process, not VMD. Non-empty basePath switches the start script to
 // the dual-symlink overlay layout.
-func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
+func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, freshUnit bool) (int, error) {
 	tPrestart := time.Now()
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
@@ -3067,9 +3215,11 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// the restart job clears at fork, before the socket exists, so no
 	// at-timeout probe can tell a just-replaced unit from a stalled fresh
 	// one. Timed separately: it is a per-launch systemd round trip, and
-	// concurrent launches serialize on the shared D-Bus connection.
+	// concurrent launches serialize on the shared D-Bus connection. A
+	// fresh unit skips it with the identical outcome: never-existed reads
+	// NotLoaded, i.e. not lingering.
 	tLinger := time.Now()
-	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
+	replacingLive := !freshUnit && unitLingering(ctx, systemdUnitName(vmID))
 	lingerCheckMs := time.Since(tLinger).Milliseconds()
 
 	tStartUnit := time.Now()
@@ -3107,6 +3257,7 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		Str("vm_id", vmID).
 		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
 		Int64("linger_check_ms", lingerCheckMs).
+		Bool("linger_skipped", freshUnit).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
 		Msg("fc startup phases")

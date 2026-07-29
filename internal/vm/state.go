@@ -23,17 +23,23 @@ var (
 // a VMD binary that predates preview policy fields can keep writing lifecycle
 // records without erasing the last policy enforced by newer binaries.
 type persistedPreviewPolicy struct {
-	Access        string
-	Ports         map[int32]bool
-	Revision      int64
-	unknownFields map[string]json.RawMessage
+	Access              string
+	Ports               map[int32]bool
+	PortAccess          map[int32]string
+	TokenVersions       map[int32]int64
+	Revision            int64
+	TokenPolicyRevision int64
+	unknownFields       map[string]json.RawMessage
 }
 
 func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 	var known struct {
-		Access   string         `json:"access,omitempty"`
-		Ports    map[int32]bool `json:"ports,omitempty"`
-		Revision int64          `json:"revision,omitempty"`
+		Access              string           `json:"access,omitempty"`
+		Ports               map[int32]bool   `json:"ports,omitempty"`
+		PortAccess          map[int32]string `json:"port_access,omitempty"`
+		TokenVersions       map[int32]int64  `json:"token_versions,omitempty"`
+		Revision            int64            `json:"revision,omitempty"`
+		TokenPolicyRevision int64            `json:"token_policy_revision,omitempty"`
 	}
 	if err := json.Unmarshal(data, &known); err != nil {
 		return err
@@ -44,21 +50,28 @@ func (p *persistedPreviewPolicy) UnmarshalJSON(data []byte) error {
 	}
 	delete(fields, "access")
 	delete(fields, "ports")
+	delete(fields, "port_access")
+	delete(fields, "token_versions")
 	delete(fields, "revision")
+	delete(fields, "token_policy_revision")
 	if len(fields) == 0 {
 		fields = nil
 	}
 	*p = persistedPreviewPolicy{
-		Access:        known.Access,
-		Ports:         known.Ports,
-		Revision:      known.Revision,
-		unknownFields: fields,
+		Access:              known.Access,
+		Ports:               known.Ports,
+		PortAccess:          known.PortAccess,
+		TokenVersions:       known.TokenVersions,
+		Revision:            known.Revision,
+		TokenPolicyRevision: known.TokenPolicyRevision,
+		unknownFields:       fields,
 	}
 	return nil
 }
 
 func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
-	fields := make(map[string]json.RawMessage, len(p.unknownFields)+3)
+	p = p.normalizedTokenState()
+	fields := make(map[string]json.RawMessage, len(p.unknownFields)+6)
 	for key, value := range p.unknownFields {
 		fields[key] = value
 	}
@@ -76,12 +89,33 @@ func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
 		}
 		fields["ports"] = data
 	}
+	if len(p.PortAccess) != 0 {
+		data, err := json.Marshal(p.PortAccess)
+		if err != nil {
+			return nil, err
+		}
+		fields["port_access"] = data
+	}
+	if len(p.TokenVersions) != 0 {
+		data, err := json.Marshal(p.TokenVersions)
+		if err != nil {
+			return nil, err
+		}
+		fields["token_versions"] = data
+	}
 	if p.Revision != 0 {
 		data, err := json.Marshal(p.Revision)
 		if err != nil {
 			return nil, err
 		}
 		fields["revision"] = data
+	}
+	if p.TokenPolicyRevision != 0 {
+		data, err := json.Marshal(p.TokenPolicyRevision)
+		if err != nil {
+			return nil, err
+		}
+		fields["token_policy_revision"] = data
 	}
 	return json.Marshal(fields)
 }
@@ -123,9 +157,14 @@ type VMRecord struct {
 	OwnerID string `json:"owner_id,omitempty"`
 	// Preview publication policy must survive vmd restarts; old records decode
 	// to empty/legacy behavior for backward compatibility.
-	PreviewAccess         string         `json:"preview_access,omitempty"`
-	PreviewPorts          map[int32]bool `json:"preview_ports,omitempty"`
-	PreviewPolicyRevision int64          `json:"preview_policy_revision,omitempty"`
+	PreviewAccess            string           `json:"preview_access,omitempty"`
+	PreviewPorts             map[int32]bool   `json:"preview_ports,omitempty"`
+	PreviewPortAccess        map[int32]string `json:"preview_port_access,omitempty"`
+	PreviewPortTokenVersions map[int32]int64  `json:"preview_port_token_versions,omitempty"`
+	PreviewPolicyRevision    int64            `json:"preview_policy_revision,omitempty"`
+	// PreviewTokenPolicyRevision is a sidecar-backed watermark. Token versions
+	// are active only when it exactly matches PreviewPolicyRevision.
+	PreviewTokenPolicyRevision int64 `json:"preview_token_policy_revision,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -292,6 +331,10 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 			}
 		}
 	}
+	// Keep the Phase 1-visible primary JSON restrictive too. A rolled-back VMD
+	// does not know about the sidecar or its parallel access map; it must still
+	// read a private top-level fallback for every mixed/private snapshot.
+	incomingPolicy.applyTo(&incoming)
 
 	data, err := json.Marshal(incoming)
 	if err != nil {
@@ -311,21 +354,48 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 }
 
 func previewPolicyFromRecord(rec VMRecord) persistedPreviewPolicy {
+	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	return persistedPreviewPolicy{
-		Access:   rec.PreviewAccess,
-		Ports:    rec.PreviewPorts,
-		Revision: rec.PreviewPolicyRevision,
-	}
+		Access:              restrictivePreviewAccess(rec.PreviewAccess, ports),
+		Ports:               previewPortsToRecord(ports),
+		PortAccess:          previewPortAccessToRecord(ports),
+		TokenVersions:       previewPortTokenVersionsToRecord(ports),
+		Revision:            rec.PreviewPolicyRevision,
+		TokenPolicyRevision: rec.PreviewTokenPolicyRevision,
+	}.normalizedTokenState()
 }
 
 func (p persistedPreviewPolicy) isSet() bool {
-	return p.Access != "" || len(p.Ports) != 0 || p.Revision != 0 || len(p.unknownFields) != 0
+	return p.Access != "" || len(p.Ports) != 0 || len(p.PortAccess) != 0 ||
+		len(p.TokenVersions) != 0 || p.Revision != 0 || p.TokenPolicyRevision != 0 ||
+		len(p.unknownFields) != 0
 }
 
 func (p persistedPreviewPolicy) applyTo(rec *VMRecord) {
-	rec.PreviewAccess = p.Access
-	rec.PreviewPorts = p.Ports
+	p = p.normalizedTokenState()
+	ports := previewPortsFromRecord(p.Ports, p.PortAccess, p.TokenVersions)
+	rec.PreviewAccess = restrictivePreviewAccess(p.Access, ports)
+	rec.PreviewPorts = previewPortsToRecord(ports)
+	rec.PreviewPortAccess = previewPortAccessToRecord(ports)
+	rec.PreviewPortTokenVersions = previewPortTokenVersionsToRecord(ports)
 	rec.PreviewPolicyRevision = p.Revision
+	rec.PreviewTokenPolicyRevision = p.TokenPolicyRevision
+}
+
+// normalizedTokenState makes the token sidecar self-invalidating across a
+// rollback. A writer which predates the active token carrier either clears its
+// generation or advances Revision without a matching watermark. A newer VMD
+// therefore clears every generation instead of reviving credentials from an
+// older tokenized snapshot.
+func (p persistedPreviewPolicy) normalizedTokenState() persistedPreviewPolicy {
+	ports := previewPortsFromRecord(p.Ports, p.PortAccess, p.TokenVersions)
+	ports, watermark := normalizePreviewTokenPolicy(ports, p.Revision, p.TokenPolicyRevision)
+	p.Access = restrictivePreviewAccess(p.Access, ports)
+	p.Ports = previewPortsToRecord(ports)
+	p.PortAccess = previewPortAccessToRecord(ports)
+	p.TokenVersions = previewPortTokenVersionsToRecord(ports)
+	p.TokenPolicyRevision = watermark
+	return p
 }
 
 func getPreviewPolicy(bucket *bolt.Bucket, key []byte) (persistedPreviewPolicy, bool, error) {
@@ -415,34 +485,37 @@ func toRecord(inst *VMInstance) VMRecord {
 // used when a state write must be serialized with the in-memory mutation.
 func toRecordLocked(inst *VMInstance) VMRecord {
 	return VMRecord{
-		ID:                    inst.ID,
-		PID:                   inst.PID,
-		SocketPath:            inst.SocketPath,
-		VsockPath:             inst.VsockPath,
-		IP:                    inst.IP,
-		TAPDevice:             inst.TAPDevice,
-		MACAddress:            inst.MACAddress,
-		Status:                inst.Status,
-		RunDirID:              inst.RunDirID,
-		Namespace:             inst.Namespace,
-		DiskPath:              inst.DiskPath,
-		SnapshotPath:          inst.SnapshotPath,
-		MemFilePath:           inst.MemFilePath,
-		BaseMemPath:           inst.BaseMemPath,
-		CreatedAt:             inst.CreatedAt,
-		Metadata:              inst.Metadata,
-		VCPU:                  inst.Config.VCPU,
-		MemoryMiB:             inst.Config.MemoryMiB,
-		BasePath:              inst.Config.BasePath,
-		TeamID:                inst.TeamID,
-		OwnerID:               inst.OwnerID,
-		PreviewAccess:         inst.PreviewAccess,
-		PreviewPorts:          previewPortsToRecord(inst.PreviewPorts),
-		PreviewPolicyRevision: inst.PreviewPolicyRevision,
+		ID:                         inst.ID,
+		PID:                        inst.PID,
+		SocketPath:                 inst.SocketPath,
+		VsockPath:                  inst.VsockPath,
+		IP:                         inst.IP,
+		TAPDevice:                  inst.TAPDevice,
+		MACAddress:                 inst.MACAddress,
+		Status:                     inst.Status,
+		RunDirID:                   inst.RunDirID,
+		Namespace:                  inst.Namespace,
+		DiskPath:                   inst.DiskPath,
+		SnapshotPath:               inst.SnapshotPath,
+		MemFilePath:                inst.MemFilePath,
+		BaseMemPath:                inst.BaseMemPath,
+		CreatedAt:                  inst.CreatedAt,
+		Metadata:                   inst.Metadata,
+		VCPU:                       inst.Config.VCPU,
+		MemoryMiB:                  inst.Config.MemoryMiB,
+		BasePath:                   inst.Config.BasePath,
+		TeamID:                     inst.TeamID,
+		OwnerID:                    inst.OwnerID,
+		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
+		PreviewPorts:               previewPortsToRecord(inst.PreviewPorts),
+		PreviewPortAccess:          previewPortAccessToRecord(inst.PreviewPorts),
+		PreviewPortTokenVersions:   previewPortTokenVersionsToRecord(inst.PreviewPorts),
+		PreviewPolicyRevision:      inst.PreviewPolicyRevision,
+		PreviewTokenPolicyRevision: inst.PreviewTokenPolicyRevision,
 	}
 }
 
-func previewPortsToRecord(in map[int32]struct{}) map[int32]bool {
+func previewPortsToRecord(in map[int32]PreviewPortPolicy) map[int32]bool {
 	if len(in) == 0 {
 		return nil
 	}
@@ -453,14 +526,40 @@ func previewPortsToRecord(in map[int32]struct{}) map[int32]bool {
 	return out
 }
 
-func previewPortsFromRecord(in map[int32]bool) map[int32]struct{} {
+func previewPortAccessToRecord(in map[int32]PreviewPortPolicy) map[int32]string {
+	out := make(map[int32]string, len(in))
+	for port, policy := range in {
+		if policy.Access != "" {
+			out[port] = policy.Access
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func previewPortTokenVersionsToRecord(in map[int32]PreviewPortPolicy) map[int32]int64 {
+	out := make(map[int32]int64, len(in))
+	for port, policy := range in {
+		if policy.TokenVersion > 0 {
+			out[port] = policy.TokenVersion
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func previewPortsFromRecord(in map[int32]bool, access map[int32]string, tokenVersions map[int32]int64) map[int32]PreviewPortPolicy {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[int32]struct{}, len(in))
+	out := make(map[int32]PreviewPortPolicy, len(in))
 	for port, published := range in {
 		if published {
-			out[port] = struct{}{}
+			out[port] = PreviewPortPolicy{Access: access[port], TokenVersion: tokenVersions[port]}
 		}
 	}
 	return out
@@ -468,28 +567,31 @@ func previewPortsFromRecord(in map[int32]bool) map[int32]struct{} {
 
 // toInstance converts a VMRecord back to a VMInstance.
 func toInstance(rec VMRecord) *VMInstance {
+	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
+	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                    rec.ID,
-		PID:                   rec.PID,
-		SocketPath:            rec.SocketPath,
-		VsockPath:             rec.VsockPath,
-		IP:                    rec.IP,
-		TAPDevice:             rec.TAPDevice,
-		MACAddress:            rec.MACAddress,
-		Status:                rec.Status,
-		RunDirID:              rec.RunDirID,
-		Namespace:             rec.Namespace,
-		DiskPath:              rec.DiskPath,
-		SnapshotPath:          rec.SnapshotPath,
-		MemFilePath:           rec.MemFilePath,
-		BaseMemPath:           rec.BaseMemPath,
-		CreatedAt:             rec.CreatedAt,
-		Metadata:              rec.Metadata,
-		TeamID:                rec.TeamID,
-		OwnerID:               rec.OwnerID,
-		PreviewAccess:         rec.PreviewAccess,
-		PreviewPorts:          previewPortsFromRecord(rec.PreviewPorts),
-		PreviewPolicyRevision: rec.PreviewPolicyRevision,
+		ID:                         rec.ID,
+		PID:                        rec.PID,
+		SocketPath:                 rec.SocketPath,
+		VsockPath:                  rec.VsockPath,
+		IP:                         rec.IP,
+		TAPDevice:                  rec.TAPDevice,
+		MACAddress:                 rec.MACAddress,
+		Status:                     rec.Status,
+		RunDirID:                   rec.RunDirID,
+		Namespace:                  rec.Namespace,
+		DiskPath:                   rec.DiskPath,
+		SnapshotPath:               rec.SnapshotPath,
+		MemFilePath:                rec.MemFilePath,
+		BaseMemPath:                rec.BaseMemPath,
+		CreatedAt:                  rec.CreatedAt,
+		Metadata:                   rec.Metadata,
+		TeamID:                     rec.TeamID,
+		OwnerID:                    rec.OwnerID,
+		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
+		PreviewPorts:               ports,
+		PreviewPolicyRevision:      rec.PreviewPolicyRevision,
+		PreviewTokenPolicyRevision: tokenPolicyRevision,
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
 			MemoryMiB: rec.MemoryMiB,

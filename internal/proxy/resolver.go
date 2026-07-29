@@ -26,13 +26,15 @@ var ErrVMDPreviewProtocolUnsupported = errors.New("proxy: vmd does not attest pr
 
 // InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
-	VMIP          string
-	Status        string
-	StartedAt     int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
-	TeamID        string // owning team, for usage attribution
-	OwnerID       string // creating user, for usage attribution; empty when unknown
-	PreviewAccess string
-	PreviewPorts  map[int]struct{}
+	VMIP                     string
+	Status                   string
+	StartedAt                int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	TeamID                   string // owning team, for usage attribution
+	OwnerID                  string // creating user, for usage attribution; empty when unknown
+	PreviewAccess            string
+	PreviewPorts             map[int]struct{}
+	PreviewPortAccess        map[int]string
+	PreviewPortTokenVersions map[int]int64
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -79,6 +81,15 @@ type cacheEntry struct {
 type VMDResolver struct {
 	vmdAddr string
 	client  *http.Client
+	// previewTokens is enabled only after cmd/proxy installs a valid seed.
+	// It keeps the local protocol attestation honest when token auth is not
+	// configured, causing VMD to withhold tokenized instances instead.
+	previewTokens bool
+	// previewBrowserAuth is enabled only by a proxy build which implements the
+	// browser sentinel's carrier parsing, cookie bootstrap, and scrubbing. It is
+	// separate from previewTokens so the local protocol exposes the Phase 4
+	// deploy boundary honestly.
+	previewBrowserAuth bool
 
 	mu sync.Mutex
 	// epoch advances on any explicit invalidation. It is part of the
@@ -90,6 +101,22 @@ type VMDResolver struct {
 	epoch uint64
 	cache map[string]cacheEntry
 	group singleflight.Group
+}
+
+// WithPreviewTokens declares that the owning proxy handler has a valid seed
+// and can enforce HostCapabilityPortTokens. Configure it once at startup.
+func (r *VMDResolver) WithPreviewTokens() *VMDResolver {
+	r.previewTokens = true
+	return r
+}
+
+// WithPreviewBrowserAuth declares that the owning proxy can enforce
+// HostCapabilityPortBrowserAuth. Browser support is additive to header tokens,
+// so this also enables the token capability if the caller did not do so first.
+func (r *VMDResolver) WithPreviewBrowserAuth() *VMDResolver {
+	r.previewTokens = true
+	r.previewBrowserAuth = true
+	return r
 }
 
 // NewVMDResolver creates a Resolver that queries VMD at vmdAddr.
@@ -143,13 +170,15 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP          string          `json:"vm_ip"`
-	Status        string          `json:"status"`
-	StartedAt     int64           `json:"started_at"`
-	TeamID        string          `json:"team_id"`
-	OwnerID       string          `json:"owner_id"`
-	PreviewAccess string          `json:"preview_access"`
-	PreviewPorts  map[string]bool `json:"preview_ports"`
+	VMIP                     string            `json:"vm_ip"`
+	Status                   string            `json:"status"`
+	StartedAt                int64             `json:"started_at"`
+	TeamID                   string            `json:"team_id"`
+	OwnerID                  string            `json:"owner_id"`
+	PreviewAccess            string            `json:"preview_access"`
+	PreviewPorts             map[string]bool   `json:"preview_ports"`
+	PreviewPortAccess        map[string]string `json:"preview_port_access"`
+	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64) (InstanceInfo, error) {
@@ -159,6 +188,14 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 		return InstanceInfo{}, fmt.Errorf("resolver: build request: %w", err)
 	}
 	req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
+	capabilities := preview.HostCapabilityPortAccess
+	if r.previewTokens {
+		capabilities += ", " + preview.HostCapabilityPortTokens
+		if r.previewBrowserAuth {
+			capabilities += ", " + preview.HostCapabilityPortBrowserAuth
+		}
+	}
+	req.Header.Set(preview.ProxyCapabilitiesHeader, capabilities)
 
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -185,10 +222,48 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 	info := InstanceInfo{
 		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
 		TeamID: raw.TeamID, OwnerID: raw.OwnerID,
-		PreviewAccess: raw.PreviewAccess,
-		PreviewPorts:  decodePreviewPorts(raw.PreviewPorts),
+		PreviewAccess:            raw.PreviewAccess,
+		PreviewPorts:             decodePreviewPorts(raw.PreviewPorts),
+		PreviewPortAccess:        decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),
+		PreviewPortTokenVersions: decodePreviewPortTokenVersions(raw.PreviewPorts, raw.PreviewPortTokenVersions),
 	}
 	return info, nil
+}
+
+func decodePreviewPortTokenVersions(published map[string]bool, raw map[string]int64) map[int]int64 {
+	if len(published) == 0 || len(raw) == 0 {
+		return nil
+	}
+	out := make(map[int]int64, len(raw))
+	for key, version := range raw {
+		port, err := strconv.Atoi(key)
+		if err != nil || !published[key] || port < minProxiedPort || port > 65535 || version <= 0 {
+			continue
+		}
+		out[port] = version
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func decodePreviewPortAccess(published map[string]bool, raw map[string]string) map[int]string {
+	if len(published) == 0 || len(raw) == 0 {
+		return nil
+	}
+	out := make(map[int]string, len(raw))
+	for key, access := range raw {
+		port, err := strconv.Atoi(key)
+		if err != nil || !published[key] || port < minProxiedPort || port > 65535 {
+			continue
+		}
+		out[port] = access
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func decodePreviewPorts(raw map[string]bool) map[int]struct{} {
