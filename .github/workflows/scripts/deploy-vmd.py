@@ -205,9 +205,12 @@ def main() -> int:
             # under them. Detect the downgrade by grepping the incoming binary for
             # its capability marker (never execute an unknown old binary — it would
             # start the daemon), then certify the host is drained USING THE CURRENT
-            # cgroup-aware binary before it is replaced. Skipped entirely for normal
-            # upgrades, so their path is unchanged.
-            if [ -x {install_dir}/vmd ] && ! grep -qa cgroup-supervision {extract_dir}/bin/vmd; then
+            # cgroup-aware binary before it is replaced. Gate on the CURRENT binary
+            # ALSO having the marker: on a retried downgrade the installed binary is
+            # already pre-direct-spawn, and running it as `vmd drain-check` would
+            # start the daemon (it doesn't know the subcommand) and hang the deploy
+            # — and there is nothing left to drain. Skipped for normal upgrades too.
+            if grep -qa cgroup-supervision {install_dir}/vmd 2>/dev/null && ! grep -qa cgroup-supervision {extract_dir}/bin/vmd; then
                 echo "incoming vmd lacks cgroup-supervision — verifying host is drained before downgrade"
                 sudo systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
                 # drain-check only needs VMD_STATE_PATH / RUN_DIR to find the DB.
