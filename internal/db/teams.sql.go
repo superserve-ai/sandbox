@@ -14,7 +14,7 @@ import (
 const createTeam = `-- name: CreateTeam :one
 INSERT INTO team (name)
 VALUES ($1)
-RETURNING id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region
+RETURNING id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region, max_snapshots, max_snapshots_per_sandbox, snapshot_storage_quota_bytes, snapshot_storage_bytes
 `
 
 func (q *Queries) CreateTeam(ctx context.Context, name string) (Team, error) {
@@ -36,6 +36,10 @@ func (q *Queries) CreateTeam(ctx context.Context, name string) (Team, error) {
 		&i.CredentialStoreConfig,
 		&i.UnmatchedHostPolicy,
 		&i.HomeRegion,
+		&i.MaxSnapshots,
+		&i.MaxSnapshotsPerSandbox,
+		&i.SnapshotStorageQuotaBytes,
+		&i.SnapshotStorageBytes,
 	)
 	return i, err
 }
@@ -51,7 +55,7 @@ func (q *Queries) DeleteTeam(ctx context.Context, id uuid.UUID) error {
 }
 
 const getTeam = `-- name: GetTeam :one
-SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region FROM team
+SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region, max_snapshots, max_snapshots_per_sandbox, snapshot_storage_quota_bytes, snapshot_storage_bytes FROM team
 WHERE id = $1
 `
 
@@ -74,6 +78,10 @@ func (q *Queries) GetTeam(ctx context.Context, id uuid.UUID) (Team, error) {
 		&i.CredentialStoreConfig,
 		&i.UnmatchedHostPolicy,
 		&i.HomeRegion,
+		&i.MaxSnapshots,
+		&i.MaxSnapshotsPerSandbox,
+		&i.SnapshotStorageQuotaBytes,
+		&i.SnapshotStorageBytes,
 	)
 	return i, err
 }
@@ -91,7 +99,7 @@ func (q *Queries) GetTeamBuildConcurrency(ctx context.Context, id uuid.UUID) (in
 }
 
 const getTeamByName = `-- name: GetTeamByName :one
-SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region FROM team
+SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region, max_snapshots, max_snapshots_per_sandbox, snapshot_storage_quota_bytes, snapshot_storage_bytes FROM team
 WHERE name = $1
 `
 
@@ -114,12 +122,16 @@ func (q *Queries) GetTeamByName(ctx context.Context, name string) (Team, error) 
 		&i.CredentialStoreConfig,
 		&i.UnmatchedHostPolicy,
 		&i.HomeRegion,
+		&i.MaxSnapshots,
+		&i.MaxSnapshotsPerSandbox,
+		&i.SnapshotStorageQuotaBytes,
+		&i.SnapshotStorageBytes,
 	)
 	return i, err
 }
 
 const listTeams = `-- name: ListTeams :many
-SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region FROM team
+SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region, max_snapshots, max_snapshots_per_sandbox, snapshot_storage_quota_bytes, snapshot_storage_bytes FROM team
 ORDER BY created_at DESC
 `
 
@@ -148,6 +160,10 @@ func (q *Queries) ListTeams(ctx context.Context) ([]Team, error) {
 			&i.CredentialStoreConfig,
 			&i.UnmatchedHostPolicy,
 			&i.HomeRegion,
+			&i.MaxSnapshots,
+			&i.MaxSnapshotsPerSandbox,
+			&i.SnapshotStorageQuotaBytes,
+			&i.SnapshotStorageBytes,
 		); err != nil {
 			return nil, err
 		}
@@ -163,7 +179,7 @@ const updateTeamName = `-- name: UpdateTeamName :one
 UPDATE team
 SET name = $2, updated_at = now()
 WHERE id = $1
-RETURNING id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region
+RETURNING id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region, max_snapshots, max_snapshots_per_sandbox, snapshot_storage_quota_bytes, snapshot_storage_bytes
 `
 
 type UpdateTeamNameParams struct {
@@ -190,6 +206,10 @@ func (q *Queries) UpdateTeamName(ctx context.Context, arg UpdateTeamNameParams) 
 		&i.CredentialStoreConfig,
 		&i.UnmatchedHostPolicy,
 		&i.HomeRegion,
+		&i.MaxSnapshots,
+		&i.MaxSnapshotsPerSandbox,
+		&i.SnapshotStorageQuotaBytes,
+		&i.SnapshotStorageBytes,
 	)
 	return i, err
 }

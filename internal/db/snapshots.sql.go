@@ -14,7 +14,7 @@ import (
 const createSnapshot = `-- name: CreateSnapshot :one
 INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path
+RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at
 `
 
 type CreateSnapshotParams struct {
@@ -45,6 +45,35 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 		&i.Trigger,
 		&i.CreatedAt,
 		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }
@@ -83,7 +112,7 @@ func (q *Queries) DeleteSnapshotsOfDestroyedSandboxes(ctx context.Context) (int6
 }
 
 const getSnapshot = `-- name: GetSnapshot :one
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
 WHERE id = $1 AND team_id = $2
 `
 
@@ -108,12 +137,41 @@ func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snaps
 		&i.Trigger,
 		&i.CreatedAt,
 		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }
 
 const getSnapshotByID = `-- name: GetSnapshotByID :one
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
 WHERE id = $1
 `
 
@@ -131,12 +189,41 @@ func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, 
 		&i.Trigger,
 		&i.CreatedAt,
 		&i.MemPath,
+		&i.Kind,
+		&i.Status,
+		&i.Name,
+		&i.IdempotencyKey,
+		&i.ParentSnapshotID,
+		&i.SourceStatus,
+		&i.TemplateID,
+		&i.TemplateSnapshotPath,
+		&i.TemplateMemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.HostID,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.DiskMib,
+		&i.ManifestPath,
+		&i.ManifestDigest,
+		&i.ArtifactMetadata,
+		&i.LogicalSizeBytes,
+		&i.ExclusiveSizeBytes,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.AutoDeleteSeconds,
+		&i.SecretBindings,
+		&i.SecretEnvKeys,
+		&i.FailureReason,
+		&i.UpdatedAt,
+		&i.FinalizedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }
 
 const listSnapshotsBySandbox = `-- name: ListSnapshotsBySandbox :many
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
 WHERE sandbox_id = $1
 ORDER BY created_at DESC
 `
@@ -159,6 +246,35 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 			&i.Trigger,
 			&i.CreatedAt,
 			&i.MemPath,
+			&i.Kind,
+			&i.Status,
+			&i.Name,
+			&i.IdempotencyKey,
+			&i.ParentSnapshotID,
+			&i.SourceStatus,
+			&i.TemplateID,
+			&i.TemplateSnapshotPath,
+			&i.TemplateMemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.HostID,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.DiskMib,
+			&i.ManifestPath,
+			&i.ManifestDigest,
+			&i.ArtifactMetadata,
+			&i.LogicalSizeBytes,
+			&i.ExclusiveSizeBytes,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.AutoDeleteSeconds,
+			&i.SecretBindings,
+			&i.SecretEnvKeys,
+			&i.FailureReason,
+			&i.UpdatedAt,
+			&i.FinalizedAt,
+			&i.DeletedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -171,7 +287,7 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 }
 
 const listSnapshotsByTeam = `-- name: ListSnapshotsByTeam :many
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, kind, status, name, idempotency_key, parent_snapshot_id, source_status, template_id, template_snapshot_path, template_mem_path, base_path, delta_path, host_id, vcpu_count, memory_mib, disk_mib, manifest_path, manifest_digest, artifact_metadata, logical_size_bytes, exclusive_size_bytes, network_config, timeout_seconds, auto_delete_seconds, secret_bindings, secret_env_keys, failure_reason, updated_at, finalized_at, deleted_at FROM snapshot
 WHERE team_id = $1
 ORDER BY created_at DESC
 `
@@ -194,6 +310,35 @@ func (q *Queries) ListSnapshotsByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.Trigger,
 			&i.CreatedAt,
 			&i.MemPath,
+			&i.Kind,
+			&i.Status,
+			&i.Name,
+			&i.IdempotencyKey,
+			&i.ParentSnapshotID,
+			&i.SourceStatus,
+			&i.TemplateID,
+			&i.TemplateSnapshotPath,
+			&i.TemplateMemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.HostID,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.DiskMib,
+			&i.ManifestPath,
+			&i.ManifestDigest,
+			&i.ArtifactMetadata,
+			&i.LogicalSizeBytes,
+			&i.ExclusiveSizeBytes,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.AutoDeleteSeconds,
+			&i.SecretBindings,
+			&i.SecretEnvKeys,
+			&i.FailureReason,
+			&i.UpdatedAt,
+			&i.FinalizedAt,
+			&i.DeletedAt,
 		); err != nil {
 			return nil, err
 		}
