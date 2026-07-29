@@ -16,17 +16,14 @@ import (
 // The rendered script and the whole nsenter→unshare→sh→exec chain are the
 // same as the unit path; only the parent and the supervision change.
 
-// directSpawnEnv is the ENTIRE environment a direct-spawned VM chain gets.
-// systemd gave start.sh a clean environment; vmd's own environ carries
-// DATABASE_URL, INTERNAL_API_TOKEN, and every VMD_* flag, none of which may
-// reach Firecracker's process memory (it is the sandbox boundary and it
-// dumps core). PATH covers the script's bare tool names; RUN_DIR matches
-// the unit file's one declared variable. Nothing else — additions here are
-// a security review, not a convenience.
-// directSpawnPATH is the PATH the direct-spawn launch chain runs under. The
-// arm-time prlimit check validates against THIS, not vmd's own PATH.
+// directSpawnPATH is the PATH the launch chain runs under; the arm-time prlimit
+// check validates against it, not vmd's own PATH.
 const directSpawnPATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
+// directSpawnEnv is the ENTIRE environment a direct-spawned chain gets: vmd's
+// own environ carries DATABASE_URL, INTERNAL_API_TOKEN and VMD_* flags, none of
+// which may cross the sandbox boundary into Firecracker. Additions are a
+// security review, not a convenience.
 func directSpawnEnv() []string {
 	return []string{
 		"PATH=" + directSpawnPATH,
@@ -34,11 +31,10 @@ func directSpawnEnv() []string {
 	}
 }
 
-// prlimitOnLaunchPath reports whether the prlimit binary directSpawnScript
-// prepends is resolvable on the launch PATH. It scans directSpawnPATH itself,
-// not vmd's PATH (which exec.LookPath would search): the chain runs under the
-// restricted PATH, so a prlimit only in e.g. /usr/local/bin would pass a
-// LookPath yet make every direct launch exit before Firecracker starts.
+// prlimitOnLaunchPath reports whether prlimit (which directSpawnScript prepends)
+// resolves on the restricted launch PATH — not vmd's PATH, which LookPath would
+// search: a prlimit only in e.g. /usr/local/bin would pass LookPath yet break
+// every launch.
 func prlimitOnLaunchPath() bool { return toolOnPath("prlimit", directSpawnPATH) }
 
 // toolOnPath reports whether an executable named tool exists in one of the
@@ -52,11 +48,9 @@ func toolOnPath(tool, path string) bool {
 	return false
 }
 
-// directSpawnScript renders the launch script for direct spawn: the unit
-// path's script with a prlimit hop pinning NOFILE to the systemd service
-// defaults. Without it the chain inherits vmd's 65536 soft limit and
-// Firecracker's fd-table preallocation (sized to the soft limit) costs
-// ~0.5MB of kernel memory per VM at fleet density.
+// directSpawnScript wraps the unit path's script with a prlimit hop pinning
+// NOFILE to the service default — without it the chain inherits vmd's 65536 soft
+// limit and FC's fd-table preallocation wastes ~0.5MB/VM at fleet density.
 func directSpawnScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID string) (string, error) {
 	base := fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID)
 	const prefix = "#!/bin/sh\nexec "
@@ -69,21 +63,14 @@ func directSpawnScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID
 	return prefix + "prlimit --nofile=1024:524288 " + rest, nil
 }
 
-// openVMConsole opens the per-VM console file the child's stdout/stderr
-// attach to (Firecracker's logs plus panic/abort output, incl. the exit-70
-// handler-death message). The child holds the fd directly, so console output
-// survives a vmd restart. A file, not journald: journald rate-limits per unit
-// cgroup, so a shared stream would let one VM suppress others' output.
-//
-// The untrusted guest console is size-bounded by the paired Firecracker
-// serial cap (1 MiB per boot) — a deploy prerequisite for arming direct
-// spawn. O_TRUNC resets the file each launch, so the on-disk total stays
-// within one boot's capped output even across resume cycles.
+// openVMConsole opens the per-VM console file the child's stdout/stderr attach
+// to (FC logs + panic output). A file, not journald (which rate-limits per unit
+// cgroup, letting one VM starve others'), so output survives a vmd restart.
+// Bounded by FC's 1 MiB/boot serial cap plus O_TRUNC-per-launch here.
 func openVMConsole(runDir, vmID string) (*os.File, error) {
 	dir := filepath.Join(runDir, vmID)
-	// Defensive: the launch path MkdirAll's this dir (via the socket dir) before
-	// we run, but create it here too rather than depend on that ordering — the
-	// cold-boot and unit paths guard their target dir the same way.
+	// Defensive: the launch path already MkdirAll's this (via the socket dir);
+	// create it here too so we don't depend on that ordering.
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir vm console dir: %w", err)
 	}

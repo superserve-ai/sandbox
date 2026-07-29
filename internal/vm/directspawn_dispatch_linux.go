@@ -30,20 +30,13 @@ func (m *Manager) cgroupLaunch(existing Supervision) bool {
 	return m.directSpawnArmed.Load()
 }
 
-// launchFirecracker starts a VM by the mode chosen from its existing
-// supervision and the armed flag, and returns the mode actually used so the
-// caller can stamp it on the instance BEFORE persisting — a resume that
-// flips a legacy record to cgroup mode must record the new mode, or every
-// oracle would then check the wrong source. A record already in cgroup mode
-// always relaunches cgroup mode regardless of the flag (so a flag-off
-// rollback drains rather than converts).
-// hadPriorLife tells launchFirecracker the vmID may already have a systemd
-// unit (a resume/verify, or an in-place replace) versus a fresh create whose
-// unit never existed — so the fresh burst path skips the flip's stopUnit
-// entirely, no D-Bus and no BoltDB read.
-// freshUnit is the linger-skip hint for the systemd path (a provably-fresh
-// launch skips the per-unit linger query); it is ignored on the cgroup path,
-// which never touches systemd.
+// launchFirecracker picks cgroup vs unit mode from the VM's existing supervision
+// and the armed flag, and returns the mode actually used so the caller stamps it
+// before persisting (a resume that flips to cgroup must record it). A cgroup
+// record always relaunches cgroup, so a flag-off rollback drains not converts.
+// hadPriorLife (resume/verify/in-place/leftover-rundir) runs the legacy-unit
+// stop before a cgroup launch; freshUnit is the systemd linger-skip hint,
+// ignored on the cgroup path.
 func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error) {
 	if m.cgroupLaunch(existing) {
 		// Unit→cgroup flip: a legacy unit whose pause-stop timed out may
