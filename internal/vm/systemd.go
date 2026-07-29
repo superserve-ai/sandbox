@@ -182,11 +182,62 @@ func settleExpiredStopWait(ctx context.Context, unit string, ch <-chan string, w
 	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	if unitDefinitelyDead(cctx, unit) {
-		confirmUnitStopped(unit) // definitively dead == systemd confirms down
+	// One authoritative ActiveState read decides both the reported outcome and
+	// whether the stop marker may be cleared. A unit still "deactivating" is
+	// dead to unitDefinitelyDead but its socket can still be held, so its stop
+	// is reported complete YET the marker is retained — otherwise a same-ID
+	// relaunch after the settle window would read as fresh, skip the linger
+	// query, and race the winding-down unit's socket. Only a conclusively-down
+	// state clears the marker; an inconclusive read confirms nothing.
+	state, notLoaded, ok := unitActiveStateRaw(cctx, unit)
+	stopConfirmed, clearMarker := classifyStopSettle(state, notLoaded, ok)
+	if clearMarker {
+		confirmUnitStopped(unit)
+	}
+	if stopConfirmed {
 		return nil
 	}
 	return waitErr
+}
+
+// unitActiveStateRaw returns a unit's ActiveState string (e.g. "active",
+// "deactivating", "inactive", "failed") via D-Bus, falling back to systemctl.
+// notLoaded is true for a unit systemd does not know; ok is false only when the
+// state cannot be determined at all (inconclusive — the caller must fail safe).
+func unitActiveStateRaw(ctx context.Context, unit string) (state string, notLoaded, ok bool) {
+	if val, nl, handled := sdbusUnitProperty(ctx, unit, "", "ActiveState"); handled {
+		if nl {
+			return "", true, true
+		}
+		if s, isStr := val.(string); isStr && s != "" {
+			return s, false, true
+		}
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", unit).Output()
+	if err != nil {
+		return "", false, false
+	}
+	return strings.TrimSpace(string(out)), false, true
+}
+
+// classifyStopSettle maps a post-stop ActiveState read to the settle outcome.
+// stopConfirmed reports the stop as complete (report success rather than the
+// wait error); clearMarker allows clearing the recentUnitStops entry. Only a
+// fully-down unit (inactive/failed/not-loaded) clears the marker — a unit still
+// deactivating or activating counts as stop-complete but KEEPS the marker
+// because its socket may still linger, and an inconclusive read (ok=false) or a
+// still-up unit confirms nothing.
+func classifyStopSettle(state string, notLoaded, ok bool) (stopConfirmed, clearMarker bool) {
+	if !ok {
+		return false, false
+	}
+	if notLoaded || state == "inactive" || state == "failed" {
+		return true, true
+	}
+	if state == "deactivating" || state == "activating" {
+		return true, false
+	}
+	return false, false // active, reloading, or any other still-up state
 }
 
 // unitFailureSummary returns a one-line summary of a unit's

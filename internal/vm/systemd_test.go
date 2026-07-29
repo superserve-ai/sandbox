@@ -25,6 +25,34 @@ func TestSettleExpiredStopWait_DrainsBufferedResult(t *testing.T) {
 	}
 }
 
+// The settle path may clear the stop marker only when the unit is CONCLUSIVELY
+// down. A still-deactivating unit reports its stop complete but must KEEP the
+// marker — clearing it would let a same-ID relaunch skip the linger query and
+// race the winding-down socket.
+func TestClassifyStopSettle(t *testing.T) {
+	cases := []struct {
+		state               string
+		notLoaded, ok       bool
+		wantStop, wantClear bool
+	}{
+		{"inactive", false, true, true, true},
+		{"failed", false, true, true, true},
+		{"", true, true, true, true}, // not-loaded == gone
+		{"deactivating", false, true, true, false}, // stop done, marker RETAINED
+		{"activating", false, true, true, false},
+		{"active", false, true, false, false},
+		{"reloading", false, true, false, false},
+		{"inactive", false, false, false, false}, // inconclusive read confirms nothing
+	}
+	for _, c := range cases {
+		stop, clear := classifyStopSettle(c.state, c.notLoaded, c.ok)
+		if stop != c.wantStop || clear != c.wantClear {
+			t.Errorf("classifyStopSettle(%q, notLoaded=%v, ok=%v) = (stop=%v, clear=%v), want (stop=%v, clear=%v)",
+				c.state, c.notLoaded, c.ok, stop, clear, c.wantStop, c.wantClear)
+		}
+	}
+}
+
 func TestLingeringState(t *testing.T) {
 	for _, s := range []string{"active", "activating", "deactivating"} {
 		if !lingeringState(s) {
