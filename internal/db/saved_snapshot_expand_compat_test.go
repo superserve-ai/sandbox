@@ -66,6 +66,9 @@ func TestSavedSnapshotExpandPreservesLegacyPauseCompatibility(t *testing.T) {
 	if !strings.Contains(sql, "CREATE TRIGGER trg_remember_sandbox_secret_env_key") {
 		t.Fatal("expand migration does not preserve secret scrub history for legacy writers")
 	}
+	if !strings.Contains(sql, "jsonb_array_elements_text(s.secret_env_keys)") {
+		t.Fatal("secret-history backfill does not merge concurrently recorded trigger history")
+	}
 	if !strings.Contains(sql, "deleted saved snapshot cannot be resurrected") {
 		t.Fatal("expand migration does not enforce monotonic logical deletion")
 	}

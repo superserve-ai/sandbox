@@ -7,7 +7,20 @@ SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '2min';
 
 UPDATE sandbox s
-SET secret_env_keys = merged.keys,
+SET secret_env_keys = (
+        SELECT COALESCE(
+            jsonb_agg(history.env_key ORDER BY history.env_key),
+            '[]'::jsonb
+        )
+        FROM (
+            -- Re-read the target row during EvalPlanQual after any concurrent
+            -- trigger writer commits, rather than replacing it with the
+            -- statement-snapshot aggregate below.
+            SELECT jsonb_array_elements_text(s.secret_env_keys) AS env_key
+            UNION
+            SELECT jsonb_array_elements_text(merged.keys) AS env_key
+        ) history
+    ),
     updated_at = now()
 FROM (
     SELECT source.sandbox_id,

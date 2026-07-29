@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -172,6 +173,151 @@ func TestSavedSnapshotExpandTracksLegacySecretHistory(t *testing.T) {
 		t.Fatalf("legacy detach secret: %v", err)
 	}
 	assertSandboxSecretHistory(t, ctx, sandboxID, []string{"LEGACY_TOKEN"})
+}
+
+func TestSavedSnapshotSecretBackfillPreservesConcurrentTriggerWrite(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	router := newRouter(t)
+
+	response := do(router, http.MethodPost, "/sandboxes", apiKey, `{"name":"concurrent-secret-backfill"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: %d %s", response.Code, response.Body.String())
+	}
+	sandboxID := mustJSON(t, response)["id"].(string)
+
+	insertSecret := func(name string) uuid.UUID {
+		t.Helper()
+		var secretID uuid.UUID
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO secret (
+			    team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id
+			)
+			VALUES ($1, $2, 'bearer', ARRAY['example.com'], '\x01', '\x02', 'test-kek')
+			RETURNING id
+		`, teamID, name+"-"+uuid.NewString()[:8]).Scan(&secretID); err != nil {
+			t.Fatalf("create %s secret: %v", name, err)
+		}
+		return secretID
+	}
+
+	initialSecretID := insertSecret("initial")
+	concurrentSecretID := insertSecret("concurrent")
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
+		VALUES ($1, $2, 'INITIAL_TOKEN')
+	`, sandboxID, initialSecretID); err != nil {
+		t.Fatalf("attach initial secret: %v", err)
+	}
+	// Model the expand window after the sandbox column exists but before the
+	// active-binding backfill has populated it.
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox
+		SET secret_env_keys = '[]'::jsonb
+		WHERE id = $1
+	`, sandboxID); err != nil {
+		t.Fatalf("clear pre-backfill secret history: %v", err)
+	}
+
+	triggerTx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin concurrent trigger transaction: %v", err)
+	}
+	defer triggerTx.Rollback(ctx)
+	if _, err := triggerTx.Exec(ctx, `
+		INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key)
+		VALUES ($1, $2, 'CONCURRENT_TOKEN')
+	`, sandboxID, concurrentSecretID); err != nil {
+		t.Fatalf("attach concurrent secret: %v", err)
+	}
+
+	backfillConn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire backfill connection: %v", err)
+	}
+	defer backfillConn.Release()
+
+	var backfillPID int32
+	if err := backfillConn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&backfillPID); err != nil {
+		t.Fatalf("read backfill backend pid: %v", err)
+	}
+
+	backfillDone := make(chan error, 1)
+	go func() {
+		_, execErr := backfillConn.Exec(ctx, `
+			UPDATE sandbox s
+			SET secret_env_keys = (
+			        SELECT COALESCE(
+			            jsonb_agg(history.env_key ORDER BY history.env_key),
+			            '[]'::jsonb
+			        )
+			        FROM (
+			            SELECT jsonb_array_elements_text(s.secret_env_keys) AS env_key
+			            UNION
+			            SELECT jsonb_array_elements_text(merged.keys) AS env_key
+			        ) history
+			    ),
+			    updated_at = now()
+			FROM (
+			    SELECT source.sandbox_id,
+			           jsonb_agg(source.env_key ORDER BY source.env_key) AS keys
+			    FROM (
+			        SELECT existing.id AS sandbox_id,
+			               jsonb_array_elements_text(existing.secret_env_keys) AS env_key
+			        FROM sandbox existing
+			        UNION
+			        SELECT binding.sandbox_id, binding.env_key
+			        FROM sandbox_secret binding
+			    ) source
+			    GROUP BY source.sandbox_id
+			) merged
+			WHERE s.id = merged.sandbox_id
+			  AND s.secret_env_keys IS DISTINCT FROM merged.keys
+		`)
+		backfillDone <- execErr
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := testPool.QueryRow(ctx, `
+			SELECT COALESCE(
+			    (SELECT wait_event_type = 'Lock'
+			     FROM pg_stat_activity
+			     WHERE pid = $1),
+			    false
+			)
+		`, backfillPID).Scan(&waiting); err != nil {
+			t.Fatalf("inspect blocked backfill: %v", err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backfill did not block behind the concurrent trigger writer")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := triggerTx.Commit(ctx); err != nil {
+		t.Fatalf("commit concurrent trigger transaction: %v", err)
+	}
+
+	select {
+	case err := <-backfillDone:
+		if err != nil {
+			t.Fatalf("run concurrent secret-history backfill: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("backfill did not finish after the concurrent trigger committed")
+	}
+
+	assertSandboxSecretHistory(
+		t,
+		ctx,
+		sandboxID,
+		[]string{"CONCURRENT_TOKEN", "INITIAL_TOKEN"},
+	)
 }
 
 func assertSandboxSecretHistory(t *testing.T, ctx context.Context, sandboxID string, want []string) {
