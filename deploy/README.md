@@ -67,6 +67,119 @@ database host-admission rejection could otherwise race a VM launch. If any
 draining host cannot be explicitly returned to `active`, do not roll the API
 back that far.
 
+The saved-snapshot contract migration
+`20260729000011_saved_snapshot_contract.sql` makes the PR3 saved-snapshot
+control-plane release the application rollback floor. It drops the legacy
+non-partial `snapshot_sandbox_unique` conflict target after installing the
+replacement partial runtime-checkpoint index. A pre-PR3 control plane still
+uses `ON CONFLICT (sandbox_id)` without that predicate and cannot finalize
+pauses after the contract. Once migration 11 is recorded in an environment,
+do not deploy or roll API workers below PR3. Database rollback remains
+leave-forward; restoring the legacy index is not an approved rollback path.
+
+Keep the global `sandbox_snapshots_v1` flag and every team override disabled
+through the index and contract rollout. Before migration 11, verify that the
+environment contains:
+
+- zero `snapshot` rows with `kind = 'saved'`;
+- zero sandboxes with `source_snapshot_id` set;
+- zero sandboxes with `snapshot_operation_id` or
+  `snapshot_operation_started_at` set.
+
+The contract migration takes bounded write locks and rechecks those conditions
+atomically before dropping the legacy index. A failed check is a safe stop:
+leave the schema expanded, keep the feature dark, remove the residue or drift,
+and retry the migration.
+
+#### Saved-snapshot index prebuild
+
+The 10 hot-table indexes are built outside the Supabase migration transaction:
+
+```sh
+psql \
+  --dbname="$DATABASE_URL" \
+  --no-psqlrc \
+  --file=scripts/prebuild-saved-snapshot-indexes.sql
+```
+
+The script issues sequential `CREATE INDEX CONCURRENTLY` statements, then
+checks the exact public table, btree access method, uniqueness, key order,
+predicate, full definition, and `valid`/`ready`/`live` catalog state. CD runs
+and verifies it in this order:
+
+1. staging prebuild, then staging migrations;
+2. production-primary prebuild;
+3. production-usw prebuild;
+4. production-primary migrations;
+5. production-usw migrations.
+
+The workflow-wide `cd-migrate` concurrency group prevents overlapping CD runs.
+The prebuild and recovery scripts also share a stable session advisory lock,
+so a manual psql invocation cannot overlap another cooperative index session
+on the same database. Do not run migration 10 against a populated `snapshot`
+or `sandbox` table by another path: it intentionally refuses to build a
+missing index transactionally. Its ordinary `CREATE INDEX` fallback is only
+for an empty local or CI schema reset.
+
+If a canceled concurrent build leaves an invalid index, inspect the failed
+workflow and run the operator-only recovery script against that exact
+environment:
+
+```sh
+psql \
+  --dbname="$DATABASE_URL" \
+  --no-psqlrc \
+  --file=scripts/recover-saved-snapshot-indexes.sql
+```
+
+Recovery drops only invalid remnants through sequential
+`DROP INDEX CONCURRENTLY` commands. It never drops a valid-but-drifted index
+and CD never invokes it automatically. After recovery, rerun the prebuild,
+verify all 10 indexes, and only then retry migrations.
+
+#### Saved-snapshot staging canary
+
+Run the staging canary only after PR3 is live on every traffic-serving API
+revision and VMD host, and after migrations 10/11 have completed. The global
+flag and all team overrides must still be disabled.
+
+Before the first canary, mark the exact staging VMD host `draining` through the
+approved operator path and wait for the drain/reconciliation workers to report
+no remaining Firecracker processes. Then activate the allowlisted XFS device
+once:
+
+```sh
+gh workflow run deploy-vmd.yml \
+  --ref main \
+  -f environment=staging \
+  -f activate_staging_snapshot_storage=true \
+  -f staging_snapshot_storage_device=/dev/disk/by-id/google-superserve-sandbox-data
+```
+
+The setup refuses to migrate storage while a Firecracker process is active.
+After activation succeeds, return the host to `active`, wait for a current
+saved-snapshot capability heartbeat, and dispatch the strict canary from the
+current `main` commit:
+
+```sh
+gh workflow run snapshot-canary.yml \
+  --ref main \
+  -f confirm=RUN_STAGING_SNAPSHOT_CANARY
+```
+
+The canary refuses a moving or non-`main` ref, a globally enabled flag, any
+enabled team override, rollout residue, missing secrets, or missing shadow
+ledger access. It temporarily enables only the staging system team, verifies
+idempotent capture, active/paused snapshots, N-way and nested forks, private
+preview policy, secret-token freshness, restricted egress, dependency-safe
+deletion, accounting, and two exact-release API/VMD restarts. Its trap and
+always-run cleanup force the team dark and restore the prior team flag/quota.
+
+Staging sign-off requires both the canary step and its final dark-state cleanup
+to be green. Confirm the global flag is still false and there are zero enabled
+team overrides afterward. This rollout does not enable saved snapshots in
+production.
+
 ## Host selection
 
 Do not deploy to a host merely because it exists. Host deployment jobs should only target hosts that are explicitly marked ready for that environment/region.

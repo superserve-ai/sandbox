@@ -1,0 +1,737 @@
+name: Saved Snapshot Staging Canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_STAGING_SNAPSHOT_CANARY'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: saved-snapshot-staging-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: Exact-main saved snapshot canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: staging
+    env:
+      API_BASE_URL: https://api-staging.superserve.ai
+      SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
+      API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+      SNAPSHOT_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_STAGING }}
+      SNAPSHOT_CANARY_MAIN_SHA: ${{ github.sha }}
+      CANARY_QUOTA_HEADROOM_BYTES: '21474836480'
+      PGCONNECT_TIMEOUT: '10'
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Validate exact-main staging intent
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRM" != "RUN_STAGING_SNAPSHOT_CANARY" ]]; then
+            echo "Refusing to run. Re-dispatch with the exact confirmation phrase." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "The staging ship gate may only be dispatched from main, got ${GITHUB_REF}." >&2
+            exit 1
+          fi
+          for name in API_KEY DATABASE_URL SNAPSHOT_TEAM_ID GH_TOKEN; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Required staging secret/environment value is missing: ${name}" >&2
+              exit 1
+            fi
+          done
+          if [[ ! "$SNAPSHOT_TEAM_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "SYSTEM_TEAM_ID_STAGING is not a UUID." >&2
+            exit 1
+          fi
+          remote_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          if [[ "$remote_main" != "$SNAPSHOT_CANARY_MAIN_SHA" ]]; then
+            echo "main moved from ${SNAPSHOT_CANARY_MAIN_SHA} to ${remote_main}; re-dispatch the canary." >&2
+            exit 1
+          fi
+          bash -n scripts/smoke-test-snapshots.sh
+          bash -n scripts/restart-staging-snapshot-services.sh
+
+      - name: Enable one team, run strict canary, and restore prior state
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PRIOR_STATE=""
+          restore_rollout_state() {
+            local original_result=$?
+            local exact_restored=0
+            local dark_asserted=0
+            local failsafe_dark=0
+            local attempt
+            local flag_exists quota_is_null prior_enabled prior_created_at prior_updated_at prior_quota
+
+            trap - EXIT INT TERM
+            force_team_dark_once() {
+              PGCONNECT_TIMEOUT=3 psql "$DATABASE_URL" \
+                --no-psqlrc \
+                --quiet \
+                --set=ON_ERROR_STOP=1 \
+                --set=team_id="$SNAPSHOT_TEAM_ID" <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '2s';
+          SET LOCAL statement_timeout = '5s';
+          UPDATE public.team_feature_flag
+          SET enabled = false,
+              updated_at = now()
+          WHERE team_id = :'team_id'::uuid
+            AND key = 'sandbox_snapshots_v1'
+            AND enabled;
+          SELECT NOT EXISTS (
+            SELECT 1
+            FROM public.team_feature_flag
+            WHERE team_id = :'team_id'::uuid
+              AND key = 'sandbox_snapshots_v1'
+              AND enabled
+          ) AS team_dark
+          \gset
+          \if :team_dark
+          COMMIT;
+          \else
+          ROLLBACK;
+          SELECT 1 / 0; -- ON_ERROR_STOP makes the cleanup fail closed.
+          \endif
+          SQL
+            }
+
+            # First cleanup action: force the team dark within cancellation
+            # grace, before parsing state or attempting exact restoration.
+            set +e
+            for attempt in 1 2 3; do
+              if force_team_dark_once; then
+                failsafe_dark=1
+                break
+              fi
+              echo "::warning::Priority team-disable attempt ${attempt}/3 failed." >&2
+              sleep "$((attempt * 2))"
+            done
+            set -e
+
+            if [[ -z "$PRIOR_STATE" ]]; then
+              if (( failsafe_dark == 0 )); then
+                echo "::error::CRITICAL: cleanup had no prior state and could not force ${SNAPSHOT_TEAM_ID} dark." >&2
+                exit 1
+              fi
+              echo "::warning::Cleanup had no captured quota state; the canary team was forced dark but quota restoration could not be verified." >&2
+              if (( original_result == 0 )); then
+                exit 1
+              fi
+              exit "$original_result"
+            fi
+
+            if ! jq -e '
+              type == "object"
+              and has("quota")
+              and has("flag")
+              and (.flag == null or (
+                .flag.enabled == false
+                and (.flag.created_at | type) == "string"
+                and (.flag.updated_at | type) == "string"
+              ))
+            ' >/dev/null <<<"$PRIOR_STATE"; then
+              if (( failsafe_dark == 0 )); then
+                echo "::error::CRITICAL: captured state is malformed and the canary team could not be forced dark." >&2
+              else
+                echo "::error::Captured state is malformed; the team is dark but exact quota/row restoration is impossible." >&2
+              fi
+              exit 1
+            fi
+
+            flag_exists="$(jq -r '(.flag != null)' <<<"$PRIOR_STATE")"
+            quota_is_null="$(jq -r '(.quota == null)' <<<"$PRIOR_STATE")"
+            prior_enabled="$(jq -r '.flag.enabled // false' <<<"$PRIOR_STATE")"
+            prior_created_at="$(jq -r '.flag.created_at // "1970-01-01T00:00:00Z"' <<<"$PRIOR_STATE")"
+            prior_updated_at="$(jq -r '.flag.updated_at // "1970-01-01T00:00:00Z"' <<<"$PRIOR_STATE")"
+            prior_quota="$(jq -r '.quota // 0' <<<"$PRIOR_STATE")"
+
+            restore_exact_once() {
+              psql "$DATABASE_URL" \
+                --no-psqlrc \
+                --quiet \
+                --set=ON_ERROR_STOP=1 \
+                --set=team_id="$SNAPSHOT_TEAM_ID" \
+                --set=flag_exists="$flag_exists" \
+                --set=quota_is_null="$quota_is_null" \
+                --set=prior_enabled="$prior_enabled" \
+                --set=prior_created_at="$prior_created_at" \
+                --set=prior_updated_at="$prior_updated_at" \
+                --set=prior_quota="$prior_quota" <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '5s';
+          SET LOCAL statement_timeout = '30s';
+          LOCK TABLE public.feature_flag, public.team_feature_flag
+            IN SHARE ROW EXCLUSIVE MODE;
+          LOCK TABLE public.team IN ROW EXCLUSIVE MODE;
+
+          \if :flag_exists
+          INSERT INTO public.team_feature_flag (
+            team_id, key, enabled, created_at, updated_at
+          )
+          VALUES (
+            :'team_id'::uuid,
+            'sandbox_snapshots_v1',
+            :'prior_enabled'::boolean,
+            :'prior_created_at'::timestamptz,
+            :'prior_updated_at'::timestamptz
+          )
+          ON CONFLICT (team_id, key) DO UPDATE
+          SET enabled = EXCLUDED.enabled,
+              created_at = EXCLUDED.created_at,
+              updated_at = EXCLUDED.updated_at;
+          \else
+          DELETE FROM public.team_feature_flag
+          WHERE team_id = :'team_id'::uuid
+            AND key = 'sandbox_snapshots_v1';
+          \endif
+
+          \if :quota_is_null
+          UPDATE public.team
+          SET snapshot_storage_quota_bytes = NULL
+          WHERE id = :'team_id'::uuid;
+          \else
+          UPDATE public.team
+          SET snapshot_storage_quota_bytes = :'prior_quota'::bigint
+          WHERE id = :'team_id'::uuid;
+          \endif
+
+          SELECT (
+            (
+              :'flag_exists'::boolean
+              AND EXISTS (
+                SELECT 1
+                FROM public.team_feature_flag
+                WHERE team_id = :'team_id'::uuid
+                  AND key = 'sandbox_snapshots_v1'
+                  AND enabled = :'prior_enabled'::boolean
+                  AND created_at = :'prior_created_at'::timestamptz
+                  AND updated_at = :'prior_updated_at'::timestamptz
+              )
+            )
+            OR (
+              NOT :'flag_exists'::boolean
+              AND NOT EXISTS (
+                SELECT 1
+                FROM public.team_feature_flag
+                WHERE team_id = :'team_id'::uuid
+                  AND key = 'sandbox_snapshots_v1'
+              )
+            )
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM public.team
+            WHERE id = :'team_id'::uuid
+              AND (
+                (
+                  :'quota_is_null'::boolean
+                  AND snapshot_storage_quota_bytes IS NULL
+                )
+                OR (
+                  NOT :'quota_is_null'::boolean
+                  AND snapshot_storage_quota_bytes = :'prior_quota'::bigint
+                )
+              )
+          ) AS restore_ok
+          \gset
+          \if :restore_ok
+          COMMIT;
+          \else
+          ROLLBACK;
+          \echo 'Exact canary-team flag/quota restoration failed.'
+          SELECT 1 / 0; -- ON_ERROR_STOP makes the exact restore fail closed.
+          \endif
+          SQL
+            }
+
+            assert_fully_dark_once() {
+              local observed
+              observed="$(psql "$DATABASE_URL" \
+                --no-psqlrc --quiet --set=ON_ERROR_STOP=1 \
+                --tuples-only --no-align \
+                --set=team_id="$SNAPSHOT_TEAM_ID" \
+                --set=flag_exists="$flag_exists" \
+                --set=quota_is_null="$quota_is_null" \
+                --set=prior_enabled="$prior_enabled" \
+                --set=prior_created_at="$prior_created_at" \
+                --set=prior_updated_at="$prior_updated_at" \
+                --set=prior_quota="$prior_quota" <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '5s';
+          SET LOCAL statement_timeout = '30s';
+          LOCK TABLE public.feature_flag, public.team_feature_flag IN SHARE MODE;
+          LOCK TABLE public.team IN SHARE MODE;
+          SELECT (
+            EXISTS (
+              SELECT 1
+              FROM public.feature_flag
+              WHERE key = 'sandbox_snapshots_v1'
+                AND NOT enabled
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM public.team_feature_flag
+              WHERE key = 'sandbox_snapshots_v1'
+                AND enabled
+            )
+            AND (
+              (
+                :'flag_exists'::boolean
+                AND EXISTS (
+                  SELECT 1
+                  FROM public.team_feature_flag
+                  WHERE team_id = :'team_id'::uuid
+                    AND key = 'sandbox_snapshots_v1'
+                    AND enabled = :'prior_enabled'::boolean
+                    AND created_at = :'prior_created_at'::timestamptz
+                    AND updated_at = :'prior_updated_at'::timestamptz
+                )
+              )
+              OR (
+                NOT :'flag_exists'::boolean
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM public.team_feature_flag
+                  WHERE team_id = :'team_id'::uuid
+                    AND key = 'sandbox_snapshots_v1'
+                )
+              )
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM public.team
+              WHERE id = :'team_id'::uuid
+                AND (
+                  (
+                    :'quota_is_null'::boolean
+                    AND snapshot_storage_quota_bytes IS NULL
+                  )
+                  OR (
+                    NOT :'quota_is_null'::boolean
+                    AND snapshot_storage_quota_bytes = :'prior_quota'::bigint
+                  )
+                )
+            )
+          )::text;
+          COMMIT;
+          SQL
+              )" || return 1
+              [[ "$observed" == "true" ]]
+            }
+
+            set +e
+            for attempt in 1 2 3 4 5; do
+              if restore_exact_once; then
+                exact_restored=1
+                break
+              fi
+              echo "::warning::Exact saved-snapshot rollout-state restore attempt ${attempt}/5 failed." >&2
+              sleep "$((attempt * 2))"
+            done
+
+            if (( exact_restored == 0 )); then
+              echo "::error::EXACT RESTORE FAILED. Forcing the canary team's saved-snapshot flag dark; quota may remain elevated and requires operator repair." >&2
+              failsafe_dark=0
+              for attempt in 1 2 3 4 5; do
+                if force_team_dark_once; then
+                  failsafe_dark=1
+                  break
+                fi
+                echo "::warning::Fail-safe team-disable attempt ${attempt}/5 failed." >&2
+                sleep "$((attempt * 2))"
+              done
+              if (( failsafe_dark == 0 )); then
+                echo "::error::CRITICAL: could not force the canary team feature flag dark. Disable sandbox_snapshots_v1 for ${SNAPSHOT_TEAM_ID} immediately." >&2
+              else
+                echo "::error::Fail-safe disabled the canary team, but exact flag/quota restoration did not complete. Operator repair is required." >&2
+              fi
+              exit 1
+            fi
+
+            for attempt in 1 2 3; do
+              if assert_fully_dark_once; then
+                dark_asserted=1
+                break
+              fi
+              echo "::warning::Post-restore global dark-state assertion attempt ${attempt}/3 failed." >&2
+              sleep "$((attempt * 2))"
+            done
+            set -e
+
+            if (( dark_asserted == 0 )); then
+              echo "::error::Post-restore sign-off failed: the global flag is not false, an enabled team override exists, or the database could not be verified. Global state was not mutated." >&2
+              exit 1
+            fi
+            echo "Restored the canary team's exact prior feature-flag row and snapshot quota."
+            exit "$original_result"
+          }
+          trap restore_rollout_state EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          # First capture prior state without mutation. The trap can now restore
+          # the exact quota/row before a later transaction is allowed to enable
+          # anything, including if cancellation lands just after that COMMIT.
+          PRIOR_STATE="$(psql "$DATABASE_URL" \
+            --no-psqlrc \
+            --quiet \
+            --tuples-only \
+            --no-align \
+            --set=ON_ERROR_STOP=1 \
+            --set=team_id="$SNAPSHOT_TEAM_ID" <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '5s';
+          SET LOCAL statement_timeout = '30s';
+          LOCK TABLE public.feature_flag, public.team_feature_flag
+            IN SHARE ROW EXCLUSIVE MODE;
+          LOCK TABLE public.team IN ROW EXCLUSIVE MODE;
+          LOCK TABLE public.sandbox IN SHARE MODE;
+          LOCK TABLE public.snapshot IN SHARE MODE;
+
+          SELECT
+            EXISTS (
+              SELECT 1
+              FROM public.feature_flag
+              WHERE key = 'sandbox_snapshots_v1'
+                AND NOT enabled
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM public.team_feature_flag
+              WHERE key = 'sandbox_snapshots_v1'
+                AND enabled
+            )
+            AND EXISTS (
+              SELECT 1 FROM public.team WHERE id = :'team_id'::uuid
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM public.snapshot
+              WHERE team_id = :'team_id'::uuid
+                AND kind = 'saved'
+                AND deleted_at IS NULL
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM public.sandbox
+              WHERE team_id = :'team_id'::uuid
+                AND (
+                  source_snapshot_id IS NOT NULL
+                  OR snapshot_operation_id IS NOT NULL
+                  OR snapshot_operation_started_at IS NOT NULL
+                )
+            ) AS gate_ok
+          \gset
+
+          \if :gate_ok
+          SELECT jsonb_build_object(
+            'quota', t.snapshot_storage_quota_bytes,
+            'flag', (
+              SELECT jsonb_build_object(
+                'enabled', tff.enabled,
+                'created_at', tff.created_at,
+                'updated_at', tff.updated_at
+              )
+              FROM public.team_feature_flag tff
+              WHERE tff.team_id = t.id
+                AND tff.key = 'sandbox_snapshots_v1'
+            )
+          )::text
+          FROM public.team t
+          WHERE t.id = :'team_id'::uuid;
+          COMMIT;
+          \else
+          ROLLBACK;
+          \warn 'Saved-snapshot canary preflight failed: global flag, team overrides, team existence, or zero-residue invariant is unsafe.'
+          SELECT 1 / 0; -- ON_ERROR_STOP makes preflight fail closed.
+          \endif
+          SQL
+          )"
+
+          if ! jq -e '
+            type == "object"
+            and has("quota")
+            and has("flag")
+            and (.flag == null or (
+              .flag.enabled == false
+              and (.flag.created_at | type) == "string"
+              and (.flag.updated_at | type) == "string"
+            ))
+          ' >/dev/null <<<"$PRIOR_STATE"; then
+            echo "Could not capture a valid pre-canary rollout state." >&2
+            exit 1
+          fi
+
+          prior_flag_exists="$(jq -r '(.flag != null)' <<<"$PRIOR_STATE")"
+          prior_quota_is_null="$(jq -r '(.quota == null)' <<<"$PRIOR_STATE")"
+          prior_enabled="$(jq -r '.flag.enabled // false' <<<"$PRIOR_STATE")"
+          prior_created_at="$(jq -r '.flag.created_at // "1970-01-01T00:00:00Z"' <<<"$PRIOR_STATE")"
+          prior_updated_at="$(jq -r '.flag.updated_at // "1970-01-01T00:00:00Z"' <<<"$PRIOR_STATE")"
+          prior_quota="$(jq -r '.quota // 0' <<<"$PRIOR_STATE")"
+
+          # Re-lock and compare-and-set against the captured row/quota. A
+          # concurrent rollout/configuration change aborts without mutation.
+          psql "$DATABASE_URL" \
+            --no-psqlrc \
+            --quiet \
+            --set=ON_ERROR_STOP=1 \
+            --set=team_id="$SNAPSHOT_TEAM_ID" \
+            --set=headroom="$CANARY_QUOTA_HEADROOM_BYTES" \
+            --set=flag_exists="$prior_flag_exists" \
+            --set=quota_is_null="$prior_quota_is_null" \
+            --set=prior_enabled="$prior_enabled" \
+            --set=prior_created_at="$prior_created_at" \
+            --set=prior_updated_at="$prior_updated_at" \
+            --set=prior_quota="$prior_quota" <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '5s';
+          SET LOCAL statement_timeout = '30s';
+          LOCK TABLE public.feature_flag, public.team_feature_flag
+            IN SHARE ROW EXCLUSIVE MODE;
+          LOCK TABLE public.team IN ROW EXCLUSIVE MODE;
+          LOCK TABLE public.sandbox IN SHARE MODE;
+          LOCK TABLE public.snapshot IN SHARE MODE;
+
+          SELECT EXISTS (
+            SELECT 1
+            FROM public.feature_flag
+            WHERE key = 'sandbox_snapshots_v1'
+              AND NOT enabled
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.team_feature_flag
+            WHERE key = 'sandbox_snapshots_v1'
+              AND enabled
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.snapshot
+            WHERE team_id = :'team_id'::uuid
+              AND kind = 'saved'
+              AND deleted_at IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.sandbox
+            WHERE team_id = :'team_id'::uuid
+              AND (
+                source_snapshot_id IS NOT NULL
+                OR snapshot_operation_id IS NOT NULL
+                OR snapshot_operation_started_at IS NOT NULL
+              )
+          )
+          AND (
+            (
+              :'flag_exists'::boolean
+              AND EXISTS (
+                SELECT 1
+                FROM public.team_feature_flag
+                WHERE team_id = :'team_id'::uuid
+                  AND key = 'sandbox_snapshots_v1'
+                  AND enabled = :'prior_enabled'::boolean
+                  AND created_at = :'prior_created_at'::timestamptz
+                  AND updated_at = :'prior_updated_at'::timestamptz
+              )
+            )
+            OR (
+              NOT :'flag_exists'::boolean
+              AND NOT EXISTS (
+                SELECT 1
+                FROM public.team_feature_flag
+                WHERE team_id = :'team_id'::uuid
+                  AND key = 'sandbox_snapshots_v1'
+              )
+            )
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM public.team
+            WHERE id = :'team_id'::uuid
+              AND (
+                (
+                  :'quota_is_null'::boolean
+                  AND snapshot_storage_quota_bytes IS NULL
+                )
+                OR (
+                  NOT :'quota_is_null'::boolean
+                  AND snapshot_storage_quota_bytes = :'prior_quota'::bigint
+                )
+              )
+          ) AS cas_ok
+          \gset
+
+          \if :cas_ok
+          INSERT INTO public.team_feature_flag (team_id, key, enabled)
+          VALUES (:'team_id'::uuid, 'sandbox_snapshots_v1', true)
+          ON CONFLICT (team_id, key) DO UPDATE
+          SET enabled = true,
+              updated_at = now();
+
+          UPDATE public.team
+          SET snapshot_storage_quota_bytes = GREATEST(
+            COALESCE(snapshot_storage_quota_bytes, 0),
+            snapshot_storage_bytes + :'headroom'::bigint
+          )
+          WHERE id = :'team_id'::uuid;
+
+          SELECT EXISTS (
+            SELECT 1
+            FROM public.feature_flag
+            WHERE key = 'sandbox_snapshots_v1'
+              AND NOT enabled
+          )
+          AND (
+            SELECT count(*) = 1
+            FROM public.team_feature_flag
+            WHERE key = 'sandbox_snapshots_v1'
+              AND enabled
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM public.team_feature_flag
+            WHERE key = 'sandbox_snapshots_v1'
+              AND enabled
+              AND team_id = :'team_id'::uuid
+          ) AS enable_ok
+          \gset
+          \if :enable_ok
+          COMMIT;
+          \else
+          ROLLBACK;
+          \warn 'Failed to establish exactly one enabled team override.'
+          SELECT 1 / 0; -- ON_ERROR_STOP makes enable fail closed.
+          \endif
+          \else
+          ROLLBACK;
+          \warn 'Saved-snapshot canary state changed after capture; refusing enable.'
+          SELECT 1 / 0; -- ON_ERROR_STOP makes the CAS fail closed.
+          \endif
+          SQL
+
+          chmod +x \
+            scripts/smoke-test-snapshots.sh \
+            scripts/restart-staging-snapshot-services.sh
+
+          RUN_SNAPSHOT_CANARY=1 \
+          REQUIRE_SNAPSHOT_RESTART_HOOK=1 \
+          SKIP_SNAPSHOT_SECRET_CHECKS=0 \
+          SNAPSHOT_RESTART_HOOK="$GITHUB_WORKSPACE/scripts/restart-staging-snapshot-services.sh" \
+          SNAPSHOT_SHADOW_DATABASE_URL="$DATABASE_URL" \
+          ./scripts/smoke-test-snapshots.sh
+
+          final_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          if [[ "$final_main" != "$SNAPSHOT_CANARY_MAIN_SHA" ]]; then
+            echo "::error::main moved to ${final_main} after the final restart; refusing stale/mixed-deploy canary sign-off for ${SNAPSHOT_CANARY_MAIN_SHA}." >&2
+            exit 1
+          fi
+          echo "Final canary sign-off remains pinned to main ${SNAPSHOT_CANARY_MAIN_SHA}."
+
+      - name: Always enforce dark rollout state
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          : "${DATABASE_URL:?DATABASE_URL_STAGING is required}"
+          : "${SNAPSHOT_TEAM_ID:?SYSTEM_TEAM_ID_STAGING is required}"
+
+          force_dark() {
+            PGCONNECT_TIMEOUT=3 psql "$DATABASE_URL" \
+              --no-psqlrc --quiet --set=ON_ERROR_STOP=1 \
+              --set=team_id="$SNAPSHOT_TEAM_ID" <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '2s';
+          SET LOCAL statement_timeout = '5s';
+          UPDATE public.team_feature_flag
+          SET enabled = false,
+              updated_at = now()
+          WHERE team_id = :'team_id'::uuid
+            AND key = 'sandbox_snapshots_v1'
+            AND enabled;
+          COMMIT;
+          SQL
+          }
+
+          assert_dark() {
+            local observed
+            observed="$(psql "$DATABASE_URL" \
+              --no-psqlrc --quiet --set=ON_ERROR_STOP=1 \
+              --tuples-only --no-align <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '5s';
+          SET LOCAL statement_timeout = '30s';
+          LOCK TABLE public.feature_flag, public.team_feature_flag IN SHARE MODE;
+          SELECT (
+            EXISTS (
+              SELECT 1
+              FROM public.feature_flag
+              WHERE key = 'sandbox_snapshots_v1'
+                AND NOT enabled
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM public.team_feature_flag
+              WHERE key = 'sandbox_snapshots_v1'
+                AND enabled
+            )
+          )::text;
+          COMMIT;
+          SQL
+            )" || return 1
+            [[ "$observed" == "true" ]]
+          }
+
+          forced=0
+          for attempt in 1 2 3 4 5; do
+            if force_dark; then
+              forced=1
+              break
+            fi
+            echo "::warning::Always-cleanup team-disable attempt ${attempt}/5 failed." >&2
+            sleep "$((attempt * 2))"
+          done
+          if (( forced == 0 )); then
+            echo "::error::CRITICAL: always-cleanup could not force ${SNAPSHOT_TEAM_ID} dark." >&2
+            exit 1
+          fi
+
+          asserted=0
+          for attempt in 1 2 3; do
+            if assert_dark; then
+              asserted=1
+              break
+            fi
+            echo "::warning::Always-cleanup global dark assertion attempt ${attempt}/3 failed." >&2
+            sleep "$((attempt * 2))"
+          done
+          if (( asserted == 0 )); then
+            echo "::error::Global saved-snapshot flag is not false, an enabled team override remains, or dark state could not be verified. Global state was not mutated." >&2
+            exit 1
+          fi
+          echo "Confirmed global saved-snapshot flag false and zero enabled team overrides."
