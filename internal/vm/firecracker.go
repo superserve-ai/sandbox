@@ -332,9 +332,7 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 // its microVM in ("Not started", "Running", "Paused"). A healthy API
 // answering "Not started" is the signature of an empty shell — a live
 // process with no microVM inside — which unit-level liveness cannot
-// distinguish from a running VM: the process only becomes a VM again
-// through vmd's own restore path, so a unit restarted outside vmd stays
-// empty forever while looking active to systemd.
+// distinguish from a running VM.
 //
 // Deliberately a bare HTTP GET rather than the generated client: probes run
 // per-VM on every reconciler pass, so the dial must honor ctx (a socket

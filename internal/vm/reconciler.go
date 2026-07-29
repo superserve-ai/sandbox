@@ -292,13 +292,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// period (drift must persist across passes) plus the op-lock check and
 	// a re-probe under the lock filter that window.
 	if dbSandboxes != nil {
-		// Probe candidates concurrently under a stage budget: a healthy
-		// probe answers in microseconds, but a wedged API burns its full
-		// timeout, and probing sequentially would let a handful of wedged
-		// sockets starve the rest of the pass (the enclosing pass deadline
-		// is shared by every rule after this one). Probes cut off by the
-		// stage budget yield errors, which are non-evidence: those VMs are
-		// simply re-examined next pass.
+		// Probe candidates concurrently under a stage budget: a wedged API
+		// burns its full timeout, and sequential probing would let a few
+		// wedged sockets starve every rule after this one. Budget-cutoff
+		// probes yield errors (non-evidence) and re-examine next pass.
 		var candidates []string
 		for id, sb := range dbSandboxes {
 			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
@@ -367,12 +364,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			err := stopUnit(ctx, systemdUnitName(id))
 			unlockOp()
 			if err != nil {
-				// Leave the row untouched; the drift persists and the next
-				// pass retries. Marking failed with the shell still active
-				// would strand a live unit behind a failed row. Refund the
-				// budget slot: nothing destructive happened, and transient
-				// stop failures must not be able to exhaust the budget
-				// without ever performing the transition.
+				// Leave the row untouched (a failed row behind a live
+				// unit would strand it) and refund the budget slot:
+				// nothing destructive happened — see refundAutoFailSlot.
 				r.refundAutoFailSlot()
 				r.writeAudit(ctx, id, "stop_failed", "empty-shell stop failed; slot refunded, retrying next pass", "fc_empty_shell")
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell unit")
@@ -1045,12 +1039,11 @@ func fcProbeShell(ctx context.Context, sock string) (empty bool, err error) {
 	return state == fcmodels.InstanceInfoStateNotStarted, nil
 }
 
-// refundAutoFailSlot returns the most recently consumed auto-fail slot.
-// Used when the destructive action the slot was reserved for did not
-// happen (a failed unit stop): the budget bounds performed destructive
-// actions, so a run of transient failures must not exhaust it without a
-// single transition occurring. Drift rules run sequentially in the single
-// reconcile pass, so the newest entry is the caller's own reservation.
+// refundAutoFailSlot returns the most recently consumed auto-fail slot,
+// for when the reserved destructive action did not happen (a failed unit
+// stop): the budget bounds performed actions, so transient failures must
+// not exhaust it. Drift rules run sequentially in the single reconcile
+// pass, so the newest entry is the caller's own reservation.
 func (r *Reconciler) refundAutoFailSlot() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
