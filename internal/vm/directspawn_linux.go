@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -79,10 +80,19 @@ type directSpawnResult struct {
 // The file's size bound is enforced by Firecracker's serial cap plus the
 // O_TRUNC-per-launch in openVMConsole (see there).
 //
+// spawnDirect OWNS cgroupDir and closes it on every return — callers must not
+// close it themselves. The fd is needed only synchronously, to seed
+// CLONE_INTO_CGROUP at clone3 time; owning it here makes the lifecycle
+// unambiguous (no per-caller close, so no leak) and lets a single
+// runtime.KeepAlive pin the *os.File across cmd.Start(). Without that pin the
+// value is unreferenced after the .Fd() call, so os.File's finalizer is free
+// to close the fd mid-clone3 — an intermittent invalid-CgroupFD launch failure.
+//
 // Setsid: the VM gets its own session — signals to vmd's process group
 // must never reach VMs (precedent: the cold-boot path). Deliberately NO
 // Pdeathsig: children must outlive vmd; that is the survival property.
 func spawnDirect(scriptPath string, cgroupDir, console *os.File) (*exec.Cmd, error) {
+	defer cgroupDir.Close()
 	cmd := exec.Command(scriptPath)
 	cmd.Env = directSpawnEnv()
 	cmd.Stdout = console
@@ -92,7 +102,11 @@ func spawnDirect(scriptPath string, cgroupDir, console *os.File) (*exec.Cmd, err
 		UseCgroupFD: true,
 		CgroupFD:    int(cgroupDir.Fd()),
 	}
-	if err := cmd.Start(); err != nil {
+	err := cmd.Start()
+	// Keep cgroupDir reachable through the clone3 inside Start; the deferred
+	// Close then releases the fd on both the success and failure paths.
+	runtime.KeepAlive(cgroupDir)
+	if err != nil {
 		return nil, err
 	}
 	return cmd, nil

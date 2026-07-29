@@ -41,7 +41,10 @@ func (m *Manager) cgroupLaunch(existing string) bool {
 // unit (a resume/verify, or an in-place replace) versus a fresh create whose
 // unit never existed — so the fresh burst path skips the flip's stopUnit
 // entirely, no D-Bus and no BoltDB read.
-func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string, hadPriorLife bool) (pid int, supervision string, err error) {
+// freshUnit is the linger-skip hint for the systemd path (a provably-fresh
+// launch skips the per-unit linger query); it is ignored on the cgroup path,
+// which never touches systemd.
+func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS, existing string, hadPriorLife, freshUnit bool) (pid int, supervision string, err error) {
 	if m.cgroupLaunch(existing) {
 		// Unit→cgroup flip: a legacy unit whose pause-stop timed out may
 		// still be live, and spawning a cgroup FC over it gives two
@@ -57,7 +60,7 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 		pid, err = m.startFirecrackerDirect(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
 		return pid, SupervisionCgroup, err
 	}
-	pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
+	pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, freshUnit)
 	return pid, SupervisionUnit, err
 }
 

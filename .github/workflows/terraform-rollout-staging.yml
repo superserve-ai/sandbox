@@ -12,6 +12,7 @@ jobs:
   staging:
     name: Apply staging us-central1
     runs-on: ubuntu-latest
+    environment: staging
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read

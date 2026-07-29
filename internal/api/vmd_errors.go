@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,29 @@ func isVMDNotFound(err error) bool {
 		return false
 	}
 	return status.Code(err) == codes.NotFound
+}
+
+// isVMDDeadline returns true when a vmd call died on its deadline. Two
+// distinct surfaces: a gRPC status (which status.Code resolves even through
+// fmt.Errorf wrapping), and a plain context.DeadlineExceeded — which
+// status.Code does NOT map (it reads as Unknown) and which the dial-site
+// Unavailable-retry interceptor returns when its window expires mid-backoff.
+func isVMDDeadline(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.DeadlineExceeded ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
+// isVMDUnavailable returns true when the daemon was unreachable for the
+// whole of the dial-site interceptor's retry window — the shape a vmd
+// restart longer than that window surfaces as.
+func isVMDUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Unavailable
 }
 
 // isVMDFileMissing returns true when vmd returned a FailedPrecondition
@@ -136,10 +160,19 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 // on a non-default host. Request middleware records the create failure metric
 // from the HTTP response, so this helper only updates state and logs.
 func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sandboxID, teamID uuid.UUID, instanceID, hostID string) {
-	if err := vmd.DestroyInstance(ctx, instanceID, true); err != nil {
+	// The post-restore operation that brought us here may have exhausted or
+	// cancelled its context. Cleanup owns fresh detached deadlines so a timed-out
+	// policy/env RPC cannot strand a running VM or prevent the failed-row write.
+	cleanupBase := context.WithoutCancel(ctx)
+	destroyCtx, destroyCancel := context.WithTimeout(cleanupBase, vmdTimeout)
+	if err := vmd.DestroyInstance(destroyCtx, instanceID, true); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy after failed boot")
 	}
-	if err := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+	destroyCancel()
+
+	dbCtx, dbCancel := context.WithTimeout(cleanupBase, asyncTimeout)
+	defer dbCancel()
+	if err := h.DB.UpdateSandboxStatus(dbCtx, db.UpdateSandboxStatusParams{
 		ID:     sandboxID,
 		Status: db.SandboxStatusFailed,
 		TeamID: teamID,
@@ -149,7 +182,7 @@ func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sand
 	// A failed sandbox keeps status=failed with destroyed_at NULL, and the
 	// secret-binding queries filter only on destroyed_at, so clear the bindings
 	// here or a never-usable sandbox would still report as bound to its secrets.
-	if err := h.DB.DeleteSandboxSecrets(ctx, sandboxID); err != nil {
+	if err := h.DB.DeleteSandboxSecrets(dbCtx, sandboxID); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("clear secret bindings after failed boot")
 	}
 }

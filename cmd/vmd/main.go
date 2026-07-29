@@ -287,6 +287,11 @@ func main() {
 			return
 		case "drain-check":
 			os.Exit(runDrainCheck())
+		case "launcher-prune":
+			// Hidden re-exec entry: the launcher-namespace build re-execs vmd
+			// under unshare so the detach syscalls run inside the freshly
+			// cloned namespace. Must dispatch before any daemon setup.
+			os.Exit(vm.LauncherPruneMain())
 		}
 	}
 
@@ -751,6 +756,7 @@ func main() {
 				ControlPlaneURL: cfg.ControlPlaneURL,
 				HostID:          cfg.HostID,
 				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+				ProxyHealthURL:  os.Getenv("PROXY_HEALTH_URL"),
 			}, log)
 			return nil
 		})

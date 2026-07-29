@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
 // insertSandboxRow drives the quota trigger directly with a minimal counted
@@ -24,15 +25,16 @@ import (
 func insertSandboxRow(ctx context.Context, teamID uuid.UUID, name string) (uuid.UUID, error) {
 	id := uuid.New()
 	_, err := testQueries.CreateSandbox(ctx, db.CreateSandboxParams{
-		ID:         id,
-		TeamID:     teamID,
-		Name:       name,
-		Status:     db.SandboxStatusStarting,
-		VcpuCount:  1,
-		MemoryMib:  1,
-		HostID:     "default",
-		Metadata:   []byte(`{}`),
-		TemplateID: pgtype.UUID{},
+		ID:            id,
+		TeamID:        teamID,
+		Name:          name,
+		Status:        db.SandboxStatusStarting,
+		VcpuCount:     1,
+		MemoryMib:     1,
+		HostID:        "default",
+		Metadata:      []byte(`{}`),
+		TemplateID:    pgtype.UUID{},
+		PreviewAccess: preview.AccessPublic,
 	})
 	return id, err
 }
