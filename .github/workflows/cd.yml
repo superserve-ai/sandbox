@@ -25,6 +25,10 @@ on:
     paths:
       - 'supabase/migrations/**'
 
+concurrency:
+  group: cd-migrate
+  cancel-in-progress: false
+
 jobs:
   migrate-staging:
     name: Migrate Staging
@@ -36,6 +40,25 @@ jobs:
       - uses: supabase/setup-cli@v1
         with:
           version: latest
+
+      - name: Ensure PostgreSQL client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+
+      # These hot-table indexes must be built one at a time outside the
+      # transactional Supabase migration. The script also verifies their exact
+      # table, btree, uniqueness, key, predicate, and catalog state contract.
+      - name: Prebuild and verify saved-snapshot indexes in staging
+        run: >-
+          psql
+          --dbname="$DATABASE_URL"
+          --no-psqlrc
+          --file=scripts/prebuild-saved-snapshot-indexes.sql
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
 
       - name: Push migrations to staging
         run: supabase db push --db-url "$DATABASE_URL"
@@ -55,7 +78,35 @@ jobs:
         with:
           version: latest
 
-      - name: Push migrations to production
+      - name: Ensure PostgreSQL client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+
+      # Prebuild and verify both production cells before either cell crosses
+      # the contract migration. A failure leaves both databases on the
+      # leave-forward expand schema with the feature dark.
+      - name: Prebuild and verify saved-snapshot indexes in production primary
+        run: >-
+          psql
+          --dbname="$DATABASE_URL"
+          --no-psqlrc
+          --file=scripts/prebuild-saved-snapshot-indexes.sql
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+
+      - name: Prebuild and verify saved-snapshot indexes in production usw
+        run: >-
+          psql
+          --dbname="$DATABASE_URL"
+          --no-psqlrc
+          --file=scripts/prebuild-saved-snapshot-indexes.sql
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
+
+      - name: Push migrations to production primary
         run: supabase db push --db-url "$DATABASE_URL"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}

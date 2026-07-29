@@ -79,6 +79,10 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
 		os.Exit(1)
 	}
+	if err := verifySavedSnapshotContractStartsDark(ctx, testPool); err != nil {
+		fmt.Fprintf(os.Stderr, "saved-snapshot contract initial state: %v\n", err)
+		os.Exit(1)
+	}
 
 	testQueries = db.New(testPool)
 
@@ -92,6 +96,36 @@ func TestMain(m *testing.M) {
 	}
 
 	os.Exit(m.Run())
+}
+
+func verifySavedSnapshotContractStartsDark(ctx context.Context, pool *pgxpool.Pool) error {
+	var (
+		globalEnabled        bool
+		enabledTeamOverrides int
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    COALESCE((
+		        SELECT enabled
+		        FROM feature_flag
+		        WHERE key = 'sandbox_snapshots_v1'
+		    ), true),
+		    (
+		        SELECT count(*)
+		        FROM team_feature_flag
+		        WHERE key = 'sandbox_snapshots_v1'
+		          AND enabled
+		    )
+	`).Scan(&globalEnabled, &enabledTeamOverrides); err != nil {
+		return fmt.Errorf("inspect feature flags: %w", err)
+	}
+	if globalEnabled {
+		return errors.New("global sandbox_snapshots_v1 flag is enabled or missing")
+	}
+	if enabledTeamOverrides != 0 {
+		return fmt.Errorf("found %d enabled team overrides", enabledTeamOverrides)
+	}
+	return nil
 }
 
 func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {

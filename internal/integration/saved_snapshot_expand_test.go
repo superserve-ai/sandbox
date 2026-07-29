@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,27 +14,197 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func TestSavedSnapshotExpandRolloutGuards(t *testing.T) {
+func TestSavedSnapshotContractRolloutGuards(t *testing.T) {
 	ctx := context.Background()
 
-	var unique, valid, ready, partial bool
-	err := testPool.QueryRow(ctx, `
-		SELECT i.indisunique,
-		       i.indisvalid,
-		       i.indisready,
-		       i.indpred IS NOT NULL
-		FROM pg_index i
-		JOIN pg_class idx ON idx.oid = i.indexrelid
-		JOIN pg_namespace ns ON ns.oid = idx.relnamespace
-		WHERE ns.nspname = 'public'
-		  AND idx.relname = 'snapshot_sandbox_unique'
-		  AND i.indrelid = 'public.snapshot'::regclass
-	`).Scan(&unique, &valid, &ready, &partial)
-	if err != nil {
-		t.Fatalf("inspect snapshot_sandbox_unique: %v", err)
+	expectedIndexes := []struct {
+		name       string
+		table      string
+		unique     bool
+		keys       []string
+		predicate  string
+		definition string
+	}{
+		{
+			name:       "snapshot_sandbox_runtime_unique",
+			table:      "snapshot",
+			unique:     true,
+			keys:       []string{"sandbox_id"},
+			predicate:  "(kind = 'runtime_checkpoint'::snapshot_kind)",
+			definition: "CREATE UNIQUE INDEX snapshot_sandbox_runtime_unique ON public.snapshot USING btree (sandbox_id) WHERE (kind = 'runtime_checkpoint'::snapshot_kind)",
+		},
+		{
+			name:       "snapshot_team_source_idempotency_unique",
+			table:      "snapshot",
+			unique:     true,
+			keys:       []string{"team_id", "sandbox_id", "idempotency_key"},
+			predicate:  "((kind = 'saved'::snapshot_kind) AND (idempotency_key IS NOT NULL))",
+			definition: "CREATE UNIQUE INDEX snapshot_team_source_idempotency_unique ON public.snapshot USING btree (team_id, sandbox_id, idempotency_key) WHERE ((kind = 'saved'::snapshot_kind) AND (idempotency_key IS NOT NULL))",
+		},
+		{
+			name:       "idx_snapshot_team_saved_created",
+			table:      "snapshot",
+			keys:       []string{"team_id", "created_at", "id"},
+			predicate:  "((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+			definition: "CREATE INDEX idx_snapshot_team_saved_created ON public.snapshot USING btree (team_id, created_at DESC, id DESC) WHERE ((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+		},
+		{
+			name:       "idx_snapshot_source_saved_created",
+			table:      "snapshot",
+			keys:       []string{"sandbox_id", "created_at", "id"},
+			predicate:  "((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+			definition: "CREATE INDEX idx_snapshot_source_saved_created ON public.snapshot USING btree (sandbox_id, created_at DESC, id DESC) WHERE ((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+		},
+		{
+			name:       "idx_snapshot_parent_saved",
+			table:      "snapshot",
+			keys:       []string{"parent_snapshot_id"},
+			predicate:  "((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+			definition: "CREATE INDEX idx_snapshot_parent_saved ON public.snapshot USING btree (parent_snapshot_id) WHERE ((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+		},
+		{
+			name:       "idx_snapshot_saved_host",
+			table:      "snapshot",
+			keys:       []string{"host_id", "status"},
+			predicate:  "((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+			definition: "CREATE INDEX idx_snapshot_saved_host ON public.snapshot USING btree (host_id, status) WHERE ((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL))",
+		},
+		{
+			name:      "idx_snapshot_saved_reconcile",
+			table:     "snapshot",
+			keys:      []string{"status", "updated_at", "id"},
+			predicate: "((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL) AND (status = ANY (ARRAY['creating'::snapshot_status, 'deleting'::snapshot_status])))",
+			definition: "CREATE INDEX idx_snapshot_saved_reconcile ON public.snapshot USING btree (status, updated_at, id) " +
+				"WHERE ((kind = 'saved'::snapshot_kind) AND (deleted_at IS NULL) AND (status = ANY (ARRAY['creating'::snapshot_status, 'deleting'::snapshot_status])))",
+		},
+		{
+			name:       "idx_sandbox_source_snapshot_pin",
+			table:      "sandbox",
+			keys:       []string{"source_snapshot_id"},
+			predicate:  "(source_snapshot_id IS NOT NULL)",
+			definition: "CREATE INDEX idx_sandbox_source_snapshot_pin ON public.sandbox USING btree (source_snapshot_id) WHERE (source_snapshot_id IS NOT NULL)",
+		},
+		{
+			name:       "idx_sandbox_destroyed_snapshot_pin",
+			table:      "sandbox",
+			keys:       []string{"destroyed_at", "id"},
+			predicate:  "((source_snapshot_id IS NOT NULL) AND (destroyed_at IS NOT NULL))",
+			definition: "CREATE INDEX idx_sandbox_destroyed_snapshot_pin ON public.sandbox USING btree (destroyed_at, id) WHERE ((source_snapshot_id IS NOT NULL) AND (destroyed_at IS NOT NULL))",
+		},
+		{
+			name:       "idx_sandbox_snapshot_operation",
+			table:      "sandbox",
+			keys:       []string{"snapshot_operation_started_at"},
+			predicate:  "((snapshot_operation_id IS NOT NULL) AND (destroyed_at IS NULL))",
+			definition: "CREATE INDEX idx_sandbox_snapshot_operation ON public.sandbox USING btree (snapshot_operation_started_at) WHERE ((snapshot_operation_id IS NOT NULL) AND (destroyed_at IS NULL))",
+		},
 	}
-	if !unique || !valid || !ready || partial {
-		t.Error("legacy snapshot_sandbox_unique is not a ready, valid, non-partial unique index")
+
+	for _, expected := range expectedIndexes {
+		var (
+			table, accessMethod, predicate, definition string
+			unique, valid, ready, live, immediate      bool
+			keyCount, attributeCount                   int16
+			keys                                       []string
+			hasExpressions                             bool
+		)
+		err := testPool.QueryRow(ctx, `
+			SELECT indexed_table.relname,
+			       access_method.amname,
+			       catalog.indisunique,
+			       catalog.indisvalid,
+			       catalog.indisready,
+			       catalog.indislive,
+			       catalog.indimmediate,
+			       catalog.indnkeyatts,
+			       catalog.indnatts,
+			       ARRAY(
+			           SELECT pg_get_indexdef(
+			                      catalog.indexrelid,
+			                      key_position,
+			                      true
+			                  )
+			           FROM generate_series(
+			                    1,
+			                    catalog.indnkeyatts
+			                ) AS key_position
+			           ORDER BY key_position
+			       ),
+			       pg_get_expr(catalog.indpred, catalog.indrelid, false),
+			       pg_get_indexdef(catalog.indexrelid),
+			       catalog.indexprs IS NOT NULL
+			FROM pg_index catalog
+			JOIN pg_class index_object
+			  ON index_object.oid = catalog.indexrelid
+			JOIN pg_namespace index_namespace
+			  ON index_namespace.oid = index_object.relnamespace
+			JOIN pg_class indexed_table
+			  ON indexed_table.oid = catalog.indrelid
+			JOIN pg_namespace table_namespace
+			  ON table_namespace.oid = indexed_table.relnamespace
+			JOIN pg_am access_method
+			  ON access_method.oid = index_object.relam
+			WHERE index_namespace.nspname = 'public'
+			  AND table_namespace.nspname = 'public'
+			  AND index_object.relkind = 'i'
+			  AND index_object.relname = $1
+		`, expected.name).Scan(
+			&table,
+			&accessMethod,
+			&unique,
+			&valid,
+			&ready,
+			&live,
+			&immediate,
+			&keyCount,
+			&attributeCount,
+			&keys,
+			&predicate,
+			&definition,
+			&hasExpressions,
+		)
+		if err != nil {
+			t.Fatalf("inspect %s: %v", expected.name, err)
+		}
+		if table != expected.table ||
+			accessMethod != "btree" ||
+			unique != expected.unique ||
+			!valid ||
+			!ready ||
+			!live ||
+			!immediate ||
+			int(keyCount) != len(expected.keys) ||
+			attributeCount != keyCount ||
+			!slices.Equal(keys, expected.keys) ||
+			predicate != expected.predicate ||
+			definition != expected.definition ||
+			hasExpressions {
+			t.Errorf(
+				"%s catalog contract mismatch: table=%q access=%q unique=%v valid=%v ready=%v live=%v immediate=%v keys=%v predicate=%q definition=%q expressions=%v",
+				expected.name,
+				table,
+				accessMethod,
+				unique,
+				valid,
+				ready,
+				live,
+				immediate,
+				keys,
+				predicate,
+				definition,
+				hasExpressions,
+			)
+		}
+	}
+
+	var legacyIndexExists bool
+	if err := testPool.QueryRow(ctx, `
+		SELECT to_regclass('public.snapshot_sandbox_unique') IS NOT NULL
+	`).Scan(&legacyIndexExists); err != nil {
+		t.Fatalf("inspect legacy snapshot_sandbox_unique: %v", err)
+	}
+	if legacyIndexExists {
+		t.Error("legacy snapshot_sandbox_unique still exists after contract")
 	}
 
 	constraints := []string{
@@ -86,19 +257,6 @@ func TestSavedSnapshotExpandRolloutGuards(t *testing.T) {
 	}
 	if globalEnabled {
 		t.Error("global saved-snapshot feature flag is enabled during expand")
-	}
-
-	var enabledTeamOverrides int
-	if err := testPool.QueryRow(ctx, `
-		SELECT count(*)
-		FROM team_feature_flag
-		WHERE key = 'sandbox_snapshots_v1'
-		  AND enabled
-	`).Scan(&enabledTeamOverrides); err != nil {
-		t.Fatalf("count enabled team saved-snapshot overrides: %v", err)
-	}
-	if enabledTeamOverrides != 0 {
-		t.Errorf("enabled saved-snapshot team overrides = %d, want 0", enabledTeamOverrides)
 	}
 
 	rows, err := testPool.Query(ctx, `
