@@ -243,6 +243,13 @@ type Manager struct {
 	// the launcher path.
 	launcherBuilt atomic.Bool
 
+	// orphanScanDone gates the fresh-unit linger skip: it is set only after
+	// startup reattach successfully listed active units and registered the
+	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if
+	// the listing failed) a predecessor-era unit could be alive with no
+	// bookkeeping, so every launch must run the linger query.
+	orphanScanDone atomic.Bool
+
 	// presenceConverged mirrors the on-disk converged marker: every layered
 	// overlay on this host has a presence side-car, so strict enforcement can
 	// engage (in "auto" mode) without affecting anything that exists. Set at
@@ -1111,7 +1118,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	}
 
 	tFcStart := time.Now()
-	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
+	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
@@ -1306,7 +1313,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// way out. Safe because the VM is paused (no live FC to disrupt), but it must
 	// not run concurrently with a resume of the same sandbox — fine for the
 	// debug/staging use this endpoint is gated to.
-	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
+	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
 	defer func() { _ = stopUnitWithBudget(context.Background(), systemdUnitName(vmID)) }()
@@ -1650,6 +1657,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	}
 
+	// Sampled before this attempt creates the rundir: a pre-existing rundir
+	// means a prior attempt on this host reached start.sh (and possibly
+	// started the unit) even if it died before persisting any state, so the
+	// unit name is not provably fresh. Only a definitive not-exist proves
+	// absence — any other stat error reads as prior.
+	_, rdErr := os.Stat(filepath.Join(m.cfg.RunDir, vmID))
+	priorRunDir := !errors.Is(rdErr, os.ErrNotExist)
+
 	m.mu.Lock()
 	_, inPlace := m.vms[vmID]
 	if inPlace {
@@ -1676,6 +1691,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
+
+	// A provably-fresh unit name — no known instance (lazyReattach already
+	// folded BoltDB into the map), no prior rundir, and no stop attempt this
+	// process could still be winding down from — cannot be lingering, so the
+	// launch may skip the systemd linger query. The winding-down term covers
+	// cleanup paths that delete the other evidence after an unconfirmed stop
+	// (destroy, reattach stale-cleanup). Build VMs never qualify: their
+	// deterministic reused IDs are exempt from persistence and invisible to
+	// the reconciler, so no bookkeeping can ever rule out a prior unit.
+	// orphanScanDone gates everything: until startup reattach has listed
+	// active units, a predecessor-era orphan may exist with no bookkeeping.
+	// Only the first attempt qualifies: any retry follows a start of the
+	// same unit name.
+	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
+		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
 	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
@@ -1766,7 +1796,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Unlock()
 
 		var startErr error
-		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName)
+		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, freshUnit && attempt == 1)
 		if startErr != nil {
 			if !inPlace {
 				m.netMgr.CleanupVM(vmID)
@@ -2082,9 +2112,18 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	} else {
 		for _, id := range activeIDs {
 			if !knownIDs[id] {
+				// Registered as an unconfirmed stop so a same-ID launch never
+				// reads this orphan as fresh: without a control-plane DB the
+				// reconciler never stops BoltDB-missing units, so this
+				// observation may be the only bookkeeping the unit gets.
+				recordUnitStop(systemdUnitName(id))
 				m.log.Warn().Str("vm_id", id).Msg("orphan systemd unit detected (not in BoltDB) — will be handled by reconciler")
 			}
 		}
+		// Orphans are accounted for — fresh-unit launches may skip the
+		// linger query from here on. Stays unset on listing failure: an
+		// unobserved orphan can't be ruled out by anything else.
+		m.orphanScanDone.Store(true)
 	}
 
 	// No broad re-sweep here. Startup already swept once before StartPool filled
@@ -3018,7 +3057,7 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 // as a standalone systemd unit. The VM survives VMD restarts because systemd
 // owns the process, not VMD. Non-empty basePath switches the start script to
 // the dual-symlink overlay layout.
-func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
+func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, freshUnit bool) (int, error) {
 	tPrestart := time.Now()
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
@@ -3067,9 +3106,11 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// the restart job clears at fork, before the socket exists, so no
 	// at-timeout probe can tell a just-replaced unit from a stalled fresh
 	// one. Timed separately: it is a per-launch systemd round trip, and
-	// concurrent launches serialize on the shared D-Bus connection.
+	// concurrent launches serialize on the shared D-Bus connection. A
+	// fresh unit skips it with the identical outcome: never-existed reads
+	// NotLoaded, i.e. not lingering.
 	tLinger := time.Now()
-	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
+	replacingLive := !freshUnit && unitLingering(ctx, systemdUnitName(vmID))
 	lingerCheckMs := time.Since(tLinger).Milliseconds()
 
 	tStartUnit := time.Now()
@@ -3107,6 +3148,7 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		Str("vm_id", vmID).
 		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
 		Int64("linger_check_ms", lingerCheckMs).
+		Bool("linger_skipped", freshUnit).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
 		Msg("fc startup phases")
