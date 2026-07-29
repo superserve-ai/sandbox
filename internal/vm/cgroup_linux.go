@@ -158,6 +158,14 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	if !firecrackerAdvertisesCap(ctx, m.cfg.FirecrackerBin, "serial-console-cap") {
 		return false, fmt.Errorf("firecracker %q lacks serial-console-cap — cannot arm direct spawn", m.cfg.FirecrackerBin)
 	}
+	// directSpawnScript prepends prlimit to every launch; if it's absent from
+	// the restricted launch PATH the chain exits before Firecracker starts.
+	// Validate it here — like unshare/nsenter, it's a mandatory launch tool —
+	// so arming refuses rather than routing every create/resume through a path
+	// that silently fails.
+	if !prlimitOnLaunchPath() {
+		return false, fmt.Errorf("prlimit not found on the direct-spawn launch PATH (%s) — every direct launch would exit before firecracker; refusing to arm", directSpawnPATH)
+	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
 }

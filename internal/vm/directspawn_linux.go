@@ -23,11 +23,33 @@ import (
 // dumps core). PATH covers the script's bare tool names; RUN_DIR matches
 // the unit file's one declared variable. Nothing else — additions here are
 // a security review, not a convenience.
+// directSpawnPATH is the PATH the direct-spawn launch chain runs under. The
+// arm-time prlimit check validates against THIS, not vmd's own PATH.
+const directSpawnPATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
 func directSpawnEnv() []string {
 	return []string{
-		"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+		"PATH=" + directSpawnPATH,
 		"RUN_DIR=/var/lib/sandbox/rundir",
 	}
+}
+
+// prlimitOnLaunchPath reports whether the prlimit binary directSpawnScript
+// prepends is resolvable on the launch PATH. It scans directSpawnPATH itself,
+// not vmd's PATH (which exec.LookPath would search): the chain runs under the
+// restricted PATH, so a prlimit only in e.g. /usr/local/bin would pass a
+// LookPath yet make every direct launch exit before Firecracker starts.
+func prlimitOnLaunchPath() bool { return toolOnPath("prlimit", directSpawnPATH) }
+
+// toolOnPath reports whether an executable named tool exists in one of the
+// directories of a PATH-style, os.PathListSeparator-delimited list.
+func toolOnPath(tool, path string) bool {
+	for _, dir := range filepath.SplitList(path) {
+		if fi, err := os.Stat(filepath.Join(dir, tool)); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // directSpawnScript renders the launch script for direct spawn: the unit

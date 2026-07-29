@@ -128,6 +128,43 @@ func TestSpawnDirectOwnsCgroupFD(t *testing.T) {
 	}
 }
 
+// prlimit is prepended to every direct-spawn launch, so ArmDirectSpawn must
+// treat it as a mandatory launch tool: present-and-executable on the launch
+// PATH passes, missing or non-executable fails (so arming refuses).
+func TestToolOnPath(t *testing.T) {
+	dir := t.TempDir()
+	other := t.TempDir()
+	path := other + string(os.PathListSeparator) + dir
+
+	if toolOnPath("prlimit", path) {
+		t.Fatal("must not find prlimit before it exists")
+	}
+	bin := filepath.Join(dir, "prlimit")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !toolOnPath("prlimit", path) {
+		t.Fatal("must find an executable prlimit on the path")
+	}
+	// A non-executable file must not count (it can't exec in the chain).
+	if err := os.Chmod(bin, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if toolOnPath("prlimit", path) {
+		t.Fatal("a non-executable prlimit must not count")
+	}
+	// A directory named prlimit must not count either.
+	if err := os.Remove(bin); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if toolOnPath("prlimit", path) {
+		t.Fatal("a directory named prlimit must not count")
+	}
+}
+
 func TestDirectSpawnScriptPinsNofile(t *testing.T) {
 	script, err := directSpawnScript("ns-7", "/run/vmd/launcher.mntns",
 		"mount --make-rprivate / && mount -t tmpfs tmpfs /d && ln -s /a /b",
