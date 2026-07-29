@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +17,7 @@ import (
 
 // Scheduler selects a host for a new sandbox.
 type Scheduler interface {
-	SelectHost(ctx context.Context) (hostID string, err error)
+	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
 }
 
 const defaultCacheTTL = 30 * time.Second
@@ -38,10 +40,14 @@ type LeastLoaded struct {
 	TTL           time.Duration // 0 = use defaultCacheTTL
 
 	mu         sync.RWMutex
-	cached     []db.ListActiveHostsByLoadRow
-	cachedAt   time.Time
+	cache      map[string]hostCacheEntry
 	gen        uint64      // bumped by Invalidate and blocking reloads; discards refreshes that started earlier
-	refreshing atomic.Bool // one background refresh at a time
+	refreshing atomic.Bool // one background refresh at a time across capability sets
+}
+
+type hostCacheEntry struct {
+	hosts    []db.ListActiveHostsByLoadRow
+	cachedAt time.Time
 }
 
 func (s *LeastLoaded) ttl() time.Duration {
@@ -51,8 +57,8 @@ func (s *LeastLoaded) ttl() time.Duration {
 	return defaultCacheTTL
 }
 
-func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
-	hosts, err := s.loadHosts(ctx)
+func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []string) (string, error) {
+	hosts, err := s.loadHosts(ctx, requiredCapabilities)
 	if err != nil {
 		return "", err
 	}
@@ -81,79 +87,97 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 	return hosts[b].ID, nil
 }
 
-// hostsStaleGrace bounds how long an expired host list keeps being served
+// hostsStaleGrace bounds how long an expired candidate set keeps being served
 // while refreshes run (or fail) in the background. Host health flows through
-// the DB — the detector marks missed-heartbeat hosts unhealthy and the next
-// refresh drops them — so the worst case for routing to a dead host is
-// ttl+grace, and persistent refresh failures degrade to blocking (erroring)
-// loads instead of serving a dead list forever.
+// the DB, and every capability set is keyed independently, so persistent
+// refresh failures degrade to blocking loads instead of serving stale hosts
+// forever.
 const hostsStaleGrace = 30 * time.Second
 
-// loadHosts serves the cached list — stale included, up to hostsStaleGrace —
-// and refreshes it in the background once the TTL lapses, so callers never
-// queue behind the refresh. The very first call, a post-Invalidate call, and
-// any call past the grace window block on a fresh load.
-func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoadRow, error) {
+// loadHosts serves a cached capability-specific candidate set — stale
+// included, up to hostsStaleGrace — and refreshes it in the background once
+// the TTL lapses. The first call for a set, a post-Invalidate call, and any
+// call past the grace window block on a fresh load.
+func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) ([]db.ListActiveHostsByLoadRow, error) {
+	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
-	cached, cachedAt, startGen := s.cached, s.cachedAt, s.gen
+	entry, cached := s.cache[key]
+	startGen := s.gen
 	s.mu.RUnlock()
-	if cached != nil && time.Since(cachedAt) >= s.ttl()+hostsStaleGrace {
-		// Past the grace window (refreshes failing or never landing): stop
-		// serving the old list and force a blocking reload below.
-		cached = nil
+
+	if cached && time.Since(entry.cachedAt) >= s.ttl()+hostsStaleGrace {
+		cached = false
 	}
-	if cached != nil {
-		if time.Since(cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
-			// Detached: the refresh outlives the triggering request. On error
-			// the stale list stays servable and the next expired call retries.
+	if cached {
+		if time.Since(entry.cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
+			// Detached: the refresh outlives the triggering request. On error the
+			// stale set stays servable and the next expired call retries.
 			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			go func() {
 				defer cancel()
 				defer s.refreshing.Store(false)
-				hosts, err := s.DB.ListActiveHostsByLoad(qctx)
+				hosts, err := s.DB.ListActiveHostsByLoad(qctx, normalized)
 				if err != nil {
-					log.Warn().Err(err).Msg("host list refresh failed; serving stale until the grace window expires")
+					log.Warn().Err(err).Strs("required_capabilities", normalized).
+						Msg("host list refresh failed; serving stale until the grace window expires")
 					return
 				}
 				s.mu.Lock()
 				// Discard results from before the latest Invalidate or blocking
-				// reload: storing them would resurrect a host list a newer,
-				// fresher load already replaced.
+				// reload so an older query cannot replace a newer candidate set.
 				if s.gen == startGen {
-					s.cached = hosts
-					s.cachedAt = time.Now()
+					if s.cache == nil {
+						s.cache = make(map[string]hostCacheEntry)
+					}
+					s.cache[key] = hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
 				}
 				s.mu.Unlock()
 			}()
 		}
-		return cached, nil
+		return entry.hosts, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Double-check: another blocked caller may have reloaded while we waited.
-	// A past-grace list does not count — it is what we are here to replace.
-	if s.cached != nil && time.Since(s.cachedAt) < s.ttl()+hostsStaleGrace {
-		return s.cached, nil
+	// Double-check: another blocked caller may have reloaded this capability
+	// set while we waited. A past-grace entry is what we are here to replace.
+	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl()+hostsStaleGrace {
+		return entry.hosts, nil
 	}
-	hosts, err := s.DB.ListActiveHostsByLoad(ctx)
+	hosts, err := s.DB.ListActiveHostsByLoad(ctx, normalized)
 	if err != nil {
 		return nil, fmt.Errorf("list active hosts by load: %w", err)
 	}
-	// Bump the generation so an older in-flight background refresh cannot
-	// land after this load and replace it with its earlier snapshot.
+	// Bump the generation so any older in-flight background refresh cannot
+	// land after this blocking load and replace it with an earlier snapshot.
 	s.gen++
-	s.cached = hosts
-	s.cachedAt = time.Now()
+	if s.cache == nil {
+		s.cache = make(map[string]hostCacheEntry)
+	}
+	s.cache[key] = hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
 	return hosts, nil
 }
 
-// Invalidate drops the cached host list so the next SelectHost reflects
-// changes immediately.
+func capabilityCacheKey(capabilities []string) (string, []string) {
+	set := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		if capability != "" {
+			set[capability] = struct{}{}
+		}
+	}
+	normalized := make([]string, 0, len(set))
+	for capability := range set {
+		normalized = append(normalized, capability)
+	}
+	sort.Strings(normalized)
+	return strings.Join(normalized, "\x00"), normalized
+}
+
+// Invalidate drops all cached capability-specific candidate sets so the next
+// SelectHost reflects status or capability changes immediately.
 func (s *LeastLoaded) Invalidate() {
 	s.mu.Lock()
 	s.gen++
-	s.cached = nil
-	s.cachedAt = time.Time{}
+	s.cache = nil
 	s.mu.Unlock()
 }

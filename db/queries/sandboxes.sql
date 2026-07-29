@@ -438,7 +438,8 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 -- An absent side-table row is the rolling-deploy-safe representation of a
 -- sandbox created by an older control plane.
 SELECT
-  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+  COALESCE(p.access, 'legacy_public')::text AS wire_access,
   COALESCE(p.revision, 0)::bigint AS revision
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -447,7 +448,7 @@ WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
 -- name: ListSandboxPreviewPoliciesByTeam :many
 SELECT
   s.id AS sandbox_id,
-  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
   COALESCE(p.revision, 0)::bigint AS revision
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -460,6 +461,12 @@ SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 FOR UPDATE;
 
+-- name: GetSandboxStatusForPreviewMutation :one
+-- Read after LockSandboxForPreviewMutation in the same transaction when host
+-- delivery semantics depend on whether the serialized sandbox is paused.
+SELECT status FROM sandbox
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
+
 -- name: EnsureSandboxPreviewPolicy :exec
 -- Publication may be staged on a legacy sandbox before it is switched to
 -- strict mode. Materialize its legacy access so the revision can still order
@@ -470,7 +477,7 @@ ON CONFLICT (sandbox_id) DO NOTHING;
 
 -- name: UpdateSandboxPreviewAccess :execrows
 UPDATE sandbox_preview_policy p
-SET access = $2, updated_at = now()
+SET default_access = $2, updated_at = now()
 WHERE p.sandbox_id = $1
   AND EXISTS (
     SELECT 1 FROM sandbox s
@@ -484,19 +491,67 @@ WHERE p.sandbox_id = $1
 UPDATE sandbox_preview_policy
 SET revision = revision + 1, updated_at = now()
 WHERE sandbox_id = $1
-RETURNING access, revision;
+RETURNING default_access AS access, access AS wire_access, revision;
 
 -- name: ListPublishedPorts :many
-SELECT port FROM sandbox_published_port
-WHERE sandbox_id = $1
-ORDER BY port;
+-- A published row without a positive generation is not safe to activate at
+-- the edge. The migration backfills every existing publication and the
+-- publication triggers create future rows, so the inner join also fails
+-- closed if that invariant is ever broken operationally.
+SELECT pp.port, pp.access, g.token_version
+FROM sandbox_published_port pp
+JOIN sandbox_preview_port_token_generation g
+  ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+WHERE pp.sandbox_id = $1
+  AND g.token_version > 0
+ORDER BY pp.port;
+
+-- name: GetPublishedPreviewPort :one
+-- Team-scoped credential lookup. Keeping ownership in the query avoids ever
+-- treating a port row from another tenant as mintable, even if a caller
+-- accidentally bypasses the preceding sandbox lookup.
+SELECT pp.port, pp.access, g.token_version
+FROM sandbox s
+JOIN sandbox_published_port pp ON pp.sandbox_id = s.id
+JOIN sandbox_preview_port_token_generation g
+  ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+WHERE s.id = sqlc.arg('sandbox_id')
+  AND s.team_id = sqlc.arg('team_id')
+  AND s.destroyed_at IS NULL
+  AND pp.port = sqlc.arg('port')
+  AND g.token_version > 0;
+
+-- name: RotatePublishedPreviewPortToken :one
+-- Called only while applyPreviewMutation holds the owning sandbox row lock.
+-- The publication join makes rotation impossible for a retained tombstone;
+-- next_sandbox_preview_port_token_version fails rather than wrapping bigint.
+UPDATE sandbox_preview_port_token_generation g
+SET token_version = next_sandbox_preview_port_token_version(g.token_version),
+    updated_at = now()
+FROM sandbox_published_port pp
+WHERE g.sandbox_id = sqlc.arg('sandbox_id')
+  AND g.port = sqlc.arg('port')
+  AND pp.sandbox_id = g.sandbox_id
+  AND pp.port = g.port
+RETURNING pp.port, pp.access, g.token_version;
 
 -- name: PublishPort :one
--- Idempotent: re-publishing keeps the same resource and refreshes updated_at.
-INSERT INTO sandbox_published_port (sandbox_id, port)
-VALUES ($1, $2)
-ON CONFLICT (sandbox_id, port) DO UPDATE SET updated_at = now()
-RETURNING port;
+-- The sandbox-level policy supplies the access mode only for a NEW row.
+-- Re-publishing without access preserves the existing row's mode; only an
+-- explicitly supplied access changes it. applyPreviewMutation takes the
+-- sandbox row lock before this query, serializing concurrent publications.
+INSERT INTO sandbox_published_port (sandbox_id, port, access)
+SELECT sqlc.arg('sandbox_id'), sqlc.arg('port'),
+       COALESCE(
+           sqlc.narg('access')::text,
+           CASE WHEN p.default_access = 'private' THEN 'private' ELSE 'public' END
+       )
+FROM sandbox_preview_policy p
+WHERE p.sandbox_id = sqlc.arg('sandbox_id')
+ON CONFLICT (sandbox_id, port) DO UPDATE
+SET access = COALESCE(sqlc.narg('access')::text, sandbox_published_port.access),
+    updated_at = now()
+RETURNING port, access;
 
 -- name: UnpublishPort :execrows
 DELETE FROM sandbox_published_port

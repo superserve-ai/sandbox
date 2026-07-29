@@ -61,6 +61,25 @@ func TestOpenAPISpecMatchesRoutes(t *testing.T) {
 	}
 }
 
+func TestOpenAPIPreviewTokenIsDocumentedAsARequestCredential(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("read openapi.yaml: %v", err)
+	}
+	spec := string(data)
+	if strings.Contains(spec, "response's `X-Superserve-Preview-Token` header") {
+		t.Fatal("OpenAPI describes the preview token as a response header instead of a request credential")
+	}
+	for _, required := range []string{
+		"a request header named `X-Superserve-Preview-Token`",
+		"whose name is the response's `header` value",
+	} {
+		if !strings.Contains(spec, required) {
+			t.Errorf("OpenAPI preview-token guidance is missing %q", required)
+		}
+	}
+}
+
 // loadSpecOps parses api/openapi.yaml and returns its operations as "METHOD /path".
 func loadSpecOps(t *testing.T) map[string]bool {
 	t.Helper()

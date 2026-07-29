@@ -17,7 +17,6 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
-	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/proxy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
@@ -89,6 +88,8 @@ func main() {
 		}
 
 		proxyHandler.WithAuth(seed)
+		resolver.WithPreviewTokens()
+		resolver.WithPreviewBrowserAuth()
 		proxyHandler.WithFiles()
 		log.Info().Msg("files endpoint enabled")
 		proxyHandler.WithExec()
@@ -156,7 +157,7 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(proxyHealthResponse{
-			Capabilities: []string{preview.HostCapabilityPorts},
+			Capabilities: proxyHandler.PreviewCapabilities(),
 		})
 	})
 	mux.Handle("/", proxyHandler)

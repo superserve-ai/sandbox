@@ -25,12 +25,36 @@ On merge to `main`, deployment should follow this shape:
 
 Build once, deploy many, verify all.
 
-### Preview-publication rollback safety
+### Preview authentication rollout and rollback safety
 
-Deploy preview-publication-aware VMD before the matching proxy. Once a host has
-strict sandboxes, never roll both VMD and proxy back to pre-publication binaries:
-drain or move those sandboxes off the host first. A mixed rollback fails closed,
-but two old data-plane binaries cannot interpret the durable strict policy.
+Preview authentication is delivered as stacked releases, not runtime feature
+flags. Do not create or enable preview-auth flags to change this order; the API
+uses the host's current heartbeat capabilities as its activation gate.
+
+Roll out each environment in this order:
+
+1. Deploy the matching browser-aware proxy and VMD host release. Wait for every
+   eligible host's current heartbeat to advertise
+   `preview_port_browser_auth_v1` together with its prerequisites:
+   `preview_ports_v1`, `preview_port_access_v1`, and
+   `preview_port_tokens_v1`. VMD derives this advertisement from the live proxy
+   health response, so the heartbeat attests the complete local enforcement
+   path rather than the VMD binary alone.
+2. Deploy the API release only after that capability is current. The API must
+   reject browser-private policy delivery when the sandbox's host is missing,
+   inactive, stale, or does not advertise the complete capability chain.
+3. Only then merge and deploy the client surfaces in
+   [superserve#287](https://github.com/superserve-ai/superserve/pull/287): SDK,
+   console, MCP, and customer documentation.
+
+The boundary is fail closed during a partial rollout or rollback. A browser
+policy has a distinct wire sentinel; VMD withholds it from a proxy that does not
+attest browser support, and an older proxy treats an unknown mode as closed.
+When a host component is rolled back, its browser capability disappears from
+the next heartbeat and the API refuses new browser-policy mutations. Never roll
+both VMD and proxy below the policy generation required by live strict
+sandboxes; drain or move those sandboxes first. The same rule applies to the
+earlier publication, per-port-access, and header-token capability boundaries.
 
 ## Host selection
 

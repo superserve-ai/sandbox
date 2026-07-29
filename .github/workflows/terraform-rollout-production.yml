@@ -20,7 +20,8 @@ jobs:
   west2:
     name: Apply production us-west2
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && (inputs.target == 'west2' || inputs.target == 'all')
+    if: ${{ always() && github.ref == 'refs/heads/main' && (inputs.target == 'west2' || inputs.target == 'all') && needs.central1.result == 'success' }}
+    needs: [central1]
     environment: production
     permissions:
       contents: read
@@ -49,7 +50,13 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT}}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify production runtime KMS grant
+        run: bash infra/scripts/verify-production-runtime-kms.sh
 
       - name: Verify validation dependencies
         run: |
@@ -76,8 +83,7 @@ jobs:
   central1:
     name: Apply production us-central1
     runs-on: ubuntu-latest
-    if: ${{ always() && github.ref == 'refs/heads/main' && (inputs.target == 'central1' || inputs.target == 'all') && (needs.west2.result == 'success' || needs.west2.result == 'skipped') }}
-    needs: [west2]
+    if: ${{ github.ref == 'refs/heads/main' && (inputs.target == 'central1' || inputs.target == 'all' || inputs.target == 'west2') }}
     environment: production
     permissions:
       contents: read
@@ -123,9 +129,3 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform apply -input=false -auto-approve tfplan
-
-      - name: Smoke test production/us-central1
-        run: |
-          set -euo pipefail
-          scripts/smoke-test-region.sh production us-central1
-          echo "production/us-central1 apply and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"

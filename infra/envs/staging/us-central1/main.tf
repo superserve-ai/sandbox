@@ -90,7 +90,28 @@ module "iam" {
   service_accounts = {
     superserve_api = {
       account_id   = "superserve-api"
-      display_name = "Superserve API (Cloud Run)"
+      display_name = "Superserve API (legacy runtime)"
+      description  = "Retained during migration to the dedicated staging runner account."
+    }
+    superserve_api_runtime = {
+      account_id   = "superserve-api-runtime"
+      display_name = "Superserve staging API runtime"
+      description  = "Runtime identity for the staging API service."
+    }
+    superserve_sandbox_runtime = {
+      account_id   = "superserve-sandbox-runtime"
+      display_name = "Superserve staging sandbox runtime"
+      description  = "Runtime identity for the staging sandbox host."
+    }
+    superserve_runner = {
+      account_id   = "superserve-runner"
+      display_name = "Superserve staging runtime (legacy)"
+      description  = "Retained during migration to separate API and sandbox runtime identities."
+    }
+    superserve_deployer = {
+      account_id   = "superserve-deployer"
+      display_name = "Superserve staging infrastructure deployer"
+      description  = "Terraform and deployment identity; not used by running workloads."
     }
     superserve_build = {
       account_id   = "superserve-build"
@@ -98,21 +119,100 @@ module "iam" {
     }
     superserve_github_actions = {
       account_id   = "superserve-github-actions"
-      display_name = "GitHub Actions CI/CD Service Account"
+      display_name = "GitHub Actions CI/CD Service Account (legacy)"
+      description  = "Retained for migration compatibility while workflows use the bootstrap identity."
     }
   }
   project_bindings = {
-    staging_host_collector_metric_writer = {
-      role    = "roles/monitoring.metricWriter"
-      members = ["serviceAccount:superserve-api@${local.project_id}.iam.gserviceaccount.com"]
+    staging_runtime_metric_writer = {
+      role = "roles/monitoring.metricWriter"
+      members = [
+        "serviceAccount:superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com",
+        "serviceAccount:superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com",
+      ]
     }
-    # The CD service account needs subnetworks.update to enable VPC flow logs
-    # (added in #257). Granted out-of-band to unblock the staging apply; imported
-    # (see imports.tf) so a rebuild adopts it instead of creating a duplicate.
-    # Prod's CD SA already carries networkAdmin.
+    staging_runtime_log_writer = {
+      role = "roles/logging.logWriter"
+      members = [
+        "serviceAccount:superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com",
+        "serviceAccount:superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com",
+      ]
+    }
+    staging_deployer_compute_instance_admin = {
+      role    = "roles/compute.instanceAdmin.v1"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_compute_network_admin = {
+      role    = "roles/compute.networkAdmin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_compute_security_admin = {
+      role    = "roles/compute.securityAdmin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_compute_load_balancer_admin = {
+      role    = "roles/compute.loadBalancerAdmin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_compute_os_admin_login = {
+      role    = "roles/compute.osAdminLogin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_iap_tunnel_accessor = {
+      role    = "roles/iap.tunnelResourceAccessor"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_run_admin = {
+      role    = "roles/run.admin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    # Account creation and project/secret IAM policy changes are bootstrap-only
+    # operations. Keeping those permissions off the routine deployer prevents
+    # it from escalating itself or changing unrelated identities and secrets.
+    staging_deployer_service_account_viewer = {
+      role    = "roles/iam.serviceAccountViewer"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_secret_viewer = {
+      role    = "roles/secretmanager.viewer"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_artifact_registry_writer = {
+      role    = "roles/artifactregistry.writer"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_vpc_access_admin = {
+      role    = "roles/vpcaccess.admin"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_monitoring_editor = {
+      role    = "roles/monitoring.editor"
+      members = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    # Temporary compatibility grant for the legacy workflow's VPC flow-log
+    # path. Replace it with a narrower grant or remove it when authentication
+    # migrates to the routine deployer.
     cd_network_admin = {
       role    = "roles/compute.networkAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+  }
+  service_bindings = {
+    staging_deployer_can_run_as_runtime = {
+      service_account = "projects/${local.project_id}/serviceAccounts/superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com"
+      role            = "roles/iam.serviceAccountUser"
+      members         = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    staging_deployer_can_run_as_sandbox_runtime = {
+      service_account = "projects/${local.project_id}/serviceAccounts/superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com"
+      role            = "roles/iam.serviceAccountUser"
+      members         = ["serviceAccount:superserve-deployer@${local.project_id}.iam.gserviceaccount.com"]
+    }
+  }
+  workload_identity = {
+    github_sandbox = {
+      service_account = "projects/${local.project_id}/serviceAccounts/superserve-deployer@${local.project_id}.iam.gserviceaccount.com"
+      principal       = "principalSet://iam.googleapis.com/projects/669325949364/locations/global/workloadIdentityPools/github-pool/attribute.repository/superserve-ai/sandbox"
     }
   }
   labels = local.common_labels
@@ -141,7 +241,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api"
-  service_account_email = module.iam.service_account_emails["superserve_api"]
+  service_account_email = module.iam.service_account_emails["superserve_api_runtime"]
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
     API_PORT                    = "8080"
@@ -174,7 +274,10 @@ module "api" {
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
 
-  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
+  depends_on = [
+    google_secret_manager_secret_iam_member.new_api_runtime_system_team_id,
+    google_secret_manager_secret_iam_member.api_runtime_secrets,
+  ]
 }
 resource "google_compute_disk" "sandbox_data" {
   project = local.project_id
@@ -203,11 +306,62 @@ resource "google_compute_attached_disk" "sandbox_data" {
 
   deletion_policy = "PREVENT"
 }
-resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
+# Preserve the existing legacy SYSTEM_TEAM_ID grant in state while creating the
+# replacement runtime grant at a distinct address. This prevents a remove/add
+# window for old Cloud Run revisions during the service-account cutover.
+moved {
+  from = google_secret_manager_secret_iam_member.api_runtime_system_team_id
+  to   = google_secret_manager_secret_iam_member.legacy_api_runtime_system_team_id
+}
+
+resource "google_secret_manager_secret_iam_member" "legacy_api_runtime_system_team_id" {
   project   = local.project_id
   secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+
+resource "google_secret_manager_secret_iam_member" "new_api_runtime_system_team_id" {
+  project   = local.project_id
+  secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api_runtime"]}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
+  for_each = toset([
+    coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}"),
+    coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}"),
+    coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}"),
+    coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}"),
+  ])
+
+  project   = local.project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api_runtime"]}"
+}
+
+resource "google_storage_bucket_iam_member" "deployer_terraform_state" {
+  bucket = "superserve-terraform-state"
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${module.iam.service_account_emails["superserve_deployer"]}"
+}
+
+resource "google_storage_bucket_iam_member" "deployer_terraform_state_reader" {
+  bucket = "superserve-terraform-state"
+  role   = "roles/storage.legacyBucketReader"
+  member = "serviceAccount:${module.iam.service_account_emails["superserve_deployer"]}"
+}
+
+# The bootstrap identity creates this bucket. The routine deployer only needs
+# storage administration inside the one staging artifact bucket managed here.
+resource "google_storage_bucket_iam_member" "deployer_artifact_bucket_admin" {
+  bucket = "superserve-artifacts"
+  role   = "roles/storage.admin"
+  member = "serviceAccount:${module.iam.service_account_emails["superserve_deployer"]}"
+
+  depends_on = [module.artifact_storage]
 }
 
 module "sandbox_host" {
@@ -229,10 +383,11 @@ module "sandbox_host" {
     sandbox_role = "vmd"
   })
 
-  service_account_email = module.iam.service_account_emails["superserve_api"]
-  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
-  boot_disk_size_gb     = 200
-  can_ip_forward        = true
+  service_account_email     = module.iam.service_account_emails["superserve_sandbox_runtime"]
+  allow_stopping_for_update = true
+  boot_disk_image           = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_size_gb         = 200
+  can_ip_forward            = true
 
   metadata = {
     startup-script = <<-EOT
