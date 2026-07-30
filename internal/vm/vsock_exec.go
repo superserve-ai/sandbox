@@ -70,9 +70,22 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 }
 
 // Keep-alives disabled for the same IP-reuse reason as boxdHTTPClient.
+// The timeout absorbs transient in-guest stalls (a freshly-restored guest's
+// first disk write can block for several seconds), so a slow-but-healthy
+// init isn't misread as a dead one.
 var boxdInitClient = &http.Client{
-	Timeout:   5 * time.Second,
+	Timeout:   15 * time.Second,
 	Transport: &http.Transport{DisableKeepAlives: true},
+}
+
+// postBoxdInitRetried retries a failed /init once. /init merges env vars and
+// re-applies the hostname, so a duplicate delivery is harmless.
+func postBoxdInitRetried(ctx context.Context, vmIP string, envVars map[string]string, hostname string) error {
+	err := postBoxdInit(ctx, vmIP, envVars, hostname)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	return postBoxdInit(ctx, vmIP, envVars, hostname)
 }
 
 

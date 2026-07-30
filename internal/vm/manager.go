@@ -2940,6 +2940,24 @@ func isReservedRunDirName(name string) bool {
 	return name == templateDirName || name == TemplatesDirName
 }
 
+// AbortResume reverts a freshly-resumed VM back to Paused when a post-restore
+// step fails after ResumeVM returned. The unit is stopped and the record
+// re-marked Paused so the host matches the caller's view of a failed resume.
+// A restore never mutates the snapshot artifacts it resumed from, so a later
+// resume simply restores them again.
+func (m *Manager) AbortResume(vmID string) {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return
+	}
+	m.stopUnitDuringRestoreError(vmID)
+	inst.mu.Lock()
+	inst.Status = StatusPaused
+	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
+	inst.mu.Unlock()
+	m.persistState(inst)
+}
+
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
 // aborts after Firecracker started. Uses a fresh context because the
 // caller's gRPC ctx is often already cancelled (deadline exceeded under
