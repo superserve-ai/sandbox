@@ -44,7 +44,7 @@ func (c *instrumentedVMDClient) DestroyInstance(ctx context.Context, instanceID 
 	return c.next.DestroyInstance(ctx, instanceID, force)
 }
 
-func (c *instrumentedVMDClient) PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error) {
+func (c *instrumentedVMDClient) PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, err error) {
 	started := time.Now()
 	defer func() { c.record(ctx, "PauseVM", started, err) }()
 	return c.next.PauseInstance(ctx, instanceID, snapshotDir)

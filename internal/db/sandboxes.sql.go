@@ -1128,7 +1128,12 @@ upserted AS (
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
-    size_bytes = EXCLUDED.size_bytes,
+    -- A finalize that has no fresh measurement passes 0 (resume_revert
+    -- reuses the prior pause's unchanged artifacts); keep the recorded
+    -- size instead of clobbering it back to zero.
+    size_bytes = CASE WHEN EXCLUDED.size_bytes > 0
+                      THEN EXCLUDED.size_bytes
+                      ELSE snapshot.size_bytes END,
     trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 )

@@ -46,14 +46,25 @@ func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest
 }
 
 func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*vmdpb.PauseVMResponse, error) {
-	snapshotPath, memPath, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir())
+	snapshotPath, memPath, manifest, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir())
 	if err != nil {
 		return nil, err
+	}
+	entries := make([]*vmdpb.ArtifactManifestEntry, 0, len(manifest))
+	for _, e := range manifest {
+		entries = append(entries, &vmdpb.ArtifactManifestEntry{
+			FileName:  e.FileName,
+			Path:      e.Path,
+			SizeBytes: e.SizeBytes,
+			Sha256:    e.SHA256,
+			BasePath:  e.BasePath,
+		})
 	}
 	return &vmdpb.PauseVMResponse{
 		VmId:         req.GetVmId(),
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
+		Manifest:     entries,
 	}, nil
 }
 
