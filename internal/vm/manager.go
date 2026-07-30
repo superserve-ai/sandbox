@@ -2945,9 +2945,26 @@ func isReservedRunDirName(name string) bool {
 // re-marked Paused so the host matches the caller's view of a failed resume.
 // A restore never mutates the snapshot artifacts it resumed from, so a later
 // resume simply restores them again.
-func (m *Manager) AbortResume(vmID string) {
+//
+// expectPID is the PID the aborting caller's resume produced; the abort is
+// skipped when the VM has since moved on (destroyed, or re-resumed by a
+// retry with a fresh Firecracker), so a stale abort can't stop a healthy
+// successor. The op lock serializes against concurrent lifecycle work; if
+// another op holds it, that op owns the VM's fate and the abort yields.
+func (m *Manager) AbortResume(vmID string, expectPID int) {
+	unlock, ok := m.tryLockVMOp(vmID)
+	if !ok {
+		return
+	}
+	defer unlock()
 	inst, err := m.getInstance(vmID)
 	if err != nil {
+		return
+	}
+	inst.mu.Lock()
+	stale := inst.Status != StatusRunning || inst.PID != expectPID
+	inst.mu.Unlock()
+	if stale {
 		return
 	}
 	m.stopUnitDuringRestoreError(vmID)

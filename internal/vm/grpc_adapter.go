@@ -10,6 +10,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -66,22 +67,44 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
 	// per-binding proxy tokens are in the snapshot and don't need re-injection.
 	if len(req.GetEnvVars()) == 0 {
+		// Skipping /init drops the call that doubled as the boxd liveness
+		// gate, so gate explicitly: a resume must not report success for a
+		// guest whose agent never came back. /health answers from memory, so
+		// this stays immune to the in-guest disk stalls /init is prone to.
+		if err := a.mgr.waitForBoxd(ctx, inst.IP, 10*time.Second); err != nil {
+			a.mgr.AbortResume(req.GetVmId(), inst.PID)
+			return nil, status.Errorf(codes.Unavailable, "boxd not reachable after resume: %v", err)
+		}
 		// Hostname-only: stamp it in the background. The guest's first disk
 		// write after a restore can stall transiently, and a cosmetic stamp
 		// must not fail an otherwise-healthy resume.
 		go func(ip, id string) {
-			stampCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer sentrylog.Recover("resume-hostname-stamp")
+			stampCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if err := postBoxdInitRetried(stampCtx, ip, nil, vmHostname(id)); err != nil {
-				a.mgr.log.Warn().Err(err).Str("vm_id", id).Msg("background hostname stamp failed after resume")
+			var lastErr error
+			for attempt := 0; attempt < 2; attempt++ {
+				// Slot IPs are recycled after destroy; re-check before each
+				// attempt so a delayed stamp can't label a different VM.
+				cur, err := a.mgr.getInstance(id)
+				if err != nil || cur.IP != ip || cur.Status != StatusRunning {
+					return
+				}
+				if lastErr = postBoxdInit(stampCtx, ip, nil, vmHostname(id)); lastErr == nil {
+					return
+				}
+				if stampCtx.Err() != nil {
+					break
+				}
 			}
+			a.mgr.log.Warn().Err(lastErr).Str("vm_id", id).Msg("background hostname stamp failed after resume")
 		}(inst.IP, inst.ID)
 	} else if err := postBoxdInitRetried(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); err != nil {
 		// Env vars must be in place before the caller unblocks user code, so
 		// this failure fails the resume — and the VM must not be left running
 		// behind it, or the record and the host diverge until an adoption or
 		// reconciler pass happens to converge them.
-		a.mgr.AbortResume(req.GetVmId())
+		a.mgr.AbortResume(req.GetVmId(), inst.PID)
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
