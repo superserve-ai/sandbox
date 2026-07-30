@@ -41,6 +41,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/pause", h.PauseSandbox)
 		api.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
 		api.PATCH("/sandboxes/:sandbox_id", h.PatchSandbox)
+		api.GET("/sandboxes/:sandbox_id/preview-ports", h.ListSandboxPreviewPorts)
+		api.POST("/sandboxes/:sandbox_id/preview-ports", h.PublishSandboxPreviewPort)
+		api.DELETE("/sandboxes/:sandbox_id/preview-ports/:port", h.UnpublishSandboxPreviewPort)
+		api.POST("/sandboxes/:sandbox_id/preview-ports/:port/token", h.MintSandboxPreviewToken)
+		api.POST("/sandboxes/:sandbox_id/preview-ports/:port/token/rotate", h.RotateSandboxPreviewToken)
 		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
 		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 
@@ -111,6 +116,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/sandboxes/:sandbox_id/egress_rules", h.GetSandboxEgressRules)
 		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
 		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
+		internal.GET("/billing", h.ListPlatformBilling)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)
