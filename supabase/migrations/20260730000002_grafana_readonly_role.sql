@@ -1,7 +1,14 @@
 -- Read-only Postgres role for the Grafana dashboard connection, kept
 -- distinct from the app's own database credentials (least privilege: no
 -- app secrets end up in Grafana, and this role can't write or see schemas
--- outside public).
+-- outside analytics).
+--
+-- Grants target the analytics schema, not public: every public base table
+-- has RLS enabled with no policy for this role, so a public grant would be
+-- silently unreadable. analytics views are the dedicated reporting surface
+-- (see 20260529000002_analytics_weekly_user_metrics.sql) and are not
+-- security_invoker, so they run with the view owner's privileges and stay
+-- readable through RLS.
 --
 -- Idempotent: re-running on a database that already has this role is a
 -- no-op. The role is created with a random throwaway password — the actual
@@ -22,6 +29,6 @@ BEGIN
 END
 $$;
 
-GRANT USAGE ON SCHEMA public TO grafana_readonly;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO grafana_readonly;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO grafana_readonly;
+GRANT USAGE ON SCHEMA analytics TO grafana_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO grafana_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA analytics GRANT SELECT ON TABLES TO grafana_readonly;
