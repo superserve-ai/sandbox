@@ -85,7 +85,10 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			var lastErr error
 			for attempt := 0; attempt < 2; attempt++ {
 				// Slot IPs are recycled after destroy; re-check before each
-				// attempt so a delayed stamp can't label a different VM.
+				// attempt so a delayed stamp can't label a different VM. The
+				// sub-ms check-to-connect window that remains is inherent to
+				// every IP-addressed boxd call racing a destroy; closing it
+				// takes a destroy-cancelled launch context, systemically.
 				cur, err := a.mgr.getInstance(id)
 				if err != nil || cur.IP != ip || cur.Status != StatusRunning {
 					return

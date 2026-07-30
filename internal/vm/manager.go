@@ -2972,7 +2972,10 @@ func (m *Manager) AbortResume(vmID string, expectPID int) {
 	inst.Status = StatusPaused
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
-	m.persistState(inst)
+	// Conditional: DestroyVM bypasses the op lock (see vmOpLocks) and may have
+	// deleted the record after the staleness check above; it owns the teardown
+	// then, and an unconditional write would resurrect a destroyed VM's record.
+	m.persistStateIfPresent(inst)
 }
 
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
