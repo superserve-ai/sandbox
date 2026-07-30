@@ -97,14 +97,19 @@ func TestDirectSpawnEnvAllowlist(t *testing.T) {
 
 // spawnDirect owns the cgroup dir fd: it must close it on every return, so no
 // caller can leak one directory fd per launch and none needs the fragile
-// keep-alive-then-close dance itself. A plain temp-dir fd is not a valid
-// CLONE_INTO_CGROUP target and the script does not exist, so cmd.Start fails
-// deterministically — no real cgroup or root needed — which exercises the
-// close-on-failure path.
+// keep-alive-then-close dance itself. Failure is forced by the cgroup fd (see
+// below), exercising the close-on-failure path.
 func TestSpawnDirectOwnsCgroupFD(t *testing.T) {
 	dir := t.TempDir()
 	cgroupDir, err := os.Open(dir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	// A valid script, so the ONLY reason Start fails is the cgroup fd: a plain
+	// temp-dir fd is not a valid CLONE_INTO_CGROUP target, so clone3 fails
+	// before the exec (no real cgroup or root needed).
+	script := filepath.Join(dir, "start.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	console, err := os.CreateTemp(dir, "console")
@@ -113,12 +118,12 @@ func TestSpawnDirectOwnsCgroupFD(t *testing.T) {
 	}
 	defer console.Close()
 
-	cmd, err := spawnDirect(filepath.Join(dir, "nonexistent.sh"), cgroupDir, console)
+	cmd, err := spawnDirect(script, cgroupDir, console)
 	if err == nil {
 		if cmd != nil && cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		t.Fatal("expected spawnDirect to fail on a non-cgroup fd / missing script")
+		t.Fatal("expected spawnDirect to fail: a plain temp-dir fd is not a valid CLONE_INTO_CGROUP target")
 	}
 	// Ownership contract: spawnDirect already closed cgroupDir, so a second
 	// Close returns an error. If it were still open, a caller retaining it would

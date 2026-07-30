@@ -109,7 +109,15 @@ type directSpawnResult struct {
 // Pdeathsig: children must outlive vmd; that is the survival property.
 func spawnDirect(scriptPath string, cgroupDir, console *os.File) (*exec.Cmd, error) {
 	defer cgroupDir.Close()
-	cmd := exec.Command(scriptPath)
+	// Exec /bin/sh with the script as an argument, not the script directly. A
+	// concurrent launch's fork can transiently inherit this freshly-written
+	// script's write fd (CLOEXEC closes it at exec, not at fork), and exec'ing a
+	// write-open file returns ETXTBSY — an intermittent launch failure under
+	// burst. /bin/sh is never written by vmd (never busy) and merely READS the
+	// script, so the race can't bite. Behaviorally identical: the script's
+	// #!/bin/sh shebang already runs it via /bin/sh, and every stage `exec`s so
+	// the chain stays a single PID in the cgroup.
+	cmd := exec.Command("/bin/sh", scriptPath)
 	cmd.Env = directSpawnEnv()
 	cmd.Stdout = console
 	cmd.Stderr = console

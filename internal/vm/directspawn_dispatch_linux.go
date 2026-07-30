@@ -198,6 +198,9 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	cmd, err := spawnDirect(scriptPath, cgDir, console)
 	console.Close() // the child holds its own dup; vmd's copy is done
 	if err != nil {
+		// Log locally: the error otherwise only surfaces as a gRPC failure at
+		// the control plane, hiding daemon-side launch faults from the journal.
+		m.log.Error().Str("vm_id", vmID).Err(err).Msg("direct spawn failed")
 		_ = m.cgroups.removeVMCgroup(context.WithoutCancel(ctx), vmID)
 		return 0, fmt.Errorf("spawn firecracker: %w", err)
 	}
