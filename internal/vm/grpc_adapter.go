@@ -205,7 +205,7 @@ func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSan
 	if jwt != "" {
 		envVars = InjectHTTPSProxyEnvWithJWT(envVars, a.sandboxProxyURL, jwt)
 	}
-	if err := postBoxdInit(ctx, inst.IP, envVars, vmHostname(vmID)); err != nil {
+	if err := postBoxdInitRetried(ctx, inst.IP, envVars, vmHostname(vmID)); err != nil {
 		return nil, status.Errorf(codes.Internal, "post-init failed: %v", err)
 	}
 	return &vmdpb.InjectSandboxEnvResponse{VmId: vmID}, nil
