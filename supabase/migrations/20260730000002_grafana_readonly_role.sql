@@ -10,11 +10,14 @@
 -- ever lands in git history.
 
 DO $$
+DECLARE
+    throwaway_password text := md5(random()::text || clock_timestamp()::text);
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'grafana_readonly') THEN
-        CREATE ROLE grafana_readonly WITH LOGIN
-            PASSWORD md5(random()::text || clock_timestamp()::text)
-            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+        EXECUTE format(
+            'CREATE ROLE grafana_readonly WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION',
+            throwaway_password
+        );
     END IF;
 END
 $$;
