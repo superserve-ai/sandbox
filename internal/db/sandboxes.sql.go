@@ -1339,6 +1339,59 @@ func (q *Queries) GetSandboxStatusForPreviewMutation(ctx context.Context, arg Ge
 	return status, err
 }
 
+const getSandboxWithPreviewPolicy = `-- name: GetSandboxWithPreviewPolicy :one
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL
+`
+
+type GetSandboxWithPreviewPolicyParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+type GetSandboxWithPreviewPolicyRow struct {
+	Sandbox Sandbox `json:"sandbox"`
+	Access  string  `json:"access"`
+}
+
+// GetSandbox plus the effective preview access, so read endpoints return
+// both in one round-trip.
+func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandboxWithPreviewPolicyParams) (GetSandboxWithPreviewPolicyRow, error) {
+	row := q.db.QueryRow(ctx, getSandboxWithPreviewPolicy, arg.ID, arg.TeamID)
+	var i GetSandboxWithPreviewPolicyRow
+	err := row.Scan(
+		&i.Sandbox.ID,
+		&i.Sandbox.TeamID,
+		&i.Sandbox.Name,
+		&i.Sandbox.Status,
+		&i.Sandbox.VcpuCount,
+		&i.Sandbox.MemoryMib,
+		&i.Sandbox.HostID,
+		&i.Sandbox.IpAddress,
+		&i.Sandbox.Pid,
+		&i.Sandbox.SnapshotID,
+		&i.Sandbox.CreatedAt,
+		&i.Sandbox.UpdatedAt,
+		&i.Sandbox.DestroyedAt,
+		&i.Sandbox.NetworkConfig,
+		&i.Sandbox.TimeoutSeconds,
+		&i.Sandbox.Metadata,
+		&i.Sandbox.TemplateID,
+		&i.Sandbox.SnapshotPath,
+		&i.Sandbox.MemPath,
+		&i.Sandbox.BasePath,
+		&i.Sandbox.DeltaPath,
+		&i.Sandbox.DiskMib,
+		&i.Sandbox.AutoDeleteSeconds,
+		&i.Sandbox.AutoDeleteAt,
+		&i.Access,
+	)
+	return i, err
+}
+
 const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
 SELECT DISTINCT base_path FROM sandbox
 WHERE base_path IS NOT NULL AND destroyed_at IS NULL

@@ -93,23 +93,6 @@ func (h *Handlers) loadPreviewPolicy(ctx context.Context, sandboxID, teamID uuid
 	return previewPolicySnapshot{Access: row.Access, WireAccess: row.WireAccess, Revision: row.Revision}, nil
 }
 
-type previewPolicyResult struct {
-	policy previewPolicySnapshot
-	err    error
-}
-
-// loadPreviewPolicyAsync overlaps the policy read with the caller's sandbox
-// load (both keyed on sandbox+team, independent) instead of paying the two
-// round-trips serially. Buffered, so an unread result never leaks the goroutine.
-func (h *Handlers) loadPreviewPolicyAsync(ctx context.Context, sandboxID, teamID uuid.UUID) <-chan previewPolicyResult {
-	ch := make(chan previewPolicyResult, 1)
-	go func() {
-		policy, err := h.loadPreviewPolicy(ctx, sandboxID, teamID)
-		ch <- previewPolicyResult{policy: policy, err: err}
-	}()
-	return ch
-}
-
 func (h *Handlers) loadPreviewPolicySnapshot(ctx context.Context, sandboxID, teamID uuid.UUID) (previewPolicySnapshot, error) {
 	policy, err := h.loadPreviewPolicy(ctx, sandboxID, teamID)
 	if err != nil {

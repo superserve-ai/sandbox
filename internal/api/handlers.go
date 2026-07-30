@@ -444,19 +444,20 @@ func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
 // loadActiveOrResumeSandbox is like loadActiveSandbox but auto-resumes a
 // paused sandbox, and waits out the activate settle window on a
 // starting/resuming row before giving up. Any other non-active state
-// returns 409.
-func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
+// returns 409. Also returns the sandbox's effective preview access (read in
+// the same round-trip); "" when the sandbox is nil.
+func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, string) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	deadline := time.Now().Add(activateSettleWindow)
 	for {
-		sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		row, err := h.DB.GetSandboxWithPreviewPolicy(c.Request.Context(), db.GetSandboxWithPreviewPolicyParams{
 			ID:     sandboxID,
 			TeamID: teamID,
 		})
@@ -467,17 +468,28 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
 				respondError(c, ErrInternal)
 			}
-			return nil
+			return nil, ""
 		}
+		sandbox := row.Sandbox
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
-			return &sandbox
+			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
 			if !h.resumePausedSandbox(c, &sandbox, teamID) {
-				return nil
+				return nil, ""
 			}
 			sandbox.Status = db.SandboxStatusActive
-			return &sandbox
+			// Re-read the policy: a mutation can land during the multi-second
+			// resume, and the pre-resume snapshot would misreport it. Best-effort
+			// — a failed re-read serves the snapshot rather than failing a
+			// completed resume.
+			if fresh, ferr := h.DB.GetSandboxWithPreviewPolicy(c.Request.Context(), db.GetSandboxWithPreviewPolicyParams{
+				ID:     sandboxID,
+				TeamID: teamID,
+			}); ferr == nil {
+				return &sandbox, fresh.Access
+			}
+			return &sandbox, row.Access
 		case db.SandboxStatusStarting, db.SandboxStatusResuming:
 			// Likely the fire-and-forget activate write in flight (or a
 			// concurrent create/resume finishing); wait for the flip
@@ -487,10 +499,10 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 				continue
 			}
 			respondError(c, ErrInvalidState)
-			return nil
+			return nil, ""
 		default:
 			respondError(c, ErrInvalidState)
-			return nil
+			return nil, ""
 		}
 	}
 }
@@ -981,27 +993,12 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 		return
 	}
 
-	sandboxID, err := parseSandboxID(c)
-	if err != nil {
-		return
-	}
-
-	// Activate is the highest-volume lifecycle endpoint; overlap the policy
-	// read with the sandbox load so the no-op refresh stays one round-trip.
-	policyCh := h.loadPreviewPolicyAsync(c.Request.Context(), sandboxID, teamID)
-
-	sandbox := h.loadActiveOrResumeSandbox(c)
-	pr := <-policyCh
+	sandbox, previewAccess := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
 	}
-	if pr.err != nil {
-		log.Error().Err(pr.err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
-		respondError(c, ErrInternal)
-		return
-	}
 	resp := h.sandboxToResponseWithToken(*sandbox)
-	resp.PreviewAccess = pr.policy.Access
+	resp.PreviewAccess = previewAccess
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1599,15 +1596,10 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	// Overlap the preview-policy read with the sandbox read — independent, both
-	// keyed on (sandbox, team) — so it stays off this endpoint's critical path.
-	policyCh := h.loadPreviewPolicyAsync(c.Request.Context(), sandboxID, teamID)
-
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+	row, err := h.DB.GetSandboxWithPreviewPolicy(c.Request.Context(), db.GetSandboxWithPreviewPolicyParams{
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
-	pr := <-policyCh
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			respondError(c, ErrSandboxNotFound)
@@ -1617,14 +1609,10 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	sandbox := row.Sandbox
 
 	resp := h.sandboxToResponse(sandbox)
-	if pr.err != nil {
-		log.Error().Err(pr.err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	resp.PreviewAccess = pr.policy.Access
+	resp.PreviewAccess = row.Access
 	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
 	if permErr != nil {
 		log.Error().
@@ -1634,7 +1622,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 			Msg("RBAC sandbox token permission check failed")
 	} else if canWrite {
 		resp = h.sandboxToResponseWithToken(sandbox)
-		resp.PreviewAccess = pr.policy.Access
+		resp.PreviewAccess = row.Access
 	}
 	if !isConsoleImpersonation(c) {
 		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
@@ -2499,7 +2487,7 @@ func (h *Handlers) ListSandboxFiles(c *gin.Context) {
 		return
 	}
 
-	sandbox := h.loadActiveOrResumeSandbox(c)
+	sandbox, _ := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
 	}

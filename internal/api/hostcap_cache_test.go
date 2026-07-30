@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -89,9 +91,10 @@ func TestHostCapCacheKeyIncludesCapabilitySet(t *testing.T) {
 	}
 }
 
-// An expired positive is refreshed, and a refuting read evicts it rather than
-// letting the stale positive linger.
-func TestHostCapCacheExpiryAndEviction(t *testing.T) {
+// A TTL-expired positive is served through the grace window while one
+// background refresh runs; a refuting refresh evicts it, after which checks
+// read fresh. Past ttl+grace an entry is a plain miss.
+func TestHostCapCacheStaleGraceAndEviction(t *testing.T) {
 	var reads atomic.Int64
 	var answer atomic.Bool
 	answer.Store(true)
@@ -100,19 +103,75 @@ func TestHostCapCacheExpiryAndEviction(t *testing.T) {
 	h.hostCaps.ttl = 20 * time.Millisecond
 
 	ctx := context.Background()
-	if ok, _ := h.hostHasCapabilitiesCached(ctx, "host-a", []string{"preview_ports_v1"}); !ok {
+	caps := []string{"preview_ports_v1"}
+	if ok, _ := h.hostHasCapabilitiesCached(ctx, "host-a", caps); !ok {
 		t.Fatal("first read should attest")
 	}
-	time.Sleep(30 * time.Millisecond)
-	answer.Store(false) // capability lost while the entry expired
-	if ok, _ := h.hostHasCapabilitiesCached(ctx, "host-a", []string{"preview_ports_v1"}); ok {
-		t.Fatal("expired entry must re-read and see the lost capability")
+	time.Sleep(30 * time.Millisecond) // past TTL, inside the grace window
+	answer.Store(false)               // capability lost
+	if ok, _ := h.hostHasCapabilitiesCached(ctx, "host-a", caps); !ok {
+		t.Fatal("within grace the stale positive must still serve")
 	}
-	if ok, _ := h.hostHasCapabilitiesCached(ctx, "host-a", []string{"preview_ports_v1"}); ok {
-		t.Fatal("refuted entry must have been evicted, not served")
+	// That serve armed one background refresh; it sees the refuting read and
+	// evicts the entry, after which checks are fresh (and false).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ok, _ := h.hostHasCapabilitiesCached(ctx, "host-a", caps); !ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if got := reads.Load(); got != 3 {
-		t.Fatalf("DB reads = %d, want 3", got)
+	if ok, _ := h.hostHasCapabilitiesCached(ctx, "host-a", caps); ok {
+		t.Fatal("refuted entry must be evicted, not served")
+	}
+	if reads.Load() < 2 {
+		t.Fatalf("background refresh never ran (reads=%d)", reads.Load())
+	}
+
+	// Past ttl+grace an entry is a miss, not a stale serve.
+	c := &h.hostCaps
+	c.put("k2", time.Now().Add(-c.ttl-hostCapCacheStaleGrace-time.Millisecond))
+	if _, ok := c.get("k2", time.Now()); ok {
+		t.Fatal("entry past ttl+grace must be a miss")
+	}
+}
+
+// The transactional validate must issue the locked query; the pre-flight
+// cache must issue the unlocked one. Pins the routing so a refactor can't
+// silently drop FOR SHARE from the mutation path.
+func TestCapabilityQueryRouting(t *testing.T) {
+	var mu sync.Mutex
+	var sqls []string
+	mock := &mockDBTX{queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		mu.Lock()
+		sqls = append(sqls, sql)
+		mu.Unlock()
+		return &mockRow{scanFn: func(dest ...any) error {
+			*(dest[0].(*bool)) = true
+			return nil
+		}}
+	}}
+	q := db.New(mock)
+
+	if err := validateHostPreviewCapabilities(context.Background(), q, "host-a", "preview_ports_v1"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	first := sqls[0]
+	mu.Unlock()
+	if !strings.Contains(first, "-- name: HostHasCapabilities :one") || !strings.Contains(first, "FOR SHARE") {
+		t.Fatalf("transactional validate must use the locked query, got: %.60s", first)
+	}
+
+	h := &Handlers{DB: q}
+	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	mu.Lock()
+	last := sqls[len(sqls)-1]
+	mu.Unlock()
+	if !strings.Contains(last, "-- name: HostHasCapabilitiesUnlocked :one") || strings.Contains(last, "FOR SHARE") {
+		t.Fatalf("pre-flight must use the unlocked query, got: %.60s", last)
 	}
 }
 
