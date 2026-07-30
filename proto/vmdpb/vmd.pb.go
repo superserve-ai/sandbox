@@ -1809,12 +1809,11 @@ type RestoreSnapshotResponse struct {
 	IpAddress      string                 `protobuf:"bytes,3,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
 	Pid            uint32                 `protobuf:"varint,4,opt,name=pid,proto3" json:"pid,omitempty"`
 	ResourceLimits *ResourceLimits        `protobuf:"bytes,5,opt,name=resource_limits,json=resourceLimits,proto3" json:"resource_limits,omitempty"`
-	// Attests that this vmd understood and applied the request's preview policy
-	// fields. Set to the enforced capability name ("preview_ports_v1"); absent
-	// from a vmd that predates preview publication, whose silence would
-	// otherwise be indistinguishable from enforcement. Callers that require
-	// enforcement fail closed on a missing attestation instead of issuing a
-	// separate policy round-trip.
+	// Attests that this vmd applied the request's preview policy fields. The
+	// value is frozen at "preview_ports_v1"; future capabilities are attested
+	// additively, never by changing it (the proxy protocol header precedent).
+	// Empty means the vmd predates this field — it may still enforce, so
+	// callers attest such vmds via UpdateSandboxPreviewPolicy instead.
 	PreviewProtocol string `protobuf:"bytes,6,opt,name=preview_protocol,json=previewProtocol,proto3" json:"preview_protocol,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache

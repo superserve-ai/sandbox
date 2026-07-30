@@ -213,19 +213,19 @@ const vmdTimeout = 30 * time.Second
 // (pauseWithRetry deliberately differs on both points — any-error retry,
 // detached context — because a late pause reconciles state instead of
 // surprising the caller.)
-func retryTransientBoot(parent context.Context, sandboxID string, boot func(context.Context) (string, uint32, uint32, string, error)) (ip string, vcpu, memMiB uint32, previewProtocol string, retried bool, err error) {
-	attempt := func() (string, uint32, uint32, string, error) {
+func retryTransientBoot(parent context.Context, sandboxID string, boot func(context.Context) (string, uint32, uint32, error)) (ip string, vcpu, memMiB uint32, retried bool, err error) {
+	attempt := func() (string, uint32, uint32, error) {
 		ctx, cancel := context.WithTimeout(parent, vmdTimeout)
 		defer cancel()
 		return boot(ctx)
 	}
-	ip, vcpu, memMiB, previewProtocol, err = attempt()
+	ip, vcpu, memMiB, err = attempt()
 	if err == nil || !(isVMDDeadline(err) || isVMDUnavailable(err)) || parent.Err() != nil {
-		return ip, vcpu, memMiB, previewProtocol, false, err
+		return ip, vcpu, memMiB, false, err
 	}
 	log.Warn().Str("sandbox_id", sandboxID).Msg("vmd boot hit a transient — retrying once")
-	ip, vcpu, memMiB, previewProtocol, err = attempt()
-	return ip, vcpu, memMiB, previewProtocol, true, err
+	ip, vcpu, memMiB, err = attempt()
+	return ip, vcpu, memMiB, true, err
 }
 
 // asyncTimeout is the deadline for fire-and-forget DB writes.
@@ -651,9 +651,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// no matter which path it walks.
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
 	defer bootCancel()
-	ipAddress, actualVcpu, actualMemMiB, _, _, err := retryTransientBoot(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, string, error) {
-		ip, vcpu, memMiB, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
-		return ip, vcpu, memMiB, "", rerr
+	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
 	})
 	if err != nil {
 		if isVMDNotFound(err) {
@@ -1981,8 +1980,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, previewProtocol, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, string, error) {
-		return vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
+	// The closure runs synchronously inside retryTransientBoot; a retry
+	// overwrites the capture with the attempt that produced the returned VM.
+	var previewProtocol string
+	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
+		previewProtocol = protocol
+		return ip, vcpu, memMiB, err
 	})
 	tVmdEnd := time.Now()
 
@@ -2074,12 +2078,28 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// The boot response must attest the preview policy was applied — an older
-	// VMD ignores the additive request fields and would create a legacy
-	// all-port VM. Check before env injection or any 201-visible side effects
-	// so failure tears the VM down without exposing it.
-	if previewProtocol != preview.HostCapabilityPorts {
-		log.Error().Str("sandbox_id", sandboxID.String()).Str("preview_protocol", previewProtocol).Msg("VMD did not attest preview policy at restore")
+	// The boot must attest the preview policy was applied, before env
+	// injection or any 201-visible side effects, so failure tears the VM down
+	// without exposing it.
+	switch previewProtocol {
+	case preview.HostCapabilityPorts:
+		// Attested in the boot response.
+	case "":
+		// A VMD from before the response echo. It may still enforce the
+		// policy (the echo is newer than enforcement), so attest the way its
+		// generation supports: the policy RPC, which fails Unimplemented on a
+		// truly pre-policy VMD. Remove once the fleet echoes.
+		log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd boot response carries no preview attestation; attesting via the policy RPC (version skew)")
+		if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), previewAccess, nil, 0); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+			respondError(c, ErrInternal)
+			return
+		}
+	default:
+		// An unrecognized echo — fail closed rather than guess what it
+		// enforces.
+		log.Error().Str("sandbox_id", sandboxID.String()).Str("preview_protocol", previewProtocol).Msg("VMD attested an unknown preview protocol at restore")
 		h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
 		respondError(c, ErrInternal)
 		return

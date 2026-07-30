@@ -41,9 +41,10 @@ type stubVMD struct {
 	updatePreviewFn  func(ctx context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
-	// restoreNoPreviewProtocol models a vmd from before preview publication:
-	// RestoreSnapshot succeeds but returns no policy attestation.
-	restoreNoPreviewProtocol bool
+	// restorePreviewProtocol overrides the boot response's attestation echo;
+	// nil echoes the current capability. Point at "" to model a vmd from
+	// before the echo existed.
+	restorePreviewProtocol *string
 }
 
 type stubScheduler struct {
@@ -79,11 +80,9 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	return "10.0.0.1", 1, 1024, nil
 }
 func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string) (string, uint32, uint32, string, error) {
-	// A policy-aware vmd attests via the response; tests for the pre-policy
-	// generation set restoreNoPreviewProtocol.
 	protocol := preview.HostCapabilityPorts
-	if s.restoreNoPreviewProtocol {
-		protocol = ""
+	if s.restorePreviewProtocol != nil {
+		protocol = *s.restorePreviewProtocol
 	}
 	if s.restorePolicyFn != nil {
 		s.restorePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
@@ -1971,60 +1970,91 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 	}
 }
 
-func TestCreateSandbox_PreviewAttestationFailureFailsClosed(t *testing.T) {
-	// A vmd that predates preview publication boots the VM but returns no
-	// policy attestation in the RestoreSnapshot response; the create must
-	// tear the VM down before any 201-visible side effects.
-	t.Run("old vmd without attestation", func(t *testing.T) {
-		teamID := uuid.New()
-		sandboxID := uuid.New()
-		var destroyed, injected bool
-		vmd := &stubVMD{
-			restoreNoPreviewProtocol: true,
-			destroyFn: func(context.Context, string, bool) error {
-				destroyed = true
-				return nil
-			},
-			injectEnvFn: func(context.Context, string, map[string]string, string) error {
-				injected = true
-				return nil
-			},
-		}
-		mock := &mockDBTX{
-			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-				switch {
-				case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
-					return previewCapableHostRow()
-				case strings.Contains(sql, "INSERT INTO sandbox"):
-					return sandboxRow(db.Sandbox{
-						ID: sandboxID, TeamID: teamID, Name: "sb",
-						Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
-					})
-				case strings.Contains(sql, "FROM template"):
-					return templateRow(defaultReadyTemplate())
-				default:
-					return activityRow()
+// The boot echo drives attestation: an unknown echo fails closed; an empty
+// echo (a vmd from before the field) falls back to the policy RPC, whose
+// failure also fails closed.
+func TestCreateSandbox_PreviewAttestationSkewAndFailClosed(t *testing.T) {
+	empty, bogus := "", "bogus-protocol"
+	tests := []struct {
+		name       string
+		echo       *string
+		rpcErr     error
+		wantStatus int
+		wantRPC    bool
+	}{
+		{name: "empty echo falls back to the policy RPC", echo: &empty, wantStatus: http.StatusCreated, wantRPC: true},
+		{name: "empty echo and pre-policy vmd fails closed", echo: &empty, rpcErr: status.Error(codes.Unimplemented, "unknown method UpdateSandboxPreviewPolicy"), wantStatus: http.StatusInternalServerError, wantRPC: true},
+		{name: "unknown echo fails closed", echo: &bogus, wantStatus: http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			teamID := uuid.New()
+			sandboxID := uuid.New()
+			var destroyed, injected, rpcCalled bool
+			vmd := &stubVMD{
+				restorePreviewProtocol: tt.echo,
+				updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+					rpcCalled = true
+					if access != preview.AccessPublic || ports != nil || revision != 0 {
+						t.Errorf("fallback attestation = (%q, %#v, %d), want (public, nil, 0)", access, ports, revision)
+					}
+					return tt.rpcErr
+				},
+				destroyFn: func(context.Context, string, bool) error {
+					destroyed = true
+					return nil
+				},
+				injectEnvFn: func(context.Context, string, map[string]string, string) error {
+					injected = true
+					return nil
+				},
+			}
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+					switch {
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+						return previewCapableHostRow()
+					case strings.Contains(sql, "INSERT INTO sandbox"):
+						return sandboxRow(db.Sandbox{
+							ID: sandboxID, TeamID: teamID, Name: "sb",
+							Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+						})
+					case strings.Contains(sql, "FROM template"):
+						return templateRow(defaultReadyTemplate())
+					default:
+						return activityRow()
+					}
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					return pgconn.NewCommandTag("UPDATE 1"), nil
+				},
+			}
+
+			h := &Handlers{VMD: vmd, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if rpcCalled != tt.wantRPC {
+				t.Fatalf("policy RPC called = %v, want %v", rpcCalled, tt.wantRPC)
+			}
+			if tt.wantStatus == http.StatusCreated {
+				if destroyed {
+					t.Fatal("successful fallback attestation must not destroy the VM")
 				}
-			},
-			execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-				return pgconn.NewCommandTag("UPDATE 1"), nil
-			},
-		}
-
-		h := &Handlers{VMD: vmd, DB: db.New(mock)}
-		w := httptest.NewRecorder()
-		setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
-
-		if w.Code != http.StatusInternalServerError {
-			t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
-		}
-		if !destroyed {
-			t.Fatal("VM was not destroyed after preview attestation failure")
-		}
-		if injected {
-			t.Fatal("env injection ran before preview attestation succeeded")
-		}
-	})
+				return
+			}
+			if !destroyed {
+				t.Fatal("VM was not destroyed after preview attestation failure")
+			}
+			if injected {
+				t.Fatal("env injection ran before preview attestation succeeded")
+			}
+		})
+	}
 }
 
 func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {

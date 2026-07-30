@@ -352,9 +352,8 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	// retry as the user-facing boots — the background ctx never reads dead,
 	// which is right: a rollback landing late still beats marking the
 	// sandbox failed.
-	_, _, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, string, error) {
-		ip, vcpu, memMiB, rerr := vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath)
-		return ip, vcpu, memMiB, "", rerr
+	_, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, error) {
+		return vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath)
 	})
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")
