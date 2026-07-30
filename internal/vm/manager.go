@@ -895,14 +895,14 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// record must reach Paused (a retry against a Running record would
 	// re-diff an already-consumed dirty bitmap and destroy the overlay).
 	//
-	// Bound the stop path (both attempts + dead-check) to the caller's
-	// deadline so the handler can't run long past the ~30s pause RPC cap
-	// (stopUnit's expiry settle may probe ≤2s past it — bounded, and it only
-	// affects the log below, never what gets persisted). A timed-out pause
-	// converges anyway: the control plane retries pause to paused rather than
-	// reverting, and a straggler unit is reclaimed by the reconciler.
+	// Run the stop path (both attempts + dead-check) on a detached context
+	// with its own budget: a slow snapshot may have spent the caller's entire
+	// deadline, and inheriting it would kill the stop before it starts. The
+	// snapshot is durable and the record reaches Paused either way; the
+	// budget only bounds how long this handler lingers past the RPC, and a
+	// straggler unit is still reclaimed by the reconciler.
 	unit := systemdUnitName(vmID)
-	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
+	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), stopUnitBudget)
 	if err := stopUnit(stopCtx, unit); err != nil {
 		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
 		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
