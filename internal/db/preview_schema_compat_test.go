@@ -229,3 +229,29 @@ func TestHostHasCapabilitiesUnlockedRunsSameDivisionWithoutRowLock(t *testing.T)
 		t.Fatalf("unlocked relational division has %d NOT EXISTS clauses, want 2", got)
 	}
 }
+
+// The standalone policy query and the joined sandbox+policy query must derive
+// the effective access identically — a precedence change applied to one but
+// not the other would make read responses disagree with the policy engine.
+func TestEffectiveAccessExpressionMatchesAcrossQueries(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "sandboxes.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sandbox queries: %v", err)
+	}
+	queries := string(raw)
+	const expr = "COALESCE(p.default_access, p.access, 'legacy_public')::text AS access"
+	for _, name := range []string{"-- name: GetSandboxPreviewPolicy :one", "-- name: GetSandboxWithPreviewPolicy :one"} {
+		start := strings.Index(queries, name)
+		if start < 0 {
+			t.Fatalf("query block %q is missing", name)
+		}
+		end := strings.Index(queries[start:], ";")
+		if end < 0 {
+			t.Fatalf("query block %q has no terminator", name)
+		}
+		if !strings.Contains(queries[start:start+end], expr) {
+			t.Errorf("%q lost the shared effective-access expression %q", name, expr)
+		}
+	}
+}

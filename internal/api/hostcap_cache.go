@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,8 @@ import (
 // grace while one background flight refreshes it, and concurrent misses
 // coalesce. The fail-closed gates (transactional validation, VMD's post-boot
 // attestation) do not go through this cache. Cardinality is hosts ×
-// capability sets, so the map needs no eviction bound.
+// capability sets; puts sweep expired entries, so memory tracks the active
+// fleet.
 const (
 	// The TTL also bounds how long a just-fenced host or dropped capability
 	// can keep passing this pre-flight (the create path already tolerates the
@@ -91,6 +93,15 @@ func (c *hostCapCache) get(key string, now time.Time) (refresh, ok bool) {
 
 func (c *hostCapCache) put(key string, attestedAt time.Time) {
 	c.mu.Lock()
+	// Lazy sweep: drop entries past serving age (retired hosts are never read
+	// again, so read-time deletion alone would retain them). puts are at most
+	// one per key per TTL and the map is hosts × capability sets, so this is
+	// cheap.
+	for k, e := range c.m {
+		if attestedAt.Sub(e.attestedAt) > c.ttl+hostCapCacheStaleGrace {
+			delete(c.m, k)
+		}
+	}
 	c.m[key] = &hostCapEntry{attestedAt: attestedAt}
 	c.mu.Unlock()
 }
@@ -147,14 +158,17 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 	if c.ttl <= 0 {
 		return h.DB.HostHasCapabilitiesUnlocked(ctx, params)
 	}
-	key := hostID + "\x00" + strings.Join(capabilities, "\x00")
+	sorted := append([]string(nil), capabilities...)
+	sort.Strings(sorted)
+	key := hostID + "\x00" + strings.Join(sorted, "\x00")
 	refresh, ok := c.get(key, time.Now())
 	if ok {
 		if refresh {
 			go func() {
 				_, err := h.fetchHostCaps(context.Background(), key, params)
 				if err != nil {
-					log.Warn().Err(err).Msg("host capability refresh failed; serving stale until the grace window expires")
+					log.Warn().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).
+						Msg("host capability refresh failed; serving stale until the grace window expires")
 					c.refreshFailed(key)
 				}
 			}()

@@ -229,6 +229,10 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[21].(*int32) = s.DiskMib
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
+		if len(dest) == 25 {
+			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
+			*dest[24].(*string) = "legacy_public"
+		}
 		return nil
 	}}
 }
@@ -1545,6 +1549,12 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 	}
 	if body["vcpu_count"].(float64) != 2 {
 		t.Errorf("vcpu_count = %v, want 2", body["vcpu_count"])
+	}
+	// Pins the joined read's trailing access column through to the response —
+	// fails if GetSandboxWithPreviewPolicy's scan order or the handler
+	// plumbing breaks.
+	if body["preview_access"] != "legacy_public" {
+		t.Errorf("preview_access = %q, want legacy_public", body["preview_access"])
 	}
 }
 

@@ -134,6 +134,16 @@ func TestHostCapCacheStaleGraceAndEviction(t *testing.T) {
 	if _, ok := c.get("k2", time.Now()); ok {
 		t.Fatal("entry past ttl+grace must be a miss")
 	}
+
+	// A put sweeps expired entries, so retired hosts' keys don't accumulate.
+	c.put("retired", time.Now().Add(-c.ttl-hostCapCacheStaleGrace-time.Millisecond))
+	c.put("live", time.Now())
+	c.mu.Lock()
+	_, retired := c.m["retired"]
+	c.mu.Unlock()
+	if retired {
+		t.Fatal("put must sweep entries past serving age")
+	}
 }
 
 // The transactional validate must issue the locked query; the pre-flight
