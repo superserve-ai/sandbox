@@ -155,13 +155,10 @@ type HostHasCapabilitiesUnlockedParams struct {
 	HostID               string   `json:"host_id"`
 }
 
-// Same relational-division check as HostHasCapabilities, but without the row
-// lock: for standalone pre-flight callers (not inside a mutation transaction)
-// that only read the current capability state and act on the result
-// immediately. Omitting the lock keeps this read off the heartbeat writer's
-// row-lock path, so a burst of concurrent pre-flight checks against one host
-// does not serialize behind heartbeat updates. Transactional callers that must
-// pin the host across a commit use HostHasCapabilities instead.
+// HostHasCapabilities without the row lock, for standalone pre-flight reads
+// outside a mutation transaction: omitting the lock keeps concurrent checks
+// from serializing behind the host's heartbeat writer. Transactional callers
+// that must pin the host across a commit use HostHasCapabilities.
 func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (bool, error) {
 	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
 	var exists bool
