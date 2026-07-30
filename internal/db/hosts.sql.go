@@ -125,6 +125,50 @@ func (q *Queries) HostHasCapabilities(ctx context.Context, arg HostHasCapabiliti
 	return exists, err
 }
 
+const hostHasCapabilitiesUnlocked = `-- name: HostHasCapabilitiesUnlocked :one
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = $2
+    AND status = 'active'
+    AND last_heartbeat_at IS NOT NULL
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest($1::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+)
+`
+
+type HostHasCapabilitiesUnlockedParams struct {
+	RequiredCapabilities []string `json:"required_capabilities"`
+	HostID               string   `json:"host_id"`
+}
+
+// Same relational-division check as HostHasCapabilities, but without the row
+// lock: for standalone pre-flight callers (not inside a mutation transaction)
+// that only read the current capability state and act on the result
+// immediately. Omitting the lock keeps this read off the heartbeat writer's
+// row-lock path, so a burst of concurrent pre-flight checks against one host
+// does not serialize behind heartbeat updates. Transactional callers that must
+// pin the host across a commit use HostHasCapabilities instead.
+func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const insertHostCapability = `-- name: InsertHostCapability :exec
 INSERT INTO host_capability (host_id, capability, heartbeat_at)
 SELECT id, $1, last_heartbeat_at

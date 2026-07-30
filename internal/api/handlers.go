@@ -92,6 +92,11 @@ type Handlers struct {
 	// across requests. Built lazily from Pool on first use.
 	authzOnce sync.Once
 	authzSvc  *authz.Service
+
+	// hostCaps is the positive-only host-capability attestation cache used by
+	// the standalone pre-flight checks (see hostcap_cache.go). Zero value is
+	// ready to use.
+	hostCaps hostCapCache
 }
 
 // asyncBookkeeping runs fire-and-forget post-VMD work in a background
@@ -976,18 +981,27 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 		return
 	}
 
+	sandboxID, err := parseSandboxID(c)
+	if err != nil {
+		return
+	}
+
+	// Activate is the highest-volume lifecycle endpoint; overlap the policy
+	// read with the sandbox load so the no-op refresh stays one round-trip.
+	policyCh := h.loadPreviewPolicyAsync(c.Request.Context(), sandboxID, teamID)
+
 	sandbox := h.loadActiveOrResumeSandbox(c)
+	pr := <-policyCh
 	if sandbox == nil {
 		return
 	}
-	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandbox.ID, teamID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB GetSandboxPreviewPolicy failed")
+	if pr.err != nil {
+		log.Error().Err(pr.err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
 		respondError(c, ErrInternal)
 		return
 	}
 	resp := h.sandboxToResponseWithToken(*sandbox)
-	resp.PreviewAccess = policy.Access
+	resp.PreviewAccess = pr.policy.Access
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1585,10 +1599,15 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
+	// Overlap the preview-policy read with the sandbox read — independent, both
+	// keyed on (sandbox, team) — so it stays off this endpoint's critical path.
+	policyCh := h.loadPreviewPolicyAsync(c.Request.Context(), sandboxID, teamID)
+
 	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
+	pr := <-policyCh
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			respondError(c, ErrSandboxNotFound)
@@ -1600,13 +1619,12 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	}
 
 	resp := h.sandboxToResponse(sandbox)
-	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandboxID, teamID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
+	if pr.err != nil {
+		log.Error().Err(pr.err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	resp.PreviewAccess = policy.Access
+	resp.PreviewAccess = pr.policy.Access
 	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
 	if permErr != nil {
 		log.Error().
@@ -1616,7 +1634,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 			Msg("RBAC sandbox token permission check failed")
 	} else if canWrite {
 		resp = h.sandboxToResponseWithToken(sandbox)
-		resp.PreviewAccess = policy.Access
+		resp.PreviewAccess = pr.policy.Access
 	}
 	if !isConsoleImpersonation(c) {
 		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
