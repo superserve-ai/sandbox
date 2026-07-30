@@ -2321,7 +2321,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			// Stamp cgroup mode FIRST, unconditionally: even if the kill
 			// below fails (host contention), the published record must never
 			// say unit over a live cgroup, or a later destroy stops a
-			// nonexistent unit and a resume launches a unit alongside it.
+			// nonexistent unit and a resume launches a unit alongside it. This
+			// is a no-op when the record already says cgroup (the common clean
+			// reattach), so capture the disagreement before overwriting it —
+			// only an ACTUAL correction is worth a WARN, not every reattach.
+			wasNonCgroup := !cgroupSupervised(rec.Supervision)
 			rec.Supervision = SupervisionCgroup
 			if rec.Status == StatusPaused {
 				// A paused VM has no live process — this is a mid-resume
@@ -2330,7 +2334,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				// backstops (the record is now cgroup-mode).
 				log.Warn().Msg("live cgroup for a paused record — killing mid-resume orphan")
 				_ = m.stopVM(ctx, rec.ID, SupervisionCgroup)
-			} else {
+			} else if wasNonCgroup {
+				// Only when the record actually disagreed with the live cgroup
+				// (a crash mid unit→cgroup flip), never on a clean reattach.
 				log.Warn().Msg("live cgroup with a non-cgroup record — corrected supervision to cgroup")
 			}
 		}
