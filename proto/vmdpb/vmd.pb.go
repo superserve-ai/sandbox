@@ -1809,8 +1809,15 @@ type RestoreSnapshotResponse struct {
 	IpAddress      string                 `protobuf:"bytes,3,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
 	Pid            uint32                 `protobuf:"varint,4,opt,name=pid,proto3" json:"pid,omitempty"`
 	ResourceLimits *ResourceLimits        `protobuf:"bytes,5,opt,name=resource_limits,json=resourceLimits,proto3" json:"resource_limits,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Attests that this vmd understood and applied the request's preview policy
+	// fields. Set to the enforced capability name ("preview_ports_v1"); absent
+	// from a vmd that predates preview publication, whose silence would
+	// otherwise be indistinguishable from enforcement. Callers that require
+	// enforcement fail closed on a missing attestation instead of issuing a
+	// separate policy round-trip.
+	PreviewProtocol string `protobuf:"bytes,6,opt,name=preview_protocol,json=previewProtocol,proto3" json:"preview_protocol,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RestoreSnapshotResponse) Reset() {
@@ -1876,6 +1883,13 @@ func (x *RestoreSnapshotResponse) GetResourceLimits() *ResourceLimits {
 		return x.ResourceLimits
 	}
 	return nil
+}
+
+func (x *RestoreSnapshotResponse) GetPreviewProtocol() string {
+	if x != nil {
+		return x.PreviewProtocol
+	}
+	return ""
 }
 
 // InjectSandboxEnv pushes env vars into a running sandbox's boxd. When
@@ -3551,7 +3565,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\vPreviewPort\x12\x12\n" +
 	"\x04port\x18\x01 \x01(\x05R\x04port\x12\x16\n" +
 	"\x06access\x18\x02 \x01(\tR\x06access\x12#\n" +
-	"\rtoken_version\x18\x03 \x01(\x03R\ftokenVersion\"\xcc\x01\n" +
+	"\rtoken_version\x18\x03 \x01(\x03R\ftokenVersion\"\xf7\x01\n" +
 	"\x17RestoreSnapshotResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +
@@ -3559,7 +3573,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\n" +
 	"ip_address\x18\x03 \x01(\tR\tipAddress\x12\x10\n" +
 	"\x03pid\x18\x04 \x01(\rR\x03pid\x12J\n" +
-	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\"\xdf\x01\n" +
+	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12)\n" +
+	"\x10preview_protocol\x18\x06 \x01(\tR\x0fpreviewProtocol\"\xdf\x01\n" +
 	"\x17InjectSandboxEnvRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12R\n" +
 	"\benv_vars\x18\x02 \x03(\v27.superserve.vmd.v1.InjectSandboxEnvRequest.EnvVarsEntryR\aenvVars\x12\x1f\n" +

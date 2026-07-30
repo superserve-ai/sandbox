@@ -143,6 +143,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			VcpuCount: inst.Config.VCPU,
 			MemoryMib: inst.Config.MemoryMiB,
 		},
+		// Attests the request's policy fields were applied (see vmd.proto).
+		PreviewProtocol: preview.HostCapabilityPorts,
 	}, nil
 }
 

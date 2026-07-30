@@ -367,6 +367,13 @@ message RestoreSnapshotResponse {
   string ip_address = 3;
   uint32 pid = 4;
   ResourceLimits resource_limits = 5;
+  // Attests that this vmd understood and applied the request's preview policy
+  // fields. Set to the enforced capability name ("preview_ports_v1"); absent
+  // from a vmd that predates preview publication, whose silence would
+  // otherwise be indistinguishable from enforcement. Callers that require
+  // enforcement fail closed on a missing attestation instead of issuing a
+  // separate policy round-trip.
+  string preview_protocol = 6;
 }
 
 // InjectSandboxEnv pushes env vars into a running sandbox's boxd. When
