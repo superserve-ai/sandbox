@@ -309,7 +309,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		TeamID:    sbx.TeamID,
 		Path:      snapshotPath,
 		MemPath:   &memPath,
-		SizeBytes: manifestTotalBytes(manifest),
+		SizeBytes: manifestCompleteBytes(manifest),
 		Trigger:   "timeout",
 	})
 	if err != nil {

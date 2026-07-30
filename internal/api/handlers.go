@@ -2428,7 +2428,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			TeamID:    teamID,
 			Path:      snapshotPath,
 			MemPath:   &memPath,
-			SizeBytes: manifestTotalBytes(manifest),
+			SizeBytes: manifestCompleteBytes(manifest),
 			Trigger:   "pause",
 		})
 		if err != nil {

@@ -782,7 +782,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
-		return snapshotPath, memPath, collectPauseManifest(snapshotPath, retryDiskPath, retryDiskBase, log), nil
+		return snapshotPath, memPath, collectPauseManifest(ctx, snapshotPath, retryDiskPath, retryDiskBase, log), nil
 	}
 	inst.mu.RUnlock()
 
@@ -919,10 +919,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	stopCancel()
 
 	// Hash the durable artifacts once the unit is stopped and the files are
-	// at rest. Not bound to the RPC ctx: a nearly-consumed deadline must not
-	// produce a paused VM with no integrity record when a few more seconds
-	// of local file IO completes it.
-	manifest = collectPauseManifest(snapshotPath, diskPath, diskBasePath, log)
+	// at rest. Runs under its own budget derived from the RPC deadline (see
+	// collectPauseManifest): large disks must not pin this handler past the
+	// pause RPC cap, or the control plane times out and retries against an
+	// already-stopped unit; a budget-exhausted hash just yields a partial
+	// manifest, never a late response.
+	manifest = collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused

@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -18,7 +19,7 @@ func TestHashFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sum, size, err := hashFile(path)
+	sum, size, err := hashFile(context.Background(), path)
 	if err != nil {
 		t.Fatalf("hashFile: %v", err)
 	}
@@ -30,7 +31,7 @@ func TestHashFile(t *testing.T) {
 		t.Errorf("sha256 = %s, want %s", sum, hex.EncodeToString(want[:]))
 	}
 
-	if _, _, err := hashFile(filepath.Join(dir, "missing")); err == nil {
+	if _, _, err := hashFile(context.Background(), filepath.Join(dir, "missing")); err == nil {
 		t.Error("hashFile on a missing file should error")
 	}
 }
@@ -46,7 +47,7 @@ func TestCollectPauseManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries := collectPauseManifest(vmstate, rootfs, "/base/base.ext4", zerolog.Nop())
+	entries := collectPauseManifest(context.Background(), vmstate, rootfs, "/base/base.ext4", zerolog.Nop())
 	if len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
@@ -76,13 +77,13 @@ func TestCollectPauseManifestDegradesOnMissingFiles(t *testing.T) {
 
 	// Missing disk file: manifest degrades to the surviving entry rather
 	// than failing the pause.
-	entries := collectPauseManifest(vmstate, filepath.Join(dir, "gone.ext4"), "", zerolog.Nop())
+	entries := collectPauseManifest(context.Background(), vmstate, filepath.Join(dir, "gone.ext4"), "", zerolog.Nop())
 	if len(entries) != 1 || entries[0].FileName != "vmstate.snap" {
 		t.Fatalf("expected only vmstate entry, got %+v", entries)
 	}
 
 	// Empty disk path (no disk recorded on the instance): same degradation.
-	entries = collectPauseManifest(vmstate, "", "", zerolog.Nop())
+	entries = collectPauseManifest(context.Background(), vmstate, "", "", zerolog.Nop())
 	if len(entries) != 1 {
 		t.Fatalf("expected only vmstate entry, got %+v", entries)
 	}

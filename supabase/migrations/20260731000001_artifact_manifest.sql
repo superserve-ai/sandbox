@@ -33,3 +33,8 @@ CREATE UNIQUE INDEX artifact_manifest_snapshot_file
 CREATE UNIQUE INDEX artifact_manifest_template_file
     ON artifact_manifest (template_id, file_name)
     WHERE template_id IS NOT NULL;
+
+-- Internal table (only the control plane touches it, over the direct DB
+-- connection): RLS on with no policies, so the anon/authenticated roles get
+-- no access. Same pattern as quota_alert_state.
+ALTER TABLE artifact_manifest ENABLE ROW LEVEL SECURITY;
