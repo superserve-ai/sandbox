@@ -1633,13 +1633,26 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// not a single probe, so a warming VM passes. Resume adoption
 		// deliberately skips this (detached-probe contract).
 		if err := adoptionBoxdReady(ctx, m, existing.IP); err != nil {
-			// A definitive timeout: this crash-window VM never became healthy.
-			// Left Running, the readiness-blind resume adoption would
-			// resurrect it forever (the resume fallback reverts to paused
-			// without destroying). Error breaks both adoption gates and the
-			// stop clears the dead unit, so the next attempt boots fresh.
+			// Classify before acting: only a definitive timeout says anything
+			// about the VM.
+			m.mu.RLock()
+			still := m.vms[vmID] == existing
+			m.mu.RUnlock()
+			if !still {
+				// A destroy raced the wait; match the sibling destroyed-paths.
+				return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
+			}
+			if ctx.Err() != nil {
+				// The caller went away — no verdict on the VM, no teardown.
+				return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, err)
+			}
+			// Definitive exhaustion: flip out of Running so the
+			// readiness-blind resume adoption cannot resurrect it (the resume
+			// fallback reverts without destroying). No unit stop — boxd-dead
+			// does not prove guest-dead, and killing a live guest over a
+			// wedged agent is the false-negative the removed probe fell into;
+			// the reconciler owns a truly dead unit.
 			m.setStatus(vmID, StatusError)
-			m.stopUnitDuringRestoreError(vmID)
 			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
 		}
 		// The wait stretched the adoption window; re-check identity after it,
