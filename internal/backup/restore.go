@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -125,16 +126,9 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureFreshDir(destDir); err != nil {
-		return nil, err
-	}
-	// Pin the destination: every per-file open, verify, and cleanup below is
-	// relative to this directory descriptor, so a symlink swapped in for
-	// destDir (or planted inside it) after the freshness check cannot
-	// redirect writes elsewhere.
-	root, err := os.OpenRoot(destDir)
+	root, err := openFreshDir(destDir)
 	if err != nil {
-		return nil, fmt.Errorf("dest dir: %w", err)
+		return nil, err
 	}
 	defer root.Close()
 	var created []string
@@ -169,26 +163,61 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	return manifest, nil
 }
 
-// ensureFreshDir creates destDir (and parents) or accepts an existing but
-// empty directory. Anything else is refused; see RestoreGeneration.
-func ensureFreshDir(dir string) error {
-	// A symlink at dir itself would be followed by MkdirAll and everything
-	// after it, redirecting the restore to wherever it points. Require a
-	// real directory (or nothing) at the path.
+// openFreshDir creates dir (and parents) if needed, requires it to be a
+// real, empty directory, and returns a Root pinned to it. Every per-file
+// open, verify, and cleanup in the restore runs relative to that pinned
+// descriptor.
+//
+// The leaf is checked through a Root on the parent: a symlink at dir must
+// never be followed, whether pre-planted (the plain Lstat and the pinned
+// re-check both refuse it) or swapped in concurrently. os.Root methods do
+// follow symlinks, but only confined within the root (absolute targets and
+// escapes error), so even a leaf link raced past the re-check cannot
+// anchor the restore outside dir's parent; and once the Root is open it
+// tracks the directory itself, unaffected by later renames at the path.
+func openFreshDir(dir string) (*os.Root, error) {
+	dir = filepath.Clean(dir)
 	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("dest dir %s is a symlink: restore only writes into a real directory", dir)
+		return nil, fmt.Errorf("dest dir %s is a symlink: restore only writes into a real directory", dir)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("dest dir: %w", err)
+		return nil, fmt.Errorf("dest dir: %w", err)
 	}
-	entries, err := os.ReadDir(dir)
+	parent, err := os.OpenRoot(filepath.Dir(dir))
 	if err != nil {
-		return fmt.Errorf("dest dir: %w", err)
+		return nil, fmt.Errorf("dest dir parent: %w", err)
 	}
-	if len(entries) != 0 {
-		return fmt.Errorf("dest dir %s is not empty: restore refuses to overwrite existing content, use a fresh directory", dir)
+	defer parent.Close()
+	base := filepath.Base(dir)
+	fi, err := parent.Lstat(base)
+	if err != nil {
+		return nil, fmt.Errorf("dest dir: %w", err)
 	}
-	return nil
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("dest dir %s is a symlink: restore only writes into a real directory", dir)
+	}
+	root, err := parent.OpenRoot(base)
+	if err != nil {
+		return nil, fmt.Errorf("dest dir: %w", err)
+	}
+	// Emptiness is checked through the pinned Root so it holds for the
+	// directory actually being written, not whatever the path resolves to.
+	d, err := root.Open(".")
+	if err != nil {
+		root.Close()
+		return nil, fmt.Errorf("dest dir: %w", err)
+	}
+	names, err := d.Readdirnames(1)
+	d.Close()
+	if err != nil && !errors.Is(err, io.EOF) {
+		root.Close()
+		return nil, fmt.Errorf("dest dir: %w", err)
+	}
+	if len(names) != 0 {
+		root.Close()
+		return nil, fmt.Errorf("dest dir %s is not empty: restore refuses to overwrite existing content, use a fresh directory", dir)
+	}
+	return root, nil
 }
 
 func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation string) (*GenerationManifest, error) {
@@ -214,6 +243,19 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	if manifest.SandboxID != sandboxID || manifest.Generation != generation {
 		return nil, fmt.Errorf("manifest identity mismatch: %s records %s/%s, requested %s/%s",
 			object, manifest.SandboxID, manifest.Generation, sandboxID, generation)
+	}
+	// The manifest must also be self-authenticating: the generation prefix
+	// is the content address GenerationKey derives from the full file set,
+	// so the entries must reproduce it. A manifest with an entry dropped or
+	// a name, digest, or base dependency altered would otherwise pass the
+	// identity check and restore an incomplete or wrong file set with every
+	// remaining digest verifying.
+	files := make([]TaskFile, 0, len(manifest.Files))
+	for _, mf := range manifest.Files {
+		files = append(files, TaskFile{Name: mf.Name, SHA256: mf.SHA256, BasePath: mf.BasePath})
+	}
+	if key := GenerationKey(files); key != generation {
+		return nil, fmt.Errorf("manifest does not reproduce its generation key: file set derives %s, prefix is %s (entry dropped or altered)", key, generation)
 	}
 	return &manifest, nil
 }

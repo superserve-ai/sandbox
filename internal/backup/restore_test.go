@@ -30,18 +30,18 @@ func newMemBlobs() *memBlobs {
 	return &memBlobs{objects: map[string][]byte{}}
 }
 
-func (m *memBlobs) Create(_ context.Context, object string, r io.Reader) error {
+func (m *memBlobs) Create(_ context.Context, object string, r io.Reader) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.objects[object]; exists {
-		return nil // create-only dedupe
+		return false, nil // create-only dedupe
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return err
+		return false, err
 	}
 	m.objects[object] = data
-	return nil
+	return true, nil
 }
 
 func (m *memBlobs) NewReader(_ context.Context, object string) (io.ReadCloser, error) {
@@ -95,7 +95,6 @@ func writeRestoreFixture(t *testing.T, dir string) Task {
 	}
 	task := Task{
 		SandboxID:  "sb-restore",
-		Generation: "gen-r1",
 		Priority:   PriorityPause,
 		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC),
 	}
@@ -110,16 +109,26 @@ func writeRestoreFixture(t *testing.T, dir string) Task {
 			Name: name, Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data)),
 		})
 	}
+	// The generation is its content address, exactly as the pause hook
+	// derives it; restore verifies the manifest reproduces this key.
+	task.Generation = GenerationKey(task.Files)
 	return task
+}
+
+// genObject names an object under the fixture task's generation prefix.
+func genObject(task Task, name string) string {
+	return "sandboxes/" + task.SandboxID + "/" + task.Generation + "/" + name
 }
 
 // uploadFixture ships the task through the real Uploader into the store so
 // restore reads exactly what production writes: packed objects plus the
-// manifest completion object.
+// manifest completion object. The uploader persists per-object
+// verification state, so it gets a real journal.
 func uploadFixture(t *testing.T, store *memBlobs, task Task) {
 	t.Helper()
-	u := &Uploader{Store: store}
-	completed, err := u.uploadTask(context.Background(), task)
+	j, _ := testJournal(t)
+	u := &Uploader{Journal: j, Store: store}
+	completed, err := u.uploadTask(context.Background(), &task)
 	if err != nil || !completed {
 		t.Fatalf("upload fixture: completed=%v err=%v", completed, err)
 	}
@@ -170,7 +179,7 @@ func TestRestoreGenerationFailsOnCorruptObject(t *testing.T) {
 	// embeds the packing fingerprint, so find it by its stem.
 	var object string
 	for name := range store.objects {
-		if strings.HasPrefix(name, "sandboxes/sb-restore/gen-r1/overlay.ext4.p") {
+		if strings.HasPrefix(name, genObject(task, "overlay.ext4.p")) {
 			object = name
 		}
 	}
@@ -202,7 +211,7 @@ func TestRestoreGenerationMissingManifestIsIncomplete(t *testing.T) {
 	uploadFixture(t, store, task)
 	// Artifacts present, manifest gone: exactly what an interrupted upload
 	// leaves behind.
-	delete(store.objects, "sandboxes/sb-restore/gen-r1/manifest.json")
+	delete(store.objects, genObject(task, ManifestObject))
 
 	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
 	if !errors.Is(err, ErrGenerationIncomplete) {
@@ -227,6 +236,72 @@ func TestRestoreGenerationRejectsMisplacedManifest(t *testing.T) {
 	}
 }
 
+func TestRestoreGenerationRejectsManifestMissingEntries(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	// Drop one entry from the stored manifest: the identity fields still
+	// match and every remaining artifact verifies, so only recomputing the
+	// generation key from the file set catches the incomplete manifest.
+	manifestObject := genObject(task, ManifestObject)
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[manifestObject], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Files = manifest.Files[:1]
+	mutated, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[manifestObject] = mutated
+
+	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
+	if err == nil || !strings.Contains(err.Error(), "generation key") {
+		t.Fatalf("err = %v, want generation key mismatch", err)
+	}
+}
+
+func TestRestoreRootPinsDirAcrossSwap(t *testing.T) {
+	// Once the destination Root is open it tracks the directory itself: a
+	// symlink swapped in at the path afterwards must not redirect writes,
+	// and anything the swap points at must stay untouched.
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[genObject(task, ManifestObject)], &manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	base := t.TempDir()
+	destDir := filepath.Join(base, "dest")
+	root, err := openFreshDir(destDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	moved := filepath.Join(base, "moved")
+	elsewhere := t.TempDir()
+	if err := os.Rename(destDir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, destDir); err != nil {
+		t.Fatal(err)
+	}
+	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[1], root)
+	if err != nil || !madeFile {
+		t.Fatalf("restoreFile after dir swap: made=%v err=%v", madeFile, err)
+	}
+	if _, err := os.Stat(filepath.Join(moved, manifest.Files[1].Name)); err != nil {
+		t.Fatalf("file not written into the pinned directory: %v", err)
+	}
+	entries, err := os.ReadDir(elsewhere)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("symlink target written to: %d entries err=%v", len(entries), err)
+	}
+}
+
 func TestRestoreGenerationRejectsEntryWithoutObject(t *testing.T) {
 	task := writeRestoreFixture(t, t.TempDir())
 	store := newMemBlobs()
@@ -235,7 +310,7 @@ func TestRestoreGenerationRejectsEntryWithoutObject(t *testing.T) {
 	// A manifest entry without its recorded object name cannot be fetched
 	// safely: deriving the name from the file name would break the binding
 	// between extent table and packing.
-	manifestObject := "sandboxes/sb-restore/gen-r1/manifest.json"
+	manifestObject := genObject(task, ManifestObject)
 	var manifest GenerationManifest
 	if err := json.Unmarshal(store.objects[manifestObject], &manifest); err != nil {
 		t.Fatal(err)
@@ -302,7 +377,7 @@ func TestRestoreFileNeverOpensExistingDest(t *testing.T) {
 	store := newMemBlobs()
 	uploadFixture(t, store, task)
 	var manifest GenerationManifest
-	if err := json.Unmarshal(store.objects["sandboxes/sb-restore/gen-r1/manifest.json"], &manifest); err != nil {
+	if err := json.Unmarshal(store.objects[genObject(task, ManifestObject)], &manifest); err != nil {
 		t.Fatal(err)
 	}
 
@@ -385,7 +460,7 @@ func TestListGenerationsReportsOnlyComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(generations) != 1 || generations[0] != "gen-r1" {
-		t.Fatalf("generations = %v, want [gen-r1]", generations)
+	if len(generations) != 1 || generations[0] != task.Generation {
+		t.Fatalf("generations = %v, want [%s]", generations, task.Generation)
 	}
 }
