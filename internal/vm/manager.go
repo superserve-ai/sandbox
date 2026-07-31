@@ -1205,6 +1205,10 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.PID = pid
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
+	// A completed relaunch supersedes an interrupted restore's optimistic
+	// marker; left set, every resume retry would refuse adoption and roll
+	// the guest back again.
+	inst.Unverified = false
 	inst.DirtyTracked = dirtyTracked
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -2169,7 +2173,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	go func() {
 		defer sentrylog.Recover("restore-verified-persist")
 		defer handoff()
-		m.persistStateIfPresent(inst)
+		m.persistVerified(inst)
 	}()
 
 	log.Info().
@@ -2930,6 +2934,33 @@ func (m *Manager) persistStateIfPresent(inst *VMInstance) bool {
 		return true
 	}
 	return wrote
+}
+
+// persistVerified makes inst's verified state durable after readiness was
+// proven. PutIfPresent alone cannot recreate a record whose optimistic write
+// failed, and without one the running VM is invisible to the next reattach —
+// so a missing record for a still-tracked VM is recreated under the
+// persist-then-verify undo. That recheck is conclusive because every destroy
+// path untracks the VM before deleting its record.
+func (m *Manager) persistVerified(inst *VMInstance) {
+	if m.persistStateIfPresent(inst) {
+		return
+	}
+	// Absent record: either a destroy raced (leave it deleted) or the
+	// optimistic write failed and never created it.
+	m.mu.RLock()
+	_, tracked := m.vms[inst.ID]
+	m.mu.RUnlock()
+	if !tracked {
+		return
+	}
+	m.persistState(inst)
+	m.mu.RLock()
+	_, tracked = m.vms[inst.ID]
+	m.mu.RUnlock()
+	if !tracked {
+		m.deleteState(inst.ID)
+	}
 }
 
 // recordDeleted reports whether vmID's record is gone from the store (deleted

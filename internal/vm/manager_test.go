@@ -1472,3 +1472,59 @@ func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *
 		t.Fatal("successful re-verification must clear the durable marker")
 	}
 }
+
+// persistVerified must be able to recreate a record whose optimistic write
+// failed (the VM would otherwise be invisible to the next reattach) without
+// resurrecting one a concurrent destroy deleted.
+func TestPersistVerified(t *testing.T) {
+	newStore := func(t *testing.T) *StateStore {
+		t.Helper()
+		s, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		return s
+	}
+
+	t.Run("present record is updated", func(t *testing.T) {
+		store := newStore(t)
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Unverified: true}
+		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+		m.persistState(inst)
+		inst.Unverified = false
+		m.persistVerified(inst)
+		rec, err := store.Get("vm-1")
+		if err != nil || rec == nil {
+			t.Fatalf("get: rec=%v err=%v", rec, err)
+		}
+		if rec.Unverified {
+			t.Fatal("verified state must land on the existing record")
+		}
+	})
+
+	t.Run("missing record for a tracked VM is created", func(t *testing.T) {
+		store := newStore(t)
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+		m.persistVerified(inst) // the optimistic write never landed
+		rec, err := store.Get("vm-1")
+		if err != nil || rec == nil {
+			t.Fatalf("a tracked VM's record must be recreated, got rec=%v err=%v", rec, err)
+		}
+	})
+
+	t.Run("missing record for an untracked VM stays deleted", func(t *testing.T) {
+		store := newStore(t)
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+		m.persistVerified(inst) // a destroy already untracked and deleted it
+		rec, err := store.Get("vm-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec != nil {
+			t.Fatal("a destroyed VM's record must not be resurrected")
+		}
+	})
+}
