@@ -7,14 +7,15 @@
 DROP VIEW IF EXISTS analytics.weekly_team_spend;
 DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 
--- One row per team per billing hour. Plan/rate resolution mirrors
--- db/queries/billing.sql (GetTeamActivePricingPlan + ranked_rates), except
--- effective_at is each row's own u.hour_start rather than now(): this view
--- is queried over arbitrary historical ranges, so pricing must reflect what
--- was actually in effect during that hour. Resolving against now() instead
--- would retroactively reprice all history on every plan/rate change and
--- misprice any range spanning a transition entirely at today's rates
--- (caught in review on #304). LATERAL correlates the resolution per row.
+-- One row per team per billing hour, priced as of that hour rather than
+-- now(): this view is queried over arbitrary historical ranges, so
+-- resolving against the current wall clock would retroactively reprice
+-- all history on every plan/rate change. Mirrors the point-in-time
+-- pattern in db/queries/billing.sql (ListPricingRatesForPlanAt), not the
+-- current-state pattern (GetTeamActivePricingPlan) — no p.active filter,
+-- since a plan being deactivated today doesn't undo what was effective
+-- during its actual assignment window. LATERAL correlates the resolution
+-- to each row's own hour_start.
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
 SELECT t.name AS team_name,
        u.hour_start,
@@ -30,7 +31,6 @@ CROSS JOIN LATERAL (
         FROM team_pricing_plan tpp
         JOIN pricing_plan p ON p.key = tpp.plan_key
         WHERE tpp.team_id = u.team_id
-          AND p.active
           AND tpp.effective_from <= u.hour_start
           AND (tpp.effective_to IS NULL OR tpp.effective_to > u.hour_start)
         ORDER BY tpp.effective_from DESC
@@ -40,7 +40,7 @@ CROSS JOIN LATERAL (
 LEFT JOIN LATERAL (
     SELECT price_usd FROM pricing_rate r
     JOIN pricing_plan p ON p.key = r.plan_key
-    WHERE r.plan_key = tp.plan_key AND r.resource = 'vcpu' AND p.active
+    WHERE r.plan_key = tp.plan_key AND r.resource = 'vcpu'
       AND r.effective_from <= u.hour_start
       AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
     ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
@@ -49,7 +49,7 @@ LEFT JOIN LATERAL (
 LEFT JOIN LATERAL (
     SELECT price_usd FROM pricing_rate r
     JOIN pricing_plan p ON p.key = r.plan_key
-    WHERE r.plan_key = tp.plan_key AND r.resource = 'memory_gib' AND p.active
+    WHERE r.plan_key = tp.plan_key AND r.resource = 'memory_gib'
       AND r.effective_from <= u.hour_start
       AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
     ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
@@ -58,7 +58,7 @@ LEFT JOIN LATERAL (
 LEFT JOIN LATERAL (
     SELECT price_usd FROM pricing_rate r
     JOIN pricing_plan p ON p.key = r.plan_key
-    WHERE r.plan_key = tp.plan_key AND r.resource = 'storage_gib' AND p.active
+    WHERE r.plan_key = tp.plan_key AND r.resource = 'storage_gib'
       AND r.effective_from <= u.hour_start
       AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
     ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
