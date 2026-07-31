@@ -719,3 +719,31 @@ func rebuildTask(vmID string, manifest []ManifestEntry) backup.Task {
 		Priority:   backup.PriorityPause,
 	}
 }
+
+// enqueueTemplateBackup hands a completed template build's hashed artifact
+// set to the backup pipeline. Same contract as enqueueBackup: a nil hook
+// (backup disabled) is a no-op, and the enqueue is a local journal write
+// that must never fail the build. Template builds ride the pause priority:
+// a finished build is user-visible durability exactly like a pause, and
+// build volume is far too low to starve the pause lane.
+func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []ManifestEntry) {
+	if m.backupEnqueue == nil || len(manifest) == 0 {
+		return
+	}
+	files := make([]backup.TaskFile, 0, len(manifest))
+	for _, e := range manifest {
+		files = append(files, backup.TaskFile{
+			Name:   e.FileName,
+			Path:   e.Path,
+			SHA256: e.SHA256,
+			Size:   e.SizeBytes,
+		})
+	}
+	m.backupEnqueue(backup.Task{
+		TemplateID: templateID,
+		BuildID:    buildID,
+		Generation: backup.GenerationKey(files),
+		Files:      files,
+		Priority:   backup.PriorityPause,
+	})
+}

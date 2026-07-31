@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -39,6 +40,11 @@ const (
 	hashSafetyMargin = 3 * time.Second
 	// hashBudgetCap bounds hashing when the caller has no deadline.
 	hashBudgetCap = 60 * time.Second
+	// buildHashBudget bounds hashing a finished build's artifact set. Builds
+	// are not latency-critical the way pause is, so the budget is generous:
+	// it exists to keep a wedged disk from pinning the build worker forever,
+	// not to shave seconds off the pause RPC.
+	buildHashBudget = 10 * time.Minute
 )
 
 // hashFile streams path through sha256, returning the lowercase hex digest
@@ -232,4 +238,47 @@ func baseIdentity(path string) (string, error) {
 	// change is visible there.
 	return fmt.Sprintf("%s|%d|%d|%d|%d|%d",
 		path, st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano(), st.Ctim.Nano()), nil
+}
+
+// collectBuildManifest hashes every artifact file in a completed build's
+// snapshot directory except build.meta.json, which the caller rewrites with
+// these digests afterwards and hashes separately. Detached from the
+// caller's cancellation like collectPauseManifest: a build that already
+// produced valid artifacts should get its integrity record even if the
+// caller gives up during finalize. A file that misses the budget or fails
+// to hash is skipped with a warning; the caller decides whether what
+// remains is worth enqueueing.
+func collectBuildManifest(ctx context.Context, snapshotDir string, log zerolog.Logger) []ManifestEntry {
+	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildHashBudget)
+	defer cancel()
+
+	dirEntries, err := os.ReadDir(snapshotDir)
+	if err != nil {
+		log.Warn().Err(err).Str("dir", snapshotDir).Msg("build manifest: read artifact dir failed")
+		return nil
+	}
+	start := time.Now()
+	entries := make([]ManifestEntry, 0, len(dirEntries))
+	for _, de := range dirEntries {
+		if !de.Type().IsRegular() || de.Name() == buildMetaFilename {
+			continue
+		}
+		path := filepath.Join(snapshotDir, de.Name())
+		sum, size, err := hashFile(hctx, path)
+		if err != nil {
+			log.Warn().Err(err).Str("path", path).Msg("build manifest: hash failed, entry skipped")
+			continue
+		}
+		entries = append(entries, ManifestEntry{
+			FileName:  de.Name(),
+			Path:      path,
+			SizeBytes: size,
+			SHA256:    sum,
+		})
+	}
+	log.Info().
+		Int("files", len(entries)).
+		Int64("manifest_hash_ms", time.Since(start).Milliseconds()).
+		Msg("build manifest computed")
+	return entries
 }

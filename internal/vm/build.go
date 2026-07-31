@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
@@ -192,8 +194,47 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		}
 	}
 
+	// Durability: hash the finished artifact set (access.log included when
+	// recorded above), stamp the digests into build.meta.json, and enqueue
+	// the build for backup. Best-effort by design: the artifacts on disk
+	// are valid regardless, so nothing in here fails the build.
+	m.backupBuildArtifacts(ctx, req.TemplateID, buildVMID, snapshotDir, log)
+
 	log.Info().Dur("total", time.Since(buildStart)).Msg("template build complete")
 	return result, nil
+}
+
+// backupBuildArtifacts makes a finished build's artifact directory durable:
+// hash the artifact set, record the digests into build.meta.json so the
+// on-host artifacts carry their integrity data the way pause artifacts do,
+// then enqueue the set (build.meta.json included) into the backup journal.
+func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMID, snapshotDir string, log zerolog.Logger) {
+	entries := collectBuildManifest(ctx, snapshotDir, log)
+	if len(entries) == 0 {
+		log.Warn().Str("dir", snapshotDir).
+			Msg("build manifest hashed no artifacts; build not enqueued for backup")
+		return
+	}
+	if err := writeBuildDigests(snapshotDir, entries); err != nil {
+		log.Warn().Err(err).Msg("recording artifact digests into build.meta.json failed")
+	}
+	// Hash build.meta.json last so the backed-up copy is the one carrying
+	// the digests it was just given; its own digest travels in the task
+	// (and the generation manifest), never inside itself.
+	metaPath := filepath.Join(snapshotDir, buildMetaFilename)
+	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	if sum, size, err := hashFile(hctx, metaPath); err != nil {
+		log.Warn().Err(err).Msg("hashing build.meta.json failed; backed-up set omits it")
+	} else {
+		entries = append(entries, ManifestEntry{
+			FileName:  buildMetaFilename,
+			Path:      metaPath,
+			SizeBytes: size,
+			SHA256:    sum,
+		})
+	}
+	m.enqueueTemplateBackup(templateID, buildVMID, entries)
 }
 
 // buildLogPipe parses NDJSON lines from template-builder's stdout and
@@ -247,9 +288,14 @@ func (p *buildLogPipe) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
+// buildMetaFilename is the metadata file template-builder writes into the
+// build's snapshot directory; vmd later stamps artifact digests into it
+// (writeBuildDigests).
+const buildMetaFilename = "build.meta.json"
+
 // readBuildMetaJSON reads the build.meta.json written by template-builder.
 func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
-	data, err := os.ReadFile(filepath.Join(snapshotDir, "build.meta.json"))
+	data, err := os.ReadFile(filepath.Join(snapshotDir, buildMetaFilename))
 	if err != nil {
 		return nil, err
 	}
@@ -274,4 +320,69 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		ResolvedDigest: meta.ResolvedDigest,
 		SizeBytes:      meta.SizeBytes,
 	}, nil
+}
+
+// buildArtifactDigest is one artifact's integrity record inside
+// build.meta.json's "artifacts" field.
+type buildArtifactDigest struct {
+	Name      string `json:"name"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// writeBuildDigests rewrites build.meta.json with an "artifacts" field
+// carrying the hashed artifact set. The document is edited as raw JSON so
+// every field template-builder wrote (including ones vmd does not model)
+// survives the round trip, and the replace is atomic so readers
+// (loadDurableBuild, the backup drain) never observe a torn file.
+func writeBuildDigests(snapshotDir string, entries []ManifestEntry) error {
+	path := filepath.Join(snapshotDir, buildMetaFilename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return fmt.Errorf("parse %s: %w", buildMetaFilename, err)
+	}
+	digests := make([]buildArtifactDigest, 0, len(entries))
+	for _, e := range entries {
+		digests = append(digests, buildArtifactDigest{
+			Name:      e.FileName,
+			SHA256:    e.SHA256,
+			SizeBytes: e.SizeBytes,
+		})
+	}
+	raw, err := json.Marshal(digests)
+	if err != nil {
+		return err
+	}
+	meta["artifacts"] = raw
+	out, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return err
+	}
+	if err := syncPath(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncPath(snapshotDir)
+}
+
+// syncPath fsyncs a file or directory by path.
+func syncPath(p string) error {
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
