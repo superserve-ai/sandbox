@@ -972,7 +972,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// probe the at-rest proof uses.
 	if stopConfirmed && m.unitConfirmedDead(ctx, vmID) {
 		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
-	} else {
+	} else if m.backupEnqueue != nil {
 		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
 		// The pause still owes its backup. Leave a pending marker AND a
 		// worker: the worker's first act re-persists the marker (healing
