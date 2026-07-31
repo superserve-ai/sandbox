@@ -179,14 +179,15 @@ type AnalyticsDailySandboxStart struct {
 	Starts int64       `json:"starts"`
 }
 
-type AnalyticsWeeklyTeamSandboxCount struct {
-	TeamName     string `json:"team_name"`
-	SandboxCount int64  `json:"sandbox_count"`
+type AnalyticsTeamHourlySpend struct {
+	TeamName  string         `json:"team_name"`
+	HourStart time.Time      `json:"hour_start"`
+	SpendUsd  pgtype.Numeric `json:"spend_usd"`
 }
 
-type AnalyticsWeeklyTeamSpend struct {
-	TeamName string         `json:"team_name"`
-	SpendUsd pgtype.Numeric `json:"spend_usd"`
+type AnalyticsTeamSandboxEvent struct {
+	TeamName  string    `json:"team_name"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type AnalyticsWeeklyUserMetric struct {

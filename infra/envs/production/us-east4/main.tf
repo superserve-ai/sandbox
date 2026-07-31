@@ -20,6 +20,12 @@ provider "google" {
 }
 
 locals {
+  cloud_ids_mirrored_subnet_self_links = [
+    module.network.subnetwork_self_link,
+  ]
+}
+
+locals {
   project_id             = var.project_id
   environment            = var.environment
   region                 = var.region
@@ -231,6 +237,19 @@ module "api_cert_lb" {
   neg_name = "superserve-api-use4-neg"
 }
 
+module "cloud_ids" {
+  source = "../../../modules/cloud-ids"
+
+  project_id                 = local.project_id
+  region                     = local.region
+  zone                       = local.zone
+  network_self_link          = module.network.network_self_link
+  endpoint_name              = "superserve-ids-${local.resource_suffix}"
+  mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
+  notification_channel_ids   = var.notification_channel_ids
+  labels                     = local.common_labels
+}
+
 module "sandbox_host" {
   source = "../../../modules/sandbox-host"
 
@@ -252,10 +271,12 @@ module "sandbox_host" {
   # flipping it to "ready" (to match the deployment-registry selector) is a
   # separate, intentional change, not part of this import PR.
   labels = merge(local.sandbox_host_labels, {
-    component               = "vmd"
-    sandbox_role            = "vmd"
-    sandbox_status          = "provisioning"
-    "goog-ops-agent-policy" = "v2-template-1-7-0"
+    component                  = "vmd"
+    sandbox_role               = "vmd"
+    sandbox_status             = "provisioning"
+    "goog-ops-agent-policy"    = "v2-template-1-7-0"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
   service_account_email = data.google_service_account.api_runner.email
@@ -333,6 +354,8 @@ module "backup_storage" {
   ]
 
   labels = merge(local.common_labels, {
-    component = "backup"
+    component                  = "backup"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_snapshots_and_files"
   })
 }
