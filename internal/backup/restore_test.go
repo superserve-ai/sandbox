@@ -200,6 +200,28 @@ func TestRestoreGenerationMissingManifestIsIncomplete(t *testing.T) {
 	}
 }
 
+func TestRestoreGenerationRefusesPopulatedDest(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	// A reused recovery directory holding a name-colliding file: restore
+	// must refuse rather than truncate it (or delete it during cleanup).
+	destDir := t.TempDir()
+	existing := filepath.Join(destDir, "overlay.ext4")
+	if err := os.WriteFile(existing, []byte("operator's earlier restore"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	if err == nil || !strings.Contains(err.Error(), "not empty") {
+		t.Fatalf("err = %v, want refusal of non-empty dest", err)
+	}
+	got, readErr := os.ReadFile(existing)
+	if readErr != nil || string(got) != "operator's earlier restore" {
+		t.Fatalf("pre-existing file disturbed: %q err=%v", got, readErr)
+	}
+}
+
 func TestListGenerationsReportsOnlyComplete(t *testing.T) {
 	task := writeRestoreFixture(t, t.TempDir())
 	store := newMemBlobs()

@@ -107,8 +107,13 @@ func ListGenerations(ctx context.Context, lister BlobLister, sandboxID string) (
 // RestoreGeneration materializes one complete generation into destDir:
 // fetch the manifest, rebuild each sparse artifact from its packed object
 // and extent table, and verify every file's full apparent content against
-// the manifest digest. On success destDir holds exactly the manifest's
-// files, verified.
+// the manifest digest. destDir must be absent or an empty directory; on
+// success it holds exactly the manifest's files, verified.
+//
+// Requiring a fresh destination is deliberate: restoring over existing
+// content would truncate name-colliding files (and follow any symlinks
+// planted there), and the failure cleanup below would then delete what it
+// clobbered. A recovery tool must never destroy state it did not create.
 //
 // Failure handling is all-or-nothing: any fetch, write, or digest failure
 // deletes every file this call created in destDir before returning. A
@@ -121,8 +126,8 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return nil, fmt.Errorf("dest dir: %w", err)
+	if err := ensureFreshDir(destDir); err != nil {
+		return nil, err
 	}
 	var created []string
 	fail := func(err error) (*GenerationManifest, error) {
@@ -152,6 +157,22 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		}
 	}
 	return manifest, nil
+}
+
+// ensureFreshDir creates destDir (and parents) or accepts an existing but
+// empty directory. Anything else is refused; see RestoreGeneration.
+func ensureFreshDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("dest dir: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("dest dir: %w", err)
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("dest dir %s is not empty: restore refuses to overwrite existing content, use a fresh directory", dir)
+	}
+	return nil
 }
 
 func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation string) (*GenerationManifest, error) {
