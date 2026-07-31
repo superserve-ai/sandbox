@@ -1128,9 +1128,39 @@ upserted AS (
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
-    size_bytes = EXCLUDED.size_bytes,
+    -- A finalize that has no complete manifest passes 0 (hash budget
+    -- exhausted or a file failed to hash); keep the recorded size instead
+    -- of clobbering it back to zero.
+    size_bytes = CASE WHEN EXCLUDED.size_bytes > 0
+                      THEN EXCLUDED.size_bytes
+                      ELSE snapshot.size_bytes END,
     trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
+),
+fresh AS (
+  SELECT unnest($7::text[]) AS file_name,
+         unnest($8::text[])      AS path,
+         unnest($9::bigint[])    AS size_bytes,
+         unnest($10::text[])    AS sha256,
+         unnest($11::text[]) AS base_path
+),
+kept AS (
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
+  SELECT u.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  FROM upserted u CROSS JOIN fresh f
+  ON CONFLICT (snapshot_id, file_name) WHERE snapshot_id IS NOT NULL
+  DO UPDATE SET
+      path = EXCLUDED.path,
+      size_bytes = EXCLUDED.size_bytes,
+      sha256 = EXCLUDED.sha256,
+      base_path = EXCLUDED.base_path,
+      created_at = now()
+  RETURNING id
+),
+cleared AS (
+  DELETE FROM artifact_manifest
+  WHERE snapshot_id IN (SELECT snap_id FROM upserted)
+    AND id NOT IN (SELECT id FROM kept)
 )
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM upserted),
@@ -1147,12 +1177,17 @@ RETURNING upserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseParams struct {
-	ID        uuid.UUID `json:"id"`
-	TeamID    uuid.UUID `json:"team_id"`
-	Path      string    `json:"path"`
-	MemPath   *string   `json:"mem_path"`
-	SizeBytes int64     `json:"size_bytes"`
-	Trigger   string    `json:"trigger"`
+	ID                uuid.UUID `json:"id"`
+	TeamID            uuid.UUID `json:"team_id"`
+	Path              string    `json:"path"`
+	MemPath           *string   `json:"mem_path"`
+	SizeBytes         int64     `json:"size_bytes"`
+	Trigger           string    `json:"trigger"`
+	ManifestFileNames []string  `json:"manifest_file_names"`
+	ManifestPaths     []string  `json:"manifest_paths"`
+	ManifestSizes     []int64   `json:"manifest_sizes"`
+	ManifestDigests   []string  `json:"manifest_digests"`
+	ManifestBasePaths []string  `json:"manifest_base_paths"`
 }
 
 // Upsert the sandbox's live snapshot row and flip status to 'paused'.
@@ -1163,6 +1198,13 @@ type FinalizePauseParams struct {
 // arm its auto-delete deadline.
 // One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
 // the UPSERT.
+// This pause rewrote the artifacts on disk, so the snapshot's manifest is
+// replaced in the same statement that finalizes the pause. Folding it in
+// (rather than a separate best-effort write) makes the manifest inherit
+// the status guard above: a finalize that lands late, after another pause
+// already finalized, matches zero rows and writes nothing, so an older
+// manifest can never overwrite a newer one. A pause whose hashing was
+// skipped or partial leaves exactly its partial set, never stale rows.
 func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, finalizePause,
 		arg.ID,
@@ -1171,6 +1213,11 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 		arg.MemPath,
 		arg.SizeBytes,
 		arg.Trigger,
+		arg.ManifestFileNames,
+		arg.ManifestPaths,
+		arg.ManifestSizes,
+		arg.ManifestDigests,
+		arg.ManifestBasePaths,
 	)
 	var snapshot_id uuid.UUID
 	err := row.Scan(&snapshot_id)

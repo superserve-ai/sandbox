@@ -385,15 +385,25 @@ func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force 
 	return nil
 }
 
-func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir string) (string, string, error) {
+func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir string) (string, string, []vmdclient.ManifestEntry, error) {
 	resp, err := c.client.PauseVM(ctx, &vmdpb.PauseVMRequest{
 		VmId:        vmID,
 		SnapshotDir: snapshotDir,
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("gRPC PauseVM: %w", err)
+		return "", "", nil, fmt.Errorf("gRPC PauseVM: %w", err)
 	}
-	return resp.SnapshotPath, resp.MemFilePath, nil
+	manifest := make([]vmdclient.ManifestEntry, 0, len(resp.GetManifest()))
+	for _, e := range resp.GetManifest() {
+		manifest = append(manifest, vmdclient.ManifestEntry{
+			FileName:  e.GetFileName(),
+			Path:      e.GetPath(),
+			SizeBytes: e.GetSizeBytes(),
+			SHA256:    e.GetSha256(),
+			BasePath:  e.GetBasePath(),
+		})
+	}
+	return resp.SnapshotPath, resp.MemFilePath, manifest, nil
 }
 
 func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {

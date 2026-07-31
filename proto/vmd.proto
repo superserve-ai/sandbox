@@ -273,6 +273,21 @@ message PauseVMResponse {
   string vm_id = 1;
   string snapshot_path = 2;
   string mem_file_path = 3;
+  // Integrity manifest for the pause's durable artifacts (disk state +
+  // vmstate). Memory files are deliberately absent: they never leave the
+  // host, and hashing multi-GiB mem images would stretch the pause RPC.
+  repeated ArtifactManifestEntry manifest = 4;
+}
+
+// ArtifactManifestEntry describes one finalized artifact file: its identity
+// (logical name + host path), integrity (sha256 + size), and, for overlay
+// files, the base file the artifact depends on to be restorable.
+message ArtifactManifestEntry {
+  string file_name = 1;   // logical name, e.g. "rootfs.ext4", "vmstate.snap"
+  string path = 2;        // absolute path on the host
+  int64 size_bytes = 3;
+  string sha256 = 4;      // lowercase hex
+  string base_path = 5;   // overlay dependency ("" when self-contained)
 }
 
 // ---------------------------------------------------------------------------

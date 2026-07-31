@@ -297,8 +297,8 @@ type stubVMD struct {
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
-func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, error) {
-	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil
+func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, []vmdclient.ManifestEntry, error) {
+	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, nil
 }
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
@@ -5146,5 +5146,88 @@ func TestIntegration_CreateTemplate_DuplicateLiveNameReturns409(t *testing.T) {
 	w := do(r, "POST", "/templates", apiKey, body)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// The pause manifest is replaced inside the FinalizePause statement, so it
+// inherits the status guard: a finalize that lands after another pause has
+// already finalized must write nothing, manifest included. This is the
+// stale-writer regression: without the fold-in, a delayed manifest write
+// from pause A could overwrite pause B's hashes on the shared snapshot row.
+func TestIntegration_FinalizePause_StaleFinalizeCannotOverwriteManifest(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"manifest-stale-writer"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	finalize := func(trigger, digest string, files ...string) (uuid.UUID, error) {
+		mem := "/snapshots/" + sid + "/mem.snap"
+		params := db.FinalizePauseParams{
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    "/snapshots/" + sid + "/vmstate.snap",
+			MemPath: &mem,
+			Trigger: trigger,
+		}
+		for _, f := range files {
+			params.ManifestFileNames = append(params.ManifestFileNames, f)
+			params.ManifestPaths = append(params.ManifestPaths, "/snapshots/"+sid+"/"+f)
+			params.ManifestSizes = append(params.ManifestSizes, 4096)
+			params.ManifestDigests = append(params.ManifestDigests, digest)
+			params.ManifestBasePaths = append(params.ManifestBasePaths, "")
+		}
+		return testQueries.FinalizePause(ctx, params)
+	}
+	manifestDigests := func(snapID uuid.UUID) map[string]string {
+		rows, err := testQueries.ListSnapshotManifest(ctx, pgtype.UUID{Bytes: snapID, Valid: true})
+		if err != nil {
+			t.Fatalf("list manifest: %v", err)
+		}
+		got := map[string]string{}
+		for _, r := range rows {
+			got[r.FileName] = r.Sha256
+		}
+		return got
+	}
+
+	digestA := strings.Repeat("aa", 32)
+	digestB := strings.Repeat("bb", 32)
+
+	// Pause A: full two-file manifest.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("force pausing: %v", err)
+	}
+	snapID, err := finalize("pause", digestA, "vmstate.snap", "rootfs.ext4")
+	if err != nil {
+		t.Fatalf("finalize A: %v", err)
+	}
+	if got := manifestDigests(snapID); len(got) != 2 || got["rootfs.ext4"] != digestA {
+		t.Fatalf("after A: manifest = %v, want 2 entries with digest A", got)
+	}
+
+	// Pause B: partial single-file manifest. A's stale rootfs row must go.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("force pausing: %v", err)
+	}
+	if _, err := finalize("pause", digestB, "vmstate.snap"); err != nil {
+		t.Fatalf("finalize B: %v", err)
+	}
+	if got := manifestDigests(snapID); len(got) != 1 || got["vmstate.snap"] != digestB {
+		t.Fatalf("after B: manifest = %v, want only vmstate with digest B", got)
+	}
+
+	// Stale finalize from A arrives after B: status is 'paused', so the
+	// status guard must reject the whole statement, manifest included.
+	if _, err := finalize("pause", digestA, "vmstate.snap", "rootfs.ext4"); err == nil {
+		t.Fatal("stale finalize succeeded; want status-guard rejection")
+	}
+	if got := manifestDigests(snapID); len(got) != 1 || got["vmstate.snap"] != digestB {
+		t.Fatalf("after stale write: manifest = %v, want B's untouched", got)
 	}
 }
