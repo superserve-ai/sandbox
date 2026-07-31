@@ -62,10 +62,18 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	if m.backupEnqueue == nil {
 		return manifest
 	}
+	if pauseManifestComplete(manifest) && m.enqueueBackup(vmID, manifest) {
+		m.deletePendingBackup(vmID, log)
+		return manifest
+	}
+	// The pause still owes its enqueue. Persist that fact BEFORE the
+	// async work: the goroutine below can run for minutes, and a crash
+	// or deploy inside its window would otherwise erase the only record
+	// that this pause needs coverage. Startup recovery re-runs pending
+	// records once reattach has rebuilt the instance map.
+	pb := PendingBackup{VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath}
+	m.persistPendingBackup(pb, log)
 	if pauseManifestComplete(manifest) {
-		if m.enqueueBackup(vmID, manifest) {
-			return manifest
-		}
 		// The hashes are good; only the journal write failed. Retry the
 		// write with the manifest already in hand: its digests describe
 		// pause-time bytes whatever the sandbox does next (the uploader's
@@ -78,63 +86,134 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	}
 	log.Warn().Str("vm_id", vmID).
 		Msg("pause backup not enqueueable synchronously; retrying with async rehash")
-	go func() {
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
-		defer cancel()
-		// The rehash must digest pause-time bytes, proven rather than
-		// assumed: a resume that writes and then QUIESCES before the
-		// hash would otherwise produce digests of post-resume bytes
-		// that verify cleanly and publish a manifest pairing a mutated
-		// disk with the pause-time vmstate. The instance must be paused
-		// on this same snapshot before and after the hash, and the disk
-		// inode must not have changed across it; any violation drops
-		// the rehash (a later re-pause enqueues its own generation).
-		before, err := os.Stat(diskPath)
-		if err != nil || !m.pausedAt(vmID, snapshotPath) {
-			log.Warn().Str("vm_id", vmID).
-				Msg("pause backup dropped: sandbox no longer at-rest for rehash")
-			return
-		}
-		retried := collectPauseManifest(rctx, snapshotPath, diskPath, diskBasePath, log)
-		after, err := os.Stat(diskPath)
-		if err != nil || !os.SameFile(before, after) ||
-			!before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() ||
-			!m.pausedAt(vmID, snapshotPath) {
-			log.Warn().Str("vm_id", vmID).
-				Msg("pause backup dropped: disk changed during rehash")
-			return
-		}
-		if !m.enqueueBackup(vmID, retried) {
-			if !pauseManifestComplete(retried) {
-				log.Error().Str("vm_id", vmID).
-					Msg("pause backup dropped: rehash also produced no enqueueable manifest")
-				return
-			}
-			// The rehash earned a complete manifest; a transient journal
-			// failure must not throw it away when the synchronous path's
-			// equivalent failure gets retries.
-			m.retryEnqueue(vmID, retried, log)
-		}
-	}()
+	go m.rehashPendingBackup(ctx, pb, log)
 	return manifest
+}
+
+// rehashPendingBackup rehashes a pause's artifacts off the RPC path and
+// enqueues them, proving at-rest bytes rather than assuming them: a
+// resume that writes and then QUIESCES before the hash would otherwise
+// produce digests of post-resume bytes that verify cleanly and publish a
+// manifest pairing a mutated disk with the pause-time vmstate. The proof
+// is threefold: the instance is paused on this snapshot, the systemd
+// unit is confirmed dead (the recorded status alone is not proof: pause
+// records StatusPaused even when its stop attempts failed, and resume
+// starts the unit before flipping the status), and the disk inode did
+// not change across the hash. Terminal outcomes clear the pending
+// record; only exhausted journal retries keep it for the next boot.
+func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
+	defer cancel()
+	before, err := os.Stat(pb.DiskPath)
+	if err != nil || !m.atRest(rctx, pb.VMID, pb.SnapshotPath) {
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("pause backup dropped: sandbox no longer at-rest for rehash")
+		m.deletePendingBackup(pb.VMID, log)
+		return
+	}
+	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
+	after, err := os.Stat(pb.DiskPath)
+	if err != nil || !os.SameFile(before, after) ||
+		!before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() ||
+		!m.atRest(rctx, pb.VMID, pb.SnapshotPath) {
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("pause backup dropped: disk changed during rehash")
+		m.deletePendingBackup(pb.VMID, log)
+		return
+	}
+	if m.enqueueBackup(pb.VMID, retried) {
+		m.deletePendingBackup(pb.VMID, log)
+		return
+	}
+	if !pauseManifestComplete(retried) {
+		log.Error().Str("vm_id", pb.VMID).
+			Msg("pause backup dropped: rehash also produced no enqueueable manifest")
+		m.deletePendingBackup(pb.VMID, log)
+		return
+	}
+	// The rehash earned a complete manifest; a transient journal failure
+	// must not throw it away when the synchronous path's equivalent
+	// failure gets retries.
+	m.retryEnqueue(pb.VMID, retried, log)
+}
+
+// RecoverPendingBackups re-runs every pause that still owed its backup
+// enqueue when the previous process exited. Call after reattach has
+// rebuilt the instance map: the at-rest proof reads it, and an empty map
+// would drop every record as superseded. No-op when backup is disabled
+// or persistence is off.
+func (m *Manager) RecoverPendingBackups(ctx context.Context, log zerolog.Logger) {
+	if m.backupEnqueue == nil || m.state == nil {
+		return
+	}
+	pending, err := m.state.ListPendingBackups()
+	if err != nil {
+		log.Error().Err(err).Msg("pending backup recovery: list failed")
+		return
+	}
+	for _, pb := range pending {
+		log.Info().Str("vm_id", pb.VMID).Msg("recovering pending pause backup")
+		go m.rehashPendingBackup(ctx, pb, log)
+	}
 }
 
 // retryEnqueue re-attempts a journal write for a manifest whose digests
 // already describe at-rest bytes: only the write failed, so no rehash
 // and no still-paused sandbox is needed (the uploader's pre-verification
 // catches divergence). Bounded backoff; a journal that keeps failing
-// drops the pause with an error log.
+// leaves the pending record for the next boot's recovery.
 func (m *Manager) retryEnqueue(vmID string, manifest []ManifestEntry, log zerolog.Logger) {
 	delay := time.Second
 	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
 		time.Sleep(delay)
 		delay *= 2
 		if m.enqueueBackup(vmID, manifest) {
+			m.deletePendingBackup(vmID, log)
 			return
 		}
 	}
 	log.Error().Str("vm_id", vmID).
-		Msg("pause backup dropped: journal writes kept failing")
+		Msg("pause backup journal writes kept failing; pending record kept for recovery")
+}
+
+// persistPendingBackup and deletePendingBackup tolerate a nil state
+// store (tests, persistence disabled): the async retry still runs, it
+// just loses crash durability.
+func (m *Manager) persistPendingBackup(pb PendingBackup, log zerolog.Logger) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.PutPendingBackup(pb); err != nil {
+		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("persist pending backup failed")
+	}
+}
+
+func (m *Manager) deletePendingBackup(vmID string, log zerolog.Logger) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.DeletePendingBackup(vmID); err != nil {
+		log.Error().Err(err).Str("vm_id", vmID).Msg("clear pending backup failed")
+	}
+}
+
+// atRest reports whether a sandbox's artifacts are provably not being
+// written: the instance is paused on exactly this snapshot AND the
+// systemd unit is confirmed dead. The recorded status alone is
+// insufficient in both directions: pause records StatusPaused even when
+// its stop attempts failed, and resume starts the unit before flipping
+// the status away from paused.
+func (m *Manager) atRest(ctx context.Context, vmID, snapshotPath string) bool {
+	return m.pausedAt(vmID, snapshotPath) && m.unitConfirmedDead(ctx, vmID)
+}
+
+// unitConfirmedDead consults systemd (overridable for tests via the
+// unitDead field) about whether the sandbox's unit is definitely stopped.
+func (m *Manager) unitConfirmedDead(ctx context.Context, vmID string) bool {
+	if m.unitDead != nil {
+		return m.unitDead(ctx, vmID)
+	}
+	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
 }
 
 // pausedAt reports whether the sandbox is currently paused on exactly

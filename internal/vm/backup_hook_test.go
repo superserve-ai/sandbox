@@ -29,9 +29,10 @@ func TestBackupPauseRetriesAsynchronouslyWhenBudgetExhausted(t *testing.T) {
 	}
 
 	tasks := make(chan backup.Task, 1)
-	m := &Manager{vms: map[string]*VMInstance{
-		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
-	}}
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
@@ -68,9 +69,10 @@ func TestBackupPauseNeverEnqueuesWithoutDiskDigest(t *testing.T) {
 	}
 
 	tasks := make(chan backup.Task, 1)
-	m := &Manager{vms: map[string]*VMInstance{
-		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
-	}}
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "missing.ext4"), "", zerolog.Nop())
@@ -96,9 +98,10 @@ func TestBackupPauseDropsRehashWhenSandboxNotAtRest(t *testing.T) {
 	}
 
 	tasks := make(chan backup.Task, 1)
-	m := &Manager{vms: map[string]*VMInstance{
-		"vm-1": {Status: StatusRunning, SnapshotPath: snap},
-	}}
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusRunning, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
@@ -128,9 +131,10 @@ func TestBackupPauseRetriesWhenJournalWriteFails(t *testing.T) {
 	}
 
 	var calls atomic.Int32
-	m := &Manager{vms: map[string]*VMInstance{
-		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
-	}}
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
 	m.SetBackupEnqueue(func(task backup.Task) error {
 		calls.Add(1)
 		return errors.New("no space left on device")
@@ -164,9 +168,10 @@ func TestBackupPauseRetriesEnqueueWithoutRehashing(t *testing.T) {
 	var calls atomic.Int32
 	tasks := make(chan backup.Task, 1)
 	// Deliberately NOT paused: the enqueue retry must not care.
-	m := &Manager{vms: map[string]*VMInstance{
-		"vm-1": {Status: StatusRunning, SnapshotPath: snap},
-	}}
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusRunning, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
 	m.SetBackupEnqueue(func(task backup.Task) error {
 		if calls.Add(1) == 1 {
 			return errors.New("transient journal failure")
@@ -215,9 +220,10 @@ func TestBackupPauseNeverEnqueuesWithoutVMStateDigest(t *testing.T) {
 	missingSnap := filepath.Join(dir, "vmstate.snap")
 
 	tasks := make(chan backup.Task, 1)
-	m := &Manager{vms: map[string]*VMInstance{
-		"vm-1": {Status: StatusPaused, SnapshotPath: missingSnap},
-	}}
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: missingSnap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	m.backupPause(context.Background(), "vm-1", missingSnap, disk, "", zerolog.Nop())
@@ -244,9 +250,10 @@ func TestBackupPauseRetriesJournalWriteAfterRehash(t *testing.T) {
 
 	var calls atomic.Int32
 	tasks := make(chan backup.Task, 1)
-	m := &Manager{vms: map[string]*VMInstance{
-		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
-	}}
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
 	m.SetBackupEnqueue(func(task backup.Task) error {
 		// First attempt is the rehash's own enqueue; fail it once.
 		if calls.Add(1) == 1 {
@@ -275,5 +282,135 @@ func TestBackupPauseRetriesJournalWriteAfterRehash(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("journal retry after rehash never delivered the task")
+	}
+}
+
+// A pause whose instance still reads paused but whose unit is not
+// confirmed dead must not rehash: resume starts the unit before it
+// flips the recorded status, so the status alone proves nothing.
+func TestBackupPauseDropsRehashWhenUnitNotDead(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
+	m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		t.Fatalf("enqueued %+v while the unit was not confirmed dead", task)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// A pause that exits before its rehash completes must survive as a
+// durable pending record, and startup recovery must finish the enqueue
+// and clear the record.
+func TestRecoverPendingBackupsFinishesTheEnqueue(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// The record a crashed process would have left behind.
+	if err := st.PutPendingBackup(PendingBackup{VMID: "vm-1", SnapshotPath: snap, DiskPath: disk}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.RecoverPendingBackups(context.Background(), zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		if task.SandboxID != "vm-1" {
+			t.Fatalf("recovered task owner = %q, want vm-1", task.SandboxID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("recovery never enqueued the pending backup")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err := st.ListPendingBackups()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending record not cleared after recovery: %+v", pending)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A recovered record whose sandbox has resumed (or vanished) is
+// superseded: recovery must clear it without enqueueing.
+func TestRecoverPendingBackupsDropsSupersededRecords(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutPendingBackup(PendingBackup{VMID: "vm-gone", SnapshotPath: "/x", DiskPath: "/y"}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.RecoverPendingBackups(context.Background(), zerolog.Nop())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err := st.ListPendingBackups()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("superseded record not cleared: %+v", pending)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case task := <-tasks:
+		t.Fatalf("recovery enqueued %+v for a vanished sandbox", task)
+	default:
 	}
 }

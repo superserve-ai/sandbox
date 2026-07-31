@@ -250,6 +250,9 @@ type Manager struct {
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
+	// unitDead overrides the systemd unit-dead probe in tests; nil means
+	// the real probe. See unitConfirmedDead.
+	unitDead func(ctx context.Context, vmID string) bool
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by
@@ -792,7 +795,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// that skip through a status the at-rest checks trust, so it
 		// backs up only once the unit is confirmed dead.
 		var manifest []ManifestEntry
-		if unitDefinitelyDead(ctx, systemdUnitName(vmID)) {
+		if m.unitConfirmedDead(ctx, vmID) {
 			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")

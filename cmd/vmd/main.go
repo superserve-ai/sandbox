@@ -701,6 +701,10 @@ func main() {
 		if reattached > 0 || stale > 0 {
 			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 		}
+		// After the instance map is rebuilt: pauses that still owed their
+		// backup enqueue when the previous process exited get their
+		// rehash re-run (no-op when backup is disabled).
+		mgr.RecoverPendingBackups(ctx, log)
 	}()
 
 	// ---- Optional DB connection for the reconciler ----

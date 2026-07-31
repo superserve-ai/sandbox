@@ -17,6 +17,10 @@ import (
 var (
 	bucketName              = []byte("vms")
 	previewPolicyBucketName = []byte("vm_preview_policies")
+	// pendingBackupBucketName records pauses whose backup enqueue has not
+	// completed: the async retry goroutine is not a durable record, and a
+	// crash or deploy during its window must not lose the pause's coverage.
+	pendingBackupBucketName = []byte("pending_backups")
 )
 
 // persistedPreviewPolicy is stored separately from VMRecord so a rollback to
@@ -181,6 +185,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 	if err := db.Update(func(tx *bolt.Tx) error {
 		records, err := tx.CreateBucketIfNotExists(bucketName)
 		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(pendingBackupBucketName); err != nil {
 			return err
 		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
@@ -598,4 +605,48 @@ func toInstance(rec VMRecord) *VMInstance {
 			BasePath:  rec.BasePath,
 		},
 	}
+}
+
+// PendingBackup is a durable marker that a pause still owes its backup
+// enqueue: the artifact paths to (re)hash and journal. Deleted once the
+// journal write lands or the pause is superseded.
+type PendingBackup struct {
+	VMID         string `json:"vm_id"`
+	SnapshotPath string `json:"snapshot_path"`
+	DiskPath     string `json:"disk_path"`
+	DiskBasePath string `json:"disk_base_path,omitempty"`
+}
+
+// PutPendingBackup records (or refreshes) a pause's owed backup.
+func (s *StateStore) PutPendingBackup(p PendingBackup) error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(pendingBackupBucketName).Put([]byte(p.VMID), data)
+	})
+}
+
+// DeletePendingBackup clears a pause's owed-backup marker.
+func (s *StateStore) DeletePendingBackup(vmID string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(pendingBackupBucketName).Delete([]byte(vmID))
+	})
+}
+
+// ListPendingBackups returns every pause still owing its backup enqueue.
+// Corrupt entries are skipped.
+func (s *StateStore) ListPendingBackups() ([]PendingBackup, error) {
+	var out []PendingBackup
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(pendingBackupBucketName).ForEach(func(k, v []byte) error {
+			var p PendingBackup
+			if json.Unmarshal(v, &p) == nil && p.VMID != "" {
+				out = append(out, p)
+			}
+			return nil
+		})
+	})
+	return out, err
 }
