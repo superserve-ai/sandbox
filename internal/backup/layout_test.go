@@ -26,3 +26,21 @@ func TestObjectNameRejectsTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerationKey(t *testing.T) {
+	base := []TaskFile{
+		{Name: "rootfs.ext4", SHA256: "aaaa"},
+		{Name: "vmstate.snap", SHA256: "bbbb"},
+	}
+	k1 := GenerationKey(base)
+	// Order-insensitive, deterministic.
+	k2 := GenerationKey([]TaskFile{base[1], base[0]})
+	if k1 != k2 || len(k1) != 64 {
+		t.Fatalf("keys differ or malformed: %q vs %q", k1, k2)
+	}
+	// Any changed artifact digest changes the generation, vmstate included.
+	changed := GenerationKey([]TaskFile{base[0], {Name: "vmstate.snap", SHA256: "cccc"}})
+	if changed == k1 {
+		t.Fatal("changed vmstate digest did not change the generation key")
+	}
+}

@@ -34,15 +34,24 @@ func NewGCSStore(client *storage.Client, bucket string) *GCSStore {
 }
 
 func (s *GCSStore) Create(ctx context.Context, object string, r io.Reader) error {
-	w := s.bucket.Object(object).If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
+	// The writer gets its own cancelable context: on a mid-copy failure the
+	// resumable session must be ABORTED, not closed. Close after a partial
+	// copy would finalize a truncated object, and create-only semantics
+	// would then turn every retry into a 412 "success" over corrupt bytes.
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w := s.bucket.Object(object).If(storage.Conditions{DoesNotExist: true}).NewWriter(wctx)
 	// Resumable-upload chunking: disk artifacts reach GiBs apparent but
 	// pack to tens of MB; 16MiB chunks keep memory bounded either way.
 	w.ChunkSize = 16 << 20
 	if _, err := io.Copy(w, r); err != nil {
-		_ = w.Close()
 		if isPreconditionExists(err) {
+			cancel()
+			_ = w.Close()
 			return nil
 		}
+		cancel() // abort the session so Close cannot finalize partial data
+		_ = w.Close()
 		return fmt.Errorf("write %s: %w", object, err)
 	}
 	if err := w.Close(); err != nil {

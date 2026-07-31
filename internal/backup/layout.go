@@ -6,14 +6,37 @@
 // Object layout is keyed by cell-portable identifiers, never host paths, so
 // a restore does not depend on which machine wrote the backup. A sandbox
 // generation is content-addressed by the disk artifact's sha256: re-uploading
-// the same pause (retry, or an unchanged disk) lands on the same object
-// names, which the bucket's create-only precondition turns into a no-op.
+// a genuine retry lands on the same object names, which the bucket's
+// create-only precondition turns into a no-op, while ANY changed artifact
+// yields a fresh generation (see GenerationKey), never a partial overlay
+// of old and new objects under one prefix.
 package backup
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 )
+
+// GenerationKey derives a generation's content address from the full
+// artifact set. Keying on a single artifact would let the others drift: a
+// re-pause with an unchanged disk but a fresh vmstate would reuse the old
+// prefix, and create-only dedupe would silently keep the stale objects.
+func GenerationKey(files []TaskFile) string {
+	lines := make([]string, 0, len(files))
+	for _, f := range files {
+		lines = append(lines, f.Name+"="+f.SHA256)
+	}
+	sort.Strings(lines)
+	h := sha256.New()
+	for _, l := range lines {
+		h.Write([]byte(l))
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // Object name templates. Generations are immutable once verified: nothing
 // ever overwrites an existing object (the writer identity cannot).
