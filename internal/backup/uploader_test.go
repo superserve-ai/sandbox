@@ -963,3 +963,59 @@ func TestRebuiltBaseAbandonsGeneration(t *testing.T) {
 		t.Fatalf("abandoned generation not acked: %v", counts)
 	}
 }
+
+// A second HOST (fresh journal, no verification history) deduping
+// against a shared base object another host uploaded must complete its
+// generation: shared-object trust is structural (content-addressed
+// name), not host-local history.
+func TestSharedBaseDedupeAcrossHosts(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	baseData := []byte("base bytes uploaded by host one")
+	if err := os.WriteFile(base, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSum := sha256.Sum256(baseData)
+	baseSHA := hex.EncodeToString(baseSum[:])
+
+	overlay := filepath.Join(dir, "rootfs.ext4")
+	odata := []byte("host two overlay")
+	if err := os.WriteFile(overlay, odata, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	osum := sha256.Sum256(odata)
+	task := Task{
+		SandboxID: "sb-host2", Generation: "gen", EnqueuedAt: time.Unix(1, 0),
+		Files: []TaskFile{{
+			Name: "rootfs.ext4", Path: overlay,
+			SHA256: hex.EncodeToString(osum[:]), Size: int64(len(odata)),
+			BasePath: base, BaseSHA256: baseSHA,
+		}},
+	}
+
+	// The store already holds the base object (host one uploaded it);
+	// host two's journal is fresh.
+	store := newMemStore()
+	bf, err := os.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents, apparent, err := Extents(bf)
+	bf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[SharedBaseObject(baseSHA, PackFingerprint(extents, apparent))] = baseData
+
+	j, _ := testJournal(t)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Journal: j, Store: store}
+	if _, err := u.drainOne(context.Background(), time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb-host2/gen/manifest.json"]; !ok {
+		t.Fatal("cross-host base dedupe abandoned the generation")
+	}
+}

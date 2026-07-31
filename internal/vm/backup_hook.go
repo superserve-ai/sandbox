@@ -70,26 +70,16 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	if m.backupEnqueue == nil {
 		return manifest
 	}
-	if pauseManifestComplete(manifest) && m.enqueueBackup(vmID, manifest) {
-		m.deletePendingBackup(vmID, log)
-		return manifest
-	}
-	// The pause still owes its enqueue. Persist that fact BEFORE the
-	// async work: the goroutine below can run for minutes, and a crash
-	// or deploy inside its window would otherwise erase the only record
-	// that this pause needs coverage. Startup recovery re-runs pending
-	// records once reattach has rebuilt the instance map.
+	// The RPC path stops at a millisecond marker write: staging copies
+	// artifact bytes when reflink is unavailable, and neither that nor
+	// journal I/O may eat the RPC's remaining deadline after hashing
+	// already spent its budget. The marker is the durable intent; the
+	// detached worker stages, enqueues, and clears it, and a crash in
+	// between leaves the marker for startup recovery.
 	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
 	m.persistPendingBackup(pb, log)
 	if pauseManifestComplete(manifest) {
-		// The hashes are good; only the journal write failed. Retry the
-		// write with the manifest already in hand: its digests describe
-		// pause-time bytes whatever the sandbox does next (the uploader's
-		// pre-verification catches any divergence), so this retry needs
-		// neither a rehash nor a still-paused sandbox.
-		log.Warn().Str("vm_id", vmID).
-			Msg("pause backup journal write failed; retrying enqueue")
-		go m.retryEnqueue(pb, manifest, log)
+		go m.finishPauseEnqueue(pb, manifest, log)
 		return manifest
 	}
 	log.Warn().Str("vm_id", vmID).
@@ -295,6 +285,23 @@ func (m *Manager) runPendingBackups(ctx context.Context, log zerolog.Logger) {
 func fileMissing(path string) bool {
 	_, err := os.Stat(path)
 	return os.IsNotExist(err)
+}
+
+// finishPauseEnqueue completes a fully hashed pause off the RPC path:
+// stage the artifacts (a byte copy when reflink is unavailable), write
+// the journal entry, clear the marker. The digests already describe
+// pause-time bytes, so no rehash and no still-paused sandbox is needed;
+// a destroy racing the instants before staging lands surfaces as a
+// vanished source and the marker clears as superseded on a later sweep.
+func (m *Manager) finishPauseEnqueue(pb PendingBackup, manifest []ManifestEntry, log zerolog.Logger) {
+	m.healPendingBackup(pb, log)
+	if m.enqueueBackup(pb.VMID, manifest) {
+		m.deletePendingBackupIf(pb, log)
+		return
+	}
+	log.Warn().Str("vm_id", pb.VMID).
+		Msg("pause backup journal write failed; retrying enqueue")
+	m.retryEnqueue(pb, manifest, log)
 }
 
 // retryEnqueue re-attempts a journal write for a manifest whose digests

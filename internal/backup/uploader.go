@@ -364,6 +364,20 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, err)
 		}
 		task.VerifiedObjects = verified
+	} else if file.Shared {
+		// A shared object deduped against another host's upload has no
+		// local verification history, and hosts cannot read the bucket
+		// to check. Trust is structural instead: the name embeds the
+		// content digest and packing fingerprint, this host just proved
+		// its own bytes match that digest, and every conforming writer
+		// either stream-verified what it stored or abandoned without
+		// publishing a manifest. The residual case (a writer crashed or
+		// mutated mid-stream, leaving torn bytes squatting the name) is
+		// caught by restore's mandatory digest check, and an operator
+		// re-uploads the base with admin credentials; write-only hosts
+		// cannot self-serve that check by design.
+		u.Log.Info().Str("object", object).
+			Msg("shared object already present; trusting content-addressed dedupe")
 	} else if !task.HasVerified(object) {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the
