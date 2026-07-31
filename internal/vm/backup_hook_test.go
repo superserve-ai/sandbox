@@ -647,3 +647,64 @@ func TestHealCannotClobberNewerRecord(t *testing.T) {
 		t.Fatalf("pending = %+v, want the newer record untouched", pending)
 	}
 }
+
+// A base replaced at the same path after the pause must not be adopted
+// by the rehash: the marker's pause-time identity is the authority, and
+// a mismatch drops the record rather than pairing the overlay with a
+// stranger's bytes.
+func TestRehashRefusesReplacedBase(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "overlay.ext4")
+	base := filepath.Join(dir, "base.ext4")
+	for p, data := range map[string]string{snap: "vm state", disk: "overlay", base: "base v1"} {
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	pb := newPendingBackup("vm-1", snap, disk, base)
+	if pb.BaseIdentity == "" {
+		t.Fatal("marker did not capture the base identity")
+	}
+	if err := st.PutPendingBackup(pb); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace the base in place after the pause.
+	if err := os.WriteFile(base, []byte("rebuilt base bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(base, later, later); err != nil {
+		t.Fatal(err)
+	}
+
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		t.Fatalf("enqueued %+v against a replaced base", task)
+	default:
+	}
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending = %+v, want the unrecoverable record dropped", pending)
+	}
+}

@@ -619,6 +619,10 @@ type PendingBackup struct {
 	// ID, so a later pause's Put replaces an older one, and the older
 	// pause's async worker must not delete the newer record.
 	Token string `json:"token,omitempty"`
+	// BaseIdentity is the overlay base's stat identity captured when the
+	// marker was created: the rehash must prove it is hashing the
+	// pause-time base, not a same-path replacement.
+	BaseIdentity string `json:"base_identity,omitempty"`
 }
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.

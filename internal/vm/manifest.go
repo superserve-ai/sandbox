@@ -90,16 +90,10 @@ func hashFile(ctx context.Context, path string) (string, int64, error) {
 // failing the pause; the control plane never publishes a partial total as
 // the snapshot size.
 func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
-	budget := hashBudgetCap
-	if dl, ok := ctx.Deadline(); ok {
-		rem := time.Until(dl) - hashSafetyMargin
-		if rem <= 0 {
-			log.Warn().Msg("pause manifest: no hashing budget left before RPC deadline, skipping")
-			return nil
-		}
-		if rem < budget {
-			budget = rem
-		}
+	budget, ok := hashBudget(ctx)
+	if !ok {
+		log.Warn().Msg("pause manifest: no hashing budget left before RPC deadline, skipping")
+		return nil
 	}
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancel()
@@ -143,6 +137,23 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 		Dur("budget", budget).
 		Msg("pause manifest computed")
 	return entries
+}
+
+// hashBudget derives the manifest hashing budget from the caller's
+// deadline: the caller's remaining time (minus the response margin) when
+// a deadline exists, whether shorter OR longer than the default, and
+// hashBudgetCap only when there is none. Clamping every caller to the
+// cap would make the async rehash's ten-minute budget unreachable, and a
+// disk that hashes in more than the cap could then never complete.
+func hashBudget(ctx context.Context) (time.Duration, bool) {
+	if dl, ok := ctx.Deadline(); ok {
+		rem := time.Until(dl) - hashSafetyMargin
+		if rem <= 0 {
+			return 0, false
+		}
+		return rem, true
+	}
+	return hashBudgetCap, true
 }
 
 // baseDigestCache memoizes content digests of overlay base images, keyed

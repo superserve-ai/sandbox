@@ -176,3 +176,23 @@ func TestBaseDigestHonorsCallerContext(t *testing.T) {
 		t.Fatalf("baseDigest blocked %v under a canceled context", elapsed)
 	}
 }
+
+// The hashing budget follows the caller's deadline in both directions:
+// a rehash context with ten minutes gets ten minutes (minus margin), not
+// the 60-second default cap.
+func TestHashBudgetFollowsCallerDeadline(t *testing.T) {
+	if b, ok := hashBudget(context.Background()); !ok || b != hashBudgetCap {
+		t.Fatalf("no-deadline budget = %v/%v, want cap", b, ok)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	b, ok := hashBudget(ctx)
+	if !ok || b <= hashBudgetCap {
+		t.Fatalf("long-deadline budget = %v/%v, want more than the default cap", b, ok)
+	}
+	short, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	if _, ok := hashBudget(short); ok {
+		t.Fatal("sub-margin deadline should yield no budget")
+	}
+}

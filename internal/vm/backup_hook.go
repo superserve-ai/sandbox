@@ -73,10 +73,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	// or deploy inside its window would otherwise erase the only record
 	// that this pause needs coverage. Startup recovery re-runs pending
 	// records once reattach has rebuilt the instance map.
-	pb := PendingBackup{
-		VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
-		Token: newPendingToken(),
-	}
+	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
 	m.persistPendingBackup(pb, log)
 	if pauseManifestComplete(manifest) {
 		// The hashes are good; only the journal write failed. Retry the
@@ -140,6 +137,27 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 			Msg("pause backup rehash inconclusive; keeping pending record")
 		m.healPendingBackup(pb, log)
 		return
+	}
+	if pb.DiskBasePath != "" {
+		// The base dependency's identity must be the PAUSE-TIME one: a
+		// base replaced or rebuilt at the same path after the pause
+		// would otherwise be hashed and recorded as the dependency of an
+		// overlay written against the original. The overlay's own at-rest
+		// checks cannot see this; only the identity captured when the
+		// marker was created can.
+		cur, err := baseIdentity(pb.DiskBasePath)
+		if err != nil {
+			log.Warn().Err(err).Str("vm_id", pb.VMID).
+				Msg("pause backup rehash inconclusive: base identity unreadable; keeping pending record")
+			m.healPendingBackup(pb, log)
+			return
+		}
+		if pb.BaseIdentity == "" || cur != pb.BaseIdentity {
+			log.Error().Str("vm_id", pb.VMID).
+				Msg("pause backup dropped: overlay base no longer the pause-time file")
+			m.deletePendingBackupIf(pb, log)
+			return
+		}
 	}
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
 	if !m.pausedAt(pb.VMID, pb.SnapshotPath) {
@@ -302,6 +320,22 @@ func (m *Manager) healPendingBackup(pb PendingBackup, log zerolog.Logger) {
 	if err := m.state.PutPendingBackupIfOwner(pb); err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("re-persist pending backup failed")
 	}
+}
+
+// newPendingBackup builds a marker for a pause's owed backup, capturing
+// the overlay base's stat identity at creation so the rehash can prove
+// it is hashing the pause-time base and not a same-path replacement.
+func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath string) PendingBackup {
+	pb := PendingBackup{
+		VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
+		Token: newPendingToken(),
+	}
+	if diskBasePath != "" {
+		if id, err := baseIdentity(diskBasePath); err == nil {
+			pb.BaseIdentity = id
+		}
+	}
+	return pb
 }
 
 // pendingTokenCounter disambiguates tokens minted in the same nanosecond.

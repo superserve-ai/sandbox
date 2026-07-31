@@ -979,10 +979,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// a transiently failed write here), its at-rest proof holds the
 		// backup off until the unit is truly down, and the periodic
 		// sweep keeps retrying after the worker gives up.
-		pb := PendingBackup{
-			VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
-			Token: newPendingToken(),
-		}
+		pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
 		m.persistPendingBackup(pb, log)
 		go m.rehashPendingBackup(ctx, pb, log)
 	}
