@@ -52,6 +52,15 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 	return i, err
 }
 
+const deleteHostCapabilities = `-- name: DeleteHostCapabilities :exec
+DELETE FROM host_capability WHERE host_id = $1
+`
+
+func (q *Queries) DeleteHostCapabilities(ctx context.Context, hostID string) error {
+	_, err := q.db.Exec(ctx, deleteHostCapabilities, hostID)
+	return err
+}
+
 const getHost = `-- name: GetHost :one
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host WHERE id = $1
 `
@@ -72,6 +81,108 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const hostHasCapabilities = `-- name: HostHasCapabilities :one
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = $2
+    AND status = 'active'
+    AND last_heartbeat_at IS NOT NULL
+  FOR SHARE
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest($1::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+)
+`
+
+type HostHasCapabilitiesParams struct {
+	RequiredCapabilities []string `json:"required_capabilities"`
+	HostID               string   `json:"host_id"`
+}
+
+// Lock the one active host row whose heartbeat anchors this capability set.
+// Callers that run this in a mutation transaction keep the host stable until
+// VMD delivery and commit, while the relational division below proves that
+// every requested capability belongs to that exact heartbeat.
+func (q *Queries) HostHasCapabilities(ctx context.Context, arg HostHasCapabilitiesParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hostHasCapabilities, arg.RequiredCapabilities, arg.HostID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hostHasCapabilitiesUnlocked = `-- name: HostHasCapabilitiesUnlocked :one
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = $2
+    AND status = 'active'
+    AND last_heartbeat_at IS NOT NULL
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest($1::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+)
+`
+
+type HostHasCapabilitiesUnlockedParams struct {
+	RequiredCapabilities []string `json:"required_capabilities"`
+	HostID               string   `json:"host_id"`
+}
+
+// HostHasCapabilities without the row lock, for standalone pre-flight reads
+// outside a mutation transaction: omitting the lock keeps concurrent checks
+// from serializing behind the host's heartbeat writer. Transactional callers
+// that must pin the host across a commit use HostHasCapabilities.
+func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const insertHostCapability = `-- name: InsertHostCapability :exec
+INSERT INTO host_capability (host_id, capability, heartbeat_at)
+SELECT id, $1, last_heartbeat_at
+FROM host
+WHERE id = $2 AND last_heartbeat_at IS NOT NULL
+ON CONFLICT (host_id, capability)
+DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
+`
+
+type InsertHostCapabilityParams struct {
+	Capability string `json:"capability"`
+	HostID     string `json:"host_id"`
+}
+
+func (q *Queries) InsertHostCapability(ctx context.Context, arg InsertHostCapabilityParams) error {
+	_, err := q.db.Exec(ctx, insertHostCapability, arg.Capability, arg.HostID)
+	return err
 }
 
 const listActiveHosts = `-- name: ListActiveHosts :many
@@ -121,6 +232,16 @@ LEFT JOIN sandbox s ON s.host_id = h.id
   AND s.status IN ('active', 'starting')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest($1::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC
 `
@@ -142,8 +263,8 @@ type ListActiveHostsByLoadRow struct {
 // Returns active hosts sorted by current sandbox count (ascending).
 // The scheduler picks the first row (least loaded host). One query
 // replaces N per-host lookups.
-func (q *Queries) ListActiveHostsByLoad(ctx context.Context) ([]ListActiveHostsByLoadRow, error) {
-	rows, err := q.db.Query(ctx, listActiveHostsByLoad)
+func (q *Queries) ListActiveHostsByLoad(ctx context.Context, requiredCapabilities []string) ([]ListActiveHostsByLoadRow, error) {
+	rows, err := q.db.Query(ctx, listActiveHostsByLoad, requiredCapabilities)
 	if err != nil {
 		return nil, err
 	}

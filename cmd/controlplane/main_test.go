@@ -11,6 +11,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -30,6 +31,16 @@ func TestRetryUnavailableRetriesUntilSuccess(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("expected 3 attempts, got %d", calls)
+	}
+}
+
+func TestPreviewPortsToProtoCarriesBrowserAccessAndTokenVersion(t *testing.T) {
+	ports := previewPortsToProto(map[int32]vmdclient.PortPolicy{
+		3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 17},
+	})
+	if len(ports) != 1 || ports[0].GetPort() != 3000 ||
+		ports[0].GetAccess() != preview.AccessPrivateBrowserV1 || ports[0].GetTokenVersion() != 17 {
+		t.Fatalf("preview proto = %#v, want port/access/token version", ports)
 	}
 }
 

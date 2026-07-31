@@ -14,33 +14,43 @@ import (
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
-// launcherPruneScript strips every /run/netns nsfs mount from a freshly cloned
-// namespace. A single `umount /run/netns` detaches only the parent layer; the
-// per-netns nsfs mounts remain stacked on /run/netns/ns-N, so each needs its
-// own unmount — batched, because one umount fork per mount takes minutes at
-// fleet scale, and every launch until the build finishes pays the legacy
-// full-table path.
-// make-rprivate MUST run first (|| exit 1) to sever propagation from the host —
-// without it a umount could propagate back and detach the host's live pins.
-// The pin list is captured before the first unmount so the /proc read cannot
-// race the table mutations it drives. xargs needs -d '\n': its default
-// tokenizer treats quotes and backslashes in the input specially, and vmd does
-// not own every netns name on the host — newline-delimited input passes the
-// kernel-escaped paths byte-for-byte, exactly what the old per-mount loop
-// passed. Exit 123 (some targets failed) is tolerated like that loop's
-// per-mount || true; any other xargs failure fails the build so the
-// diagnostics surface in its error.
-const launcherPruneScript = `mount --make-rprivate / || exit 1
-umount -l /run/netns 2>/dev/null || true
-pins=$(awk '$2 ~ "^/run/netns/" {print $2}' /proc/self/mounts)
-[ -z "$pins" ] && exit 0
-printf '%s\n' "$pins" | xargs -d '\n' umount -l || [ $? -eq 123 ]`
+// launcherPruneArg is the hidden argv[1] under which vmd re-execs itself to
+// run the prune inside the freshly cloned namespace (see LauncherPruneMain).
+// A re-exec, not a shell: the umount binary re-reads the mount table per
+// target, which makes a script prune quadratic in table size — raw
+// MNT_DETACH syscalls keep the build linear at any fleet size.
+const launcherPruneArg = "launcher-prune"
+
+// launcherPruneEnv is the spawn marker the build sets on the re-exec child;
+// LauncherPruneMain refuses to run without it. Together with the child's own
+// namespace check it keeps a direct invocation — in any mount namespace —
+// from detaching live netns pins.
+const launcherPruneEnv = "VMD_LAUNCHER_PRUNE_CHILD"
+
+// prunePaths returns every /run/netns pin mountpoint from /proc/self/mounts
+// content, in file order. Stacked pins list one line per layer and each
+// MNT_DETACH peels the topmost, so duplicates must be kept, not deduped.
+// Mountpoints are kernel-escaped (\040 etc.); unescape so the unmount
+// targets the real path even for netns names vmd didn't create.
+func prunePaths(mounts []byte) []string {
+	var paths []string
+	for _, line := range strings.Split(string(mounts), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		if mp := unescapeMountinfo(f[1]); strings.HasPrefix(mp, "/run/netns/") {
+			paths = append(paths, mp)
+		}
+	}
+	return paths
+}
 
 // launcherBuildTimeout reaps a genuinely wedged mount syscall — it does not
-// pace the build, which runs async with legacy-path fallback until done. With
-// the unmounts batched the build takes seconds even at fleet scale, so the
-// bound exists only to reap a wedge; do not raise it to accommodate growth,
-// as it also bounds how long a wedged build delays the boot-time error.
+// pace the build, which runs async with legacy-path fallback until done. The
+// syscall prune is sub-second even at fleet scale, so the bound exists only
+// to reap a wedge; do not raise it to accommodate growth, as it also bounds
+// how long a wedged build delays the boot-time error.
 const launcherBuildTimeout = 10 * time.Minute
 
 // EnsureLauncherNamespace builds and pins the pruned launcher mount namespace at
@@ -131,7 +141,15 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 	if err := ensurePinFile(pinPath); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "unshare", "--mount="+pinPath, "--", "sh", "-c", launcherPruneScript)
+	// The daemon's pid-qualified exe link, resolved by unshare's exec: bare
+	// /proc/self/exe would name unshare's own binary at that point, and the
+	// on-disk vmd path can be a different (just-deployed) binary — this link
+	// execs the running daemon's inode either way.
+	pruner := fmt.Sprintf("/proc/%d/exe", os.Getpid())
+	cmd := exec.CommandContext(ctx, "unshare", "--mount="+pinPath, "--", pruner, launcherPruneArg)
+	// Positive spawn marker required by LauncherPruneMain, so an accidental
+	// direct `vmd launcher-prune` refuses even outside the init namespace.
+	cmd.Env = append(os.Environ(), launcherPruneEnv+"=1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("unshare --mount=%s: %v: %s", pinPath, err, strings.TrimSpace(string(out)))
 	}

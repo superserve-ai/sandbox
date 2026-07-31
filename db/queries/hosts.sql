@@ -40,6 +40,74 @@ FROM prev
 WHERE host.id = prev.id
 RETURNING host.*, prev.status AS prev_status;
 
+-- name: DeleteHostCapabilities :exec
+DELETE FROM host_capability WHERE host_id = $1;
+
+-- name: InsertHostCapability :exec
+INSERT INTO host_capability (host_id, capability, heartbeat_at)
+SELECT id, sqlc.arg(capability), last_heartbeat_at
+FROM host
+WHERE id = sqlc.arg(host_id) AND last_heartbeat_at IS NOT NULL
+ON CONFLICT (host_id, capability)
+DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at;
+
+-- name: HostHasCapabilities :one
+-- Lock the one active host row whose heartbeat anchors this capability set.
+-- Callers that run this in a mutation transaction keep the host stable until
+-- VMD delivery and commit, while the relational division below proves that
+-- every requested capability belongs to that exact heartbeat.
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = sqlc.arg('host_id')
+    AND status = 'active'
+    AND last_heartbeat_at IS NOT NULL
+  FOR SHARE
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+);
+
+-- name: HostHasCapabilitiesUnlocked :one
+-- HostHasCapabilities without the row lock, for standalone pre-flight reads
+-- outside a mutation transaction: omitting the lock keeps concurrent checks
+-- from serializing behind the host's heartbeat writer. Transactional callers
+-- that must pin the host across a commit use HostHasCapabilities.
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = sqlc.arg('host_id')
+    AND status = 'active'
+    AND last_heartbeat_at IS NOT NULL
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+);
+
 -- name: MarkHostUnhealthy :exec
 UPDATE host
 SET status = 'unhealthy', updated_at = now()
@@ -67,5 +135,15 @@ LEFT JOIN sandbox s ON s.host_id = h.id
   AND s.status IN ('active', 'starting')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC;

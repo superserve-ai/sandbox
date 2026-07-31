@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -31,12 +34,27 @@ type stubVMD struct {
 	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	restorePolicyFn  func(access string, ports map[int32]vmdclient.PortPolicy, revision int64)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
 	deleteSnapsFn    func(ctx context.Context, id string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	updatePreviewFn  func(ctx context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
 }
+
+type stubScheduler struct {
+	hostID   string
+	err      error
+	required []string
+}
+
+func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, error) {
+	s.required = append([]string(nil), required...)
+	return s.hostID, s.err
+}
+
+func (s *stubScheduler) Invalidate() {}
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
@@ -57,7 +75,10 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string) (string, uint32, uint32, error) {
+	if s.restorePolicyFn != nil {
+		s.restorePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
+	}
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -90,6 +111,12 @@ func (s *stubVMD) ListDir(ctx context.Context, id, path string) ([]vmdclient.Dir
 func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, denied, domains []string) error {
 	if s.updateNetworkFn != nil {
 		return s.updateNetworkFn(ctx, id, allowed, denied, domains)
+	}
+	return nil
+}
+func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+	if s.updatePreviewFn != nil {
+		return s.updatePreviewFn(ctx, id, access, ports, revision)
 	}
 	return nil
 }
@@ -164,6 +191,20 @@ func (emptyRows) Conn() *pgx.Conn                              { return nil }
 // sqlc-generated queries (see db.Sandbox field order in internal/db/models.go).
 func sandboxRow(s db.Sandbox) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
+		// Side-table policy reads intentionally share sandbox ownership scope.
+		// Many lifecycle mocks route any `FROM sandbox` query here; model an
+		// older control-plane row (no policy relation) for those reads.
+		if len(dest) == 3 {
+			access, accessOK := dest[0].(*string)
+			wireAccess, wireAccessOK := dest[1].(*string)
+			revision, revisionOK := dest[2].(*int64)
+			if accessOK && wireAccessOK && revisionOK {
+				*access = "legacy_public"
+				*wireAccess = "legacy_public"
+				*revision = 0
+				return nil
+			}
+		}
 		*dest[0].(*uuid.UUID) = s.ID
 		*dest[1].(*uuid.UUID) = s.TeamID
 		*dest[2].(*string) = s.Name
@@ -188,6 +229,33 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[21].(*int32) = s.DiskMib
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
+		if len(dest) == 25 {
+			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
+			*dest[24].(*string) = "legacy_public"
+		}
+		return nil
+	}}
+}
+
+func hostRow(h db.Host) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*string) = h.ID
+		*dest[1].(*string) = h.VmdAddr
+		*dest[2].(*string) = h.ProxyAddr
+		*dest[3].(*string) = h.Region
+		*dest[4].(*string) = h.Status
+		*dest[5].(*int32) = h.CapacityMemoryMib
+		*dest[6].(*int32) = h.CapacityVcpus
+		*dest[7].(*pgtype.Timestamptz) = h.LastHeartbeatAt
+		*dest[8].(*time.Time) = h.CreatedAt
+		*dest[9].(*time.Time) = h.UpdatedAt
+		return nil
+	}}
+}
+
+func previewCapableHostRow() *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*bool) = true
 		return nil
 	}}
 }
@@ -833,7 +901,7 @@ func pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandb
 	}
 }
 
-func TestResumeSandbox_Success(t *testing.T) {
+func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -847,7 +915,7 @@ func TestResumeSandbox_Success(t *testing.T) {
 		Trigger:   "pause",
 	}
 
-	var resumeCalled bool
+	var resumeCalled, updateCalled bool
 	vmd := &stubVMD{
 		destroyFn: func(context.Context, string, bool) error { return nil },
 		resumeFn: func(_ context.Context, id, snapPath, memPath string) (string, error) {
@@ -862,6 +930,13 @@ func TestResumeSandbox_Success(t *testing.T) {
 				t.Errorf("memPath = %q, want %q", memPath, "/snapshots/test/mem.snap")
 			}
 			return "10.0.0.5", nil
+		},
+		updatePreviewFn: func(_ context.Context, _ string, access string, _ map[int32]vmdclient.PortPolicy, revision int64) error {
+			updateCalled = true
+			if access != preview.AccessLegacyPublic || revision != 0 {
+				t.Errorf("legacy reconciliation = (%q, %d), want (legacy_public, 0)", access, revision)
+			}
+			return status.Error(codes.Unimplemented, "old vmd")
 		},
 	}
 
@@ -893,6 +968,9 @@ func TestResumeSandbox_Success(t *testing.T) {
 	if !resumeCalled {
 		t.Error("VMD.ResumeInstance was not called")
 	}
+	if !updateCalled {
+		t.Error("resume did not attempt final policy reconciliation")
+	}
 
 	// Resume returns the minimal {id, status, access_token} shape, not the
 	// full sandbox response.
@@ -902,6 +980,184 @@ func TestResumeSandbox_Success(t *testing.T) {
 	}
 	if body["id"] != sandboxID.String() {
 		t.Errorf("id = %q, want %q", body["id"], sandboxID)
+	}
+}
+
+func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "host-a"
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	var policyReads int
+	var restored, reconciled previewPolicySnapshot
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.NotFound, "vm absent after vmd restart")
+		},
+		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
+			restored = previewPolicySnapshot{Access: access, Ports: ports, Revision: revision}
+		},
+		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+			reconciled = previewPolicySnapshot{Access: access, Ports: ports, Revision: revision}
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				policyReads++
+				if policyReads == 1 {
+					return previewPolicyRow(preview.AccessPublic, 7)
+				}
+				return previewPolicyRow(preview.AccessPublic, 8)
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: BeginResume :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSnapshot :one"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			switch {
+			case strings.Contains(sql, "-- name: ListPublishedPorts :many"):
+				if policyReads == 1 {
+					return previewPortRows(3000), nil
+				}
+				return previewPortRows(8080), nil
+			case strings.Contains(sql, "-- name: ListSandboxSecretBindingMeta :many"):
+				return emptyRows{}, nil
+			default:
+				return nil, fmt.Errorf("unexpected Query: %s", sql)
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if restored.Access != preview.AccessPublic || restored.Revision != 7 {
+		t.Fatalf("restore policy = (%q, %d), want (public, 7)", restored.Access, restored.Revision)
+	}
+	if _, ok := restored.Ports[3000]; !ok || len(restored.Ports) != 1 {
+		t.Fatalf("restore ports = %#v, want {3000}", restored.Ports)
+	}
+	if reconciled.Access != preview.AccessPublic || reconciled.Revision != 8 {
+		t.Fatalf("reconciled policy = (%q, %d), want (public, 8)", reconciled.Access, reconciled.Revision)
+	}
+	if _, ok := reconciled.Ports[8080]; !ok || len(reconciled.Ports) != 1 {
+		t.Fatalf("reconciled ports = %#v, want {8080}", reconciled.Ports)
+	}
+}
+
+func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "token-host"
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	var restored, reconciled previewPolicySnapshot
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.NotFound, "vm absent after restart")
+		},
+		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
+			restored = previewPolicySnapshot{Access: access, Ports: ports, Revision: revision}
+		},
+		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+			reconciled = previewPolicySnapshot{Access: access, Ports: ports, Revision: revision}
+			return nil
+		},
+	}
+
+	var capabilityRequirements [][]string
+	var revisionBumps int
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPrivate, 8)
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+				capabilityRequirements = append(capabilityRequirements, append([]string(nil), args[0].([]string)...))
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
+				return scalarUUIDRow(sandboxID)
+			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
+				revisionBumps++
+				return previewPolicyRow(preview.AccessPrivate, 8)
+			case strings.Contains(sql, "-- name: BeginResume :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSnapshot :one"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			switch {
+			case strings.Contains(sql, "-- name: ListPublishedPorts :many"):
+				return previewPortPolicyRows(publishedPortResponse{
+					Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12,
+				}), nil
+			case strings.Contains(sql, "-- name: ListSandboxSecretBindingMeta :many"):
+				return emptyRows{}, nil
+			default:
+				return nil, fmt.Errorf("unexpected Query: %s", sql)
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200; body=%s", w.Code, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+	if len(capabilityRequirements) != 3 || revisionBumps != 1 {
+		t.Fatalf("capability checks=%d revision bumps=%d, want 3/1", len(capabilityRequirements), revisionBumps)
+	}
+	for _, got := range capabilityRequirements {
+		if !slices.Equal(got, previewBrowserCapabilities()) {
+			t.Fatalf("private resume capabilities=%v, want %v", got, previewBrowserCapabilities())
+		}
+	}
+	for name, got := range map[string]previewPolicySnapshot{"restore": restored, "reconcile": reconciled} {
+		if got.Access != preview.AccessPrivate || got.Revision != 8 {
+			t.Fatalf("%s top-level policy=(%q,%d), want raw private revision 8", name, got.Access, got.Revision)
+		}
+		port := got.Ports[3000]
+		if len(got.Ports) != 1 || port.Access != preview.AccessPrivateBrowserV1 || port.TokenVersion != 12 {
+			t.Fatalf("%s ports=%#v, want browser-authenticated 3000 v12", name, got.Ports)
+		}
 	}
 }
 
@@ -1294,6 +1550,12 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 	if body["vcpu_count"].(float64) != 2 {
 		t.Errorf("vcpu_count = %v, want 2", body["vcpu_count"])
 	}
+	// Pins the joined read's trailing access column through to the response —
+	// fails if GetSandboxWithPreviewPolicy's scan order or the handler
+	// plumbing breaks.
+	if body["preview_access"] != "legacy_public" {
+		t.Errorf("preview_access = %q, want legacy_public", body["preview_access"])
+	}
 }
 
 func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
@@ -1499,11 +1761,41 @@ func TestCreateSandbox_Success(t *testing.T) {
 	// Even though the request omits from_template, the handler defaults it
 	// to "superserve/base" and routes through RestoreSnapshot. The stub returns
 	// VMD-reported resources (1 vcpu, 1024 MiB — stubVMD's defaults).
-	vmd := &stubVMD{}
+	var restoredAccess string
+	var restoredPorts map[int32]vmdclient.PortPolicy
+	var restoredRevision int64
+	var attested bool
+	var insertedSandboxID, policySandboxID uuid.UUID
+	var insertedPolicyAccess string
+	scheduler := &stubScheduler{hostID: "public-host"}
+	var policyInsertedAtomically bool
+	vmd := &stubVMD{
+		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
+			restoredAccess, restoredPorts, restoredRevision = access, ports, revision
+		},
+		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+			attested = true
+			if access != preview.AccessPublic || ports != nil || revision != 0 {
+				t.Errorf("live policy attestation = (%q, %#v, %d), want (public, nil, 0)", access, ports, revision)
+			}
+			return nil
+		},
+	}
 
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
+				insertedSandboxID = args[0].(uuid.UUID)
+				if strings.Contains(sql, "INSERT INTO sandbox_preview_policy") {
+					policyInsertedAtomically = true
+					policySandboxID = insertedSandboxID
+					if access, ok := args[len(args)-1].(string); ok {
+						insertedPolicyAccess = access
+					}
+				}
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "my-sandbox",
 					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
@@ -1515,12 +1807,12 @@ func TestCreateSandbox_Success(t *testing.T) {
 			}
 			return activityRow()
 		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
 
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: scheduler}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox"}`))
 
@@ -1536,12 +1828,213 @@ func TestCreateSandbox_Success(t *testing.T) {
 	if body["status"] != "active" {
 		t.Errorf("status = %q, want active", body["status"])
 	}
+	if body["preview_access"] != "public" {
+		t.Errorf("preview_access = %q, want public", body["preview_access"])
+	}
+	if restoredAccess != "public" || restoredPorts != nil || restoredRevision != 0 {
+		t.Errorf("restored preview policy = (%q, %#v, %d), want (public, nil, 0)", restoredAccess, restoredPorts, restoredRevision)
+	}
+	if !attested {
+		t.Error("create did not attest the live VMD after restore")
+	}
+	if insertedSandboxID == uuid.Nil || !policyInsertedAtomically || policySandboxID != insertedSandboxID || insertedPolicyAccess != preview.AccessPublic {
+		t.Errorf("inserted policy = (sandbox=%s access=%q), want sandbox=%s access=%q", policySandboxID, insertedPolicyAccess, insertedSandboxID, preview.AccessPublic)
+	}
+	if !reflect.DeepEqual(scheduler.required, []string{preview.HostCapabilityPorts}) {
+		t.Errorf("scheduler requirements = %#v, want preview ports", scheduler.required)
+	}
 	// Resources should reflect what VMD reported, not the initial INSERT placeholders.
 	if v := body["vcpu_count"].(float64); v == 0 {
 		t.Error("vcpu_count is 0 — VMD's reported value was not propagated to the response")
 	}
 	if v := body["memory_mib"].(float64); v == 0 {
 		t.Error("memory_mib is 0 — VMD's reported value was not propagated to the response")
+	}
+}
+
+func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+	scheduler := &stubScheduler{hostID: "private-host"}
+	var restored, attested bool
+	var policyAccess string
+	var checkedCapabilities []string
+
+	vmd := &stubVMD{
+		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
+			restored = true
+			if access != preview.AccessPrivate || ports != nil || revision != 0 {
+				t.Errorf("restore policy = (%q, %#v, %d), want (private, nil, 0)", access, ports, revision)
+			}
+		},
+		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+			attested = true
+			if access != preview.AccessPrivate || ports != nil || revision != 0 {
+				t.Errorf("attested policy = (%q, %#v, %d), want (private, nil, 0)", access, ports, revision)
+			}
+			return nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+				checkedCapabilities = append(checkedCapabilities, args[0].([]string)...)
+				return previewCapableHostRow()
+			case strings.Contains(sql, "INSERT INTO sandbox"):
+				if strings.Contains(sql, "INSERT INTO sandbox_preview_policy") {
+					if access, ok := args[len(args)-1].(string); ok {
+						policyAccess = access
+					}
+				}
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "private-sandbox",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 1024,
+					CreatedAt: time.Now(), HostID: "private-host",
+				})
+			case strings.Contains(sql, "FROM template"):
+				return templateRow(defaultReadyTemplate())
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"private-sandbox","preview_access":"private"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if got := parseJSON(t, w)["preview_access"]; got != preview.AccessPrivate {
+		t.Fatalf("preview_access = %#v, want private", got)
+	}
+	wantCaps := []string{
+		preview.HostCapabilityPorts,
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPortBrowserAuth,
+	}
+	if !reflect.DeepEqual(scheduler.required, wantCaps) {
+		t.Fatalf("scheduler requirements = %#v, want %#v", scheduler.required, wantCaps)
+	}
+	if !reflect.DeepEqual(checkedCapabilities, wantCaps) {
+		t.Fatalf("post-selection checks = %#v, want %#v", checkedCapabilities, wantCaps)
+	}
+	if policyAccess != preview.AccessPrivate || !restored || !attested {
+		t.Fatalf("private create policy = %q restored=%v attested=%v", policyAccess, restored, attested)
+	}
+}
+
+func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T) {
+	teamID := uuid.New()
+	scheduler := &stubScheduler{hostID: "rolled-back-host"}
+	var inserted, restored bool
+	var checks int
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM template"):
+				return templateRow(defaultReadyTemplate())
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+				checks++
+				return scalarBoolRow(!slices.Contains(args[0].([]string), preview.HostCapabilityPortBrowserAuth))
+			case strings.Contains(sql, "INSERT INTO sandbox"):
+				inserted = true
+				return errorRow(fmt.Errorf("insert must not run after capability rollback"))
+			default:
+				return errorRow(fmt.Errorf("unexpected query: %s", sql))
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			inserted = true
+			return pgconn.CommandTag{}, fmt.Errorf("unexpected exec: %s", sql)
+		},
+	}
+	vmd := &stubVMD{restoreFn: func(context.Context, string, string, string) (string, error) {
+		restored = true
+		return "", nil
+	}}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"private-sandbox","preview_access":"private"}`))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+	}
+	if checks != 1 || inserted || restored {
+		t.Fatalf("post-selection result: checks=%d inserted=%v restored=%v", checks, inserted, restored)
+	}
+}
+
+func TestCreateSandbox_PreviewAttestationFailureFailsClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "old vmd unimplemented", err: status.Error(codes.Unimplemented, "unknown method UpdateSandboxPreviewPolicy")},
+		{name: "policy update failed", err: status.Error(codes.Internal, "policy persistence failed")},
+		{name: "revision zero policy mismatch", err: status.Error(codes.FailedPrecondition, "revision zero conflicts with stored policy")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			teamID := uuid.New()
+			sandboxID := uuid.New()
+			var destroyed, injected bool
+			vmd := &stubVMD{
+				updatePreviewFn: func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
+					return tt.err
+				},
+				destroyFn: func(context.Context, string, bool) error {
+					destroyed = true
+					return nil
+				},
+				injectEnvFn: func(context.Context, string, map[string]string, string) error {
+					injected = true
+					return nil
+				},
+			}
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+					switch {
+					case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+						return previewCapableHostRow()
+					case strings.Contains(sql, "INSERT INTO sandbox"):
+						return sandboxRow(db.Sandbox{
+							ID: sandboxID, TeamID: teamID, Name: "sb",
+							Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+						})
+					case strings.Contains(sql, "FROM template"):
+						return templateRow(defaultReadyTemplate())
+					default:
+						return activityRow()
+					}
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					return pgconn.NewCommandTag("UPDATE 1"), nil
+				},
+			}
+
+			h := &Handlers{VMD: vmd, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
+			}
+			if !destroyed {
+				t.Fatal("VM was not destroyed after preview attestation failure")
+			}
+			if injected {
+				t.Fatal("env injection ran before preview attestation succeeded")
+			}
+		})
 	}
 }
 
@@ -1561,6 +2054,9 @@ func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "sb",
@@ -1612,6 +2108,9 @@ func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "sb",
@@ -1675,6 +2174,9 @@ func newHostnameStampEnv(t *testing.T, stampErr error) *hostnameStampEnv {
 	}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: e.teamID, Name: "sb",
@@ -1825,6 +2327,9 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return errorRow(quotaErr)
 			}
@@ -1871,6 +2376,9 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "sb",
@@ -2253,6 +2761,9 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				// Positional args (0-indexed): id, team_id, name, status,
 				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
@@ -2313,6 +2824,9 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				// Positional args (0-indexed): id, team_id, name, status,
 				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
@@ -2384,30 +2898,45 @@ func TestCreateSandbox_MetadataValidationRejected(t *testing.T) {
 	}
 }
 
-func TestFailSandboxAfterBootDestroysOnSandboxHost(t *testing.T) {
+func TestFailSandboxAfterBootUsesDetachedCleanupOnSandboxHost(t *testing.T) {
 	var defaultDestroyed, hostDestroyed string
+	var destroyContextErr error
+	var dbCalls int
 	defaultVMD := &stubVMD{destroyFn: func(_ context.Context, id string, _ bool) error {
 		defaultDestroyed = id
 		return nil
 	}}
-	hostVMD := &stubVMD{destroyFn: func(_ context.Context, id string, _ bool) error {
+	hostVMD := &stubVMD{destroyFn: func(ctx context.Context, id string, _ bool) error {
 		hostDestroyed = id
+		destroyContextErr = ctx.Err()
 		return nil
 	}}
 	mock := &mockDBTX{
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+		execFn: func(ctx context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+			dbCalls++
+			if err := ctx.Err(); err != nil {
+				t.Errorf("cleanup DB context already canceled: %v", err)
+			}
 			return pgconn.NewCommandTag(""), nil
 		},
 	}
 	h := &Handlers{VMD: defaultVMD, DB: db.New(mock)}
 
-	h.failSandboxAfterBoot(context.Background(), hostVMD, uuid.New(), uuid.New(), "instance-xyz", "host-a")
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.failSandboxAfterBoot(canceledCtx, hostVMD, uuid.New(), uuid.New(), "instance-xyz", "host-a")
 
 	if hostDestroyed != "instance-xyz" {
 		t.Errorf("destroy routed to host client = %q, want instance-xyz", hostDestroyed)
 	}
 	if defaultDestroyed != "" {
 		t.Errorf("default client must not destroy; got %q", defaultDestroyed)
+	}
+	if destroyContextErr != nil {
+		t.Errorf("destroy cleanup context already canceled: %v", destroyContextErr)
+	}
+	if dbCalls != 2 {
+		t.Errorf("cleanup DB writes = %d, want status update + secret cleanup", dbCalls)
 	}
 }
 

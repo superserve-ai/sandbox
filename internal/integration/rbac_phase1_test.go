@@ -63,6 +63,7 @@ func TestRbacSeedData(t *testing.T) {
 		"platform:teams:read",
 		"platform:team_users:write",
 		"platform:team_roles:write",
+		"platform:billing:read",
 		"platform:billing:write",
 	}
 	var gotPerms []string
@@ -97,6 +98,7 @@ func TestRbacSeedData(t *testing.T) {
 			"platform:teams:read",
 			"platform:team_users:write",
 			"platform:team_roles:write",
+			"platform:billing:read",
 			"platform:billing:write",
 			"billing:read",
 			"billing:write",
