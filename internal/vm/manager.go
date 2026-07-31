@@ -1633,6 +1633,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// not a single probe, so a warming VM passes. Resume adoption
 		// deliberately skips this (detached-probe contract).
 		if err := adoptionBoxdReady(ctx, m, existing.IP); err != nil {
+			// A definitive timeout: this crash-window VM never became healthy.
+			// Left Running, the readiness-blind resume adoption would
+			// resurrect it forever (the resume fallback reverts to paused
+			// without destroying). Error breaks both adoption gates and the
+			// stop clears the dead unit, so the next attempt boots fresh.
+			m.setStatus(vmID, StatusError)
+			m.stopUnitDuringRestoreError(vmID)
 			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
 		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")

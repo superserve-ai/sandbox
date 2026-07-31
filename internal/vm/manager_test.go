@@ -1036,6 +1036,14 @@ func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
 	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0); err == nil {
 		t.Fatal("adopting an unverified VM must fail when boxd never becomes ready")
 	}
+	// The failed adoption must break the adoption gates: a Running record
+	// would be resurrected forever by the readiness-blind resume adoption.
+	existing.mu.RLock()
+	status := existing.Status
+	existing.mu.RUnlock()
+	if status == StatusRunning {
+		t.Fatal("a definitively-unready adopted VM must not stay Running")
+	}
 }
 
 func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
