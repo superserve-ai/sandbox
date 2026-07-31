@@ -188,7 +188,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		m.healPendingBackup(pb, log)
 		return
 	}
-	if m.enqueueBackup(pb.VMID, retried) {
+	if ok, _ := m.enqueueBackup(pb.VMID, retried); ok {
 		m.deletePendingBackupIf(pb, log)
 		return
 	}
@@ -295,8 +295,19 @@ func fileMissing(path string) bool {
 // vanished source and the marker clears as superseded on a later sweep.
 func (m *Manager) finishPauseEnqueue(pb PendingBackup, manifest []ManifestEntry, log zerolog.Logger) {
 	m.healPendingBackup(pb, log)
-	if m.enqueueBackup(pb.VMID, manifest) {
-		m.deletePendingBackupIf(pb, log)
+	ok, staged := m.enqueueBackup(pb.VMID, manifest)
+	if ok {
+		if staged {
+			m.deletePendingBackupIf(pb, log)
+			return
+		}
+		// Journaled but from mutable paths: the marker stays, and the
+		// sweep's worker retries under the at-rest proof; its enqueue
+		// dedupes against this generation and upgrades the queued paths
+		// to staged ones, after which the marker clears.
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("pause enqueued unstaged; keeping marker for staging upgrade")
+		m.healPendingBackup(pb, log)
 		return
 	}
 	log.Warn().Str("vm_id", pb.VMID).
@@ -315,7 +326,7 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
 		time.Sleep(delay)
 		delay *= 2
-		if m.enqueueBackup(pb.VMID, manifest) {
+		if ok, _ := m.enqueueBackup(pb.VMID, manifest); ok {
 			m.deletePendingBackupIf(pb, log)
 			return
 		}
@@ -488,9 +499,9 @@ func (m *Manager) pausedAt(vmID, snapshotPath string) bool {
 // Enqueue is a local BoltDB write (milliseconds) and must never fail the
 // pause: the artifacts on disk are valid regardless, and the journal is
 // the retry mechanism, not the caller.
-func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
+func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bool) {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
-		return false
+		return false, false
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
@@ -506,7 +517,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 	if !pauseManifestComplete(manifest) {
 		m.log.Warn().Str("vm_id", vmID).
 			Msg("pause manifest missing a durable artifact digest; generation not enqueued for backup")
-		return false
+		return false, false
 	}
 	task := backup.Task{
 		SandboxID: vmID,
@@ -519,19 +530,71 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 	}
 	// Stage before enqueueing: teardown of a destroyed sandbox unlinks
 	// the artifacts, and the queued upload must survive it to honor the
-	// retention promise for deleted sandboxes. Hard links pin the inodes
-	// until the uploader acks; on a staging failure the original paths
-	// remain, preserving the previous best-effort behavior.
+	// retention promise for deleted sandboxes. Staging is only trusted
+	// under the at-rest proof held ACROSS the snapshot: this worker runs
+	// off the pause operation lock, so a client's immediate resume can
+	// win the race and a reflink would capture post-resume bytes (or the
+	// copy a torn mixture). When the proof fails or staging errors, the
+	// task keeps its original mutable paths (the uploader's
+	// pre-verification decides, the pre-staging contract) and the caller
+	// keeps the pending marker so a later sweep can upgrade the entry;
+	// the journal upgrades a deduped generation's paths in place.
+	// With staging disabled there is nothing to upgrade later: the
+	// original paths ARE the handoff, as before staging existed.
+	staged := m.backupStaging == ""
 	if m.backupStaging != "" {
-		if err := backup.StageTask(m.backupStaging, &task); err != nil {
-			m.log.Warn().Err(err).Str("vm_id", vmID).
-				Msg("backup staging failed; uploading from original paths")
+		snapPath, diskPath := "", ""
+		for _, f := range task.Files {
+			switch f.Name {
+			case "vmstate.snap":
+				snapPath = f.Path
+			case "rootfs.ext4":
+				diskPath = f.Path
+			}
+		}
+		before, statErr := os.Stat(diskPath)
+		if statErr == nil && m.atRest(context.Background(), vmID, snapPath) {
+			if err := backup.StageTask(m.backupStaging, &task); err != nil {
+				m.log.Warn().Err(err).Str("vm_id", vmID).
+					Msg("backup staging failed; uploading from original paths")
+			} else if after, err := os.Stat(diskPath); err == nil &&
+				os.SameFile(before, after) &&
+				before.ModTime().Equal(after.ModTime()) && before.Size() == after.Size() &&
+				m.atRest(context.Background(), vmID, snapPath) {
+				staged = true
+			} else {
+				m.log.Warn().Str("vm_id", vmID).
+					Msg("sandbox left at-rest during staging; uploading from original paths")
+				task = rebuildTask(vmID, manifest)
+			}
 		}
 	}
 	if err := m.backupEnqueue(task); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).
 			Msg("backup enqueue failed; pause not journaled")
-		return false
+		return false, false
 	}
-	return true
+	return true, staged
+}
+
+// rebuildTask reconstructs the enqueue task from the manifest with its
+// original paths, discarding any staged rewrites.
+func rebuildTask(vmID string, manifest []ManifestEntry) backup.Task {
+	files := make([]backup.TaskFile, 0, len(manifest))
+	for _, e := range manifest {
+		files = append(files, backup.TaskFile{
+			Name:       e.FileName,
+			Path:       e.Path,
+			SHA256:     e.SHA256,
+			Size:       e.SizeBytes,
+			BasePath:   e.BasePath,
+			BaseSHA256: e.BaseSHA256,
+		})
+	}
+	return backup.Task{
+		SandboxID:  vmID,
+		Generation: backup.GenerationKey(files),
+		Files:      files,
+		Priority:   backup.PriorityPause,
+	}
 }

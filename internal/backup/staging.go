@@ -45,12 +45,32 @@ func StageTask(root string, task *Task) error {
 		staged := filepath.Join(dir, f.Name)
 		if _, err := os.Stat(staged); err == nil {
 			task.Files[i].Path = staged
-			continue
-		}
-		if err := snapshotFile(staged, f.Path); err != nil {
+		} else if err := snapshotFile(staged, f.Path); err != nil {
 			return fmt.Errorf("stage %s: %w", f.Name, err)
+		} else {
+			task.Files[i].Path = staged
 		}
-		task.Files[i].Path = staged
+		// The base is GC-owned: destroying the last sandbox on an old
+		// template build deletes it, which would abandon every queued
+		// generation depending on it. One snapshot per base CONTENT
+		// serves every generation on the host (reflink makes it free;
+		// the copy fallback pays once per base, off the RPC path).
+		if f.BaseSHA256 != "" && f.BasePath != "" {
+			basesDir := filepath.Join(root, "bases")
+			if err := os.MkdirAll(basesDir, 0o700); err != nil {
+				return err
+			}
+			stagedBase := filepath.Join(basesDir, f.BaseSHA256)
+			if _, err := os.Stat(stagedBase); err != nil {
+				if err := snapshotFile(stagedBase, f.BasePath); err != nil {
+					return fmt.Errorf("stage base %s: %w", f.BaseSHA256, err)
+				}
+				if err := syncDir(basesDir); err != nil {
+					return err
+				}
+			}
+			task.Files[i].BasePath = stagedBase
+		}
 	}
 	return nil
 }
@@ -159,8 +179,30 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 		}
 		return
 	}
+	referenced, err := j.PendingBaseSHAs()
+	if err != nil {
+		log.Warn().Err(err).Msg("backup staging sweep: base reference scan failed")
+		referenced = nil // fail safe: keep every staged base this pass
+	}
 	for _, sb := range sandboxes {
 		if !sb.IsDir() {
+			continue
+		}
+		if sb.Name() == "bases" {
+			// Shared base snapshots are cleared only when no pending
+			// task references their content hash.
+			if referenced == nil {
+				continue
+			}
+			bases, err := os.ReadDir(filepath.Join(root, "bases"))
+			if err != nil {
+				continue
+			}
+			for _, b := range bases {
+				if !referenced[b.Name()] {
+					_ = os.RemoveAll(filepath.Join(root, "bases", b.Name()))
+				}
+			}
 			continue
 		}
 		sbDir := filepath.Join(root, sb.Name())

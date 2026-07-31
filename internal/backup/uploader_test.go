@@ -1019,3 +1019,98 @@ func TestSharedBaseDedupeAcrossHosts(t *testing.T) {
 		t.Fatal("cross-host base dedupe abandoned the generation")
 	}
 }
+
+// The staged base must carry the upload when template GC deletes the
+// original: one snapshot per base content serves every generation.
+func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	base := filepath.Join(dir, "base.ext4")
+	baseData := []byte("template base bytes")
+	if err := os.WriteFile(base, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSum := sha256.Sum256(baseData)
+	overlay := filepath.Join(dir, "rootfs.ext4")
+	odata := []byte("overlay bytes")
+	if err := os.WriteFile(overlay, odata, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	osum := sha256.Sum256(odata)
+	task := Task{
+		SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0),
+		Files: []TaskFile{{
+			Name: "rootfs.ext4", Path: overlay,
+			SHA256: hex.EncodeToString(osum[:]), Size: int64(len(odata)),
+			BasePath: base, BaseSHA256: hex.EncodeToString(baseSum[:]),
+		}},
+	}
+	if err := StageTask(staging, &task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Files[0].BasePath == base {
+		t.Fatal("base path not staged")
+	}
+	// Template GC deletes the original base and the sandbox artifacts.
+	if err := os.Remove(base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(overlay); err != nil {
+		t.Fatal(err)
+	}
+
+	j, _ := testJournal(t)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store, StagingRoot: staging}
+	if _, err := u.drainOne(context.Background(), time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb/gen/manifest.json"]; !ok {
+		t.Fatal("generation abandoned despite staged base")
+	}
+
+	// The sweep keeps a base referenced by pending work and clears it
+	// once nothing references it.
+	if err := j.Enqueue(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0),
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/gone", SHA256: "x", BaseSHA256: hex.EncodeToString(baseSum[:])}}}); err != nil {
+		t.Fatal(err)
+	}
+	SweepStaging(staging, j, zerolog.Nop())
+	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); err != nil {
+		t.Fatalf("referenced staged base swept: %v", err)
+	}
+	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, false); err != nil {
+		t.Fatal(err)
+	}
+	SweepStaging(staging, j, zerolog.Nop())
+	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced staged base kept: %v", err)
+	}
+}
+
+// A deduped re-enqueue upgrades the queued task's paths (mutable
+// originals to staged snapshots) while keeping the row's scheduling.
+func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	orig := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: base,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/live/rootfs.ext4", SHA256: "aa"}}}
+	if err := j.Enqueue(orig); err != nil {
+		t.Fatal(err)
+	}
+	staged := orig
+	staged.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/staging/sb/gen/rootfs.ext4", SHA256: "aa"}}
+	if err := j.Enqueue(staged); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := j.Next(base.Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if got.Files[0].Path != "/staging/sb/gen/rootfs.ext4" {
+		t.Fatalf("queued path = %s, want the staged upgrade", got.Files[0].Path)
+	}
+}

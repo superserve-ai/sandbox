@@ -814,3 +814,52 @@ func TestRecoveryTrustsDurableRecordWhenMapUnloaded(t *testing.T) {
 		t.Fatal("unloaded-but-paused record treated as superseded")
 	}
 }
+
+// A resume winning the race against the staging worker must not produce
+// a staged snapshot of post-resume bytes: the proof fails, the task
+// ships with its original paths, and the marker survives so a later
+// sweep can upgrade the queued entry under a real at-rest proof.
+func TestStagingFallsBackAndKeepsMarkerWhenNotAtRest(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:         st,
+		backupStaging: filepath.Join(dir, "staging"),
+		vms:           map[string]*VMInstance{"vm-1": {Status: StatusRunning, SnapshotPath: snap}},
+		unitDead:      func(context.Context, string) bool { return false },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		for _, f := range task.Files {
+			if f.Name == "rootfs.ext4" && f.Path != disk {
+				t.Fatalf("disk staged to %s despite a failed at-rest proof", f.Path)
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("task never enqueued")
+	}
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending = %d, want the marker kept for a staging upgrade", len(pending))
+	}
+}

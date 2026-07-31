@@ -184,8 +184,26 @@ func (j *Journal) Enqueue(task Task) error {
 		idx := tx.Bucket(indexBucket)
 		// One point lookup; a stale index entry (its queue key gone, e.g.
 		// the entry was dropped as corrupt) self-heals by overwriting.
-		if qk := idx.Get(task.indexKey()); qk != nil && queue.Get(qk) != nil {
-			return nil
+		if qk := idx.Get(task.indexKey()); qk != nil {
+			if existing := queue.Get(qk); existing != nil {
+				// Dedupe, with a path upgrade: a first enqueue can carry
+				// mutable original paths (staging proof failed on the
+				// pause path) and a later at-rest retry the staged ones.
+				// The generation is content-addressed, so the digests are
+				// identical either way; adopting the newer paths makes
+				// the queued upload survive teardown. Scheduling state
+				// (attempts, NotBefore, position) stays with the row.
+				var cur Task
+				if json.Unmarshal(existing, &cur) == nil {
+					cur.Files = task.Files
+					upgraded, err := json.Marshal(cur)
+					if err != nil {
+						return err
+					}
+					return queue.Put(qk, upgraded)
+				}
+				return nil
+			}
 		}
 		if err := queue.Put(task.key(), val); err != nil {
 			return err
@@ -284,6 +302,26 @@ func (j *Journal) RecordVerification(task Task, object string, now time.Time) er
 		}
 		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
 	})
+}
+
+// PendingBaseSHAs returns the content hashes of every base image some
+// queued task still depends on, for staged-base garbage collection.
+func (j *Journal) PendingBaseSHAs() (map[string]bool, error) {
+	out := map[string]bool{}
+	err := j.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(journalBucket).ForEach(func(_, v []byte) error {
+			var t Task
+			if json.Unmarshal(v, &t) == nil {
+				for _, f := range t.Files {
+					if f.BaseSHA256 != "" {
+						out[f.BaseSHA256] = true
+					}
+				}
+			}
+			return nil
+		})
+	})
+	return out, err
 }
 
 // HasPending reports whether a task for this generation is still queued.
