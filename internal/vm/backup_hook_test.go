@@ -27,7 +27,9 @@ func TestBackupPauseRetriesAsynchronouslyWhenBudgetExhausted(t *testing.T) {
 	}
 
 	tasks := make(chan backup.Task, 1)
-	m := &Manager{}
+	m := &Manager{vms: map[string]*VMInstance{
+		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
+	}}
 	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
@@ -64,7 +66,9 @@ func TestBackupPauseNeverEnqueuesWithoutDiskDigest(t *testing.T) {
 	}
 
 	tasks := make(chan backup.Task, 1)
-	m := &Manager{}
+	m := &Manager{vms: map[string]*VMInstance{
+		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
+	}}
 	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
 
 	m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "missing.ext4"), "", zerolog.Nop())
@@ -72,6 +76,38 @@ func TestBackupPauseNeverEnqueuesWithoutDiskDigest(t *testing.T) {
 	select {
 	case task := <-tasks:
 		t.Fatalf("enqueued %+v despite a missing disk digest", task)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// A sandbox that resumed (or vanished) by the time the rehash runs must
+// not have its live disk digested: the rehash only trusts bytes proven
+// at rest, so a non-paused instance drops the retry entirely.
+func TestBackupPauseDropsRehashWhenSandboxNotAtRest(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{vms: map[string]*VMInstance{
+		"vm-1": {Status: StatusRunning, SnapshotPath: snap},
+	}}
+	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
+	if got := m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop()); len(got) != 0 {
+		t.Fatalf("synchronous manifest = %v, want none", got)
+	}
+
+	select {
+	case task := <-tasks:
+		t.Fatalf("rehash enqueued %+v for a running sandbox", task)
 	case <-time.After(500 * time.Millisecond):
 	}
 }

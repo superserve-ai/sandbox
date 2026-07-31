@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -44,13 +45,50 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	go func() {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 		defer cancel()
+		// The rehash must digest pause-time bytes, proven rather than
+		// assumed: a resume that writes and then QUIESCES before the
+		// hash would otherwise produce digests of post-resume bytes
+		// that verify cleanly and publish a manifest pairing a mutated
+		// disk with the pause-time vmstate. The instance must be paused
+		// on this same snapshot before and after the hash, and the disk
+		// inode must not have changed across it; any violation drops
+		// the rehash (a later re-pause enqueues its own generation).
+		before, err := os.Stat(diskPath)
+		if err != nil || !m.pausedAt(vmID, snapshotPath) {
+			log.Warn().Str("vm_id", vmID).
+				Msg("pause backup dropped: sandbox no longer at-rest for rehash")
+			return
+		}
 		retried := collectPauseManifest(rctx, snapshotPath, diskPath, diskBasePath, log)
+		after, err := os.Stat(diskPath)
+		if err != nil || !os.SameFile(before, after) ||
+			!before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() ||
+			!m.pausedAt(vmID, snapshotPath) {
+			log.Warn().Str("vm_id", vmID).
+				Msg("pause backup dropped: disk changed during rehash")
+			return
+		}
 		if !m.enqueueBackup(vmID, retried) {
 			log.Error().Str("vm_id", vmID).
 				Msg("pause backup dropped: rehash also produced no enqueueable manifest")
 		}
 	}()
 	return manifest
+}
+
+// pausedAt reports whether the sandbox is currently paused on exactly
+// this snapshot. Reads the live map only: a lazy reattach here would
+// resurrect state for a sandbox the rehash should simply drop.
+func (m *Manager) pausedAt(vmID, snapshotPath string) bool {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.Status == StatusPaused && inst.SnapshotPath == snapshotPath
 }
 
 // enqueueBackup hands a pause's manifest to the backup pipeline,
