@@ -1613,9 +1613,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if lerr != nil {
 		return nil, lerr
 	}
-	// nil-guarded: the success path hands the unlock to its background
-	// persist goroutine so the durable verified write stays inside the
-	// critical section.
+	// The success path nils unlockOp after handing the release to its
+	// background persist goroutine.
 	defer func() {
 		if unlockOp != nil {
 			unlockOp()
